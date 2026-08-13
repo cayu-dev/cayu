@@ -8,12 +8,14 @@ import sys
 import tarfile
 import threading
 import time
+from contextlib import suppress
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import cayu.environments.bindings as bindings_module
 from cayu.environments import (
     BoundWorkspace,
     GitRepositoryBinding,
@@ -21,6 +23,7 @@ from cayu.environments import (
     NoWorkspaceBinding,
     SyncBinding,
     SyncBindingContext,
+    SyncTargetWorkspacePlan,
     WorkspaceBinding,
     WorkspaceSnapshot,
     copy_bound_workspace,
@@ -28,11 +31,13 @@ from cayu.environments import (
 )
 from cayu.environments.bindings import (
     _list_workspace_paths,
-    _release_sync_target,
+    _release_sync_resources,
     _reset_workspace_after_failed_clone,
     _validate_sync_tar,
 )
 from cayu.runners import E2BRunner, ExecCommand, ExecResult, LocalRunner, Runner
+from cayu.runtime._environment_operation_boundary import await_environment_operation
+from cayu.vaults import SecretRedactor
 from cayu.workspaces import (
     BoundedTarReader,
     E2BWorkspace,
@@ -753,7 +758,7 @@ def test_sync_binding_copies_source_to_target_and_syncs_back(tmp_path) -> None:
     assert final_snapshot.metadata["final"] is True
 
 
-def test_sync_binding_can_use_target_workspace_factory(tmp_path) -> None:
+def test_sync_binding_can_use_target_workspace_plan_factory(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
     source_root.mkdir()
@@ -762,13 +767,18 @@ def test_sync_binding_can_use_target_workspace_factory(tmp_path) -> None:
     source = LocalWorkspace(source_root, workspace_id="source")
     target = LocalWorkspace(target_root, workspace_id="target")
     calls: list[SyncBindingContext] = []
+    provision_calls = 0
 
-    async def factory(context: SyncBindingContext) -> Workspace:
+    async def provision() -> None:
+        nonlocal provision_calls
+        provision_calls += 1
+
+    async def factory(context: SyncBindingContext) -> SyncTargetWorkspacePlan:
         calls.append(context)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target, provision=provision)
 
     async def run() -> BoundWorkspace:
-        return await SyncBinding(target_workspace_factory=factory).bind(
+        return await SyncBinding(target_workspace_plan_factory=factory).bind(
             source,
             None,
             session_id="sess_sync_factory",
@@ -788,7 +798,621 @@ def test_sync_binding_can_use_target_workspace_factory(tmp_path) -> None:
     assert calls[0].agent_name == "assistant"
     assert calls[0].environment_name == "env"
     assert calls[0].metadata == {"request": "meta"}
+    assert provision_calls == 1
     assert (target_root / "a.txt").read_text(encoding="utf-8") == "before"
+
+
+def test_sync_binding_rejects_legacy_target_factory_before_invocation() -> None:
+    factory_calls = 0
+
+    def legacy_factory(_context: SyncBindingContext) -> Workspace:
+        nonlocal factory_calls
+        factory_calls += 1
+        return StubWorkspace()
+
+    with pytest.raises(ValueError, match="unsafe.*target_workspace_plan_factory"):
+        SyncBinding(target_workspace_factory=legacy_factory)
+
+    assert factory_calls == 0
+
+
+def test_sync_binding_lifecycle_accepts_defensive_copy_of_admitted_generation(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    class CopyingSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return copy_bound_workspace(await super().bind(*args, **kwargs))
+
+    async def run() -> None:
+        binding = CopyingSyncBinding(target_workspace=target)
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        bound = await binding._bind_for_environment_lifecycle(
+            source,
+            None,
+            session_id="copied-lifecycle-bind",
+            _attempt=attempt,
+        )
+        assert bound.workspace is target
+        assert bound.source_workspace is source
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+
+def test_sync_binding_rejects_detached_lifecycle_base_bind_after_dispatch_exits(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    detached: list[asyncio.Task[BoundWorkspace]] = []
+
+    class DetachedSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            detached.append(asyncio.create_task(super().bind(*args, **kwargs)))
+            raise RuntimeError("override exited before delegated bind")
+
+    async def run() -> None:
+        binding = DetachedSyncBinding(target_workspace=target)
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(RuntimeError, match="override exited"):
+            await binding._bind_for_environment_lifecycle(
+                source,
+                None,
+                session_id="detached-lifecycle-bind",
+                _attempt=attempt,
+            )
+        with pytest.raises(RuntimeError, match="dispatch ended"):
+            await detached[0]
+
+        contender = SyncBinding(target_workspace=target)
+        rebound = await contender.bind(
+            source,
+            None,
+            session_id="rebound-after-detached-bind",
+        )
+        assert rebound.workspace is target
+        contender.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_rejects_lifecycle_success_before_base_bind_starts(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    detached: list[asyncio.Task[BoundWorkspace]] = []
+
+    class PrematureSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            detached.append(asyncio.create_task(super().bind(*args, **kwargs)))
+            return BoundWorkspace(
+                workspace=target,
+                source_workspace=source,
+            )
+
+    async def run() -> None:
+        binding = PrematureSyncBinding(target_workspace=target)
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(RuntimeError, match="authoritative base bind completed"):
+            await binding._bind_for_environment_lifecycle(
+                source,
+                None,
+                session_id="premature-lifecycle-bind",
+                _attempt=attempt,
+            )
+        assert attempt.release_failed_reservations is None
+        with pytest.raises(RuntimeError, match="dispatch ended"):
+            await detached[0]
+
+        contender = SyncBinding(target_workspace=target)
+        rebound = await contender.bind(
+            source,
+            None,
+            session_id="rebound-after-premature-bind",
+        )
+        contender.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_classifies_detached_child_cancellation_as_failure(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    source_listing_started = asyncio.Event()
+
+    class BlockingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            source_listing_started.set()
+            await asyncio.Event().wait()
+
+    blocking_source = BlockingSource(source_root, workspace_id="blocking-source")
+
+    class CancellingSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            delegated = asyncio.create_task(super().bind(*args, **kwargs))
+            await source_listing_started.wait()
+            delegated.cancel("child-only bind cancellation")
+            return BoundWorkspace()
+
+    async def run() -> None:
+        binding = CancellingSyncBinding(target_workspace=target)
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(RuntimeError, match="cancelled without caller cancellation"):
+            await binding._bind_for_environment_lifecycle(
+                blocking_source,
+                None,
+                session_id="child-cancelled-lifecycle-bind",
+                _attempt=attempt,
+            )
+        assert asyncio.current_task() is not None
+        assert asyncio.current_task().cancelling() == 0
+        assert attempt.release_failed_reservations is not None
+        attempt.release_failed_reservations()
+
+        contender = SyncBinding(target_workspace=target)
+        rebound = await contender.bind(
+            source,
+            None,
+            session_id="rebound-after-child-cancellation",
+        )
+        contender.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_wait_for_timeout_preserves_timeout_and_cleanup_ownership(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    class BlockingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            await asyncio.Event().wait()
+
+    blocking_source = BlockingSource(source_root, workspace_id="blocking-source")
+
+    class TimingOutSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return await asyncio.wait_for(super().bind(*args, **kwargs), timeout=0.01)
+
+    async def run() -> None:
+        binding = TimingOutSyncBinding(target_workspace=target)
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(TimeoutError):
+            await binding._bind_for_environment_lifecycle(
+                blocking_source,
+                None,
+                session_id="timed-out-lifecycle-bind",
+                _attempt=attempt,
+            )
+        assert attempt.release_failed_reservations is not None
+
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="workspace.*already bound"):
+            await contender.bind(source, None, session_id="blocked-timeout-contender")
+
+        attempt.release_failed_reservations()
+        rebound = await contender.bind(source, None, session_id="timeout-rebound")
+        contender.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_redelivers_cancellation_consumed_during_delegated_settlement(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source"
+    contender_root = tmp_path / "contender"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    contender_source = LocalWorkspace(contender_root, workspace_id="contender")
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    class CancellingAfterDelegationSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            bound = await asyncio.create_task(super().bind(*args, **kwargs))
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            asyncio.get_running_loop().call_soon(
+                current_task.cancel,
+                "cancel during delegated settlement",
+            )
+            return bound
+
+    async def run() -> None:
+        binding = CancellingAfterDelegationSyncBinding(target_workspace=target)
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        bind_task = asyncio.create_task(
+            await_environment_operation(
+                lambda: binding._bind_for_environment_lifecycle(
+                    source,
+                    None,
+                    session_id="cancel-during-delegated-settlement",
+                    _attempt=attempt,
+                ),
+                operation_name="Environment workspace binding",
+                redactor=SecretRedactor(),
+            )
+        )
+        with pytest.raises(asyncio.CancelledError, match="cancel during delegated settlement"):
+            await bind_task
+        assert bind_task.cancelling() == 1
+        assert bind_task.cancelled() is True
+
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-settlement-cancellation-contender",
+            )
+
+        # A caller that obtains only cancellation cannot release lifecycle-owned
+        # reservations; the real environment lifecycle transfers this callback
+        # directly to factory cleanup.
+        assert attempt.release_failed_reservations is not None
+        attempt.release_failed_reservations()
+        rebound = await contender.bind(
+            contender_source,
+            None,
+            session_id="settlement-cancellation-rebound",
+        )
+        contender.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_shared_failure_keeps_each_generation_ownership(tmp_path) -> None:
+    shared_error = RuntimeError("shared workspace failure")
+    failures_ready = asyncio.Event()
+    failure_count = 0
+    bindings: list[SyncBinding] = []
+    sources: list[Workspace] = []
+    rebound_sources: list[Workspace] = []
+    targets: list[Workspace] = []
+
+    class FailingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            raise shared_error
+
+    class CoordinatedSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal failure_count
+            try:
+                return await super().bind(*args, **kwargs)
+            except BaseException:
+                failure_count += 1
+                if failure_count == 2:
+                    failures_ready.set()
+                await failures_ready.wait()
+                raise
+
+    for index in range(2):
+        source_root = tmp_path / f"source-{index}"
+        target_root = tmp_path / f"target-{index}"
+        source_root.mkdir()
+        target_root.mkdir()
+        source = FailingSource(source_root, workspace_id=f"source-{index}")
+        target = LocalWorkspace(target_root, workspace_id=f"target-{index}")
+        bindings.append(CoordinatedSyncBinding(target_workspace=target))
+        sources.append(source)
+        rebound_sources.append(LocalWorkspace(source_root, workspace_id=f"source-{index}"))
+        targets.append(target)
+
+    async def run() -> None:
+        attempts = [bindings_module._EnvironmentLifecycleBindAttempt() for _ in bindings]
+        results = await asyncio.gather(
+            *(
+                binding._bind_for_environment_lifecycle(
+                    source,
+                    None,
+                    session_id=f"shared-failure-{index}",
+                    _attempt=attempts[index],
+                )
+                for index, (binding, source) in enumerate(zip(bindings, sources, strict=True))
+            ),
+            return_exceptions=True,
+        )
+        errors = tuple(result for result in results if isinstance(result, BaseException))
+        assert len(errors) == 2
+        releases = tuple(attempt.release_failed_reservations for attempt in attempts)
+        assert all(release is not None for release in releases)
+        assert releases[0] is not releases[1]
+
+        for source, target in zip(sources, targets, strict=True):
+            contender = SyncBinding(target_workspace=target)
+            with pytest.raises(ValueError, match="source workspace.*already bound"):
+                await contender.bind(source, None, session_id="blocked-shared-contender")
+
+        for release in releases:
+            assert release is not None
+            release()
+
+        for index, (source, target) in enumerate(zip(rebound_sources, targets, strict=True)):
+            contender = SyncBinding(target_workspace=target)
+            rebound = await contender.bind(
+                source,
+                None,
+                session_id=f"shared-failure-rebound-{index}",
+            )
+            contender.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_current_failure_ownership_scopes_historical_grouped_failure(
+    tmp_path,
+) -> None:
+    historical_error = RuntimeError("historical workspace failure")
+    current_error = RuntimeError("current workspace failure")
+    roots: list[tuple[Path, Path]] = []
+    for label in ("historical", "current"):
+        source_root = tmp_path / f"{label}-source"
+        target_root = tmp_path / f"{label}-target"
+        source_root.mkdir()
+        target_root.mkdir()
+        roots.append((source_root, target_root))
+
+    class FailingSource(LocalWorkspace):
+        def __init__(self, root: Path, *, workspace_id: str, error: RuntimeError) -> None:
+            super().__init__(root, workspace_id=workspace_id)
+            self.error = error
+
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            raise self.error
+
+    async def run() -> None:
+        historical_source_root, historical_target_root = roots[0]
+        historical_source = FailingSource(
+            historical_source_root,
+            workspace_id="historical-source",
+            error=historical_error,
+        )
+        historical_target = LocalWorkspace(
+            historical_target_root,
+            workspace_id="historical-target",
+        )
+        historical_binding = SyncBinding(target_workspace=historical_target)
+        historical_attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(RuntimeError, match="historical workspace failure") as historical:
+            await historical_binding._bind_for_environment_lifecycle(
+                historical_source,
+                None,
+                session_id="historical-failed-bind",
+                _attempt=historical_attempt,
+            )
+        historical_release = historical_attempt.release_failed_reservations
+        assert historical_release is not None
+
+        current_source_root, current_target_root = roots[1]
+        current_source = FailingSource(
+            current_source_root,
+            workspace_id="current-source",
+            error=current_error,
+        )
+        current_target = LocalWorkspace(current_target_root, workspace_id="current-target")
+
+        class GroupingSyncBinding(SyncBinding):
+            async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                try:
+                    return await super().bind(*args, **kwargs)
+                except BaseException as error:
+                    raise BaseExceptionGroup(
+                        "current and historical bind failures",
+                        [error, historical.value],
+                    ) from None
+
+        current_binding = GroupingSyncBinding(target_workspace=current_target)
+        current_attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(BaseExceptionGroup, match="current and historical"):
+            await current_binding._bind_for_environment_lifecycle(
+                current_source,
+                None,
+                session_id="current-failed-bind",
+                _attempt=current_attempt,
+            )
+        current_release = current_attempt.release_failed_reservations
+        assert current_release is not None
+        assert current_release is not historical_release
+
+        for source, target in (
+            (historical_source, historical_target),
+            (current_source, current_target),
+        ):
+            contender = SyncBinding(target_workspace=target)
+            with pytest.raises(ValueError, match="source workspace.*already bound"):
+                await contender.bind(source, None, session_id="blocked-historical-group-contender")
+
+        historical_release()
+        current_release()
+        for index, (source_root, target_root) in enumerate(roots):
+            contender = SyncBinding(
+                target_workspace=LocalWorkspace(target_root, workspace_id=f"target-{index}")
+            )
+            rebound = await contender.bind(
+                LocalWorkspace(source_root, workspace_id=f"source-{index}"),
+                None,
+                session_id=f"historical-group-rebound-{index}",
+            )
+            contender.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_replayed_failure_has_no_historical_release_authority(tmp_path) -> None:
+    roots = {
+        name: tmp_path / name
+        for name in ("first-source", "first-target", "second-source", "second-target")
+    }
+    for root in roots.values():
+        root.mkdir()
+    captured_error: BaseException | None = None
+
+    class FailingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            raise RuntimeError("first bind failed")
+
+    class CapturingBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal captured_error
+            try:
+                return await super().bind(*args, **kwargs)
+            except BaseException as error:
+                captured_error = error
+                raise
+
+    class ReplayingBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            del args, kwargs
+            assert captured_error is not None
+            raise captured_error
+
+    async def run() -> None:
+        first = CapturingBinding(
+            target_workspace=LocalWorkspace(roots["first-target"], workspace_id="first-target")
+        )
+        first_attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(RuntimeError, match="first bind failed"):
+            await first._bind_for_environment_lifecycle(
+                FailingSource(roots["first-source"], workspace_id="first-source"),
+                None,
+                session_id="first",
+                _attempt=first_attempt,
+            )
+        assert first_attempt.release_failed_reservations is not None
+
+        second = ReplayingBinding(
+            target_workspace=LocalWorkspace(roots["second-target"], workspace_id="second-target")
+        )
+        second_attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(RuntimeError, match="first bind failed"):
+            await second._bind_for_environment_lifecycle(
+                LocalWorkspace(roots["second-source"], workspace_id="second-source"),
+                None,
+                session_id="second",
+                _attempt=second_attempt,
+            )
+        assert second_attempt.release_failed_reservations is None
+
+        contender = SyncBinding(
+            target_workspace=LocalWorkspace(roots["first-target"], workspace_id="first-target")
+        )
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                LocalWorkspace(roots["second-source"], workspace_id="contender-source"),
+                None,
+                session_id="blocked-before-first-cleanup",
+            )
+        first_attempt.release_failed_reservations()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("wrapper", ["cause", "group"])
+def test_sync_binding_does_not_duplicate_wrapped_delegated_failure(
+    tmp_path,
+    wrapper: str,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    base_errors: list[RuntimeError] = []
+
+    class FailingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            error = RuntimeError("delegated bind failed")
+            base_errors.append(error)
+            raise error
+
+    failing_source = FailingSource(source_root, workspace_id="failing-source")
+
+    class WrappingSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            delegated = asyncio.create_task(super().bind(*args, **kwargs))
+            try:
+                return await delegated
+            except RuntimeError as error:
+                if wrapper == "cause":
+                    raise RuntimeError("override wrapped delegated failure") from error
+                raise ExceptionGroup("override wrapped delegated failure", [error]) from None
+
+    def visible_occurrences(error: BaseException, expected: BaseException) -> int:
+        pending = [error]
+        visited_edges: set[tuple[int, int]] = set()
+        occurrences = 0
+        while pending:
+            candidate = pending.pop()
+            if candidate is expected:
+                occurrences += 1
+            children: tuple[BaseException, ...] = (
+                candidate.exceptions if isinstance(candidate, BaseExceptionGroup) else ()
+            )
+            cause = candidate.__cause__
+            context = None if candidate.__suppress_context__ else candidate.__context__
+            for child in (*children, cause, context):
+                if child is None:
+                    continue
+                edge = (id(candidate), id(child))
+                if edge in visited_edges:
+                    continue
+                visited_edges.add(edge)
+                pending.append(child)
+        return occurrences
+
+    async def run() -> None:
+        binding = WrappingSyncBinding(target_workspace=target)
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        with pytest.raises(BaseException) as raised:
+            await binding._bind_for_environment_lifecycle(
+                failing_source,
+                None,
+                session_id=f"wrapped-delegated-failure-{wrapper}",
+                _attempt=attempt,
+            )
+        assert len(base_errors) == 1
+        assert visible_occurrences(raised.value, base_errors[0]) == 1
+        assert attempt.release_failed_reservations is not None
+        attempt.release_failed_reservations()
+
+        contender = SyncBinding(target_workspace=target)
+        rebound = await contender.bind(source, None, session_id="wrapped-failure-rebound")
+        contender.abandon(rebound)
+
+    asyncio.run(run())
 
 
 def test_sync_binding_rejects_source_as_target_workspace(tmp_path) -> None:
@@ -861,6 +1485,37 @@ def test_sync_binding_rejects_target_subclass_with_same_local_root(tmp_path) -> 
 
     with pytest.raises(ValueError, match="different"):
         asyncio.run(run())
+
+
+def test_failed_outer_bind_accepts_legacy_implicit_abandon_success() -> None:
+    abandoned: list[BoundWorkspace] = []
+
+    class ImplicitAbandonBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **_kwargs):  # type: ignore[no-untyped-def]
+            return BoundWorkspace(workspace=workspace, runner=runner)
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+        def abandon(self, bound: BoundWorkspace) -> None:  # type: ignore[override]
+            abandoned.append(bound)
+
+    async def run() -> BoundWorkspace:
+        binding = ImplicitAbandonBinding()
+        attempt = bindings_module._EnvironmentLifecycleBindAttempt()
+        bound = await binding._bind_for_environment_lifecycle(
+            None,
+            None,
+            session_id="implicit-abandon",
+            _attempt=attempt,
+        )
+        assert attempt.release_failed_reservations is not None
+        attempt.release_failed_reservations()
+        return bound
+
+    bound = asyncio.run(run())
+
+    assert abandoned == [bound]
 
 
 def test_sync_binding_rejects_target_with_same_runner_cwd(tmp_path) -> None:
@@ -1258,6 +1913,477 @@ def test_sync_binding_reserves_fixed_target_before_mutating_await(tmp_path) -> N
     assert binding._fixed_target_owners == {"target": bound.state_key}
 
 
+def test_sync_binding_rejects_concurrent_reuse_of_source_before_target_mutation(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source"
+    first_target_root = tmp_path / "first-target"
+    second_target_root = tmp_path / "second-target"
+    source_root.mkdir()
+    first_target_root.mkdir()
+    second_target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    (second_target_root / "operator.txt").write_text("untouched", encoding="utf-8")
+    source = BlockingListWorkspace(source_root, workspace_id="source")
+    first_target = LocalWorkspace(first_target_root, workspace_id="first-target")
+    second_target = LocalWorkspace(second_target_root, workspace_id="second-target")
+    first_binding = SyncBinding(target_workspace=first_target)
+    second_binding = SyncBinding(target_workspace=second_target)
+
+    async def run() -> None:
+        source.block_list = True
+        first_task = asyncio.create_task(first_binding.bind(source, None, session_id="sess_first"))
+        await source.list_started.wait()
+
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await second_binding.bind(source, None, session_id="sess_second")
+        assert (second_target_root / "operator.txt").read_text(encoding="utf-8") == "untouched"
+
+        source.release_list.set()
+        first = await first_task
+        first_binding.abandon(first)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_rejects_owned_source_before_invoking_target_factory(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    first_target_root = tmp_path / "first-target"
+    factory_target_root = tmp_path / "factory-target"
+    source_root.mkdir()
+    first_target_root.mkdir()
+    factory_target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    first_target = LocalWorkspace(first_target_root, workspace_id="first-target")
+    factory_target = LocalWorkspace(factory_target_root, workspace_id="factory-target")
+    owner_binding = SyncBinding(target_workspace=first_target)
+    factory_calls = 0
+
+    async def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        nonlocal factory_calls
+        factory_calls += 1
+        return SyncTargetWorkspacePlan(workspace=factory_target)
+
+    factory_binding = SyncBinding(target_workspace_plan_factory=factory)
+
+    async def run() -> None:
+        owner = await owner_binding.bind(source, None, session_id="sess_owner")
+        with pytest.raises(ValueError, match="source workspace.*already bound"):
+            await factory_binding.bind(source, None, session_id="sess_rejected")
+        assert factory_calls == 0
+        owner_binding.abandon(owner)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_releases_factory_source_when_reservation_commits_then_raises(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    factory_calls = 0
+
+    def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        nonlocal factory_calls
+        factory_calls += 1
+        return SyncTargetWorkspacePlan(workspace=target)
+
+    original_reserve = bindings_module._reserve_sync_factory_source
+    raise_after_first_commit = True
+
+    def reserve_then_interrupt(*args: Any, **kwargs: Any) -> None:
+        nonlocal raise_after_first_commit
+        original_reserve(*args, **kwargs)
+        if raise_after_first_commit:
+            raise_after_first_commit = False
+            raise KeyboardInterrupt("interrupted after provisional source reservation")
+
+    monkeypatch.setattr(
+        bindings_module,
+        "_reserve_sync_factory_source",
+        reserve_then_interrupt,
+    )
+    factory_binding = SyncBinding(target_workspace_plan_factory=factory)
+    replacement = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        with pytest.raises(KeyboardInterrupt, match="interrupted after provisional"):
+            await factory_binding.bind(source, None, session_id="sess_interrupted")
+        assert factory_calls == 0
+
+        rebound = await replacement.bind(source, None, session_id="sess_replacement")
+        replacement.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_factory_source_claim_prevents_concurrent_provisioning(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    provisioning_started = asyncio.Event()
+    release_provisioning = asyncio.Event()
+    factory_calls = 0
+
+    async def provision() -> None:
+        provisioning_started.set()
+        await release_provisioning.wait()
+
+    def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        nonlocal factory_calls
+        factory_calls += 1
+        return SyncTargetWorkspacePlan(workspace=target, provision=provision)
+
+    binding = SyncBinding(target_workspace_plan_factory=factory)
+
+    async def run() -> None:
+        first_task = asyncio.create_task(binding.bind(source, None, session_id="sess_first"))
+        await provisioning_started.wait()
+        with pytest.raises(ValueError, match="source workspace.*already bound"):
+            await binding.bind(source, None, session_id="sess_second")
+        assert factory_calls == 1
+
+        release_provisioning.set()
+        first = await first_task
+        binding.abandon(first)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_factory_does_not_provision_an_owned_target(tmp_path) -> None:
+    first_source_root = tmp_path / "first-source"
+    second_source_root = tmp_path / "second-source"
+    target_root = tmp_path / "target"
+    first_source_root.mkdir()
+    second_source_root.mkdir()
+    target_root.mkdir()
+    (first_source_root / "first.txt").write_text("first", encoding="utf-8")
+    (second_source_root / "second.txt").write_text("second", encoding="utf-8")
+    (target_root / "owned.txt").write_text("unchanged", encoding="utf-8")
+    first_source = LocalWorkspace(first_source_root, workspace_id="first-source")
+    second_source = LocalWorkspace(second_source_root, workspace_id="second-source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    owner_binding = SyncBinding(target_workspace=target)
+    provision_calls = 0
+
+    async def provision() -> None:
+        nonlocal provision_calls
+        provision_calls += 1
+        await target.write_bytes("owned.txt", b"mutated")
+
+    def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        return SyncTargetWorkspacePlan(workspace=target, provision=provision)
+
+    contender_binding = SyncBinding(target_workspace_plan_factory=factory)
+
+    async def run() -> None:
+        owner = await owner_binding.bind(first_source, None, session_id="sess_owner")
+        await target.write_bytes("owned.txt", b"unchanged")
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender_binding.bind(second_source, None, session_id="sess_contender")
+        assert provision_calls == 0
+        assert (target_root / "owned.txt").read_text(encoding="utf-8") == "unchanged"
+        owner_binding.abandon(owner)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("termination", ["failure", "cancellation"])
+def test_sync_binding_factory_termination_releases_provisional_source(
+    tmp_path,
+    termination: str,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    provisioning_started = asyncio.Event()
+    release_provisioning = asyncio.Event()
+
+    async def provision() -> None:
+        provisioning_started.set()
+        await release_provisioning.wait()
+        if termination == "failure":
+            raise RuntimeError("factory failed")
+
+    def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        return SyncTargetWorkspacePlan(
+            workspace=target,
+            provision=provision,
+        )
+
+    factory_binding = SyncBinding(target_workspace_plan_factory=factory)
+    replacement = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            factory_binding.bind(source, None, session_id=f"sess_{termination}")
+        )
+        await provisioning_started.wait()
+        if termination == "cancellation":
+            task.cancel("cancel factory bind")
+            await asyncio.sleep(0)
+            assert not task.done()
+            with pytest.raises(ValueError, match="source workspace.*already bound"):
+                await replacement.bind(source, None, session_id="sess_competing")
+            release_provisioning.set()
+            with pytest.raises(asyncio.CancelledError, match="cancel factory bind"):
+                await task
+            assert task.cancelling() == 1
+            assert task.cancelled()
+        else:
+            release_provisioning.set()
+            with pytest.raises(RuntimeError, match="factory failed"):
+                await task
+
+        rebound = await replacement.bind(source, None, session_id="sess_replacement")
+        replacement.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_factory_cancellation_fences_dispatched_thread_worker(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    contender_source_root = tmp_path / "contender-source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    (contender_source_root / "b.txt").write_text("contender", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    contender_source = LocalWorkspace(
+        contender_source_root,
+        workspace_id="contender-source",
+    )
+    target = LocalWorkspace(target_root, workspace_id="target")
+    provisioning_started = threading.Event()
+    release_provisioning = threading.Event()
+    provisioning_finished = threading.Event()
+
+    def provision_target() -> Workspace:
+        provisioning_started.set()
+        assert release_provisioning.wait(timeout=5)
+        (target_root / "stale-provision.txt").write_text("stale", encoding="utf-8")
+        provisioning_finished.set()
+        return target
+
+    async def provision() -> None:
+        provisioned_target = await asyncio.to_thread(provision_target)
+        assert provisioned_target is target
+
+    def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        return SyncTargetWorkspacePlan(
+            workspace=target,
+            provision=provision,
+        )
+
+    factory_binding = SyncBinding(target_workspace_plan_factory=factory)
+    replacement = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        task = asyncio.create_task(factory_binding.bind(source, None, session_id="sess_cancelled"))
+        assert await asyncio.to_thread(provisioning_started.wait, 5)
+        task.cancel("cancel dispatched factory")
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await replacement.bind(
+                contender_source,
+                None,
+                session_id="sess_competing",
+            )
+
+        release_provisioning.set()
+        with pytest.raises(asyncio.CancelledError, match="cancel dispatched factory"):
+            await task
+        assert provisioning_finished.is_set()
+        assert task.cancelling() == 1
+        assert task.cancelled()
+
+        rebound = await replacement.bind(source, None, session_id="sess_replacement")
+        assert not (target_root / "stale-provision.txt").exists()
+        replacement.abandon(rebound)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_opposite_direction_race_has_one_winner_without_deadlock(
+    tmp_path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    (first_root / "first.txt").write_text("first", encoding="utf-8")
+    (second_root / "second.txt").write_text("second", encoding="utf-8")
+    first = LocalWorkspace(first_root, workspace_id="first")
+    second = LocalWorkspace(second_root, workspace_id="second")
+    both_factories_started = asyncio.Event()
+    release_factories = asyncio.Event()
+    factory_calls = 0
+
+    async def wait_for_both(target: Workspace) -> SyncTargetWorkspacePlan:
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 2:
+            both_factories_started.set()
+        await release_factories.wait()
+        return SyncTargetWorkspacePlan(workspace=target)
+
+    first_binding = SyncBinding(
+        target_workspace_plan_factory=lambda _context: wait_for_both(second)
+    )
+    second_binding = SyncBinding(
+        target_workspace_plan_factory=lambda _context: wait_for_both(first)
+    )
+
+    async def run() -> None:
+        tasks = (
+            asyncio.create_task(first_binding.bind(first, None, session_id="sess_first")),
+            asyncio.create_task(second_binding.bind(second, None, session_id="sess_second")),
+        )
+        await both_factories_started.wait()
+        release_factories.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=5,
+        )
+        winners = [result for result in results if isinstance(result, BoundWorkspace)]
+        losers = [result for result in results if isinstance(result, ValueError)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+        assert "already bound by an active session" in str(losers[0])
+        winner_index = results.index(winners[0])
+        (first_binding, second_binding)[winner_index].abandon(winners[0])
+
+    asyncio.run(run())
+
+
+def test_sync_binding_opposite_factory_race_has_one_winner_across_event_loops(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    (first_root / "first.txt").write_text("first", encoding="utf-8")
+    (second_root / "second.txt").write_text("second", encoding="utf-8")
+    first = LocalWorkspace(first_root, workspace_id="first")
+    second = LocalWorkspace(second_root, workspace_id="second")
+    factories_ready = threading.Barrier(2)
+    failed_promotions_ready = threading.Barrier(2)
+    original_promote = bindings_module._promote_sync_factory_resources
+
+    def delay_failed_promotion(*args: Any, **kwargs: Any) -> None:
+        try:
+            original_promote(*args, **kwargs)
+        except ValueError:
+            # Pause before bind() reaches its outer cleanup. The previous implementation let
+            # both threads observe the other's provisional source during this interval and
+            # consequently rejected both binds.
+            with suppress(threading.BrokenBarrierError):
+                failed_promotions_ready.wait(timeout=1)
+            raise
+
+    monkeypatch.setattr(
+        bindings_module,
+        "_promote_sync_factory_resources",
+        delay_failed_promotion,
+    )
+
+    async def first_factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        factories_ready.wait(timeout=5)
+        return SyncTargetWorkspacePlan(workspace=second)
+
+    async def second_factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        factories_ready.wait(timeout=5)
+        return SyncTargetWorkspacePlan(workspace=first)
+
+    bindings = (
+        SyncBinding(target_workspace_plan_factory=first_factory),
+        SyncBinding(target_workspace_plan_factory=second_factory),
+    )
+    sources = (first, second)
+    results: list[BoundWorkspace | BaseException | None] = [None, None]
+
+    def run(index: int) -> None:
+        try:
+            results[index] = asyncio.run(
+                bindings[index].bind(
+                    sources[index],
+                    None,
+                    session_id=f"sess_{index}",
+                )
+            )
+        except BaseException as exc:
+            results[index] = exc
+
+    threads = tuple(threading.Thread(target=run, args=(index,)) for index in range(2))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    winners = [result for result in results if isinstance(result, BoundWorkspace)]
+    losers = [result for result in results if isinstance(result, ValueError)]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert "already bound by an active session" in str(losers[0])
+    winner_index = results.index(winners[0])
+    bindings[winner_index].abandon(winners[0])
+
+
+def test_sync_binding_failed_pair_acquisition_does_not_reserve_uncontended_source(
+    tmp_path,
+) -> None:
+    roots = {name: tmp_path / name for name in ("a", "b", "c", "d")}
+    for root in roots.values():
+        root.mkdir()
+    (roots["a"] / "a.txt").write_text("a", encoding="utf-8")
+    (roots["c"] / "c.txt").write_text("c", encoding="utf-8")
+    workspaces = {name: LocalWorkspace(root, workspace_id=name) for name, root in roots.items()}
+    first_binding = SyncBinding(target_workspace=workspaces["b"])
+    conflicting_binding = SyncBinding(target_workspace=workspaces["b"])
+    unrelated_binding = SyncBinding(target_workspace=workspaces["d"])
+
+    async def run() -> None:
+        first = await first_binding.bind(workspaces["a"], None, session_id="sess_first")
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await conflicting_binding.bind(
+                workspaces["c"],
+                None,
+                session_id="sess_conflict",
+            )
+
+        unrelated = await unrelated_binding.bind(
+            workspaces["c"],
+            None,
+            session_id="sess_unrelated",
+        )
+        first_binding.abandon(first)
+        unrelated_binding.abandon(unrelated)
+
+    asyncio.run(run())
+
+
 def test_sync_binding_cancellation_releases_only_inflight_owner(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -1370,25 +2496,40 @@ def test_sync_binding_abandon_releases_fixed_target(tmp_path) -> None:
     assert binding._fixed_target_owners == {"target": rebound.state_key}
 
 
-def test_sync_binding_factory_allows_distinct_target_resources(tmp_path) -> None:
-    source_root = tmp_path / "source"
-    source_root.mkdir()
-    (source_root / "a.txt").write_text("x", encoding="utf-8")
-    source = LocalWorkspace(source_root, workspace_id="source")
+def test_sync_binding_factory_allows_unrelated_resource_pairs(tmp_path) -> None:
+    first_source_root = tmp_path / "first-source"
+    second_source_root = tmp_path / "second-source"
+    first_source_root.mkdir()
+    second_source_root.mkdir()
+    target_roots = {
+        "first-source": tmp_path / "target_first-source",
+        "second-source": tmp_path / "target_second-source",
+    }
+    for target_root in target_roots.values():
+        target_root.mkdir()
+    (first_source_root / "a.txt").write_text("x", encoding="utf-8")
+    (second_source_root / "b.txt").write_text("y", encoding="utf-8")
+    first_source = LocalWorkspace(first_source_root, workspace_id="first-source")
+    second_source = LocalWorkspace(second_source_root, workspace_id="second-source")
     made: list[LocalWorkspace] = []
 
-    async def factory(context: SyncBindingContext) -> Workspace:
-        root = tmp_path / f"target_{len(made)}"
-        root.mkdir()
-        target = LocalWorkspace(root, workspace_id=f"target_{len(made)}")
-        made.append(target)
-        return target
+    def factory(context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        target_name = f"target_{context.source_workspace.id}"
+        root = target_roots[context.source_workspace.id]
+        target = LocalWorkspace(root, workspace_id=target_name)
 
-    binding = SyncBinding(target_workspace_factory=factory)
+        async def provision() -> None:
+            made.append(target)
+
+        return SyncTargetWorkspacePlan(workspace=target, provision=provision)
+
+    binding = SyncBinding(target_workspace_plan_factory=factory)
 
     async def run() -> None:
-        first = await binding.bind(source, None, session_id="sess_a")
-        second = await binding.bind(source, None, session_id="sess_b")
+        first, second = await asyncio.gather(
+            binding.bind(first_source, None, session_id="sess_a"),
+            binding.bind(second_source, None, session_id="sess_b"),
+        )
         binding.abandon(first)
         binding.abandon(second)
 
@@ -1397,54 +2538,63 @@ def test_sync_binding_factory_allows_distinct_target_resources(tmp_path) -> None
     assert binding._fixed_target_owners == {}
 
 
-def test_sync_binding_factory_rejects_same_resolved_target(tmp_path) -> None:
-    source_root = tmp_path / "source"
+def test_sync_binding_factory_and_fixed_target_share_resource_registry(tmp_path) -> None:
+    first_source_root = tmp_path / "first-source"
+    second_source_root = tmp_path / "second-source"
     target_root = tmp_path / "target"
-    source_root.mkdir()
+    first_source_root.mkdir()
+    second_source_root.mkdir()
     target_root.mkdir()
-    (source_root / "a.txt").write_text("x", encoding="utf-8")
-    source = LocalWorkspace(source_root, workspace_id="source")
+    (first_source_root / "a.txt").write_text("x", encoding="utf-8")
+    (second_source_root / "b.txt").write_text("y", encoding="utf-8")
+    first_source = LocalWorkspace(first_source_root, workspace_id="first-source")
+    second_source = LocalWorkspace(second_source_root, workspace_id="second-source")
     target = LocalWorkspace(target_root, workspace_id="target")
 
-    async def factory(_context: SyncBindingContext) -> Workspace:
-        return target
+    async def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    binding = SyncBinding(target_workspace_factory=factory)
+    fixed_binding = SyncBinding(target_workspace=target)
+    factory_binding = SyncBinding(target_workspace_plan_factory=factory)
 
     async def run() -> None:
-        owner = await binding.bind(source, None, session_id="sess_a")
+        owner = await fixed_binding.bind(first_source, None, session_id="sess_a")
         with pytest.raises(ValueError, match="already bound by an active session"):
-            await binding.bind(source, None, session_id="sess_b")
-        binding.abandon(owner)
+            await factory_binding.bind(second_source, None, session_id="sess_b")
+        fixed_binding.abandon(owner)
 
     asyncio.run(run())
 
 
 def test_sync_binding_concurrent_factory_same_target_has_one_winner(tmp_path) -> None:
-    source_root = tmp_path / "source"
+    first_source_root = tmp_path / "first-source"
+    second_source_root = tmp_path / "second-source"
     target_root = tmp_path / "target"
-    source_root.mkdir()
+    first_source_root.mkdir()
+    second_source_root.mkdir()
     target_root.mkdir()
-    (source_root / "a.txt").write_text("x", encoding="utf-8")
-    source = LocalWorkspace(source_root, workspace_id="source")
+    (first_source_root / "a.txt").write_text("x", encoding="utf-8")
+    (second_source_root / "b.txt").write_text("y", encoding="utf-8")
+    first_source = LocalWorkspace(first_source_root, workspace_id="first-source")
+    second_source = LocalWorkspace(second_source_root, workspace_id="second-source")
     target = LocalWorkspace(target_root, workspace_id="target")
     both_resolving = asyncio.Event()
     release_factory = asyncio.Event()
     factory_calls = 0
 
-    async def factory(_context: SyncBindingContext) -> Workspace:
+    async def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
         nonlocal factory_calls
         factory_calls += 1
         if factory_calls == 2:
             both_resolving.set()
         await release_factory.wait()
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    binding = SyncBinding(target_workspace_factory=factory)
+    binding = SyncBinding(target_workspace_plan_factory=factory)
 
     async def run() -> None:
-        first_task = asyncio.create_task(binding.bind(source, None, session_id="sess_a"))
-        second_task = asyncio.create_task(binding.bind(source, None, session_id="sess_b"))
+        first_task = asyncio.create_task(binding.bind(first_source, None, session_id="sess_a"))
+        second_task = asyncio.create_task(binding.bind(second_source, None, session_id="sess_b"))
         await both_resolving.wait()
         release_factory.set()
         results = await asyncio.gather(first_task, second_task, return_exceptions=True)
@@ -1459,12 +2609,16 @@ def test_sync_binding_concurrent_factory_same_target_has_one_winner(tmp_path) ->
 
 
 def test_sync_binding_separate_instances_share_target_registry(tmp_path) -> None:
-    source_root = tmp_path / "source"
+    first_source_root = tmp_path / "first-source"
+    second_source_root = tmp_path / "second-source"
     target_root = tmp_path / "target"
-    source_root.mkdir()
+    first_source_root.mkdir()
+    second_source_root.mkdir()
     target_root.mkdir()
-    (source_root / "a.txt").write_text("x", encoding="utf-8")
-    source = LocalWorkspace(source_root, workspace_id="source")
+    (first_source_root / "a.txt").write_text("x", encoding="utf-8")
+    (second_source_root / "b.txt").write_text("y", encoding="utf-8")
+    first_source = LocalWorkspace(first_source_root, workspace_id="first-source")
+    second_source = LocalWorkspace(second_source_root, workspace_id="second-source")
     first_binding = SyncBinding(
         target_workspace=LocalWorkspace(target_root, workspace_id="first-view")
     )
@@ -1473,17 +2627,52 @@ def test_sync_binding_separate_instances_share_target_registry(tmp_path) -> None
     )
 
     async def run() -> None:
-        first = await first_binding.bind(source, None, session_id="sess_a")
+        first = await first_binding.bind(first_source, None, session_id="sess_a")
         with pytest.raises(ValueError, match="already bound by an active session"):
-            await second_binding.bind(source, None, session_id="sess_b")
+            await second_binding.bind(second_source, None, session_id="sess_b")
 
         first_binding.abandon(first)
-        second = await second_binding.bind(source, None, session_id="sess_b")
+        second = await second_binding.bind(second_source, None, session_id="sess_b")
 
         # Delayed cleanup from the old generation cannot release the newer owner.
         first_binding.abandon(first)
         with pytest.raises(ValueError, match="already bound by an active session"):
-            await first_binding.bind(source, None, session_id="sess_c")
+            await first_binding.bind(first_source, None, session_id="sess_c")
+        second_binding.abandon(second)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_separate_wrappers_share_source_registry(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    first_target_root = tmp_path / "first-target"
+    second_target_root = tmp_path / "second-target"
+    source_root.mkdir()
+    first_target_root.mkdir()
+    second_target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    first_source_view = LocalWorkspace(source_root, workspace_id="first-source-view")
+    second_source_view = LocalWorkspace(source_root, workspace_id="second-source-view")
+    first_binding = SyncBinding(
+        target_workspace=LocalWorkspace(first_target_root, workspace_id="first-target")
+    )
+    second_binding = SyncBinding(
+        target_workspace=LocalWorkspace(second_target_root, workspace_id="second-target")
+    )
+
+    async def run() -> None:
+        first = await first_binding.bind(first_source_view, None, session_id="sess_a")
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await second_binding.bind(second_source_view, None, session_id="sess_b")
+
+        first_binding.abandon(first)
+        second = await second_binding.bind(second_source_view, None, session_id="sess_b")
+
+        # Delayed cleanup from the old generation cannot release the source
+        # identity now owned through a separate wrapper by the new generation.
+        first_binding.abandon(first)
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await first_binding.bind(first_source_view, None, session_id="sess_c")
         second_binding.abandon(second)
 
     asyncio.run(run())
@@ -1526,9 +2715,14 @@ def test_sync_binding_releases_fixed_target_when_bind_fails(tmp_path) -> None:
 def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
+    alternate_source_root = tmp_path / "alternate-source"
+    alternate_target_root = tmp_path / "alternate-target"
     source_root.mkdir()
     target_root.mkdir()
+    alternate_source_root.mkdir()
+    alternate_target_root.mkdir()
     (source_root / "removed.txt").write_text("delete me", encoding="utf-8")
+    (alternate_source_root / "alternate.txt").write_text("alternate", encoding="utf-8")
 
     class FlakyDeleteWorkspace(LocalWorkspace):
         fail_delete = True
@@ -1540,6 +2734,14 @@ def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
 
     source = FlakyDeleteWorkspace(source_root, workspace_id="source")
     target = LocalWorkspace(target_root, workspace_id="target")
+    alternate_source = LocalWorkspace(
+        alternate_source_root,
+        workspace_id="alternate-source",
+    )
+    alternate_target = LocalWorkspace(
+        alternate_target_root,
+        workspace_id="alternate-target",
+    )
     binding = SyncBinding(target_workspace=target)
 
     async def run() -> None:
@@ -1550,8 +2752,28 @@ def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
         assert len(binding._states) == 1
         assert binding._states[bound.state_key].phase == "active"
         assert binding._fixed_target_owners == {"target": bound.state_key}
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=alternate_target).bind(
+                source,
+                None,
+                session_id="sess_source_conflict",
+            )
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=target).bind(
+                alternate_source,
+                None,
+                session_id="sess_target_conflict",
+            )
         source.fail_delete = False
         await binding.finalize(bound, outcome="completed")
+
+        source_reuse = SyncBinding(target_workspace=alternate_target)
+        rebound = await source_reuse.bind(
+            source,
+            None,
+            session_id="sess_source_reuse",
+        )
+        source_reuse.abandon(rebound)
 
     asyncio.run(run())
 
@@ -1562,11 +2784,17 @@ def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
 def test_sync_binding_deferred_finalize_advances_path_baselines(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
+    alternate_target_root = tmp_path / "alternate-target"
     source_root.mkdir()
     target_root.mkdir()
+    alternate_target_root.mkdir()
     (source_root / "recreated.txt").write_text("original", encoding="utf-8")
     source = LocalWorkspace(source_root, workspace_id="source")
     target = LocalWorkspace(target_root, workspace_id="target")
+    alternate_target = LocalWorkspace(
+        alternate_target_root,
+        workspace_id="alternate-target",
+    )
     binding = SyncBinding(target_workspace=target, delete_missing=True)
 
     async def run() -> None:
@@ -1582,6 +2810,12 @@ def test_sync_binding_deferred_finalize_advances_path_baselines(tmp_path) -> Non
         state = binding._states[bound.state_key]
         assert state.source_paths == ("transient.txt",)
         assert state.target_baseline_paths == ("transient.txt",)
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=alternate_target).bind(
+                source,
+                None,
+                session_id="sess_deferred_conflict",
+            )
 
         # The next pass must delete a path introduced by the first pass and
         # recognize an original path recreated after its first-pass deletion.
@@ -1634,11 +2868,17 @@ def test_sync_binding_finalization_excludes_other_lifecycle_operations(tmp_path)
 def test_sync_binding_finalization_cancellation_restores_owner_for_retry(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
+    alternate_target_root = tmp_path / "alternate-target"
     source_root.mkdir()
     target_root.mkdir()
+    alternate_target_root.mkdir()
     (source_root / "a.txt").write_text("before", encoding="utf-8")
     source = LocalWorkspace(source_root, workspace_id="source")
     target = BlockingListWorkspace(target_root, workspace_id="target")
+    alternate_target = LocalWorkspace(
+        alternate_target_root,
+        workspace_id="alternate-target",
+    )
     binding = SyncBinding(target_workspace=target)
 
     async def run() -> None:
@@ -1653,9 +2893,19 @@ def test_sync_binding_finalization_cancellation_restores_owner_for_retry(tmp_pat
         assert finalize_task.cancelled()
         assert binding._states[bound.state_key].phase == "active"
         assert binding._fixed_target_owners == {"target": bound.state_key}
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=alternate_target).bind(
+                source,
+                None,
+                session_id="sess_source_conflict",
+            )
 
         target.block_list = False
         await binding.finalize(bound, outcome="completed")
+
+        source_reuse = SyncBinding(target_workspace=alternate_target)
+        rebound = await source_reuse.bind(source, None, session_id="sess_source_reuse")
+        source_reuse.abandon(rebound)
 
     asyncio.run(run())
     assert binding._states == {}
@@ -1746,11 +2996,24 @@ def test_sync_binding_preserves_cancellation_and_late_mutation_failure(tmp_path)
 def test_sync_binding_stale_cleanup_cannot_release_new_owner(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
+    alternate_source_root = tmp_path / "alternate-source"
+    alternate_target_root = tmp_path / "alternate-target"
     source_root.mkdir()
     target_root.mkdir()
+    alternate_source_root.mkdir()
+    alternate_target_root.mkdir()
     (source_root / "a.txt").write_text("before", encoding="utf-8")
+    (alternate_source_root / "alternate.txt").write_text("alternate", encoding="utf-8")
     source = LocalWorkspace(source_root, workspace_id="source")
     target = LocalWorkspace(target_root, workspace_id="target")
+    alternate_source = LocalWorkspace(
+        alternate_source_root,
+        workspace_id="alternate-source",
+    )
+    alternate_target = LocalWorkspace(
+        alternate_target_root,
+        workspace_id="alternate-target",
+    )
     binding = SyncBinding(target_workspace=target)
 
     async def run() -> None:
@@ -1764,11 +3027,26 @@ def test_sync_binding_stale_cleanup_cannot_release_new_owner(tmp_path) -> None:
         binding.abandon(first)
         with pytest.raises(ValueError, match="in-process bind state"):
             await binding.finalize(first, outcome="completed")
+        assert source.resource_key is not None
         assert target.resource_key is not None
-        _release_sync_target(target.resource_key, generation=first.state_key)
+        _release_sync_resources(
+            source.resource_key,
+            target.resource_key,
+            generation=first.state_key,
+        )
         assert binding._fixed_target_owners == {"target": second.state_key}
         with pytest.raises(ValueError, match="already bound by an active session"):
-            await binding.bind(source, None, session_id="sess_third")
+            await SyncBinding(target_workspace=alternate_target).bind(
+                source,
+                None,
+                session_id="sess_source_conflict",
+            )
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=target).bind(
+                alternate_source,
+                None,
+                session_id="sess_target_conflict",
+            )
         binding.abandon(second)
 
     asyncio.run(run())
@@ -1794,7 +3072,10 @@ def test_sync_binding_respects_sync_back_and_delete_options(tmp_path) -> None:
         bound = await binding.bind(source, None, session_id="sess_sync_policy")
         assert len(binding._states) == 1
         await target.delete("keep.txt")
-        return await binding.finalize(bound, outcome="failed")
+        snapshot = await binding.finalize(bound, outcome="failed")
+        rebound = await binding.bind(source, None, session_id="sess_sync_policy_reuse")
+        binding.abandon(rebound)
+        return snapshot
 
     final_snapshot = asyncio.run(run())
 
@@ -1865,10 +3146,12 @@ def test_sync_binding_enforces_total_bytes_and_accepts_exact_boundary(tmp_path) 
 
     async def run() -> BoundWorkspace:
         exact_target = LocalWorkspace(exact_target_root, workspace_id="exact-target")
-        bound = await SyncBinding(
+        exact_binding = SyncBinding(
             target_workspace=exact_target,
             max_total_bytes=6,
-        ).bind(source, None, session_id="sess_sync_total_exact")
+        )
+        bound = await exact_binding.bind(source, None, session_id="sess_sync_total_exact")
+        exact_binding.abandon(bound)
         oversized_target = LocalWorkspace(
             oversized_target_root,
             workspace_id="oversized-target",
@@ -2276,34 +3559,41 @@ def test_sync_binding_abandon_releases_state_without_syncing(tmp_path) -> None:
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "before"
 
 
-def test_sync_binding_factory_rebind_keeps_each_same_session_state(tmp_path) -> None:
-    # A factory returns a distinct target for each bind. Rebinding the same session must not silently
-    # invalidate the earlier target's exact-owner finalization state.
+def test_sync_binding_factory_rebind_rejects_an_active_source_generation(tmp_path) -> None:
+    # Resolving a fresh target does not permit a second generation to overlap
+    # the same active source, even for a different session.
     source_root = tmp_path / "source"
     source_root.mkdir()
+    target_roots = (tmp_path / "target_0", tmp_path / "target_1")
+    for target_root in target_roots:
+        target_root.mkdir()
     (source_root / "a.txt").write_text("before", encoding="utf-8")
     source = LocalWorkspace(source_root, workspace_id="source")
     made: list[LocalWorkspace] = []
 
-    async def factory(context: SyncBindingContext) -> Workspace:
-        root = tmp_path / f"target_{len(made)}"
-        root.mkdir()
-        target = LocalWorkspace(root, workspace_id=f"target_{len(made)}")
-        made.append(target)
-        return target
+    def factory(_context: SyncBindingContext) -> SyncTargetWorkspacePlan:
+        target_index = len(made)
+        root = target_roots[target_index]
+        target = LocalWorkspace(root, workspace_id=f"target_{target_index}")
 
-    binding = SyncBinding(target_workspace_factory=factory)
+        async def provision() -> None:
+            made.append(target)
+
+        return SyncTargetWorkspacePlan(workspace=target, provision=provision)
+
+    binding = SyncBinding(target_workspace_plan_factory=factory)
 
     async def run() -> None:
         first = await binding.bind(source, None, session_id="sess_leak")
-        other = await binding.bind(source, None, session_id="sess_other")
-        rebound = await binding.bind(source, None, session_id="sess_leak")
-        assert len(binding._states) == 3
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_other")
+        assert len(binding._states) == 1
         assert first.state_key in binding._states
-        assert other.state_key in binding._states
-        assert rebound.state_key in binding._states
         binding.abandon(first)
-        binding.abandon(other)
+
+        rebound = await binding.bind(source, None, session_id="sess_leak")
+        assert len(binding._states) == 1
+        assert rebound.state_key in binding._states
         binding.abandon(rebound)
 
     asyncio.run(run())
@@ -2541,11 +3831,18 @@ def test_binding_constructors_validate_values() -> None:
         NativeBinding(default_path=" ")
     with pytest.raises(TypeError, match="target_workspace"):
         SyncBinding(target_workspace=invalid_path)
-    with pytest.raises(TypeError, match="target_workspace_factory"):
-        SyncBinding(target_workspace_factory=invalid_path)
-    with pytest.raises(ValueError, match="either target_workspace or target_workspace_factory"):
+    with pytest.raises(TypeError, match="target_workspace_plan_factory"):
+        SyncBinding(target_workspace_plan_factory=invalid_path)
+    with pytest.raises(TypeError, match="workspace"):
+        SyncTargetWorkspacePlan(workspace=invalid_path)
+    with pytest.raises(TypeError, match="provision"):
+        SyncTargetWorkspacePlan(workspace=StubWorkspace(), provision=invalid_path)
+    with pytest.raises(ValueError, match="either target_workspace or"):
         SyncBinding(
-            target_workspace=StubWorkspace(), target_workspace_factory=lambda _ctx: StubWorkspace()
+            target_workspace=StubWorkspace(),
+            target_workspace_plan_factory=lambda _ctx: SyncTargetWorkspacePlan(
+                workspace=StubWorkspace()
+            ),
         )
     with pytest.raises(ValueError, match="path"):
         SyncBinding(path=" ")

@@ -338,6 +338,20 @@ def _detached_environment_failure(
         redactor=redactor,
     )
     message = diagnostic.message
+
+    def detached_with_handoffs(detached: BaseException) -> BaseException:
+        _attach_detached_binding_statuses(
+            error,
+            detached,
+            redactor=redactor,
+        )
+        if (factory_cleanup_task := environment_factory_cleanup_settlement_task(error)) is not None:
+            attach_environment_factory_cleanup_settlement_task(
+                detached,
+                factory_cleanup_task,
+            )
+        return detached
+
     if (
         detached := _detach_exact_environment_failure_in_place(
             error,
@@ -347,11 +361,11 @@ def _detached_environment_failure(
     ) is not None:
         return detached
     if isinstance(error, GeneratorExit):
-        return GeneratorExit(message)
+        return detached_with_handoffs(GeneratorExit(message))
     if isinstance(error, KeyboardInterrupt):
-        return KeyboardInterrupt(message)
+        return detached_with_handoffs(KeyboardInterrupt(message))
     if isinstance(error, SystemExit):
-        return SystemExit(message)
+        return detached_with_handoffs(SystemExit(message))
     if type(error) is TimeoutError:
         detached_timeout = TimeoutError(message)
         _attach_detached_binding_statuses(
@@ -361,14 +375,14 @@ def _detached_environment_failure(
         )
         return detached_timeout
     if type(error) is ValueError:
-        return ValueError(message)
+        return detached_with_handoffs(ValueError(message))
     if type(error) is TypeError:
-        return TypeError(message)
+        return detached_with_handoffs(TypeError(message))
     if type(error) is RuntimeError:
-        return RuntimeError(message)
+        return detached_with_handoffs(RuntimeError(message))
     if isinstance(error, Exception):
-        return RuntimeError(f"{diagnostic.error_type}: {message}")
-    return BaseException(f"{diagnostic.error_type}: {message}")
+        return detached_with_handoffs(RuntimeError(f"{diagnostic.error_type}: {message}"))
+    return detached_with_handoffs(BaseException(f"{diagnostic.error_type}: {message}"))
 
 
 async def await_environment_operation(

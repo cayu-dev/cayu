@@ -9,11 +9,14 @@ import pytest
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
+from cayu._exception_groups import iter_exception_tree
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.environments import (
     BoundWorkspace,
     Environment,
     EnvironmentSpec,
+    SyncBinding,
+    SyncTargetWorkspacePlan,
     WorkspaceBinding,
     WorkspaceInstructions,
     WorkspaceSnapshot,
@@ -47,7 +50,7 @@ from cayu.runtime._environment_lifecycle import (
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.sessions import CheckpointTransform, Session
-from cayu.workspaces import Workspace
+from cayu.workspaces import LocalWorkspace, Workspace
 
 
 def _preserve_session_control_state(
@@ -74,6 +77,262 @@ def _lifecycle(store: InMemorySessionStore) -> EnvironmentLifecycle:
         ),
         checkpoint_transform=_preserve_session_control_state,
     )
+
+
+def test_cancelled_factory_settlement_retires_owner_after_quiescence() -> None:
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    quiescent_calls = 0
+
+    async def release(_action: EnvironmentFactoryReleaseAction) -> None:
+        release_started.set()
+        await allow_release.wait()
+
+    def on_quiescent() -> None:
+        nonlocal quiescent_calls
+        quiescent_calls += 1
+
+    async def run() -> tuple[asyncio.Task[None], EnvironmentLifecycle]:
+        original_error = RuntimeError("bind failed")
+        result = EnvironmentFactoryResult(
+            Environment(EnvironmentSpec(name="dynamic")),
+            release=release,
+            release_timeout_s=0.01,
+        )
+        payload = await environment_lifecycle_module._release_unclaimed_factory_result(
+            result,
+            action=EnvironmentFactoryReleaseAction.PRESERVE,
+            original_error=original_error,
+            on_quiescent=on_quiescent,
+        )
+        assert payload["completed"] is False
+        settlement = environment_lifecycle_module.environment_factory_cleanup_settlement_task(
+            original_error
+        )
+        assert settlement is not None
+        await release_started.wait()
+        lifecycle = object.__new__(EnvironmentLifecycle)
+        lifecycle._deferred_factory_cleanup_tasks = {"settled-session": settlement}
+        lifecycle._pending_environment_owner_admissions = {"settled-session"}
+        settlement.cancel("stop waiting for cleanup")
+        allow_release.set()
+        await settlement
+        lifecycle._harvest_deferred_factory_cleanups()
+        return settlement, lifecycle
+
+    settlement, lifecycle = asyncio.run(run())
+
+    assert not settlement.cancelled()
+    assert settlement.cancelling() == 0
+    assert quiescent_calls == 1
+    assert lifecycle._deferred_factory_cleanup_tasks == {}
+    assert lifecycle._pending_environment_owner_admissions == set()
+
+
+def test_cancelled_factory_settlement_preserves_cleanup_failure() -> None:
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    quiescent_calls = 0
+
+    async def release(_action: EnvironmentFactoryReleaseAction) -> None:
+        release_started.set()
+        await allow_release.wait()
+        raise RuntimeError("release failed")
+
+    def on_quiescent() -> None:
+        nonlocal quiescent_calls
+        quiescent_calls += 1
+
+    async def run() -> asyncio.Task[None]:
+        original_error = RuntimeError("bind failed")
+        result = EnvironmentFactoryResult(
+            Environment(EnvironmentSpec(name="dynamic")),
+            release=release,
+            release_timeout_s=0.01,
+        )
+        await environment_lifecycle_module._release_unclaimed_factory_result(
+            result,
+            action=EnvironmentFactoryReleaseAction.PRESERVE,
+            original_error=original_error,
+            on_quiescent=on_quiescent,
+        )
+        settlement = environment_lifecycle_module.environment_factory_cleanup_settlement_task(
+            original_error
+        )
+        assert settlement is not None
+        await release_started.wait()
+        settlement.cancel("stop waiting for failed cleanup")
+        allow_release.set()
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await settlement
+        assert (
+            sum(
+                isinstance(error, asyncio.CancelledError)
+                for error in iter_exception_tree(exc_info.value)
+            )
+            == 1
+        )
+        assert (
+            sum(
+                isinstance(error, RuntimeError) and str(error) == "release failed"
+                for error in iter_exception_tree(exc_info.value)
+            )
+            == 1
+        )
+        return settlement
+
+    settlement = asyncio.run(run())
+
+    assert not settlement.cancelled()
+    assert settlement.cancelling() == 0
+    assert quiescent_calls == 0
+
+
+def test_factory_settlement_retries_post_release_ownership_failure() -> None:
+    release_calls = 0
+
+    class RetiringBinding(WorkspaceBinding):
+        def __init__(self) -> None:
+            self.abandon_calls = 0
+
+        async def bind(self, workspace, runner, **_kwargs):  # type: ignore[no-untyped-def]
+            return BoundWorkspace(workspace=workspace, runner=runner)
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+        def abandon(self, bound: BoundWorkspace) -> bool:
+            self.abandon_calls += 1
+            return self.abandon_calls > 1
+
+    async def release(_action: EnvironmentFactoryReleaseAction) -> None:
+        nonlocal release_calls
+        release_calls += 1
+
+    async def run() -> tuple[asyncio.Task[None], asyncio.Task[None], RetiringBinding]:
+        binding = RetiringBinding()
+        attempt = environment_lifecycle_module._EnvironmentLifecycleBindAttempt()
+        await binding._bind_for_environment_lifecycle(
+            None,
+            None,
+            session_id="retry-ownership-release",
+            _attempt=attempt,
+        )
+        assert attempt.release_failed_reservations is not None
+        original_error = RuntimeError("bind failed")
+        payload = await environment_lifecycle_module._release_unclaimed_factory_result(
+            EnvironmentFactoryResult(
+                Environment(EnvironmentSpec(name="dynamic")),
+                release=release,
+            ),
+            action=EnvironmentFactoryReleaseAction.PRESERVE,
+            original_error=original_error,
+            on_quiescent=attempt.release_failed_reservations,
+        )
+        assert payload["completed"] is False
+        failed = environment_lifecycle_module.environment_factory_cleanup_settlement_task(
+            original_error
+        )
+        assert failed is not None
+        with pytest.raises(RuntimeError, match="could not retire a failed outer bind"):
+            await failed
+        lifecycle = object.__new__(EnvironmentLifecycle)
+        lifecycle._deferred_factory_cleanup_tasks = {"retry-session": failed}
+        lifecycle._pending_environment_owner_admissions = {"retry-session"}
+        attempted_sessions: set[str] = set()
+        lifecycle._retry_failed_deferred_factory_cleanups(attempted_sessions=attempted_sessions)
+        replacement = lifecycle._deferred_factory_cleanup_tasks["retry-session"]
+        assert replacement is not failed
+        assert attempted_sessions == {"retry-session"}
+        await replacement
+        lifecycle._harvest_deferred_factory_cleanups()
+        assert lifecycle._deferred_factory_cleanup_tasks == {}
+        assert lifecycle._pending_environment_owner_admissions == set()
+        return failed, replacement, binding
+
+    failed, replacement, binding = asyncio.run(run())
+
+    assert failed.done()
+    assert replacement.done()
+    assert release_calls == 1
+    assert binding.abandon_calls == 2
+
+
+def test_factory_settlement_retries_ownership_after_successful_delegated_cleanup() -> None:
+    release_calls = 0
+    cleanup_calls = 0
+    ownership_calls = 0
+
+    def cleanup_attempt() -> asyncio.Task[None]:
+        async def cleanup() -> None:
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            if cleanup_calls == 1:
+                raise RuntimeError("delegated cleanup failed")
+
+        task = asyncio.create_task(cleanup())
+        register_environment_factory_cleanup_retry(task, cleanup_attempt)
+        return task
+
+    async def release(_action: EnvironmentFactoryReleaseAction) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        error = RuntimeError("release delegated cleanup")
+        attach_environment_factory_cleanup_settlement_task(error, cleanup_attempt())
+        raise error
+
+    def on_quiescent() -> None:
+        nonlocal ownership_calls
+        ownership_calls += 1
+        if ownership_calls == 1:
+            raise RuntimeError("ownership retirement failed")
+
+    async def run() -> None:
+        original_error = RuntimeError("bind failed")
+        payload = await environment_lifecycle_module._release_unclaimed_factory_result(
+            EnvironmentFactoryResult(
+                Environment(EnvironmentSpec(name="dynamic")),
+                release=release,
+            ),
+            action=EnvironmentFactoryReleaseAction.PRESERVE,
+            original_error=original_error,
+            on_quiescent=on_quiescent,
+        )
+        assert payload["completed"] is False
+        first = environment_lifecycle_module.environment_factory_cleanup_settlement_task(
+            original_error
+        )
+        assert first is not None
+        with pytest.raises(RuntimeError, match="delegated cleanup failed"):
+            await first
+
+        lifecycle = object.__new__(EnvironmentLifecycle)
+        lifecycle._deferred_factory_cleanup_tasks = {"retry-session": first}
+        lifecycle._pending_environment_owner_admissions = {"retry-session"}
+
+        first_drain_attempts: set[str] = set()
+        lifecycle._retry_failed_deferred_factory_cleanups(attempted_sessions=first_drain_attempts)
+        second = lifecycle._deferred_factory_cleanup_tasks["retry-session"]
+        with pytest.raises(RuntimeError, match="ownership retirement failed"):
+            await second
+        assert first_drain_attempts == {"retry-session"}
+        assert lifecycle._pending_environment_owner_admissions == {"retry-session"}
+
+        second_drain_attempts: set[str] = set()
+        lifecycle._retry_failed_deferred_factory_cleanups(attempted_sessions=second_drain_attempts)
+        third = lifecycle._deferred_factory_cleanup_tasks["retry-session"]
+        assert third is not second
+        await third
+        lifecycle._harvest_deferred_factory_cleanups()
+        assert second_drain_attempts == {"retry-session"}
+        assert lifecycle._deferred_factory_cleanup_tasks == {}
+        assert lifecycle._pending_environment_owner_admissions == set()
+
+    asyncio.run(run())
+
+    assert release_calls == 1
+    assert cleanup_calls == 2
+    assert ownership_calls == 2
 
 
 class _FakeProvider(ModelProvider):
@@ -1302,6 +1561,750 @@ def test_grouped_factory_leaf_cleanups_retain_capacity_until_all_settle() -> Non
     assert factory.calls == 2
     assert app._environment_lifecycle._pending_environment_owner_admissions == set()
     assert app._environment_lifecycle._deferred_factory_cleanup_tasks == {}
+
+
+@pytest.mark.parametrize("bind_delegate", ["direct", "create_task", "wait_for", "detached"])
+@pytest.mark.parametrize("release_times_out", [False, True])
+def test_failed_sync_bind_reserves_target_until_factory_release_settles(
+    tmp_path,
+    release_times_out: bool,
+    bind_delegate: str,
+) -> None:
+    source_root = tmp_path / "source"
+    contender_root = tmp_path / "contender"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_root.mkdir()
+    target_root.mkdir()
+    (source_root / "source.txt").write_text("source", encoding="utf-8")
+    (contender_root / "contender.txt").write_text("contender", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    contender_source = LocalWorkspace(contender_root, workspace_id="contender")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    source_listing_started = asyncio.Event()
+    allow_source_listing = asyncio.Event()
+
+    class FailingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            source_listing_started.set()
+            await allow_source_listing.wait()
+            raise RuntimeError("source listing failed")
+
+    failing_source = FailingSource(source_root, workspace_id="failing-source")
+    binding_calls = 0
+
+    class TrackingSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal binding_calls
+            binding_calls += 1
+            base_bind = super().bind(*args, **kwargs)
+            if bind_delegate == "create_task":
+                return await asyncio.create_task(base_bind)
+            if bind_delegate == "wait_for":
+                return await asyncio.wait_for(base_bind, timeout=1)
+            if bind_delegate == "detached":
+                detached_bind = asyncio.create_task(base_bind)
+                await source_listing_started.wait()
+                assert not detached_bind.done()
+                raise RuntimeError("override exited while delegated bind was active")
+            return await base_bind
+
+    class BlockingReleaseFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            def target_plan(_context):  # type: ignore[no-untyped-def]
+                return SyncTargetWorkspacePlan(workspace=target)
+
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                assert action is EnvironmentFactoryReleaseAction.PRESERVE
+                self.release_started.set()
+                await self.allow_release.wait()
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=failing_source,
+                    binding=TrackingSyncBinding(target_workspace_plan_factory=target_plan),
+                ),
+                release=release,
+                release_timeout_s=0.01 if release_times_out else 1,
+            )
+
+    async def run() -> tuple[list[Event], BoundWorkspace]:
+        factory = BlockingReleaseFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        failed_run = asyncio.create_task(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="failed-sync-bind",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await source_listing_started.wait()
+        if bind_delegate == "detached":
+            assert not factory.release_started.is_set()
+        allow_source_listing.set()
+        await factory.release_started.wait()
+        events: list[Event] | None = None
+        deferred_settlement: asyncio.Task[None] | None = None
+        if release_times_out:
+            events = await failed_run
+            assert "failed-sync-bind" in (
+                app._environment_lifecycle._deferred_factory_cleanup_tasks
+            )
+            deferred_settlement = app._environment_lifecycle._deferred_factory_cleanup_tasks[
+                "failed-sync-bind"
+            ]
+            deferred_settlement.cancel("stop waiting for failed bind cleanup")
+
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-contender",
+            )
+
+        factory.allow_release.set()
+        if events is None:
+            events = await failed_run
+        else:
+            assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+            assert deferred_settlement is not None
+            assert deferred_settlement.done()
+            assert not deferred_settlement.cancelled()
+            assert deferred_settlement.cancelling() == 0
+        rebound = await contender.bind(source, None, session_id="admitted-contender")
+        contender.abandon(rebound)
+        return events, rebound
+
+    events, rebound = asyncio.run(run())
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    if bind_delegate == "detached":
+        assert "delegated base bind both failed" in events[-1].payload["error"]
+    else:
+        assert events[-1].payload["error"] == "source listing failed"
+    assert binding_calls == 1
+    assert rebound.workspace is target
+
+
+@pytest.mark.parametrize("override_mode", ["raise", "replace"])
+def test_failed_sync_bind_override_after_super_retains_factory_cleanup_ownership(
+    tmp_path,
+    override_mode: str,
+) -> None:
+    source_root = tmp_path / "source"
+    contender_root = tmp_path / "contender"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_root.mkdir()
+    target_root.mkdir()
+    (source_root / "source.txt").write_text("source", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    contender_source = LocalWorkspace(contender_root, workspace_id="contender")
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    class RejectingSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            bound = await super().bind(*args, **kwargs)
+            if override_mode == "raise":
+                raise RuntimeError("override rejected completed bind")
+            return BoundWorkspace(
+                workspace=bound.workspace,
+                source_workspace=bound.source_workspace,
+                runner=bound.runner,
+                path=bound.path,
+                metadata=bound.metadata,
+                snapshot=bound.snapshot,
+            )
+
+    class BlockingReleaseFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                assert action is EnvironmentFactoryReleaseAction.PRESERVE
+                self.release_started.set()
+                await self.allow_release.wait()
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=source,
+                    binding=RejectingSyncBinding(target_workspace=target),
+                ),
+                release=release,
+            )
+
+    async def run() -> list[Event]:
+        factory = BlockingReleaseFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        failed_run = asyncio.create_task(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"post-super-bind-{override_mode}",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await factory.release_started.wait()
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-contender",
+            )
+
+        factory.allow_release.set()
+        events = await failed_run
+        rebound = await contender.bind(
+            contender_source,
+            None,
+            session_id="admitted-contender",
+        )
+        contender.abandon(rebound)
+        return events
+
+    events = asyncio.run(run())
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    expected_error = (
+        "override rejected completed bind"
+        if override_mode == "raise"
+        else "SyncBinding override returned a different admitted bind generation."
+    )
+    assert events[-1].payload["error"] == expected_error
+
+
+def test_failed_sync_bind_does_not_repeat_terminal_factory_release(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    contender_root = tmp_path / "contender"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_root.mkdir()
+    target_root.mkdir()
+    contender_source = LocalWorkspace(contender_root, workspace_id="contender")
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    class FailingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            raise RuntimeError("source listing failed")
+
+    failing_source = FailingSource(source_root, workspace_id="failing-source")
+
+    class TerminalReleaseFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_calls = 0
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            def target_plan(_context):  # type: ignore[no-untyped-def]
+                return SyncTargetWorkspacePlan(workspace=target)
+
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                assert action is EnvironmentFactoryReleaseAction.PRESERVE
+                self.release_calls += 1
+                raise PermissionError("factory release failed terminally")
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=failing_source,
+                    binding=SyncBinding(target_workspace_plan_factory=target_plan),
+                ),
+                release=release,
+            )
+
+    async def run() -> tuple[list[Event], TerminalReleaseFactory, CayuApp]:
+        factory = TerminalReleaseFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="terminal-release-failure",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-before-drain",
+            )
+
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is False
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is False
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-after-drain",
+            )
+        return events, factory, app
+
+    events, factory, app = asyncio.run(run())
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert factory.release_calls == 1
+    assert "terminal-release-failure" in (
+        app._environment_lifecycle._deferred_factory_cleanup_tasks
+    )
+
+
+@pytest.mark.parametrize("cancel_successor", [False, True])
+def test_failed_sync_bind_retries_release_successor_without_repeating_callback(
+    tmp_path,
+    cancel_successor: bool,
+) -> None:
+    source_root = tmp_path / "source"
+    contender_root = tmp_path / "contender"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_root.mkdir()
+    target_root.mkdir()
+    contender_source = LocalWorkspace(contender_root, workspace_id="contender")
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    class FailingSource(LocalWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            raise RuntimeError("source listing failed")
+
+    failing_source = FailingSource(source_root, workspace_id="failing-source")
+
+    class SuccessorReleaseFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_calls = 0
+            self.cleanup_calls = 0
+            self.allow_cleanup = False
+
+        def cleanup_attempt(self) -> asyncio.Task[None]:
+            async def cleanup() -> None:
+                self.cleanup_calls += 1
+                if not self.allow_cleanup:
+                    if cancel_successor:
+                        current = asyncio.current_task()
+                        assert current is not None
+                        current.cancel("cancel successor cleanup")
+                        await asyncio.sleep(0)
+                    raise PermissionError("successor cleanup failed")
+
+            task = asyncio.create_task(cleanup())
+            register_environment_factory_cleanup_retry(task, self.cleanup_attempt)
+            return task
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            def target_plan(_context):  # type: ignore[no-untyped-def]
+                return SyncTargetWorkspacePlan(workspace=target)
+
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                assert action is EnvironmentFactoryReleaseAction.PRESERVE
+                self.release_calls += 1
+                cleanup_task = self.cleanup_attempt()
+                error = RuntimeError("release delegated cleanup")
+                attach_environment_factory_cleanup_settlement_task(
+                    error,
+                    cleanup_task,
+                )
+                raise error
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=failing_source,
+                    binding=SyncBinding(target_workspace_plan_factory=target_plan),
+                ),
+                release=release,
+            )
+
+    async def run() -> tuple[list[Event], SuccessorReleaseFactory, BoundWorkspace]:
+        factory = SuccessorReleaseFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="retryable-release-successor",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        events = await run_task
+        assert run_task.cancelling() == 0
+        assert not run_task.cancelled()
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-contender",
+            )
+
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is False
+        assert factory.release_calls == 1
+        assert factory.cleanup_calls == 2
+
+        factory.allow_cleanup = True
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        rebound = await contender.bind(
+            contender_source,
+            None,
+            session_id="admitted-contender",
+        )
+        contender.abandon(rebound)
+        return events, factory, rebound
+
+    events, factory, rebound = asyncio.run(run())
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert factory.release_calls == 1
+    assert factory.cleanup_calls == 3
+    assert rebound.workspace is target
+
+
+@pytest.mark.parametrize(
+    ("provision_fails", "bind_delegate"),
+    [
+        (False, "direct"),
+        (False, "create_task"),
+        (False, "wait_for"),
+        (True, "direct"),
+        (True, "create_task"),
+        (True, "wait_for"),
+    ],
+)
+def test_cancelled_sync_bind_reserves_target_until_factory_release_settles(
+    tmp_path,
+    provision_fails: bool,
+    bind_delegate: str,
+) -> None:
+    source_root = tmp_path / "source"
+    contender_root = tmp_path / "contender"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    contender_source = LocalWorkspace(contender_root, workspace_id="contender")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    provisioning_started = asyncio.Event()
+    allow_provisioning = asyncio.Event()
+
+    class DelegatingSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            base_bind = super().bind(*args, **kwargs)
+            if bind_delegate == "create_task":
+                return await asyncio.create_task(base_bind)
+            if bind_delegate == "wait_for":
+                return await asyncio.wait_for(base_bind, timeout=1)
+            return await base_bind
+
+    class BlockingReleaseFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            async def provision() -> None:
+                provisioning_started.set()
+                await allow_provisioning.wait()
+                if provision_fails:
+                    raise RuntimeError("provision failed after cancellation")
+
+            def target_plan(_context):  # type: ignore[no-untyped-def]
+                return SyncTargetWorkspacePlan(
+                    workspace=target,
+                    provision=provision,
+                )
+
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                assert action is EnvironmentFactoryReleaseAction.PRESERVE
+                self.release_started.set()
+                await self.allow_release.wait()
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=source,
+                    binding=DelegatingSyncBinding(target_workspace_plan_factory=target_plan),
+                ),
+                release=release,
+            )
+
+    async def run() -> tuple[asyncio.Task[list[Event]], BoundWorkspace]:
+        factory = BlockingReleaseFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        cancelled_run = asyncio.create_task(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancelled-sync-bind",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await provisioning_started.wait()
+        cancelled_run.cancel("cancel sync bind")
+        allow_provisioning.set()
+        await factory.release_started.wait()
+        assert not cancelled_run.done()
+
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-contender",
+            )
+
+        factory.allow_release.set()
+        if provision_fails:
+            with pytest.raises(BaseExceptionGroup) as raised:
+                await cancelled_run
+            leaves = tuple(
+                error
+                for error in iter_exception_tree(raised.value)
+                if not isinstance(error, BaseExceptionGroup)
+            )
+            assert sum(isinstance(error, asyncio.CancelledError) for error in leaves) == 1
+            assert (
+                sum(
+                    type(error) is RuntimeError
+                    and str(error) == "provision failed after cancellation"
+                    for error in leaves
+                )
+                == 1
+            )
+        else:
+            with pytest.raises(asyncio.CancelledError, match="cancel sync bind"):
+                await cancelled_run
+        assert cancelled_run.cancelling() == (0 if provision_fails else 1)
+        assert cancelled_run.cancelled() is (not provision_fails)
+        rebound = await contender.bind(
+            contender_source,
+            None,
+            session_id="admitted-contender",
+        )
+        contender.abandon(rebound)
+        return cancelled_run, rebound
+
+    cancelled_run, rebound = asyncio.run(run())
+
+    assert cancelled_run.cancelled() is (not provision_fails)
+    assert rebound.workspace is target
+
+
+@pytest.mark.parametrize(
+    "cancellation_mode",
+    ["override_suppresses", "delegated_settlement"],
+)
+def test_sync_bind_post_success_cancellation_transfers_factory_ownership(
+    tmp_path,
+    cancellation_mode: str,
+) -> None:
+    source_root = tmp_path / "source"
+    contender_root = tmp_path / "contender"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    contender_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    contender_source = LocalWorkspace(contender_root, workspace_id="contender")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    bind_completed = asyncio.Event()
+
+    class PostSuccessCancellationSyncBinding(SyncBinding):
+        async def bind(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if cancellation_mode == "delegated_settlement":
+                bound = await asyncio.create_task(super().bind(*args, **kwargs))
+                bind_completed.set()
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                asyncio.get_running_loop().call_soon(
+                    current_task.cancel,
+                    "cancel during delegated settlement",
+                )
+                return bound
+            bound = await super().bind(*args, **kwargs)
+            bind_completed.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return bound
+
+    class BlockingReleaseFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+            self.binding: PostSuccessCancellationSyncBinding | None = None
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            self.binding = PostSuccessCancellationSyncBinding(target_workspace=target)
+
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                assert action is EnvironmentFactoryReleaseAction.PRESERVE
+                self.release_started.set()
+                await self.allow_release.wait()
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=source,
+                    binding=self.binding,
+                ),
+                release=release,
+            )
+
+    async def run() -> tuple[asyncio.Task[list[Event]], BoundWorkspace, BlockingReleaseFactory]:
+        factory = BlockingReleaseFactory()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            _FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        cancelled_run = asyncio.create_task(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancelled-completed-sync-bind",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await bind_completed.wait()
+        if cancellation_mode == "override_suppresses":
+            cancelled_run.cancel("cancel completed sync bind")
+        await factory.release_started.wait()
+        assert not cancelled_run.done()
+
+        contender = SyncBinding(target_workspace=target)
+        with pytest.raises(ValueError, match="target workspace.*already bound"):
+            await contender.bind(
+                contender_source,
+                None,
+                session_id="blocked-post-success-contender",
+            )
+
+        factory.allow_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_run
+        assert cancelled_run.cancelling() == 1
+        assert cancelled_run.cancelled() is True
+        assert factory.binding is not None
+        assert factory.binding._states == {}
+
+        rebound = await contender.bind(
+            contender_source,
+            None,
+            session_id="admitted-post-success-contender",
+        )
+        contender.abandon(rebound)
+        return cancelled_run, rebound, factory
+
+    cancelled_run, rebound, factory = asyncio.run(run())
+
+    assert cancelled_run.cancelled() is True
+    assert rebound.workspace is target
+    assert factory.binding is not None
+    assert factory.binding._states == {}
 
 
 def test_timed_out_factory_release_adopts_late_cleanup_settlement() -> None:

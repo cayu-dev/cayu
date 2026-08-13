@@ -128,6 +128,14 @@ supports deploying and operating Cayu Cloud applications.
 - Tool output suppression, duplicate interaction model names, malformed webhook
   signatures, and out-of-domain eval comparison scores now fail explicitly and
   safely.
+- Active `SyncBinding` generations reserve both source and target workspace
+  identities before optional target provisioning, preventing overlapping setup,
+  copy, and sync-back ownership in any role. Target allocation that establishes
+  the stable workspace identity belongs in the surrounding `EnvironmentFactory`.
+  The ambiguous legacy `target_workspace_factory` entrance now fails before
+  invocation. Use `target_workspace_plan_factory` returning
+  `SyncTargetWorkspacePlan`, and perform attachment, cleaning, or other
+  post-identity work in its `provision` callback.
 - Provider, approval, budget, usage, vault, and eval evidence is detached from
   caller-owned mutable inputs, and HTTP/retry metadata is validated before use.
 

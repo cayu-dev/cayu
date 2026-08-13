@@ -10,13 +10,19 @@ import tarfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from cayu._task_wait import unexpected_child_cancellation_error
+from cayu._exception_groups import (
+    exception_cause,
+    exception_context,
+    exception_group_children,
+)
+from cayu._task_wait import await_shielded_task_outcome, unexpected_child_cancellation_error
 from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces import (
@@ -98,9 +104,34 @@ SYNC_FINAL_METADATA_KEYS = frozenset(
 )
 
 
-SyncTargetWorkspaceFactory = Callable[
+SyncTargetWorkspaceProvisioner = Callable[[], None | Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class SyncTargetWorkspacePlan:
+    """A resolved target identity plus setup that runs after ownership admission.
+
+    ``workspace`` must already expose its stable, quiescent resource identity.
+    ``provision`` may attach, clean, or otherwise mutate that target and is
+    invoked only after the source and target resource keys are owned by the
+    binding generation. Allocation and failed-bind cleanup remain owned by the
+    surrounding environment factory lifecycle. Constructing the in-process
+    workspace wrapper needed to identify an already-owned target is allowed.
+    """
+
+    workspace: Workspace
+    provision: SyncTargetWorkspaceProvisioner | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.workspace, Workspace):
+            raise TypeError("SyncTargetWorkspacePlan workspace must be a Workspace.")
+        if self.provision is not None and not callable(self.provision):
+            raise TypeError("SyncTargetWorkspacePlan provision must be callable or None.")
+
+
+SyncTargetWorkspacePlanFactory = Callable[
     [SyncBindingContext],
-    Workspace | Awaitable[Workspace],
+    SyncTargetWorkspacePlan | Awaitable[SyncTargetWorkspacePlan],
 ]
 SyncTargetCleanPolicy = Literal["always", "never"]
 SyncBackPolicy = Literal["always", "on_success", "never"]
@@ -111,45 +142,159 @@ SYNC_DISTINCT_WORKSPACES_ERROR = "SyncBinding source and target workspaces must 
 
 _MutationResultT = TypeVar("_MutationResultT")
 
-_SYNC_TARGET_OWNERS_LOCK = threading.Lock()
-_SYNC_TARGET_OWNERS: dict[tuple[object, ...], str] = {}
+_SYNC_RESOURCE_OWNERS_LOCK = threading.Lock()
+_SYNC_RESOURCE_OWNERS: dict[tuple[object, ...], str] = {}
+_SYNC_PROVISIONAL_SOURCES: dict[str, tuple[object, ...]] = {}
+_BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR = BaseException.__dict__["__suppress_context__"]
 
 
-def _reserve_sync_target(
-    target: Workspace,
+@dataclass(slots=True, repr=False)
+class _BindingFailureOwnership:
+    """Exact process-local reservations retained for outer lifecycle cleanup."""
+
+    source_resource_key: tuple[object, ...]
+    target_resource_key: tuple[object, ...]
+    generation: str
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        _release_sync_resources(
+            self.source_resource_key,
+            self.target_resource_key,
+            generation=self.generation,
+        )
+        self.released = True
+
+
+@dataclass(slots=True)
+class _EnvironmentLifecycleBindAttempt:
+    """Exact failed-generation release authority for one private bind."""
+
+    release_failed_reservations: Callable[[], None] | None = field(
+        default=None,
+        repr=False,
+    )
+
+    def retain(
+        self,
+        release_failed_reservations: Callable[[], None] | None,
+    ) -> None:
+        self.release_failed_reservations = release_failed_reservations
+
+
+def _reserve_sync_factory_source(
+    source: Workspace,
     *,
     resource_key: tuple[object, ...],
     generation: str,
 ) -> None:
-    """Atomically reserve one process-local target resource for an exact generation."""
+    """Reserve a factory bind's source before the factory can provision a target."""
 
-    with _SYNC_TARGET_OWNERS_LOCK:
-        if resource_key in _SYNC_TARGET_OWNERS:
+    with _SYNC_RESOURCE_OWNERS_LOCK:
+        if resource_key in _SYNC_RESOURCE_OWNERS:
+            raise ValueError(
+                f"SyncBinding source workspace {source.id!r} is already bound by an active session."
+            )
+        _SYNC_RESOURCE_OWNERS[resource_key] = generation
+        _SYNC_PROVISIONAL_SOURCES[generation] = resource_key
+
+
+def _promote_sync_factory_resources(
+    target: Workspace,
+    *,
+    source_resource_key: tuple[object, ...],
+    target_resource_key: tuple[object, ...],
+    generation: str,
+) -> None:
+    """Atomically promote one provisional source claim to the complete resource pair."""
+
+    with _SYNC_RESOURCE_OWNERS_LOCK:
+        if _SYNC_RESOURCE_OWNERS.get(source_resource_key) != generation:
+            raise RuntimeError("SyncBinding lost provisional source ownership.")
+        target_owner = _SYNC_RESOURCE_OWNERS.get(target_resource_key)
+        if target_owner is not None:
+            if _SYNC_PROVISIONAL_SOURCES.get(target_owner) == target_resource_key:
+                # The target is another factory bind's provisionally owned source. Yield this
+                # generation's source atomically with rejecting its promotion. For an opposite
+                # A->B / B->A race, the other generation can therefore promote instead of both
+                # contenders observing occupied targets and then releasing too late.
+                if _SYNC_RESOURCE_OWNERS.get(source_resource_key) == generation:
+                    del _SYNC_RESOURCE_OWNERS[source_resource_key]
+                _SYNC_PROVISIONAL_SOURCES.pop(generation, None)
             raise ValueError(
                 f"SyncBinding target workspace {target.id!r} is already bound by an active session."
             )
-        _SYNC_TARGET_OWNERS[resource_key] = generation
+        _SYNC_RESOURCE_OWNERS[target_resource_key] = generation
+        _SYNC_PROVISIONAL_SOURCES.pop(generation, None)
 
 
-def _release_sync_target(
+def _reserve_sync_resources(
+    source: Workspace,
+    target: Workspace,
+    *,
+    source_resource_key: tuple[object, ...],
+    target_resource_key: tuple[object, ...],
+    generation: str,
+) -> None:
+    """Atomically reserve both process-local resources for an exact generation."""
+
+    resources = (
+        ("source", source, source_resource_key),
+        ("target", target, target_resource_key),
+    )
+    with _SYNC_RESOURCE_OWNERS_LOCK:
+        for role, workspace, resource_key in resources:
+            if resource_key in _SYNC_RESOURCE_OWNERS:
+                raise ValueError(
+                    f"SyncBinding {role} workspace {workspace.id!r} is already bound "
+                    "by an active session."
+                )
+        for _, _, resource_key in resources:
+            _SYNC_RESOURCE_OWNERS[resource_key] = generation
+
+
+def _release_sync_resources(
+    source_resource_key: tuple[object, ...],
+    target_resource_key: tuple[object, ...],
+    *,
+    generation: str,
+) -> None:
+    """Release both resources still owned by the exact generation."""
+
+    with _SYNC_RESOURCE_OWNERS_LOCK:
+        for resource_key in (source_resource_key, target_resource_key):
+            if _SYNC_RESOURCE_OWNERS.get(resource_key) == generation:
+                del _SYNC_RESOURCE_OWNERS[resource_key]
+        _SYNC_PROVISIONAL_SOURCES.pop(generation, None)
+
+
+def _release_sync_resource(
     resource_key: tuple[object, ...],
     *,
     generation: str,
 ) -> None:
-    """Release only the exact generation that currently owns a target."""
+    """Release one provisional resource still owned by the exact generation."""
 
-    with _SYNC_TARGET_OWNERS_LOCK:
-        if _SYNC_TARGET_OWNERS.get(resource_key) == generation:
-            del _SYNC_TARGET_OWNERS[resource_key]
+    with _SYNC_RESOURCE_OWNERS_LOCK:
+        if _SYNC_RESOURCE_OWNERS.get(resource_key) == generation:
+            del _SYNC_RESOURCE_OWNERS[resource_key]
+        if _SYNC_PROVISIONAL_SOURCES.get(generation) == resource_key:
+            del _SYNC_PROVISIONAL_SOURCES[generation]
 
 
-def _sync_target_is_owned_by(
-    resource_key: tuple[object, ...],
+def _sync_resources_are_owned_by(
+    source_resource_key: tuple[object, ...],
+    target_resource_key: tuple[object, ...],
     *,
     generation: str,
 ) -> bool:
-    with _SYNC_TARGET_OWNERS_LOCK:
-        return _SYNC_TARGET_OWNERS.get(resource_key) == generation
+    with _SYNC_RESOURCE_OWNERS_LOCK:
+        return all(
+            _SYNC_RESOURCE_OWNERS.get(resource_key) == generation
+            for resource_key in (source_resource_key, target_resource_key)
+        )
 
 
 @dataclass(frozen=True)
@@ -277,6 +422,46 @@ class WorkspaceBinding(ABC):
         metadata: dict[str, Any] | None = None,
     ) -> WorkspaceSnapshot | None:
         """Clean up or persist the binding after the session ends."""
+
+    async def _bind_for_environment_lifecycle(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        _attempt: _EnvironmentLifecycleBindAttempt | None = None,
+    ) -> BoundWorkspace:
+        """Bind and return any exact cleanup authority outside diagnostics.
+
+        Stateless and self-cleaning bindings use the public entrance unchanged.
+        A binding that must retain process-local exclusion until an outer
+        factory release settles can override this private lifecycle seam.
+        """
+        attempt = _attempt or _EnvironmentLifecycleBindAttempt()
+        try:
+            bound = await self.bind(
+                workspace,
+                runner,
+                session_id=session_id,
+                agent_name=agent_name,
+                environment_name=environment_name,
+                metadata=metadata,
+            )
+        except BaseException:
+            raise
+        attempt.retain(
+            lambda: self._release_failed_outer_bind(bound),
+        )
+        return bound
+
+    def _release_failed_outer_bind(self, bound: BoundWorkspace) -> None:
+        """Retire a successful inner bind after a surrounding bind layer fails."""
+
+        if self.abandon(bound) is False:
+            raise RuntimeError("Workspace binding could not retire a failed outer bind.")
 
     def abandon(self, bound: BoundWorkspace) -> bool:
         """Release process-local retry state when finalization will not run again.
@@ -622,18 +807,206 @@ class GitRepositoryBinding(WorkspaceBinding):
             await executor.run("merge", "--ff-only", fetched_ref)
 
 
+@dataclass(slots=True, repr=False)
+class _SyncBindingLifecycleBindAuthority:
+    """Context-owned authority for one runtime-owned public bind dispatch."""
+
+    binding: object
+    active: bool = True
+    base_invoked: bool = False
+    base_task: asyncio.Task[Any] | None = None
+    bound: BoundWorkspace | None = None
+    failure_ownership: _BindingFailureOwnership | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def claim_base_bind(self, binding: object) -> bool:
+        """Claim this live dispatch once, including from an inherited child context."""
+
+        if binding is not self.binding:
+            return False
+        with self.lock:
+            if not self.active:
+                raise RuntimeError(
+                    "SyncBinding lifecycle dispatch ended before its delegated base bind started."
+                )
+            if self.base_invoked:
+                raise RuntimeError(
+                    "SyncBinding lifecycle dispatch may invoke the base bind only once."
+                )
+            self.base_invoked = True
+            self.base_task = asyncio.current_task()
+            return True
+
+    def delegated_base_task(self) -> asyncio.Task[Any] | None:
+        """Return a claimed base task only when it differs from the lifecycle caller."""
+
+        with self.lock:
+            task = self.base_task
+        return None if task is asyncio.current_task() else task
+
+    def deactivate(self) -> None:
+        """Prevent detached child contexts from consuming stale lifecycle authority."""
+
+        with self.lock:
+            self.active = False
+
+
+async def _settle_delegated_sync_bind(
+    authority: _SyncBindingLifecycleBindAuthority,
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Settle a child-task base bind before its lifecycle authority can escape."""
+
+    task = authority.delegated_base_task()
+    if task is None:
+        return None, None
+    # The outer environment-operation boundary owns classification and
+    # redelivery of an already-observed caller cancellation. Passing that
+    # signal into the settlement helper would consume its Task.cancelling()
+    # request before the boundary can distinguish it from child cancellation.
+    outcome = await await_shielded_task_outcome(task)
+    return outcome.error, outcome.cancellation
+
+
+def _timeout_represents_delegated_cancellation(error: BaseException) -> bool:
+    """Return whether a timeout positively carries its wrapper cancellation."""
+
+    return type(error) is TimeoutError and isinstance(
+        exception_cause(error),
+        asyncio.CancelledError,
+    )
+
+
+def _redeliver_settlement_cancellation(
+    cancellation: asyncio.CancelledError,
+) -> None:
+    """Restore one caller request consumed while settling a delegated bind."""
+
+    current_task = asyncio.current_task()
+    if current_task is None:  # pragma: no cover - coroutine execution invariant
+        raise RuntimeError("SyncBinding could not redeliver caller cancellation.")
+    cancellation_args = cancellation.args
+    if not cancellation_args:
+        current_task.cancel()
+    else:
+        current_task.cancel(cancellation_args[0])
+
+
+def _exception_graph_contains_identity(
+    error: BaseException,
+    expected: BaseException,
+) -> bool:
+    """Return whether one runtime-readable exception graph already carries a failure."""
+
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        if candidate is expected:
+            return True
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(children)
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
+            continue
+        try:
+            suppress_context = _BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR.__get__(
+                candidate,
+                BaseException,
+            )
+        except BaseException:
+            suppress_context = True
+        if not suppress_context:
+            context = exception_context(candidate)
+            if context is not None:
+                pending.append(context)
+    return False
+
+
+def _without_delegated_cancellation(
+    error: BaseException,
+) -> BaseException | None:
+    """Remove child cancellation already represented by the lifecycle caller.
+
+    A wrapper such as ``asyncio.wait_for`` can propagate the caller's
+    cancellation into the delegated base task.  If that task then reports an
+    aggregate containing both the propagated cancellation and a real mutation
+    failure, the public wrapper and delegated task expose the same cancellation
+    at two levels.  Rebuild only the affected groups and retain every
+    non-cancellation leaf in its original order and nesting.
+    """
+
+    pending: list[tuple[BaseException, bool]] = [(error, False)]
+    children_by_group: dict[int, tuple[BaseException, ...]] = {}
+    filtered: dict[int, BaseException | None] = {}
+    while pending:
+        candidate, expanded = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in filtered:
+            continue
+        if not isinstance(candidate, BaseExceptionGroup):
+            filtered[candidate_id] = (
+                None if isinstance(candidate, asyncio.CancelledError) else candidate
+            )
+            continue
+        if expanded:
+            children = children_by_group.pop(candidate_id, ())
+            retained = [filtered.get(id(child)) for child in children]
+            retained_children = [child for child in retained if child is not None]
+            if not retained_children:
+                filtered[candidate_id] = None
+            elif len(retained_children) == len(children) and all(
+                retained_child is child
+                for retained_child, child in zip(retained_children, children, strict=True)
+            ):
+                filtered[candidate_id] = candidate
+            else:
+                filtered[candidate_id] = BaseExceptionGroup(
+                    "SyncBinding delegated base bind failures after caller cancellation.",
+                    retained_children,
+                )
+            continue
+        children = exception_group_children(candidate)
+        if children is None:
+            # Fail closed for an unreadable extension-defined group. The
+            # lifecycle boundary must not discard unknown failure evidence.
+            filtered[candidate_id] = candidate
+            continue
+        children_by_group[candidate_id] = children
+        pending.append((candidate, True))
+        pending.extend((child, False) for child in reversed(children))
+
+    return filtered.get(id(error), error)
+
+
+_SYNC_BINDING_LIFECYCLE_AUTHORITY: ContextVar[_SyncBindingLifecycleBindAuthority | None] = (
+    ContextVar("cayu_sync_binding_lifecycle_authority", default=None)
+)
+
+
 class SyncBinding(WorkspaceBinding):
     """Copy a durable workspace into a bound workspace and sync changes back.
 
     ``workspace`` passed to ``bind`` is the durable source. ``target_workspace``
-    or ``target_workspace_factory`` identifies the workspace visible to tools
-    during the run, typically a sandbox filesystem wrapper. The target workspace
-    should be dedicated to this binding because the default clean policy deletes
-    files in the target before copying source files in. Every resolved target,
-    whether fixed or factory-created, is process-locally single-owner by its
-    authoritative ``Workspace.resource_key``. Concurrent binds through the same
-    or different ``SyncBinding`` instances are rejected when they resolve to the
-    same resource.
+    or ``target_workspace_plan_factory`` identifies the workspace visible to tools
+    during the run, typically a sandbox filesystem wrapper. A factory must only
+    resolve a stable, quiescent target identity. Setup that mutates the target is
+    returned as ``SyncTargetWorkspacePlan.provision`` so it runs after ownership
+    admission. External allocation remains owned by the surrounding environment
+    factory lifecycle; constructing a wrapper for an already-owned target is
+    identity resolution rather than provisioning. The target workspace should be dedicated to this binding
+    because the default clean policy deletes files in the target before copying
+    source files in. Every active generation
+    process-locally owns both source and target by their authoritative
+    ``Workspace.resource_key`` values. Concurrent binds through the same or
+    different ``SyncBinding`` instances are rejected when either resource would
+    overlap in any source or target role.
 
     File copies use one bulk tar transfer per direction when either workspace
     implements the explicit ``BoundedTarReader`` or ``TarWriter`` capability
@@ -641,9 +1014,9 @@ class SyncBinding(WorkspaceBinding):
     before destination writes. ``max_total_bytes`` bounds logical file bytes,
     while ``max_archive_bytes`` independently bounds raw tar bytes; pass
     ``None`` for a limit to opt out of that bound.
-    Per-bind state is keyed by an opaque owner generation. A target remains
+    Per-bind state is keyed by an opaque owner generation. Both resources remain
     reserved until that exact generation finalizes successfully or is explicitly
-    abandoned; elapsed time is not evidence that a live binding released it.
+    abandoned; elapsed time is not evidence that a live binding released them.
     Direct callers whose lifecycle will not invoke ``finalize`` must call
     ``abandon`` with the matching bound workspace.
     """
@@ -652,7 +1025,8 @@ class SyncBinding(WorkspaceBinding):
         self,
         *,
         target_workspace: Workspace | None = None,
-        target_workspace_factory: SyncTargetWorkspaceFactory | None = None,
+        target_workspace_plan_factory: SyncTargetWorkspacePlanFactory | None = None,
+        target_workspace_factory: Callable[[SyncBindingContext], object] | None = None,
         path: str | None = None,
         pattern: str = "**/*",
         max_files: int = 10_000,
@@ -665,16 +1039,27 @@ class SyncBinding(WorkspaceBinding):
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
-        if target_workspace_factory is not None and not callable(target_workspace_factory):
-            raise TypeError("SyncBinding target_workspace_factory must be callable or None.")
-        if target_workspace is not None and target_workspace_factory is not None:
+        if target_workspace_plan_factory is not None and not callable(
+            target_workspace_plan_factory
+        ):
+            raise TypeError("SyncBinding target_workspace_plan_factory must be callable or None.")
+        if target_workspace_factory is not None:
+            if not callable(target_workspace_factory):
+                raise TypeError("SyncBinding target_workspace_factory must be callable or None.")
             raise ValueError(
-                "SyncBinding accepts either target_workspace or target_workspace_factory, not both."
+                "SyncBinding target_workspace_factory is unsafe because it can mutate a target "
+                "before ownership admission; use target_workspace_plan_factory returning "
+                "SyncTargetWorkspacePlan."
+            )
+        if target_workspace is not None and target_workspace_plan_factory is not None:
+            raise ValueError(
+                "SyncBinding accepts either target_workspace or "
+                "target_workspace_plan_factory, not both."
             )
         if path is not None:
             require_clean_nonblank(path, "path")
         self.target_workspace = target_workspace
-        self.target_workspace_factory = target_workspace_factory
+        self.target_workspace_plan_factory = target_workspace_plan_factory
         self.path = path
         self.pattern = require_clean_nonblank(pattern, "pattern")
         self.max_files = _validate_positive_int(max_files, "max_files")
@@ -694,8 +1079,9 @@ class SyncBinding(WorkspaceBinding):
         self.delete_missing = delete_missing
         self._state_lock = threading.Lock()
         self._states: dict[str, _SyncBindingState] = {}
-        # Retained as a compatibility diagnostic for existing callers. The authoritative
-        # exclusion registry is process-wide and keyed by Workspace.resource_key.
+        # Retained as a target-oriented compatibility diagnostic for existing callers. The
+        # authoritative source-and-target exclusion registry is process-wide and keyed by
+        # Workspace.resource_key.
         self._fixed_target_owners: dict[str, str] = {}
 
     async def bind(
@@ -707,6 +1093,153 @@ class SyncBinding(WorkspaceBinding):
         agent_name: str | None = None,
         environment_name: str | None = None,
         metadata: dict[str, Any] | None = None,
+    ) -> BoundWorkspace:
+        authority = _SYNC_BINDING_LIFECYCLE_AUTHORITY.get()
+        retain_failed_ownership = False if authority is None else authority.claim_base_bind(self)
+        try:
+            bound = await self._bind(
+                workspace,
+                runner,
+                session_id=session_id,
+                agent_name=agent_name,
+                environment_name=environment_name,
+                metadata=metadata,
+                retain_failed_ownership=retain_failed_ownership,
+                lifecycle_authority=authority if retain_failed_ownership else None,
+            )
+        except BaseException:
+            raise
+        if retain_failed_ownership and authority is not None:
+            authority.bound = bound
+        return bound
+
+    async def _bind_for_environment_lifecycle(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        _attempt: _EnvironmentLifecycleBindAttempt | None = None,
+    ) -> BoundWorkspace:
+        attempt = _attempt or _EnvironmentLifecycleBindAttempt()
+        authority = _SyncBindingLifecycleBindAuthority(binding=self)
+        authority_token = _SYNC_BINDING_LIFECYCLE_AUTHORITY.set(authority)
+        current_task = asyncio.current_task()
+        cancellation_baseline = 0 if current_task is None else current_task.cancelling()
+        cancellation_pending_at_entry = bool(
+            current_task is not None and getattr(current_task, "_must_cancel", False)
+        )
+        try:
+            try:
+                bound = await self.bind(
+                    workspace,
+                    runner,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    metadata=metadata,
+                )
+            except BaseException as public_bind_error:
+                delegated_error, settlement_cancellation = await _settle_delegated_sync_bind(
+                    authority
+                )
+                if (
+                    isinstance(public_bind_error, asyncio.CancelledError)
+                    and delegated_error is not None
+                ):
+                    delegated_error = _without_delegated_cancellation(delegated_error)
+                elif isinstance(
+                    delegated_error, asyncio.CancelledError
+                ) and _timeout_represents_delegated_cancellation(public_bind_error):
+                    delegated_error = None
+                elif isinstance(delegated_error, asyncio.CancelledError):
+                    delegated_error = unexpected_child_cancellation_error(
+                        delegated_error,
+                        operation="SyncBinding delegated base bind",
+                    )
+                secondary_failures = tuple(
+                    error
+                    for error in (delegated_error, settlement_cancellation)
+                    if error is not None
+                    and error is not public_bind_error
+                    and not _exception_graph_contains_identity(public_bind_error, error)
+                    and not (
+                        isinstance(public_bind_error, asyncio.CancelledError)
+                        and isinstance(error, asyncio.CancelledError)
+                    )
+                )
+                if settlement_cancellation is not None:
+                    _redeliver_settlement_cancellation(settlement_cancellation)
+                if secondary_failures:
+                    raise BaseExceptionGroup(
+                        "SyncBinding override and delegated base bind both failed.",
+                        [public_bind_error, *secondary_failures],
+                    ) from None
+                raise
+            delegated_error, settlement_cancellation = await _settle_delegated_sync_bind(authority)
+            if isinstance(delegated_error, asyncio.CancelledError):
+                delegated_error = unexpected_child_cancellation_error(
+                    delegated_error,
+                    operation="SyncBinding delegated base bind",
+                )
+            if settlement_cancellation is not None:
+                _redeliver_settlement_cancellation(settlement_cancellation)
+                if delegated_error is not None:
+                    raise BaseExceptionGroup(
+                        "SyncBinding delegated base bind failed after caller cancellation.",
+                        [settlement_cancellation, delegated_error],
+                    ) from delegated_error
+                raise settlement_cancellation
+            if delegated_error is not None:
+                raise delegated_error
+            if authority.failure_ownership is not None:
+                suppressed_error = RuntimeError(
+                    "SyncBinding override suppressed a failed base bind."
+                )
+                raise suppressed_error
+            if authority.bound is None:
+                raise RuntimeError(
+                    "SyncBinding lifecycle override returned before its authoritative "
+                    "base bind completed."
+                )
+            self._validate_lifecycle_bound_result(
+                returned=bound,
+                authoritative=authority.bound,
+            )
+            if current_task is not None and (
+                current_task.cancelling() > cancellation_baseline or cancellation_pending_at_entry
+            ):
+                raise asyncio.CancelledError(getattr(current_task, "_cancel_message", None))
+            attempt.retain(
+                lambda: self._release_failed_outer_bind(bound),
+            )
+            return bound
+        except BaseException as bind_error:
+            ownership = authority.failure_ownership
+            if ownership is None and authority.bound is not None:
+                ownership = self._transfer_bound_failure_ownership(authority.bound, bind_error)
+            attempt.retain(
+                None if ownership is None else ownership.release,
+            )
+            raise
+        finally:
+            authority.deactivate()
+            _SYNC_BINDING_LIFECYCLE_AUTHORITY.reset(authority_token)
+
+    async def _bind(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None,
+        environment_name: str | None,
+        metadata: dict[str, Any] | None,
+        retain_failed_ownership: bool,
+        lifecycle_authority: _SyncBindingLifecycleBindAuthority | None,
     ) -> BoundWorkspace:
         request_metadata = _validate_bind_request(
             workspace,
@@ -728,21 +1261,54 @@ class SyncBinding(WorkspaceBinding):
             environment_name=environment_name,
             metadata=request_metadata,
         )
-        target = await self._target_workspace(context)
-        source_resource_key, target_resource_key = _reject_same_or_indeterminate_target(
-            workspace,
-            target,
-        )
         state_key = uuid4().hex
-        # Reserve every resolved target before any mutating await. The module-level registry
-        # composes fixed targets, factory targets, and separate SyncBinding instances into one
-        # exact-generation exclusion decision.
-        _reserve_sync_target(
-            target,
-            resource_key=target_resource_key,
-            generation=state_key,
-        )
+        source_resource_key: tuple[object, ...] | None = None
+        target_resource_key: tuple[object, ...] | None = None
+        target: Workspace | None = None
+        target_provision: SyncTargetWorkspaceProvisioner | None = None
+        factory_source_claimed = self.target_workspace_plan_factory is not None
         try:
+            if factory_source_claimed:
+                source_resource_key = _validated_workspace_resource_key(workspace)
+                _reserve_sync_factory_source(
+                    workspace,
+                    resource_key=source_resource_key,
+                    generation=state_key,
+                )
+            target, target_provision = await self._target_workspace(context)
+            resolved_source_key, target_resource_key = _reject_same_or_indeterminate_target(
+                workspace,
+                target,
+            )
+            if factory_source_claimed:
+                if resolved_source_key != source_resource_key:
+                    raise RuntimeError(
+                        "SyncBinding source resource_key changed during target factory resolution."
+                    )
+                _promote_sync_factory_resources(
+                    target,
+                    source_resource_key=resolved_source_key,
+                    target_resource_key=target_resource_key,
+                    generation=state_key,
+                )
+            else:
+                source_resource_key = resolved_source_key
+                # Fixed targets have both identities before admission, so reserve the complete pair
+                # atomically without a provisional phase.
+                _reserve_sync_resources(
+                    workspace,
+                    target,
+                    source_resource_key=source_resource_key,
+                    target_resource_key=target_resource_key,
+                    generation=state_key,
+                )
+            if source_resource_key is None:
+                raise AssertionError("SyncBinding source resource ownership was not established.")
+            if target_provision is not None:
+                await _await_sync_mutation(
+                    lambda: _run_sync_target_provisioner(target_provision),
+                    operation="SyncBinding target provisioning",
+                )
             with self._state_lock:
                 self._fixed_target_owners[target.id] = state_key
             source_paths = await _list_workspace_paths(
@@ -817,14 +1383,91 @@ class SyncBinding(WorkspaceBinding):
                 ),
             )
             return bound
-        except BaseException:
-            # A failed bind must not leak its reservation (the state that would release it was never
-            # stored). Success keeps the reservation until the bind's state is dropped.
-            with self._state_lock:
-                if self._fixed_target_owners.get(target.id) == state_key:
-                    del self._fixed_target_owners[target.id]
-            _release_sync_target(target_resource_key, generation=state_key)
+        except BaseException as bind_error:
+            # A failed bind must not leak either a provisional source claim or a promoted pair (the
+            # state that would release it was never stored). Success keeps both resources until the
+            # bind's state is dropped.
+            if target is not None:
+                with self._state_lock:
+                    if self._fixed_target_owners.get(target.id) == state_key:
+                        del self._fixed_target_owners[target.id]
+            if source_resource_key is not None:
+                if target_resource_key is None:
+                    _release_sync_resource(source_resource_key, generation=state_key)
+                elif retain_failed_ownership and _sync_resources_are_owned_by(
+                    source_resource_key,
+                    target_resource_key,
+                    generation=state_key,
+                ):
+                    ownership = _BindingFailureOwnership(
+                        source_resource_key=source_resource_key,
+                        target_resource_key=target_resource_key,
+                        generation=state_key,
+                    )
+                    if lifecycle_authority is None:
+                        ownership.release()
+                        raise RuntimeError(
+                            "SyncBinding failed without its lifecycle ownership authority."
+                        ) from bind_error
+                    lifecycle_authority.failure_ownership = ownership
+                else:
+                    _release_sync_resources(
+                        source_resource_key,
+                        target_resource_key,
+                        generation=state_key,
+                    )
             raise
+
+    def _transfer_bound_failure_ownership(
+        self,
+        bound: BoundWorkspace,
+        bind_error: BaseException,
+    ) -> _BindingFailureOwnership | None:
+        """Detach a completed base bind that an overriding public bind later rejected."""
+
+        state_key = bound.state_key
+        if state_key is None:
+            return None
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None:
+                return None
+            _validate_sync_generation_ownership(bound, state)
+            if state.phase != "active":
+                raise RuntimeError(
+                    "SyncBinding override failed while its completed bind was finalizing."
+                ) from bind_error
+            ownership = _BindingFailureOwnership(
+                source_resource_key=state.source_resource_key,
+                target_resource_key=state.target_resource_key,
+                generation=state_key,
+            )
+            del self._states[state_key]
+            if self._fixed_target_owners.get(state.target_id) == state_key:
+                del self._fixed_target_owners[state.target_id]
+        return ownership
+
+    def _validate_lifecycle_bound_result(
+        self,
+        *,
+        returned: BoundWorkspace,
+        authoritative: BoundWorkspace,
+    ) -> None:
+        """Require an override to return the exact admitted bind generation."""
+
+        if type(returned) is not BoundWorkspace:
+            raise TypeError("SyncBinding override must return a BoundWorkspace.")
+        state_key = authoritative.state_key
+        if state_key is None or returned.state_key != state_key:
+            raise ValueError("SyncBinding override returned a different admitted bind generation.")
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None:
+                raise ValueError(
+                    "SyncBinding override returned a bind generation that is no longer active."
+                )
+            _validate_sync_generation_ownership(authoritative, state)
+            _validate_sync_generation_ownership(returned, state)
 
     async def finalize(
         self,
@@ -911,24 +1554,28 @@ class SyncBinding(WorkspaceBinding):
     async def _target_workspace(
         self,
         context: SyncBindingContext,
-    ) -> Workspace:
+    ) -> tuple[Workspace, SyncTargetWorkspaceProvisioner | None]:
         if self.target_workspace is not None:
-            return self.target_workspace
-        if self.target_workspace_factory is None:
-            raise ValueError("SyncBinding requires target_workspace or target_workspace_factory.")
-        result = self.target_workspace_factory(context)
+            return self.target_workspace, None
+        if self.target_workspace_plan_factory is None:
+            raise ValueError(
+                "SyncBinding requires target_workspace or target_workspace_plan_factory."
+            )
+        result = self.target_workspace_plan_factory(context)
         if inspect.isawaitable(result):
             result = await result
-        if not isinstance(result, Workspace):
-            raise TypeError("SyncBinding target workspace factory must return a Workspace.")
-        return result
+        if isinstance(result, SyncTargetWorkspacePlan):
+            return result.workspace, result.provision
+        raise TypeError(
+            "SyncBinding target_workspace_plan_factory must return SyncTargetWorkspacePlan."
+        )
 
     def abandon(self, bound: BoundWorkspace) -> bool:
         """Drop in-process bind state for a bind whose finalize will never run.
 
         Lifecycle owners that skip ``finalize`` (crash recovery, cancelled
-        sessions) should call this so per-bind state and fixed-target ownership
-        do not leak.
+        sessions) should call this so per-bind state and resource ownership do
+        not leak.
         """
 
         if type(bound) is not BoundWorkspace:
@@ -968,22 +1615,26 @@ class SyncBinding(WorkspaceBinding):
         with self._state_lock:
             if state_key in self._states:
                 raise RuntimeError("SyncBinding generated a duplicate state key.")
-            if not _sync_target_is_owned_by(
+            if not _sync_resources_are_owned_by(
+                state.source_resource_key,
                 state.target_resource_key,
                 generation=state_key,
             ):
-                raise RuntimeError("SyncBinding lost fixed-target ownership during bind.")
+                raise RuntimeError("SyncBinding lost resource ownership during bind.")
             self._states[state_key] = state
             self._fixed_target_owners[state.target_id] = state_key
 
     def _remove_state_locked(self, state_key: str) -> None:
-        """The single place that drops a `_states` entry: pop it and release the target
-        reservation it held, so a reservation can never outlive its state."""
+        """Pop one state and release both reservations held by its exact generation."""
         state = self._states.pop(state_key, None)
         if state is not None:
             if self._fixed_target_owners.get(state.target_id) == state_key:
                 del self._fixed_target_owners[state.target_id]
-            _release_sync_target(state.target_resource_key, generation=state_key)
+            _release_sync_resources(
+                state.source_resource_key,
+                state.target_resource_key,
+                generation=state_key,
+            )
 
     def _begin_sync_finalize(self, bound: BoundWorkspace) -> tuple[str, _SyncBindingState]:
         state_key = bound.state_key
@@ -1450,6 +2101,18 @@ async def _await_sync_mutation(
             [caller_signal, mutation_error],
         ) from mutation_error
     raise mutation_error
+
+
+async def _run_sync_target_provisioner(
+    provision: SyncTargetWorkspaceProvisioner,
+) -> None:
+    """Run one admitted target setup callback and validate its result."""
+
+    result = provision()
+    if inspect.isawaitable(result):
+        result = await result
+    if result is not None:
+        raise TypeError("SyncTargetWorkspacePlan provision must return None.")
 
 
 def _validate_sync_tar(

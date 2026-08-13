@@ -306,6 +306,23 @@ tar including framing and path metadata. Bulk tar transfers are buffered and run
 encoding overhead, so size these controls below the process or sandbox memory ceiling. See the
 `*_sync_binding_live.py` examples below.
 
+A `SyncBinding` target plan factory is an identity-resolution boundary, not an
+allocation owner: `target_workspace_plan_factory` returns a
+`SyncTargetWorkspacePlan` containing an already lifecycle-owned, quiescent
+`Workspace`.
+Allocation that establishes the target's stable identity belongs in the
+surrounding `EnvironmentFactory`. Once that identity exists, attachment or setup
+that must mutate the workspace is represented by
+`SyncTargetWorkspacePlan(workspace=target, provision=setup)`. Cayu
+reserves the source and target pair before invoking `setup`; failed-bind resource
+cleanup remains the surrounding `EnvironmentFactoryResult.release` owner's
+responsibility.
+
+The legacy `target_workspace_factory` entrance is rejected before its callback
+is invoked. Its earlier create-or-attach contract could mutate a target before
+Cayu knew the target identity and therefore could not satisfy resource
+exclusion.
+
 Two patterns the issue that motivated this guide called out are **not** separate classes:
 
 - **Snapshots** are not a `SnapshotBinding`; they are the `WorkspaceSnapshot` a binding
@@ -320,7 +337,8 @@ Two patterns the issue that motivated this guide called out are **not** separate
 
 `Environment`, `EnvironmentSpec`, `EnvironmentFactory`, `WorkspaceBinding`, `BoundWorkspace`,
 `WorkspaceSnapshot`, and the concrete bindings (`NativeBinding`, `NoWorkspaceBinding`,
-`SyncBinding`, `GitRepositoryBinding`) are re-exported from the top-level `cayu`. The base
+`SyncBinding`, `GitRepositoryBinding`) plus `SyncTargetWorkspacePlan` are re-exported from the
+top-level `cayu`. The base
 `Workspace` and `Runner` types are **not** — import those from their modules:
 
 ```python

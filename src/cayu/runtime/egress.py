@@ -77,6 +77,7 @@ from cayu.environments.bindings import (
     NoWorkspaceBinding,
     WorkspaceBinding,
     WorkspaceSnapshot,
+    _EnvironmentLifecycleBindAttempt,
     copy_workspace_snapshot,
 )
 from cayu.environments.factory import (
@@ -2486,6 +2487,72 @@ class _EgressTeardownBinding(WorkspaceBinding):
         agent_name: str | None = None,
         environment_name: str | None = None,
         metadata: dict[str, Any] | None = None,
+    ) -> BoundWorkspace:
+        return await self._bind(
+            workspace,
+            runner,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            metadata=metadata,
+        )
+
+    async def _bind_for_environment_lifecycle(
+        self,
+        workspace: Any,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        _attempt: _EnvironmentLifecycleBindAttempt | None = None,
+    ) -> BoundWorkspace:
+        outer_attempt = _attempt or _EnvironmentLifecycleBindAttempt()
+        self._runner.begin_workspace_binding()
+        admission_active = True
+        inner_attempt = _EnvironmentLifecycleBindAttempt()
+        try:
+            bound = await self._inner._bind_for_environment_lifecycle(
+                workspace,
+                runner,
+                session_id=session_id,
+                agent_name=agent_name,
+                environment_name=environment_name,
+                metadata=metadata,
+                _attempt=inner_attempt,
+            )
+            requires_mutation_quiescence = self._inner._requires_mutation_quiescence(bound)
+            workspace_owner_key = bound.state_key or f"bound:{id(bound)}"
+            self._runner.finish_workspace_binding(
+                require_mutation_quiescence=requires_mutation_quiescence,
+                workspace_owner_key=(workspace_owner_key if requires_mutation_quiescence else None),
+            )
+            admission_active = False
+            outer_attempt.retain(
+                inner_attempt.release_failed_reservations,
+            )
+            return bound
+        except BaseException:
+            outer_attempt.retain(
+                inner_attempt.release_failed_reservations,
+            )
+            raise
+        finally:
+            if admission_active:
+                self._runner.finish_workspace_binding(
+                    require_mutation_quiescence=False,
+                )
+
+    async def _bind(
+        self,
+        workspace: Any,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None,
+        environment_name: str | None,
+        metadata: dict[str, Any] | None,
     ) -> BoundWorkspace:
         # Until bind returns successfully, the EnvironmentFactoryResult remains
         # unadopted and its release callback owns factory-created resources. The

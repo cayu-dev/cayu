@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from math import isfinite
 from typing import Any
 
@@ -19,7 +19,10 @@ from cayu._exception_groups import (
     exception_tree_contains,
     iter_exception_tree,
 )
-from cayu._task_wait import await_shielded_task_outcome
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    unexpected_child_cancellation_error,
+)
 from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
@@ -45,11 +48,14 @@ from cayu.environments import (
     evaluate_execution_admission,
     load_workspace_instructions,
 )
+from cayu.environments.bindings import _EnvironmentLifecycleBindAttempt
 from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
     combine_environment_factory_cleanup_settlement_tasks,
+    environment_factory_cleanup_retry_available,
     environment_factory_cleanup_settlement_task,
     environment_factory_cleanup_settlement_tasks,
+    register_environment_factory_cleanup_retry,
     retry_environment_factory_cleanup_settlement_task,
 )
 from cayu.runners import Runner
@@ -150,6 +156,10 @@ class _ActiveEnvironmentSetup:
     cleanup_retry_outcome: str | None = None
     cleanup_retry_metadata: dict[str, Any] | None = None
     cleanup_settlement_task: asyncio.Task[_EnvironmentCleanupSettlementOutcome] | None = None
+    release_failed_binding_reservations: Callable[[], None] | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 class EnvironmentLifecycle:
@@ -1029,6 +1039,7 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment,
         *,
         error: BaseException,
+        release_failed_binding_reservations: Callable[[], None] | None = None,
     ) -> tuple[runtime_records.RegisteredEnvironment, dict[str, Any] | None]:
         result = registered_environment.unclaimed_factory_result
         if result is None:
@@ -1041,6 +1052,7 @@ class EnvironmentLifecycle:
             action=EnvironmentFactoryReleaseAction.PRESERVE,
             original_error=error,
             redactor=self._secret_redactor,
+            on_quiescent=(release_failed_binding_reservations),
         )
         _attach_environment_factory_release_payload(error, release_payload)
         return (
@@ -1137,18 +1149,40 @@ class EnvironmentLifecycle:
             setup_owner = _ActiveEnvironmentSetup(registered_environment=registered_environment)
             self._active_environment_setups[session.id] = setup_owner
         self._release_pending_environment_owner_admission(session.id)
+        release_failed_binding_reservations: Callable[[], None] | None = None
         try:
-            bound = await environment_operation_boundary.await_environment_operation(
-                lambda: binding.bind(
-                    registered_environment.environment.workspace,
-                    registered_environment.environment.runner,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                ),
-                operation_name="Environment workspace binding",
-                redactor=self._secret_redactor,
-            )
+            if registered_environment.unclaimed_factory_result is not None:
+                attempt = _EnvironmentLifecycleBindAttempt()
+                try:
+                    bound = await environment_operation_boundary.await_environment_operation(
+                        lambda: binding._bind_for_environment_lifecycle(
+                            registered_environment.environment.workspace,
+                            registered_environment.environment.runner,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            _attempt=attempt,
+                        ),
+                        operation_name="Environment workspace binding",
+                        redactor=self._secret_redactor,
+                    )
+                finally:
+                    release_failed_binding_reservations = attempt.release_failed_reservations
+                    setup_owner.release_failed_binding_reservations = (
+                        release_failed_binding_reservations
+                    )
+            else:
+                bound = await environment_operation_boundary.await_environment_operation(
+                    lambda: binding.bind(
+                        registered_environment.environment.workspace,
+                        registered_environment.environment.runner,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                    ),
+                    operation_name="Environment workspace binding",
+                    redactor=self._secret_redactor,
+                )
         except BaseException as exc:
             cleanup_status = binding_cleanup_status(exc)
             retry_error: BaseException | None = None
@@ -1194,6 +1228,7 @@ class EnvironmentLifecycle:
                 ) = await self._release_unexposed_factory_environment(
                     registered_environment,
                     error=exc,
+                    release_failed_binding_reservations=(release_failed_binding_reservations),
                 )
             finally:
                 self._transfer_deferred_factory_cleanup(
@@ -1284,6 +1319,7 @@ class EnvironmentLifecycle:
         # Binding owns the live handles from this point. Record that transfer
         # before publishing it so cancellation or an event-store failure cannot
         # leave cleanup using the stale pre-bound value.
+        setup_owner.release_failed_binding_reservations = None
         setup_owner.registered_environment = bound_registered_environment
         events.append(
             await self._event_writer.emit(
@@ -1454,6 +1490,11 @@ class EnvironmentLifecycle:
                 ) = await self._release_unexposed_factory_environment(
                     registered_environment,
                     error=setup_error,
+                    release_failed_binding_reservations=(
+                        None
+                        if setup_owner is None
+                        else setup_owner.release_failed_binding_reservations
+                    ),
                 )
             finally:
                 self._transfer_deferred_factory_cleanup(
@@ -1885,6 +1926,9 @@ class EnvironmentLifecycle:
                     await self._release_unexposed_factory_environment(
                         registered_environment,
                         error=original_error,
+                        release_failed_binding_reservations=(
+                            setup_owner.release_failed_binding_reservations
+                        ),
                     )
                 finally:
                     self._transfer_deferred_factory_cleanup(
@@ -2519,10 +2563,13 @@ async def _release_unclaimed_factory_result(
     action: EnvironmentFactoryReleaseAction,
     original_error: BaseException,
     redactor: SecretRedactor | None = None,
+    on_quiescent: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if redactor is not None and not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
     resolved_redactor = redactor or SecretRedactor()
+    if on_quiescent is not None and not callable(on_quiescent):
+        raise TypeError("on_quiescent must be callable or None.")
     payload: dict[str, Any] = {
         "action": action.value,
         "callback_provided": result.release is not None,
@@ -2537,14 +2584,67 @@ async def _release_unclaimed_factory_result(
                 redactor=resolved_redactor,
             )
 
-        release_task = asyncio.create_task(run_release())
+        release_attempt = asyncio.create_task(run_release())
+        factory_cleanup_quiescent = False
+
+        def retire_after_factory_quiescence() -> None:
+            nonlocal factory_cleanup_quiescent
+            factory_cleanup_quiescent = True
+            if on_quiescent is not None:
+                on_quiescent()
+
+        def retry_release_settlement() -> asyncio.Task[None]:
+            for task in _environment_factory_release_retryable_handoffs(release_attempt):
+                retry_environment_factory_cleanup_settlement_task(task)
+            return start_release_settlement()
+
+        def retain_successor_retry(settlement: asyncio.Task[None]) -> None:
+            try:
+                settlement.result()
+            except BaseException:
+                try:
+                    release_attempt.result()
+                except BaseException:
+                    release_succeeded = False
+                else:
+                    release_succeeded = True
+                if (
+                    factory_cleanup_quiescent
+                    or release_succeeded
+                    or _environment_factory_release_retryable_handoffs(release_attempt)
+                ):
+                    register_environment_factory_cleanup_retry(
+                        settlement,
+                        retry_release_settlement,
+                    )
+
+        def start_release_settlement() -> asyncio.Task[None]:
+            async def settle_release() -> None:
+                await _settle_environment_factory_release(
+                    release_attempt,
+                    on_quiescent=retire_after_factory_quiescence,
+                )
+
+            settlement = asyncio.create_task(settle_release())
+            settlement.add_done_callback(retain_successor_retry)
+            return settlement
+
+        release_task = release_attempt if on_quiescent is None else start_release_settlement()
         try:
             cancelled = await _await_bounded_environment_factory_release(
                 release_task,
                 timeout_s=result.release_timeout_s,
+                timeout_handoff_task=(release_task if on_quiescent is not None else None),
             )
         except BaseException as cleanup_error:
-            if (
+            if on_quiescent is not None:
+                # The complete release settlement remains the reservation owner whether it
+                # failed immediately or is still running after a timeout.
+                attach_environment_factory_cleanup_settlement_task(
+                    original_error,
+                    environment_factory_cleanup_settlement_task(cleanup_error) or release_task,
+                )
+            elif (
                 settlement_task := environment_factory_cleanup_settlement_task(cleanup_error)
             ) is not None:
                 attach_environment_factory_cleanup_settlement_task(
@@ -2607,6 +2707,19 @@ async def _release_unclaimed_factory_result(
             "Environment factory result has durable reconnect state but no release callback; "
             "the runtime left the live allocation untouched rather than closing it terminally.",
         )
+        if on_quiescent is not None:
+
+            async def missing_release() -> None:
+                raise RuntimeError(
+                    "Environment factory result cannot settle failed binding ownership "
+                    "without a release callback."
+                )
+
+            missing_release_task = asyncio.create_task(missing_release())
+            attach_environment_factory_cleanup_settlement_task(
+                original_error,
+                missing_release_task,
+            )
         return payload
 
     cleanup_errors: list[tuple[str, Exception]] = []
@@ -2640,6 +2753,8 @@ async def _release_unclaimed_factory_result(
                 )
             except Exception as cleanup_error:
                 cleanup_errors.append(("binding", cleanup_error))
+        if not cleanup_errors and on_quiescent is not None:
+            on_quiescent()
 
     fallback_task = asyncio.create_task(run_fallback_release())
     try:
@@ -2715,6 +2830,7 @@ async def _await_bounded_environment_factory_release(
     task: asyncio.Task[None],
     *,
     timeout_s: float,
+    timeout_handoff_task: asyncio.Task[None] | None = None,
 ) -> bool:
     """Finish a factory release despite cancellation, within its declared bound."""
 
@@ -2728,7 +2844,7 @@ async def _await_bounded_environment_factory_release(
             )
             attach_environment_factory_cleanup_settlement_task(
                 error,
-                _defer_timed_out_environment_factory_release(task),
+                timeout_handoff_task or _defer_timed_out_environment_factory_release(task),
             )
             raise error
         try:
@@ -2746,7 +2862,7 @@ async def _await_bounded_environment_factory_release(
             )
             attach_environment_factory_cleanup_settlement_task(
                 error,
-                _defer_timed_out_environment_factory_release(task),
+                timeout_handoff_task or _defer_timed_out_environment_factory_release(task),
             )
             raise error from exc
     task.result()
@@ -2776,51 +2892,114 @@ def _environment_factory_cleanup_handoffs(
     return tuple(dict.fromkeys(tasks)), tuple(failures)
 
 
+def _environment_factory_release_retryable_handoffs(
+    release_task: asyncio.Task[None],
+) -> tuple[asyncio.Task[None], ...]:
+    """Find retryable cleanup owners below one completed public release call."""
+
+    pending = [release_task]
+    seen: set[asyncio.Task[None]] = set()
+    retryable: list[asyncio.Task[None]] = []
+    while pending:
+        task = pending.pop()
+        if task in seen or not task.done():
+            continue
+        seen.add(task)
+        try:
+            task.result()
+        except BaseException as error:
+            nested, _ = _environment_factory_cleanup_handoffs(error)
+        else:
+            continue
+        for nested_task in nested:
+            if environment_factory_cleanup_retry_available(nested_task):
+                retryable.append(nested_task)
+            else:
+                pending.append(nested_task)
+    return tuple(dict.fromkeys(retryable))
+
+
 def _defer_timed_out_environment_factory_release(
     release_task: asyncio.Task[None],
 ) -> asyncio.Task[None]:
     """Follow a timed-out release through any later cleanup-owner handoff."""
 
-    async def settle() -> None:
-        pending = [release_task]
-        seen: set[asyncio.Task[None]] = set()
-        failures: list[BaseException] = []
-        cancellation: asyncio.CancelledError | None = None
-        while pending:
-            task = pending.pop()
-            if task in seen:
-                continue
-            seen.add(task)
-            outcome = await await_shielded_task_outcome(task)
-            error = outcome.error
-            cancellation = cancellation or outcome.cancellation
-            if error is None:
-                continue
-            nested, unresolved = _environment_factory_cleanup_handoffs(error)
-            unseen = tuple(task for task in nested if task not in seen)
-            if len(unseen) != len(nested):
-                # A terminal task that delegates back to itself or an earlier
-                # owner supplies no new proof of quiescence. Preserve its
-                # original failure so lifecycle capacity remains fenced.
-                failures.append(error)
-            pending.extend(unseen)
-            failures.extend(unresolved)
-        if failures:
-            failure: BaseException = (
-                failures[0]
-                if len(failures) == 1
-                else BaseExceptionGroup(
-                    "Environment factory cleanup settlement chain failed.",
-                    failures,
-                )
-            )
-            if cancellation is not None:
-                raise cancellation from failure
-            raise failure
-        if cancellation is not None:
-            raise cancellation
-
     return asyncio.create_task(
-        settle(),
+        _settle_environment_factory_release(release_task),
         name="cayu-timed-out-environment-factory-release-settlement",
     )
+
+
+async def _settle_environment_factory_release(
+    release_task: asyncio.Task[None],
+    *,
+    on_quiescent: Callable[[], None] | None = None,
+) -> None:
+    """Follow one release through authenticated successor cleanup owners.
+
+    This task is the lifecycle's cleanup owner, not an interruptible waiter.
+    Cancellation stops neither opaque factory work nor its successor owners, so
+    the task completes from their authoritative outcome. If cancellation races
+    a failure, preserve both without turning the owner into a cancelled task;
+    once every owner and ``on_quiescent`` succeed, the cleanup is settled.
+    """
+
+    pending = [release_task]
+    seen: set[asyncio.Task[None]] = set()
+    failures: list[BaseException] = []
+    cancellation: asyncio.CancelledError | None = None
+    while pending:
+        task = pending.pop()
+        if task in seen:
+            continue
+        seen.add(task)
+        outcome = await await_shielded_task_outcome(task)
+        error = outcome.error
+        cancellation = cancellation or outcome.cancellation
+        if error is None:
+            continue
+        nested, unresolved = _environment_factory_cleanup_handoffs(error)
+        unseen = tuple(task for task in nested if task not in seen)
+        if len(unseen) != len(nested):
+            # A terminal task that delegates back to itself or an earlier
+            # owner supplies no new proof of quiescence. Preserve its
+            # original failure so lifecycle capacity remains fenced.
+            failures.append(_environment_factory_cleanup_failure(error))
+        pending.extend(unseen)
+        failures.extend(_environment_factory_cleanup_failure(failure) for failure in unresolved)
+    if failures:
+        failure: BaseException = (
+            failures[0]
+            if len(failures) == 1
+            else BaseExceptionGroup(
+                "Environment factory cleanup settlement chain failed.",
+                failures,
+            )
+        )
+        if cancellation is not None:
+            raise BaseExceptionGroup(
+                "Environment factory cleanup settlement failed after cancellation.",
+                [cancellation, failure],
+            ) from failure
+        raise failure
+    if on_quiescent is not None:
+        try:
+            on_quiescent()
+        except BaseException as failure:
+            if cancellation is not None:
+                raise BaseExceptionGroup(
+                    "Environment factory ownership release failed after cancellation.",
+                    [cancellation, failure],
+                ) from failure
+            raise
+
+
+def _environment_factory_cleanup_failure(error: BaseException) -> BaseException:
+    """Classify child-only cancellation without claiming caller cancellation."""
+
+    if isinstance(error, asyncio.CancelledError):
+        return unexpected_child_cancellation_error(
+            error,
+            operation="Environment factory cleanup settlement",
+        )
+    return error

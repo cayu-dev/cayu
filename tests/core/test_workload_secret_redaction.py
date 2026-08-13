@@ -1124,6 +1124,176 @@ def test_binding_cleanup_handoff_survives_real_cancellation_without_retaining_se
     _assert_cayu_traceback_does_not_retain_text(failure, secret)
 
 
+def test_factory_backed_binding_cancellation_does_not_retain_raw_failure() -> None:
+    from cayu.environments import BoundWorkspace, WorkspaceBinding
+
+    secret = "factory-binding-attempt-secret-canary"
+
+    class CancellationSuppressingBinding(WorkspaceBinding):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def bind(self, workspace, runner, **_kwargs) -> BoundWorkspace:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise ExceptionGroup(
+                    f"factory binding failed after cancellation with {secret}",
+                    [RuntimeError(secret)],
+                ) from None
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):
+            raise AssertionError("finalize should not run")
+
+    binding = CancellationSuppressingBinding()
+
+    class BindingFactory(EnvironmentFactory):
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    binding=binding,
+                )
+            )
+
+    app = CayuApp(
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(
+        FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+        default=True,
+    )
+    app.register_environment_factory(
+        EnvironmentSpec(name="dynamic"),
+        BindingFactory(),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> BaseExceptionGroup:
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="factory_binding_attempt_traceback",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await binding.started.wait()
+        run_task.cancel(f"operator cancellation with {secret}")
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await run_task
+        return exc_info.value
+
+    failure = asyncio.run(scenario())
+
+    assert secret not in repr(failure)
+    assert REDACTED_SECRET in repr(failure)
+    _assert_cayu_traceback_does_not_retain_text(failure, secret)
+
+
+def test_factory_backed_sync_bind_cancellation_hides_resource_keys_from_traceback(
+    tmp_path,
+) -> None:
+    from cayu.environments import SyncBinding
+
+    secret = "sync-binding-resource-key-secret-canary"
+    source_started = asyncio.Event()
+
+    class SecretKeyWorkspace(LocalWorkspace):
+        def __init__(self, *args, resource_key, **kwargs):  # type: ignore[no-untyped-def]
+            super().__init__(*args, **kwargs)
+            self._secret_resource_key = resource_key
+
+        @property
+        def resource_key(self) -> tuple[object, ...]:
+            return self._secret_resource_key
+
+    class BlockingSource(SecretKeyWorkspace):
+        async def list(self, pattern="**/*", *, limit=None):  # type: ignore[no-untyped-def]
+            del pattern, limit
+            source_started.set()
+            await asyncio.Event().wait()
+
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = BlockingSource(
+        source_root,
+        workspace_id="source",
+        resource_key=("source", secret),
+    )
+    target = SecretKeyWorkspace(
+        target_root,
+        workspace_id="target",
+        resource_key=("target", secret),
+    )
+
+    class BindingFactory(EnvironmentFactory):
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            async def release(_action) -> None:  # type: ignore[no-untyped-def]
+                return None
+
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=source,
+                    binding=SyncBinding(target_workspace=target),
+                ),
+                release=release,
+            )
+
+    app = CayuApp(
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(
+        FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+        default=True,
+    )
+    app.register_environment_factory(
+        EnvironmentSpec(name="dynamic"),
+        BindingFactory(),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="factory_sync_resource_key_traceback",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await source_started.wait()
+        run_task.cancel("operator cancellation")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await run_task
+        return exc_info.value, run_task.cancelling(), run_task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert secret not in repr(cancellation)
+    _assert_cayu_traceback_does_not_retain_text(cancellation, secret)
+
+
 def test_scalar_cancellation_preserves_binding_cleanup_handoff_and_retry() -> None:
     from cayu.environments import BoundWorkspace, WorkspaceBinding
     from cayu.runtime._binding_cleanup import binding_cleanup_status, record_binding_cleanup_failure

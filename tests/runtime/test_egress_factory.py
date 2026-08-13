@@ -47,6 +47,7 @@ from cayu.environments import (
     ExecutionEvidenceOverride,
     ExecutionRequirements,
     SyncBinding,
+    SyncTargetWorkspacePlan,
 )
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.environments.factory import (
@@ -2367,9 +2368,9 @@ def test_egress_teardown_does_not_read_runner_bound_target_after_quiescence(
             workspace_id="shared-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     class _QuiescingAdapter(_RecordingAdapter):
         def __init__(self) -> None:
@@ -2477,9 +2478,9 @@ def test_egress_teardown_drains_dispatched_write_before_authoritative_sync(
             workspace_id="late-write-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(
@@ -2588,13 +2589,15 @@ def test_egress_teardown_waits_for_deferred_command_settlement_before_sync(
 
     def target_factory(context):  # type: ignore[no-untyped-def]
         assert context.runner is not None
-        return _ClosedRejectingRunnerWorkspace(
-            context.runner,
-            local_target,
-            workspace_id="deferred-command-target",
+        return SyncTargetWorkspacePlan(
+            workspace=_ClosedRejectingRunnerWorkspace(
+                context.runner,
+                local_target,
+                workspace_id="deferred-command-target",
+            )
         )
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(
@@ -2720,9 +2723,9 @@ def test_egress_teardown_retries_only_after_deferred_sync_command_settles(
             workspace_id="sync-command-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(
@@ -2805,9 +2808,9 @@ def test_egress_teardown_retires_target_killed_by_command_cleanup(
             workspace_id="killed-command-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
     adapter = _RecordingAdapter(runner_factory=runner_factory)
 
     async def run() -> None:
@@ -2895,13 +2898,15 @@ def test_egress_teardown_retains_owner_when_command_settlement_is_uncertain(
 
     def target_factory(context):  # type: ignore[no-untyped-def]
         assert context.runner is not None
-        return _ClosedRejectingRunnerWorkspace(
-            context.runner,
-            local_target,
-            workspace_id="uncertain-command-target",
+        return SyncTargetWorkspacePlan(
+            workspace=_ClosedRejectingRunnerWorkspace(
+                context.runner,
+                local_target,
+                workspace_id="uncertain-command-target",
+            )
         )
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(
@@ -3009,13 +3014,15 @@ def test_cancelled_egress_teardown_retains_gate_until_dispatched_write_syncs(
 
     def target_factory(context):  # type: ignore[no-untyped-def]
         assert context.runner is not None
-        return _ClosedRejectingRunnerWorkspace(
-            context.runner,
-            local_target,
-            workspace_id="cancelled-drain-target",
+        return SyncTargetWorkspacePlan(
+            workspace=_ClosedRejectingRunnerWorkspace(
+                context.runner,
+                local_target,
+                workspace_id="cancelled-drain-target",
+            )
         )
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(
@@ -3094,9 +3101,9 @@ def test_egress_teardown_retains_sync_owner_until_post_cleanup_diagnostics_finis
             workspace_id="fixed-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
     cancel_revocation_once = True
 
     async def workspace_factory(_runner):  # type: ignore[no-untyped-def]
@@ -3165,9 +3172,9 @@ def test_egress_teardown_retries_partial_runner_bound_copy_before_cleanup(
             workspace_id="partial-copy-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(
@@ -3237,9 +3244,9 @@ def test_egress_teardown_retries_partial_runner_bound_delete_before_cleanup(
             workspace_id="partial-delete-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(
@@ -3302,9 +3309,9 @@ def test_egress_teardown_retains_readable_target_after_sync_failure(
             workspace_id="failed-target",
         )
         target_holder.append(target)
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
     sync_error = RuntimeError("target listing failed before teardown")
 
     async def run() -> None:
@@ -6056,9 +6063,9 @@ def test_managed_runner_rejects_second_stateful_binding_before_inner_mutation(
     def target_factory(_context):  # type: ignore[no-untyped-def]
         nonlocal target_factory_calls
         target_factory_calls += 1
-        return target
+        return SyncTargetWorkspacePlan(workspace=target)
 
-    inner = SyncBinding(target_workspace_factory=target_factory)
+    inner = SyncBinding(target_workspace_plan_factory=target_factory)
 
     async def run() -> None:
         result = await _virtual_factory(

@@ -167,6 +167,17 @@ def retry_environment_factory_cleanup_settlement_task(
     return owner.retry_failed_task()
 
 
+def environment_factory_cleanup_retry_available(
+    task: asyncio.Task[None],
+) -> bool:
+    """Return whether ``task`` owns an authenticated cleanup retry."""
+
+    if not isinstance(task, asyncio.Task):
+        raise TypeError("Factory cleanup settlement lookup requires an asyncio Task.")
+    owner = _environment_factory_cleanup_owner_for_task(task)
+    return owner is not None and owner.task is task and owner.retry is not None
+
+
 def environment_factory_cleanup_settlement_tasks(
     error: BaseException,
 ) -> tuple[asyncio.Task[None], ...]:
