@@ -1295,6 +1295,20 @@ agent has its own `AgentSpec`, tools, policies, model, context policy, and
 durable events, but inherits the parent's `environment_name` (it is not
 configurable per subagent). To shape a child's environment differently, branch a
 single `EnvironmentFactory` on `EnvironmentFactoryRequest.agent_name`.
+Runtime-created child session ids are opaque durable identities. Subagent
+spawns derive a collision-resistant id from the parent-scoped tool-execution
+idempotency key, so retries and process reconstruction select the same id;
+non-idempotent child creation retains a full UUID identity. Display shortening
+must never become a stored session key. Existing stored child ids remain valid
+and routable. A deterministic retry reuses an existing child only when its
+runtime-owned lineage and content fingerprint match the requested spawn. A
+conflicting record fails closed without starting, overwriting, or attaching it.
+Crash recovery reattaches matching foreground and background children; if
+multiple stored children claim one spawn identity, recovery fails closed
+instead of choosing one child to attach. New-format children must match both
+their deterministic id and runtime-owned spawn fingerprint. Legacy child ids
+remain recoverable through their complete parent, tool-call, agent, mode, and
+idempotency lineage; they are not rewritten into the new format.
 `SubagentExecutionMode.FOREGROUND` subagents wait for the child terminal
 event; the parent receives only a bounded `ToolResult` containing the child session id,
 status, and model-facing result. `SubagentSpec.result_max_chars` caps the child
@@ -2192,6 +2206,18 @@ attempt check and unique started-event insert share the same in-memory lock,
 SQLite write transaction, or PostgreSQL session-row transaction. A takeover
 cannot therefore interleave between the fence and insert, and concurrent
 reservation retains one winner before child execution.
+Generated workflow children derive their session id from the workflow run,
+workflow name, and logical step id, then defer the step reservation until the
+session create is known durable. Their create request carries an opaque,
+deterministic runtime-owned claim materialized only after caller metadata has
+crossed the public preparation boundary. If cancellation, an operational error,
+or process reconstruction follows a committed create whose acknowledgement was
+lost, the workflow recomputes that identity, authenticates the exact stored
+claim and deferred input, publishes its `workflow.step.started` reservation,
+and recovers the child. A missing or conflicting claim is not attached, loaded
+as step output, or recovered, so a concurrent foreign identity winner remains
+untouched. Session stores must preserve runtime-owned session metadata on create
+and user-metadata replacement for this readback boundary.
 
 `gated_loop` journal identities use the fixed-size `gated-loop:v2:` form derived
 from the canonical `(loop_name, item_key)` tuple. Delimiters, Unicode, and long

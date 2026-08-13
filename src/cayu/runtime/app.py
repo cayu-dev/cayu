@@ -3268,6 +3268,7 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         parallel_safe=tool.parallel_safe,
         effect=tool.effect,
         tool=tool.tool,
+        child_session_recovery=tool.child_session_recovery,
     )
 
 
@@ -3349,6 +3350,9 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         parallel_safe=validated_spec.parallel_safe,
         effect=validated_spec.effect,
         tool=tool,
+        child_session_recovery=(
+            tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None
+        ),
     )
 
 

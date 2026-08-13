@@ -651,8 +651,47 @@ SESSION_MESSAGE_DELIVERY_BATCH_LIMIT = 100
 MODEL_TARGET_PROJECTION_METADATA_KEY = "cayu:model_target_projection"
 MODEL_TARGET_PROJECTION_RECORD_TYPE = "cayu.model-target-projection"
 MODEL_TARGET_PROJECTION_SCHEMA_VERSION = 1
+SESSION_CREATE_CLAIM_METADATA_KEY = "cayu:session_create_claim"
+SESSION_CREATE_CLAIM_RECORD_TYPE = "cayu.session-create-claim"
+SESSION_CREATE_CLAIM_SCHEMA_VERSION = 1
 SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
 SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
+
+_RUNTIME_SESSION_CREATE_CLAIM_TOKEN = object()
+
+
+class _RuntimeSessionCreateClaim:
+    """Authenticated process-local authority for one durable create readback."""
+
+    expected_session_material: _SessionCreateMaterial | None
+    interaction_id: str | None
+    messages_sha256: str | None
+    request_sha256: str | None
+
+    __slots__ = (
+        "claim_id",
+        "expected_session_material",
+        "interaction_id",
+        "messages_sha256",
+        "request_sha256",
+        "session_id",
+        "token",
+    )
+
+    def __init__(self, *, session_id: str, claim_id: str) -> None:
+        self.token = _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+        self.session_id = session_id
+        self.claim_id = require_clean_nonblank(claim_id, "session create claim_id")
+        self.expected_session_material = None
+        self.interaction_id = None
+        self.messages_sha256 = None
+        self.request_sha256 = None
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> None:
+        # Generic deep copies are caller-controlled and must not duplicate
+        # runtime authority. The explicit RunRequest copier authenticates and
+        # preserves the original handoff instead.
+        return None
 
 
 def is_runtime_owned_session_metadata_key(key: str) -> bool:
@@ -846,6 +885,7 @@ class RunRequest(BaseModel):
     _runtime_generated_authority: frozenset[tuple[str, str]] = PrivateAttr(
         default_factory=_empty_run_request_authority
     )
+    _runtime_session_create_claim: object | None = PrivateAttr(default=None)
     _input_redactions_applied: bool = PrivateAttr(default=False)
 
     @field_validator("messages")
@@ -1610,6 +1650,50 @@ class Session(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionCreateMaterial:
+    agent_name: str
+    provider_name: str
+    model: str
+    parent_session_id: str | None
+    causal_budget_id: str
+    runtime_name: str
+    runtime_version: str | None
+    environment_name: str | None
+
+    @classmethod
+    def from_request(
+        cls,
+        request: RunRequest,
+        *,
+        identity: SessionIdentity,
+        session_id: str,
+    ) -> _SessionCreateMaterial:
+        return cls(
+            agent_name=request.agent_name,
+            provider_name=identity.provider_name,
+            model=identity.model,
+            parent_session_id=request.parent_session_id,
+            causal_budget_id=request.causal_budget_id or request.task_id or session_id,
+            runtime_name=identity.runtime_name,
+            runtime_version=identity.runtime_version,
+            environment_name=request.environment_name,
+        )
+
+    @classmethod
+    def from_session(cls, session: Session) -> _SessionCreateMaterial:
+        return cls(
+            agent_name=session.agent_name,
+            provider_name=session.provider_name,
+            model=session.model,
+            parent_session_id=session.parent_session_id,
+            causal_budget_id=session.causal_budget_id,
+            runtime_name=session.runtime_name,
+            runtime_version=session.runtime_version,
+            environment_name=session.environment_name,
+        )
 
 
 class SessionStateSnapshot(BaseModel):
@@ -11390,6 +11474,13 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
     copied._runtime_generated_authority = request._runtime_generated_authority
+    create_claim = request._runtime_session_create_claim
+    copied._runtime_session_create_claim = (
+        create_claim
+        if type(create_claim) is _RuntimeSessionCreateClaim
+        and create_claim.token is _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+        else None
+    )
     copied._input_redactions_applied = request._input_redactions_applied
     return copied
 
@@ -11436,6 +11527,260 @@ def run_request_authority_is_runtime_generated(
         and type(value) is str
         and getattr(request, field_name, None) == value
         and (field_name, value) in request._runtime_generated_authority
+    )
+
+
+def run_request_with_runtime_session_create_claim(
+    request: RunRequest,
+    *,
+    claim_id: str,
+) -> tuple[RunRequest, object]:
+    """Attach authenticated authority for exact generated-session readback."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime session create authority requires a RunRequest.")
+    session_id = request.session_id
+    if type(session_id) is not str or not run_request_authority_is_runtime_generated(
+        request,
+        field_name="session_id",
+        value=session_id,
+    ):
+        raise ValueError("Runtime session create authority requires a generated session_id.")
+    if SESSION_CREATE_CLAIM_METADATA_KEY in request.metadata:
+        raise ValueError("Session create claim metadata is runtime-owned.")
+    copied = copy_run_request(request)
+    claim = _RuntimeSessionCreateClaim(session_id=session_id, claim_id=claim_id)
+    copied._runtime_session_create_claim = claim
+    return copied, claim
+
+
+def _session_create_claim_record(
+    *,
+    claim_id: str,
+    request_sha256: str,
+    interaction_id: str | None = None,
+    messages_sha256: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "record_type": SESSION_CREATE_CLAIM_RECORD_TYPE,
+        "schema_version": SESSION_CREATE_CLAIM_SCHEMA_VERSION,
+        "claim_id": claim_id,
+        "request_sha256": request_sha256,
+    }
+    if interaction_id is not None or messages_sha256 is not None:
+        if interaction_id is None or messages_sha256 is None:
+            raise ValueError("Final session create claims require complete interaction evidence.")
+        record["interaction_id"] = interaction_id
+        record["messages_sha256"] = messages_sha256
+    return record
+
+
+def strip_runtime_session_create_claim_before_redaction(request: RunRequest) -> RunRequest:
+    """Remove authenticated claim metadata before generic value redaction."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime session create claim preparation requires a RunRequest.")
+    record = request.metadata.get(SESSION_CREATE_CLAIM_METADATA_KEY)
+    if record is None:
+        return request
+    claim = request._runtime_session_create_claim
+    if (
+        type(claim) is not _RuntimeSessionCreateClaim
+        or claim.token is not _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+        or request.session_id != claim.session_id
+        or type(record) is not dict
+        or record.get("record_type") != SESSION_CREATE_CLAIM_RECORD_TYPE
+        or record.get("schema_version") != SESSION_CREATE_CLAIM_SCHEMA_VERSION
+        or record.get("claim_id") != claim.claim_id
+    ):
+        raise ValueError("Session create claim metadata is runtime-owned.")
+    metadata = copy_durable_json_object(request.metadata, "metadata")
+    metadata.pop(SESSION_CREATE_CLAIM_METADATA_KEY)
+    prepared = request.model_copy(update={"metadata": metadata})
+    prepared._runtime_session_create_claim = claim
+    return prepared
+
+
+def apply_runtime_session_create_claim(request: RunRequest) -> RunRequest:
+    """Materialize an authenticated create claim after public metadata preparation."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime session create claim requires a RunRequest.")
+    claim = request._runtime_session_create_claim
+    if (
+        type(claim) is not _RuntimeSessionCreateClaim
+        or claim.token is not _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+        or request.session_id != claim.session_id
+    ):
+        if SESSION_CREATE_CLAIM_METADATA_KEY in request.metadata:
+            raise ValueError("Session create claim metadata is runtime-owned.")
+        copied = copy_run_request(request)
+        copied._runtime_session_create_claim = None
+        return copied
+    copied = copy_run_request(request)
+    metadata = copy_durable_json_object(copied.metadata, "metadata")
+    previous_record = metadata.pop(SESSION_CREATE_CLAIM_METADATA_KEY, None)
+    request_without_claim = copied.model_copy(update={"metadata": metadata})
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(
+            request_without_claim.model_dump(mode="json", warnings=False),
+            "runtime session create request",
+        )
+    ).hexdigest()
+    if previous_record is not None and (
+        type(previous_record) is not dict
+        or previous_record.get("record_type") != SESSION_CREATE_CLAIM_RECORD_TYPE
+        or previous_record.get("schema_version") != SESSION_CREATE_CLAIM_SCHEMA_VERSION
+        or previous_record.get("claim_id") != claim.claim_id
+        or previous_record.get("request_sha256") != request_sha256
+    ):
+        raise ValueError("Session create claim metadata is runtime-owned.")
+    claim.request_sha256 = request_sha256
+    metadata[SESSION_CREATE_CLAIM_METADATA_KEY] = _session_create_claim_record(
+        claim_id=claim.claim_id,
+        request_sha256=claim.request_sha256,
+    )
+    prepared = request_without_claim.model_copy(update={"metadata": metadata})
+    prepared._runtime_session_create_claim = claim
+    return prepared
+
+
+def bind_runtime_session_create_claim(
+    request: RunRequest,
+    *,
+    identity: SessionIdentity,
+    interaction_started_event: Event,
+) -> None:
+    """Bind a claim to the exact prepared request crossing the store boundary."""
+
+    if (
+        type(request) is not RunRequest
+        or type(identity) is not SessionIdentity
+        or type(interaction_started_event) is not Event
+    ):
+        raise TypeError("Runtime session create claim binding received invalid input.")
+    claim = request._runtime_session_create_claim
+    if claim is None:
+        return
+    if (
+        type(claim) is not _RuntimeSessionCreateClaim
+        or claim.token is not _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+        or request.session_id != claim.session_id
+        or claim.request_sha256 is None
+        or request.metadata.get(SESSION_CREATE_CLAIM_METADATA_KEY)
+        != _session_create_claim_record(
+            claim_id=claim.claim_id,
+            request_sha256=claim.request_sha256,
+        )
+    ):
+        request._runtime_session_create_claim = None
+        return
+    claim.expected_session_material = _SessionCreateMaterial.from_request(
+        request,
+        identity=identity,
+        session_id=claim.session_id,
+    )
+    if (
+        interaction_started_event.session_id != claim.session_id
+        or interaction_started_event.interaction_id is None
+    ):
+        request._runtime_session_create_claim = None
+        claim.expected_session_material = None
+        return
+    claim.messages_sha256 = session_input_messages_sha256(request.messages)
+    claim.interaction_id = interaction_started_event.interaction_id
+    request.metadata[SESSION_CREATE_CLAIM_METADATA_KEY] = _session_create_claim_record(
+        claim_id=claim.claim_id,
+        request_sha256=claim.request_sha256,
+        interaction_id=interaction_started_event.interaction_id,
+        messages_sha256=claim.messages_sha256,
+    )
+
+
+def session_has_runtime_create_claim(session: Session | None, claim: object) -> bool:
+    """Return whether a session carries one authenticated logical create claim."""
+
+    if (
+        type(session) is not Session
+        or type(claim) is not _RuntimeSessionCreateClaim
+        or claim.token is not _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+        or session.id != claim.session_id
+        or claim.request_sha256 is None
+    ):
+        return False
+    record = session.metadata.get(SESSION_CREATE_CLAIM_METADATA_KEY)
+    return (
+        type(record) is dict
+        and set(record)
+        == {
+            "record_type",
+            "schema_version",
+            "claim_id",
+            "request_sha256",
+            "interaction_id",
+            "messages_sha256",
+        }
+        and record.get("record_type") == SESSION_CREATE_CLAIM_RECORD_TYPE
+        and record.get("schema_version") == SESSION_CREATE_CLAIM_SCHEMA_VERSION
+        and record.get("claim_id") == claim.claim_id
+        and record.get("request_sha256") == claim.request_sha256
+        and type(record.get("interaction_id")) is str
+        and type(record.get("messages_sha256")) is str
+    )
+
+
+def session_matches_reconstructed_runtime_create_claim(
+    session: Session | None,
+    deferred_input: DeferredInteractionInput | None,
+    claim: object,
+) -> bool:
+    """Authenticate a deterministic create claim after process reconstruction."""
+
+    if (
+        not session_has_runtime_create_claim(session, claim)
+        or type(deferred_input) is not DeferredInteractionInput
+    ):
+        return False
+    assert isinstance(session, Session)  # narrowed by the authenticated helper
+    record = session.metadata[SESSION_CREATE_CLAIM_METADATA_KEY]
+    assert isinstance(record, dict)
+    return (
+        deferred_input.interaction_id == record["interaction_id"]
+        and session_input_messages_sha256(deferred_input.source_messages)
+        == record["messages_sha256"]
+    )
+
+
+def session_matches_runtime_create_claim(
+    session: Session | None,
+    deferred_input: DeferredInteractionInput | None,
+    claim: object,
+) -> bool:
+    """Authenticate exact durable evidence for one runtime-owned create claim."""
+
+    if (
+        type(session) is not Session
+        or type(deferred_input) is not DeferredInteractionInput
+        or type(claim) is not _RuntimeSessionCreateClaim
+        or claim.token is not _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+        or session.id != claim.session_id
+        or claim.expected_session_material is None
+        or claim.interaction_id is None
+        or claim.messages_sha256 is None
+        or claim.request_sha256 is None
+    ):
+        return False
+    return (
+        _SessionCreateMaterial.from_session(session) == claim.expected_session_material
+        and session.metadata.get(SESSION_CREATE_CLAIM_METADATA_KEY)
+        == _session_create_claim_record(
+            claim_id=claim.claim_id,
+            request_sha256=claim.request_sha256,
+            interaction_id=claim.interaction_id,
+            messages_sha256=claim.messages_sha256,
+        )
+        and deferred_input.interaction_id == claim.interaction_id
+        and session_input_messages_sha256(deferred_input.source_messages) == claim.messages_sha256
     )
 
 

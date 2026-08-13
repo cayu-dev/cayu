@@ -16,6 +16,7 @@ from cayu.environments import (
     ExecutionRequirements,
 )
 from cayu.providers import ModelProvider, UsageDialect
+from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
@@ -53,6 +54,7 @@ class RegisteredTool:
     parallel_safe: bool
     effect: ToolEffect
     tool: Tool
+    child_session_recovery: ChildSessionRecoveryMatcher | None = None
 
 
 @dataclass(frozen=True)

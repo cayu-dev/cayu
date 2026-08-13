@@ -20,6 +20,7 @@ from cayu.runtime.sessions import (
     ResumeRequest,
     RunRequest,
     Session,
+    apply_runtime_session_create_claim,
     copy_compact_session_request,
     copy_enqueue_session_message_request,
     copy_fork_session_request,
@@ -28,6 +29,7 @@ from cayu.runtime.sessions import (
     copy_run_request,
     copy_session,
     run_request_authority_is_runtime_generated,
+    strip_runtime_session_create_claim_before_redaction,
 )
 from cayu.runtime.structured_output import require_secret_free_structured_output_spec
 from cayu.runtime.tool_policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
@@ -53,7 +55,7 @@ def prepare_run_request(
 ) -> RunRequest:
     """Return a request safe to use as the source of a durable session."""
 
-    request = copy_run_request(request)
+    request = strip_runtime_session_create_claim_before_redaction(copy_run_request(request))
     if (
         request.session_id is not None
         and public_authority_alias_is_reserved(request.session_id)
@@ -125,7 +127,7 @@ def prepare_run_request(
         original != redacted
         for original, redacted in zip(request.messages, redacted_messages, strict=True)
     )
-    return prepared
+    return apply_runtime_session_create_claim(prepared)
 
 
 def prepare_resume_request(

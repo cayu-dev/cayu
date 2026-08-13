@@ -68,6 +68,11 @@ from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime import pending_actions
+from cayu.runtime._child_session_identity import (
+    ChildSessionKind,
+    child_session_id_prefix,
+    generate_child_session_id,
+)
 from cayu.runtime._diagnostics import (
     bound_diagnostic_text,
     exception_diagnostic,
@@ -85,7 +90,6 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
-    _is_background_subagent_session,
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._run_limits import RunLimitController, SessionUsageTracker
@@ -6956,7 +6960,8 @@ class RecoveryCoordinator:
             cancellation_artifacts_by_id=request.cancellation_artifacts_by_id,
         )
         interrupted_results = await self.reattach_subagent_children_in_outcomes(
-            session_id=request.session.id,
+            session=request.session,
+            registered_agent=request.registered_agent,
             tool_round_id=request.tool_round_identity.tool_round_id,
             outcomes=interrupted_results,
         )
@@ -7515,14 +7520,15 @@ class RecoveryCoordinator:
     async def reattach_subagent_children_in_outcomes(
         self,
         *,
-        session_id: str,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
         tool_round_id: str | None,
         outcomes: list[runtime_records.ToolCallOutcome],
     ) -> list[runtime_records.ToolCallOutcome]:
         """Replace unfinished spawn outcomes with matching durable child references."""
         if tool_round_id is None or not outcomes:
             return outcomes
-        children = await self._subagent_children_by_idempotency_key(session_id)
+        children = await self._subagent_children_by_idempotency_key(session.id)
         if not children:
             return outcomes
         reattached: list[runtime_records.ToolCallOutcome] = []
@@ -7530,14 +7536,27 @@ class RecoveryCoordinator:
             result = self._reattached_subagent_result(
                 children,
                 tool_execution.tool_idempotency_key(
-                    session_id=session_id,
+                    session_id=session.id,
                     tool_round_id=tool_round_id,
                     tool_call_id=outcome.call.id,
                 ),
                 tool_call_id=outcome.call.id,
                 tool_name=outcome.call.name,
                 tool_round_id=tool_round_id,
+                arguments=outcome.call.arguments,
+                parent_session=session,
+                registered_agent=registered_agent,
             )
+            if result is not None and outcome.result.artifacts:
+                result = result.model_copy(
+                    update={
+                        "artifacts": copy_json_value(
+                            outcome.result.artifacts,
+                            "reattached_subagent_artifacts",
+                        )
+                    },
+                    deep=True,
+                )
             reattached.append(
                 outcome
                 if result is None
@@ -7790,7 +7809,7 @@ class RecoveryCoordinator:
             events=lifecycle_events,
             pending_round=pending_round,
         )
-        subagent_children: dict[str, Session] = {}
+        subagent_children: dict[str, Session | None] = {}
         if any(
             recorded_outcomes.get(call.tool_call_id) is None for call in pending_round.tool_calls
         ):
@@ -7817,6 +7836,9 @@ class RecoveryCoordinator:
                 tool_call_id=pending_tool_call.tool_call_id,
                 tool_name=pending_tool_call.tool_name,
                 tool_round_id=pending_round.tool_round_id,
+                arguments=tool_call.arguments,
+                parent_session=session,
+                registered_agent=registered_agent,
             )
             if result is None:
                 result = tool_round_recovery.unknown_recovered_tool_result(
@@ -10119,8 +10141,8 @@ class RecoveryCoordinator:
     async def _subagent_children_by_idempotency_key(
         self,
         parent_session_id: str,
-    ) -> dict[str, Session]:
-        children: dict[str, Session] = {}
+    ) -> dict[str, Session | None]:
+        children: dict[str, Session | None] = {}
         sessions = await query_all_sessions(
             self._session_store,
             SessionQuery(
@@ -10129,24 +10151,35 @@ class RecoveryCoordinator:
             ),
         )
         for child in sessions:
-            if not _is_background_subagent_session(child):
-                continue
             idempotency_key = tool_round_recovery.subagent_child_idempotency_key(child)
             if idempotency_key is not None:
-                children[idempotency_key] = child
+                # Contradictory durable claims must not make recovery attach
+                # whichever child happened to be listed last.
+                children[idempotency_key] = None if idempotency_key in children else child
         return children
 
     @staticmethod
     def _reattached_subagent_result(
-        children: dict[str, Session],
+        children: dict[str, Session | None],
         idempotency_key: str,
         *,
         tool_call_id: str,
         tool_name: str,
         tool_round_id: str,
+        arguments: dict[str, Any],
+        parent_session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
     ) -> ToolResult | None:
         child = children.get(idempotency_key)
-        if child is None:
+        if child is None or not _matches_recoverable_subagent_child(
+            child,
+            idempotency_key=idempotency_key,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            parent_session=parent_session,
+            registered_agent=registered_agent,
+        ):
             return None
         return tool_round_recovery.recovered_subagent_tool_result(
             tool_call_id=tool_call_id,
@@ -10154,6 +10187,42 @@ class RecoveryCoordinator:
             tool_round_id=tool_round_id,
             child=child,
         )
+
+
+def _matches_recoverable_subagent_child(
+    child: Session,
+    *,
+    idempotency_key: str,
+    tool_call_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    parent_session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+) -> bool:
+    registered_tool = registered_agent.tools.get(tool_name)
+    if registered_tool is None or registered_tool.child_session_recovery is None:
+        return False
+    generated_prefix = child_session_id_prefix(ChildSessionKind.SUBAGENT)
+    generated_identity = child.id.startswith(generated_prefix)
+    if generated_identity and child.id != generate_child_session_id(
+        kind=ChildSessionKind.SUBAGENT,
+        parent_session_id=parent_session.id,
+        logical_spawn_id=idempotency_key,
+    ):
+        return False
+    matched = registered_tool.child_session_recovery.matches_recoverable_child(
+        child,
+        parent_session_id=parent_session.id,
+        causal_budget_id=parent_session.causal_budget_id,
+        environment_name=parent_session.environment_name,
+        tool_call_id=tool_call_id,
+        idempotency_key=idempotency_key,
+        arguments=arguments,
+        require_fingerprint=generated_identity,
+    )
+    if type(matched) is not bool:
+        raise TypeError("Child-session recovery matchers must return bool.")
+    return matched
 
 
 def _checkpoint_without_active_incomplete_recovery_claim(

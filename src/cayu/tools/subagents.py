@@ -5,13 +5,14 @@ import logging
 from collections.abc import AsyncIterator, Mapping
 from enum import StrEnum
 from functools import partial
+from hashlib import sha256
 from typing import Any, Protocol
-from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import (
     _RESERVED_LABEL_PREFIX,
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_json_object,
     copy_json_value,
@@ -23,6 +24,11 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.runtime._child_session_identity import (
+    ChildSessionKind,
+    ChildSessionRecoveryMatcher,
+    generate_child_session_id,
+)
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
     RunRequest,
@@ -236,7 +242,7 @@ class SubagentRuntime(Protocol):
         """Interrupt a child Cayu session and stream interruption events."""
 
 
-class SubagentTool(Tool):
+class SubagentTool(Tool, ChildSessionRecoveryMatcher):
     """Model-facing delegation tool backed by normal Cayu child sessions."""
 
     def __init__(
@@ -247,12 +253,23 @@ class SubagentTool(Tool):
         name: str = "subagent",
         description: str | None = None,
         background_registry: BackgroundSubagentTaskRegistry | None = None,
+        session_store: SessionStore | None = None,
     ) -> None:
         if background_registry is not None and not isinstance(
             background_registry, BackgroundSubagentTaskRegistry
         ):
             raise TypeError("background_registry must be a BackgroundSubagentTaskRegistry.")
+        if session_store is not None and not isinstance(session_store, SessionStore):
+            raise TypeError("session_store must be a SessionStore.")
         self._runtime = runtime
+        runtime_session_store = getattr(runtime, "session_store", None)
+        self._session_store = (
+            session_store
+            if session_store is not None
+            else (
+                runtime_session_store if isinstance(runtime_session_store, SessionStore) else None
+            )
+        )
         self._background_registry = (
             background_registry
             if background_registry is not None
@@ -297,31 +314,7 @@ class SubagentTool(Tool):
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         with tool_argument_validation():
-            agent_alias = require_unicode_scalar_text(
-                _string_argument(args, "agent", clean=True),
-                "agent",
-            )
-            task = require_unicode_scalar_text(
-                _string_argument(args, "task", clean=False),
-                "task",
-            )
-            raw_metadata = args.get("metadata", {})
-            metadata = require_unicode_scalar_json(
-                copy_json_object(
-                    {} if raw_metadata is None else raw_metadata,
-                    "metadata",
-                ),
-                "metadata",
-            )
-            # Never let the model seed cayu-reserved metadata via its own tool arguments (e.g.
-            # taint labels supplied authoritatively by the runtime through ctx.metadata below).
-            # Leaving a reserved key in model-controlled metadata would let an injected parent
-            # forge child state (or crash the child's policy read with a malformed value).
-            metadata = {
-                key: value
-                for key, value in metadata.items()
-                if not key.startswith(_RESERVED_LABEL_PREFIX)
-            }
+            agent_alias, task, metadata = _subagent_arguments(args)
         spec = self._agents.get(agent_alias)
         if spec is None:
             return ToolResult(
@@ -342,7 +335,11 @@ class SubagentTool(Tool):
                 is_error=True,
             )
 
-        child_session_id = f"{ctx.session_id}_subagent_{uuid4().hex[:8]}"
+        child_session_id = generate_child_session_id(
+            kind=ChildSessionKind.SUBAGENT,
+            parent_session_id=ctx.session_id,
+            logical_spawn_id=ctx.idempotency_key,
+        )
         causal_budget_id = ctx.causal_budget_id or ctx.session_id
         child_metadata: dict[str, Any] = {
             **copy_json_value(spec.metadata, "metadata"),
@@ -357,11 +354,24 @@ class SubagentTool(Tool):
                 # before its spawn tool call's TOOL_CALL_COMPLETED persists can still re-attach the child
                 # during recovery instead of resolving it as unknown. Recovery matches on idempotency_key
                 # (encodes session+tool_round+tool_call), which is round-scoped; tool_call_id is kept for
-                # human/debug readability. Both come from the runtime-injected ctx.metadata.
+                # human/debug readability. Both come from the runtime-owned ToolContext.
                 "tool_call_id": ctx.metadata.get("tool_call_id"),
-                "idempotency_key": ctx.metadata.get("idempotency_key"),
+                "idempotency_key": ctx.idempotency_key,
             },
         }
+        spawn_fingerprint = _subagent_spawn_fingerprint(
+            agent_alias=agent_alias,
+            spec=spec,
+            parent_session_id=ctx.session_id,
+            causal_budget_id=causal_budget_id,
+            environment_name=ctx.environment_name,
+            task=task,
+            metadata=child_metadata,
+        )
+        subagent_metadata = child_metadata["subagent"]
+        if not isinstance(subagent_metadata, dict):  # pragma: no cover - construction invariant
+            raise AssertionError("Subagent metadata must be an object.")
+        subagent_metadata["spawn_fingerprint"] = spawn_fingerprint
         # Propagate the parent session's taint across the subagent boundary so the child's
         # TaintAwareToolPolicy gates protected tools it would otherwise run untainted. Merge with
         # any labels the child metadata already carries rather than clobbering them.
@@ -395,6 +405,18 @@ class SubagentTool(Tool):
             child_session_id=child_session_id,
             causal_budget_id=causal_budget_id,
         )
+        existing_result = await self._existing_child_result(
+            child_session_id=child_session_id,
+            agent_alias=agent_alias,
+            spec=spec,
+            parent_session_id=ctx.session_id,
+            causal_budget_id=causal_budget_id,
+            environment_name=ctx.environment_name,
+            spawn_fingerprint=spawn_fingerprint,
+            structured=structured,
+        )
+        if existing_result is not None:
+            return existing_result
         if spec.mode == SubagentExecutionMode.BACKGROUND:
             try:
                 first_event = await _start_background_subagent(
@@ -495,6 +517,127 @@ class SubagentTool(Tool):
                 ),
             },
             is_error=True,
+        )
+
+    async def _existing_child_result(
+        self,
+        *,
+        child_session_id: str,
+        agent_alias: str,
+        spec: SubagentSpec,
+        parent_session_id: str,
+        causal_budget_id: str,
+        environment_name: str | None,
+        spawn_fingerprint: str,
+        structured: dict[str, Any],
+    ) -> ToolResult | None:
+        session_store = self._session_store
+        if session_store is None:
+            return None
+        child = await session_store.load(child_session_id)
+        if child is None:
+            return None
+        if not _matches_subagent_spawn(
+            child,
+            agent_alias=agent_alias,
+            spec=spec,
+            parent_session_id=parent_session_id,
+            causal_budget_id=causal_budget_id,
+            environment_name=environment_name,
+            spawn_fingerprint=spawn_fingerprint,
+        ):
+            return ToolResult(
+                content=(
+                    f"Subagent identity conflict for {child_session_id}; Cayu refused "
+                    "to attach or overwrite the existing session."
+                ),
+                structured={
+                    **structured,
+                    "status": "identity_conflict",
+                    "outcome_unknown": True,
+                },
+                is_error=True,
+            )
+        if child.status not in _SUBAGENT_TERMINAL_STATUSES:
+            return ToolResult(
+                content=(
+                    f"Subagent {child_session_id} already exists with status "
+                    f"{child.status.value}; Cayu refused to start a duplicate child."
+                ),
+                structured={
+                    **structured,
+                    "status": child.status.value,
+                    "reused": True,
+                    "outcome_unknown": True,
+                },
+                is_error=True,
+            )
+        summary = await _summarize_child_session(
+            session_store,
+            child,
+            max_chars=spec.result_max_chars,
+            background_failure=self._background_registry.failure(child_session_id),
+        )
+        summary = {**structured, **summary, "reused": True}
+        return _tool_result_from_child_summary(summary)
+
+    def matches_recoverable_child(
+        self,
+        child: Session,
+        *,
+        parent_session_id: str,
+        causal_budget_id: str,
+        environment_name: str | None,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+        require_fingerprint: bool,
+    ) -> bool:
+        try:
+            agent_alias, task, metadata = _subagent_arguments(arguments)
+        except (TypeError, ValueError):
+            return False
+        spec = self._agents.get(agent_alias)
+        if spec is None or spec.context_mode is not SubagentContextMode.TASK_ONLY:
+            return False
+        child_metadata: dict[str, Any] = {
+            **copy_json_value(spec.metadata, "metadata"),
+            **metadata,
+            "subagent": {
+                "agent": agent_alias,
+                "agent_name": spec.agent_name,
+                "context_mode": spec.context_mode.value,
+                "mode": spec.mode.value,
+                "parent_session_id": parent_session_id,
+                "tool_call_id": tool_call_id,
+                "idempotency_key": idempotency_key,
+            },
+        }
+        expected_fingerprint = _subagent_spawn_fingerprint(
+            agent_alias=agent_alias,
+            spec=spec,
+            parent_session_id=parent_session_id,
+            causal_budget_id=causal_budget_id,
+            environment_name=environment_name,
+            task=task,
+            metadata=child_metadata,
+        )
+        if not _matches_subagent_spawn(
+            child,
+            agent_alias=agent_alias,
+            spec=spec,
+            parent_session_id=parent_session_id,
+            causal_budget_id=causal_budget_id,
+            environment_name=environment_name,
+            spawn_fingerprint=expected_fingerprint,
+            require_fingerprint=require_fingerprint,
+        ):
+            return False
+        subagent = child.metadata.get("subagent")
+        return (
+            isinstance(subagent, dict)
+            and subagent.get("tool_call_id") == tool_call_id
+            and subagent.get("idempotency_key") == idempotency_key
         )
 
 
@@ -763,6 +906,30 @@ def _copy_subagent_specs(
     return copied
 
 
+def _subagent_arguments(args: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    agent_alias = require_unicode_scalar_text(
+        _string_argument(args, "agent", clean=True),
+        "agent",
+    )
+    task = require_unicode_scalar_text(
+        _string_argument(args, "task", clean=False),
+        "task",
+    )
+    raw_metadata = args.get("metadata", {})
+    metadata = require_unicode_scalar_json(
+        copy_json_object(
+            {} if raw_metadata is None else raw_metadata,
+            "metadata",
+        ),
+        "metadata",
+    )
+    # Never let the model seed Cayu-reserved metadata through tool arguments.
+    metadata = {
+        key: value for key, value in metadata.items() if not key.startswith(_RESERVED_LABEL_PREFIX)
+    }
+    return agent_alias, task, metadata
+
+
 def _string_argument(args: dict[str, Any], field_name: str, *, clean: bool) -> str:
     value = args.get(field_name)
     if not isinstance(value, str):
@@ -838,6 +1005,65 @@ def _subagent_result_payload(
         "causal_budget_id": causal_budget_id,
         "result_max_chars": spec.result_max_chars,
     }
+
+
+def _subagent_spawn_fingerprint(
+    *,
+    agent_alias: str,
+    spec: SubagentSpec,
+    parent_session_id: str,
+    causal_budget_id: str,
+    environment_name: str | None,
+    task: str,
+    metadata: dict[str, Any],
+) -> str:
+    material = {
+        "version": "cayu-subagent-spawn-v1",
+        "agent": agent_alias,
+        "agent_name": spec.agent_name,
+        "context_mode": spec.context_mode.value,
+        "mode": spec.mode.value,
+        "parent_session_id": parent_session_id,
+        "causal_budget_id": causal_budget_id,
+        "environment_name": environment_name,
+        "task": task,
+        "metadata": metadata,
+        "max_steps": spec.max_steps,
+        "result_max_chars": spec.result_max_chars,
+        "limits": spec.limits.model_dump(mode="json"),
+    }
+    return "sha256:" + sha256(canonical_durable_json_bytes(material, "subagent_spawn")).hexdigest()
+
+
+def _matches_subagent_spawn(
+    child: Session,
+    *,
+    agent_alias: str,
+    spec: SubagentSpec,
+    parent_session_id: str,
+    causal_budget_id: str,
+    environment_name: str | None,
+    spawn_fingerprint: str,
+    require_fingerprint: bool = True,
+) -> bool:
+    subagent = child.metadata.get("subagent")
+    return (
+        isinstance(subagent, dict)
+        and child.agent_name == spec.agent_name
+        and child.parent_session_id == parent_session_id
+        and child.causal_budget_id == causal_budget_id
+        and child.environment_name == environment_name
+        and subagent.get("agent") == agent_alias
+        and subagent.get("agent_name") == spec.agent_name
+        and subagent.get("context_mode") == spec.context_mode.value
+        and subagent.get("mode") == spec.mode.value
+        and subagent.get("parent_session_id") == parent_session_id
+        and (
+            subagent.get("spawn_fingerprint") == spawn_fingerprint
+            if require_fingerprint
+            else "spawn_fingerprint" not in subagent
+        )
+    )
 
 
 class _SubagentResult(BaseModel):

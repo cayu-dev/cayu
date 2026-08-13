@@ -567,7 +567,7 @@ class _KillpointSink(EventSink):
             self.killpoint == "subagent_child_started"
             and event.type == EventType.INTERACTION_STARTED
             and self.parent_session_id is not None
-            and event.session_id.startswith(f"{self.parent_session_id}_subagent_")
+            and event.session_id.startswith("cayu-child:v1:subagent:")
         ):
             _write_json_atomic(
                 self.phase_path,

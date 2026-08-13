@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
+from enum import Enum
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_json_value,
     copy_label_map,
@@ -41,9 +45,19 @@ from cayu.runtime import (
     StructuredOutputSpec,
     StructuredOutputStrategy,
 )
+from cayu.runtime._child_session_identity import (
+    ChildSessionKind,
+    generate_child_session_id,
+)
+from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.runtime.budgets import copy_request_budget_limits
 from cayu.runtime.retry_policy import copy_retry_policy
-from cayu.runtime.sessions import run_request_with_runtime_generated_authority
+from cayu.runtime.sessions import (
+    run_request_with_runtime_generated_authority,
+    run_request_with_runtime_session_create_claim,
+    session_matches_reconstructed_runtime_create_claim,
+    session_matches_runtime_create_claim,
+)
 from cayu.runtime.stop_policy import copy_run_limits
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -216,6 +230,24 @@ class _StepRunEventState:
             self.failure = str(event.payload.get("error", "session failed"))
         elif event_type == EventType.SESSION_INTERRUPTED:
             self.interrupted = str(event.payload.get("interruption_type") or "interrupted")
+
+
+class _GeneratedChildOwnership(Enum):
+    NOT_GENERATED = "not_generated"
+    UNCREATED = "uncreated"
+    CREATED_UNATTACHED = "created_unattached"
+    ATTACHED = "attached"
+
+    @property
+    def is_generated(self) -> bool:
+        return self is not _GeneratedChildOwnership.NOT_GENERATED
+
+    @property
+    def is_created(self) -> bool:
+        return self in {
+            _GeneratedChildOwnership.CREATED_UNATTACHED,
+            _GeneratedChildOwnership.ATTACHED,
+        }
 
 
 class WorkflowContext:
@@ -639,8 +671,13 @@ async def _run_step(
 
     child_session_id = session_id
     child_session_has_runtime_authority = False
+    generated_child_ownership = _GeneratedChildOwnership.NOT_GENERATED
+    generated_child_claim_id: str | None = None
+    failed_started_child_session_id: str | None = None
     if child_session_id is None and started_child_session_id is not None:
         started_child = await ctx.app.session_store.load(started_child_session_id)
+        if started_child is not None and started_child.status == SessionStatus.FAILED:
+            failed_started_child_session_id = started_child_session_id
         if started_child is None or started_child.status != SessionStatus.FAILED:
             if started_child is not None and started_child.status in _LIVE_CHILD_STATUSES:
                 await ctx.app.recover_incomplete_session(
@@ -655,11 +692,28 @@ async def _run_step(
             # caller, selected the replay identity.
             child_session_has_runtime_authority = True
     if child_session_id is None:
-        child_session_id = f"{ctx.session_id}:{step_id}:{uuid4().hex[:8]}"
+        generated_child_claim_id = sha256(
+            canonical_durable_json_bytes(
+                [
+                    "cayu-workflow-step-spawn-v1",
+                    ctx.workflow_name,
+                    step_id,
+                    failed_started_child_session_id,
+                ],
+                "workflow step spawn identity",
+            )
+        ).hexdigest()
+        child_session_id = generate_child_session_id(
+            kind=ChildSessionKind.WORKFLOW_STEP,
+            parent_session_id=ctx.session_id,
+            logical_spawn_id=generated_child_claim_id,
+        )
         child_session_has_runtime_authority = True
+        generated_child_ownership = _GeneratedChildOwnership.UNCREATED
 
     # Resume onto an already-started child reuses its journaled STARTED record;
     # appending a second one would leave unpaired started/completed events.
+    started_event: Event | None = None
     if child_session_id != started_child_session_id:
         started_event = ctx.event(
             EventType.WORKFLOW_STEP_STARTED,
@@ -675,34 +729,16 @@ async def _run_step(
                 started_event,
                 "child_session_id",
             )
-        if not await ctx.journal.append_step_started(
-            started_event,
-            attempt_id=ctx.attempt_id,
-        ):
-            (
-                completed_child_session_id,
-                started_child_session_id,
-            ) = await ctx.journal.step_replay_ids(
+        if not generated_child_ownership.is_generated:
+            replayed = await _reserve_step_started(
+                ctx,
                 step_id=step_id,
-                attempt_id=ctx.attempt_id,
+                started_event=started_event,
+                structured_output=spec,
             )
-            if completed_child_session_id is not None:
-                completed_child = await ctx.app.session_store.load(completed_child_session_id)
-                if (
-                    completed_child is not None
-                    and completed_child.status == SessionStatus.COMPLETED
-                ):
-                    return await _step_result_from_completed_child(
-                        ctx,
-                        step_id=step_id,
-                        child_session_id=completed_child_session_id,
-                        structured_output=spec,
-                    )
-            raise WorkflowSupersededError(
-                f"Workflow step {step_id!r} in run {ctx.session_id!r} was already "
-                "reserved by another attempt; this attempt stops to avoid "
-                "double-executing the child session."
-            )
+            if replayed is not None:
+                return replayed
+            started_event = None
     # The shipped journal anchors a session under the workflow run id, ensured
     # by the attempt-fence append above. When present, record lineage so budget
     # roll-ups and parent/child views span the whole workflow; custom journals
@@ -741,9 +777,66 @@ async def _run_step(
             request,
             *request_authority,
         )
+    session_create_claim: object | None = None
+    if generated_child_ownership.is_generated:
+        if generated_child_claim_id is None:  # pragma: no cover - state invariant
+            raise AssertionError("Generated workflow child is missing its durable claim id.")
+        request, session_create_claim = run_request_with_runtime_session_create_claim(
+            request,
+            claim_id=generated_child_claim_id,
+        )
+        # Compute the exact redacted request fingerprint for pre-create
+        # reconstruction without exposing runtime-owned metadata to adapters
+        # that wrap the public app.run boundary.
+        prepare_run_request(request, redactor=ctx.app._secret_redactor)
 
+    # Narrow the attempt-fence-to-create window after all request preparation.
+    # A newer workflow attempt should win before either contender mutates the
+    # session store, especially when both derive the same durable child id.
+    await ctx._check_fence(establish=False)
     existing_child = await ctx.app.session_store.load(child_session_id)
     if existing_child is not None:
+        if generated_child_ownership.is_generated:
+            deferred_input = await ctx.app.session_store.load_deferred_interaction_input(
+                child_session_id
+            )
+            if not session_matches_reconstructed_runtime_create_claim(
+                existing_child,
+                deferred_input,
+                session_create_claim,
+            ):
+                raise StepError(
+                    f"generated child session identity collision: {child_session_id!r}",
+                    step_id=step_id,
+                    session_id=child_session_id,
+                )
+            if started_event is None:  # pragma: no cover - generated-child invariant
+                raise AssertionError("Reconstructed workflow child is missing its start event.")
+            replayed = await _reserve_step_started(
+                ctx,
+                step_id=step_id,
+                started_event=started_event,
+                structured_output=spec,
+            )
+            if replayed is not None:
+                return replayed
+            generated_child_ownership = _GeneratedChildOwnership.ATTACHED
+            if existing_child.status in _LIVE_CHILD_STATUSES:
+                await ctx.app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=child_session_id,
+                        reason="workflow_step_reconstructed_unacknowledged_child",
+                        metadata={"workflow": ctx.workflow_name, "step_id": step_id},
+                    )
+                )
+                reloaded_child = await ctx.app.session_store.load(child_session_id)
+                if reloaded_child is None:  # pragma: no cover - store contract violation
+                    raise StepError(
+                        "generated workflow child disappeared during recovery",
+                        step_id=step_id,
+                        session_id=child_session_id,
+                    )
+                existing_child = reloaded_child
         if existing_child.status == SessionStatus.COMPLETED:
             result = await _step_result_from_completed_child(
                 ctx,
@@ -779,34 +872,157 @@ async def _run_step(
     if capture_structured_output:
         ctx.app._session_engine.prepare_workflow_structured_output(child_session_id)
     run_stream = ctx.app.run(request)
+
+    async def close_unattached_generated_child() -> None:
+        if generated_child_ownership is _GeneratedChildOwnership.CREATED_UNATTACHED:
+            await _close_unattached_generated_child(
+                ctx,
+                child_session_id=child_session_id,
+                run_stream=run_stream,
+                step_id=step_id,
+            )
+
+    async def authenticate_unacknowledged_generated_child() -> bool:
+        nonlocal generated_child_ownership
+        if (
+            generated_child_ownership is not _GeneratedChildOwnership.UNCREATED
+            or session_create_claim is None
+        ):
+            return False
+        created = await ctx.app.session_store.load(child_session_id)
+        deferred_input = await ctx.app.session_store.load_deferred_interaction_input(
+            child_session_id
+        )
+        if not session_matches_runtime_create_claim(
+            created,
+            deferred_input,
+            session_create_claim,
+        ):
+            return False
+        generated_child_ownership = _GeneratedChildOwnership.CREATED_UNATTACHED
+        if started_event is None:  # pragma: no cover - generated-child invariant
+            raise AssertionError("Unacknowledged workflow child is missing its start event.")
+        if not await ctx.journal.append_step_started(
+            started_event,
+            attempt_id=ctx.attempt_id,
+        ):
+            generated_child_ownership = _GeneratedChildOwnership.UNCREATED
+            latest_attempt_id = await ctx.journal.latest_attempt_id()
+            if latest_attempt_id is not None:
+                ctx._raise_superseded(latest_attempt_id)
+            raise WorkflowSupersededError(
+                f"Workflow step {step_id!r} no longer owns its durable reservation."
+            )
+        generated_child_ownership = _GeneratedChildOwnership.ATTACHED
+        return True
+
+    async def recover_authenticated_unacknowledged_child(*, reason: str) -> bool:
+        if not await authenticate_unacknowledged_generated_child():
+            return False
+        await ctx.app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=child_session_id,
+                reason=reason,
+                metadata={"workflow": ctx.workflow_name, "step_id": step_id},
+            )
+        )
+        return True
+
     try:
+        if started_event is not None:
+            # The store's session create is the atomic ownership boundary for a
+            # runtime-generated id. Pause after that create succeeds, then bind
+            # only the proven-owned child to the workflow journal. A concurrent
+            # foreign create therefore fails before any durable workflow event
+            # can reference its identity or any model request can begin.
+            first_event = await anext(run_stream)
+            generated_child_ownership = _GeneratedChildOwnership.CREATED_UNATTACHED
+            state.record(first_event)
+            replayed = await _reserve_step_started(
+                ctx,
+                step_id=step_id,
+                started_event=started_event,
+                structured_output=spec,
+            )
+            if replayed is not None:
+                await _close_unattached_generated_child(
+                    ctx,
+                    child_session_id=child_session_id,
+                    run_stream=run_stream,
+                    step_id=step_id,
+                )
+                if capture_structured_output:
+                    ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
+                return replayed
+            generated_child_ownership = _GeneratedChildOwnership.ATTACHED
         async for event in run_stream:
             state.record(event)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
-        aclose = getattr(run_stream, "aclose", None)
-        if aclose is not None:
-            with contextlib.suppress(Exception, asyncio.CancelledError):
-                await asyncio.shield(aclose())
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            await asyncio.shield(
-                ctx.app.recover_incomplete_session(
+
+        async def settle_cancelled_child() -> None:
+            nonlocal generated_child_ownership
+            aclose = getattr(run_stream, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await aclose()
+            await authenticate_unacknowledged_generated_child()
+            if not generated_child_ownership.is_generated or generated_child_ownership.is_created:
+                await ctx.app.recover_incomplete_session(
                     IncompleteSessionRecoveryRequest(
                         session_id=child_session_id,
                         reason="workflow_step_cancelled",
                         metadata={"workflow": ctx.workflow_name, "step_id": step_id},
                     )
                 )
+
+        settlement_task = asyncio.create_task(settle_cancelled_child())
+        settlement = await await_shielded_task_outcome(
+            settlement_task,
+            cancellation=cancellation,
+        )
+        if settlement.error is not None:
+            cancellation.add_note(
+                f"Workflow child cancellation settlement failed: {type(settlement.error).__name__}."
             )
-        raise
+        authoritative_cancellation = settlement.cancellation or cancellation
+        if authoritative_cancellation is cancellation:
+            raise
+        raise authoritative_cancellation from None
     except StepError:
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
         raise
+    except WorkflowSupersededError:
+        if capture_structured_output:
+            ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
+        await close_unattached_generated_child()
+        raise
     except Exception as exc:
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
+        if generated_child_ownership is _GeneratedChildOwnership.UNCREATED:
+            reconciliation_task = asyncio.create_task(
+                recover_authenticated_unacknowledged_child(
+                    reason="workflow_step_create_acknowledgement_lost"
+                )
+            )
+            reconciliation = await await_shielded_task_outcome(reconciliation_task)
+            if reconciliation.cancellation is not None:
+                if reconciliation.error is not None:
+                    reconciliation.cancellation.add_note(
+                        "Workflow child create reconciliation failed: "
+                        f"{type(reconciliation.error).__name__}."
+                    )
+                raise reconciliation.cancellation from None
+            if reconciliation.error is not None:
+                exc.add_note(
+                    "Workflow child create reconciliation failed: "
+                    f"{type(reconciliation.error).__name__}."
+                )
+        else:
+            await close_unattached_generated_child()
         raise StepError(
             str(exc),
             step_id=step_id,
@@ -815,6 +1031,7 @@ async def _run_step(
     except BaseException:
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
+        await close_unattached_generated_child()
         raise
 
     raw_output_available = False
@@ -855,6 +1072,57 @@ async def _run_step(
     )
     await _append_step_completed(ctx, agent, result)
     return result
+
+
+async def _reserve_step_started(
+    ctx: WorkflowContext,
+    *,
+    step_id: str,
+    started_event: Event,
+    structured_output: StructuredOutputSpec | None,
+) -> StepResult | None:
+    if await ctx.journal.append_step_started(
+        started_event,
+        attempt_id=ctx.attempt_id,
+    ):
+        return None
+    completed_child_session_id, _ = await ctx.journal.step_replay_ids(
+        step_id=step_id,
+        attempt_id=ctx.attempt_id,
+    )
+    if completed_child_session_id is not None:
+        completed_child = await ctx.app.session_store.load(completed_child_session_id)
+        if completed_child is not None and completed_child.status == SessionStatus.COMPLETED:
+            return await _step_result_from_completed_child(
+                ctx,
+                step_id=step_id,
+                child_session_id=completed_child_session_id,
+                structured_output=structured_output,
+            )
+    raise WorkflowSupersededError(
+        f"Workflow step {step_id!r} in run {ctx.session_id!r} was already "
+        "reserved by another attempt; this attempt stops to avoid "
+        "double-executing the child session."
+    )
+
+
+async def _close_unattached_generated_child(
+    ctx: WorkflowContext,
+    *,
+    child_session_id: str,
+    run_stream: AsyncIterator[Event],
+    step_id: str,
+) -> None:
+    aclose = getattr(run_stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
+    await ctx.app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(
+            session_id=child_session_id,
+            reason="workflow_step_reservation_lost",
+            metadata={"workflow": ctx.workflow_name, "step_id": step_id},
+        )
+    )
 
 
 async def _append_step_completed(

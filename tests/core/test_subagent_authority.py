@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
@@ -59,7 +60,7 @@ def test_foreground_subagent_generated_lineage_survives_short_secret_collision()
 
     assert events[-1].type == EventType.SESSION_COMPLETED, events[-1].payload
     assert len(children) == 1
-    assert children[0].id.startswith(f"{root.id}_subagent_")
+    assert re.fullmatch(r"cayu-child:v1:subagent:[0-9a-f]{64}", children[0].id)
     assert children[0].parent_session_id == root.id
     assert children[0].causal_budget_id == root.id
     assert children[0].status.value == "completed"

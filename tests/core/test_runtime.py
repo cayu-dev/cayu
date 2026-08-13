@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 import traceback
@@ -18037,7 +18038,7 @@ def test_subagent_tool_background_starts_child_without_waiting_for_completion():
     parent_events, child_session_id = asyncio.run(run())
 
     assert parent_events[-1].type == EventType.SESSION_COMPLETED
-    assert child_session_id.startswith("sess_subagent_background_parent_subagent_")
+    assert re.fullmatch(r"cayu-child:v1:subagent:[0-9a-f]{64}", child_session_id)
 
 
 def test_subagent_result_tool_waits_for_background_child_result():
@@ -25444,11 +25445,13 @@ async def _seed_crashed_spawn_parent(
     child_status,
     mode: str = "background",
     linkage: str = "correct",
+    conflicting_linkage: bool = False,
+    generated_identity_conflict: bool = False,
 ):
     """Reproduce the AGT-02 crash window: a parent with an in-progress ``subagent`` spawn tool round
     (STARTED, no terminal event) and a durably-created child.
 
-    ``mode`` is the child's subagent mode ("background" re-attaches; "foreground" must fall back).
+    ``mode`` is the child's subagent execution mode.
     ``linkage`` controls the child's stamped idempotency_key: "correct" stamps the child's real key,
     "none" omits it, "wrong_round" stamps a key for a different tool round (both must fall back)."""
     from cayu.runtime import _runtime_records as runtime_records
@@ -25503,7 +25506,14 @@ async def _seed_crashed_spawn_parent(
         tool_round_identity=_tool_round_identity(),
     )
 
-    subagent_meta = {"agent": "reviewer", "mode": mode, "tool_call_id": "call_spawn"}
+    subagent_meta = {
+        "agent": "reviewer",
+        "agent_name": "reviewer",
+        "context_mode": "task_only",
+        "mode": mode,
+        "parent_session_id": "parent",
+        "tool_call_id": "call_spawn",
+    }
     if linkage == "correct":
         subagent_meta["idempotency_key"] = tool_execution.tool_idempotency_key(
             session_id="parent",
@@ -25514,21 +25524,48 @@ async def _seed_crashed_spawn_parent(
         subagent_meta["idempotency_key"] = tool_execution.tool_idempotency_key(
             session_id="parent", tool_round_id="a-different-round", tool_call_id="call_spawn"
         )
+    child_session_id = "child"
+    if generated_identity_conflict:
+        from cayu.runtime._child_session_identity import (
+            ChildSessionKind,
+            generate_child_session_id,
+        )
+
+        child_session_id = generate_child_session_id(
+            kind=ChildSessionKind.SUBAGENT,
+            parent_session_id="parent",
+            logical_spawn_id=subagent_meta["idempotency_key"],
+        )
+        subagent_meta["spawn_fingerprint"] = "sha256:" + ("0" * 64)
     await store.create(
         RunRequest(
             agent_name="reviewer",
-            session_id="child",
+            session_id=child_session_id,
             parent_session_id="parent",
+            causal_budget_id="parent",
             messages=[Message.text("user", "review")],
             metadata={"subagent": subagent_meta},
         ),
         identity=identity,
     )
     await store.append_transcript_messages(
-        "child",
+        child_session_id,
         [Message.text("user", "review"), Message.text("assistant", "looks good")],
     )
-    await store.update_status("child", child_status)
+    await store.update_status(child_session_id, child_status)
+    if conflicting_linkage:
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="conflicting-child",
+                parent_session_id="parent",
+                causal_budget_id="parent",
+                messages=[Message.text("user", "different review")],
+                metadata={"subagent": dict(subagent_meta)},
+            ),
+            identity=identity,
+        )
+        await store.update_status("conflicting-child", child_status)
 
     await store.checkpoint("parent", checkpoint)
     await store.append_events(
@@ -25573,7 +25610,14 @@ def _recovered_tool_event(result):
     )
 
 
-def _recover_parent(child_status, *, mode: str = "background", linkage: str = "correct"):
+def _recover_parent(
+    child_status,
+    *,
+    mode: str = "background",
+    linkage: str = "correct",
+    conflicting_linkage: bool = False,
+    generated_identity_conflict: bool = False,
+):
     async def run():
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
@@ -25584,13 +25628,19 @@ def _recover_parent(child_status, *, mode: str = "background", linkage: str = "c
                 "reviewer": SubagentSpec(
                     agent_name="reviewer",
                     description="Review delegated work.",
+                    mode=SubagentExecutionMode(mode),
                 )
             },
         )
         app.register_agent(AgentSpec(name="parent", model="fake-model"), tools=[subagent_tool])
         app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
         await _seed_crashed_spawn_parent(
-            store, child_status=child_status, mode=mode, linkage=linkage
+            store,
+            child_status=child_status,
+            mode=mode,
+            linkage=linkage,
+            conflicting_linkage=conflicting_linkage,
+            generated_identity_conflict=generated_identity_conflict,
         )
         result = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id="parent", reason="worker restart")
@@ -25646,14 +25696,30 @@ def test_recovery_without_child_linkage_falls_back_to_unknown_outcome():
     assert _recovered_tool_event(result).type == EventType.TOOL_CALL_FAILED
 
 
-def test_recovery_does_not_reattach_foreground_child():
-    # Foreground children have no supported fetch path (subagent_result refuses non-background sessions),
-    # so recovery must NOT re-attach them — it falls back to "outcome unknown" instead of a dangling ref.
-    store, _result = _recover_parent(SessionStatus.COMPLETED, mode="foreground")
+def test_recovery_reattaches_completed_foreground_child():
+    store, result = _recover_parent(SessionStatus.COMPLETED, mode="foreground")
     recovered = _recovered_parent_tool_result(store)
 
-    assert recovered.structured["recovery_reason"] == "pending_tool_round_missing_terminal_event"
-    assert "child_session_id" not in recovered.structured
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_reattached_subagent"
+    assert recovered.structured["child_session_id"] == "child"
+    assert recovered.structured["mode"] == "foreground"
+    assert recovered.structured["status"] == "completed"
+    assert recovered.structured["outcome_unknown"] is False
+    assert "subagent_result" not in recovered.content
+    assert _recovered_tool_event(result).type == EventType.TOOL_CALL_COMPLETED
+
+
+def test_recovery_reattaches_nonterminal_foreground_child_as_unknown():
+    store, result = _recover_parent(SessionStatus.RUNNING, mode="foreground")
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_reattached_subagent"
+    assert recovered.structured["child_session_id"] == "child"
+    assert recovered.structured["mode"] == "foreground"
+    assert recovered.structured["status"] == "running"
+    assert recovered.structured["outcome_unknown"] is True
+    assert recovered.is_error is True
+    assert _recovered_tool_event(result).type == EventType.TOOL_CALL_FAILED
 
 
 def test_recovery_ignores_child_stamped_for_a_different_round():
@@ -25666,6 +25732,34 @@ def test_recovery_ignores_child_stamped_for_a_different_round():
     assert "child_session_id" not in recovered.structured
 
 
+@pytest.mark.parametrize("mode", ["foreground", "background"])
+def test_recovery_fails_closed_when_multiple_children_claim_one_spawn_identity(mode):
+    store, _result = _recover_parent(
+        SessionStatus.COMPLETED,
+        mode=mode,
+        conflicting_linkage=True,
+    )
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_missing_terminal_event"
+    assert recovered.structured["outcome_unknown"] is True
+    assert "child_session_id" not in recovered.structured
+
+
+@pytest.mark.parametrize("mode", ["foreground", "background"])
+def test_recovery_rejects_single_new_identity_with_contradictory_spawn_evidence(mode):
+    store, _result = _recover_parent(
+        SessionStatus.COMPLETED,
+        mode=mode,
+        generated_identity_conflict=True,
+    )
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_missing_terminal_event"
+    assert recovered.structured["outcome_unknown"] is True
+    assert "child_session_id" not in recovered.structured
+
+
 async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
     """Seed a parent + a background child stamped for `child_round_id`, then run the interrupt-close
     re-attach against a generic interrupted outcome for tool round `tool_round_id`."""
@@ -25674,6 +25768,20 @@ async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
 
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
+    subagent_tool = SubagentTool(
+        app,
+        agents={
+            "reviewer": SubagentSpec(
+                agent_name="reviewer",
+                mode=SubagentExecutionMode.BACKGROUND,
+            )
+        },
+    )
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[subagent_tool],
+    )
+    app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
     identity = SessionIdentity(provider_name="fake", model="fake-model")
     await store.create(
         RunRequest(agent_name="parent", session_id="parent", messages=[Message.text("user", "go")]),
@@ -25687,11 +25795,15 @@ async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
             agent_name="reviewer",
             session_id="child",
             parent_session_id="parent",
+            causal_budget_id="parent",
             messages=[Message.text("user", "review")],
             metadata={
                 "subagent": {
                     "agent": "reviewer",
+                    "agent_name": "reviewer",
+                    "context_mode": "task_only",
                     "mode": "background",
+                    "parent_session_id": "parent",
                     "tool_call_id": "call_spawn",
                     "idempotency_key": key,
                 }
@@ -25701,15 +25813,24 @@ async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
     )
     await store.update_status("child", SessionStatus.INTERRUPTED)
     interrupted = runtime_records.ToolCallOutcome(
-        call=runtime_records.ToolCallRequest(id="call_spawn", name="subagent", arguments={}),
+        call=runtime_records.ToolCallRequest(
+            id="call_spawn",
+            name="subagent",
+            arguments={"agent": "reviewer", "task": "review"},
+        ),
         result=ToolResult(
             content="Tool call interrupted before completion.",
             structured={"interrupted": True, "tool_call_id": "call_spawn"},
             is_error=True,
         ),
     )
+    parent = await store.load("parent")
+    assert parent is not None
     outcomes = await app._recovery_coordinator.reattach_subagent_children_in_outcomes(
-        session_id="parent", tool_round_id=tool_round_id, outcomes=[interrupted]
+        session=parent,
+        registered_agent=app._get_registered_agent("parent"),
+        tool_round_id=tool_round_id,
+        outcomes=[interrupted],
     )
     return outcomes[0].result
 
@@ -25748,7 +25869,20 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(FakeProvider([]), default=True)
-    app.register_agent(AgentSpec(name="parent", model="fake-model"))
+    subagent_tool = SubagentTool(
+        app,
+        agents={
+            "reviewer": SubagentSpec(
+                agent_name="reviewer",
+                mode=SubagentExecutionMode.BACKGROUND,
+            )
+        },
+    )
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[subagent_tool],
+    )
+    app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
     identity = SessionIdentity(provider_name="fake", model="fake-model")
     interaction_id = "interaction-parent-interrupted-spawn"
     parent_messages = [Message.text("user", "go")]
@@ -25772,7 +25906,7 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
     tool_call = runtime_records.ToolCallRequest(
         id="call_spawn",
         name="subagent",
-        arguments={},
+        arguments={"agent": "reviewer", "task": "review"},
     )
     checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
         None,
@@ -25795,11 +25929,15 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
             agent_name="reviewer",
             session_id="child",
             parent_session_id="parent",
+            causal_budget_id="parent",
             messages=[Message.text("user", "review")],
             metadata={
                 "subagent": {
                     "agent": "reviewer",
+                    "agent_name": "reviewer",
+                    "context_mode": "task_only",
                     "mode": "background",
+                    "parent_session_id": "parent",
                     "tool_call_id": "call_spawn",
                     "idempotency_key": key,
                 }

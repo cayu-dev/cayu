@@ -1342,15 +1342,21 @@ def recovered_subagent_tool_result(
 
     Closes the parent->child linkage window: instead of resolving an incomplete spawn call as an unknown
     (or generic interrupted) outcome, record the discovered child (id + terminal status) so the parent
-    transcript keeps a durable reference. The parent can fetch the child's full output later via
-    ``subagent_result``. Shared by the crash-recovery and live-interrupt close paths.
+    transcript keeps a durable reference. Shared by the crash-recovery and live-interrupt close paths.
     """
     status = child.status
     terminal = status in _SUBAGENT_RECOVERY_TERMINAL_STATUSES
+    subagent = child.metadata.get("subagent")
+    mode = subagent.get("mode") if isinstance(subagent, dict) else None
     if terminal:
+        retrieval = (
+            "Use subagent_result for its full output."
+            if mode == "background"
+            else "Its durable session and transcript remain available for inspection."
+        )
         content = (
             f"Subagent {child.id} was recovered with terminal status {status.value} after Cayu "
-            "recovered an incomplete tool round. Use subagent_result for its full output."
+            f"recovered an incomplete tool round. {retrieval}"
         )
     else:
         # A non-terminal child means its in-process execution did not survive the crash. The linkage is
@@ -1369,6 +1375,7 @@ def recovered_subagent_tool_result(
             "tool_name": tool_name,
             "child_session_id": child.id,
             "parent_session_id": child.parent_session_id,
+            "mode": mode,
             "status": status.value,
             "outcome_unknown": not terminal,
         },

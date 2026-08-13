@@ -351,6 +351,7 @@ from cayu.runtime.sessions import (
     _set_session_interaction_recovered_active_through,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
+    bind_runtime_session_create_claim,
     copy_compact_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
@@ -3471,12 +3472,18 @@ class SessionEngine:
             environment_name=_environment_name(registered_environment),
             interaction_id=interaction_id,
         )
+        session_identity = _session_identity(
+            provider_name=registered_provider.name,
+            model=model,
+        )
+        bind_runtime_session_create_claim(
+            request,
+            identity=session_identity,
+            interaction_started_event=interaction_started_event,
+        )
         session = await self.session_store.create(
             request,
-            identity=_session_identity(
-                provider_name=registered_provider.name,
-                model=model,
-            ),
+            identity=session_identity,
             interaction_started_event=interaction_started_event,
             interaction_source_messages=request.messages,
         )
