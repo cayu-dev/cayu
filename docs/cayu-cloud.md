@@ -20,6 +20,18 @@ returns the Cloud-owned structured publication activity for that exact immutable
 release. Both commands use authenticated, tenant-scoped customer API responses and
 emit the same machine-readable JSON envelope as the rest of the Cloud CLI.
 
+`service status` reports `degraded` when a required Agent process repeatedly fails to
+start. Its `result.issues` array preserves Cloud's safe structured diagnostics, including
+the affected process, failed-attempt count, stable issue code, and remediation hint. Use
+the hint together with `cayu cloud service logs --application AGENT_SLUG`; credentials and
+raw provider error bodies are never included in the issue payload.
+
+By default, `deploy` also waits for a declared Agent service to reach `running`. A
+`degraded` service ends that wait with a nonzero `service_degraded` result. Its
+`error.issues` array preserves every structured process diagnostic, while `error.message`
+aggregates their safe messages and remediation hints for humans. `--no-wait` keeps the
+explicit asynchronous workflow.
+
 `cayu cloud deploy` creates the 8-63 character application slug declared in
 `cayu-cloud.toml` when it does not exist, then updates it on later deploys. Slugs use
 lowercase letters, numbers, and interior hyphens. `--application SLUG`

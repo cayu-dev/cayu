@@ -19,6 +19,7 @@ from cayu.cli import _cloud_project as cloud_project
 from cayu.cli import cloud as cloud_cli
 from cayu.cli import main
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_evidence import EvidenceRecorder
 
 
 def _write_ready_context(
@@ -587,6 +588,48 @@ def test_service_destroy_waits_until_the_application_is_stopped() -> None:
         ("DELETE", "/v1/applications/app_research/service"),
         ("GET", "/v1/applications/app_research/service"),
     ]
+
+
+def test_service_status_preserves_structured_health_issues(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    issue = {
+        "code": "process_start_failed",
+        "failure_count": 4,
+        "hint": "Check the worker logs and Agent environment configuration.",
+        "message": "The Agent worker is repeatedly failing to start.",
+        "process": "worker",
+        "severity": "error",
+    }
+
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, kwargs
+            if path == "/v1/applications":
+                return {"items": [{"id": "outbound-agent", "name": "Outbound Agent"}]}
+            return {
+                "application_id": "outbound-agent",
+                "issues": [issue],
+                "status": "degraded",
+            }
+
+    monkeypatch.setattr(
+        cloud_cli,
+        "_cloud_client",
+        lambda *_args, **_kwargs: Client(),
+    )
+
+    assert main(["cloud", "service", "status", "--application", "outbound-agent"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "operation": "service.status",
+        "result": {
+            "application_id": "outbound-agent",
+            "issues": [issue],
+            "status": "degraded",
+        },
+    }
 
 
 @pytest.mark.parametrize("action", ["sleep", "wake"])
@@ -1412,6 +1455,7 @@ EOF
         "message": "Deployment succeeded, but local evidence could not be recorded.",
         "status": "unavailable",
     }
+
     service_request = next(
         item
         for item in requests
@@ -1452,6 +1496,165 @@ EOF
         "MODE": "[redacted]",
     }
     assert "disabled" not in evidence_files[0].read_text()
+
+
+def test_cloud_deploy_wait_preserves_every_degraded_process_issue(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    issues = [
+        {
+            "code": "process_start_failed",
+            "failure_count": 3,
+            "hint": "Check the web logs and Agent environment configuration.",
+            "message": "The Agent web process is repeatedly failing to start.",
+            "process": "web",
+            "severity": "error",
+        },
+        {
+            "code": "process_start_failed",
+            "failure_count": 4,
+            "hint": "Check the worker logs and Agent environment configuration.",
+            "message": "The Agent worker is repeatedly failing to start.",
+            "process": "worker",
+            "severity": "error",
+        },
+    ]
+
+    class Client:
+        def __init__(self) -> None:
+            self.deployment_reads = 0
+            self.service_reads = 0
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            if path == "/v1/applications":
+                return {
+                    "items": [
+                        {
+                            "current_deployment_id": None,
+                            "id": "outbound-agent",
+                            "name": "Outbound Agent",
+                            "revision": 1,
+                        }
+                    ]
+                }
+            if method == "POST" and path.endswith("/deployments"):
+                return {"id": "dep_health", "status": "queued"}
+            if method == "POST" and path.endswith("/promote"):
+                return {
+                    "current_deployment_id": "dep_health",
+                    "id": "outbound-agent",
+                    "name": "Outbound Agent",
+                    "revision": 2,
+                }
+            if path.endswith("/deployments/dep_health"):
+                self.deployment_reads += 1
+                return {
+                    "id": "dep_health",
+                    "status": "smoke_tested" if self.deployment_reads == 1 else "promoted",
+                }
+            if method == "PUT" and path.endswith("/service"):
+                return {"issues": [], "status": "starting"}
+            if method == "GET" and path.endswith("/service"):
+                self.service_reads += 1
+                return {"issues": issues, "status": "degraded"}
+            raise AssertionError(f"unexpected Cloud request: {method} {path}")
+
+    manifest = cloud_project.CloudProjectManifest.loads(
+        """
+schema_version = 2
+application = "outbound-agent"
+name = "Outbound Agent"
+version = "1.0.0"
+entrypoint = "python -m outbound"
+capabilities = ["model.generate"]
+cpu_millis = 512
+memory_mb = 1024
+timeout_seconds = 600
+environment = "python"
+compatibility = "cayu>=0.1"
+policy_version = "v1"
+[worker]
+command = "python -m outbound.worker"
+"""
+    )
+    project = cloud_project.ResolvedCloudProject(
+        root=None,
+        manifest_path=tmp_path / "cayu-cloud.toml",
+        manifest=manifest,
+        repository="https://github.com/example/outbound-agent",
+        revision="a" * 40,
+    )
+    client = Client()
+
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._deploy(
+            SimpleNamespace(
+                application=None,
+                no_promote=False,
+                no_wait=False,
+                poll_seconds=0.01,
+                wait_seconds=10.0,
+            ),
+            client=client,
+            recorder=EvidenceRecorder(tmp_path / "evidence"),
+            project=project,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    assert raised.value.category == "service_degraded"
+    assert str(raised.value) == (
+        "The Agent web process is repeatedly failing to start. "
+        "Check the web logs and Agent environment configuration. "
+        "The Agent worker is repeatedly failing to start. "
+        "Check the worker logs and Agent environment configuration."
+    )
+    assert client.service_reads == 1
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "category": "service_degraded",
+            "issues": issues,
+            "message": (
+                "The Agent web process is repeatedly failing to start. "
+                "Check the web logs and Agent environment configuration. "
+                "The Agent worker is repeatedly failing to start. "
+                "Check the worker logs and Agent environment configuration."
+            ),
+        },
+        "ok": False,
+    }
+
+
+def test_cloud_deploy_wait_requires_the_agent_service_to_be_running() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str]] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            self.requests.append((method, path))
+            return {"issues": [], "status": "running"}
+
+    client = Client()
+
+    result = cloud_cli._wait_for_service(
+        client,
+        application_id="outbound-agent",
+        initial={"issues": [], "status": "sleeping"},
+        poll_seconds=0.01,
+        wait_seconds=10.0,
+        sleep=lambda _: None,
+        monotonic=lambda: 0.0,
+    )
+
+    assert result["status"] == "running"
+    assert client.requests == [
+        ("GET", "/v1/applications/outbound-agent/service"),
+    ]
 
 
 def test_cloud_inspection_commands_are_implemented_by_the_core_package(

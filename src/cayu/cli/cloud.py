@@ -34,6 +34,8 @@ from cayu.cli._cloud_project import (
 
 _DEPLOYMENT_FAILURES = {"cancelled", "destroyed", "failed"}
 _DEPLOYMENT_READY = {"smoke_tested", "promoted"}
+_SERVICE_FAILURES = {"degraded", "failed", "stopped"}
+_SERVICE_READY = {"running"}
 _PRODUCTION_API_URL = "https://cloud.cayu.dev"
 
 
@@ -43,6 +45,20 @@ class CloudCommandError(RuntimeError):
     def __init__(self, category: str, message: str) -> None:
         super().__init__(message)
         self.category = category
+
+
+class _CloudServiceHealthError(CloudApiError):
+    """Safe structured Agent service health failure."""
+
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        issues: Sequence[dict[str, Any]],
+    ) -> None:
+        super().__init__(category, message)
+        self.issues = [dict(issue) for issue in issues]
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -105,9 +121,12 @@ def _cloud_failure(exc: Exception) -> int:
         message = "Cayu Cloud API response is missing required data."
     else:
         category, message = "invalid_input", str(exc)
+    error: dict[str, object] = {"category": category, "message": message}
+    if isinstance(exc, _CloudServiceHealthError):
+        error["issues"] = exc.issues
     print(
         json.dumps(
-            {"error": {"category": category, "message": message}, "ok": False},
+            {"error": error, "ok": False},
             sort_keys=True,
         )
     )
@@ -632,6 +651,16 @@ def _deploy(
             "PUT",
             f"/v1/applications/{application['id']}/service",
         )
+        if not arguments.no_wait:
+            service = _wait_for_service(
+                client,
+                application_id=str(application["id"]),
+                initial=service,
+                poll_seconds=arguments.poll_seconds,
+                wait_seconds=arguments.wait_seconds,
+                sleep=sleep,
+                monotonic=monotonic,
+            )
     result = {
         "application": application,
         "deployment": deployment,
@@ -975,6 +1004,57 @@ def _wait_for_deployment(
         if monotonic() >= deadline:
             raise CloudApiError("wait_timeout", "Timed out waiting for deployment.")
         sleep(poll_seconds)
+
+
+def _wait_for_service(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    initial: dict[str, Any],
+    poll_seconds: float,
+    wait_seconds: float,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> dict[str, Any]:
+    _validate_wait(poll_seconds, wait_seconds)
+    deadline = monotonic() + wait_seconds
+    path = f"/v1/applications/{application_id}/service"
+    service = initial
+    while True:
+        status = service.get("status")
+        if status in _SERVICE_READY:
+            return service
+        if status in _SERVICE_FAILURES:
+            issues = _service_issues(service)
+            raise _CloudServiceHealthError(
+                "service_degraded" if status == "degraded" else "service_failed",
+                _service_failure_message(issues, status=str(status)),
+                issues=issues,
+            )
+        if monotonic() >= deadline:
+            raise CloudApiError("wait_timeout", "Timed out waiting for Agent service readiness.")
+        sleep(poll_seconds)
+        service = client.request("GET", path)
+
+
+def _service_issues(service: dict[str, Any]) -> list[dict[str, Any]]:
+    issues = service.get("issues")
+    if not isinstance(issues, list):
+        return []
+    return [dict(issue) for issue in issues if isinstance(issue, dict)]
+
+
+def _service_failure_message(issues: Sequence[dict[str, Any]], *, status: str) -> str:
+    diagnostics: list[str] = []
+    for issue in issues:
+        message = issue.get("message")
+        hint = issue.get("hint")
+        parts = [value for value in (message, hint) if isinstance(value, str) and value]
+        if parts:
+            diagnostics.append(" ".join(parts))
+    if diagnostics:
+        return " ".join(diagnostics)
+    return f"Agent service reached terminal status: {status}"
 
 
 def _read_context(path: Path) -> dict[str, Any]:
