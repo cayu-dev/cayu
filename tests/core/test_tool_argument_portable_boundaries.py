@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Literal, cast
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     AgentSpec,
@@ -64,6 +65,7 @@ def _session() -> Session:
         agent_name="worker",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_portable_tool_arguments"),
     )
 
 

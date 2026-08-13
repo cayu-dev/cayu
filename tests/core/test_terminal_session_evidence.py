@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 from tests.core.postgres_contention_support import drop_cayu_tables
 
 import cayu.runtime.sessions as sessions_module
@@ -64,6 +65,7 @@ def _session(
         provider_name="fake",
         model="fake-model",
         causal_budget_id="session-evidence",
+        invocation=fixture_session_invocation("session-evidence"),
         status=status,
         created_at=now,
         updated_at=now,

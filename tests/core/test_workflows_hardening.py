@@ -39,6 +39,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 import cayu
 import cayu.workflows as workflows
@@ -56,11 +57,13 @@ from cayu.runtime import (
     IncompleteSessionsRecoveryRequest,
     InMemoryEventSink,
     InMemorySessionStore,
+    InvocationOriginTrust,
     ModelPrice,
     PriceBook,
     RetryPolicy,
     RunLimits,
     RunRequest,
+    SessionExecutionSource,
     SessionIdentity,
     SessionStatus,
     ToolApprovalDecision,
@@ -1944,6 +1947,11 @@ def test_step_child_session_records_workflow_lineage():
     assert child is not None
     assert child.parent_session_id == "wf-lineage"
     assert child.causal_budget_id == "wf-lineage"
+    anchor = asyncio.run(app.session_store.load("wf-lineage"))
+    assert anchor is not None
+    assert child.invocation.origin == anchor.invocation.origin
+    assert child.invocation.root_session_id == anchor.id
+    assert child.invocation.source is SessionExecutionSource.WORKFLOW_STEP
 
 
 def test_step_child_session_inherits_anchor_causal_budget_id():
@@ -1993,6 +2001,8 @@ def test_step_no_anchor_custom_journal_keeps_budget_link_without_parent():
     assert child is not None
     assert child.parent_session_id is None
     assert child.causal_budget_id == "wf-memory"
+    assert child.invocation.root_session_id == child.id
+    assert child.invocation.source is SessionExecutionSource.WORKFLOW_STEP
     assert [event.type for event in journal.events] == [
         WORKFLOW_ATTEMPT_EVENT_TYPE,
         EventType.WORKFLOW_STEP_STARTED,
@@ -3638,6 +3648,75 @@ def test_generated_workflow_child_identity_survives_process_reconstruction() -> 
         if event.type == EventType.WORKFLOW_STEP_STARTED
     ]
     assert started_ids == [child_session_id]
+
+
+def test_generated_workflow_child_reconstruction_rejects_contradictory_invocation() -> None:
+    class SimulatedProcessLoss(BaseException):
+        pass
+
+    app, provider = _scripted_assistant_app(
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+    )
+    store = app.session_store
+    assert isinstance(store, InMemorySessionStore)
+    original_create = store.create
+    created_child_id: str | None = None
+
+    async def create_then_process_exits(request: RunRequest, **kwargs: Any):
+        nonlocal created_child_id
+        created = await original_create(request, **kwargs)
+        if request.session_id is not None and request.session_id.startswith(
+            "cayu-child:v1:workflow-step:"
+        ):
+            created_child_id = request.session_id
+            raise SimulatedProcessLoss
+        return created
+
+    async def run() -> object:
+        store.create = create_then_process_exits  # type: ignore[method-assign]
+        with pytest.raises(SimulatedProcessLoss):
+            await step(
+                TinyWorkflow(app).context("workflow-parent"),
+                agent="assistant",
+                step_id="durable-step",
+                prompt="go",
+            )
+        store.create = original_create  # type: ignore[method-assign]
+        assert created_child_id is not None
+        child = await store.load(created_child_id)
+        assert child is not None
+        unrelated = fixture_session_invocation("unrelated-root")
+        contradictory_origin = child.invocation.origin.model_copy(
+            update={
+                "trust": InvocationOriginTrust.HOST_ASSERTED,
+                "subject": "unrelated-user",
+            }
+        )
+        contradictory_invocations = (
+            child.invocation.model_copy(update={"origin": contradictory_origin}),
+            child.invocation.model_copy(
+                update={"root_invocation_id": unrelated.root_invocation_id}
+            ),
+            child.invocation.model_copy(update={"root_session_id": unrelated.root_session_id}),
+            child.invocation.model_copy(update={"source": SessionExecutionSource.SDK_RUN}),
+        )
+        for invocation in contradictory_invocations:
+            store._sessions[created_child_id] = child.model_copy(update={"invocation": invocation})
+            with pytest.raises(StepError, match="generated child session identity collision"):
+                await step(
+                    TinyWorkflow(app).context("workflow-parent"),
+                    agent="assistant",
+                    step_id="durable-step",
+                    prompt="go",
+                )
+        return await store.load(created_child_id)
+
+    contradictory = asyncio.run(run())
+
+    assert contradictory is not None
+    assert contradictory.invocation.source is SessionExecutionSource.SDK_RUN
+    assert contradictory.status == SessionStatus.RUNNING
+    assert provider.requests == []
 
 
 def test_generated_workflow_child_cancellation_does_not_settle_foreign_create_winner(

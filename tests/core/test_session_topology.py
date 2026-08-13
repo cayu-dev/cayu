@@ -442,12 +442,21 @@ def test_sqlite_topology_child_page_work_is_independent_of_branch_size(tmp_path)
                         id, agent_name, provider_name, model, parent_session_id,
                         causal_budget_id, runtime_name, runtime_version,
                         environment_name, status, created_at, updated_at,
-                        last_activity_at, run_epoch, metadata_json
+                        last_activity_at, run_epoch, invocation_json, metadata_json
                     )
                     SELECT
                         printf('child-%06d', value), 'agent', 'fake', 'fake-model',
                         'parent', 'budget', 'cayu', NULL, NULL, 'pending', ?, ?, ?,
-                        0, '{}'
+                        0,
+                        json_object(
+                            'schema_version', 1,
+                            'origin', json_object('trust', 'unattributed'),
+                            'root_invocation_id',
+                            'f055bedc-62cf-4fa4-979a-d0378ca93131',
+                            'root_session_id', 'parent',
+                            'source', 'subagent'
+                        ),
+                        '{}'
                     FROM numbers
                     """,
                     (timestamp, timestamp, timestamp),

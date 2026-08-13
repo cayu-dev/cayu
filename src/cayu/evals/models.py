@@ -53,9 +53,9 @@ from cayu.runtime.usage import (
 EVAL_SCHEMA_VERSION = 7
 
 # Version of the standalone trajectory JSON document written by
-# write_trajectory_json. Version 2 adds conclusive workspace/artifact capture
-# provenance; load_trajectory intentionally does not guess or migrate older shapes.
-TRAJECTORY_SCHEMA_VERSION = 2
+# write_trajectory_json. Version 3 includes immutable session invocation provenance;
+# load_trajectory intentionally does not guess or migrate older shapes.
+TRAJECTORY_SCHEMA_VERSION = 3
 
 # Cap on the bytes copied out of a probed workspace file into the serialized trajectory. A file
 # larger than this is captured truncated — with its true size and a content hash still recorded —

@@ -306,7 +306,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 31
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 36
 _SQLITE_TASK_MIN_REQUIRED_REVISION = 34
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -576,7 +576,7 @@ def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | 
         SELECT id, agent_name, provider_name, model, parent_session_id,
                causal_budget_id, runtime_name, runtime_version, environment_name,
                status, created_at, updated_at, last_activity_at, run_epoch,
-               metadata_json
+               invocation_json, metadata_json
         FROM cayu_sessions
         WHERE id = ?
         """,
@@ -1568,21 +1568,35 @@ class SQLiteSessionStore(SessionStore):
         identity = copy_session_identity(identity)
         async with self._lock:
             self._require_current_public_authority_configuration(self._connection)
-            session = sqlite_support.session_from_request(request, identity=identity)
-            admission = _copy_optional_interaction_admission(
-                session.id,
-                interaction_started_event,
-                interaction_source_messages,
-                defer_transcript=True,
-            )
-            if admission is not None:
-                session = session.model_copy(
-                    update={"status": SessionStatus.RUNNING, "run_epoch": 1}
-                )
-            if session.parent_session_id == session.id:
+            if request.session_id is not None and request.parent_session_id == request.session_id:
                 raise ValueError("Session cannot be its own parent.")
             try:
+                self._connection.execute("BEGIN IMMEDIATE")
                 with self._connection:
+                    parent_session = (
+                        None
+                        if request.parent_session_id is None
+                        else _load_session(self._connection, request.parent_session_id)
+                    )
+                    if request.parent_session_id is not None and parent_session is None:
+                        raise ValueError(f"Parent session not found: {request.parent_session_id}")
+                    session = sqlite_support.session_from_request(
+                        request,
+                        identity=identity,
+                        parent_session=parent_session,
+                    )
+                    admission = _copy_optional_interaction_admission(
+                        session.id,
+                        interaction_started_event,
+                        interaction_source_messages,
+                        defer_transcript=True,
+                    )
+                    if admission is not None:
+                        session = session.model_copy(
+                            update={"status": SessionStatus.RUNNING, "run_epoch": 1}
+                        )
+                    if session.parent_session_id == session.id:
+                        raise ValueError("Session cannot be its own parent.")
                     self._connection.execute(
                         """
                         INSERT INTO cayu_sessions (
@@ -1600,9 +1614,10 @@ class SQLiteSessionStore(SessionStore):
                             updated_at,
                             last_activity_at,
                             run_epoch,
+                            invocation_json,
                             metadata_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session.id,
@@ -1619,6 +1634,7 @@ class SQLiteSessionStore(SessionStore):
                             sqlite_support.format_datetime(session.updated_at),
                             sqlite_support.format_datetime(session.last_activity_at),
                             session.run_epoch,
+                            sqlite_support.json_dumps(session.invocation.model_dump(mode="json")),
                             sqlite_support.json_dumps(session.metadata),
                         ),
                     )
@@ -1863,9 +1879,10 @@ class SQLiteSessionStore(SessionStore):
                         updated_at,
                         last_activity_at,
                         run_epoch,
+                        invocation_json,
                         metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     sqlite_support.session_to_row_values(fork),
                 )
@@ -8145,7 +8162,7 @@ class SQLiteSessionStore(SessionStore):
                 SELECT id, agent_name, provider_name, model, parent_session_id,
                        causal_budget_id, runtime_name, runtime_version, environment_name,
                        status, created_at, updated_at, last_activity_at, run_epoch,
-                       metadata_json
+                       invocation_json, metadata_json
                 FROM {session_source_sql}
                 {plan.page_where_sql}
                 ORDER BY {plan.order_sql}, id ASC

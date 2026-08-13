@@ -211,6 +211,10 @@ REVISIONS: tuple[Revision, ...] = (
     # ambiguous writes by deleting a shared deterministic entry id, so they must
     # not share a database with revision-35 knowledge writers.
     Revision(revision=35, kind=RevisionKind.BREAKING, compatible_from=35),
+    # Every session now persists its immutable root invocation origin and immediate
+    # execution source. Pre-36 writers cannot populate the required value, so they
+    # must not share a revision-36 database.
+    Revision(revision=36, kind=RevisionKind.BREAKING, compatible_from=36),
 )
 
 #: The revision an empty database is initialized to.

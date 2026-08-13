@@ -387,6 +387,7 @@ from cayu.runtime.sessions import (
     copy_resume_request,
     copy_run_request,
     execution_profile_adoption_request_fingerprint,
+    fork_session_invocation,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     session_input_contract_evidence,
@@ -9468,6 +9469,7 @@ class SessionEngine:
             runtime_version=source_session.runtime_version,
             environment_name=environment_name,
             status=source_session.status,
+            invocation=fork_session_invocation(source_session),
             labels=source_session.labels,
             metadata=copy_json_value(fork_metadata, "metadata"),
         )

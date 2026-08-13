@@ -173,15 +173,23 @@ application-consistent backup, and upgrade independently deployed Cayu servers,
 dashboards, generated clients, and workers together. Do not run mixed `v0.1.0`
 and `v0.2.0` processes against the same stores.
 
-The storage schema advances from revision 29 to revision 35. Run
+The storage schema advances from revision 29 to revision 36. Run
 `cayu storage status` followed by `cayu storage migrate` against every
 explicitly configured SQLite or PostgreSQL session store, budget ledger, eval
-store, task store, and knowledge store, then confirm revision 35 with no pending
-migrations before starting `v0.2.0` workers. Revisions 34–35 include the durable
-eval catalog, run lifecycle, delayed task availability contract, and immutable
-knowledge-publication receipts. Revision 35 is a breaking mixed-worker boundary:
-stop older workers before migrating because they do not honor operation-owned
-knowledge publication.
+store, task store, and knowledge store, then confirm revision 36 with no pending
+migrations before starting `v0.2.0` workers. Revisions 34–36 include the durable
+eval catalog, run lifecycle, delayed task availability contract, immutable
+knowledge-publication receipts, and immutable root invocation provenance.
+Revision 35 is a breaking mixed-worker boundary: stop older workers before
+migrating because they do not honor operation-owned knowledge publication.
+Breaking revision 36 requires invocation provenance on every session, including
+a Cayu-minted root invocation ID that remains distinct when a deleted root's
+session ID is reused. Populated pre-36 prerelease session stores must be
+recreated rather than assigned guessed origins; empty stores migrate normally.
+Standalone trajectory documents advance from schema version 2 to version 3
+because session-backed trajectories now retain the same immutable invocation
+provenance. Version-2 exports must be regenerated rather than assigned an
+invented origin during loading.
 
 ### Verification
 

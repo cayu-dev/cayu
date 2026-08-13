@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 from tests.core.test_runtime import (
     CompactionIdentityMutatingProvider,
     CompletedThenRetryableCompactionProvider,
@@ -129,6 +130,7 @@ def test_provider_backed_compactors_keep_construction_time_provider_identity(
         agent_name="assistant",
         provider_name="gateway",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_compactor_identity_snapshot"),
     )
     if compactor_kind == "model":
         compactor: ContextCompactor = ModelCompactor(
@@ -204,6 +206,7 @@ def test_provider_backed_compactors_freeze_invocation_identity_across_dispatch(
         agent_name="assistant",
         provider_name="gateway",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_compactor_invocation_identity"),
     )
     if compactor_kind == "model":
         compactor: ModelCompactor | PromptCacheCompactor = ModelCompactor(
@@ -745,6 +748,7 @@ def test_hierarchical_model_compactor_freezes_configuration_for_every_dispatch()
                     agent_name="assistant",
                     provider_name="gateway",
                     model="fake-model",
+                    invocation=fixture_session_invocation("sess_hierarchy_invocation_identity"),
                 ),
                 agent=AgentSpec(name="assistant", model="fake-model"),
                 messages=[Message.text("user", "x" * 5000)],
@@ -956,6 +960,7 @@ def test_prompt_cache_bounded_fallback_uses_frozen_provider_identity() -> None:
                     agent_name="assistant",
                     provider_name="gateway",
                     model="fake-model",
+                    invocation=fixture_session_invocation("sess_prompt_cache_identity_overflow"),
                 ),
                 agent=AgentSpec(name="assistant", model="fake-model"),
                 messages=[Message.text("user", "bounded transcript")],

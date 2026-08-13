@@ -44,6 +44,7 @@ from cayu.runtime.sessions import (
     BudgetReservationIdentityConflict,
     ModelCompletionStageRequest,
     PendingActionQuery,
+    fork_session_invocation,
 )
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_support as sqlite_support
@@ -1626,6 +1627,7 @@ def test_sqlite_session_store_rejects_fork_status_mismatch(tmp_path):
                     provider_name="fake",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.RUNNING,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -1661,6 +1663,7 @@ def test_sqlite_session_store_rejects_fork_provider_mismatch(tmp_path):
                     provider_name="other",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -1696,6 +1699,7 @@ def test_sqlite_session_store_transforms_current_checkpoint_during_fork(tmp_path
                 provider_name="fake",
                 model="fake-model",
                 parent_session_id=source.id,
+                invocation=fork_session_invocation(source),
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
@@ -1761,6 +1765,7 @@ def test_sqlite_session_store_fork_reads_checkpoint_inside_write_transaction(tmp
                 provider_name="fake",
                 model="fake-model",
                 parent_session_id=source.id,
+                invocation=fork_session_invocation(source),
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
@@ -1898,7 +1903,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 34"):
@@ -2053,7 +2058,7 @@ def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2099,7 +2104,7 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2124,6 +2129,43 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     assert index is None
 
 
+def test_sqlite_session_store_rejects_populated_pre_invocation_database(tmp_path) -> None:
+    db_path = tmp_path / "pre-invocation.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def create() -> None:
+        await store.create(
+            RunRequest(agent_name="assistant", session_id="existing", messages=[]),
+            identity=_identity(),
+        )
+        await _close(store)
+
+    asyncio.run(create())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 36")
+        connection.execute("PRAGMA user_version = 35")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match="requires invocation provenance for every session",
+    ):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (35,)
+        assert connection.execute(
+            "SELECT MAX(revision) FROM cayu_schema_migrations"
+        ).fetchone() == (35,)
+    finally:
+        connection.close()
+
+
 def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path) -> None:
     db_path = tmp_path / "revision-17-session-operations.sqlite"
     store = SQLiteSessionStore(db_path)
@@ -2138,7 +2180,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2600,6 +2642,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (33, 31),
         (34, 34),
         (35, 35),
+        (36, 36),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3928,6 +3971,7 @@ def test_sqlite_partial_fork_uses_absolute_cursor_after_transcript_retention(
                 provider_name="fake",
                 model="fake-model",
                 parent_session_id=source.id,
+                invocation=fork_session_invocation(source),
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
@@ -3948,6 +3992,7 @@ def test_sqlite_partial_fork_uses_absolute_cursor_after_transcript_retention(
                     provider_name="fake",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},

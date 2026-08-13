@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
 
 from cayu import (
@@ -49,6 +50,7 @@ from cayu.runtime.sessions import (
     decode_session_cursor,
     encode_session_cursor,
     event_summary_from_records,
+    fork_session_invocation,
     session_outcome_from_records,
 )
 
@@ -3190,6 +3192,7 @@ def test_decode_session_cursor_rejects_naive_datetimes() -> None:
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_ok"),
     )
 
     # A UTC-aware cursor round-trips.
@@ -3221,6 +3224,7 @@ def test_session_cursor_contract_wraps_maximum_valid_session_identifier() -> Non
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation(session_id),
     )
 
     cursor = encode_session_cursor(session, SessionOrder.UPDATED_AT_DESC)
@@ -3253,6 +3257,7 @@ def test_session_creation_contract_rejects_oversized_ids_without_hiding_existing
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation(oversized_session_id),
     )
     fork = ForkSessionRequest(source_session_id=oversized_session_id)
 
@@ -3269,6 +3274,7 @@ def test_session_cursor_contracts_reject_oversized_values() -> None:
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
+                invocation=fixture_session_invocation(oversized_session_id),
             ),
             SessionOrder.UPDATED_AT_DESC,
         )
@@ -3592,6 +3598,7 @@ def test_fork_transcripts_do_not_alias_source_transcripts(
                 provider_name="fake",
                 model="fake-model",
                 parent_session_id=source.id,
+                invocation=fork_session_invocation(source),
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},

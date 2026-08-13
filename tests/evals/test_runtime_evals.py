@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     EVAL_SCHEMA_VERSION,
@@ -121,6 +122,10 @@ def _session(
         environment_name=environment_name,
         status=status,
         parent_session_id=parent_session_id,
+        invocation=fixture_session_invocation(
+            session_id,
+            parent_session_id=parent_session_id,
+        ),
     )
 
 
@@ -1954,6 +1959,7 @@ def test_max_estimated_cost_accepts_tiered_price_book():
             provider_name=model.provider_name,
             model=model.model,
             causal_budget_id="cb",
+            invocation=fixture_session_invocation("sess_eval"),
         ),
         events=(event,),
     )
@@ -2022,6 +2028,7 @@ def test_max_estimated_cost_is_unavailable_when_any_model_step_is_unpriced(
             provider_name="priced-provider",
             model="priced-model",
             causal_budget_id="cb",
+            invocation=fixture_session_invocation("sess_eval"),
         ),
         events=tuple(events),
     )
@@ -2231,6 +2238,7 @@ def test_trial_rejects_incomplete_nested_trajectory_as_complete():
             model="fake-model",
             causal_budget_id="cb",
             parent_session_id="root",
+            invocation=fixture_session_invocation("child", parent_session_id="root"),
             status=SessionStatus.COMPLETED,
         ),
         events=(_terminal_event("child"),),
@@ -2276,6 +2284,7 @@ def test_trajectory_export_rejects_nonterminal_session_before_overwrite(tmp_path
                 model="fake-model",
                 causal_budget_id="cb",
                 parent_session_id="root",
+                invocation=fixture_session_invocation("child", parent_session_id="root"),
                 status=SessionStatus.RUNNING,
             ),
             usage_summary=SessionUsageSummary(session_id="child"),
@@ -2344,6 +2353,7 @@ def test_trajectory_export_validates_nested_terminal_boundary_before_overwrite(t
             model="fake-model",
             causal_budget_id="cb",
             parent_session_id="root",
+            invocation=fixture_session_invocation("child", parent_session_id="root"),
             status=SessionStatus.COMPLETED,
         ),
         events=(_terminal_event("child", SessionStatus.FAILED),),
@@ -2804,7 +2814,7 @@ def test_load_trajectory_rejects_unversioned_preview_export(tmp_path):
         load_trajectory(path)
 
 
-@pytest.mark.parametrize("schema_version", [0, 1, 3, "2", True])
+@pytest.mark.parametrize("schema_version", [0, 1, 2, 4, "3", True])
 def test_load_trajectory_rejects_unsupported_schema_version(tmp_path, schema_version):
     path = tmp_path / "unsupported-trajectory.json"
     path.write_text(
@@ -2818,6 +2828,20 @@ def test_load_trajectory_rejects_unsupported_schema_version(tmp_path, schema_ver
     )
 
     with pytest.raises(ValueError, match="unsupported schema_version"):
+        load_trajectory(path)
+
+
+def test_load_trajectory_rejects_version_two_before_validating_new_session_shape(tmp_path):
+    trajectory = _context(session=_session()).trajectory.model_dump(mode="json")
+    assert trajectory["session"] is not None
+    trajectory["session"].pop("invocation")
+    path = tmp_path / "version-two-trajectory.json"
+    path.write_text(
+        json.dumps({"schema_version": 2, "trajectory": trajectory}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported schema_version 2"):
         load_trajectory(path)
 
 

@@ -1006,14 +1006,16 @@ regenerate those baselines with the current Cayu version. No compatibility loade
 or migration is used.
 
 Standalone exports use a versioned document envelope. The current trajectory
-schema version is `2`; `load_trajectory(...)` rejects files without that version
+schema version is `3`; `load_trajectory(...)` rejects files without that version
 or with an unsupported version before validating the trajectory payload. This is an
 intentional clean break from Cayu's earlier unversioned preview exports: they
 are not migrated and must be regenerated. The trajectory schema version is
-independent from `EvalRun.schema_version`. Version 2 applies Cayu's durable-JSON
-contract before writing and while decoding: nonportable text or numbers,
-duplicate object keys, and excessive nesting are rejected before an existing
-export can be overwritten or an imported trajectory can be replayed.
+independent from `EvalRun.schema_version`. Version 3 retains immutable session
+invocation provenance in session-backed trajectories while preserving Cayu's
+durable-JSON contract: nonportable text or numbers, duplicate object keys, and
+excessive nesting are rejected before an existing export can be overwritten or
+an imported trajectory can be replayed. Version-2 exports must be regenerated;
+Cayu does not invent provenance while loading them.
 
 Replay is faithful for the assertions the run captured: event / transcript / usage / output /
 tool assertions always re-check correctly, and a workspace or artifact assertion replays as long

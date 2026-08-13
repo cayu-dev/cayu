@@ -109,6 +109,15 @@ def prepare_run_request(
             raise ValueError(
                 "labels contain a workload secret and cannot be used as durable session authority."
             )
+    for origin in (request.invocation_origin, request._verified_invocation_origin):
+        if origin is None:
+            continue
+        for value in (origin.subject, origin.tenant):
+            if value is not None and redactor.redact_text(value) != value:
+                raise ValueError(
+                    "invocation origin contains a workload secret and cannot be used "
+                    "as durable session authority."
+                )
     redacted_messages = redact_messages(
         request.messages,
         redactor=redactor,

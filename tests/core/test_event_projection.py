@@ -11,6 +11,7 @@ from uuid import UUID
 
 import pytest
 from pydantic import SecretStr
+from tests._session_provenance import fixture_session_invocation
 
 import cayu.core.events as events_module
 import cayu.runtime._event_projection as event_projection_module
@@ -812,6 +813,7 @@ def test_structured_output_round_events_attest_their_deterministic_ids() -> None
         agent_name="bot",
         provider_name="p",
         model="m",
+        invocation=fixture_session_invocation("run"),
     )
     registered_agent = cast(
         "Any",

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
+from tests._session_provenance import fixture_session_invocation
 from tests.core._workload_secret_support import (
     FakeProvider,
     collect_events,
@@ -21,6 +22,7 @@ from cayu.runtime import (
     ForkSessionRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
+    InvocationOriginClaim,
     ModelTarget,
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
@@ -43,7 +45,10 @@ from cayu.runtime._session_request_boundary import (
     prepare_run_request,
 )
 from cayu.runtime.event_sinks import InMemoryEventSink
-from cayu.runtime.sessions import run_request_with_runtime_generated_authority
+from cayu.runtime.sessions import (
+    fork_session_invocation,
+    run_request_with_runtime_generated_authority,
+)
 from cayu.storage import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
@@ -71,6 +76,20 @@ def test_runtime_attested_subagent_lineage_survives_short_secret_collision() -> 
     assert prepared.causal_budget_id == request.causal_budget_id
 
 
+def test_run_request_rejects_a_secret_in_durable_invocation_origin() -> None:
+    secret = "workload-secret-origin"
+
+    with pytest.raises(ValueError, match="invocation origin contains a workload secret"):
+        prepare_run_request(
+            RunRequest(
+                agent_name="assistant",
+                messages=[],
+                invocation_origin=InvocationOriginClaim(subject=f"user:{secret}"),
+            ),
+            redactor=SecretRedactor(secret),
+        )
+
+
 def test_fork_destination_rejects_reserved_public_authority_namespace() -> None:
     with pytest.raises(ValueError, match="reserved public-authority alias namespace"):
         prepare_fork_session_request(
@@ -92,6 +111,7 @@ def _safe_fork_sessions() -> tuple[Session, Session]:
         causal_budget_id="source",
         runtime_name="runtime",
         environment_name="environment",
+        invocation=fixture_session_invocation("source"),
         status=SessionStatus.COMPLETED,
     )
     return source, Session(
@@ -103,6 +123,7 @@ def _safe_fork_sessions() -> tuple[Session, Session]:
         causal_budget_id=source.causal_budget_id,
         runtime_name="runtime",
         environment_name="environment",
+        invocation=fork_session_invocation(source),
         status=SessionStatus.COMPLETED,
     )
 
@@ -261,6 +282,7 @@ def test_derived_fork_accepts_short_secret_collision_in_generated_session_id(
         model="model",
         causal_budget_id="root",
         runtime_name="core",
+        invocation=fixture_session_invocation("root"),
         status=SessionStatus.COMPLETED,
     )
     fork = Session(
@@ -271,6 +293,7 @@ def test_derived_fork_accepts_short_secret_collision_in_generated_session_id(
         parent_session_id=source.id,
         causal_budget_id=source.causal_budget_id,
         runtime_name="core",
+        invocation=fork_session_invocation(source),
         status=SessionStatus.COMPLETED,
     )
 

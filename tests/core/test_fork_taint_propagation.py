@@ -15,6 +15,7 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     Session,
+    SessionExecutionSource,
     SessionIdentity,
     SessionStatus,
     TaintAwareToolPolicy,
@@ -25,6 +26,7 @@ from cayu import (
     ToolSpec,
 )
 from cayu.providers import ModelStreamEvent
+from cayu.runtime.sessions import fork_session_invocation
 
 
 class UntrustedEvidenceTool(Tool):
@@ -118,6 +120,13 @@ def test_generic_session_fork_inherits_durable_taint() -> None:
 
     child_events = asyncio.run(scenario())
 
+    source = asyncio.run(app.session_store.load("taint-source"))
+    child = asyncio.run(app.session_store.load("taint-child"))
+    assert source is not None
+    assert child is not None
+    assert child.invocation.origin == source.invocation.origin
+    assert child.invocation.root_session_id == source.id
+    assert child.invocation.source is SessionExecutionSource.FORK
     assert mutation.calls == 0
     blocked = [event for event in child_events if event.type == EventType.TOOL_CALL_BLOCKED]
     assert len(blocked) == 1
@@ -194,6 +203,7 @@ def test_store_rejects_fork_when_source_run_epoch_changed_during_preparation() -
                     provider_name="scripted",
                     model="scripted-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.COMPLETED,
                     run_epoch=resumed.run_epoch,
                 ),

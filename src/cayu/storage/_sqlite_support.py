@@ -18,6 +18,7 @@ from cayu._validation import (
     require_execution_unit_id,
 )
 from cayu.core.events import Event
+from cayu.runtime.invocation import SessionInvocation
 from cayu.runtime.sessions import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
     PendingActionSession,
@@ -26,6 +27,7 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionOrder,
     SessionStatus,
+    session_invocation_for_run_request,
     session_metadata_for_creation,
 )
 from cayu.runtime.tasks import (
@@ -167,6 +169,7 @@ _BASELINE_DDL = """
         last_activity_at TEXT NOT NULL,
         run_epoch INTEGER NOT NULL DEFAULT 0,
         transcript_seq INTEGER NOT NULL DEFAULT 0,
+        invocation_json TEXT NOT NULL,
         metadata_json TEXT NOT NULL
     );
 
@@ -1511,6 +1514,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ),
     ),
     34: (("cayu_tasks", "available_at", "TEXT"),),
+    36: (("cayu_sessions", "invocation_json", "TEXT NOT NULL"),),
 }
 
 # Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD
@@ -1561,6 +1565,15 @@ def _reject_populated_pre_interaction_database(connection: sqlite3.Connection) -
             "Storage revision 26 is a clean prerelease break and cannot migrate a "
             "populated Cayu session database. Recreate the Cayu database before "
             "starting this build."
+        )
+
+
+def _reject_populated_pre_invocation_database(connection: sqlite3.Connection) -> None:
+    if connection.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions)").fetchone()[0]:
+        raise schema.SchemaTooOld(
+            "Storage revision 36 requires invocation provenance for every session and "
+            "cannot migrate a populated Cayu session database. Recreate the Cayu "
+            "database before starting this build."
         )
 
 
@@ -2210,6 +2223,21 @@ def reconcile_schema(
             _repair_missing_workflow_replay_indexes(connection)
         else:
             _validate_workflow_replay_indexes(connection, require_all=True)
+    if app_min_supported >= 36:
+        _validate_session_invocation_column(connection)
+
+
+def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_sessions)")
+    }
+    if columns.get("invocation_json") != ("TEXT", 1):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_sessions.invocation_json' conflicts with "
+            "Cayu's required invocation-provenance contract. Recreate the Cayu "
+            "database from a known-good revision-36 schema."
+        )
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
@@ -2305,6 +2333,12 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         # A failed migration must not leave an old populated database advanced
         # partway to revision 25.
         _reject_populated_pre_interaction_database(connection)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 36
+        and any(revision.revision == 36 for revision in schema.pending(current))
+    ):
+        _reject_populated_pre_invocation_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -2438,7 +2472,12 @@ def _record_revision(connection: sqlite3.Connection, rev: schema.Revision) -> No
     )
 
 
-def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> Session:
+def session_from_request(
+    request: RunRequest,
+    *,
+    identity: SessionIdentity,
+    parent_session: Session | None,
+) -> Session:
     now = datetime.now(UTC)
     session_id = request.session_id if request.session_id is not None else str(uuid4())
     return Session(
@@ -2455,6 +2494,11 @@ def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> S
         created_at=now,
         updated_at=now,
         last_activity_at=now,
+        invocation=session_invocation_for_run_request(
+            request,
+            session_id=session_id,
+            parent_session=parent_session,
+        ),
         metadata=session_metadata_for_creation(request.metadata, identity=identity),
         labels=copy_label_map(request.labels, "labels"),
     )
@@ -2476,6 +2520,7 @@ def session_to_row_values(session: Session) -> tuple[object, ...]:
         format_datetime(session.updated_at),
         format_datetime(session.last_activity_at),
         session.run_epoch,
+        json_dumps(session.invocation.model_dump(mode="json")),
         json_dumps(session.metadata),
     )
 
@@ -2666,6 +2711,7 @@ def session_from_row(row: sqlite3.Row, labels: dict[str, str] | None = None) -> 
         updated_at=parse_datetime(row["updated_at"]),
         last_activity_at=parse_datetime(row["last_activity_at"]),
         run_epoch=row["run_epoch"],
+        invocation=SessionInvocation.model_validate(json.loads(row["invocation_json"])),
         metadata=json.loads(row["metadata_json"]),
         labels=copy_label_map(labels, "labels"),
     )

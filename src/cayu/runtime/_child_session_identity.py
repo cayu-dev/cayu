@@ -9,6 +9,7 @@ from uuid import uuid4
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 
 if TYPE_CHECKING:
+    from cayu.runtime.invocation import SessionInvocation
     from cayu.runtime.sessions import Session
 
 
@@ -20,6 +21,7 @@ class ChildSessionRecoveryMatcher(ABC):
         self,
         child: Session,
         *,
+        parent_invocation: SessionInvocation,
         parent_session_id: str,
         causal_budget_id: str,
         environment_name: str | None,

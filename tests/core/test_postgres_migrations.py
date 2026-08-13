@@ -521,6 +521,149 @@ def test_revision_twenty_six_rejects_populated_session_database(
     asyncio.run(runner())
 
 
+def test_revision_thirty_six_rejects_populated_session_database(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_invocation_migration",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 36")
+                await cur.execute("ALTER TABLE cayu_sessions DROP COLUMN invocation")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match="requires invocation provenance for every session",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (35,)
+            await cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_sessions' AND column_name = 'invocation'"
+            )
+            assert await cur.fetchone() is None
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(
+    ("column_ddl", "expected_shape"),
+    [
+        (
+            "ALTER TABLE cayu_sessions ADD COLUMN invocation TEXT",
+            ("text", "YES", "NEVER"),
+        ),
+        (
+            "ALTER TABLE cayu_sessions ADD COLUMN invocation JSONB "
+            "GENERATED ALWAYS AS ('{}'::jsonb) STORED NOT NULL",
+            ("jsonb", "NO", "ALWAYS"),
+        ),
+    ],
+    ids=["wrong-type", "generated-lookalike"],
+)
+def test_revision_thirty_six_rejects_conflicting_invocation_column_before_recording(
+    postgres_dsn: str,
+    column_ddl: str,
+    expected_shape: tuple[str, str, str],
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 36")
+                await cur.execute("ALTER TABLE cayu_sessions DROP COLUMN invocation")
+                await cur.execute(column_ddl)
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="invocation-provenance contract"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (35,)
+            await cur.execute(
+                "SELECT data_type, is_nullable, is_generated "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_sessions' AND column_name = 'invocation'"
+            )
+            assert await cur.fetchone() == expected_shape
+
+    asyncio.run(runner())
+
+
+def test_migrate_mode_rejects_recorded_revision_thirty_six_with_bad_column(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("ALTER TABLE cayu_sessions ALTER COLUMN invocation DROP NOT NULL")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="invocation-provenance contract"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
+
+    asyncio.run(runner())
+
+
 def test_latest_migrates_queue_and_event_side_effect_handoff(
     postgres_dsn: str,
 ) -> None:
@@ -543,6 +686,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 await cur.execute("DROP INDEX idx_cayu_sessions_parent_created_id")
                 await cur.execute("DROP INDEX idx_cayu_tasks_session_created_id")
                 await cur.execute("DROP INDEX idx_cayu_tasks_parent_created_id")
+                await cur.execute("ALTER TABLE cayu_sessions DROP COLUMN invocation")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
@@ -663,6 +807,20 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 34"
             )
             assert await cur.fetchone() == ("breaking", 34)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 35"
+            )
+            assert await cur.fetchone() == ("breaking", 35)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 36"
+            )
+            assert await cur.fetchone() == ("breaking", 36)
+            await cur.execute(
+                "SELECT data_type, is_nullable FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_sessions' AND column_name = 'invocation'"
+            )
+            assert await cur.fetchone() == ("jsonb", "NO")
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

@@ -5,6 +5,7 @@ import inspect
 from decimal import Decimal
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import AgentSpec, ModelProvider, ModelStreamEvent, RunRequest, ScriptedModelProvider
 from cayu.core.events import Event, EventType
@@ -119,6 +120,10 @@ def _trajectory(*, children_incomplete: bool = False) -> Trajectory:
             model="fixture-model",
             causal_budget_id="budget",
             parent_session_id=root_id,
+            invocation=fixture_session_invocation(
+                child_id,
+                parent_session_id=root_id,
+            ),
             status=SessionStatus.FAILED,
         ),
         events=child_events,
@@ -131,6 +136,7 @@ def _trajectory(*, children_incomplete: bool = False) -> Trajectory:
             provider_name="fixture",
             model="fixture-model",
             causal_budget_id="budget",
+            invocation=fixture_session_invocation(root_id),
             status=SessionStatus.COMPLETED,
         ),
         events=events,
@@ -693,6 +699,10 @@ def _child_boundary_trajectory(count: int) -> Trajectory:
                     model="fixture-model",
                     causal_budget_id="budget",
                     parent_session_id="root",
+                    invocation=fixture_session_invocation(
+                        child_id,
+                        parent_session_id="root",
+                    ),
                     status=SessionStatus.COMPLETED,
                 ),
                 events=events,

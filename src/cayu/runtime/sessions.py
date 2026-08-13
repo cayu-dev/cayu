@@ -156,6 +156,17 @@ from cayu.runtime.execution_units import (
     ToolRoundIdentity,
     copy_tool_round_identity,
 )
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    SessionInvocation,
+    copy_invocation_origin,
+    copy_invocation_origin_claim,
+    copy_session_invocation,
+    inherited_session_invocation,
+)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
@@ -914,6 +925,7 @@ class RunRequest(BaseModel):
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    invocation_origin: InvocationOriginClaim | None = None
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
@@ -929,6 +941,8 @@ class RunRequest(BaseModel):
     )
     _runtime_session_create_claim: object | None = PrivateAttr(default=None)
     _input_redactions_applied: bool = PrivateAttr(default=False)
+    _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
+    _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
 
     @field_validator("messages")
     @classmethod
@@ -1649,7 +1663,8 @@ class SessionIdentity(BaseModel):
 class Session(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    # SessionStore implementations may set this from RunRequest.session_id.
+    # SessionStore implementations set this from RunRequest.session_id or mint it
+    # before constructing the record so invocation.root_session_id is exact.
     id: str = Field(default_factory=lambda: str(uuid4()))
     agent_name: str
     provider_name: str
@@ -1664,6 +1679,7 @@ class Session(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_activity_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     run_epoch: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    invocation: SessionInvocation = Field(frozen=True)
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -5634,6 +5650,11 @@ class SessionStore(ABC):
     ) -> Session:
         """Create a session, optionally admitting its first interaction atomically.
 
+        Implementations must mint the final session ID, load any requested parent,
+        and call ``session_invocation_for_run_request`` inside the same create
+        boundary. The returned immutable invocation record is persisted with the
+        session and preserved by all later updates.
+
         With admission, create the session directly in ``RUNNING``, claim its
         first run epoch, and persist the start event plus deferred source batch
         in the same transaction. Both optional arguments are supplied together.
@@ -7463,6 +7484,11 @@ class InMemorySessionStore(SessionStore):
                 and request.parent_session_id not in self._sessions
             ):
                 raise ValueError(f"Parent session not found: {request.parent_session_id}")
+            parent_session = (
+                None
+                if request.parent_session_id is None
+                else self._sessions[request.parent_session_id]
+            )
 
             now = datetime.now(UTC)
             session = Session(
@@ -7479,6 +7505,11 @@ class InMemorySessionStore(SessionStore):
                 created_at=now,
                 updated_at=now,
                 last_activity_at=now,
+                invocation=session_invocation_for_run_request(
+                    request,
+                    session_id=session_id,
+                    parent_session=parent_session,
+                ),
                 labels=request.labels,
                 metadata=session_metadata_for_creation(request.metadata, identity=identity),
                 run_epoch=1 if admission is not None else 0,
@@ -11665,6 +11696,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
+        invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
@@ -11682,6 +11714,38 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         else None
     )
     copied._input_redactions_applied = request._input_redactions_applied
+    copied._verified_invocation_origin = (
+        None
+        if request._verified_invocation_origin is None
+        else copy_invocation_origin(request._verified_invocation_origin)
+    )
+    copied._runtime_invocation_source = request._runtime_invocation_source
+    return copied
+
+
+def run_request_with_runtime_invocation(
+    request: RunRequest,
+    *,
+    source: SessionExecutionSource,
+    verified_origin: InvocationOrigin | None = None,
+) -> RunRequest:
+    """Attach invocation authority minted by a trusted Cayu runtime boundary."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime invocation authority requires a RunRequest.")
+    if type(source) is not SessionExecutionSource:
+        raise TypeError("source must be a SessionExecutionSource.")
+    if verified_origin is not None:
+        verified_origin = copy_invocation_origin(verified_origin)
+        if verified_origin.trust is not InvocationOriginTrust.SERVER_VERIFIED:
+            raise ValueError("Runtime-verified origins must use server_verified trust.")
+        if request.invocation_origin is not None:
+            raise ValueError("A verified invocation cannot also carry a host origin claim.")
+        if source is not SessionExecutionSource.HTTP_RUN:
+            raise ValueError("Server-verified invocation origins require an HTTP run source.")
+    copied = copy_run_request(request)
+    copied._runtime_invocation_source = source
+    copied._verified_invocation_origin = verified_origin
     return copied
 
 
@@ -11933,6 +11997,9 @@ def session_matches_reconstructed_runtime_create_claim(
     session: Session | None,
     deferred_input: DeferredInteractionInput | None,
     claim: object,
+    *,
+    request: RunRequest,
+    parent_session: Session | None,
 ) -> bool:
     """Authenticate a deterministic create claim after process reconstruction."""
 
@@ -11945,7 +12012,12 @@ def session_matches_reconstructed_runtime_create_claim(
     record = session.metadata[SESSION_CREATE_CLAIM_METADATA_KEY]
     assert isinstance(record, dict)
     return (
-        deferred_input.interaction_id == record["interaction_id"]
+        session_invocation_matches_run_request(
+            session,
+            request=request,
+            parent_session=parent_session,
+        )
+        and deferred_input.interaction_id == record["interaction_id"]
         and session_input_messages_sha256(deferred_input.source_messages)
         == record["messages_sha256"]
     )
@@ -11955,6 +12027,9 @@ def session_matches_runtime_create_claim(
     session: Session | None,
     deferred_input: DeferredInteractionInput | None,
     claim: object,
+    *,
+    request: RunRequest,
+    parent_session: Session | None,
 ) -> bool:
     """Authenticate exact durable evidence for one runtime-owned create claim."""
 
@@ -11972,6 +12047,11 @@ def session_matches_runtime_create_claim(
         return False
     return (
         _SessionCreateMaterial.from_session(session) == claim.expected_session_material
+        and session_invocation_matches_run_request(
+            session,
+            request=request,
+            parent_session=parent_session,
+        )
         and session.metadata.get(SESSION_CREATE_CLAIM_METADATA_KEY)
         == _session_create_claim_record(
             claim_id=claim.claim_id,
@@ -11981,6 +12061,127 @@ def session_matches_runtime_create_claim(
         )
         and deferred_input.interaction_id == claim.interaction_id
         and session_input_messages_sha256(deferred_input.source_messages) == claim.messages_sha256
+    )
+
+
+def session_invocation_for_run_request(
+    request: RunRequest,
+    *,
+    session_id: str,
+    parent_session: Session | None,
+) -> SessionInvocation:
+    """Derive exact provenance inside the atomic store-create boundary."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Session invocation derivation requires a RunRequest.")
+    session_id = _require_bounded_session_id(session_id, "session_id")
+    source = request._runtime_invocation_source or SessionExecutionSource.SDK_RUN
+    verified_origin = request._verified_invocation_origin
+    if request.invocation_origin is not None and verified_origin is not None:
+        raise ValueError("A run cannot carry both host-asserted and server-verified origins.")
+    if parent_session is not None:
+        if request.parent_session_id != parent_session.id:
+            raise ValueError("Parent session identity conflicts with invocation derivation.")
+        if request.invocation_origin is not None or verified_origin is not None:
+            raise ValueError("Derived sessions must inherit their root invocation origin.")
+        if source is SessionExecutionSource.HTTP_RUN:
+            raise ValueError("Derived sessions cannot claim a root HTTP run source.")
+        return inherited_session_invocation(
+            parent_session.invocation,
+            source=source,
+        )
+    if request.parent_session_id is not None:
+        raise ValueError("Parent session not found for invocation provenance.")
+    if source in {
+        SessionExecutionSource.FORK,
+        SessionExecutionSource.SUBAGENT,
+    }:
+        raise ValueError(f"{source.value} invocation provenance requires a parent session.")
+    if verified_origin is not None:
+        if source is not SessionExecutionSource.HTTP_RUN:
+            raise ValueError("Server-verified invocation origins require an HTTP run source.")
+        origin = copy_invocation_origin(verified_origin)
+    elif request.invocation_origin is not None:
+        if source is not SessionExecutionSource.SDK_RUN:
+            raise ValueError("Host-asserted invocation origins require an SDK run source.")
+        origin = InvocationOrigin(
+            trust=InvocationOriginTrust.HOST_ASSERTED,
+            subject=request.invocation_origin.subject,
+            tenant=request.invocation_origin.tenant,
+        )
+    else:
+        origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    return SessionInvocation(
+        origin=origin,
+        root_invocation_id=str(uuid4()),
+        root_session_id=session_id,
+        source=source,
+    )
+
+
+def session_invocation_matches_run_request(
+    session: Session,
+    *,
+    request: RunRequest,
+    parent_session: Session | None,
+) -> bool:
+    """Authenticate stored invocation provenance against one create request."""
+
+    if type(session) is not Session or type(request) is not RunRequest:
+        return False
+    source = request._runtime_invocation_source or SessionExecutionSource.SDK_RUN
+    if parent_session is not None:
+        if (
+            request.parent_session_id != parent_session.id
+            or session.parent_session_id != parent_session.id
+        ):
+            return False
+        if request.invocation_origin is not None or request._verified_invocation_origin is not None:
+            return False
+        try:
+            expected = inherited_session_invocation(parent_session.invocation, source=source)
+        except (TypeError, ValueError):
+            return False
+        return session.invocation == expected
+    if request.parent_session_id is not None or session.parent_session_id is not None:
+        return False
+    if source in {SessionExecutionSource.FORK, SessionExecutionSource.SUBAGENT}:
+        return False
+    verified_origin = request._verified_invocation_origin
+    if request.invocation_origin is not None and verified_origin is not None:
+        return False
+    if verified_origin is not None:
+        if (
+            source is not SessionExecutionSource.HTTP_RUN
+            or verified_origin.trust is not InvocationOriginTrust.SERVER_VERIFIED
+        ):
+            return False
+        expected_origin = verified_origin
+    elif request.invocation_origin is not None:
+        if source is not SessionExecutionSource.SDK_RUN:
+            return False
+        expected_origin = InvocationOrigin(
+            trust=InvocationOriginTrust.HOST_ASSERTED,
+            subject=request.invocation_origin.subject,
+            tenant=request.invocation_origin.tenant,
+        )
+    else:
+        expected_origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    return (
+        session.invocation.origin == expected_origin
+        and session.invocation.root_session_id == session.id
+        and session.invocation.source is source
+    )
+
+
+def fork_session_invocation(source_session: Session) -> SessionInvocation:
+    """Build the only valid invocation provenance for a direct session fork."""
+
+    if type(source_session) is not Session:
+        raise TypeError("Fork invocation provenance requires a Session.")
+    return inherited_session_invocation(
+        source_session.invocation,
+        source=SessionExecutionSource.FORK,
     )
 
 
@@ -12235,6 +12436,7 @@ def copy_session(session: Session) -> Session:
         updated_at=session.updated_at,
         last_activity_at=session.last_activity_at,
         run_epoch=session.run_epoch,
+        invocation=copy_session_invocation(session.invocation),
         labels=copy_label_map(session.labels, "labels"),
         metadata=copy_durable_json_object(session.metadata, "metadata"),
     )
@@ -12571,6 +12773,8 @@ def _validate_session_fork_source(
             "Fork provider_name must match source session provider_name: "
             f"{fork.provider_name} != {source_session.provider_name}"
         )
+    if fork.invocation != fork_session_invocation(source_session):
+        raise ValueError("Fork invocation provenance conflicts with its source session.")
     return source_session
 
 

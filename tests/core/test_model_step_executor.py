@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from decimal import Decimal
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 from cayu.artifacts import (
@@ -463,6 +464,7 @@ def test_model_step_executor_builds_defensive_structured_output_request() -> Non
         provider_name="fake",
         model="fake-model",
         causal_budget_id="sess_request",
+        invocation=fixture_session_invocation("sess_request"),
     )
     messages = [Message.text("user", "answer as JSON")]
     spec = StructuredOutputSpec(
@@ -730,6 +732,7 @@ def test_attachment_resolution_fails_open_only_for_prompt_files(
         provider_name="fake",
         model="fake-model",
         causal_budget_id="sess_resolve",
+        invocation=fixture_session_invocation("sess_resolve"),
     )
 
     def missing(artifact_id: str):

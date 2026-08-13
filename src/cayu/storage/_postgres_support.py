@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_label_map
+from cayu.runtime.invocation import SessionInvocation
 from cayu.runtime.sessions import (
     PendingActionSession,
     Session,
@@ -49,6 +50,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         run_epoch BIGINT NOT NULL DEFAULT 0,
         event_seq BIGINT NOT NULL DEFAULT 0,
         transcript_seq BIGINT NOT NULL DEFAULT 0,
+        invocation JSONB NOT NULL,
         metadata JSONB NOT NULL
     )
     """,
@@ -453,6 +455,7 @@ def session_insert_values(session: Session) -> tuple[object, ...]:
         to_utc(session.updated_at),
         to_utc(session.last_activity_at),
         session.run_epoch,
+        _dumps(session.invocation.model_dump(mode="json")),
         _dumps(session.metadata),
     )
 
@@ -477,7 +480,8 @@ def session_from_row(row: tuple[Any, ...], labels: dict[str, str] | None = None)
         updated_at=to_utc(row[11]),
         last_activity_at=to_utc(row[12]),
         run_epoch=row[13],
-        metadata=_loads(row[14]),
+        invocation=SessionInvocation.model_validate(_loads(row[14])),
+        metadata=_loads(row[15]),
         labels=copy_label_map(labels, "labels"),
     )
 
@@ -485,7 +489,7 @@ def session_from_row(row: tuple[Any, ...], labels: dict[str, str] | None = None)
 SESSION_COLUMNS = (
     "id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "
     "runtime_name, runtime_version, environment_name, status, created_at, updated_at, "
-    "last_activity_at, run_epoch, metadata"
+    "last_activity_at, run_epoch, invocation, metadata"
 )
 
 SESSION_TOPOLOGY_COLUMNS = (

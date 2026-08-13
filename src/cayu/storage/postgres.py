@@ -328,6 +328,7 @@ from cayu.runtime.sessions import (
     replace_session_user_metadata,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
+    session_invocation_for_run_request,
     session_metadata_for_creation,
     session_next_cursor,
     session_outcome,
@@ -420,7 +421,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 31
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 36
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -1269,6 +1270,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_publication_receipts_entry "
         "ON cayu_knowledge_publication_receipts(entry_id)",
     ),
+    36: ("ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS invocation JSONB NOT NULL",),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -2165,6 +2167,17 @@ async def _reject_populated_pre_interaction_database(cur: Any) -> None:
         )
 
 
+async def _reject_populated_pre_invocation_database(cur: Any) -> None:
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 36 requires invocation provenance for every session and "
+            "cannot migrate a populated Cayu session database. Recreate the Cayu "
+            "database before starting this build."
+        )
+
+
 async def _transcript_cursor(cur: Any, session_id: str) -> int:
     """Return the permanent next transcript position, independent of retention."""
 
@@ -2372,6 +2385,12 @@ class _PostgresStoreBase:
                         # Reject before applying any earlier pending revision so
                         # the clean break cannot leave a database half-migrated.
                         await _reject_populated_pre_interaction_database(cur)
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 36
+                        and any(revision.revision == 36 for revision in schema.pending(current))
+                    ):
+                        await _reject_populated_pre_invocation_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -2383,6 +2402,8 @@ class _PostgresStoreBase:
                             app_min_supported=self._min_required_revision,
                         )
                         self._validate_postgres_revision(current_state)
+                        if self._min_required_revision >= 36:
+                            await self._validate_session_invocation_column(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -2407,6 +2428,7 @@ class _PostgresStoreBase:
                         else:
                             for statement in _MIGRATION_STEPS.get(revision.revision, ()):
                                 await cur.execute(cast("LiteralString", statement))
+                            await self._validate_revision_schema_objects(cur, revision)
                             await self._record_revision(cur, revision)
                 await conn.commit()
             if concurrent_revision is None:
@@ -2520,6 +2542,8 @@ class _PostgresStoreBase:
 
     async def _validate_postgres_schema(self, cur: Any, state: schema.SchemaState) -> None:
         self._validate_postgres_revision(state)
+        if self._min_required_revision >= 36:
+            await self._validate_session_invocation_column(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -2540,6 +2564,33 @@ class _PostgresStoreBase:
                     f"Required Cayu Postgres index is not ready: {index.index_name}. "
                     "Run `cayu storage migrate` to repair the schema."
                 )
+
+    async def _validate_session_invocation_column(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, is_generated
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_sessions'
+              AND column_name = 'invocation'
+            """
+        )
+        if await cur.fetchone() != ("jsonb", "NO", "NEVER"):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_sessions.invocation' conflicts with "
+                "Cayu's required invocation-provenance contract. Recreate the Cayu "
+                "database from a known-good revision-36 schema."
+            )
+
+    async def _validate_revision_schema_objects(
+        self,
+        cur: Any,
+        revision: schema.Revision,
+    ) -> None:
+        """Validate non-index objects before recording their owning revision."""
+
+        if revision.revision == 36:
+            await self._validate_session_invocation_column(cur)
 
     async def _validate_budget_reservation_identity_registry(
         self,
@@ -2766,6 +2817,12 @@ class _PostgresStoreBase:
             and any(revision.revision == 26 for revision in schema.pending(current))
         ):
             await _reject_populated_pre_interaction_database(cur)
+        if (
+            current != schema.UNINITIALIZED
+            and current < 36
+            and any(revision.revision == 36 for revision in schema.pending(current))
+        ):
+            await _reject_populated_pre_invocation_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -2777,6 +2834,7 @@ class _PostgresStoreBase:
             # the non-transactional CONCURRENTLY path in ``_migrate_schema``.
             for index in _CONCURRENT_INDEX_MIGRATIONS.get(rev.revision, ()):
                 await cur.execute(index.transactional_create_statement())
+            await self._validate_revision_schema_objects(cur, rev)
             await self._record_revision(cur, rev)
 
     async def _ensure_concurrent_index(
@@ -6727,40 +6785,54 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         now = datetime.now(UTC)
         session_id = request.session_id if request.session_id is not None else _new_id()
-        session = Session(
-            id=session_id,
-            agent_name=request.agent_name,
-            provider_name=identity.provider_name,
-            model=identity.model,
-            parent_session_id=request.parent_session_id,
-            causal_budget_id=request.causal_budget_id or request.task_id or session_id,
-            runtime_name=identity.runtime_name,
-            runtime_version=identity.runtime_version,
-            environment_name=request.environment_name,
-            status=SessionStatus.PENDING,
-            created_at=now,
-            updated_at=now,
-            last_activity_at=now,
-            metadata=session_metadata_for_creation(request.metadata, identity=identity),
-            labels=request.labels,
-        )
-        admission = _copy_optional_interaction_admission(
-            session.id,
-            interaction_started_event,
-            interaction_source_messages,
-            defer_transcript=True,
-        )
-        if admission is not None:
-            session = session.model_copy(update={"status": SessionStatus.RUNNING, "run_epoch": 1})
-        if session.parent_session_id == session.id:
+        if request.parent_session_id == session_id:
             raise ValueError("Session cannot be its own parent.")
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    parent_session = (
+                        None
+                        if request.parent_session_id is None
+                        else await self._load_for_key_share(cur, request.parent_session_id)
+                    )
+                    if request.parent_session_id is not None and parent_session is None:
+                        raise ValueError(f"Parent session not found: {request.parent_session_id}")
+                    session = Session(
+                        id=session_id,
+                        agent_name=request.agent_name,
+                        provider_name=identity.provider_name,
+                        model=identity.model,
+                        parent_session_id=request.parent_session_id,
+                        causal_budget_id=request.causal_budget_id or request.task_id or session_id,
+                        runtime_name=identity.runtime_name,
+                        runtime_version=identity.runtime_version,
+                        environment_name=request.environment_name,
+                        status=SessionStatus.PENDING,
+                        created_at=now,
+                        updated_at=now,
+                        last_activity_at=now,
+                        invocation=session_invocation_for_run_request(
+                            request,
+                            session_id=session_id,
+                            parent_session=parent_session,
+                        ),
+                        metadata=session_metadata_for_creation(request.metadata, identity=identity),
+                        labels=request.labels,
+                    )
+                    admission = _copy_optional_interaction_admission(
+                        session.id,
+                        interaction_started_event,
+                        interaction_source_messages,
+                        defer_transcript=True,
+                    )
+                    if admission is not None:
+                        session = session.model_copy(
+                            update={"status": SessionStatus.RUNNING, "run_epoch": 1}
+                        )
                     await cur.execute(
                         f"""
                         INSERT INTO cayu_sessions ({pg_support.SESSION_COLUMNS})
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(session),
                     )
@@ -7004,7 +7076,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.execute(
                         f"""
                         INSERT INTO cayu_sessions ({pg_support.SESSION_COLUMNS})
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(fork),
                     )
@@ -13991,6 +14063,21 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def _load_for_update(self, cur: Any, session_id: str) -> Session | None:
         await cur.execute(
             f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s FOR UPDATE",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return pg_support.session_from_row(
+            row,
+            labels=await self._load_labels(cur, session_id),
+        )
+
+    async def _load_for_key_share(self, cur: Any, session_id: str) -> Session | None:
+        """Load immutable parent identity while preventing delete or key replacement."""
+
+        await cur.execute(
+            f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s FOR KEY SHARE",
             (session_id,),
         )
         row = await cur.fetchone()

@@ -41,9 +41,12 @@ from cayu.providers import ProviderOperationStatus
 from cayu.runtime import (
     EventOrder,
     EventQuery,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
     RunRequest,
     Session,
     SessionDebugState,
+    SessionExecutionSource,
     SessionIdentity,
     SessionLineageQuery,
     SessionOrder,
@@ -63,6 +66,7 @@ from cayu.runtime.sessions import (
     PendingActionKind,
     PendingActionQuery,
     _McpManifestBaselineEvidenceInvalid,
+    fork_session_invocation,
 )
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -759,7 +763,7 @@ def test_postgres_session_topology_child_query_uses_composite_index(
                     id, agent_name, provider_name, model, parent_session_id,
                     causal_budget_id, runtime_name, runtime_version,
                     environment_name, status, created_at, updated_at,
-                    last_activity_at, run_epoch, event_seq, metadata
+                    last_activity_at, run_epoch, event_seq, invocation, metadata
                 )
                 SELECT
                     'topology-plan-child-' || lpad(value::text, 6, '0'),
@@ -768,7 +772,17 @@ def test_postgres_session_topology_child_query_uses_composite_index(
                     TIMESTAMPTZ '2026-01-01T00:00:00Z',
                     TIMESTAMPTZ '2026-01-01T00:00:00Z',
                     TIMESTAMPTZ '2026-01-01T00:00:00Z',
-                    0, 0, '{}'::jsonb
+                    0,
+                    0,
+                    jsonb_build_object(
+                        'schema_version', 1,
+                        'origin', jsonb_build_object('trust', 'unattributed'),
+                        'root_invocation_id',
+                        'f055bedc-62cf-4fa4-979a-d0378ca93131',
+                        'root_session_id', 'topology-plan-parent',
+                        'source', 'subagent'
+                    ),
+                    '{}'::jsonb
                 FROM generate_series(0, 99999) AS value
                 """
             )
@@ -1618,6 +1632,7 @@ def test_postgres_session_store_transforms_current_checkpoint_during_fork(postgr
                 provider_name="fake",
                 model="fake-model",
                 parent_session_id=source.id,
+                invocation=fork_session_invocation(source),
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
@@ -1639,10 +1654,14 @@ def test_postgres_session_store_transforms_current_checkpoint_during_fork(postgr
 
 def test_postgres_session_store_persists_run_request_parent_session_id(postgres_dsn):
     async def ops(store):
-        await store.create(
+        parent = await store.create(
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_pg_run_parent",
+                invocation_origin=InvocationOriginClaim(
+                    subject="application-user",
+                    tenant="customer-a",
+                ),
                 messages=[Message.text("user", "parent")],
             ),
             identity=_identity(),
@@ -1659,14 +1678,85 @@ def test_postgres_session_store_persists_run_request_parent_session_id(postgres_
         )
 
         assert child.parent_session_id == "sess_pg_run_parent"
+        assert parent.invocation.origin.trust is InvocationOriginTrust.HOST_ASSERTED
+        assert child.invocation.origin == parent.invocation.origin
+        assert child.invocation.root_session_id == parent.id
+        assert child.invocation.source is SessionExecutionSource.SDK_RUN
         loaded = await store.load("sess_pg_run_child")
         assert loaded is not None
         assert loaded.parent_session_id == "sess_pg_run_parent"
         assert loaded.causal_budget_id == "job_pg_run_parent"
+        assert loaded.invocation == child.invocation
         children = (
             await store.list_sessions(SessionQuery(parent_session_id="sess_pg_run_parent"))
         ).sessions
         assert [session.id for session in children] == ["sess_pg_run_child"]
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_child_creation_locks_parent_against_delete_and_reuse(
+    postgres_dsn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def ops(store):
+        parent = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_pg_locked_parent",
+                messages=[],
+                invocation_origin=InvocationOriginClaim(subject="original-user"),
+            ),
+            identity=_identity(),
+        )
+        parent_locked = asyncio.Event()
+        release_parent = asyncio.Event()
+        original_load = store._load_for_key_share
+
+        async def load_then_pause(cur, session_id: str):
+            loaded = await original_load(cur, session_id)
+            parent_locked.set()
+            await release_parent.wait()
+            return loaded
+
+        monkeypatch.setattr(store, "_load_for_key_share", load_then_pause)
+        child_task = asyncio.create_task(
+            store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id="sess_pg_locked_child",
+                    parent_session_id=parent.id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+        )
+        await asyncio.wait_for(parent_locked.wait(), timeout=2.0)
+        delete_task = asyncio.create_task(store.delete_session(parent.id))
+        await asyncio.sleep(0.1)
+        assert delete_task.done() is False
+
+        release_parent.set()
+        child = await asyncio.wait_for(child_task, timeout=2.0)
+        await asyncio.wait_for(delete_task, timeout=2.0)
+        replacement = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=parent.id,
+                messages=[],
+                invocation_origin=InvocationOriginClaim(subject="replacement-user"),
+            ),
+            identity=_identity(),
+        )
+        loaded_child = await store.load(child.id)
+
+        assert loaded_child is not None
+        assert loaded_child.parent_session_id is None
+        assert loaded_child.invocation == child.invocation
+        assert loaded_child.invocation.root_invocation_id == parent.invocation.root_invocation_id
+        assert (
+            loaded_child.invocation.root_invocation_id != replacement.invocation.root_invocation_id
+        )
 
     _run(postgres_dsn, ops)
 
@@ -1732,6 +1822,7 @@ def test_postgres_session_store_fork_honors_transcript_cursor(postgres_dsn):
                 provider_name="fake",
                 model="fake-model",
                 parent_session_id=source.id,
+                invocation=fork_session_invocation(source),
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
@@ -1751,6 +1842,7 @@ def test_postgres_session_store_fork_honors_transcript_cursor(postgres_dsn):
                     provider_name="fake",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -1783,6 +1875,7 @@ def test_postgres_session_store_rejects_fork_status_and_provider_mismatch(postgr
                     provider_name="fake",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.RUNNING,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -1800,6 +1893,7 @@ def test_postgres_session_store_rejects_fork_status_and_provider_mismatch(postgr
                     provider_name="other",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},

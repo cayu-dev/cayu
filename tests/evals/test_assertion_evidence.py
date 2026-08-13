@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, ToolCallPart
@@ -68,6 +69,10 @@ def _child(parent_id: str, *, status: SessionStatus) -> Trajectory:
             model="private-model",
             causal_budget_id="private-budget",
             parent_session_id=parent_id,
+            invocation=fixture_session_invocation(
+                session_id,
+                parent_session_id=parent_id,
+            ),
             status=status,
         ),
         events=events,
@@ -127,6 +132,7 @@ def _trajectory(
             provider_name="provider-a",
             model="model-a",
             causal_budget_id="private-budget",
+            invocation=fixture_session_invocation(session_id),
             status=SessionStatus.COMPLETED,
         ),
         events=events,
@@ -164,6 +170,7 @@ def _large_usage_trajectory() -> Trajectory:
             agent_name="agent",
             provider_name="provider-a",
             model="model-a",
+            invocation=fixture_session_invocation(session_id),
             status=SessionStatus.COMPLETED,
         ),
         events=events,

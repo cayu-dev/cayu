@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     AgentSpec,
@@ -99,6 +100,7 @@ def _session() -> Session:
         agent_name="agent",
         provider_name="fake",
         model="model",
+        invocation=fixture_session_invocation("sess_portable_value"),
     )
 
 

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
+from tests._session_provenance import fixture_session_invocation
 
 import cayu
 import cayu.artifacts.local as artifact_local_module
@@ -347,6 +348,7 @@ def test_static_tool_policy_allows_by_default_and_denies_explicit_names():
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_policy"),
         status=SessionStatus.RUNNING,
     )
     request = ToolPolicyRequest(
@@ -369,9 +371,11 @@ def test_static_tool_policy_allows_by_default_and_denies_explicit_names():
 
 def test_session_defaults_causal_budget_id_to_session_id():
     session = Session(
+        id="sess_default_budget",
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_default_budget"),
     )
 
     assert session.id
@@ -384,6 +388,7 @@ def test_static_tool_policy_allowlist_blocks_unlisted_tools_and_deny_wins():
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_policy"),
         status=SessionStatus.RUNNING,
     )
     request = ToolPolicyRequest(
@@ -410,6 +415,7 @@ def test_tool_policy_contract_rejects_invalid_boundary_data():
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_policy"),
         status=SessionStatus.RUNNING,
     )
     agent = AgentSpec(name="assistant", model="fake-model")
@@ -2511,6 +2517,7 @@ def test_runtime_identity_models_reject_edge_whitespace_fields():
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            invocation=fixture_session_invocation("sess_1"),
         )
 
     with pytest.raises(ValidationError, match="must not start or end with whitespace"):

@@ -19,6 +19,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import SecretStr, ValidationError
+from tests._session_provenance import fixture_session_invocation
 from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._execution_unit_fixtures import model_attempt_identity
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
@@ -154,6 +155,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     InMemoryTaskStore,
     InterruptSessionRequest,
+    InvocationOriginTrust,
     KnowledgeInjectionPolicy,
     LoopPolicy,
     MessageWindowContextPolicy,
@@ -186,6 +188,7 @@ from cayu.runtime import (
     RuntimeHook,
     RuntimeHookContext,
     Session,
+    SessionExecutionSource,
     SessionIdentity,
     SessionQuery,
     SessionRunFenced,
@@ -248,7 +251,10 @@ from cayu.runtime.context import (
     _format_knowledge_candidates,
     validate_context_messages,
 )
-from cayu.runtime.sessions import _checkpoint_with_session_run_operation
+from cayu.runtime.sessions import (
+    _checkpoint_with_session_run_operation,
+    fork_session_invocation,
+)
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage import (
     InMemoryKnowledgeStore,
@@ -6378,6 +6384,7 @@ def _test_session() -> Session:
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        invocation=fixture_session_invocation("sess_context"),
     )
 
 
@@ -17420,6 +17427,11 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
     assert child.parent_session_id == "sess_subagent_parent"
     assert child.causal_budget_id == "job_subagent"
     assert child.status == SessionStatus.COMPLETED
+    parent = asyncio.run(store.load("sess_subagent_parent"))
+    assert parent is not None
+    assert child.invocation.origin == parent.invocation.origin
+    assert child.invocation.root_session_id == parent.id
+    assert child.invocation.source is SessionExecutionSource.SUBAGENT
     subagent_meta = child.metadata["subagent"]
     assert subagent_meta["agent"] == "reviewer"
     assert subagent_meta["agent_name"] == "reviewer"
@@ -17431,6 +17443,47 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
     # TOOL_CALL_COMPLETED. idempotency_key is a runtime-computed hash, so assert shape not value.
     assert subagent_meta["tool_call_id"] == "call_subagent"
     assert isinstance(subagent_meta["idempotency_key"], str) and subagent_meta["idempotency_key"]
+    matcher_arguments = {
+        "agent": "reviewer",
+        "task": "Review only the authentication changes.",
+    }
+    assert subagent_tool.matches_recoverable_child(
+        child,
+        parent_invocation=parent.invocation,
+        parent_session_id=parent.id,
+        causal_budget_id=parent.causal_budget_id,
+        environment_name=parent.environment_name,
+        tool_call_id=subagent_meta["tool_call_id"],
+        idempotency_key=subagent_meta["idempotency_key"],
+        arguments=matcher_arguments,
+        require_fingerprint=True,
+    )
+    unrelated = fixture_session_invocation("unrelated-root")
+    contradictory_origin = child.invocation.origin.model_copy(
+        update={
+            "trust": InvocationOriginTrust.HOST_ASSERTED,
+            "subject": "unrelated-user",
+        }
+    )
+    contradictory_invocations = (
+        child.invocation.model_copy(update={"origin": contradictory_origin}),
+        child.invocation.model_copy(update={"root_invocation_id": unrelated.root_invocation_id}),
+        child.invocation.model_copy(update={"root_session_id": unrelated.root_session_id}),
+        child.invocation.model_copy(update={"source": SessionExecutionSource.SDK_RUN}),
+    )
+    for invocation in contradictory_invocations:
+        contradictory = child.model_copy(update={"invocation": invocation})
+        assert not subagent_tool.matches_recoverable_child(
+            contradictory,
+            parent_invocation=parent.invocation,
+            parent_session_id=parent.id,
+            causal_budget_id=parent.causal_budget_id,
+            environment_name=parent.environment_name,
+            tool_call_id=subagent_meta["tool_call_id"],
+            idempotency_key=subagent_meta["idempotency_key"],
+            arguments=matcher_arguments,
+            require_fingerprint=True,
+        )
 
     child_transcript = asyncio.run(store.load_transcript(child.id))
     assert [message.role for message in child_transcript] == ["user", "assistant"]
@@ -25552,13 +25605,16 @@ async def _seed_crashed_spawn_parent(
         )
         subagent_meta["spawn_fingerprint"] = "sha256:" + ("0" * 64)
     await store.create(
-        RunRequest(
-            agent_name="reviewer",
-            session_id=child_session_id,
-            parent_session_id="parent",
-            causal_budget_id="parent",
-            messages=[Message.text("user", "review")],
-            metadata={"subagent": subagent_meta},
+        sessions_module.run_request_with_runtime_invocation(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_session_id,
+                parent_session_id="parent",
+                causal_budget_id="parent",
+                messages=[Message.text("user", "review")],
+                metadata={"subagent": subagent_meta},
+            ),
+            source=SessionExecutionSource.SUBAGENT,
         ),
         identity=identity,
     )
@@ -25569,13 +25625,16 @@ async def _seed_crashed_spawn_parent(
     await store.update_status(child_session_id, child_status)
     if conflicting_linkage:
         await store.create(
-            RunRequest(
-                agent_name="reviewer",
-                session_id="conflicting-child",
-                parent_session_id="parent",
-                causal_budget_id="parent",
-                messages=[Message.text("user", "different review")],
-                metadata={"subagent": dict(subagent_meta)},
+            sessions_module.run_request_with_runtime_invocation(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id="conflicting-child",
+                    parent_session_id="parent",
+                    causal_budget_id="parent",
+                    messages=[Message.text("user", "different review")],
+                    metadata={"subagent": dict(subagent_meta)},
+                ),
+                source=SessionExecutionSource.SUBAGENT,
             ),
             identity=identity,
         )
@@ -25805,23 +25864,26 @@ async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
         session_id="parent", tool_round_id=child_round_id, tool_call_id="call_spawn"
     )
     await store.create(
-        RunRequest(
-            agent_name="reviewer",
-            session_id="child",
-            parent_session_id="parent",
-            causal_budget_id="parent",
-            messages=[Message.text("user", "review")],
-            metadata={
-                "subagent": {
-                    "agent": "reviewer",
-                    "agent_name": "reviewer",
-                    "context_mode": "task_only",
-                    "mode": "background",
-                    "parent_session_id": "parent",
-                    "tool_call_id": "call_spawn",
-                    "idempotency_key": key,
-                }
-            },
+        sessions_module.run_request_with_runtime_invocation(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="child",
+                parent_session_id="parent",
+                causal_budget_id="parent",
+                messages=[Message.text("user", "review")],
+                metadata={
+                    "subagent": {
+                        "agent": "reviewer",
+                        "agent_name": "reviewer",
+                        "context_mode": "task_only",
+                        "mode": "background",
+                        "parent_session_id": "parent",
+                        "tool_call_id": "call_spawn",
+                        "idempotency_key": key,
+                    }
+                },
+            ),
+            source=SessionExecutionSource.SUBAGENT,
         ),
         identity=identity,
     )
@@ -25939,23 +26001,26 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
         tool_call_id="call_spawn",
     )
     await store.create(
-        RunRequest(
-            agent_name="reviewer",
-            session_id="child",
-            parent_session_id="parent",
-            causal_budget_id="parent",
-            messages=[Message.text("user", "review")],
-            metadata={
-                "subagent": {
-                    "agent": "reviewer",
-                    "agent_name": "reviewer",
-                    "context_mode": "task_only",
-                    "mode": "background",
-                    "parent_session_id": "parent",
-                    "tool_call_id": "call_spawn",
-                    "idempotency_key": key,
-                }
-            },
+        sessions_module.run_request_with_runtime_invocation(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="child",
+                parent_session_id="parent",
+                causal_budget_id="parent",
+                messages=[Message.text("user", "review")],
+                metadata={
+                    "subagent": {
+                        "agent": "reviewer",
+                        "agent_name": "reviewer",
+                        "context_mode": "task_only",
+                        "mode": "background",
+                        "parent_session_id": "parent",
+                        "tool_call_id": "call_spawn",
+                        "idempotency_key": key,
+                    }
+                },
+            ),
+            source=SessionExecutionSource.SUBAGENT,
         ),
         identity=identity,
     )
@@ -37070,6 +37135,7 @@ def test_in_memory_session_store_rejects_fork_status_mismatch():
                     provider_name="fake",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.RUNNING,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -37103,6 +37169,7 @@ def test_in_memory_session_store_rejects_fork_provider_mismatch():
                     provider_name="other",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -37137,6 +37204,7 @@ def test_in_memory_session_store_transforms_current_checkpoint_during_fork():
                 provider_name="fake",
                 model="fake-model",
                 parent_session_id=source.id,
+                invocation=fork_session_invocation(source),
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
@@ -38420,6 +38488,9 @@ def test_prompt_cache_compactor_reports_every_completion_when_retry_follows_comp
                     agent_name="assistant",
                     provider_name=provider.name,
                     model="fake-model",
+                    invocation=fixture_session_invocation(
+                        "sess_prompt_cache_retry_after_completed"
+                    ),
                 ),
                 agent=AgentSpec(name="assistant", model="fake-model"),
                 messages=[Message.text("user", "old request")],
@@ -44767,6 +44838,7 @@ def test_prompt_cache_compactor_uses_session_model_by_default():
         agent_name="assistant",
         provider_name="fake",
         model="claude-sonnet-4-20260601",
+        invocation=fixture_session_invocation("sess_model_test"),
     )
 
     asyncio.run(
@@ -44882,6 +44954,7 @@ def test_prompt_cache_compactor_bounds_exact_context_overflow_once():
         agent_name="assistant",
         provider_name=provider.name,
         model="fake-model",
+        invocation=fixture_session_invocation("sess_prompt_cache_overflow"),
     )
 
     result = asyncio.run(
@@ -44955,6 +45028,7 @@ def test_prompt_cache_compactor_surfaces_bounded_failure_after_exact_overflow():
         agent_name="assistant",
         provider_name=provider.name,
         model="fake-model",
+        invocation=fixture_session_invocation("sess_prompt_cache_bounded_failure"),
     )
 
     with pytest.raises(RuntimeError, match="bounded compaction failed") as exc_info:
@@ -44986,6 +45060,7 @@ def test_prompt_cache_compactor_does_not_loop_when_bounded_attempt_also_overflow
         agent_name="assistant",
         provider_name=provider.name,
         model="fake-model",
+        invocation=fixture_session_invocation("sess_prompt_cache_double_overflow"),
     )
 
     with pytest.raises(RuntimeError, match="context too large") as exc_info:

@@ -74,6 +74,8 @@ from cayu.runtime import (
     InMemorySessionStore,
     InteractionTransitionSpec,
     InterruptSessionRequest,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
     McpManifestBaseline,
     ModelCompactor,
     ModelCompletionStageRequest,
@@ -94,6 +96,7 @@ from cayu.runtime import (
     RuntimePublicationMutation,
     RuntimePublicationRequest,
     Session,
+    SessionExecutionSource,
     SessionIdentity,
     SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
@@ -174,6 +177,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_run_fence,
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
+    fork_session_invocation,
 )
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -833,6 +837,202 @@ def test_in_memory_public_authority_aliases_reject_retired_keys() -> None:
             )
             == private_session_id
         )
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_parent_deletion_preserves_root_invocation(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            parent = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"invocation-parent-{session_store_case[0]}",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            child = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"invocation-child-{session_store_case[0]}",
+                    parent_session_id=parent.id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+
+            await store.delete_session(parent.id)
+            loaded = await store.load(child.id)
+
+            assert loaded is not None
+            assert loaded.parent_session_id is None
+            assert loaded.invocation == child.invocation
+            assert loaded.invocation.root_session_id == parent.id
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reused_root_session_id_cannot_rebind_invocation(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            root_session_id = f"invocation-reused-root-{session_store_case[0]}"
+            original_root = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=root_session_id,
+                    messages=[],
+                    invocation_origin=InvocationOriginClaim(subject="original-user"),
+                ),
+                identity=_identity(),
+            )
+            child = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"invocation-reused-child-{session_store_case[0]}",
+                    parent_session_id=original_root.id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+
+            await store.delete_session(original_root.id)
+            replacement_root = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=root_session_id,
+                    messages=[],
+                    invocation_origin=InvocationOriginClaim(subject="replacement-user"),
+                ),
+                identity=_identity(),
+            )
+            store = await _reopen_store(session_store_case, store)
+            loaded_child = await store.load(child.id)
+            loaded_replacement = await store.load(replacement_root.id)
+
+            assert loaded_child is not None
+            assert loaded_replacement is not None
+            assert loaded_child.invocation.root_session_id == root_session_id
+            assert loaded_replacement.invocation.root_session_id == root_session_id
+            assert (
+                loaded_child.invocation.root_invocation_id
+                == original_root.invocation.root_invocation_id
+            )
+            assert (
+                loaded_replacement.invocation.root_invocation_id
+                == replacement_root.invocation.root_invocation_id
+            )
+            assert (
+                loaded_child.invocation.root_invocation_id
+                != loaded_replacement.invocation.root_invocation_id
+            )
+            assert loaded_child.invocation.origin.subject == "original-user"
+            assert loaded_replacement.invocation.origin.subject == "replacement-user"
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reconstructs_exact_root_invocation(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            root_request = RunRequest(
+                agent_name="assistant",
+                session_id=f"invocation-root-{session_store_case[0]}",
+                messages=[],
+                invocation_origin=InvocationOriginClaim(
+                    subject="application-user",
+                    tenant="customer-a",
+                ),
+            )
+            root = await store.create(root_request, identity=_identity())
+            child_request = RunRequest(
+                agent_name="assistant",
+                session_id=f"invocation-child-reload-{session_store_case[0]}",
+                parent_session_id=root.id,
+                messages=[],
+            )
+            child = await store.create(child_request, identity=_identity())
+
+            with pytest.raises(ValueError, match="Session already exists"):
+                await store.create(child_request, identity=_identity())
+
+            store = await _reopen_store(session_store_case, store)
+            loaded_root = await store.load(root.id)
+            loaded_child = await store.load(child.id)
+
+            assert loaded_root is not None
+            assert loaded_child is not None
+            assert loaded_root.invocation.origin.trust is InvocationOriginTrust.HOST_ASSERTED
+            assert loaded_root.invocation.origin.subject == "application-user"
+            assert loaded_root.invocation.origin.tenant == "customer-a"
+            assert loaded_root.invocation.root_invocation_id == root.invocation.root_invocation_id
+            assert loaded_root.invocation.root_session_id == root.id
+            assert loaded_root.invocation.source is SessionExecutionSource.SDK_RUN
+            assert loaded_child.invocation.origin == loaded_root.invocation.origin
+            assert (
+                loaded_child.invocation.root_invocation_id
+                == loaded_root.invocation.root_invocation_id
+            )
+            assert loaded_child.invocation.root_session_id == loaded_root.id
+            assert loaded_child.invocation.source is SessionExecutionSource.SDK_RUN
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_concurrent_child_creation_has_one_provenance(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            root = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"invocation-concurrent-root-{session_store_case[0]}",
+                    messages=[],
+                    invocation_origin=InvocationOriginClaim(subject="application-user"),
+                ),
+                identity=_identity(),
+            )
+            child_request = RunRequest(
+                agent_name="assistant",
+                session_id=f"invocation-concurrent-child-{session_store_case[0]}",
+                parent_session_id=root.id,
+                messages=[],
+            )
+            results = await asyncio.gather(
+                store.create(child_request, identity=_identity()),
+                store.create(child_request, identity=_identity()),
+                return_exceptions=True,
+            )
+
+            created = [result for result in results if isinstance(result, Session)]
+            rejected = [result for result in results if isinstance(result, ValueError)]
+            assert len(created) == 1
+            assert len(rejected) == 1
+            assert "Session already exists" in str(rejected[0])
+            loaded = await store.load(child_request.session_id or "")
+            assert loaded is not None
+            assert loaded.invocation == created[0].invocation
+            assert loaded.invocation.origin == root.invocation.origin
+            assert loaded.invocation.root_session_id == root.id
+        finally:
+            await _close_store(store)
 
     asyncio.run(run())
 
@@ -12120,6 +12320,7 @@ def test_session_store_conformance_blocks_fork_and_delete_with_active_model_stag
                 model=interrupted.model,
                 parent_session_id=interrupted.id,
                 causal_budget_id=interrupted.causal_budget_id,
+                invocation=fork_session_invocation(interrupted),
                 status=interrupted.status,
             )
 
@@ -14374,6 +14575,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         model="fake-model",
                         parent_session_id="sess_other",
                         causal_budget_id=source.causal_budget_id,
+                        invocation=fork_session_invocation(source),
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.PENDING},
@@ -14391,6 +14593,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         model="fake-model",
                         parent_session_id=source.id,
                         causal_budget_id=source.causal_budget_id,
+                        invocation=fork_session_invocation(source),
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.PENDING},
@@ -14408,6 +14611,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         model="fake-model",
                         parent_session_id=source.id,
                         causal_budget_id=source.causal_budget_id,
+                        invocation=fork_session_invocation(source),
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.COMPLETED},
@@ -14425,6 +14629,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         model="fake-model",
                         parent_session_id=source.id,
                         causal_budget_id=source.causal_budget_id,
+                        invocation=fork_session_invocation(source),
                         status=SessionStatus.COMPLETED,
                     ),
                     source_statuses={SessionStatus.PENDING},
@@ -14442,6 +14647,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         model="fake-model",
                         parent_session_id=source.id,
                         causal_budget_id=source.causal_budget_id,
+                        invocation=fork_session_invocation(source),
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.PENDING},
@@ -14493,6 +14699,7 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
                     provider_name="fake",
                     model="fake-model",
                     parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -14551,6 +14758,7 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
                     provider_name="fake",
                     model="fake-model",
                     parent_session_id=mutation_source.id,
+                    invocation=fork_session_invocation(mutation_source),
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
@@ -14581,6 +14789,7 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
                             provider_name="fake",
                             model="fake-model",
                             parent_session_id=source.id,
+                            invocation=fork_session_invocation(source),
                             status=SessionStatus.COMPLETED,
                         ),
                         source_statuses={SessionStatus.COMPLETED},

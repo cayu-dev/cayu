@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+from tests._session_provenance import fixture_session_invocation
+
 from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
@@ -20,6 +22,7 @@ def _request(tool_name: str) -> ToolPolicyRequest:
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            invocation=fixture_session_invocation("s"),
             status=SessionStatus.RUNNING,
         ),
         agent=AgentSpec(name="assistant", model="fake-model"),

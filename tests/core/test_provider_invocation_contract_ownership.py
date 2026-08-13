@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 
 from cayu.core import AgentSpec, Message, TextPart
 from cayu.embeddings import (
@@ -153,6 +154,7 @@ def _session() -> Session:
         provider_name="provider",
         model="model",
         causal_budget_id="budget-1",
+        invocation=fixture_session_invocation("session-1"),
         metadata={"nested": {"value": "original"}},
     )
 

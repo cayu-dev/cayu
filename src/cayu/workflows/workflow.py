@@ -51,9 +51,11 @@ from cayu.runtime._child_session_identity import (
 )
 from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.runtime.budgets import copy_request_budget_limits
+from cayu.runtime.invocation import SessionExecutionSource
 from cayu.runtime.retry_policy import copy_retry_policy
 from cayu.runtime.sessions import (
     run_request_with_runtime_generated_authority,
+    run_request_with_runtime_invocation,
     run_request_with_runtime_session_create_claim,
     session_matches_reconstructed_runtime_create_claim,
     session_matches_runtime_create_claim,
@@ -777,6 +779,10 @@ async def _run_step(
             request,
             *request_authority,
         )
+    request = run_request_with_runtime_invocation(
+        request,
+        source=SessionExecutionSource.WORKFLOW_STEP,
+    )
     session_create_claim: object | None = None
     if generated_child_ownership.is_generated:
         if generated_child_claim_id is None:  # pragma: no cover - state invariant
@@ -804,6 +810,8 @@ async def _run_step(
                 existing_child,
                 deferred_input,
                 session_create_claim,
+                request=request,
+                parent_session=anchor if parent_session_id is not None else None,
             ):
                 raise StepError(
                     f"generated child session identity collision: {child_session_id!r}",
@@ -897,6 +905,8 @@ async def _run_step(
             created,
             deferred_input,
             session_create_claim,
+            request=request,
+            parent_session=anchor if parent_session_id is not None else None,
         ):
             return False
         generated_child_ownership = _GeneratedChildOwnership.CREATED_UNATTACHED

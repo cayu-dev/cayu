@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
+from tests._session_provenance import session_fixture
 
 from cayu import (
     AgentSpec,
@@ -24,7 +25,6 @@ from cayu import (
     ResumeRequest,
     RetryPolicy,
     RunRequest,
-    Session,
     TextPart,
     ThinkingConfig,
 )
@@ -198,7 +198,7 @@ def test_prompt_cache_compactor_extends_the_exact_model_request_prefix() -> None
     result = asyncio.run(
         compactor.compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-prefix",
                     agent_name="assistant",
                     provider_name="recording",
@@ -247,7 +247,7 @@ def test_prompt_cache_compactor_uses_bounded_cross_model_fallback_for_override()
             model="different-model",
         ).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-model-mismatch",
                     agent_name="assistant",
                     provider_name="recording",
@@ -290,7 +290,7 @@ def test_prompt_cache_compactor_uses_bounded_fallback_when_session_model_changed
     result = asyncio.run(
         PromptCacheCompactor(provider=provider).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-session-model-changed",
                     agent_name="assistant",
                     provider_name="recording",
@@ -325,7 +325,7 @@ def test_prompt_cache_compactor_requires_model_for_cross_provider_compaction() -
         asyncio.run(
             PromptCacheCompactor(provider=provider).compact(
                 CompactionRequest(
-                    session=Session(
+                    session=session_fixture(
                         id="prompt-cache-provider-model-required",
                         agent_name="assistant",
                         provider_name="original-provider",
@@ -377,7 +377,7 @@ def test_prompt_cache_compactor_uses_explicit_model_for_cross_provider_compactio
     result = asyncio.run(
         PromptCacheCompactor(provider=provider, model="gpt-4.1-mini").compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-provider-mismatch",
                     agent_name="assistant",
                     provider_name="original-provider",
@@ -430,7 +430,7 @@ def test_prompt_cache_compactor_uses_bounded_fallback_for_tool_structured_output
     result = asyncio.run(
         PromptCacheCompactor(provider=provider).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-tool-structured-output",
                     agent_name="assistant",
                     provider_name="recording",
@@ -495,7 +495,7 @@ def test_prompt_cache_compactor_degrades_exact_tool_call_to_bounded_input() -> N
     result = asyncio.run(
         PromptCacheCompactor(provider=provider).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-tool-call-degradation",
                     agent_name="assistant",
                     provider_name="sequenced",
@@ -545,7 +545,7 @@ def test_prompt_cache_compactor_degrades_when_exact_tool_call_stream_fails(
     result = asyncio.run(
         PromptCacheCompactor(provider=provider).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id=f"prompt-cache-tool-call-{failure_kind}",
                     agent_name="assistant",
                     provider_name=provider.name,
@@ -591,7 +591,7 @@ def test_model_compactor_detaches_provider_failure_after_tool_call() -> None:
                 model="summary-model",
             ).compact(
                 CompactionRequest(
-                    session=Session(
+                    session=session_fixture(
                         id="model-compactor-secret-tool-failure",
                         agent_name="assistant",
                         provider_name="secret-tool-failure",
@@ -628,7 +628,7 @@ def test_prompt_cache_compactor_preserves_bounded_provider_error_after_tool_degr
         asyncio.run(
             PromptCacheCompactor(provider=provider).compact(
                 CompactionRequest(
-                    session=Session(
+                    session=session_fixture(
                         id="prompt-cache-tool-call-bounded-provider-error",
                         agent_name="assistant",
                         provider_name=provider.name,
@@ -681,7 +681,7 @@ def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> Non
 
     def context_request(*, force_bounded_compaction: bool) -> ContextRequest:
         return ContextRequest(
-            session=Session(
+            session=session_fixture(
                 id="prompt-cache-failure-telemetry-scope",
                 agent_name="assistant",
                 provider_name=provider.name,
@@ -784,7 +784,7 @@ def test_prompt_cache_compactor_retains_usage_before_post_completion_stream_fail
     result = asyncio.run(
         PromptCacheCompactor(provider=provider).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-tool-call-post-completion-error",
                     agent_name="assistant",
                     provider_name=provider.name,
@@ -811,7 +811,7 @@ def test_prompt_cache_compactor_falls_back_without_an_exact_request() -> None:
     result = asyncio.run(
         PromptCacheCompactor(provider=provider).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-unavailable",
                     agent_name="assistant",
                     provider_name="recording",
@@ -849,7 +849,7 @@ def test_prompt_cache_compactor_accounts_for_usage_and_ignores_thinking() -> Non
     result = asyncio.run(
         PromptCacheCompactor(provider=provider).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-usage",
                     agent_name="assistant",
                     provider_name="recording",
@@ -904,7 +904,7 @@ def test_prompt_cache_compactor_retries_structured_provider_errors() -> None:
             retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
         ).compact(
             CompactionRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-retry",
                     agent_name="assistant",
                     provider_name=provider.name,
@@ -958,7 +958,7 @@ def test_checkpoint_policy_builds_the_cache_prefix_with_runtime_request_shape() 
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-cache-prefix",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1003,7 +1003,7 @@ def test_checkpoint_policy_reports_start_when_cache_prefix_build_fails() -> None
         asyncio.run(
             policy.build_with_checkpoint(
                 ContextRequest(
-                    session=Session(
+                    session=session_fixture(
                         id="checkpoint-cache-prefix-failure",
                         agent_name="assistant",
                         provider_name="recording",
@@ -1058,7 +1058,7 @@ def test_prompt_cache_digest_exhaustion_can_progress_on_bounded_followup() -> No
     first = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-digest-exhaustion",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1080,7 +1080,7 @@ def test_prompt_cache_digest_exhaustion_can_progress_on_bounded_followup() -> No
     second = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="prompt-cache-digest-exhaustion",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1120,7 +1120,7 @@ def test_prompt_cache_digest_exhaustion_uses_fallback_key_without_valid_usage_cu
         raise AssertionError("an invalid usage cursor cannot reconstruct a cache prefix")
 
     request = ContextRequest(
-        session=Session(
+        session=session_fixture(
             id="prompt-cache-missing-usage-cursor",
             agent_name="assistant",
             provider_name="recording",
@@ -1170,7 +1170,7 @@ def test_checkpoint_policy_skips_cache_request_after_provider_identity_changes()
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-provider-changed",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1220,7 +1220,7 @@ def test_checkpoint_policy_skips_cache_request_after_requested_model_changes() -
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-requested-model-changed",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1271,7 +1271,7 @@ def test_checkpoint_policy_skips_exact_builder_for_tool_structured_output() -> N
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-tool-structured-output",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1315,7 +1315,7 @@ def test_checkpoint_policy_keeps_the_initial_prefix_until_it_can_compact() -> No
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-warm-prefix",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1352,7 +1352,7 @@ def test_checkpoint_policy_falls_back_without_a_completed_request_cursor() -> No
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-cache-unavailable",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1398,7 +1398,7 @@ def test_checkpoint_policy_skips_cache_request_for_cross_model_override() -> Non
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-cross-model",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1436,7 +1436,7 @@ def test_checkpoint_policy_does_not_build_a_model_request_for_digest_compaction(
     result = asyncio.run(
         policy.build_with_checkpoint(
             ContextRequest(
-                session=Session(
+                session=session_fixture(
                     id="checkpoint-digest-lazy",
                     agent_name="assistant",
                     provider_name="recording",
@@ -1792,7 +1792,7 @@ def test_prompt_cache_compactor_uses_bounded_incremental_compaction_after_checkp
         provider=provider,
         compaction_instruction=compaction_instruction,
     )
-    session = Session(
+    session = session_fixture(
         id="repeated-compaction",
         agent_name="assistant",
         provider_name="sequenced",

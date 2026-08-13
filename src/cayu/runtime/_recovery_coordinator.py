@@ -10220,6 +10220,7 @@ def _matches_recoverable_subagent_child(
         return False
     matched = registered_tool.child_session_recovery.matches_recoverable_child(
         child,
+        parent_invocation=parent_session.invocation,
         parent_session_id=parent_session.id,
         causal_budget_id=parent_session.causal_budget_id,
         environment_name=parent_session.environment_name,

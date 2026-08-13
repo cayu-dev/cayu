@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -489,6 +490,7 @@ def test_checkpoint_preservation_rejects_deleting_transform() -> None:
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
+                invocation=fixture_session_invocation("environment_checkpoint_deletion"),
             ),
             None,
         )

@@ -29,6 +29,11 @@ from cayu.runtime._child_session_identity import (
     ChildSessionRecoveryMatcher,
     generate_child_session_id,
 )
+from cayu.runtime.invocation import (
+    SessionExecutionSource,
+    SessionInvocation,
+    inherited_session_invocation,
+)
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
     RunRequest,
@@ -39,6 +44,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     TranscriptQuery,
     run_request_with_runtime_generated_authority,
+    run_request_with_runtime_invocation,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.tool_policy import metadata_with_taint_labels, taint_labels_from_metadata
@@ -398,6 +404,10 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             "parent_session_id",
             "causal_budget_id",
         )
+        request = run_request_with_runtime_invocation(
+            request,
+            source=SessionExecutionSource.SUBAGENT,
+        )
         structured = _subagent_result_payload(
             agent_alias=agent_alias,
             spec=spec,
@@ -537,8 +547,10 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         child = await session_store.load(child_session_id)
         if child is None:
             return None
+        parent = await session_store.load(parent_session_id)
         if not _matches_subagent_spawn(
             child,
+            parent_invocation=None if parent is None else parent.invocation,
             agent_alias=agent_alias,
             spec=spec,
             parent_session_id=parent_session_id,
@@ -585,6 +597,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         self,
         child: Session,
         *,
+        parent_invocation: SessionInvocation,
         parent_session_id: str,
         causal_budget_id: str,
         environment_name: str | None,
@@ -624,6 +637,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         )
         if not _matches_subagent_spawn(
             child,
+            parent_invocation=parent_invocation,
             agent_alias=agent_alias,
             spec=spec,
             parent_session_id=parent_session_id,
@@ -1038,6 +1052,7 @@ def _subagent_spawn_fingerprint(
 def _matches_subagent_spawn(
     child: Session,
     *,
+    parent_invocation: SessionInvocation | None,
     agent_alias: str,
     spec: SubagentSpec,
     parent_session_id: str,
@@ -1048,7 +1063,13 @@ def _matches_subagent_spawn(
 ) -> bool:
     subagent = child.metadata.get("subagent")
     return (
-        isinstance(subagent, dict)
+        parent_invocation is not None
+        and child.invocation
+        == inherited_session_invocation(
+            parent_invocation,
+            source=SessionExecutionSource.SUBAGENT,
+        )
+        and isinstance(subagent, dict)
         and child.agent_name == spec.agent_name
         and child.parent_session_id == parent_session_id
         and child.causal_budget_id == causal_budget_id

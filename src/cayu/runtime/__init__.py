@@ -247,6 +247,13 @@ from cayu.runtime.hooks import (
     ToolCallHookContext,
 )
 from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    SessionInvocation,
+)
 from cayu.runtime.loop_policies import (
     BeforeStopAction,
     BeforeStopContext,
@@ -464,6 +471,7 @@ from cayu.runtime.sessions import (
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     runtime_publication_event_reference,
+    session_invocation_for_run_request,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -750,6 +758,9 @@ __all__ = [
     "InteractionTransitionResult",
     "InteractionTransitionSpec",
     "InterruptSessionRequest",
+    "InvocationOrigin",
+    "InvocationOriginClaim",
+    "InvocationOriginTrust",
     "KnowledgeInjectionPolicy",
     "LabelSelectorOperator",
     "LabelSelectorRequirement",
@@ -873,10 +884,12 @@ __all__ = [
     "SessionBudgetStore",
     "SessionCostSummary",
     "SessionDebugState",
+    "SessionExecutionSource",
     "SessionIdentity",
     "SessionInspectionIdentity",
     "SessionInspectionSummary",
     "SessionInspectionUsageSummary",
+    "SessionInvocation",
     "SessionLineageNode",
     "SessionLineageOrigin",
     "SessionLineageQuery",
@@ -1058,6 +1071,7 @@ __all__ = [
     "runtime_publication_checkpoint_mutation",
     "runtime_publication_checkpoint_value_digest",
     "runtime_publication_event_reference",
+    "session_invocation_for_run_request",
     "session_usage_summary",
     "strip_old_file_attachments",
     "taint_labels_from_metadata",

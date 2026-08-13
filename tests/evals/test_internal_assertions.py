@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     ChildSessionCompleted,
@@ -42,6 +43,10 @@ def _session(
         causal_budget_id="budget",
         status=status,
         parent_session_id=parent_session_id,
+        invocation=fixture_session_invocation(
+            session_id,
+            parent_session_id=parent_session_id,
+        ),
     )
 
 

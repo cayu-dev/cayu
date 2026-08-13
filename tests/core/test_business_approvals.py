@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY,
@@ -86,6 +87,7 @@ def _policy_request(tool_name: str = "route_package") -> ToolPolicyRequest:
             agent_name="router",
             provider_name="scripted",
             model="fake-model",
+            invocation=fixture_session_invocation("s"),
             status=SessionStatus.RUNNING,
         ),
         agent=AgentSpec(name="router", model="fake-model"),

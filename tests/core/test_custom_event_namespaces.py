@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, cast
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     AgentSpec,
@@ -200,6 +201,7 @@ def test_hook_context_rejects_reserved_event_before_custom_runtime_delegation() 
         agent_name="assistant",
         provider_name="custom",
         model="custom-model",
+        invocation=fixture_session_invocation("sess_custom_hook_runtime"),
     )
     context = RuntimeHookContext(
         runtime=cast("Any", runtime),

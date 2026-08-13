@@ -129,6 +129,24 @@ def test_revision_thirty_four_adds_delayed_task_availability() -> None:
         )
 
 
+def test_revision_thirty_six_requires_session_invocation_provenance() -> None:
+    revision = m.revision(36)
+    state = m.SchemaState(
+        revision=revision.revision,
+        compatible_from=revision.compatible_from,
+    )
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 36"):
+        m.validate(state, app_latest=35, app_min_supported=35)
+    m.validate(state, app_latest=36, app_min_supported=36)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 36"):
+        m.validate(
+            m.SchemaState(revision=35, compatible_from=35),
+            app_latest=36,
+            app_min_supported=36,
+        )
+
+
 def test_revision_fourteen_remains_compatible_with_older_binaries() -> None:
     m.validate(
         m.SchemaState(revision=14, compatible_from=10),

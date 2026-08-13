@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     ANY_TAINT_LABEL,
@@ -33,6 +34,7 @@ def _request(
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            invocation=fixture_session_invocation("sess_policy"),
             status=SessionStatus.RUNNING,
         ),
         agent=AgentSpec(name="assistant", model="fake-model"),
