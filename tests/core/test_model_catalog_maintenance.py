@@ -371,6 +371,28 @@ def test_bedrock_opus_5_release_date_matches_aws_model_card() -> None:
     assert model.release_date == date(2026, 7, 23)
 
 
+@pytest.mark.parametrize(
+    ("model_name", "release_date"),
+    [
+        ("claude-fable-5", date(2026, 6, 9)),
+        ("claude-opus-4-8", date(2026, 5, 28)),
+        ("claude-sonnet-4-6", date(2026, 2, 17)),
+        ("claude-sonnet-5", date(2026, 6, 30)),
+    ],
+)
+def test_vertex_claude_facts_match_google_model_cards(model_name: str, release_date: date) -> None:
+    model = default_model_catalog().match(provider_name="vertex", model=model_name)
+
+    assert model is not None
+    assert model.context_window == 1_000_000
+    assert model.max_output_tokens == 128_000
+    assert model.release_date == release_date
+    assert model.provenance.url == (
+        "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/"
+        f"partner-models/claude/{model_name.removeprefix('claude-')}"
+    )
+
+
 def test_bedrock_browser_allows_the_official_aws_bulk_price_list() -> None:
     url = (
         "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/"

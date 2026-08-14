@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-08-03",
-  "generated_at": "2026-08-03",
+  "catalog_version": "2026-08-13",
+  "generated_at": "2026-08-13",
   "models": [
     {
       "aliases": [],
@@ -656,7 +656,7 @@
         "claude-fable-5-20",
         "claude-fable-5@20"
       ],
-      "max_output_tokens": null,
+      "max_output_tokens": 128000,
       "modalities_in": [
         "text",
         "image",
@@ -668,13 +668,13 @@
       "model": "claude-fable-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-07-13",
+        "as_of": "2026-08-13",
         "source": "official",
-        "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+        "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/fable-5"
       },
       "provider_name": "vertex",
       "reasoning": true,
-      "release_date": null,
+      "release_date": "2026-06-09",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true
@@ -702,13 +702,13 @@
       "model": "claude-opus-4-8",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-07-13",
+        "as_of": "2026-08-13",
         "source": "official",
-        "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+        "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/opus-4-8"
       },
       "provider_name": "vertex",
       "reasoning": true,
-      "release_date": null,
+      "release_date": "2026-05-28",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true
@@ -755,7 +755,7 @@
         "claude-sonnet-4-6-20",
         "claude-sonnet-4-6@20"
       ],
-      "max_output_tokens": null,
+      "max_output_tokens": 128000,
       "modalities_in": [
         "text",
         "image",
@@ -767,13 +767,13 @@
       "model": "claude-sonnet-4-6",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-07-13",
+        "as_of": "2026-08-13",
         "source": "official",
-        "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+        "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/sonnet-4-6"
       },
       "provider_name": "vertex",
       "reasoning": true,
-      "release_date": null,
+      "release_date": "2026-02-17",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true
@@ -801,9 +801,9 @@
       "model": "claude-sonnet-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-07-13",
+        "as_of": "2026-08-13",
         "source": "official",
-        "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+        "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/sonnet-5"
       },
       "provider_name": "vertex",
       "reasoning": true,

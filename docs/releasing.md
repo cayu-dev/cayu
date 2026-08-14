@@ -83,7 +83,17 @@ PyPI access.
    cd ..
    uv run python scripts/build_dashboard_source_bundle.py
    ```
-2. Create and push the matching tag:
+2. Run the release-only model-catalog freshness gate before creating the tag:
+
+   ```bash
+   uv run python -m maintenance.model_catalog.check
+   ```
+
+   Pull-request and `main` CI deliberately skip wall-clock staleness so unchanged
+   branches remain deterministic. The tag workflow does not skip it. Do not create
+   the tag if this command fails; re-verify the reported records against their
+   official sources and land the refreshed catalog first.
+3. Create and push the matching tag:
 
    ```bash
    git switch main
@@ -93,7 +103,7 @@ PyPI access.
    git push origin "v${version}"
    ```
 
-3. Wait for the `static`, `test`, `sqlite-cancellation`, `package`,
+4. Wait for the `static`, `test`, `sqlite-cancellation`, `package`,
    `windows-dashboard-artifact`, and `dashboard` jobs to pass on the tagged commit. The
    `package` job checks that the tag matches the project version and uploads the exact
    distribution it validated. Its artifact gate verifies identical dashboard-source bundles in
@@ -102,10 +112,10 @@ PyPI access.
    tree, and browser-smokes a non-root deep link plus a bounded control-plane read against the
    installed server. The Windows artifact job separately verifies native extraction, inherited
    permissions, and the installed API-check workflow.
-4. Confirm the environment request names the expected tag and commit, then
+5. Confirm the environment request names the expected tag and commit, then
    approve the `pypi` deployment.
-5. Wait for PyPI publication and the dependent GitHub release to complete.
-6. Verify the exact published version:
+6. Wait for PyPI publication and the dependent GitHub release to complete.
+7. Verify the exact published version:
 
    ```bash
    version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
