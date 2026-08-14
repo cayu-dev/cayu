@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     copy_durable_json_value,
     require_durable_clean_nonblank,
     require_durable_nonblank,
@@ -137,6 +138,11 @@ class PendingUserInput(BaseModel):
     tool_round_id: str
     model_step_id: str
     model_attempt_id: str
+    model_step: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     tool_call_id: str
     tool_name: str
     question: str
@@ -420,6 +426,7 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         tool_round_id=pending.tool_round_id,
         model_step_id=pending.model_step_id,
         model_attempt_id=pending.model_attempt_id,
+        model_step=pending.model_step,
         tool_call_id=pending.tool_call_id,
         tool_name=pending.tool_name,
         question=pending.question,

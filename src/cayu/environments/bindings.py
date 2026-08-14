@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import io
+import json
+import ntpath
 import shutil
 import tarfile
 import threading
@@ -12,7 +15,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -23,7 +26,12 @@ from cayu._exception_groups import (
     exception_group_children,
 )
 from cayu._task_wait import await_shielded_task_outcome, unexpected_child_cancellation_error
-from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces import (
     BoundedTarReader,
@@ -31,8 +39,17 @@ from cayu.workspaces import (
     RunnerWorkspace,
     TarWriter,
     Workspace,
+    WorkspaceIdentity,
+    WorkspacePathRevision,
+    WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimits,
+    WorkspaceRevisionObservationStatus,
 )
 from cayu.workspaces._tar import tar_archive_size_bound
+from cayu.workspaces.revisions import (
+    observe_deterministic_workspace,
+    unsupported_workspace_revision,
+)
 
 
 @dataclass(frozen=True)
@@ -137,6 +154,36 @@ SyncTargetCleanPolicy = Literal["always", "never"]
 SyncBackPolicy = Literal["always", "on_success", "never"]
 
 GIT_REPOSITORY_METADATA_KEY = "git_repository"
+_GIT_OBSERVATION_ENV_REMOVE = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_REDIRECT_STDERR",
+    "GIT_TRACE",
+    "GIT_TRACE_CURL",
+    "GIT_TRACE_CURL_NO_DATA",
+    "GIT_TRACE_FSMONITOR",
+    "GIT_TRACE_PACKET",
+    "GIT_TRACE_PACK_ACCESS",
+    "GIT_TRACE_PERFORMANCE",
+    "GIT_TRACE_REFS",
+    "GIT_TRACE_SETUP",
+    "GIT_TRACE_SHALLOW",
+    "GIT_TRACE2",
+    "GIT_TRACE2_BRIEF",
+    "GIT_TRACE2_CONFIG_PARAMS",
+    "GIT_TRACE2_DST_DEBUG",
+    "GIT_TRACE2_EVENT",
+    "GIT_TRACE2_PERF",
+    "GIT_WORK_TREE",
+)
 
 SYNC_DISTINCT_WORKSPACES_ERROR = "SyncBinding source and target workspaces must be different."
 
@@ -423,6 +470,26 @@ class WorkspaceBinding(ABC):
     ) -> WorkspaceSnapshot | None:
         """Clean up or persist the binding after the session ends."""
 
+    async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:
+        """Observe bounded workspace state when this binding supports it.
+
+        The compatibility default is an explicit unsupported result.  It must
+        not reinterpret per-file optimistic revision tokens or binding
+        snapshots as restorable workspace revisions.
+        """
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("Workspace revision observation requires a BoundWorkspace.")
+        workspace = bound.workspace or bound.source_workspace
+        if workspace is None:
+            workspace_id = "workspace-unavailable"
+        else:
+            workspace_id = require_clean_nonblank(workspace.id, "workspace.id")
+        return unsupported_workspace_revision(
+            workspace_id=workspace_id,
+            observer=type(self).__name__,
+        )
+
     async def _bind_for_environment_lifecycle(
         self,
         workspace: Workspace | None,
@@ -549,6 +616,53 @@ class NativeBinding(WorkspaceBinding):
         return None
 
 
+def _copy_workspace_revision_observation_limits(
+    limits: WorkspaceRevisionObservationLimits | None,
+) -> WorkspaceRevisionObservationLimits:
+    if limits is None:
+        return WorkspaceRevisionObservationLimits()
+    if type(limits) is not WorkspaceRevisionObservationLimits:
+        raise TypeError(
+            "Workspace observation limits must be a WorkspaceRevisionObservationLimits instance."
+        )
+    values = {
+        "max_paths": limits.max_paths,
+        "max_path_bytes": limits.max_path_bytes,
+        "max_file_bytes": limits.max_file_bytes,
+        "max_total_file_bytes": limits.max_total_file_bytes,
+        "max_manifest_bytes": limits.max_manifest_bytes,
+    }
+    if any(type(value) is not int for value in values.values()):
+        raise TypeError("Workspace observation limit fields must be integers.")
+    return WorkspaceRevisionObservationLimits(**values)
+
+
+class DeterministicWorkspaceBinding(NativeBinding):
+    """Backend-neutral revision observer for conformance and simple workspaces."""
+
+    def __init__(
+        self,
+        *,
+        default_path: str | None = None,
+        observation_limits: WorkspaceRevisionObservationLimits | None = None,
+    ) -> None:
+        super().__init__(default_path=default_path)
+        self.observation_limits = _copy_workspace_revision_observation_limits(observation_limits)
+
+    async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("Workspace revision observation requires a BoundWorkspace.")
+        workspace = bound.workspace or bound.source_workspace
+        if workspace is None:
+            return await super().observe_revision(bound)
+        limits = _copy_workspace_revision_observation_limits(self.observation_limits)
+        return await observe_deterministic_workspace(
+            workspace,
+            observer=type(self).__name__,
+            limits=limits,
+        )
+
+
 class NoWorkspaceBinding(WorkspaceBinding):
     """Binding for agents that intentionally expose no workspace to the runner."""
 
@@ -617,6 +731,7 @@ class GitRepositoryBinding(WorkspaceBinding):
         verify_remote_url: bool = True,
         timeout_s: int | None = 120,
         output_limit_bytes: int = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+        observation_limits: WorkspaceRevisionObservationLimits | None = None,
     ) -> None:
         self.repo_url = _validate_git_repo_url(repo_url)
         self.ref = _validate_git_value(ref, "ref") if ref is not None else None
@@ -647,6 +762,7 @@ class GitRepositoryBinding(WorkspaceBinding):
             "output_limit_bytes",
             owner="GitRepositoryBinding",
         )
+        self.observation_limits = _copy_workspace_revision_observation_limits(observation_limits)
 
     async def bind(
         self,
@@ -703,8 +819,7 @@ class GitRepositoryBinding(WorkspaceBinding):
         await self._fetch_extra_refspecs(executor)
         if self.ref is not None:
             await self._checkout_configured_ref(executor)
-        commit = await executor.stdout("rev-parse", "HEAD")
-        branch = await executor.stdout("rev-parse", "--abbrev-ref", "HEAD")
+        commit, branch = await _git_snapshot_identity(executor)
         dirty = await executor.is_dirty()
         git_metadata = {
             "repo_url": self.repo_url,
@@ -729,7 +844,7 @@ class GitRepositoryBinding(WorkspaceBinding):
             path=self.path,
             metadata=bound_metadata,
             snapshot=WorkspaceSnapshot(
-                snapshot_id=f"git-bind:{session_id}:{commit[:12]}",
+                snapshot_id=f"git-bind:{session_id}:{_git_snapshot_version_label(commit)}",
                 workspace_id=workspace.id,
                 version=commit,
                 source="git",
@@ -759,8 +874,7 @@ class GitRepositoryBinding(WorkspaceBinding):
         )
         if not await executor.is_work_tree():
             raise ValueError("GitRepositoryBinding finalize requires a Git work tree.")
-        commit = await executor.stdout("rev-parse", "HEAD")
-        branch = await executor.stdout("rev-parse", "--abbrev-ref", "HEAD")
+        commit, branch = await _git_snapshot_identity(executor)
         dirty = await executor.is_dirty()
         git_metadata = {
             **copy_json_value(bind_metadata, GIT_REPOSITORY_METADATA_KEY),
@@ -770,7 +884,10 @@ class GitRepositoryBinding(WorkspaceBinding):
             "outcome": outcome,
         }
         return WorkspaceSnapshot(
-            snapshot_id=f"git-final:{bound.workspace.id}:{commit[:12]}:{outcome or 'unknown'}",
+            snapshot_id=(
+                f"git-final:{bound.workspace.id}:"
+                f"{_git_snapshot_version_label(commit)}:{outcome or 'unknown'}"
+            ),
             workspace_id=bound.workspace.id,
             version=commit,
             source="git",
@@ -779,6 +896,54 @@ class GitRepositoryBinding(WorkspaceBinding):
                 GIT_REPOSITORY_METADATA_KEY: git_metadata,
             },
         )
+
+    async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:
+        """Observe Git HEAD, branch, index, and worktree state without mutating Git."""
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("Workspace revision observation requires a BoundWorkspace.")
+        workspace = bound.workspace or bound.source_workspace
+        if workspace is None:
+            return await super().observe_revision(bound)
+        identity = WorkspaceIdentity(
+            workspace_id=workspace.id,
+            observer=type(self).__name__,
+        )
+        try:
+            limits = _copy_workspace_revision_observation_limits(self.observation_limits)
+            executor = _git_executor_for_workspace(
+                workspace,
+                git_executable=self.git_executable,
+                timeout_s=self.timeout_s,
+                output_limit_bytes=max(
+                    self.output_limit_bytes,
+                    limits.max_manifest_bytes,
+                ),
+            )
+            work_tree_result = await executor.capture("rev-parse", "--is-inside-work-tree")
+            if (
+                work_tree_result.exit_code != 0
+                or work_tree_result.stdout_truncated
+                or work_tree_result.stderr_truncated
+                or work_tree_result.stdout.strip() != "true"
+            ):
+                return WorkspaceRevisionObservation(
+                    identity=identity,
+                    status=WorkspaceRevisionObservationStatus.FAILED,
+                    detail_code="git_worktree_unavailable",
+                )
+            return await _observe_git_workspace_revision(
+                workspace=workspace,
+                executor=executor,
+                identity=identity,
+                limits=limits,
+            )
+        except Exception:
+            return WorkspaceRevisionObservation(
+                identity=identity,
+                status=WorkspaceRevisionObservationStatus.FAILED,
+                detail_code="git_observation_failed",
+            )
 
     async def _prepare_existing_repository(self, executor: _GitWorkspaceExecutor) -> None:
         if self.verify_remote_url:
@@ -2366,6 +2531,39 @@ class _GitWorkspaceExecutor:
         result = await self._exec("rev-parse", "--verify", "--quiet", ref)
         return result.exit_code == 0
 
+    async def capture(self, *args: str):
+        """Return bounded raw Git output for typed observation parsing."""
+
+        cwd = self.runner.resolve_cwd(self.cwd)
+        windows_workspace = bool(ntpath.splitdrive(cwd)[0])
+        null_device = "NUL" if windows_workspace else "/dev/null"
+        file_mode_config = () if windows_workspace else ("-c", "core.fileMode=true")
+        return await self.runner.exec(
+            ExecCommand.process(
+                self.git_executable,
+                "--no-pager",
+                "-c",
+                "core.fsmonitor=false",
+                *file_mode_config,
+                "-c",
+                f"core.hooksPath={null_device}",
+                *args,
+            ),
+            cwd=self.cwd,
+            env={
+                "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_CEILING_DIRECTORIES": cwd,
+                "GIT_CONFIG_GLOBAL": null_device,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM": "0",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "LC_ALL": "C",
+            },
+            env_remove=_GIT_OBSERVATION_ENV_REMOVE,
+            timeout_s=self.timeout_s,
+            output_limit_bytes=self.output_limit_bytes,
+        )
+
     async def _exec(self, *args: str):
         return await self.runner.exec(
             ExecCommand.process(self.git_executable, *args),
@@ -2373,6 +2571,439 @@ class _GitWorkspaceExecutor:
             timeout_s=self.timeout_s,
             output_limit_bytes=self.output_limit_bytes,
         )
+
+
+async def _git_snapshot_identity(
+    executor: _GitWorkspaceExecutor,
+) -> tuple[str | None, str]:
+    """Return Git snapshot identity without requiring an initial commit."""
+
+    head_result = await executor.capture("rev-parse", "--verify", "--quiet", "HEAD")
+    if head_result.stdout_truncated or head_result.stderr_truncated:
+        raise RuntimeError("Git HEAD identity exceeded the configured output limit.")
+    if head_result.exit_code == 0:
+        commit = head_result.stdout.strip()
+        if not _valid_git_object_id(commit):
+            raise RuntimeError("Git HEAD identity is malformed.")
+    elif (
+        head_result.exit_code == 1
+        and not head_result.stdout.strip()
+        and not head_result.stderr.strip()
+    ):
+        commit = None
+    else:
+        raise RuntimeError("Git HEAD identity could not be read.")
+
+    branch_result = await executor.capture("symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch_result.stdout_truncated or branch_result.stderr_truncated:
+        raise RuntimeError("Git branch identity exceeded the configured output limit.")
+    if branch_result.exit_code == 0:
+        try:
+            branch = require_durable_clean_nonblank(branch_result.stdout.strip(), "branch")
+            if len(branch.encode("utf-8")) > 4096:
+                raise ValueError("Git branch identity is too large.")
+        except (UnicodeEncodeError, ValueError):
+            raise RuntimeError("Git branch identity is malformed.") from None
+    elif (
+        commit is not None
+        and branch_result.exit_code == 1
+        and not branch_result.stdout.strip()
+        and not branch_result.stderr.strip()
+    ):
+        branch = "HEAD"
+    else:
+        raise RuntimeError("Git branch identity could not be read.")
+    return commit, branch
+
+
+def _git_snapshot_version_label(commit: str | None) -> str:
+    return "unborn" if commit is None else commit[:12]
+
+
+async def _observe_git_workspace_revision(
+    *,
+    workspace: Workspace,
+    executor: _GitWorkspaceExecutor,
+    identity: WorkspaceIdentity,
+    limits: WorkspaceRevisionObservationLimits,
+) -> WorkspaceRevisionObservation:
+    head_result = await executor.capture("rev-parse", "--verify", "--quiet", "HEAD")
+    if head_result.stdout_truncated or head_result.stderr_truncated:
+        return _git_observation_limit(identity, "git_head_output_truncated")
+    if head_result.exit_code == 0:
+        head_revision = head_result.stdout.strip()
+    elif (
+        head_result.exit_code == 1
+        and not head_result.stdout.strip()
+        and not head_result.stderr.strip()
+    ):
+        head_revision = None
+    else:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            detail_code="git_head_observation_failed",
+        )
+    if head_revision is not None and not _valid_git_object_id(head_revision):
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            detail_code="git_head_invalid",
+        )
+
+    branch_result = await executor.capture("symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch_result.stdout_truncated or branch_result.stderr_truncated:
+        return _git_observation_limit(identity, "git_branch_output_truncated")
+    if branch_result.exit_code == 0:
+        branch = branch_result.stdout.strip()
+    elif (
+        branch_result.exit_code == 1
+        and not branch_result.stdout.strip()
+        and not branch_result.stderr.strip()
+    ):
+        branch = None
+    else:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            head_revision=head_revision,
+            detail_code="git_branch_observation_failed",
+        )
+    if branch is not None and len(branch.encode("utf-8")) > 4096:
+        return _git_observation_limit(
+            identity,
+            "git_branch_output_truncated",
+            head_revision=head_revision,
+        )
+
+    status_result = await executor.capture(
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+        "--renames",
+    )
+    if status_result.exit_code != 0:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            head_revision=head_revision,
+            branch=branch,
+            detail_code="git_status_failed",
+        )
+    if status_result.stdout_truncated or status_result.stderr_truncated:
+        return _git_observation_limit(
+            identity,
+            "git_status_output_truncated",
+            head_revision=head_revision,
+            branch=branch,
+        )
+    try:
+        records = _parse_git_status_records(status_result.stdout)
+    except ValueError:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            head_revision=head_revision,
+            branch=branch,
+            detail_code="git_status_invalid",
+        )
+
+    index_result = await executor.capture("ls-files", "--stage", "-v", "-z")
+    if index_result.stdout_truncated or index_result.stderr_truncated:
+        return _git_observation_limit(
+            identity,
+            "git_index_output_truncated",
+            head_revision=head_revision,
+            branch=branch,
+        )
+    if index_result.exit_code != 0:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.INCOMPLETE,
+            head_revision=head_revision,
+            branch=branch,
+            detail_code="git_index_observation_failed",
+        )
+    try:
+        index_entries = _parse_git_index_entries(index_result.stdout)
+    except ValueError:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.INCOMPLETE,
+            head_revision=head_revision,
+            branch=branch,
+            detail_code="git_index_observation_invalid",
+        )
+
+    if any(tag == "S" or tag.islower() for _, _, tag in index_entries.values()):
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.INCOMPLETE,
+            head_revision=head_revision,
+            branch=branch,
+            total_paths=len(index_entries),
+            detail_code="git_index_visibility_flags_unsupported",
+        )
+
+    status_by_path: dict[str, tuple[str, str, str | None]] = {}
+    for staged, working_tree, path, renamed_from in records:
+        if path in status_by_path:
+            return WorkspaceRevisionObservation(
+                identity=identity,
+                status=WorkspaceRevisionObservationStatus.FAILED,
+                head_revision=head_revision,
+                branch=branch,
+                detail_code="git_status_duplicate_path",
+            )
+        status_by_path[path] = (staged, working_tree, renamed_from)
+    observed_paths = sorted(index_entries.keys() | status_by_path.keys())
+    if len(observed_paths) > limits.max_paths:
+        return _git_observation_limit(
+            identity,
+            "path_count_limit_exceeded",
+            head_revision=head_revision,
+            branch=branch,
+            total_paths=len(observed_paths),
+        )
+
+    paths: list[WorkspacePathRevision] = []
+    observed_file_bytes = 0
+    for path in observed_paths:
+        status_record = status_by_path.get(path)
+        staged, working_tree, renamed_from = status_record or (" ", " ", None)
+        if not _safe_git_observation_path(path) or (
+            renamed_from is not None and not _safe_git_observation_path(renamed_from)
+        ):
+            return WorkspaceRevisionObservation(
+                identity=identity,
+                status=WorkspaceRevisionObservationStatus.FAILED,
+                head_revision=head_revision,
+                branch=branch,
+                total_paths=len(observed_paths),
+                detail_code="unsafe_git_path",
+            )
+        path_values = (path,) if renamed_from is None else (path, renamed_from)
+        if any(len(value.encode("utf-8")) > limits.max_path_bytes for value in path_values):
+            return _git_observation_limit(
+                identity,
+                "path_byte_limit_exceeded",
+                head_revision=head_revision,
+                branch=branch,
+                total_paths=len(observed_paths),
+            )
+
+        mode, index_object_id, _index_tag = index_entries.get(path, (None, None, None))
+        kind = _git_mode_kind(mode)
+        staged_code = None if staged in {" ", "?", "!"} else staged
+        working_tree_code = None if working_tree in {" ", "?", "!"} else working_tree
+        untracked = staged in {"?", "!"} and working_tree == staged
+        ignored = staged == "!" and working_tree == "!"
+        content_digest: str | None = None
+        present: bool | None = None
+        should_read_worktree = status_record is not None and (
+            untracked
+            or not (working_tree_code == "D" or (staged_code == "D" and working_tree_code is None))
+        )
+        if kind in {"symlink", "submodule"} and (working_tree_code is not None or untracked):
+            return WorkspaceRevisionObservation(
+                identity=identity,
+                status=WorkspaceRevisionObservationStatus.INCOMPLETE,
+                head_revision=head_revision,
+                branch=branch,
+                path_scope="complete",
+                total_paths=len(observed_paths),
+                detail_code="git_worktree_special_path_unsupported",
+            )
+        if should_read_worktree and kind not in {"symlink", "submodule"}:
+            remaining_file_bytes = limits.max_total_file_bytes - observed_file_bytes
+            try:
+                read = await workspace.read_bytes(
+                    path,
+                    # Preserve exact-limit success for trailing empty files;
+                    # a one-byte probe still rejects any additional content.
+                    max_bytes=min(limits.max_file_bytes, max(1, remaining_file_bytes)),
+                )
+            except (FileNotFoundError, IsADirectoryError, PermissionError, ValueError):
+                return WorkspaceRevisionObservation(
+                    identity=identity,
+                    status=WorkspaceRevisionObservationStatus.INCOMPLETE,
+                    head_revision=head_revision,
+                    branch=branch,
+                    total_paths=len(observed_paths),
+                    detail_code="git_worktree_path_unreadable",
+                )
+            if read.truncated:
+                return _git_observation_limit(
+                    identity,
+                    (
+                        "total_file_byte_limit_exceeded"
+                        if remaining_file_bytes < limits.max_file_bytes
+                        else "file_byte_limit_exceeded"
+                    ),
+                    head_revision=head_revision,
+                    branch=branch,
+                    total_paths=len(observed_paths),
+                )
+            observed_file_bytes += read.total_bytes
+            if observed_file_bytes > limits.max_total_file_bytes:
+                return _git_observation_limit(
+                    identity,
+                    "total_file_byte_limit_exceeded",
+                    head_revision=head_revision,
+                    branch=branch,
+                    total_paths=len(observed_paths),
+                )
+            content_digest = hashlib.sha256(read.content).hexdigest()
+            present = True
+        elif status_record is not None and not should_read_worktree:
+            present = False
+        elif kind in {"symlink", "submodule"}:
+            present = staged_code != "D"
+        else:
+            present = True
+        paths.append(
+            WorkspacePathRevision(
+                path=path,
+                staged=staged_code,
+                working_tree=working_tree_code,
+                untracked=untracked,
+                ignored=ignored,
+                kind=kind,
+                content_sha256=content_digest,
+                index_object_id=index_object_id,
+                index_mode=mode,
+                renamed_from=renamed_from,
+                present=present,
+                tracked=not untracked,
+            )
+        )
+
+    paths.sort(key=lambda item: item.path)
+    manifest = {
+        "head_revision": head_revision,
+        "branch": branch,
+        "path_scope": "complete",
+        "paths": [path.model_dump(mode="json") for path in paths],
+    }
+    encoded = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > limits.max_manifest_bytes:
+        return _git_observation_limit(
+            identity,
+            "manifest_byte_limit_exceeded",
+            head_revision=head_revision,
+            branch=branch,
+            total_paths=len(paths),
+        )
+    return WorkspaceRevisionObservation(
+        identity=identity,
+        status=WorkspaceRevisionObservationStatus.SUPPORTED,
+        revision="sha256:" + hashlib.sha256(encoded).hexdigest(),
+        head_revision=head_revision,
+        branch=branch,
+        path_scope="complete",
+        paths=tuple(paths),
+        total_paths=len(paths),
+    )
+
+
+def _parse_git_status_records(
+    output: str,
+) -> list[tuple[str, str, str, str | None]]:
+    if "\ufffd" in output:
+        raise ValueError("Git status path is not portable UTF-8.")
+    tokens = output.split("\x00")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    records: list[tuple[str, str, str, str | None]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if len(token) < 4 or token[2] != " ":
+            raise ValueError("Git status record is malformed.")
+        staged, working_tree, path = token[0], token[1], token[3:]
+        if staged not in " MADRCU?!" or working_tree not in " MADRCU?!":
+            raise ValueError("Git status record has an unknown state code.")
+        renamed_from: str | None = None
+        if staged in {"R", "C"} or working_tree in {"R", "C"}:
+            index += 1
+            if index >= len(tokens):
+                raise ValueError("Git rename record is incomplete.")
+            renamed_from = tokens[index]
+        records.append((staged, working_tree, path, renamed_from))
+        index += 1
+    return records
+
+
+def _parse_git_index_entries(output: str) -> dict[str, tuple[str, str, str]]:
+    if "\ufffd" in output:
+        raise ValueError("Git index path is not portable UTF-8.")
+    entries: dict[str, tuple[str, str, str]] = {}
+    tokens = output.split("\x00")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    for token in tokens:
+        header, separator, path = token.partition("\t")
+        fields = header.split()
+        if not separator or not path or len(fields) != 4:
+            raise ValueError("Git index entry is malformed.")
+        tag, mode, object_id, stage = fields
+        if len(tag) != 1 or not tag.isascii() or not tag.isalpha():
+            raise ValueError("Git index entry tag is malformed.")
+        if len(mode) != 6 or any(char not in "01234567" for char in mode):
+            raise ValueError("Git index entry mode is malformed.")
+        if not _valid_git_object_id(object_id):
+            raise ValueError("Git index entry object id is malformed.")
+        if stage != "0" or path in entries:
+            raise ValueError("Git index contains an unsupported unmerged entry.")
+        entries[path] = (mode, object_id, tag)
+    return entries
+
+
+def _valid_git_object_id(value: str) -> bool:
+    return len(value) in {40, 64} and all(char in "0123456789abcdefABCDEF" for char in value)
+
+
+def _git_mode_kind(mode: str | None) -> Literal["file", "symlink", "submodule", "unknown"]:
+    if mode == "120000":
+        return "symlink"
+    if mode == "160000":
+        return "submodule"
+    if mode is not None:
+        return "file"
+    return "unknown"
+
+
+def _safe_git_observation_path(path: str) -> bool:
+    if type(path) is not str or not path or "\x00" in path:
+        return False
+    candidate = PurePosixPath(path)
+    return not candidate.is_absolute() and ".." not in candidate.parts and str(candidate) == path
+
+
+def _git_observation_limit(
+    identity: WorkspaceIdentity,
+    detail_code: str,
+    *,
+    head_revision: str | None = None,
+    branch: str | None = None,
+    total_paths: int = 0,
+) -> WorkspaceRevisionObservation:
+    return WorkspaceRevisionObservation(
+        identity=identity,
+        status=WorkspaceRevisionObservationStatus.TRUNCATED,
+        head_revision=head_revision,
+        branch=branch,
+        path_scope="changed",
+        total_paths=total_paths,
+        detail_code=detail_code,
+    )
 
 
 def _git_executor_for_workspace(

@@ -44,6 +44,8 @@ class LineCountTool(Tool):
     spec = ToolSpec(
         name="line_count",
         description="Write text to a file in the workspace and count its lines.",
+        parallel_safe=False,
+        workspace_mutation=True,
         input_schema={
             "type": "object",
             "properties": {"filename": {"type": "string"}, "text": {"type": "string"}},

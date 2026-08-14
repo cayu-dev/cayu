@@ -11087,6 +11087,7 @@ class SessionEngine:
                     messages=messages,
                     tool_calls=tool_calls,
                     tool_round_identity=tool_round_identity,
+                    model_step=step,
                 ):
                     yield event
                 close_new_pending_round_on_interrupt = False

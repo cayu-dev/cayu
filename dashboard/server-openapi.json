@@ -12061,6 +12061,11 @@
           },
           "registration_provenance": {
             "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "workspace_mutation": {
+            "default": false,
+            "title": "Workspace Mutation",
+            "type": "boolean"
           }
         },
         "required": [

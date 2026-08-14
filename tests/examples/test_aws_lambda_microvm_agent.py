@@ -425,6 +425,8 @@ def test_internal_action_tool_uses_microvm_virtual_token_and_persists_artifact()
     runner = _Runner()
     artifacts = _Artifacts()
     tool = InternalActionTool(logical_host="receiver.internal")
+    assert tool.spec.workspace_mutation is True
+    assert tool.spec.parallel_safe is False
     context = ToolContext(
         session_id="sess-1",
         agent_name="aws-agent",

@@ -154,6 +154,7 @@ class ToolManifest(_ManifestModel):
     description: str
     effect: str
     parallel_safe: bool
+    workspace_mutation: bool = False
     input_schema: FrozenJsonObject = Field(default_factory=lambda: MappingProxyType({}))
     policy_coverage: Literal["allowed", "denied", "approval_required", "conditional", "unknown"]
     command_policy: str | None = None
@@ -443,6 +444,7 @@ def _describe_agent(
                 description=tool.description,
                 effect=tool.effect.value,
                 parallel_safe=tool.parallel_safe,
+                workspace_mutation=tool.workspace_mutation,
                 input_schema=app.redact_json(tool.schema),
                 policy_coverage=_tool_policy_coverage(registration.tool_policy, tool_name),
                 command_policy=_command_policy_name(tool.tool),

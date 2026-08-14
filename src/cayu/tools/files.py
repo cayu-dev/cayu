@@ -1546,6 +1546,7 @@ class EditFileTool(Tool):
         name="edit_file",
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,
+        workspace_mutation=True,
         description=(
             "Atomically edit an existing UTF-8 workspace file using one or more exact "
             "text replacements. Requires the opaque revision returned by read_file and "
@@ -1805,6 +1806,7 @@ class DeleteFileTool(Tool):
         name="delete_file",
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,
+        workspace_mutation=True,
         description=(
             "Delete one workspace-relative file after verifying the opaque revision "
             "returned by read_file. Refuses missing, stale, directory, and oversized paths."
@@ -1913,6 +1915,7 @@ class WriteFileTool(Tool):
         # Mutates the workspace; never overlaps other tools in a round.
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,
+        workspace_mutation=True,
         description=(
             "Create a missing UTF-8 file or conditionally overwrite an existing file. "
             "Overwrite requires the opaque revision returned by a complete read_file."

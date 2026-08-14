@@ -30,6 +30,7 @@ from cayu.environments.base import (
 )
 from cayu.environments.bindings import (
     BoundWorkspace,
+    DeterministicWorkspaceBinding,
     GitRepositoryBinding,
     NativeBinding,
     NoWorkspaceBinding,
@@ -67,6 +68,7 @@ __all__ = [
     "EXECUTION_CAPABILITY_EVIDENCE_SCHEMA",
     "EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS",
     "BoundWorkspace",
+    "DeterministicWorkspaceBinding",
     "EFSAccessPointBinding",
     "Environment",
     "EnvironmentAllocationContext",

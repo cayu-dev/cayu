@@ -3358,6 +3358,7 @@ class RecoveryCoordinator:
                     policy_output_secret_resolution_scope=pause_secret_resolution_scope,
                     input_id=pending.input_id,
                     tool_round_identity=tool_round_identity,
+                    model_step=pending.model_step,
                     taint_labels=call_taint_labels,
                     publish_arguments_as_unavailable=publish_arguments_as_unavailable,
                     deferred_terminal_stager=(
@@ -4537,6 +4538,7 @@ class RecoveryCoordinator:
                     policy_output_secret_resolution_scope=pause_secret_resolution_scope,
                     approval_id=pending_approval.approval_id,
                     tool_round_identity=tool_round_identity,
+                    model_step=publication_round.model_step,
                     taint_labels=call_taint_labels,
                     publish_arguments_as_unavailable=publish_arguments_as_unavailable,
                     deferred_terminal_stager=(

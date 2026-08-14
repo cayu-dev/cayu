@@ -6275,6 +6275,10 @@ export type ToolManifest = {
      */
     policy_coverage: 'allowed' | 'denied' | 'approval_required' | 'conditional' | 'unknown';
     registration_provenance: RegistrationProvenance;
+    /**
+     * Workspace Mutation
+     */
+    workspace_mutation?: boolean;
 };
 
 /**

@@ -1683,6 +1683,103 @@ def test_session_store_conformance_declares_usage_aggregate_support(
     asyncio.run(run())
 
 
+def test_session_store_conformance_reconstructs_workspace_mutation_receipts(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = f"workspace-receipt-{session_store_case[0]}"
+            await store.create(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            observed_before = Event(
+                id=f"evt-workspace-before-{session_store_case[0]}",
+                type=EventType.WORKSPACE_REVISION_OBSERVED,
+                session_id=session_id,
+                payload={
+                    "phase": "before",
+                    "window_id": "wmut-conformance",
+                    "session_run_epoch": 1,
+                    "model_step": 2,
+                    "tool_call_id": "call-workspace",
+                    "workspace_id": "workspace-conformance",
+                    "observer": "GitRepositoryBinding",
+                    "status": "supported",
+                    "revision": "sha256:before",
+                    "head_revision": "before-head",
+                    "branch": "main",
+                    "paths": [],
+                    "total_paths": 0,
+                    "detail_code": None,
+                    "model_step_id": "step-conformance",
+                    "model_attempt_id": "attempt-conformance",
+                    "tool_round_id": "round-conformance",
+                },
+            )
+            observed_after = observed_before.model_copy(
+                update={
+                    "id": f"evt-workspace-after-{session_store_case[0]}",
+                    "payload": {
+                        **observed_before.payload,
+                        "phase": "after",
+                        "revision": "sha256:after",
+                    },
+                },
+                deep=True,
+            )
+            receipt = Event(
+                id=f"evt-workspace-receipt-{session_store_case[0]}",
+                type=EventType.WORKSPACE_MUTATION_RECORDED,
+                session_id=session_id,
+                payload={
+                    "window_id": "wmut-conformance",
+                    "before_observation_id": observed_before.id,
+                    "after_observation_id": observed_after.id,
+                    "session_run_epoch": 1,
+                    "model_step": 2,
+                    "tool_call_id": "call-workspace",
+                    "workspace_id": "workspace-conformance",
+                    "observer": "GitRepositoryBinding",
+                    "status": "changed",
+                    "before_revision": "sha256:before",
+                    "after_revision": "sha256:after",
+                    "paths": [
+                        {
+                            "path": "created.txt",
+                            "change": "added",
+                            "renamed_from": None,
+                        }
+                    ],
+                    "total_paths": 1,
+                    "head_changed": False,
+                    "branch_changed": False,
+                    "detail_code": None,
+                    "model_step_id": "step-conformance",
+                    "model_attempt_id": "attempt-conformance",
+                    "tool_round_id": "round-conformance",
+                },
+            )
+            expected = [observed_before, observed_after, receipt]
+            await store.append_events(session_id, expected)
+            store = await _reopen_store(session_store_case, store)
+
+            restored = await store.query_events(EventQuery(session_id=session_id))
+
+            assert [record.event.model_dump(mode="json") for record in restored] == [
+                event.model_dump(mode="json") for event in expected
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_event_projection_preserves_private_authority(
     session_store_case,
 ) -> None:

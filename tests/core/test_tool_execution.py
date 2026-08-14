@@ -260,6 +260,11 @@ def test_builtin_mutating_tools_are_not_parallel_safe() -> None:
     assert DeleteFileTool.spec.parallel_safe is False
     assert WriteFileTool.spec.parallel_safe is False
     assert RememberKnowledgeTool.spec.parallel_safe is False
+    assert ExecCommandTool.spec.workspace_mutation is True
+    assert EditFileTool.spec.workspace_mutation is True
+    assert DeleteFileTool.spec.workspace_mutation is True
+    assert WriteFileTool.spec.workspace_mutation is True
+    assert RememberKnowledgeTool.spec.workspace_mutation is False
     assert ExecCommandTool.spec.effect is ToolEffect.EXTERNAL
     assert EditFileTool.spec.effect is ToolEffect.EXTERNAL
     assert DeleteFileTool.spec.effect is ToolEffect.EXTERNAL

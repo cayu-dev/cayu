@@ -188,6 +188,7 @@ class InternalActionTool(Tool):
         name="request_internal_action",
         description="Request one named action from the trusted internal service.",
         parallel_safe=False,
+        workspace_mutation=True,
         input_schema={
             "type": "object",
             "properties": {"action": {"type": "string", "minLength": 1, "maxLength": 128}},

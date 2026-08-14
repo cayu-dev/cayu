@@ -87,3 +87,6 @@ def test_tool_uses_runner_and_workspace(tmp_path: Path) -> None:
     completed = [e for e in outcome.events if e.type == EventType.TOOL_CALL_COMPLETED]
     assert completed
     assert completed[0].payload["result"]["structured"]["exit_code"] == 0
+    assert mod.LineCountTool.spec.workspace_mutation is True
+    assert mod.LineCountTool.spec.parallel_safe is False
+    assert any(event.type == EventType.WORKSPACE_MUTATION_RECORDED for event in outcome.events)

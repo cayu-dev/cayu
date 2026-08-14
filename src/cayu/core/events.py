@@ -148,6 +148,9 @@ class EventType(StrEnum):
     ENVIRONMENT_FACTORY_COMPLETED = "environment.factory.completed"
     ENVIRONMENT_FACTORY_FAILED = "environment.factory.failed"
 
+    WORKSPACE_REVISION_OBSERVED = "workspace.revision.observed"
+    WORKSPACE_MUTATION_RECORDED = "workspace.mutation.recorded"
+
     HOOK_STARTED = "hook.started"
     HOOK_COMPLETED = "hook.completed"
     HOOK_FAILED = "hook.failed"

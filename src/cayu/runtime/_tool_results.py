@@ -92,6 +92,12 @@ _RUNTIME_TOOL_EVENT_LINKAGE_FIELDS = frozenset(
         "tool_round_id",
     }
 )
+_RUNTIME_TOOL_EVENT_FIXED_FIELDS = frozenset(
+    {
+        "workspace_mutation_capture_detail_code",
+        "workspace_mutation_capture_status",
+    }
+)
 _TOOL_EFFECT_VALUES = frozenset(effect.value for effect in ToolEffect)
 
 
@@ -206,7 +212,7 @@ def _runtime_tool_event_linkage_fields(payload: dict[str, Any]) -> dict[str, str
     """Validate runtime-owned identities before exempting them from redaction."""
 
     linkage: dict[str, str] = {}
-    for key in _RUNTIME_TOOL_EVENT_LINKAGE_FIELDS:
+    for key in _RUNTIME_TOOL_EVENT_LINKAGE_FIELDS | _RUNTIME_TOOL_EVENT_FIXED_FIELDS:
         if key not in payload:
             continue
         value = require_durable_text(payload[key], key)

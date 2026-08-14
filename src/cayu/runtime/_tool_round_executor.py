@@ -18,7 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, Never, TypeVar, cast
 from uuid import uuid4
 
 from cayu._exception_groups import (
@@ -41,6 +41,7 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.artifacts import ArtifactMetadata, ArtifactScope, LocalArtifactStore
 from cayu.core.agents import AgentSpec
 from cayu.core.events import (
     Event,
@@ -61,6 +62,7 @@ from cayu.core.tools import (
     _bound_policy_denial_result,
     _bound_policy_denial_text,
 )
+from cayu.environments import BoundWorkspace
 from cayu.mcp import McpToolAdapter, McpToolset
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
@@ -179,8 +181,13 @@ from cayu.runtime.user_input import (
     public_pending_user_input_event_payload,
     public_pending_user_input_prompt,
 )
+from cayu.tools._operation_boundary import (
+    BoundedInvocationOperationRegistry,
+    await_invocation_operation,
+)
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (
+    InvocationWorkspaceMutationOwner,
     invocation_artifact_store_handle,
     invocation_workspace_handle,
 )
@@ -191,6 +198,18 @@ from cayu.tools._runner import (
     sanitize_runner_failure_group,
 )
 from cayu.vaults import SecretRedactor
+from cayu.workspaces import (
+    LocalWorkspace,
+    WorkspaceIdentity,
+    WorkspacePathRevision,
+    WorkspaceRevisionDelta,
+    WorkspaceRevisionDeltaStatus,
+    WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimits,
+    WorkspaceRevisionObservationStatus,
+    compare_workspace_revisions,
+)
+from cayu.workspaces.revisions import unsupported_workspace_revision
 
 
 def _event_with_tool_round_authority(
@@ -214,6 +233,25 @@ def _event_with_tool_round_authority(
 
 
 _TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS = 30.0
+_WORKSPACE_RECEIPT_INLINE_PATH_LIMIT = 32
+_WORKSPACE_RECEIPT_INLINE_BYTES = 8 * 1024
+_WORKSPACE_OBSERVATION_RUNTIME_LIMITS = WorkspaceRevisionObservationLimits()
+_WORKSPACE_OBSERVATION_MAX_TOTAL_PATHS = (1 << 63) - 1
+_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS = 30.0
+_WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS = 30.0
+_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS = 64
+
+
+@dataclass(frozen=True)
+class _WorkspaceEvidenceProjection:
+    paths: list[dict[str, Any]]
+    status: str
+    detail_code: str | None
+    manifest_artifact_id: str | None = None
+    manifest_artifact_sha256: str | None = None
+    manifest_artifact_size_bytes: int | None = None
+    evidence_available: bool = True
+
 
 CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
@@ -638,6 +676,9 @@ class ToolRoundExecutor:
         self._checkpoint_transform = checkpoint_transform
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
+        self._workspace_capture_operations = BoundedInvocationOperationRegistry(
+            max_operations=_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS
+        )
 
     def create_run(
         self,
@@ -1373,6 +1414,7 @@ class ToolRoundExecutor:
             tool_round_id=tool_round_identity.tool_round_id,
             model_step_id=tool_round_identity.model_step_id,
             model_attempt_id=tool_round_identity.model_attempt_id,
+            model_step=pending_round.model_step,
             tool_call_id=tool_call.id,
             tool_name=tool_call.name,
             question=question,
@@ -1568,6 +1610,7 @@ class ToolRoundExecutor:
         tool_call: runtime_records.ToolCallRequest,
         request_metadata: dict[str, Any],
         task_id: str | None,
+        model_step: int | None = None,
         check_policy: bool = True,
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
@@ -2069,6 +2112,15 @@ class ToolRoundExecutor:
 
         raw_workspace = _workspace(registered_environment)
         raw_artifact_store = _artifact_store(registered_environment)
+        workspace_mutation_owner = (
+            InvocationWorkspaceMutationOwner()
+            if registered_tool.workspace_mutation and raw_workspace is not None
+            else None
+        )
+        (
+            workspace_receipt_artifact_store,
+            workspace_receipt_artifact_unavailable_detail,
+        ) = _workspace_receipt_artifact_store(registered_environment)
         tool_context = ToolContext(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
@@ -2081,6 +2133,7 @@ class ToolRoundExecutor:
                 raw_workspace,
                 redactor_snapshot_provider=invocation_secret_scope.snapshot,
                 capture_observer=invocation_secret_scope.record_ambiguous_output_capture,
+                mutation_owner=workspace_mutation_owner,
             ),
             artifact_store=invocation_artifact_store_handle(
                 raw_artifact_store,
@@ -2118,6 +2171,87 @@ class ToolRoundExecutor:
             workspace=raw_workspace,
             artifact_store=raw_artifact_store,
         )
+        workspace_window_id: str | None = None
+        before_workspace_observation: WorkspaceRevisionObservation | None = None
+        if registered_tool.workspace_mutation and _workspace(registered_environment) is not None:
+            if registered_tool.parallel_safe:
+                raise RuntimeError("Workspace-mutating tools must execute exclusively.")
+            workspace_window_id = _workspace_mutation_window_id(
+                session_id=session.id,
+                session_run_epoch=session.run_epoch,
+                tool_round_id=tool_round_identity.tool_round_id,
+                tool_call_id=tool_call.id,
+            )
+            before_workspace_observation = await _observe_workspace_revision(
+                registered_environment,
+                operation_registry=self._workspace_capture_operations,
+            )
+
+        async def close_workspace_mutation_window() -> tuple[Event, ...]:
+            if workspace_window_id is None or before_workspace_observation is None:
+                return ()
+            if workspace_mutation_owner is not None:
+                await workspace_mutation_owner.seal_and_wait()
+            publication = invocation_secret_scope.seal_for_publication()
+            evidence_available = (
+                not publication.unsafe_output
+                and not publish_arguments_as_unavailable
+                and deferred_terminal_stager is None
+            )
+            return await _record_workspace_mutation_after(
+                event_writer=self._event_writer,
+                registered_environment=registered_environment,
+                artifact_store=workspace_receipt_artifact_store,
+                artifact_unavailable_detail_code=(workspace_receipt_artifact_unavailable_detail),
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                tool_call=tool_call,
+                tool_round_identity=tool_round_identity,
+                model_step=model_step,
+                window_id=workspace_window_id,
+                before_observation=before_workspace_observation,
+                redactor=publication.redactor,
+                evidence_available=evidence_available,
+                operation_registry=self._workspace_capture_operations,
+            )
+
+        def retain_workspace_settlement_failure(interrupt: BaseException) -> None:
+            safe_failure = RuntimeError(
+                "Workspace mutation settlement failed after caller cancellation."
+            )
+            prior_cause = exception_cause(interrupt)
+            cause: BaseException = safe_failure
+            if prior_cause is not None:
+                cause = BaseExceptionGroup(
+                    "Caller cancellation and workspace mutation settlement failures.",
+                    [prior_cause, safe_failure],
+                )
+            if isinstance(interrupt, asyncio.CancelledError):
+                attach_runner_cancellation_failure(interrupt, cause)
+            elif isinstance(interrupt, BaseExceptionGroup):
+                for candidate in iter_exception_tree(interrupt):
+                    if isinstance(candidate, asyncio.CancelledError):
+                        attach_runner_cancellation_failure(candidate, cause)
+                        set_exception_cause(candidate, cause)
+            set_exception_cause(interrupt, cause)
+
+        async def close_workspace_mutation_window_after_interrupt(
+            interrupt: BaseException,
+            cancellation: asyncio.CancelledError,
+        ) -> None:
+            outcome = await await_invocation_operation(
+                close_workspace_mutation_window,
+                request_child_cancellation=False,
+                cancellation=cancellation,
+            )
+            if _contains_process_signal(outcome.error):
+                if outcome.error is None:  # pragma: no cover - narrowed by the helper
+                    raise AssertionError("Process-signal classification lost its error.")
+                raise outcome.error
+            if outcome.error is not None:
+                retain_workspace_settlement_failure(interrupt)
+
         try:
             execution_outcome = await tool_execution.run_tool(
                 tool=registered_tool.tool,
@@ -2130,9 +2264,12 @@ class ToolRoundExecutor:
             )
         except BaseExceptionGroup as exc:
             if is_current_runner_cancellation_group(exc):
+                group_cancellation: asyncio.CancelledError | None = None
                 for candidate in iter_exception_tree(exc):
                     if not isinstance(candidate, asyncio.CancelledError):
                         continue
+                    if group_cancellation is None:
+                        group_cancellation = candidate
                     invocation_secrets.initialize_cancellation_evidence(candidate)
                     invocation_secrets.set_cancellation_redactor(
                         candidate,
@@ -2142,6 +2279,14 @@ class ToolRoundExecutor:
                         candidate,
                         tool_call.id,
                     )
+                if group_cancellation is None:  # pragma: no cover - classification invariant
+                    raise AssertionError(
+                        "Current cancellation group has no cancellation leaf."
+                    ) from None
+                await close_workspace_mutation_window_after_interrupt(
+                    exc,
+                    group_cancellation,
+                )
                 await record_interrupted_publication_scope(exc)
             raise
         except asyncio.CancelledError as exc:
@@ -2151,6 +2296,7 @@ class ToolRoundExecutor:
                 invocation_secret_scope.redactor,
             )
             invocation_secrets.set_cancellation_tool_call_id(exc, tool_call.id)
+            await close_workspace_mutation_window_after_interrupt(exc, exc)
             cancellation_redelivered = await record_interrupted_publication_scope(exc)
             if cancellation_redelivered:
                 raise
@@ -2175,8 +2321,42 @@ class ToolRoundExecutor:
         result = execution_outcome.result
         redactor = invocation_secret_scope.redactor
         output_redactor = redactor
+        workspace_events: tuple[Event, ...] = ()
+        post_tool_cancellation: asyncio.CancelledError | None = None
+        workspace_capture_payload: dict[str, str] = {}
+        if workspace_window_id is not None:
+            try:
+                workspace_events = await close_workspace_mutation_window()
+            except asyncio.CancelledError as exc:
+                post_tool_cancellation = consume_pending_task_cancellation(exc)
+                if post_tool_cancellation is not None:
+                    invocation_secrets.initialize_cancellation_evidence(post_tool_cancellation)
+                    invocation_secrets.set_cancellation_redactor(
+                        post_tool_cancellation,
+                        invocation_secret_scope.redactor,
+                    )
+                    invocation_secrets.set_cancellation_tool_call_id(
+                        post_tool_cancellation,
+                        tool_call.id,
+                    )
+                workspace_capture_payload = {
+                    "workspace_mutation_capture_status": "interrupted",
+                    "workspace_mutation_capture_detail_code": "receipt_publication_interrupted",
+                }
+            except Exception:
+                workspace_capture_payload = {
+                    "workspace_mutation_capture_status": "failed",
+                    "workspace_mutation_capture_detail_code": "receipt_publication_failed",
+                }
+            else:
+                workspace_capture_payload = {
+                    "workspace_mutation_capture_status": "recorded",
+                }
         publication_snapshot = invocation_secret_scope.seal_for_publication()
-        await record_publication_snapshot(publication_snapshot)
+        await _await_post_tool_operation(
+            record_publication_snapshot(publication_snapshot),
+            cancellation=post_tool_cancellation,
+        )
         hook_argument_projection = (
             tool_argument_publication.unavailable_argument_projection()
             if publish_arguments_as_unavailable
@@ -2217,6 +2397,7 @@ class ToolRoundExecutor:
                 "result": result.model_dump(),
                 **effective_arguments_payload,
                 **execution_outcome.terminal_payload_fields(),
+                **workspace_capture_payload,
                 **identity_payload,
             }
             if approval_id is not None:
@@ -2247,76 +2428,127 @@ class ToolRoundExecutor:
                     result_event,
                     result,
                     projection_cancellation,
-                ) = await self._project_terminal_tool_result(
-                    event=result_event,
-                    result=result,
-                    session=session,
-                    registered_environment=registered_environment,
-                    tool_call=effective_tool_call,
-                )
-                published_terminal_event = await self._event_writer.emit(result_event)
-                yield (
-                    published_terminal_event,
-                    runtime_records.ToolCallOutcome(
-                        call=replace(
-                            effective_tool_call,
-                            arguments=argument_projection.transcript_arguments(),
-                        ),
+                ) = await _await_post_tool_operation(
+                    self._project_terminal_tool_result(
+                        event=result_event,
                         result=result,
+                        session=session,
+                        registered_environment=registered_environment,
+                        tool_call=effective_tool_call,
                     ),
+                    cancellation=post_tool_cancellation,
                 )
-        async for event in self._emit_proxy_authorization_events(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            records=proxy_authorizations,
-            tool_round_identity=tool_round_identity,
-            approval_id=approval_id,
-            input_id=input_id,
-            idempotency_key=idempotency_key,
-            redactor=redactor,
-            output_redactor=output_redactor,
-            quarantine_output=deferred_terminal_stager is not None,
-        ):
-            yield event, None
-        if projection_cancellation is not None:
-            raise projection_cancellation
-        current_task = asyncio.current_task()
-        tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
-        if tool_swallowed_cancellation and await self._session_control.is_interrupting(session.id):
-            raise SessionInterruptedByRequest(session.id)
-        if policy_denial is not None:
-            public_policy_denial_reason = output_redactor.redact_text(policy_denial.reason)
-            async for event in self._emit_terminal_tool_result(
+                published_terminal_event = await _await_post_tool_operation(
+                    self._event_writer.emit(result_event),
+                    cancellation=post_tool_cancellation,
+                )
+                published_terminal_outcome = runtime_records.ToolCallOutcome(
+                    call=replace(
+                        effective_tool_call,
+                        arguments=argument_projection.transcript_arguments(),
+                    ),
+                    result=result,
+                )
+                # This terminal is already durable. Expose it before proxy
+                # telemetry so a later telemetry failure cannot erase the
+                # authoritative tool outcome from the public stream. Receipt
+                # events remain ordered immediately before that terminal.
+                for workspace_event in workspace_events:
+                    yield workspace_event, None
+                yield published_terminal_event, published_terminal_outcome
+        proxy_events: list[Event] = []
+        async for event in _iterate_post_tool_events(
+            self._emit_proxy_authorization_events(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                tool_call=effective_tool_call,
-                event_type=EventType.TOOL_CALL_BLOCKED,
-                result=policy_denial.result,
-                extra_payload={
-                    "idempotency_key": idempotency_key,
-                    **policy_denial_payload_fields(
-                        tool_name=effective_tool_call.name,
-                        denied_by=policy_denial.denied_by,
-                        decision=policy_denial.decision,
-                        reason=public_policy_denial_reason,
-                        metadata={},
-                    ),
-                },
-                task_id=task_id,
+                tool_call=tool_call,
+                records=proxy_authorizations,
                 tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
-                allow_modification=False,
+                idempotency_key=idempotency_key,
                 redactor=redactor,
                 output_redactor=output_redactor,
-                argument_projection=argument_projection,
-                deferred_terminal_stager=deferred_terminal_stager,
-                publication_snapshot=publication_snapshot,
+                quarantine_output=deferred_terminal_stager is not None,
+            ),
+            cancellation=post_tool_cancellation,
+        ):
+            if published_terminal_event is not None:
+                yield event, None
+            else:
+                proxy_events.append(event)
+        if projection_cancellation is not None:
+            _raise_preserved_post_tool_cancellation(
+                post_tool_cancellation,
+                projection_cancellation,
+            )
+        current_task = asyncio.current_task()
+        tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
+        if tool_swallowed_cancellation and await _await_post_tool_operation(
+            self._session_control.is_interrupting(session.id),
+            cancellation=post_tool_cancellation,
+        ):
+            raise SessionInterruptedByRequest(session.id)
+        if policy_denial is not None:
+            public_policy_denial_reason = output_redactor.redact_text(policy_denial.reason)
+            terminal_events: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
+            terminal_recorded = False
+            async for event in _iterate_post_tool_events(
+                self._emit_terminal_tool_result(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=effective_tool_call,
+                    event_type=EventType.TOOL_CALL_BLOCKED,
+                    result=policy_denial.result,
+                    extra_payload={
+                        "idempotency_key": idempotency_key,
+                        **workspace_capture_payload,
+                        **policy_denial_payload_fields(
+                            tool_name=effective_tool_call.name,
+                            denied_by=policy_denial.denied_by,
+                            decision=policy_denial.decision,
+                            reason=public_policy_denial_reason,
+                            metadata={},
+                        ),
+                    },
+                    task_id=task_id,
+                    tool_round_identity=tool_round_identity,
+                    approval_id=approval_id,
+                    input_id=input_id,
+                    allow_modification=False,
+                    redactor=redactor,
+                    output_redactor=output_redactor,
+                    argument_projection=argument_projection,
+                    deferred_terminal_stager=deferred_terminal_stager,
+                    publication_snapshot=publication_snapshot,
+                ),
+                cancellation=post_tool_cancellation,
             ):
-                yield event
+                if terminal_recorded:
+                    yield event
+                    continue
+                terminal_events.append(event)
+                if event[1] is None:
+                    continue
+                terminal_recorded = True
+                for workspace_event in workspace_events:
+                    yield workspace_event, None
+                for proxy_event in proxy_events:
+                    yield proxy_event, None
+                for terminal_event in terminal_events:
+                    yield terminal_event
+                terminal_events.clear()
+            if not terminal_recorded:
+                for workspace_event in workspace_events:
+                    yield workspace_event, None
+                for proxy_event in proxy_events:
+                    yield proxy_event, None
+                for terminal_event in terminal_events:
+                    yield terminal_event
+            if post_tool_cancellation is not None:
+                raise post_tool_cancellation
             return
         if published_terminal_event is not None:
             hook_tool_call = _project_tool_call_for_hook(
@@ -2324,48 +2556,86 @@ class ToolRoundExecutor:
                 argument_projection=hook_argument_projection,
                 redactor=redactor,
             )
-            async for hook_event, modified in self.run_tool_call_hooks(
-                session=session,
-                tool_event=published_terminal_event,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=hook_tool_call,
-                result=result,
-                task_id=task_id,
-                redactor=redactor,
-                output_redactor=output_redactor,
-                allow_modification=False,
-                quarantine_output=not registered_tool.publish_arguments,
+            async for hook_event, modified in _iterate_post_tool_events(
+                self.run_tool_call_hooks(
+                    session=session,
+                    tool_event=published_terminal_event,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=hook_tool_call,
+                    result=result,
+                    task_id=task_id,
+                    redactor=redactor,
+                    output_redactor=output_redactor,
+                    allow_modification=False,
+                    quarantine_output=not registered_tool.publish_arguments,
+                ),
+                cancellation=post_tool_cancellation,
             ):
                 if modified is not None:
                     raise AssertionError(
                         "Observational after-tool hook modified terminal evidence."
                     )
                 yield hook_event, None
-            if await self._session_control.is_interrupting(session.id):
+            if await _await_post_tool_operation(
+                self._session_control.is_interrupting(session.id),
+                cancellation=post_tool_cancellation,
+            ):
                 raise SessionInterruptedByRequest(session.id)
+            if post_tool_cancellation is not None:
+                raise post_tool_cancellation
             return
         if result_event is None:
             raise AssertionError("Ordinary tool result event was not constructed.")
-        async for event in self.emit_tool_call_result_with_hooks(
-            event=result_event,
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=effective_tool_call,
-            result=result,
-            task_id=task_id,
-            redactor=redactor,
-            output_redactor=output_redactor,
-            argument_projection=argument_projection,
-            hook_argument_projection=hook_argument_projection,
-            allow_modification=execution_outcome.allows_hook_modification,
-            publish_before_hooks=execution_outcome.publish_before_hooks,
-            deferred_terminal_stager=deferred_terminal_stager,
-            publication_snapshot=publication_snapshot,
+        terminal_events: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
+        terminal_recorded = False
+        async for event in _iterate_post_tool_events(
+            self.emit_tool_call_result_with_hooks(
+                event=result_event,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=effective_tool_call,
+                result=result,
+                task_id=task_id,
+                redactor=redactor,
+                output_redactor=output_redactor,
+                argument_projection=argument_projection,
+                hook_argument_projection=hook_argument_projection,
+                allow_modification=execution_outcome.allows_hook_modification,
+                publish_before_hooks=execution_outcome.publish_before_hooks,
+                deferred_terminal_stager=deferred_terminal_stager,
+                publication_snapshot=publication_snapshot,
+            ),
+            cancellation=post_tool_cancellation,
         ):
-            yield event
-        if await self._session_control.is_interrupting(session.id):
+            if terminal_recorded:
+                yield event
+                continue
+            terminal_events.append(event)
+            if event[1] is None:
+                continue
+            terminal_recorded = True
+            for workspace_event in workspace_events:
+                yield workspace_event, None
+            for proxy_event in proxy_events:
+                yield proxy_event, None
+            for terminal_event in terminal_events:
+                yield terminal_event
+            terminal_events.clear()
+        if not terminal_recorded:
+            for workspace_event in workspace_events:
+                yield workspace_event, None
+            for proxy_event in proxy_events:
+                yield proxy_event, None
+            for terminal_event in terminal_events:
+                yield terminal_event
+        if post_tool_cancellation is not None:
+            raise post_tool_cancellation
+        if await _await_post_tool_operation(
+            self._session_control.is_interrupting(session.id),
+            cancellation=post_tool_cancellation,
+        ):
             raise SessionInterruptedByRequest(session.id)
 
     async def emit_mcp_manifest_checks(
@@ -3522,6 +3792,7 @@ class ToolRoundRun:
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_round_identity: ToolRoundIdentity,
+        model_step: int | None = None,
     ) -> AsyncIterator[Event]:
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         model_attempt_identity = ModelAttemptIdentity(
@@ -3921,6 +4192,7 @@ class ToolRoundRun:
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
                         tool_round_identity=tool_round_identity,
+                        model_step=model_step,
                         taint_labels_by_id=policy_plan.active_taint_labels,
                         publish_arguments_as_unavailable=publish_arguments_as_unavailable,
                         policy_output_secret_resolution_scope=(
@@ -3942,6 +4214,7 @@ class ToolRoundRun:
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
                         tool_round_identity=tool_round_identity,
+                        model_step=model_step,
                         taint_labels_by_id=policy_plan.active_taint_labels,
                         publish_arguments_as_unavailable=publish_arguments_as_unavailable,
                         policy_output_secret_resolution_scope=(
@@ -4229,6 +4502,7 @@ class ToolRoundRun:
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
         tool_round_identity: ToolRoundIdentity,
+        model_step: int | None,
         round_tool_calls: list[runtime_records.ToolCallRequest] | None = None,
         taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
         publish_arguments_as_unavailable: bool = False,
@@ -4277,6 +4551,7 @@ class ToolRoundRun:
                 tool_call=tool_call,
                 request_metadata=self._request_metadata,
                 task_id=self._task_id,
+                model_step=model_step,
                 policy_result=policy_results_by_id.get(tool_call.id),
                 tool_round_identity=tool_round_identity,
                 taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
@@ -4296,6 +4571,7 @@ class ToolRoundRun:
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
         tool_round_identity: ToolRoundIdentity,
+        model_step: int | None,
         taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
         publish_arguments_as_unavailable: bool = False,
         policy_output_secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown",
@@ -4328,6 +4604,7 @@ class ToolRoundRun:
                         tool_call=tool_call,
                         request_metadata=self._request_metadata,
                         task_id=self._task_id,
+                        model_step=model_step,
                         policy_result=policy_results_by_id.get(tool_call.id),
                         tool_round_identity=tool_round_identity,
                         taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
@@ -4887,6 +5164,795 @@ def _workspace_id(
     return require_clean_nonblank(workspace_id, "workspace.id")
 
 
+async def _observe_workspace_revision(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    *,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> WorkspaceRevisionObservation:
+    workspace_id = _workspace_id(registered_environment) or "workspace-unavailable"
+    if registered_environment is None:
+        return unsupported_workspace_revision(
+            workspace_id=workspace_id,
+            observer="UnconfiguredEnvironment",
+        )
+    binding = registered_environment.environment.binding
+    bound = registered_environment.bound_workspace
+    if binding is None:
+        return unsupported_workspace_revision(
+            workspace_id=workspace_id,
+            observer="UnconfiguredWorkspaceBinding",
+        )
+    if bound is None:
+        workspace = registered_environment.environment.workspace
+        bound = BoundWorkspace(
+            workspace=workspace,
+            source_workspace=workspace,
+            runner=registered_environment.environment.runner,
+        )
+    expected_identity = WorkspaceIdentity(
+        workspace_id=workspace_id,
+        observer=type(binding).__name__,
+    )
+    if not operation_registry.reserve():
+        return WorkspaceRevisionObservation(
+            identity=expected_identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            detail_code="revision_observer_capacity_exhausted",
+        )
+
+    async def invoke_observer() -> WorkspaceRevisionObservation:
+        return await binding.observe_revision(bound)
+
+    try:
+        observation_task = asyncio.create_task(invoke_observer())
+    except BaseException:
+        operation_registry.release_reservation()
+        raise
+    operation_registry.track(observation_task)
+    outcome = await await_shielded_task_outcome(
+        observation_task,
+        timeout_s=_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS,
+        timeout_after_cancellation_s=0.0,
+    )
+    if observation_task.done():
+        operation_registry.release(observation_task)
+    if outcome.cancellation is not None:
+        raise outcome.cancellation
+    if outcome.timed_out:
+        return WorkspaceRevisionObservation(
+            identity=expected_identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            detail_code="revision_observer_timeout",
+        )
+    if _contains_process_signal(outcome.error):
+        if outcome.error is None:  # pragma: no cover - narrowed by the helper
+            raise AssertionError("Process-signal classification lost its error.")
+        raise outcome.error
+    if outcome.error is not None:
+        return WorkspaceRevisionObservation(
+            identity=expected_identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            detail_code="revision_observer_failed",
+        )
+    try:
+        observed = outcome.result
+        validated = _bounded_workspace_observation_copy(
+            observed,
+            expected_identity=expected_identity,
+        )
+    except _WorkspaceObservationRuntimeLimitExceeded:
+        return WorkspaceRevisionObservation(
+            identity=expected_identity,
+            status=WorkspaceRevisionObservationStatus.TRUNCATED,
+            detail_code="revision_observer_limit_exceeded",
+        )
+    except Exception:
+        return WorkspaceRevisionObservation(
+            identity=expected_identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            detail_code="revision_observer_failed",
+        )
+    return validated
+
+
+class _WorkspaceObservationRuntimeLimitExceeded(Exception):
+    pass
+
+
+def _contains_process_signal(error: BaseException | None) -> bool:
+    if error is None:
+        return False
+    return any(
+        isinstance(candidate, (KeyboardInterrupt, SystemExit))
+        for candidate in iter_exception_tree(error)
+    )
+
+
+_PostToolResultT = TypeVar("_PostToolResultT")
+
+
+def _raise_preserved_post_tool_cancellation(
+    cancellation: asyncio.CancelledError | None,
+    failure: BaseException,
+) -> Never:
+    """Keep an earlier caller cancellation authoritative over terminalization failure."""
+
+    if cancellation is None or type(failure) is GeneratorExit or _contains_process_signal(failure):
+        raise failure
+    if isinstance(failure, asyncio.CancelledError):
+        failure = consume_pending_task_cancellation(failure) or failure
+    # Terminalization crosses stores, hooks, projections, and other extension
+    # seams. Preserve the fact of the secondary failure without retaining its
+    # potentially workload-derived message, traceback, or mutable state on the
+    # public cancellation object.
+    safe_failure = RuntimeError("Tool terminalization failed after caller cancellation.")
+    del failure
+    prior_cause = exception_cause(cancellation)
+    if prior_cause is None:
+        cause: BaseException = safe_failure
+    else:
+        cause = BaseExceptionGroup(
+            "Post-tool cancellation and terminalization failures.",
+            [prior_cause, safe_failure],
+        )
+    attach_runner_cancellation_failure(cancellation, cause)
+    set_exception_cause(cancellation, cause)
+    raise cancellation from cause
+
+
+async def _await_post_tool_operation(
+    operation: Awaitable[_PostToolResultT],
+    *,
+    cancellation: asyncio.CancelledError | None,
+) -> _PostToolResultT:
+    """Await terminalization without allowing it to replace owned cancellation."""
+
+    if cancellation is None:
+        return await operation
+    try:
+        return await operation
+    except BaseException as failure:
+        _raise_preserved_post_tool_cancellation(cancellation, failure)
+
+
+async def _iterate_post_tool_events(
+    events: AsyncIterator[_PostToolResultT],
+    *,
+    cancellation: asyncio.CancelledError | None,
+) -> AsyncIterator[_PostToolResultT]:
+    """Iterate terminalization events under the same cancellation authority."""
+
+    if cancellation is None:
+        async for event in events:
+            yield event
+        return
+    try:
+        async for event in events:
+            yield event
+    except BaseException as failure:
+        _raise_preserved_post_tool_cancellation(cancellation, failure)
+
+
+def _bounded_workspace_observation_copy(
+    observed: object,
+    *,
+    expected_identity: WorkspaceIdentity,
+) -> WorkspaceRevisionObservation:
+    """Detach public observer output only after enforcing runtime hard limits."""
+
+    if type(observed) is not WorkspaceRevisionObservation:
+        raise TypeError("Workspace observer must return WorkspaceRevisionObservation.")
+    if type(observed.identity) is not WorkspaceIdentity:
+        raise TypeError("Workspace observer returned an invalid identity.")
+    if (
+        type(observed.identity.workspace_id) is not str
+        or type(observed.identity.observer) is not str
+        or observed.identity.workspace_id != expected_identity.workspace_id
+        or observed.identity.observer != expected_identity.observer
+    ):
+        raise ValueError("Workspace observer returned an unexpected identity.")
+    if type(observed.status) is not WorkspaceRevisionObservationStatus:
+        raise TypeError("Workspace observation status is invalid.")
+    if type(observed.path_scope) is not str or observed.path_scope not in {"complete", "changed"}:
+        raise TypeError("Workspace observation path scope is invalid.")
+    if type(observed.paths) is not tuple:
+        raise TypeError("Workspace observation paths must be a tuple.")
+    limits = _WORKSPACE_OBSERVATION_RUNTIME_LIMITS
+    if len(observed.paths) > limits.max_paths:
+        raise _WorkspaceObservationRuntimeLimitExceeded
+    if (
+        type(observed.total_paths) is not int
+        or observed.total_paths < 0
+        or observed.total_paths > _WORKSPACE_OBSERVATION_MAX_TOTAL_PATHS
+    ):
+        raise _WorkspaceObservationRuntimeLimitExceeded
+
+    serialized_size = 256
+    for value in (
+        observed.identity.workspace_id,
+        observed.identity.observer,
+        observed.revision,
+        observed.head_revision,
+        observed.branch,
+        observed.detail_code,
+    ):
+        serialized_size += _bounded_workspace_observation_text_size(
+            value,
+            max_bytes=limits.max_path_bytes,
+        )
+    detached_paths: list[WorkspacePathRevision] = []
+    detached_path_names: set[str] = set()
+    for path in observed.paths:
+        if type(path) is not WorkspacePathRevision:
+            raise TypeError("Workspace observation contains an invalid path entry.")
+        if type(path.path) is not str or path.path in detached_path_names:
+            raise ValueError("Workspace observation paths must be unique strings.")
+        detached_path_names.add(path.path)
+        for value in (path.untracked, path.ignored):
+            if type(value) is not bool:
+                raise TypeError("Workspace observation path flags must be booleans.")
+        for value in (path.present, path.tracked):
+            if value is not None and type(value) is not bool:
+                raise TypeError("Workspace observation path flags must be booleans or None.")
+        if type(path.kind) is not str or path.kind not in {
+            "file",
+            "symlink",
+            "submodule",
+            "unknown",
+        }:
+            raise TypeError("Workspace observation path kind is invalid.")
+        for value in (
+            path.path,
+            path.staged,
+            path.working_tree,
+            path.content_sha256,
+            path.index_object_id,
+            path.index_mode,
+            path.renamed_from,
+        ):
+            serialized_size += _bounded_workspace_observation_text_size(
+                value,
+                max_bytes=limits.max_path_bytes,
+            )
+        serialized_size += 192
+        if serialized_size > limits.max_manifest_bytes:
+            raise _WorkspaceObservationRuntimeLimitExceeded
+        detached_paths.append(
+            WorkspacePathRevision(
+                path=path.path,
+                staged=path.staged,
+                working_tree=path.working_tree,
+                untracked=path.untracked,
+                ignored=path.ignored,
+                present=path.present,
+                tracked=path.tracked,
+                kind=path.kind,
+                content_sha256=path.content_sha256,
+                index_object_id=path.index_object_id,
+                index_mode=path.index_mode,
+                renamed_from=path.renamed_from,
+            )
+        )
+
+    detached = WorkspaceRevisionObservation(
+        identity=WorkspaceIdentity(
+            workspace_id=observed.identity.workspace_id,
+            observer=observed.identity.observer,
+        ),
+        status=observed.status,
+        revision=observed.revision,
+        head_revision=observed.head_revision,
+        branch=observed.branch,
+        path_scope=observed.path_scope,
+        paths=tuple(detached_paths),
+        total_paths=observed.total_paths,
+        detail_code=observed.detail_code,
+    )
+    encoded = detached.model_dump_json().encode("utf-8")
+    if len(encoded) > limits.max_manifest_bytes:
+        raise _WorkspaceObservationRuntimeLimitExceeded
+    return WorkspaceRevisionObservation.model_validate_json(encoded)
+
+
+def _bounded_workspace_observation_text_size(
+    value: str | None,
+    *,
+    max_bytes: int,
+) -> int:
+    if value is None:
+        return 0
+    if type(value) is not str:
+        raise TypeError("Workspace observation text fields must be strings.")
+    if len(value) > max_bytes:
+        raise _WorkspaceObservationRuntimeLimitExceeded
+    encoded = value.encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise _WorkspaceObservationRuntimeLimitExceeded
+    return len(encoded)
+
+
+async def _record_workspace_mutation_after(
+    *,
+    event_writer: RuntimeEventWriter,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    artifact_store: Any,
+    artifact_unavailable_detail_code: str,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    tool_call: runtime_records.ToolCallRequest,
+    tool_round_identity: ToolRoundIdentity,
+    model_step: int | None,
+    window_id: str,
+    before_observation: WorkspaceRevisionObservation,
+    redactor: SecretRedactor,
+    evidence_available: bool,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> tuple[Event, Event, Event]:
+    """Persist the closing observation and attributable delta for one tool window."""
+
+    before_projection = await _workspace_evidence_projection(
+        paths=[path.model_dump(mode="json") for path in before_observation.paths],
+        status=before_observation.status.value,
+        detail_code=before_observation.detail_code,
+        artifact_store=artifact_store,
+        artifact_unavailable_detail_code=artifact_unavailable_detail_code,
+        session=session,
+        registered_agent=registered_agent,
+        environment_name=environment_name,
+        window_id=window_id,
+        evidence_kind="revision-before",
+        redactor=redactor,
+        evidence_available=evidence_available,
+        operation_registry=operation_registry,
+    )
+    before_event = await _emit_workspace_capture_event(
+        event_writer,
+        prepare_runtime_event(
+            _workspace_revision_observed_event(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                tool_call=tool_call,
+                tool_round_identity=tool_round_identity,
+                model_step=model_step,
+                window_id=window_id,
+                phase="before",
+                observation=before_observation,
+                projection=before_projection,
+            ),
+            redactor=redactor,
+        ),
+    )
+    after_observation = await _observe_workspace_revision(
+        registered_environment,
+        operation_registry=operation_registry,
+    )
+    after_projection = await _workspace_evidence_projection(
+        paths=[path.model_dump(mode="json") for path in after_observation.paths],
+        status=after_observation.status.value,
+        detail_code=after_observation.detail_code,
+        artifact_store=artifact_store,
+        artifact_unavailable_detail_code=artifact_unavailable_detail_code,
+        session=session,
+        registered_agent=registered_agent,
+        environment_name=environment_name,
+        window_id=window_id,
+        evidence_kind="revision-after",
+        redactor=redactor,
+        evidence_available=evidence_available,
+        operation_registry=operation_registry,
+    )
+    after_event = await _emit_workspace_capture_event(
+        event_writer,
+        prepare_runtime_event(
+            _workspace_revision_observed_event(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                tool_call=tool_call,
+                tool_round_identity=tool_round_identity,
+                model_step=model_step,
+                window_id=window_id,
+                phase="after",
+                observation=after_observation,
+                projection=after_projection,
+            ),
+            redactor=redactor,
+        ),
+    )
+    try:
+        delta = compare_workspace_revisions(before_observation, after_observation)
+    except Exception:
+        delta = WorkspaceRevisionDelta(
+            identity=before_observation.identity,
+            status=WorkspaceRevisionDeltaStatus.FAILED,
+            before_revision=before_observation.revision,
+            after_revision=after_observation.revision,
+            detail_code="revision_comparison_failed",
+        )
+    delta_projection = await _workspace_evidence_projection(
+        paths=[path.model_dump(mode="json") for path in delta.paths],
+        status=delta.status.value,
+        detail_code=delta.detail_code,
+        artifact_store=artifact_store,
+        artifact_unavailable_detail_code=artifact_unavailable_detail_code,
+        session=session,
+        registered_agent=registered_agent,
+        environment_name=environment_name,
+        window_id=window_id,
+        evidence_kind="revision-delta",
+        redactor=redactor,
+        evidence_available=evidence_available,
+        operation_registry=operation_registry,
+    )
+    receipt_event = await _emit_workspace_capture_event(
+        event_writer,
+        prepare_runtime_event(
+            _workspace_mutation_recorded_event(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                tool_call=tool_call,
+                tool_round_identity=tool_round_identity,
+                model_step=model_step,
+                window_id=window_id,
+                before_observation_id=before_event.id,
+                after_observation_id=after_event.id,
+                delta=delta,
+                projection=delta_projection,
+            ),
+            redactor=redactor,
+        ),
+    )
+    return before_event, after_event, receipt_event
+
+
+async def _emit_workspace_capture_event(
+    event_writer: RuntimeEventWriter,
+    event: Event,
+) -> Event:
+    """Own one capture append and distinguish store cancellation from the caller's."""
+
+    outcome = await await_invocation_operation(
+        lambda: event_writer.emit(event),
+        request_child_cancellation=False,
+    )
+    if outcome.cancellation is not None:
+        raise outcome.cancellation
+    if _contains_process_signal(outcome.error):
+        if outcome.error is None:  # pragma: no cover - narrowed by the helper
+            raise AssertionError("Process-signal classification lost its error.")
+        raise outcome.error
+    if outcome.error is not None:
+        del outcome
+        raise RuntimeError("Workspace mutation receipt event publication failed.") from None
+    if type(outcome.result) is not Event:
+        raise RuntimeError("Workspace mutation receipt event publication returned invalid data.")
+    return outcome.result
+
+
+def _workspace_mutation_window_id(
+    *,
+    session_id: str,
+    session_run_epoch: int,
+    tool_round_id: str,
+    tool_call_id: str,
+) -> str:
+    material = json.dumps(
+        [session_id, session_run_epoch, tool_round_id, tool_call_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "wmut_" + hashlib.sha256(material).hexdigest()
+
+
+def _workspace_revision_observed_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    tool_call: runtime_records.ToolCallRequest,
+    tool_round_identity: ToolRoundIdentity,
+    model_step: int | None,
+    window_id: str,
+    phase: Literal["before", "after"],
+    observation: WorkspaceRevisionObservation,
+    projection: _WorkspaceEvidenceProjection,
+) -> Event:
+    payload: dict[str, Any] = {
+        "phase": phase,
+        "window_id": window_id,
+        "session_run_epoch": session.run_epoch,
+        "tool_call_id": tool_call.id,
+        "workspace_id": observation.identity.workspace_id,
+        "observer": observation.identity.observer,
+        "status": projection.status,
+        "revision": observation.revision if projection.evidence_available else None,
+        "head_revision": (observation.head_revision if projection.evidence_available else None),
+        "branch": observation.branch if projection.evidence_available else None,
+        "path_scope": observation.path_scope,
+        "paths": projection.paths,
+        "total_paths": observation.total_paths if projection.evidence_available else 0,
+        "detail_code": projection.detail_code,
+        **tool_round_identity.payload(),
+    }
+    if model_step is not None:
+        payload["model_step"] = model_step
+    _add_workspace_manifest_artifact_fields(payload, projection)
+    event = Event(
+        type=EventType.WORKSPACE_REVISION_OBSERVED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        tool_name=tool_call.name,
+        payload=payload,
+    )
+    return _event_with_tool_round_authority(
+        event,
+        tool_round_identity,
+        "tool_call_id",
+        "window_id",
+        "workspace_id",
+        "manifest_artifact_id",
+    )
+
+
+def _workspace_mutation_recorded_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    tool_call: runtime_records.ToolCallRequest,
+    tool_round_identity: ToolRoundIdentity,
+    model_step: int | None,
+    window_id: str,
+    before_observation_id: str,
+    after_observation_id: str,
+    delta: WorkspaceRevisionDelta,
+    projection: _WorkspaceEvidenceProjection,
+) -> Event:
+    payload: dict[str, Any] = {
+        "window_id": window_id,
+        "before_observation_id": before_observation_id,
+        "after_observation_id": after_observation_id,
+        "session_run_epoch": session.run_epoch,
+        "tool_call_id": tool_call.id,
+        "workspace_id": delta.identity.workspace_id,
+        "observer": delta.identity.observer,
+        "status": projection.status,
+        "before_revision": delta.before_revision if projection.evidence_available else None,
+        "after_revision": delta.after_revision if projection.evidence_available else None,
+        "paths": projection.paths,
+        "total_paths": delta.total_paths if projection.evidence_available else 0,
+        "head_changed": delta.head_changed if projection.evidence_available else False,
+        "branch_changed": delta.branch_changed if projection.evidence_available else False,
+        "detail_code": projection.detail_code,
+        **tool_round_identity.payload(),
+    }
+    if model_step is not None:
+        payload["model_step"] = model_step
+    _add_workspace_manifest_artifact_fields(payload, projection)
+    event = Event(
+        type=EventType.WORKSPACE_MUTATION_RECORDED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        tool_name=tool_call.name,
+        payload=payload,
+    )
+    return _event_with_tool_round_authority(
+        event,
+        tool_round_identity,
+        "tool_call_id",
+        "window_id",
+        "workspace_id",
+        "before_observation_id",
+        "after_observation_id",
+        "manifest_artifact_id",
+    )
+
+
+def _add_workspace_manifest_artifact_fields(
+    payload: dict[str, Any],
+    projection: _WorkspaceEvidenceProjection,
+) -> None:
+    if projection.manifest_artifact_id is None:
+        return
+    payload.update(
+        {
+            "manifest_artifact_id": projection.manifest_artifact_id,
+            "manifest_artifact_sha256": projection.manifest_artifact_sha256,
+            "manifest_artifact_size_bytes": projection.manifest_artifact_size_bytes,
+        }
+    )
+
+
+async def _workspace_evidence_projection(
+    *,
+    paths: list[dict[str, Any]],
+    status: str,
+    detail_code: str | None,
+    artifact_store: Any,
+    artifact_unavailable_detail_code: str = "manifest_artifact_store_unavailable",
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    window_id: str,
+    evidence_kind: str,
+    redactor: SecretRedactor,
+    evidence_available: bool = True,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> _WorkspaceEvidenceProjection:
+    if not evidence_available:
+        return _WorkspaceEvidenceProjection(
+            paths=[],
+            status="truncated",
+            detail_code="workspace_evidence_quarantined",
+            evidence_available=False,
+        )
+    redacted_paths = redactor.redact_json_values(paths)
+    if type(redacted_paths) is not list or any(type(path) is not dict for path in redacted_paths):
+        return _WorkspaceEvidenceProjection(
+            paths=[],
+            status="failed",
+            detail_code="manifest_redaction_failed",
+        )
+    content = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": evidence_kind,
+            "paths": redacted_paths,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if (
+        len(redacted_paths) <= _WORKSPACE_RECEIPT_INLINE_PATH_LIMIT
+        and len(content) <= _WORKSPACE_RECEIPT_INLINE_BYTES
+    ):
+        return _WorkspaceEvidenceProjection(
+            paths=redacted_paths,
+            status=status,
+            detail_code=detail_code,
+        )
+    if artifact_store is None:
+        return _WorkspaceEvidenceProjection(
+            paths=[],
+            status="truncated",
+            detail_code=artifact_unavailable_detail_code,
+        )
+
+    digest = hashlib.sha256(content).hexdigest()
+    artifact_identity = json.dumps(
+        [session.id, window_id, evidence_kind, digest],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    artifact_id = f"art_{hashlib.sha256(artifact_identity).hexdigest()[:32]}"
+    filename = f"workspace-{evidence_kind}.json"
+    try:
+        async with asyncio.timeout(_WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS):
+            artifact_outcome = await await_invocation_operation(
+                lambda: artifact_store.put_bytes(
+                    content,
+                    artifact_id=artifact_id,
+                    filename=filename,
+                    content_type="application/json",
+                    scope=ArtifactScope.SESSION,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    metadata={
+                        "schema_version": 1,
+                        "kind": evidence_kind,
+                        "sha256": digest,
+                        "window_id": window_id,
+                    },
+                ),
+                request_child_cancellation=False,
+                abandon_on_caller_cancellation=True,
+                operation_registry=operation_registry,
+            )
+            if artifact_outcome.cancellation is not None:
+                raise artifact_outcome.cancellation
+    except TimeoutError:
+        return _WorkspaceEvidenceProjection(
+            paths=[],
+            status="truncated",
+            detail_code="manifest_artifact_write_failed",
+        )
+    if _contains_process_signal(artifact_outcome.error):
+        if artifact_outcome.error is None:  # pragma: no cover - narrowed by the helper
+            raise AssertionError("Process-signal classification lost its error.")
+        raise artifact_outcome.error
+    if artifact_outcome.error is not None:
+        return _WorkspaceEvidenceProjection(
+            paths=[],
+            status="truncated",
+            detail_code="manifest_artifact_write_failed",
+        )
+    metadata = artifact_outcome.result
+    if not _workspace_manifest_artifact_metadata_matches(
+        metadata,
+        artifact_id=artifact_id,
+        filename=filename,
+        content_size=len(content),
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        evidence_kind=evidence_kind,
+        digest=digest,
+        window_id=window_id,
+    ):
+        return _WorkspaceEvidenceProjection(
+            paths=[],
+            status="failed",
+            detail_code="manifest_artifact_reference_invalid",
+        )
+    return _WorkspaceEvidenceProjection(
+        paths=[],
+        status=status,
+        detail_code=detail_code,
+        manifest_artifact_id=artifact_id,
+        manifest_artifact_sha256=digest,
+        manifest_artifact_size_bytes=len(content),
+    )
+
+
+def _workspace_manifest_artifact_metadata_matches(
+    metadata: object,
+    *,
+    artifact_id: str,
+    filename: str,
+    content_size: int,
+    session_id: str,
+    agent_name: str,
+    environment_name: str | None,
+    evidence_kind: str,
+    digest: str,
+    window_id: str,
+) -> bool:
+    """Validate extension-owned artifact evidence before any value comparison."""
+
+    if type(metadata) is not ArtifactMetadata:
+        return False
+    text_fields = (
+        metadata.id,
+        metadata.filename,
+        metadata.content_type,
+        metadata.session_id,
+        metadata.agent_name,
+        metadata.environment_name,
+    )
+    if any(value is not None and type(value) is not str for value in text_fields):
+        return False
+    if type(metadata.size_bytes) is not int or type(metadata.scope) is not ArtifactScope:
+        return False
+    try:
+        artifact_metadata = copy_durable_json_object(
+            metadata.metadata,
+            "workspace_manifest_artifact_metadata",
+        )
+    except Exception:
+        return False
+    return (
+        metadata.id == artifact_id
+        and metadata.filename == filename
+        and metadata.content_type == "application/json"
+        and metadata.size_bytes == content_size
+        and metadata.scope is ArtifactScope.SESSION
+        and metadata.session_id == session_id
+        and metadata.agent_name == agent_name
+        and metadata.environment_name == environment_name
+        and artifact_metadata.get("schema_version") == 1
+        and artifact_metadata.get("kind") == evidence_kind
+        and artifact_metadata.get("sha256") == digest
+        and artifact_metadata.get("window_id") == window_id
+    )
+
+
 def _workspace(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
     if registered_environment is None:
         return None
@@ -4909,6 +5975,25 @@ def _artifact_store(registered_environment: runtime_records.RegisteredEnvironmen
     if registered_environment is None:
         return None
     return registered_environment.environment.artifact_store
+
+
+def _workspace_receipt_artifact_store(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> tuple[Any, str]:
+    """Exclude local stores whose receipt writes would mutate the observed workspace."""
+
+    artifact_store = _artifact_store(registered_environment)
+    workspace = _workspace(registered_environment)
+    if registered_environment is not None and registered_environment.bound_workspace is not None:
+        workspace = registered_environment.bound_workspace.workspace
+    if isinstance(artifact_store, LocalArtifactStore) and isinstance(workspace, LocalWorkspace):
+        try:
+            artifact_store.root.relative_to(workspace.root)
+        except ValueError:
+            pass
+        else:
+            return None, "manifest_artifact_store_inside_workspace"
+    return artifact_store, "manifest_artifact_store_unavailable"
 
 
 def _runner(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:

@@ -293,10 +293,11 @@ The built-in bindings live in `src/cayu/environments/bindings.py`:
 
 | Binding | What it does | Pairs well with |
 |---|---|---|
-| `NativeBinding` | Pass-through — workspace and runner already share a filesystem. | `LocalRunner` + `LocalWorkspace`; a Docker bind-mount. |
+| `NativeBinding` | Pass-through — workspace and runner already share a filesystem; revision observation is explicitly unsupported. | `LocalRunner` + `LocalWorkspace`; a Docker bind-mount. |
+| `DeterministicWorkspaceBinding` | Native pass-through plus bounded backend-neutral workspace revision observation. | Tests, conformance adapters, and simple workspaces whose public list/read APIs are authoritative. |
 | `NoWorkspaceBinding` | Exposes no workspace to the runner (compute-only runs). | Any runner when the agent needs no files. |
 | `SyncBinding` | Copy-in on bind, conditional copy-out on finalize. | An ephemeral/remote runner + a `RunnerWorkspace` (Docker, E2B, microVM). |
-| `GitRepositoryBinding` | Ensures the workspace has a checked-out repo at a ref; records commit/branch/dirty state (never commits or pushes). | Any runner for code-on-a-branch workflows. |
+| `GitRepositoryBinding` | Ensures the workspace has a checked-out repo at a ref and provides bounded read-only HEAD/branch/index/worktree observation (never commits or pushes). | Any runner for code-on-a-branch workflows. |
 
 `SyncBinding` is policy-driven: `sync_back` (`always`/`on_success`/`never`) controls when changed files
 are copied back, while `clean_target`, `delete_missing`, `pattern`, `max_files`, `max_file_bytes`,
@@ -337,7 +338,7 @@ Two patterns the issue that motivated this guide called out are **not** separate
 
 `Environment`, `EnvironmentSpec`, `EnvironmentFactory`, `WorkspaceBinding`, `BoundWorkspace`,
 `WorkspaceSnapshot`, and the concrete bindings (`NativeBinding`, `NoWorkspaceBinding`,
-`SyncBinding`, `GitRepositoryBinding`) plus `SyncTargetWorkspacePlan` are re-exported from the
+`SyncBinding`, `GitRepositoryBinding`, `DeterministicWorkspaceBinding`) plus `SyncTargetWorkspacePlan` are re-exported from the
 top-level `cayu`. The base
 `Workspace` and `Runner` types are **not** — import those from their modules:
 

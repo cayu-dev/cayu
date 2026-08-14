@@ -17,6 +17,7 @@ from pydantic import (
     computed_field,
     field_serializer,
     field_validator,
+    model_validator,
 )
 
 from cayu._validation import (
@@ -114,6 +115,7 @@ class _ToolSpecInput(BaseModel):
     input_schema: dict[str, Any] = Field(default_factory=dict)
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
+    workspace_mutation: StrictBool = False
 
     @field_validator("input_schema", mode="before")
     @classmethod
@@ -130,6 +132,14 @@ class _ToolSpecInput(BaseModel):
     def validate_description(cls, value: str) -> str:
         return require_durable_text(value, "description")
 
+    @model_validator(mode="after")
+    def validate_workspace_mutation(self) -> _ToolSpecInput:
+        if self.workspace_mutation and self.parallel_safe:
+            raise ValueError("Workspace-mutating tools must declare parallel_safe=False.")
+        if self.workspace_mutation and self.effect is ToolEffect.NONE:
+            raise ValueError("Workspace-mutating tools cannot declare ToolEffect.NONE.")
+        return self
+
 
 class ToolSpec(BaseModel):
     """Immutable public declaration for a native Python tool.
@@ -145,6 +155,7 @@ class ToolSpec(BaseModel):
     description: str = ""
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
+    workspace_mutation: StrictBool = False
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
     def __init__(
@@ -155,6 +166,7 @@ class ToolSpec(BaseModel):
         input_schema: dict[str, Any] | None = None,
         parallel_safe: bool = True,
         effect: ToolEffect = ToolEffect.EXTERNAL,
+        workspace_mutation: bool = False,
         **data: Any,
     ) -> None:
         parsed = _ToolSpecInput.model_validate(
@@ -164,6 +176,7 @@ class ToolSpec(BaseModel):
                 "input_schema": {} if input_schema is None else input_schema,
                 "parallel_safe": parallel_safe,
                 "effect": effect,
+                "workspace_mutation": workspace_mutation,
                 **data,
             }
         )
@@ -172,6 +185,7 @@ class ToolSpec(BaseModel):
             description=parsed.description,
             parallel_safe=parsed.parallel_safe,
             effect=parsed.effect,
+            workspace_mutation=parsed.workspace_mutation,
         )
         object.__setattr__(self, "_input_schema", _freeze_value(parsed.input_schema))
 

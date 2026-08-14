@@ -118,6 +118,7 @@ class ExecCommandTool(Tool):
         # Runs commands with side effects; never overlaps other tools in a round.
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,
+        workspace_mutation=True,
         description="Execute a process or explicit shell command with the active runner.",
         input_schema={
             "type": "object",

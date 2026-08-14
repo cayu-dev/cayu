@@ -3302,6 +3302,7 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         parallel_safe=tool.parallel_safe,
         effect=tool.effect,
         publish_arguments=tool.publish_arguments,
+        workspace_mutation=tool.workspace_mutation,
         tool=tool.tool,
         child_session_recovery=tool.child_session_recovery,
     )
@@ -3380,6 +3381,7 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         input_schema=schema,
         parallel_safe=spec.parallel_safe,
         effect=spec.effect,
+        workspace_mutation=spec.workspace_mutation,
     )
     return runtime_records.RegisteredTool(
         name=validated_spec.name,
@@ -3388,6 +3390,7 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         parallel_safe=validated_spec.parallel_safe,
         effect=validated_spec.effect,
         publish_arguments=publish_arguments,
+        workspace_mutation=validated_spec.workspace_mutation,
         tool=tool,
         child_session_recovery=(
             tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None

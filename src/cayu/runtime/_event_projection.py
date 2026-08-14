@@ -217,6 +217,11 @@ _TERMINAL_CONTROL_KEYS = frozenset(
         "durable_value_error_path",
     }
 )
+_WORKSPACE_MUTATION_CAPTURE_DETAILS = {
+    "recorded": None,
+    "failed": "receipt_publication_failed",
+    "interrupted": "receipt_publication_interrupted",
+}
 
 _SESSION_STATUS_VALUES = frozenset(
     {"pending", "running", "interrupting", "completed", "failed", "interrupted"}
@@ -1079,6 +1084,7 @@ _PENDING_USER_INPUT_FIELD_NAMES = frozenset(
         "limits",
         "max_steps",
         "model_attempt_id",
+        "model_step",
         "model_step_id",
         "options",
         "question",
@@ -1648,6 +1654,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "tool_call_metadata_truncated",
         "tool_name",
         "tool_round_id",
+        "workspace_mutation_capture_detail_code",
+        "workspace_mutation_capture_status",
     }
     tool_terminal = tool_common | {
         "durable_value_error_code",
@@ -1713,6 +1721,43 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
                 "structured_output_validation",
             },
         )
+    workspace_observation_keys = (
+        "branch detail_code head_revision model_attempt_id model_step model_step_id observer "
+        "manifest_artifact_id manifest_artifact_sha256 manifest_artifact_size_bytes path_scope paths phase "
+        "revision session_run_epoch status tool_call_id tool_round_id total_paths window_id "
+        "workspace_id"
+    )
+    policies[EventType.WORKSPACE_REVISION_OBSERVED] = _observed_policy(
+        workspace_observation_keys,
+        aliased_authority_keys={
+            "model_attempt_id",
+            "model_step_id",
+            "manifest_artifact_id",
+            "tool_call_id",
+            "tool_round_id",
+            "window_id",
+            "workspace_id",
+        },
+        untrusted_container_keys={"paths"},
+    )
+    policies[EventType.WORKSPACE_MUTATION_RECORDED] = _observed_policy(
+        "after_observation_id after_revision before_observation_id before_revision "
+        "branch_changed detail_code head_changed model_attempt_id model_step model_step_id "
+        "manifest_artifact_id manifest_artifact_sha256 manifest_artifact_size_bytes observer paths "
+        "session_run_epoch status tool_call_id tool_round_id total_paths window_id workspace_id",
+        aliased_authority_keys={
+            "after_observation_id",
+            "before_observation_id",
+            "model_attempt_id",
+            "model_step_id",
+            "manifest_artifact_id",
+            "tool_call_id",
+            "tool_round_id",
+            "window_id",
+            "workspace_id",
+        },
+        untrusted_container_keys={"paths"},
+    )
     policies[EventType.TOOL_CALL_BLOCKED] = _policy(
         *tool_common,
         "blocked_by",
@@ -3528,6 +3573,18 @@ def _recognized_controls(
                 if type(effect) is not str or effect not in {item.value for item in ToolEffect}:
                     raise ValueError("Invalid runtime tool effect control.")
                 controls["effect"] = effect
+            capture_status = event.payload.get("workspace_mutation_capture_status")
+            capture_detail = event.payload.get("workspace_mutation_capture_detail_code")
+            if capture_status is not None or capture_detail is not None:
+                if (
+                    type(capture_status) is not str
+                    or capture_status not in _WORKSPACE_MUTATION_CAPTURE_DETAILS
+                    or capture_detail != _WORKSPACE_MUTATION_CAPTURE_DETAILS[capture_status]
+                ):
+                    raise ValueError("Invalid workspace mutation capture controls.")
+                controls["workspace_mutation_capture_status"] = capture_status
+                if capture_detail is not None:
+                    controls["workspace_mutation_capture_detail_code"] = capture_detail
             if event.type == EventType.TOOL_CALL_BLOCKED:
                 _recognize_policy_block_controls(
                     event,

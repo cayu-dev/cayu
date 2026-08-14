@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
+from cayu._exception_groups import exception_tree_contains, rebuild_exception_group
 from cayu.artifacts import (
     ArtifactReadResult,
     ArtifactStore,
@@ -24,6 +25,137 @@ from cayu.workspaces import Workspace, WorkspaceReadResult
 
 class InvocationResourceReadError(RuntimeError):
     """A custom-tool resource read could not be projected safely."""
+
+
+def _bounded_workspace_mutation_failure(
+    error: BaseException,
+    *,
+    operation: str,
+) -> Exception:
+    """Detach extension-owned control signals as ordinary operation failures."""
+
+    message = f"{operation} failed with an unexpected control signal."
+    if isinstance(error, Exception):
+        return error
+    if isinstance(error, BaseExceptionGroup):
+        rebuilt = rebuild_exception_group(
+            error,
+            group_message=f"{operation} reported multiple failures.",
+            leaf_mapper=lambda _leaf: RuntimeError(message),
+            invalid_leaf_factory=lambda: RuntimeError(message),
+        )
+        if isinstance(rebuilt, Exception):
+            return rebuilt
+    return RuntimeError(message)
+
+
+class InvocationWorkspaceMutationOwner:
+    """Fence invocation-dispatched workspace mutations until proven settled."""
+
+    def __init__(self) -> None:
+        self.__active: set[asyncio.Task[Any]] = set()
+        self.__sealed = False
+
+    async def run(self, operation_factory: Callable[[], Awaitable[Any]]) -> Any:
+        if self.__sealed:
+            raise RuntimeError("Workspace mutation is unavailable after invocation settlement.")
+        current = asyncio.current_task()
+        if current is None:  # pragma: no cover - coroutine execution invariant
+            raise RuntimeError("Workspace mutation requires an asyncio task owner.")
+        self.__active.add(current)
+        try:
+            outcome = await await_invocation_operation(
+                operation_factory,
+                request_child_cancellation=False,
+            )
+        finally:
+            self.__active.discard(current)
+        mutation_error = outcome.error
+        if mutation_error is not None and exception_tree_contains(
+            mutation_error,
+            (KeyboardInterrupt, SystemExit),
+        ):
+            raise mutation_error
+        if mutation_error is not None:
+            mutation_error = _bounded_workspace_mutation_failure(
+                mutation_error,
+                operation="Invocation workspace mutation",
+            )
+        if outcome.cancellation is not None and mutation_error is not None:
+            raise BaseExceptionGroup(
+                "Invocation workspace mutation failed after caller cancellation.",
+                [outcome.cancellation, mutation_error],
+            ) from mutation_error
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
+        if mutation_error is not None:
+            raise mutation_error
+        return outcome.result
+
+    async def seal_and_wait(self) -> None:
+        """Reject new mutations and wait for every dispatched mutation owner."""
+
+        self.__sealed = True
+        current = asyncio.current_task()
+        owned = {task for task in self.__active if task is not current}
+        pending = set(owned)
+        cancellation: asyncio.CancelledError | None = None
+        while pending:
+            waiter = asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                pending = {task for task in pending if not task.done()}
+                continue
+            pending.clear()
+
+        failures: list[BaseException] = []
+        for task in owned:
+            try:
+                task.result()
+            except BaseException as exc:
+                failures.append(exc)
+        process_failures = [
+            failure
+            for failure in failures
+            if exception_tree_contains(failure, (KeyboardInterrupt, SystemExit))
+        ]
+        if len(process_failures) == 1:
+            raise process_failures[0]
+        if process_failures:
+            raise BaseExceptionGroup(
+                "Workspace mutation settlement received process signals.",
+                process_failures,
+            )
+        bounded_failures = [
+            _bounded_workspace_mutation_failure(
+                failure,
+                operation="Detached invocation workspace mutation",
+            )
+            for failure in failures
+        ]
+        del failures
+        if cancellation is not None and bounded_failures:
+            # The mutation adapter is extension-owned, so its failures may
+            # retain private arguments or backend diagnostics. Keep caller
+            # cancellation authoritative and attach only a fixed public-safe
+            # indication that settlement also failed.
+            del bounded_failures
+            safe_failure = RuntimeError(
+                "Workspace mutation settlement failed after caller cancellation."
+            )
+            raise cancellation from safe_failure
+        if cancellation is not None:
+            raise cancellation
+        if len(bounded_failures) == 1:
+            raise bounded_failures[0]
+        if bounded_failures:
+            raise ExceptionGroup(
+                "Detached workspace mutations failed during settlement.",
+                bounded_failures,
+            )
 
 
 _MAX_RESOURCE_CANCELLATION_REASON_BYTES = 2_048
@@ -60,6 +192,7 @@ class InvocationWorkspaceHandle(Workspace):
 
     __slots__ = (
         "__capture_observer",
+        "__mutation_owner",
         "__redactor_snapshot_provider",
         "__workspace",
     )
@@ -70,6 +203,7 @@ class InvocationWorkspaceHandle(Workspace):
         *,
         redactor_snapshot_provider: Callable[[], Any],
         capture_observer: Callable[[int], None],
+        mutation_owner: InvocationWorkspaceMutationOwner | None = None,
     ) -> None:
         if not isinstance(workspace, Workspace):
             raise TypeError("Invocation workspace delegate must implement Workspace.")
@@ -77,9 +211,15 @@ class InvocationWorkspaceHandle(Workspace):
             raise TypeError("Invocation workspace snapshot provider must be callable.")
         if not callable(capture_observer):
             raise TypeError("Invocation workspace capture observer must be callable.")
+        if (
+            mutation_owner is not None
+            and type(mutation_owner) is not InvocationWorkspaceMutationOwner
+        ):
+            raise TypeError("Invocation workspace mutation owner is invalid.")
         self.__workspace = workspace
         self.__redactor_snapshot_provider = redactor_snapshot_provider
         self.__capture_observer = capture_observer
+        self.__mutation_owner = mutation_owner
         self.id = workspace.id
 
     async def read_bytes(
@@ -188,26 +328,35 @@ class InvocationWorkspaceHandle(Workspace):
         return self.__workspace.bounded_read_limit(max_bytes)
 
     async def write_bytes(self, path: str, content: bytes) -> None:
-        await self.__workspace.write_bytes(path, content)
+        await self._run_mutation(lambda: self.__workspace.write_bytes(path, content))
 
     async def delete(self, path: str) -> None:
-        await self.__workspace.delete(path)
+        await self._run_mutation(lambda: self.__workspace.delete(path))
 
     async def create_bytes(self, path: str, content: bytes):
-        return await self.__workspace.create_bytes(path, content)
+        return await self._run_mutation(lambda: self.__workspace.create_bytes(path, content))
 
     async def replace_bytes(self, path: str, content: bytes, *, expected_revision: str):
-        return await self.__workspace.replace_bytes(
-            path,
-            content,
-            expected_revision=expected_revision,
+        return await self._run_mutation(
+            lambda: self.__workspace.replace_bytes(
+                path,
+                content,
+                expected_revision=expected_revision,
+            )
         )
 
     async def delete_if_revision(self, path: str, *, expected_revision: str):
-        return await self.__workspace.delete_if_revision(
-            path,
-            expected_revision=expected_revision,
+        return await self._run_mutation(
+            lambda: self.__workspace.delete_if_revision(
+                path,
+                expected_revision=expected_revision,
+            )
         )
+
+    async def _run_mutation(self, operation_factory: Callable[[], Awaitable[Any]]) -> Any:
+        if self.__mutation_owner is None:
+            return await operation_factory()
+        return await self.__mutation_owner.run(operation_factory)
 
     async def list(self, pattern: str = "**/*", *, limit: int | None = None):
         return await self.__workspace.list(pattern, limit=limit)
@@ -607,6 +756,7 @@ def invocation_workspace_handle(
     *,
     redactor_snapshot_provider: Callable[[], Any],
     capture_observer: Callable[[int], None],
+    mutation_owner: InvocationWorkspaceMutationOwner | None = None,
 ) -> InvocationWorkspaceHandle | None:
     if workspace is None:
         return None
@@ -614,6 +764,7 @@ def invocation_workspace_handle(
         workspace,
         redactor_snapshot_provider=redactor_snapshot_provider,
         capture_observer=capture_observer,
+        mutation_owner=mutation_owner,
     )
 
 
@@ -642,6 +793,7 @@ __all__ = [
     "InvocationArtifactStoreHandle",
     "InvocationResourceReadError",
     "InvocationWorkspaceHandle",
+    "InvocationWorkspaceMutationOwner",
     "invocation_artifact_store_handle",
     "invocation_workspace_authenticated_cwd",
     "invocation_workspace_handle",
