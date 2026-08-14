@@ -2039,6 +2039,7 @@ def test_profile_policy_copy_does_not_emit_mutated_result_diagnostics(
 
     with warnings.catch_warnings(record=True) as emitted, caplog.at_level(logging.WARNING):
         warnings.simplefilter("always")
+        warnings.filterwarnings("ignore", category=ResourceWarning)
         raised = asyncio.run(exercise())
 
     captured = capsys.readouterr()

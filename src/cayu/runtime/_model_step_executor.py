@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, Never, cast
 from uuid import uuid4
@@ -93,6 +94,7 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
     ProviderOperationAdapter,
+    ProviderOperationCancellationSupport,
     ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationRecoveryMetadata,
@@ -127,6 +129,16 @@ from cayu.runtime._model_errors import (
     resolve_completion_billing_identity,
     resolve_request_billing_identity,
 )
+from cayu.runtime._provider_operation_cancellation_claim import (
+    ProviderOperationCancellationClaim,
+    checkpoint_with_provider_operation_cancellation_claim,
+    checkpoint_without_provider_operation_cancellation_claim,
+    provider_operation_cancellation_claim_from_checkpoint,
+)
+from cayu.runtime._run_limit_accounting import (
+    RunLimitAccountingContext,
+    has_run_limit_accounting_authority,
+)
 from cayu.runtime._run_limits import (
     UNKNOWN_POST_DISPATCH_BUDGET_REASON,
     BudgetDispatchReservationFailed,
@@ -136,6 +148,7 @@ from cayu.runtime._run_limits import (
     BudgetModelStepLifecycle,
     BudgetReservationLeaseLost,
     BudgetReservationLeaseLostBeforeModelDispatch,
+    BudgetStepReservation,
     LimitEvaluation,
     RunLimitController,
     RunLimitGate,
@@ -154,6 +167,7 @@ from cayu.runtime._structured_output_tool_round import (
 from cayu.runtime.budgets import (
     BudgetLimit,
     BudgetPolicy,
+    BudgetReservationRecoveryContext,
     BudgetReservationResult,
     budget_limits_for_session,
     copy_request_budget_limits,
@@ -215,6 +229,7 @@ from cayu.runtime.provider_operations import (
     ProviderOperationRecoveryStatus,
     RecoverableProviderOperation,
     commit_provider_operation_progress,
+    load_recoverable_provider_operation,
     provider_operation_progress_envelope,
     provider_operation_progress_event_id,
 )
@@ -275,6 +290,8 @@ from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
 _PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS = 5.0
+_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE = timedelta(seconds=30)
+_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS = 5.0
 _PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS = 5.0
 MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES = MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
 MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES = 256
@@ -319,7 +336,9 @@ class ModelCompletionRecoveryContext(BaseModel):
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
+    run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] = ()
+    budget_reservations: tuple[BudgetReservationRecoveryContext, ...] = ()
     retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
     structured_output_attempt: StrictInt | None = Field(default=None, ge=1)
     billing_identity: BillingIdentity | None = None
@@ -355,6 +374,28 @@ class ModelCompletionRecoveryContext(BaseModel):
             )
         return copy_request_budget_limits(value)
 
+    @field_validator("budget_reservations", mode="before")
+    @classmethod
+    def copy_budget_reservations(
+        cls,
+        value: Any,
+    ) -> tuple[BudgetReservationRecoveryContext, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("budget_reservations must be a list or tuple.")
+        if len(value) > MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS:
+            raise ValueError(
+                "budget_reservations cannot contain more than "
+                f"{MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS} entries."
+            )
+        copied = tuple(BudgetReservationRecoveryContext.model_validate(item) for item in value)
+        reservation_ids = [item.reservation_id for item in copied]
+        budget_limit_ids = [item.budget_limit_id for item in copied]
+        if len(set(reservation_ids)) != len(reservation_ids):
+            raise ValueError("budget_reservations must not repeat reservation ids.")
+        if len(set(budget_limit_ids)) != len(budget_limit_ids):
+            raise ValueError("budget_reservations must not repeat budget limit ids.")
+        return copied
+
     @field_validator("billing_identity", mode="after")
     @classmethod
     def copy_context_billing_identity(
@@ -365,7 +406,15 @@ class ModelCompletionRecoveryContext(BaseModel):
 
     @model_validator(mode="after")
     def validate_durable_bounds(self) -> ModelCompletionRecoveryContext:
-        for limit in self.budget_limits:
+        if self.run_limit_accounting is not None and not has_run_limit_accounting_authority(
+            self.limits,
+            self.budget_limits,
+        ):
+            raise ValueError("run_limit_accounting requires active run-scoped authority.")
+        for limit in (
+            *self.budget_limits,
+            *(reservation.limit for reservation in self.budget_reservations),
+        ):
             price_book = limit.pricing
             if (
                 len(price_book.prices) > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
@@ -400,7 +449,7 @@ class ModelCompletionRecoveryContext(BaseModel):
 
 
 ModelCompletionRecoveryContextFactory = Callable[
-    [BillingIdentity | None],
+    [BillingIdentity | None, tuple[BudgetStepReservation, ...]],
     ModelCompletionRecoveryContext | None,
 ]
 
@@ -413,9 +462,15 @@ def model_completion_recovery_context_from_stage(
     raw_context = stage.intent.get("recovery_context")
     if raw_context is None:
         return None
-    return ModelCompletionRecoveryContext.model_validate(
+    context = ModelCompletionRecoveryContext.model_validate(
         copy_durable_json_object(raw_context, "recovery_context")
     )
+    if (
+        context.run_limit_accounting is not None
+        and context.run_limit_accounting.baseline.session_id != stage.session_id
+    ):
+        raise ValueError("Model completion run-limit accounting belongs to another session.")
+    return context
 
 
 def _ambiguous_provider_operation_start_error(
@@ -455,11 +510,37 @@ async def _cancel_provider_operation_after_definite_absence(
     state: ProviderOperationState,
     failure: BaseException,
     cancellation: asyncio.CancelledError | None = None,
+    ownership_lost: asyncio.Event | None = None,
 ) -> tuple[asyncio.CancelledError | None, ProviderOperationSnapshot | None]:
     async def cancel():
         return await adapter.cancel(copy_provider_operation_state(state))
 
-    cleanup_task = asyncio.create_task(cancel())
+    async def cancel_while_owned() -> ProviderOperationSnapshot:
+        if ownership_lost is None:  # pragma: no cover - selected before task creation
+            raise RuntimeError("Cancellation ownership supervision requires an ownership event.")
+        provider_task = asyncio.create_task(cancel())
+        ownership_task = asyncio.create_task(ownership_lost.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {provider_task, ownership_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if provider_task in done:
+                return provider_task.result()
+            provider_task.cancel("Provider-operation cancellation ownership was lost.")
+            return await provider_task
+        finally:
+            if not ownership_task.done():
+                ownership_task.cancel()
+            if not provider_task.done():
+                provider_task.cancel()
+            await asyncio.gather(
+                provider_task,
+                ownership_task,
+                return_exceptions=True,
+            )
+
+    cleanup_task = asyncio.create_task(cancel() if ownership_lost is None else cancel_while_owned())
     outcome = await await_shielded_task_outcome(
         cleanup_task,
         cancellation=cancellation,
@@ -1412,6 +1493,17 @@ class _AutomaticCompactionAdmissionStopped(RuntimeError):
         super().__init__("Automatic compaction provider dispatch was stopped by a limit.")
 
 
+class _ProviderOperationCancellationClaimReleaseObserved(RuntimeError):
+    """An intentional durable claim release won a concurrent heartbeat."""
+
+
+@dataclass
+class _ProviderOperationCancellationHeartbeat:
+    stop: asyncio.Event
+    release_intended: asyncio.Event
+    task: asyncio.Task[None] | None = None
+
+
 class ModelStepExecutor:
     """Build and execute provider requests for one logical model step."""
 
@@ -1448,6 +1540,10 @@ class ModelStepExecutor:
         self._apply_limit_evaluation = apply_limit_evaluation
         self._stop_for_budget_reservation_failure = stop_for_budget_reservation_failure
         self._provider_operation_reconciliation_tasks: set[asyncio.Task[None]] = set()
+        self._provider_operation_cancellation_heartbeats: dict[
+            str,
+            _ProviderOperationCancellationHeartbeat,
+        ] = {}
 
     def _retain_provider_operation_reconciliation(self, task: asyncio.Task[None]) -> None:
         self._provider_operation_reconciliation_tasks.add(task)
@@ -1457,6 +1553,486 @@ class ModelStepExecutor:
             _consume_detached_task_outcome(completed)
 
         task.add_done_callback(settled)
+
+    def _start_provider_operation_cancellation_heartbeat(
+        self,
+        *,
+        session: Session,
+        claim: ProviderOperationCancellationClaim,
+        ownership_lost: asyncio.Event,
+    ) -> None:
+        control = _ProviderOperationCancellationHeartbeat(
+            stop=asyncio.Event(),
+            release_intended=asyncio.Event(),
+        )
+        task = asyncio.create_task(
+            self._heartbeat_provider_operation_cancellation_claim(
+                session=session,
+                claim=claim,
+                owner_task=asyncio.current_task(),
+                ownership_lost=ownership_lost,
+                stop=control.stop,
+                release_intended=control.release_intended,
+            )
+        )
+        control.task = task
+        self._provider_operation_cancellation_heartbeats[claim.claim_id] = control
+
+        def settled(completed: asyncio.Task[None]) -> None:
+            if self._provider_operation_cancellation_heartbeats.get(claim.claim_id) is control:
+                self._provider_operation_cancellation_heartbeats.pop(claim.claim_id, None)
+            _consume_detached_task_outcome(completed)
+
+        task.add_done_callback(settled)
+
+    def _mark_provider_operation_cancellation_claim_release(
+        self,
+        claim: ProviderOperationCancellationClaim,
+    ) -> None:
+        control = self._provider_operation_cancellation_heartbeats.get(claim.claim_id)
+        if control is not None:
+            control.release_intended.set()
+
+    async def _stop_provider_operation_cancellation_heartbeat(
+        self,
+        claim: ProviderOperationCancellationClaim,
+    ) -> None:
+        control = self._provider_operation_cancellation_heartbeats.get(claim.claim_id)
+        if control is None or control.task is None:
+            return
+        control.stop.set()
+        await control.task
+
+    async def _persist_provider_operation_cancellation_event(
+        self,
+        *,
+        event_type: EventType,
+        cancellation_status: str,
+        session: Session,
+        stage: ModelCompletionStage,
+        state: ProviderOperationState,
+        interaction_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+        model_attempt_identity: ModelAttemptIdentity,
+        provider_status: ProviderOperationStatus | None = None,
+        error_type: str | None = None,
+        cancellation_claim: ProviderOperationCancellationClaim | None = None,
+        release_cancellation_claim: bool = False,
+    ) -> Event:
+        identity_material = canonical_durable_json_bytes(
+            {
+                "schema_version": 1,
+                "stage_id": stage.stage_id,
+                "run_epoch": session.run_epoch,
+                "event_type": event_type.value,
+                "cancellation_status": cancellation_status,
+                "provider_status": None if provider_status is None else provider_status.value,
+                "error_type": error_type,
+            },
+            "provider_operation_cancellation_identity",
+        )
+        payload: dict[str, Any] = {
+            "provider": registered_provider.name,
+            "model": session.model,
+            "step": step,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            **model_attempt_identity.payload(),
+            "source_run_epoch": stage.source_run_epoch,
+            "run_epoch": session.run_epoch,
+            "operation_id": state.operation_id,
+            "stream_protocol": state.stream_protocol,
+            "cancellation_status": cancellation_status,
+        }
+        if provider_status is not None:
+            payload["provider_status"] = provider_status.value
+        if error_type is not None:
+            payload["error_type"] = require_durable_clean_nonblank(error_type, "error_type")
+        event = _event_with_model_identity_authority(
+            Event(
+                id=f"provider-cancel:v1:{sha256(identity_material).hexdigest()}",
+                type=event_type,
+                session_id=session.id,
+                interaction_id=interaction_id,
+                timestamp=stage.prepared_at,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=payload,
+            ),
+            model_attempt_identity,
+        )
+        event = event_with_runtime_payload_authority(
+            event,
+            "operation_id",
+            "stream_protocol",
+        )
+        prepared = self._event_writer.prepare(event_with_runtime_generated_id(event))
+        if cancellation_claim is None:
+            if release_cancellation_claim:
+                raise ValueError("Cancellation-claim release requires the exact claim.")
+            persisted = await self._event_writer.persist_exact_replay(prepared)
+        else:
+
+            def checkpoint_transform(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                if current_session.run_epoch != session.run_epoch:
+                    raise SessionRunFenced(
+                        "Provider-operation cancellation ownership changed at publication."
+                    )
+                if release_cancellation_claim:
+                    return checkpoint_without_provider_operation_cancellation_claim(
+                        checkpoint,
+                        cancellation_claim,
+                    )
+                return checkpoint_with_provider_operation_cancellation_claim(
+                    checkpoint,
+                    cancellation_claim,
+                )
+
+            if release_cancellation_claim:
+                self._mark_provider_operation_cancellation_claim_release(cancellation_claim)
+            await self._session_store.publish_checkpoint_and_events(
+                session.id,
+                checkpoint_transform=checkpoint_transform,
+                events=[prepared],
+                expected_run_epoch=session.run_epoch,
+            )
+            if release_cancellation_claim:
+                await self._stop_provider_operation_cancellation_heartbeat(cancellation_claim)
+            persisted = prepared
+        [emitted] = await self._event_writer.fan_out_persisted([persisted])
+        return emitted
+
+    async def _release_provider_operation_cancellation_claim(
+        self,
+        *,
+        session: Session,
+        claim: ProviderOperationCancellationClaim,
+    ) -> None:
+        def release_claim(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if current_session.run_epoch != session.run_epoch:
+                raise SessionRunFenced(
+                    "Provider-operation cancellation ownership changed before claim release."
+                )
+            return checkpoint_without_provider_operation_cancellation_claim(
+                checkpoint,
+                claim,
+            )
+
+        self._mark_provider_operation_cancellation_claim_release(claim)
+        await self._session_store.publish_checkpoint_and_events(
+            session.id,
+            checkpoint_transform=release_claim,
+            events=[],
+            expected_run_epoch=session.run_epoch,
+        )
+        await self._stop_provider_operation_cancellation_heartbeat(claim)
+
+    async def _heartbeat_provider_operation_cancellation_claim(
+        self,
+        *,
+        session: Session,
+        claim: ProviderOperationCancellationClaim,
+        owner_task: asyncio.Task[Any] | None,
+        ownership_lost: asyncio.Event,
+        stop: asyncio.Event,
+        release_intended: asyncio.Event,
+    ) -> None:
+        """Renew one cancellation lease until its owner releases or loses it."""
+
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS,
+                )
+                return
+            except TimeoutError:
+                pass
+            if owner_task is not None and owner_task.done():
+                return
+            renewed = claim.model_copy(
+                update={
+                    "expires_at": datetime.now(UTC) + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE
+                }
+            )
+
+            def renew_claim(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+                renewed_claim: ProviderOperationCancellationClaim = renewed,
+            ) -> dict[str, Any]:
+                if current_session.run_epoch != session.run_epoch:
+                    raise SessionRunFenced(
+                        "Provider-operation cancellation ownership changed before renewal."
+                    )
+                existing = provider_operation_cancellation_claim_from_checkpoint(checkpoint)
+                if existing is None and release_intended.is_set():
+                    raise _ProviderOperationCancellationClaimReleaseObserved
+                if existing is None or not existing.same_owner(claim):
+                    raise RuntimeError("Provider-operation cancellation claim is no longer active.")
+                return checkpoint_with_provider_operation_cancellation_claim(
+                    checkpoint,
+                    renewed_claim,
+                )
+
+            try:
+                await self._session_store.publish_checkpoint_and_events(
+                    session.id,
+                    checkpoint_transform=renew_claim,
+                    events=[],
+                    expected_run_epoch=session.run_epoch,
+                )
+            except _ProviderOperationCancellationClaimReleaseObserved:
+                return
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                ownership_lost.set()
+                if owner_task is not None and not owner_task.done():
+                    owner_task.cancel("Provider-operation cancellation ownership heartbeat failed.")
+                raise
+
+    async def _cancel_started_provider_operation(
+        self,
+        *,
+        adapter: ProviderOperationAdapter,
+        state: ProviderOperationState,
+        failure: SessionInterruptedByRequest | asyncio.CancelledError,
+        session: Session,
+        stage: ModelCompletionStage,
+        interaction_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+        model_attempt_identity: ModelAttemptIdentity,
+        settle_budget: bool = False,
+    ) -> ProviderOperationSnapshot | None:
+        async def require_cancellation_owner() -> None:
+            current = await self._session_store.load(session.id)
+            if current is None:
+                raise KeyError(f"Session not found: {session.id}")
+            if current.run_epoch != session.run_epoch:
+                raise SessionRunFenced(
+                    "Provider-operation cancellation run epoch is stale: expected "
+                    f"{session.run_epoch}, current {current.run_epoch}."
+                )
+
+        await require_cancellation_owner()
+        cancellation_claim = ProviderOperationCancellationClaim(
+            claim_id=(
+                f"provider-cancel:{stage.stage_id}:{session.run_epoch}:"
+                f"{state.operation_id}:{state.stream_protocol}"
+            ),
+            stage_id=stage.stage_id,
+            run_epoch=session.run_epoch,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+            expires_at=datetime.now(UTC) + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE,
+        )
+        support = adapter.cancellation_support
+        if type(support) is not ProviderOperationCancellationSupport:
+            raise TypeError(
+                "ProviderOperationAdapter.cancellation_support must return "
+                "ProviderOperationCancellationSupport."
+            )
+        await self._persist_provider_operation_cancellation_event(
+            event_type=EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+            cancellation_status="requested",
+            session=session,
+            stage=stage,
+            state=state,
+            interaction_id=interaction_id,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            model_attempt_identity=model_attempt_identity,
+            cancellation_claim=cancellation_claim,
+        )
+        cancellation_ownership_lost = asyncio.Event()
+        self._start_provider_operation_cancellation_heartbeat(
+            session=session,
+            claim=cancellation_claim,
+            ownership_lost=cancellation_ownership_lost,
+        )
+        await require_cancellation_owner()
+        if support is ProviderOperationCancellationSupport.UNSUPPORTED:
+            await self._persist_provider_operation_cancellation_event(
+                event_type=EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+                cancellation_status="unsupported",
+                session=session,
+                stage=stage,
+                state=state,
+                interaction_id=interaction_id,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=step,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                model_attempt_identity=model_attempt_identity,
+                cancellation_claim=cancellation_claim,
+                release_cancellation_claim=True,
+            )
+            failure.__dict__["provider_operation_accounting_pending"] = True
+            return None
+        cancellation, snapshot = await _cancel_provider_operation_after_definite_absence(
+            adapter=adapter,
+            state=state,
+            failure=failure,
+            cancellation=(failure if isinstance(failure, asyncio.CancelledError) else None),
+            ownership_lost=cancellation_ownership_lost,
+        )
+        if cancellation is not None and cancellation is not failure:
+            raise cancellation from failure
+        if snapshot is None:
+            await require_cancellation_owner()
+            await self._persist_provider_operation_cancellation_event(
+                event_type=EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+                cancellation_status="failed",
+                session=session,
+                stage=stage,
+                state=state,
+                interaction_id=interaction_id,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=step,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                model_attempt_identity=model_attempt_identity,
+                error_type="CancellationUnconfirmed",
+                cancellation_claim=cancellation_claim,
+                release_cancellation_claim=True,
+            )
+            failure.__dict__["provider_operation_accounting_pending"] = True
+            return None
+        cancellation_status = {
+            ProviderOperationStatus.CANCELLED: "cancelled",
+            ProviderOperationStatus.COMPLETED: "completed",
+            ProviderOperationStatus.QUEUED: "pending",
+            ProviderOperationStatus.IN_PROGRESS: "pending",
+            ProviderOperationStatus.UNAVAILABLE: "unavailable",
+            ProviderOperationStatus.FAILED: "failed",
+            ProviderOperationStatus.EXPIRED: "failed",
+        }[snapshot.status]
+        await require_cancellation_owner()
+        retain_claim_after_resolution = snapshot.status is ProviderOperationStatus.COMPLETED or (
+            snapshot.status is ProviderOperationStatus.CANCELLED and bool(stage.reservation_ids)
+        )
+        await self._persist_provider_operation_cancellation_event(
+            event_type=EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+            cancellation_status=cancellation_status,
+            session=session,
+            stage=stage,
+            state=state,
+            interaction_id=interaction_id,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            model_attempt_identity=model_attempt_identity,
+            provider_status=snapshot.status,
+            cancellation_claim=cancellation_claim,
+            release_cancellation_claim=not retain_claim_after_resolution,
+        )
+        if snapshot.status is not ProviderOperationStatus.CANCELLED:
+            failure.__dict__["provider_operation_accounting_pending"] = True
+        elif settle_budget and stage.reservation_ids:
+            await require_cancellation_owner()
+            recovery_context = model_completion_recovery_context_from_stage(stage)
+            if recovery_context is None:
+                raise ProviderOperationEvidenceError(
+                    "Budgeted provider-operation cancellation has no durable accounting context."
+                )
+            try:
+                await (
+                    self._run_limit_controller.reconcile_cancelled_provider_operation_reservations(
+                        reservation_ids=stage.reservation_ids,
+                        recovery_contexts=recovery_context.budget_reservations,
+                        session=session,
+                        provider_name=registered_provider.name,
+                        model_attempt_identity=model_attempt_identity,
+                        dispatch_id=stage.stage_id,
+                        request_billing_identity=recovery_context.billing_identity,
+                    )
+                )
+            except (KeyError, NotImplementedError, TypeError, ValueError) as accounting_error:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation cancellation could not reconstruct its original "
+                    "budget reservation and pricing context."
+                ) from accounting_error
+            await self._release_provider_operation_cancellation_claim(
+                session=session,
+                claim=cancellation_claim,
+            )
+        elif stage.reservation_ids:
+            failure.__dict__["provider_operation_cancellation_claim"] = cancellation_claim
+        return snapshot
+
+    async def cancel_provider_operation_for_interruption(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+    ) -> ProviderOperationSnapshot | None:
+        """Cancel one durably identified operation after its worker disappears."""
+
+        provider = registered_provider.provider
+        adapter = provider.provider_operations
+        if (
+            provider.provider_operation_mode is not ProviderOperationMode.BACKGROUND
+            or not isinstance(adapter, ProviderOperationAdapter)
+        ):
+            raise RuntimeError(
+                "The registered provider no longer supports its durable background operation."
+            )
+        if operation.provider != registered_provider.name:
+            raise RuntimeError("Provider-operation cancellation resolved a different provider.")
+        if operation.model != session.model:
+            raise RuntimeError("Provider-operation cancellation resolved a different model.")
+        if operation.model_attempt_identity.model_step_id != stage.logical_step_id:
+            raise RuntimeError(
+                "Provider-operation cancellation belongs to a different model stage."
+            )
+        return await self._cancel_started_provider_operation(
+            adapter=adapter,
+            state=operation.state,
+            failure=SessionInterruptedByRequest(session.id),
+            session=session,
+            stage=stage,
+            interaction_id=operation.interaction_id,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+            step=operation.step,
+            attempt=operation.attempt,
+            max_attempts=operation.max_attempts,
+            model_attempt_identity=operation.model_attempt_identity,
+            settle_budget=True,
+        )
 
     def _provider_operation_progress_event(
         self,
@@ -1645,7 +2221,21 @@ class ModelStepExecutor:
                 "Stored provider-operation recovery state conflicts with a current workload secret."
             )
 
+        cancellation_claim = ProviderOperationCancellationClaim(
+            claim_id=(
+                f"provider-cancel:{stage.stage_id}:{session.run_epoch}:"
+                f"{operation.state.operation_id}:{operation.state.stream_protocol}"
+            ),
+            stage_id=stage.stage_id,
+            run_epoch=session.run_epoch,
+            operation_id=operation.state.operation_id,
+            stream_protocol=operation.state.stream_protocol,
+            expires_at=datetime.now(UTC) + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE,
+        )
+        recovery_under_cancellation_claim = False
+
         async def require_recovery_owner() -> None:
+            nonlocal recovery_under_cancellation_claim
             current = await self._session_store.load(session.id)
             if current is None:
                 raise KeyError(f"Session not found: {session.id}")
@@ -1655,7 +2245,14 @@ class ModelStepExecutor:
                     f"{session.run_epoch}, current {current.run_epoch}."
                 )
             if current.status is SessionStatus.INTERRUPTING:
-                raise SessionInterruptedByRequest(session.id)
+                checkpoint = await self._session_store.load_checkpoint(session.id)
+                if (
+                    stored_claim := provider_operation_cancellation_claim_from_checkpoint(
+                        checkpoint
+                    )
+                ) is None or not stored_claim.same_owner(cancellation_claim):
+                    raise SessionInterruptedByRequest(session.id)
+                recovery_under_cancellation_claim = True
 
         def recovery_event(event_type: EventType, *, status: str) -> Event:
             event = _event_with_model_identity_authority(
@@ -2082,6 +2679,10 @@ class ModelStepExecutor:
             usage_normalization_failed=completed_boundary.usage_normalization_failed,
             completion_diagnostics=completion_diagnostics,
         )
+        completion_event = completion_event.model_copy(
+            update={"interaction_id": operation.interaction_id},
+            deep=True,
+        )
         if terminal_progress_verified:
             completion_event = self._provider_operation_progress_event(
                 stage=stage,
@@ -2172,6 +2773,29 @@ class ModelStepExecutor:
                 transcript_cursor=stage.source_transcript_cursor,
             )
         )
+        if stage.reservation_ids:
+            if recovery_context is None:
+                raise ProviderOperationEvidenceError(
+                    "Budgeted provider-operation recovery has no durable accounting context."
+                )
+            try:
+                publication_event = (
+                    await self._run_limit_controller.recover_model_completion_budget_evidence(
+                        publication_event,
+                        reservation_ids=stage.reservation_ids,
+                        recovery_contexts=recovery_context.budget_reservations,
+                        session=session,
+                        provider_name=registered_provider.name,
+                        model_attempt_identity=operation.model_attempt_identity,
+                        dispatch_id=stage.stage_id,
+                        request_billing_identity=recovery_context.billing_identity,
+                    )
+                )
+            except (KeyError, NotImplementedError, TypeError, ValueError) as accounting_error:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation recovery could not reconstruct its original budget "
+                    "reservation and pricing context."
+                ) from accounting_error
         publication_event = self._event_writer.prepare(publication_event)
         publication = ModelCompletionPublicationRequest(
             dispatch=ModelCompletionDispatch(
@@ -2211,6 +2835,16 @@ class ModelStepExecutor:
                 type(delivery_error).__name__,
             )
         recovered_events.append(reconciled)
+        if recovery_under_cancellation_claim:
+            if stage.reservation_ids:
+                await self._run_limit_controller.reconcile_model_completion_settlements(
+                    publication_event,
+                    reservation_ids=stage.reservation_ids,
+                )
+            await self._release_provider_operation_cancellation_claim(
+                session=session,
+                claim=cancellation_claim,
+            )
         return ProviderOperationRecoveryResult(
             status=ProviderOperationRecoveryStatus.RECONCILED,
             events=tuple(recovered_events),
@@ -2264,7 +2898,7 @@ class ModelStepExecutor:
             model_completion_recovery_context_factory=(
                 model_completion_recovery_context_factory
                 or (
-                    lambda billing_identity: ModelCompletionRecoveryContext(
+                    lambda billing_identity, _reservations: ModelCompletionRecoveryContext(
                         billing_identity=billing_identity
                     )
                 )
@@ -3043,14 +3677,51 @@ class ModelStepExecutor:
         else:
             completion_dispatch = await prepare_model_completion_dispatch(model_request)
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
+        provider_operation_adapter: ProviderOperationAdapter | None = None
         provider_operation_state: ProviderOperationState | None = None
         provider_operation_interaction_id: str | None = None
+        provider_operation_identity_durable = False
         provider_exhausted = False
         background_dispatch_invoked = False
         durable_stream_failure: ModelAttemptFailed | None = None
         provider_control_failure: ModelProviderError | None = None
         provider_control_error_emitted = False
         post_completion_failure: BaseException | None = None
+
+        async def reconcile_completion_that_won_cancellation(
+            snapshot: ProviderOperationSnapshot | None,
+        ) -> None:
+            if snapshot is None or snapshot.status is not ProviderOperationStatus.COMPLETED:
+                return
+            if completion_dispatch is None or model_completion_publisher is None:
+                raise RuntimeError(
+                    "Provider completion won cancellation without a durable publication stage."
+                )
+            recoverable = await load_recoverable_provider_operation(
+                self._session_store,
+                completion_dispatch.stage,
+            )
+            if recoverable is None:
+                raise ProviderOperationEvidenceError(
+                    "Provider completion won cancellation without recoverable operation evidence."
+                )
+            recovered = await self.recover_provider_operation(
+                session=session,
+                stage=completion_dispatch.stage,
+                operation=recoverable,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                recovery_context=model_completion_recovery_context_from_stage(
+                    completion_dispatch.stage
+                ),
+                model_completion_publisher=model_completion_publisher,
+            )
+            if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:
+                raise ProviderOperationEvidenceError(
+                    "Provider completion won cancellation but remained unreconciled."
+                )
+
         try:
             provider_operation_mode = provider.provider_operation_mode
             if type(provider_operation_mode) is not ProviderOperationMode:
@@ -3323,6 +3994,7 @@ class ModelStepExecutor:
                         failure=preparation_error,
                         cancellation=start_outcome.cancellation,
                     )
+                    provider_operation_state = None
                     if cleanup_cancellation is not None:
                         raise cleanup_cancellation from preparation_error
                     if isinstance(
@@ -3381,6 +4053,7 @@ class ModelStepExecutor:
                             failure=persistence_error,
                             cancellation=start_outcome.cancellation,
                         )
+                        provider_operation_state = None
                         if cleanup_cancellation is not None:
                             raise cleanup_cancellation from persistence_error
                     if start_outcome.cancellation is not None:
@@ -3414,6 +4087,7 @@ class ModelStepExecutor:
                             cause=delivery_error,
                         ) from delivery_error
                     raise
+                provider_operation_identity_durable = True
                 if start_outcome.cancellation is not None:
                     raise start_outcome.cancellation
                 yield emitted_operation_event, None
@@ -3867,12 +4541,59 @@ class ModelStepExecutor:
                 yield emitted_event, None
             else:
                 provider_exhausted = True
+
         except SessionInterruptedByRequest as exc:
             if model_completion_publisher is None or not model_completed:
+                if (
+                    provider_operation_adapter is not None
+                    and provider_operation_state is not None
+                    and provider_operation_interaction_id is not None
+                    and provider_operation_identity_durable
+                    and completion_dispatch is not None
+                ):
+                    cancellation_snapshot = await self._cancel_started_provider_operation(
+                        adapter=provider_operation_adapter,
+                        state=provider_operation_state,
+                        failure=exc,
+                        session=session,
+                        stage=completion_dispatch.stage,
+                        interaction_id=provider_operation_interaction_id,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        environment_name=environment_name,
+                        step=step,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                    )
+                    await reconcile_completion_that_won_cancellation(cancellation_snapshot)
                 raise
             post_completion_failure = exc
         except asyncio.CancelledError as exc:
             if model_completion_publisher is None or not model_completed:
+                if (
+                    provider_operation_adapter is not None
+                    and provider_operation_state is not None
+                    and provider_operation_interaction_id is not None
+                    and provider_operation_identity_durable
+                    and completion_dispatch is not None
+                ):
+                    cancellation_snapshot = await self._cancel_started_provider_operation(
+                        adapter=provider_operation_adapter,
+                        state=provider_operation_state,
+                        failure=exc,
+                        session=session,
+                        stage=completion_dispatch.stage,
+                        interaction_id=provider_operation_interaction_id,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        environment_name=environment_name,
+                        step=step,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                    )
+                    await reconcile_completion_that_won_cancellation(cancellation_snapshot)
                 raise
             post_completion_failure = exc
         except GeneratorExit as exc:
@@ -4846,7 +5567,10 @@ class ModelStepRun:
                     raise RuntimeError(
                         "Model completion stage attempt belongs to a different model step."
                     )
-                recovery_context = self._model_completion_recovery_context_factory(billing_identity)
+                recovery_context = self._model_completion_recovery_context_factory(
+                    billing_identity,
+                    pending_reservations,
+                )
                 if (
                     recovery_context is not None
                     and type(recovery_context) is not ModelCompletionRecoveryContext
@@ -5029,32 +5753,54 @@ class ModelStepRun:
                 yield event, None
             raise
         except SessionInterruptedByRequest as authoritative_exc:
-            async for event in controller.settlement_events_preserving_failure(
-                controller.settle_after_model_failure(
-                    budget_reservations,
-                    lifecycle=lifecycle,
-                    session=self._session,
-                    agent_name=self._registered_agent.spec.name,
-                    environment_name=self._environment_name,
-                    release_reason="session interrupted before provider dispatch",
-                ),
-                authoritative_failure=authoritative_exc,
-            ):
-                yield event, None
+            cancellation_claim = authoritative_exc.__dict__.get(
+                "provider_operation_cancellation_claim"
+            )
+            try:
+                if not authoritative_exc.__dict__.get("provider_operation_accounting_pending"):
+                    async for event in controller.settlement_events_preserving_failure(
+                        controller.settle_after_model_failure(
+                            budget_reservations,
+                            lifecycle=lifecycle,
+                            session=self._session,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            release_reason="session interrupted before provider dispatch",
+                        ),
+                        authoritative_failure=authoritative_exc,
+                    ):
+                        yield event, None
+            finally:
+                if isinstance(cancellation_claim, ProviderOperationCancellationClaim):
+                    await self._executor._release_provider_operation_cancellation_claim(
+                        session=self._session,
+                        claim=cancellation_claim,
+                    )
             raise
         except asyncio.CancelledError as authoritative_exc:
-            async for event in controller.settlement_events_preserving_failure(
-                controller.settle_after_model_failure(
-                    budget_reservations,
-                    lifecycle=lifecycle,
-                    session=self._session,
-                    agent_name=self._registered_agent.spec.name,
-                    environment_name=self._environment_name,
-                    release_reason="model step cancelled before provider dispatch",
-                ),
-                authoritative_failure=authoritative_exc,
-            ):
-                yield event, None
+            cancellation_claim = authoritative_exc.__dict__.get(
+                "provider_operation_cancellation_claim"
+            )
+            try:
+                if not authoritative_exc.__dict__.get("provider_operation_accounting_pending"):
+                    async for event in controller.settlement_events_preserving_failure(
+                        controller.settle_after_model_failure(
+                            budget_reservations,
+                            lifecycle=lifecycle,
+                            session=self._session,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            release_reason="model step cancelled before provider dispatch",
+                        ),
+                        authoritative_failure=authoritative_exc,
+                    ):
+                        yield event, None
+            finally:
+                if isinstance(cancellation_claim, ProviderOperationCancellationClaim):
+                    await self._executor._release_provider_operation_cancellation_claim(
+                        session=self._session,
+                        claim=cancellation_claim,
+                    )
             raise
         except Exception as provider_exc:
             async for event in controller.settlement_events_preserving_failure(

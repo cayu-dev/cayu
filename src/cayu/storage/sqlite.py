@@ -27,6 +27,9 @@ from cayu._validation import (
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
+from cayu.runtime._provider_operation_cancellation_claim import (
+    active_provider_operation_cancellation_claim_from_checkpoint,
+)
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.execution_profiles import (
@@ -2728,7 +2731,19 @@ class SQLiteSessionStore(SessionStore):
         now = datetime.now(UTC)
         placeholders = ", ".join("?" for _ in allowed_statuses)
         async with self._lock:
-            with self._connection:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                if not self._session_exists_unlocked(session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                if (
+                    active_provider_operation_cancellation_claim_from_checkpoint(
+                        self._load_checkpoint_unlocked(session_id),
+                        now=now,
+                    )
+                    is not None
+                ):
+                    self._connection.rollback()
+                    return None
                 cursor = self._connection.execute(
                     f"""
                     UPDATE cayu_sessions
@@ -2742,9 +2757,11 @@ class SQLiteSessionStore(SessionStore):
                         sqlite_support.format_datetime(inactive_before),
                     ),
                 )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
             if cursor.rowcount != 1:
-                if not self._session_exists_unlocked(session_id):
-                    raise KeyError(f"Session not found: {session_id}")
                 return None
             loaded = self._load_unlocked(session_id)
             if loaded is None:
@@ -2772,9 +2789,20 @@ class SQLiteSessionStore(SessionStore):
                     raise KeyError(f"Session not found: {session_id}")
                 if loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(f"Session status cannot be fenced: {loaded.status}")
+                current_checkpoint = self._load_checkpoint_unlocked(session_id)
+                if (
+                    active_provider_operation_cancellation_claim_from_checkpoint(
+                        current_checkpoint,
+                        now=updated_at,
+                    )
+                    is not None
+                ):
+                    raise SessionStatusConflict(
+                        "Provider-operation cancellation still owns the session run epoch."
+                    )
                 transformed = checkpoint_transform(
                     loaded,
-                    self._load_checkpoint_unlocked(session_id),
+                    current_checkpoint,
                 )
                 if transformed is None:
                     raise ValueError("Fenced checkpoint transform must return a checkpoint.")

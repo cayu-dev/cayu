@@ -20,7 +20,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4, uuid5
@@ -53,7 +53,12 @@ from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPar
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
 from cayu.environments import EnvironmentFactoryOperation
-from cayu.providers import ProviderOperationAdapter, ProviderOperationMode
+from cayu.providers import (
+    ProviderOperationAdapter,
+    ProviderOperationMode,
+    ProviderOperationSnapshot,
+    ProviderOperationStatus,
+)
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -92,7 +97,18 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
-from cayu.runtime._run_limits import RunLimitController, SessionUsageTracker
+from cayu.runtime._provider_operation_cancellation_claim import (
+    active_provider_operation_cancellation_claim_from_checkpoint,
+)
+from cayu.runtime._run_limit_accounting import (
+    RunLimitAccountingContext,
+    rebase_run_limit_accounting_context,
+    restore_run_limit_accounting_context,
+)
+from cayu.runtime._run_limits import (
+    RunLimitController,
+    SessionUsageTracker,
+)
 from cayu.runtime._session_control import (
     ActiveSessionRun,
     SessionControl,
@@ -759,6 +775,7 @@ class RecoverySessionRunRequest:
     start_event_payload: dict[str, Any]
     start_task_on_enter: bool
     release_run_fence_on_exit: bool
+    run_limit_accounting: RunLimitAccountingContext | None = None
 
 
 @dataclass(frozen=True)
@@ -963,6 +980,17 @@ RecoverProviderOperation = Callable[
     ],
     Awaitable[ProviderOperationRecoveryResult],
 ]
+CancelProviderOperation = Callable[
+    [
+        Session,
+        ModelCompletionStage,
+        RecoverableProviderOperation,
+        runtime_records.RegisteredAgentState,
+        runtime_records.RegisteredProvider,
+        runtime_records.RegisteredEnvironment | None,
+    ],
+    Awaitable[ProviderOperationSnapshot | None],
+]
 
 
 class RecoveryCoordinator:
@@ -994,6 +1022,7 @@ class RecoveryCoordinator:
         abandoned_turn_completed: AbandonedTurnCompleted,
         resume_interaction: ResumeInteraction,
         recover_provider_operation: RecoverProviderOperation,
+        cancel_provider_operation: CancelProviderOperation,
     ) -> None:
         self._session_store = session_store
         self._task_store = task_store
@@ -1018,6 +1047,7 @@ class RecoveryCoordinator:
         self._abandoned_turn_completed = abandoned_turn_completed
         self._resume_interaction = resume_interaction
         self._recover_provider_operation = recover_provider_operation
+        self._cancel_provider_operation = cancel_provider_operation
 
     async def _recoverable_provider_operation(
         self,
@@ -1063,6 +1093,49 @@ class RecoveryCoordinator:
                 "Its provider outcome and linked budget reservations require manual "
                 f"reconciliation before retrying: {stage.stage_id}"
             )
+        return True
+
+    async def cancel_provider_operation_for_interruption(self, session: Session) -> bool:
+        """Address one durable in-flight provider operation without a live worker."""
+
+        active = await self._session_store.load_active_model_completion_stage(session.id)
+        if active is None or active.stage.state != "in_flight":
+            return False
+        stage = active.stage
+        self._validate_active_model_completion_stage(session, stage)
+        recoverable = await self._recoverable_provider_operation(stage)
+        if recoverable is None:
+            return False
+        operation, registered_provider = recoverable
+        try:
+            registered_agent = self._resolve_registered_agent(session.agent_name)
+            registered_environment = self._resolve_registered_environment(session.environment_name)
+        except KeyError as registration_error:
+            raise ModelCompletionManualRecoveryRequired(
+                "Provider-operation cancellation requires the original agent, provider, "
+                "and environment registrations."
+            ) from registration_error
+        cancellation = await self._cancel_provider_operation(
+            session,
+            stage,
+            operation,
+            registered_agent,
+            registered_provider,
+            registered_environment,
+        )
+        if cancellation is not None and cancellation.status is ProviderOperationStatus.COMPLETED:
+            recovered = await self._recover_provider_operation(
+                session,
+                stage,
+                operation,
+                registered_agent,
+                registered_provider,
+                registered_environment,
+            )
+            if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:
+                raise ModelCompletionManualRecoveryRequired(
+                    "Provider completion won cancellation but could not be reconciled."
+                )
         return True
 
     async def reconcile_model_completion_boundary(
@@ -2906,9 +2979,25 @@ class RecoveryCoordinator:
                 pending=pending,
             )
         )
+        continued_run_limit_accounting = pending.run_limit_accounting
         try:
             transcript = await self._session_store.load_transcript(session.id)
             resume_events = await self._session_store.load_events(session.id)
+            if continued_run_limit_accounting is not None:
+                continued_run_limit_accounting = rebase_run_limit_accounting_context(
+                    continued_run_limit_accounting,
+                    session_id=session.id,
+                    limits=effective_limits,
+                    budget_limits=request_budget_limits_for_session(
+                        limits=effective_budget_limits,
+                        agent_name=registered_agent.spec.name,
+                        causal_budget_id=session.causal_budget_id,
+                    ),
+                    events=resume_events,
+                    reset_run_limits=response.limits is not None,
+                    reset_budgets=response.budget_limits is not None,
+                    now=self._clock(),
+                )
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
                 registered_agent=registered_agent,
@@ -3461,6 +3550,7 @@ class RecoveryCoordinator:
                     start_event_payload={},
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
+                    run_limit_accounting=continued_run_limit_accounting,
                 )
             )
             forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -3879,6 +3969,7 @@ class RecoveryCoordinator:
                 pending_approval=pending_approval,
             )
         )
+        continued_run_limit_accounting = pending_approval.run_limit_accounting
         try:
             transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
             try:
@@ -3889,6 +3980,22 @@ class RecoveryCoordinator:
             finally:
                 del transcript_snapshot
             approval_events = await self._session_store.load_events(session.id)
+            resolved_budget_limits = request_budget_limits_for_session(
+                limits=effective_budget_limits,
+                agent_name=registered_agent.spec.name,
+                causal_budget_id=session.causal_budget_id,
+            )
+            if continued_run_limit_accounting is not None:
+                continued_run_limit_accounting = rebase_run_limit_accounting_context(
+                    continued_run_limit_accounting,
+                    session_id=session.id,
+                    limits=effective_limits,
+                    budget_limits=resolved_budget_limits,
+                    events=approval_events,
+                    reset_run_limits=request.limits is not None,
+                    reset_budgets=request.budget_limits is not None,
+                    now=self._clock(),
+                )
             history = approval_support.approval_resolution_history(
                 events=approval_events,
                 approval=pending_approval,
@@ -4081,16 +4188,23 @@ class RecoveryCoordinator:
             if request.decision == ToolApprovalDecision.APPROVE:
                 run_started_at = time.monotonic()
                 limits = copy_run_limits(effective_limits)
-                budget_limits = request_budget_limits_for_session(
-                    limits=effective_budget_limits,
-                    agent_name=registered_agent.spec.name,
-                    causal_budget_id=session.causal_budget_id,
-                )
-                run_baseline = (
-                    session_usage_summary(session.id, approval_events)
-                    if limits.scope == "run" and has_run_limits(limits)
-                    else None
-                )
+                budget_limits = resolved_budget_limits
+                if continued_run_limit_accounting is not None:
+                    run_started_at, run_baseline, run_budget_authorities = (
+                        restore_run_limit_accounting_context(
+                            continued_run_limit_accounting,
+                            session_id=session.id,
+                            budget_limits=budget_limits,
+                            now=self._clock(),
+                        )
+                    )
+                else:
+                    run_budget_authorities = None
+                    run_baseline = (
+                        session_usage_summary(session.id, approval_events)
+                        if limits.scope == "run" and has_run_limits(limits)
+                        else None
+                    )
                 budget_baseline_events = (
                     approval_events if _has_run_budget_limit(budget_limits) else []
                 )
@@ -4131,6 +4245,7 @@ class RecoveryCoordinator:
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
                     budget_baseline_events=budget_baseline_events,
+                    run_budget_authorities=run_budget_authorities,
                     pending_tool_calls=executable_pending_tool_calls,
                     budget_notify_events=request_budget_notify_events,
                     pricing_provider_name=(
@@ -4727,6 +4842,7 @@ class RecoveryCoordinator:
                     start_event_payload={},
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
+                    run_limit_accounting=continued_run_limit_accounting,
                 )
             )
             forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -9311,6 +9427,16 @@ class RecoveryCoordinator:
                 nonlocal claim_expires_at, claim_run_epoch, session_before_fence
                 claimed_at = self._clock()
                 _require_aware_datetime(claimed_at, "recovery claim clock")
+                if (
+                    active_provider_operation_cancellation_claim_from_checkpoint(
+                        checkpoint,
+                        now=datetime.now(UTC),
+                    )
+                    is not None
+                ):
+                    raise _IncompleteRecoveryClaimLost(
+                        "Provider-operation cancellation still owns the session epoch."
+                    )
                 existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
                 if (
                     existing is None
@@ -9454,6 +9580,16 @@ class RecoveryCoordinator:
             nonlocal claim_expires_at, claim_run_epoch, session_before_fence
             claimed_at = self._clock()
             _require_aware_datetime(claimed_at, "recovery claim clock")
+            if (
+                active_provider_operation_cancellation_claim_from_checkpoint(
+                    checkpoint,
+                    now=datetime.now(UTC),
+                )
+                is not None
+            ):
+                raise _IncompleteRecoveryClaimLost(
+                    "Provider-operation cancellation still owns the session epoch."
+                )
             existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
             if (
                 current_session.status != session.status
@@ -9880,7 +10016,27 @@ class RecoveryCoordinator:
                 )
             )
 
-        model_boundary = await self.reconcile_model_completion_boundary(session)
+        provider_operation_addressed = False
+        if session.status is SessionStatus.INTERRUPTING:
+            provider_operation_addressed = await self.cancel_provider_operation_for_interruption(
+                session
+            )
+            session = await self._require_session(session.id)
+        active_model_stage = await self._session_store.load_active_model_completion_stage(
+            session.id
+        )
+        if provider_operation_addressed and active_model_stage is not None:
+            # Cancellation already resolved the exact in-flight operation. A
+            # cancelled, pending, unavailable, or unconfirmed provider outcome
+            # must not be reinterpreted as recoverable model completion before
+            # the local interruption is finalized. If completion won, the
+            # cancellation path promoted it and cleared the active stage above.
+            model_boundary = ModelCompletionBoundaryReconciliation(
+                state="none",
+                session=session,
+            )
+        else:
+            model_boundary = await self.reconcile_model_completion_boundary(session)
         session = model_boundary.session
         events.extend(copy_event(event) for event in model_boundary.recovery_events)
         if model_boundary.state == "provider_operation_pending":

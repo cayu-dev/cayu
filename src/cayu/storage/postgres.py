@@ -52,6 +52,9 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     copy_text_embedding_result,
 )
+from cayu.runtime._provider_operation_cancellation_claim import (
+    active_provider_operation_cancellation_claim_from_checkpoint,
+)
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
@@ -3703,7 +3706,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             try:
                 async with conn.cursor() as cur:
                     records_by_id = {
-                        reservation_id: await self._load_record_for_update(
+                        reservation_id: await self._load_record(
                             cur,
                             reservation_id,
                         )
@@ -3750,7 +3753,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    record = await self._load_record_for_update(cur, reservation_id)
+                    record = await self._load_record(cur, reservation_id)
                     now = self._clock()
                     if record.status != "active" or _reservation_is_expired(
                         record,
@@ -3858,6 +3861,19 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             )
             row = await cur.fetchone()
             return None if row is None else self._settlement_from_row(row)
+
+    async def load_reservation(
+        self,
+        reservation_id: str,
+    ) -> BudgetReservationRecord | None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            try:
+                record = await self._load_record(cur, reservation_id, for_update=False)
+            except KeyError:
+                return None
+            return record.model_copy(deep=True)
 
     async def list_pending_settlements(
         self,
@@ -3979,7 +3995,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             ),
         )
         for row in await cur.fetchall():
-            record = await self._load_record_for_update(cur, row[0])
+            record = await self._load_record(cur, row[0])
             released = _released_record(
                 record,
                 reason=(
@@ -4171,13 +4187,14 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         if cur.rowcount != 1:
             raise KeyError(f"Budget reservation not found: {record.reservation_id}")
 
-    async def _load_record_for_update(
+    async def _load_record(
         self,
         cur: Any,
         reservation_id: str,
+        *,
+        for_update: bool = True,
     ) -> BudgetReservationRecord:
-        await cur.execute(
-            """
+        query = """
             SELECT reservation_id, budget_limit_id, model_step_id, model_attempt_id,
                    scope, budget_key, budget_window,
                    currency, session_id,
@@ -4188,10 +4205,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                    status, reason, created_at, updated_at
             FROM cayu_budget_reservations
             WHERE reservation_id = %s
-            FOR UPDATE
-            """,
-            (reservation_id,),
-        )
+            """
+        if for_update:
+            query += " FOR UPDATE"
+        await cur.execute(query, (reservation_id,))
         row = await cur.fetchone()
         if row is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
@@ -4297,7 +4314,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         cur: Any,
         reservation_id: str,
     ) -> BudgetReservationRecord:
-        record = await self._load_record_for_update(cur, reservation_id)
+        record = await self._load_record(cur, reservation_id)
         if record.status != "active":
             raise ValueError(f"Budget reservation is not active: {reservation_id}")
         return record
@@ -4307,7 +4324,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         cur: Any,
         reservation_id: str,
     ) -> BudgetReservationRecord:
-        record = await self._load_record_for_update(cur, reservation_id)
+        record = await self._load_record(cur, reservation_id)
         if record.status == "active" and record.dispatch_id is not None:
             raise ValueError(f"Dispatched budget reservation cannot be released: {reservation_id}")
         if record.status in {"active", "released"}:
@@ -4319,7 +4336,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         cur: Any,
         reservation_id: str,
     ) -> BudgetReservationRecord:
-        record = await self._load_record_for_update(cur, reservation_id)
+        record = await self._load_record(cur, reservation_id)
         if record.status in {"active", "reconciled"}:
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
@@ -8205,32 +8222,38 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         now = datetime.now(UTC)
         async with self._connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    UPDATE cayu_sessions
-                    SET run_epoch = run_epoch + 1, last_activity_at = %s
-                    WHERE id = %s AND status = ANY(%s) AND last_activity_at <= %s
-                    RETURNING run_epoch
-                    """,
-                    (
-                        now,
-                        session_id,
-                        [str(status) for status in allowed_statuses],
-                        inactive_before,
-                    ),
-                )
-                row = await cur.fetchone()
-                if row is None:
-                    loaded = await self._load(cur, session_id)
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    if (
+                        active_provider_operation_cancellation_claim_from_checkpoint(
+                            await self._load_checkpoint(cur, session_id),
+                            now=now,
+                        )
+                        is not None
+                    ):
+                        await conn.commit()
+                        return None
+                    if (
+                        loaded.status not in allowed_statuses
+                        or loaded.last_activity_at > inactive_before
+                    ):
+                        await conn.commit()
+                        return None
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
+                        "last_activity_at = %s WHERE id = %s",
+                        (now, session_id),
+                    )
+                    loaded = await self._load(cur, session_id)
+                    if loaded is None:  # pragma: no cover - row remains locked
+                        raise KeyError(f"Session not found: {session_id}")
                     await conn.commit()
-                    return None
-                loaded = await self._load(cur, session_id)
-            await conn.commit()
-            if loaded is None:
-                raise KeyError(f"Session not found: {session_id}")
+            except Exception:
+                await conn.rollback()
+                raise
             _activate_session_run_fence(loaded)
             return loaded
 
@@ -8257,9 +8280,20 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionStatusConflict(
                             f"Session status cannot be fenced: {loaded.status}"
                         )
+                    current_checkpoint = await self._load_checkpoint(cur, session_id)
+                    if (
+                        active_provider_operation_cancellation_claim_from_checkpoint(
+                            current_checkpoint,
+                            now=updated_at,
+                        )
+                        is not None
+                    ):
+                        raise SessionStatusConflict(
+                            "Provider-operation cancellation still owns the session run epoch."
+                        )
                     transformed = checkpoint_transform(
                         loaded,
-                        await self._load_checkpoint(cur, session_id),
+                        current_checkpoint,
                     )
                     if transformed is None:
                         raise ValueError("Fenced checkpoint transform must return a checkpoint.")

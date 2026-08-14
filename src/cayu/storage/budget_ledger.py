@@ -441,6 +441,18 @@ class SQLiteBudgetLedger(BudgetLedger):
             ).fetchone()
             return None if row is None else self._settlement_from_row(row)
 
+    async def load_reservation(
+        self,
+        reservation_id: str,
+    ) -> BudgetReservationRecord | None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        async with self._lock:
+            try:
+                record = self._load_record_unlocked(reservation_id)
+            except KeyError:
+                return None
+            return record.model_copy(deep=True)
+
     async def list_pending_settlements(
         self,
         *,

@@ -844,6 +844,14 @@ export type ApiPendingActionIssue = {
  */
 export type ApiProviderOperationInspection = {
     /**
+     * Accounting Status
+     */
+    accounting_status: 'not_applicable' | 'reserved' | 'settled';
+    /**
+     * Cancellation Status
+     */
+    cancellation_status: 'not_requested' | 'requested' | 'unsupported' | 'pending' | 'cancelled' | 'completed' | 'failed' | 'unavailable';
+    /**
      * Operation Id
      */
     operation_id?: string | null;
@@ -851,6 +859,10 @@ export type ApiProviderOperationInspection = {
      * Provider
      */
     provider?: string | null;
+    /**
+     * Reservation Count
+     */
+    reservation_count: number;
     /**
      * Status
      */

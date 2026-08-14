@@ -1073,6 +1073,7 @@ class ToolRoundExecutor:
             thinking=thinking,
             max_steps=max_steps,
             limits=copy_run_limits(limits) if limits is not None else None,
+            run_limit_accounting=pending_round.run_limit_accounting,
             budget_limits=(
                 copy_request_budget_limits(budget_limits) if budget_limits is not None else None
             ),
@@ -1437,6 +1438,7 @@ class ToolRoundExecutor:
             thinking=thinking,
             max_steps=max_steps,
             limits=copy_run_limits(limits) if limits is not None else None,
+            run_limit_accounting=pending_round.run_limit_accounting,
             budget_limits=(
                 copy_request_budget_limits(budget_limits) if budget_limits is not None else None
             ),

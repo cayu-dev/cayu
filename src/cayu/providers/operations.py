@@ -31,6 +31,13 @@ class ProviderOperationMode(StrEnum):
     BACKGROUND = "background"
 
 
+class ProviderOperationCancellationSupport(StrEnum):
+    """Whether an adapter can target an existing durable operation."""
+
+    UNSUPPORTED = "unsupported"
+    SUPPORTED = "supported"
+
+
 class ProviderOperationStatus(StrEnum):
     """Provider-neutral lifecycle states for reconnectable model work."""
 
@@ -178,9 +185,23 @@ class ProviderOperationAdapter(ABC):
     async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
         """Reconnect to an existing provider-owned stream."""
 
-    @abstractmethod
+    @property
+    def cancellation_support(self) -> ProviderOperationCancellationSupport:
+        """Advertise exact-operation cancellation without implying universal support."""
+
+        return ProviderOperationCancellationSupport.UNSUPPORTED
+
     async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
-        """Request cancellation and return the resulting provider state."""
+        """Request cancellation and return the resulting provider state.
+
+        Non-cancellable adapters inherit a truthful bounded ``UNAVAILABLE``
+        snapshot. Adapters advertising ``SUPPORTED`` must override this method.
+        """
+
+        return ProviderOperationSnapshot(
+            state=copy_provider_operation_state(state),
+            status=ProviderOperationStatus.UNAVAILABLE,
+        )
 
 
 def copy_provider_operation_state(state: ProviderOperationState) -> ProviderOperationState:
@@ -232,6 +253,7 @@ __all__ = [
     "PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES",
     "PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS",
     "ProviderOperationAdapter",
+    "ProviderOperationCancellationSupport",
     "ProviderOperationConnection",
     "ProviderOperationMode",
     "ProviderOperationRecoveryMetadata",

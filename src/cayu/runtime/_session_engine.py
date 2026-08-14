@@ -156,6 +156,13 @@ from cayu.runtime._recovery_coordinator import (
     _checkpoint_without_active_incomplete_recovery_claim,
     _run_recovery_cleanup_steps,
 )
+from cayu.runtime._run_limit_accounting import (
+    RunLimitAccountingContext,
+    capture_run_limit_accounting_context,
+    has_run_limit_accounting_authority,
+    restore_run_limit_accounting_context,
+    run_budget_authorities_from_context,
+)
 from cayu.runtime._run_limits import (
     BudgetEvaluation,
     BudgetReservationIdentityGuard,
@@ -210,6 +217,7 @@ from cayu.runtime.budgets import (
     BudgetCheck,
     BudgetLimit,
     BudgetPolicy,
+    BudgetReservationRecoveryContext,
     BudgetReservationResult,
     _effective_budget_limit_id,
     budget_check_payload,
@@ -2922,10 +2930,6 @@ def _limit_reached_payload(
     if cost_summary is not None:
         payload["cost_summary"] = cost_summary.model_dump(mode="json")
     return payload
-
-
-def _has_run_budget_limit(limits: tuple[BudgetLimit, ...]) -> bool:
-    return any(limit.scope == "run" for limit in limits)
 
 
 def _limit_value_for_payload(value: int | Decimal) -> int | str:
@@ -8940,7 +8944,10 @@ class SessionEngine:
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
-            if loaded_session.status == SessionStatus.RUNNING:
+            provider_operation_addressed = (
+                await self._recovery_coordinator.cancel_provider_operation_for_interruption(session)
+            )
+            if loaded_session.status == SessionStatus.RUNNING and not provider_operation_addressed:
                 existing_interrupt_event = (
                     await self._session_control.wait_for_active_interrupted_event(
                         session.id,
@@ -10467,6 +10474,7 @@ class SessionEngine:
         retry_policy: RetryPolicy,
         structured_output_attempt: int | None,
         structured_output_retries: int,
+        run_limit_accounting: RunLimitAccountingContext | None,
     ) -> ModelCompletionPublicationResult:
         """Commit one staged model completion and its next durable action atomically."""
 
@@ -10521,6 +10529,7 @@ class SessionEngine:
                     thinking=thinking,
                     max_steps=max_steps,
                     limits=limits,
+                    run_limit_accounting=run_limit_accounting,
                     budget_limits=budget_limits,
                     retry_policy=retry_policy,
                     tool_round_identity=tool_round_identity,
@@ -10666,6 +10675,7 @@ class SessionEngine:
         messages_deferred: bool = False,
         deliver_queued_input_before_first_step: bool = True,
         pending_tool_round_source_transcript_cursor: int | None = None,
+        run_limit_accounting: RunLimitAccountingContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         # Deep defense for internal recovery callers. Public entry points
         # validate before claiming mutable session ownership.
@@ -10780,6 +10790,18 @@ class SessionEngine:
         )
         structured_output_retries = 0
         run_baseline: SessionUsageSummary | None = None
+        run_budget_authorities = None
+        if run_limit_accounting is not None:
+            if not has_run_limit_accounting_authority(limits, budget_limits):
+                raise ValueError("Run-limit accounting requires active run-scoped authority.")
+            run_started_at, run_baseline, run_budget_authorities = (
+                restore_run_limit_accounting_context(
+                    run_limit_accounting,
+                    session_id=session.id,
+                    budget_limits=budget_limits,
+                    now=self._clock(),
+                )
+            )
         turn_usage_tracker = self._run_limit_controller.usage_tracker(session.id)
         baseline_events: list[Event] = []
         request_budget_notify_events: list[Event] = []
@@ -10832,11 +10854,9 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                 )
             await turn_usage_tracker.mark_current_position()
-            if (limits.scope == "run" and has_run_limits(limits)) or _has_run_budget_limit(
-                budget_limits
-            ):
+            if has_run_limit_accounting_authority(limits, budget_limits):
                 baseline_events = await self._run_limit_controller.session_usage_events(session.id)
-            if limits.scope == "run" and has_run_limits(limits):
+            if limits.scope == "run" and has_run_limits(limits) and run_limit_accounting is None:
                 run_baseline = session_usage_summary(session.id, baseline_events)
 
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
@@ -11104,6 +11124,21 @@ class SessionEngine:
                         return
                 else:
                     skip_model_steps = True
+            if (
+                has_run_limit_accounting_authority(limits, budget_limits)
+                and run_limit_accounting is None
+            ):
+                run_limit_accounting = capture_run_limit_accounting_context(
+                    session_id=session.id,
+                    run_started_at=run_started_at,
+                    run_baseline=run_baseline,
+                    budget_limits=budget_limits,
+                    now=self._clock(),
+                )
+                run_budget_authorities = run_budget_authorities_from_context(
+                    run_limit_accounting,
+                    budget_limits=budget_limits,
+                )
             limit_gate = RunLimitGate(
                 self._run_limit_controller,
                 session=session,
@@ -11115,6 +11150,7 @@ class SessionEngine:
                 run_baseline=run_baseline,
                 budget_baseline_events=baseline_events,
                 budget_notify_events=request_budget_notify_events,
+                run_budget_authorities=run_budget_authorities,
                 pricing_provider_name=(
                     registered_provider.provider.billing_provider_name or registered_provider.name
                 ),
@@ -11140,6 +11176,7 @@ class SessionEngine:
 
             def model_completion_recovery_context(
                 billing_identity: BillingIdentity | None,
+                reservations: tuple[BudgetStepReservation, ...],
             ) -> ModelCompletionRecoveryContext | None:
                 if (
                     registered_provider.provider.provider_operation_mode
@@ -11153,7 +11190,16 @@ class SessionEngine:
                     thinking=effective_thinking,
                     max_steps=max_steps,
                     limits=limits,
+                    run_limit_accounting=run_limit_accounting,
                     budget_limits=budget_limits,
+                    budget_reservations=tuple(
+                        BudgetReservationRecoveryContext(
+                            reservation_id=reservation.record.reservation_id,
+                            budget_limit_id=reservation.record.budget_limit_id,
+                            limit=reservation.limit,
+                        )
+                        for reservation in reservations
+                    ),
                     retry_policy=retry_policy,
                     structured_output_attempt=(
                         structured_output_retries + 1
@@ -11203,6 +11249,7 @@ class SessionEngine:
                         else None
                     ),
                     structured_output_retries=structured_output_retries,
+                    run_limit_accounting=run_limit_accounting,
                 )
 
             model_step_run = self._model_step_executor.create_run(

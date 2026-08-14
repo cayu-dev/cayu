@@ -145,6 +145,9 @@ class _DelegatingBudgetLedger(BudgetLedger):
     async def release(self, **kwargs):
         return await self.ledger.release(**kwargs)
 
+    async def load_reservation(self, reservation_id):
+        return await self.ledger.load_reservation(reservation_id)
+
     async def load_settlement(self, settlement_id):
         return await self.ledger.load_settlement(settlement_id)
 
@@ -184,6 +187,38 @@ class _LoseFirstReservationAcknowledgement(_DelegatingBudgetLedger):
             self.lost_reservation_id = result.record.reservation_id
             raise RuntimeError("reservation acknowledgement lost after commit")
         return result
+
+
+async def assert_load_reservation_reconstructs_exact_record(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+) -> None:
+    """Load one exact active and reconciled reservation by durable identity."""
+
+    result = await ledger.reserve(
+        limit=limit,
+        session_id="sess_provider_operation_reservation_recovery",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert result.accepted is True
+    assert result.record is not None
+    loaded = await ledger.load_reservation(result.record.reservation_id)
+    assert loaded == result.record
+    assert loaded is not result.record
+
+    await ledger.reconcile(
+        reservation_id=result.record.reservation_id,
+        actual_amount=Decimal("0.01"),
+        reason="provider operation recovered",
+    )
+    reconciled = await ledger.load_reservation(result.record.reservation_id)
+    assert reconciled is not None
+    assert reconciled.status == "reconciled"
+    assert reconciled.actual_amount == Decimal("0.01")
+    assert await ledger.load_reservation("missing-provider-operation-reservation") is None
 
 
 async def assert_runtime_reconstructs_dispatch_fence_acknowledgement(

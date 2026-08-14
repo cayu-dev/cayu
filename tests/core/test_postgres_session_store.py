@@ -27,7 +27,9 @@ from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
 )
 from tests.core.test_provider_operation_offline_recovery import (
+    assert_budgeted_offline_provider_operation_recovery,
     assert_offline_provider_operation_recovery,
+    assert_offline_provider_operation_reuses_run_limit_accounting,
     assert_pending_provider_operation_later_completes,
 )
 from tests.core.tool_result_projection_conformance import (
@@ -43,6 +45,7 @@ from cayu.runtime import (
     EventQuery,
     InvocationOriginClaim,
     InvocationOriginTrust,
+    RunLimits,
     RunRequest,
     Session,
     SessionDebugState,
@@ -72,6 +75,8 @@ from cayu.runtime.sessions import (
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_budget_settlements",
+    "cayu_budget_reservations",
     "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
@@ -183,6 +188,60 @@ def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
 
 def test_postgres_offline_provider_operation_recovery(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_offline_provider_operation_recovery)
+
+
+def test_postgres_budgeted_offline_provider_operation_recovery(postgres_dsn: str) -> None:
+    async def ops(store) -> None:
+        from cayu import PostgresBudgetLedger
+        from cayu.storage.migrations import SchemaMode
+
+        ledger = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            reservation_ttl_seconds=None,
+        )
+        try:
+            await assert_budgeted_offline_provider_operation_recovery(store, ledger)
+        finally:
+            await ledger.close()
+
+    _run(postgres_dsn, ops)
+
+
+@pytest.mark.parametrize("limit_kind", ["tokens", "tools", "elapsed", "cost"])
+def test_postgres_offline_provider_operation_reuses_run_limit_accounting(
+    postgres_dsn: str,
+    limit_kind: str,
+) -> None:
+    async def ops(store) -> None:
+        await assert_offline_provider_operation_reuses_run_limit_accounting(
+            store,
+            limit_kind=limit_kind,
+        )
+
+    _run(postgres_dsn, ops)
+
+
+@pytest.mark.parametrize("override_kind", ["limits", "budget_limits"])
+def test_postgres_offline_field_override_preserves_other_run_accounting(
+    postgres_dsn: str,
+    override_kind: str,
+) -> None:
+    async def ops(store) -> None:
+        await assert_offline_provider_operation_reuses_run_limit_accounting(
+            store,
+            limit_kind="cost" if override_kind == "limits" else "tokens",
+            approval_limits=(
+                RunLimits(max_total_tokens=1_000, scope="run")
+                if override_kind == "limits"
+                else None
+            ),
+            approval_budget_limits=() if override_kind == "budget_limits" else None,
+        )
+
+    _run(postgres_dsn, ops)
 
 
 @pytest.mark.parametrize(

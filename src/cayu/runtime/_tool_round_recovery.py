@@ -27,6 +27,10 @@ from cayu.runtime._checkpoint_redaction import (
     durable_value_contains_secret,
     require_secret_free_durable_object,
 )
+from cayu.runtime._run_limit_accounting import (
+    RunLimitAccountingContext,
+    has_run_limit_accounting_authority,
+)
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
     ToolPolicyEvidence,
@@ -84,6 +88,7 @@ class PendingToolRound(BaseModel):
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
+    run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     source_model_step_id: str | None = None
@@ -124,6 +129,11 @@ class PendingToolRound(BaseModel):
             model_step_id=self.model_step_id,
             model_attempt_id=self.model_attempt_id,
         )
+        if self.run_limit_accounting is not None and not has_run_limit_accounting_authority(
+            self.limits,
+            self.budget_limits,
+        ):
+            raise ValueError("run_limit_accounting requires active run-scoped authority.")
         return self
 
     @field_validator("environment_name", "task_id", "source_model_step_id")
@@ -723,6 +733,7 @@ def checkpoint_with_pending_tool_round(
     thinking: ThinkingConfig | None = None,
     max_steps: int | None = None,
     limits: RunLimits | None = None,
+    run_limit_accounting: RunLimitAccountingContext | None = None,
     budget_limits: tuple[BudgetLimit, ...] | None = None,
     retry_policy: RetryPolicy | None = None,
     tool_round_identity: ToolRoundIdentity,
@@ -802,6 +813,7 @@ def checkpoint_with_pending_tool_round(
         thinking=thinking,
         max_steps=max_steps,
         limits=copy_run_limits(limits) if limits is not None else None,
+        run_limit_accounting=run_limit_accounting,
         budget_limits=(
             copy_request_budget_limits(budget_limits) if budget_limits is not None else None
         ),

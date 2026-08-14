@@ -1624,6 +1624,22 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
         public_authority_keys={"operation_id", "stream_protocol"},
     )
+    provider_operation_cancellation_keys = (
+        *provider_operation_recovery_keys,
+        "cancellation_status",
+        "error_type",
+        "provider_status",
+    )
+    policies[EventType.PROVIDER_OPERATION_CANCEL_REQUESTED] = _policy(
+        *provider_operation_cancellation_keys,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+    )
+    policies[EventType.PROVIDER_OPERATION_CANCEL_RESOLVED] = _policy(
+        *provider_operation_cancellation_keys,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+    )
 
     tool_common = {
         "approval",

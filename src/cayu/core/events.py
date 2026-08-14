@@ -111,6 +111,8 @@ class EventType(StrEnum):
     PROVIDER_OPERATION_STARTING = "provider.operation.starting"
     PROVIDER_OPERATION_STARTED = "provider.operation.started"
     PROVIDER_OPERATION_PROGRESS = "provider.operation.progress"
+    PROVIDER_OPERATION_CANCEL_REQUESTED = "provider.operation.cancel_requested"
+    PROVIDER_OPERATION_CANCEL_RESOLVED = "provider.operation.cancel_resolved"
     PROVIDER_OPERATION_RECONNECT_SCHEDULED = "provider.operation.reconnect_scheduled"
     PROVIDER_OPERATION_RECONNECT_STARTED = "provider.operation.reconnect_started"
     PROVIDER_OPERATION_RECONCILED = "provider.operation.reconciled"

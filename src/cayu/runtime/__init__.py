@@ -226,6 +226,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     ExecutionProfileRejectionResult,
+    build_execution_profile_identity,
 )
 from cayu.runtime.execution_units import (
     BudgetLimitIdentity,
@@ -284,6 +285,8 @@ from cayu.runtime.mcp_manifest_policy import (
 )
 from cayu.runtime.outcomes import RunOutcome, StructuredOutputResult, run_to_completion
 from cayu.runtime.provider_operations import (
+    ProviderOperationAccountingStatus,
+    ProviderOperationCancellationStatus,
     ProviderOperationEvidenceError,
     ProviderOperationInspection,
     ProviderOperationInspectionStatus,
@@ -833,6 +836,8 @@ __all__ = [
     "PromptContributionManifest",
     "Provenance",
     "ProviderManifest",
+    "ProviderOperationAccountingStatus",
+    "ProviderOperationCancellationStatus",
     "ProviderOperationEvidenceError",
     "ProviderOperationInspection",
     "ProviderOperationInspectionStatus",
@@ -1026,6 +1031,7 @@ __all__ = [
     "VirtualEgressEnvironmentFactory",
     "VirtualEgressRunnerRequest",
     "VirtualEgressWorkspaceFactory",
+    "build_execution_profile_identity",
     "build_prompt_contribution_manifest",
     "build_request_footprint",
     "business_approval_audit",

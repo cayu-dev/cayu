@@ -4,6 +4,7 @@ import asyncio
 import re
 
 import pytest
+from tests._session_provenance import fixture_session_invocation
 
 from cayu import (
     AgentSpec,
@@ -132,6 +133,8 @@ def test_package_shipped_durable_operations_guide_is_runnable(capsys) -> None:
         agent_name="operator",
         provider_name="scripted",
         model="scripted-model",
+        causal_budget_id="same-round",
+        invocation=fixture_session_invocation("same-round"),
     )
     request = ToolPolicyRequest(
         session=session,

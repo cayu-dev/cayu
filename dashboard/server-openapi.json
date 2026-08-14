@@ -1609,6 +1609,29 @@
       "ApiProviderOperationInspection": {
         "additionalProperties": false,
         "properties": {
+          "accounting_status": {
+            "enum": [
+              "not_applicable",
+              "reserved",
+              "settled"
+            ],
+            "title": "Accounting Status",
+            "type": "string"
+          },
+          "cancellation_status": {
+            "enum": [
+              "not_requested",
+              "requested",
+              "unsupported",
+              "pending",
+              "cancelled",
+              "completed",
+              "failed",
+              "unavailable"
+            ],
+            "title": "Cancellation Status",
+            "type": "string"
+          },
           "operation_id": {
             "anyOf": [
               {
@@ -1632,6 +1655,12 @@
               }
             ],
             "title": "Provider"
+          },
+          "reservation_count": {
+            "maximum": 32.0,
+            "minimum": 0.0,
+            "title": "Reservation Count",
+            "type": "integer"
           },
           "status": {
             "enum": [
@@ -1658,7 +1687,10 @@
           }
         },
         "required": [
-          "status"
+          "status",
+          "cancellation_status",
+          "accounting_status",
+          "reservation_count"
         ],
         "title": "ApiProviderOperationInspection",
         "type": "object"

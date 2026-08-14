@@ -1319,8 +1319,8 @@ from cayu import (
     SQLiteTaskStore,
     TaskCreate,
     TaskStatus,
+    build_execution_profile_identity,
 )
-from cayu.runtime.execution_profiles import build_execution_profile_identity
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,

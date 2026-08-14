@@ -19,6 +19,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
     ProviderOperationAdapter,
+    ProviderOperationCancellationSupport,
     ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationSnapshot,
@@ -31,6 +32,7 @@ from cayu.runtime import (
     EventQuery,
     EventRecord,
     InMemorySessionStore,
+    InterruptSessionRequest,
     PersistedEventSideEffectClaim,
     RecentTurnsContextPolicy,
     RetryPolicy,
@@ -49,6 +51,8 @@ from cayu.runtime._model_step_executor import (
     _raise_terminal_model_attempt_failure,
 )
 from cayu.runtime.provider_operations import (
+    ProviderOperationAccountingStatus,
+    ProviderOperationCancellationStatus,
     ProviderOperationEvidenceError,
     ProviderOperationInspectionStatus,
     inspect_provider_operation,
@@ -64,6 +68,10 @@ class _ReconnectableAdapter(ProviderOperationAdapter):
         self.start_calls = 0
         self.start_requests: list[ProviderOperationStartRequest] = []
         self.cancel_calls = 0
+
+    @property
+    def cancellation_support(self) -> ProviderOperationCancellationSupport:
+        return ProviderOperationCancellationSupport.SUPPORTED
 
     async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
         self.start_calls += 1
@@ -103,6 +111,77 @@ class _ReconnectableAdapter(ProviderOperationAdapter):
             state=state,
             status=ProviderOperationStatus.CANCELLED,
         )
+
+
+class _InterruptibleOperationAdapter(_ReconnectableAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream_started = asyncio.Event()
+        self.cancelled_states: list[ProviderOperationState] = []
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        self.start_calls += 1
+        self.start_requests.append(request)
+        state = ProviderOperationState(
+            operation_id="response_interruptible",
+            stream_protocol="responses-v1",
+            recovery_metadata={"cursor": 0},
+        )
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            self.stream_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+            yield  # pragma: no cover - keeps this an async generator
+
+        return ProviderOperationConnection(
+            state=state,
+            status=ProviderOperationStatus.IN_PROGRESS,
+            events=events(),
+        )
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        self.cancelled_states.append(state)
+        return ProviderOperationSnapshot(state=state, status=ProviderOperationStatus.CANCELLED)
+
+
+class _CompletionWinsLiveCancellationAdapter(_InterruptibleOperationAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completed = False
+
+    def _completed_snapshot(
+        self,
+        state: ProviderOperationState,
+    ) -> ProviderOperationSnapshot:
+        return ProviderOperationSnapshot(
+            state=state,
+            status=ProviderOperationStatus.COMPLETED,
+            events=(
+                ModelStreamEvent.text_delta(
+                    "completed during cancellation",
+                    recovery_metadata={"cursor": 1},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {"input_tokens": 3, "output_tokens": 4},
+                    },
+                    recovery_metadata={"cursor": 2},
+                ),
+            ),
+        )
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        self.cancelled_states.append(state)
+        self.completed = True
+        return self._completed_snapshot(state)
+
+    async def retrieve(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        assert self.completed
+        return self._completed_snapshot(state)
 
 
 class _GeneratedToolIdAdapter(_ReconnectableAdapter):
@@ -1405,6 +1484,141 @@ def test_provider_owned_operation_identity_cannot_embed_a_workload_secret() -> N
     stored = asyncio.run(app.session_store.load_events("secret_provider_identity"))
     assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in stored}
     assert secret not in repr(events) + repr(stored)
+
+
+def test_session_interruption_cancels_the_exact_durable_provider_operation() -> None:
+    async def scenario():
+        provider = _ReconnectableProvider(background=True)
+        adapter = _InterruptibleOperationAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def run_session() -> list[Event]:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="interrupt_provider_operation",
+                        messages=[Message.text("user", "wait for cancellation")],
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(run_session())
+        await asyncio.wait_for(adapter.stream_started.wait(), timeout=1)
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="interrupt_provider_operation",
+                    reason="operator requested cancellation",
+                )
+            )
+        ]
+        run_events = await run_task
+        inspection = await inspect_provider_operation(
+            app.session_store,
+            "interrupt_provider_operation",
+        )
+        return run_events, interrupt_events, adapter, inspection
+
+    run_events, interrupt_events, adapter, inspection = asyncio.run(scenario())
+
+    assert adapter.cancel_calls == 1
+    assert adapter.cancelled_states == [
+        ProviderOperationState(
+            operation_id="response_interruptible",
+            stream_protocol="responses-v1",
+            recovery_metadata={"cursor": 0},
+        )
+    ]
+    assert EventType.SESSION_INTERRUPTED in {event.type for event in run_events}
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert inspection.cancellation_status is ProviderOperationCancellationStatus.CANCELLED
+    assert inspection.accounting_status is ProviderOperationAccountingStatus.NOT_APPLICABLE
+    assert inspection.reservation_count == 0
+
+
+def test_provider_completion_before_interruption_is_never_cancelled() -> None:
+    async def scenario() -> tuple[list[Event], _ReconnectableAdapter]:
+        provider = _ReconnectableProvider(background=True)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="provider_completion_wins_interruption_race",
+                messages=[Message.text("user", "finish first")],
+            ),
+        )
+        with pytest.raises(ValueError, match="cannot be interrupted"):
+            async for _event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="provider_completion_wins_interruption_race",
+                    reason="too late",
+                )
+            ):
+                pass
+        return events, provider.adapter
+
+    events, adapter = asyncio.run(scenario())
+
+    assert sum(event.type is EventType.MODEL_COMPLETED for event in events) == 1
+    assert adapter.cancel_calls == 0
+
+
+def test_provider_completion_winning_live_cancellation_is_reconciled() -> None:
+    async def scenario() -> tuple[
+        list[Event],
+        list[Event],
+        list[Event],
+        _CompletionWinsLiveCancellationAdapter,
+    ]:
+        provider = _ReconnectableProvider(background=True)
+        adapter = _CompletionWinsLiveCancellationAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "provider_completion_wins_live_cancellation"
+
+        run_task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "complete while cancellation races")],
+                ),
+            )
+        )
+        await asyncio.wait_for(adapter.stream_started.wait(), timeout=1)
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="provider may have completed",
+                )
+            )
+        ]
+        run_events = await run_task
+        durable_events = await app.session_store.load_events(session_id)
+        return run_events, interrupt_events, durable_events, adapter
+
+    run_events, interrupt_events, durable_events, adapter = asyncio.run(scenario())
+
+    assert adapter.cancel_calls == 1
+    assert sum(event.type is EventType.MODEL_COMPLETED for event in durable_events) == 1
+    assert EventType.SESSION_INTERRUPTED in {event.type for event in run_events}
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    completed = next(event for event in durable_events if event.type is EventType.MODEL_COMPLETED)
+    assert completed.interaction_id is not None
 
 
 def test_cancellation_during_provider_start_waits_for_identity_before_releasing_run() -> None:

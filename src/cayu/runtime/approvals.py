@@ -23,6 +23,10 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
+from cayu.runtime._run_limit_accounting import (
+    RunLimitAccountingContext,
+    has_run_limit_accounting_authority,
+)
 from cayu.runtime._tool_argument_publication import pause_checkpoint_validation_view
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
 from cayu.runtime.execution_units import ToolRoundIdentity
@@ -433,6 +437,7 @@ class PendingToolApproval(BaseModel):
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
+    run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     expires_at: datetime | None = None
@@ -484,6 +489,11 @@ class PendingToolApproval(BaseModel):
             raise ValueError(
                 "Pending tool approval call details do not match its tool-round record."
             )
+        if self.run_limit_accounting is not None and not has_run_limit_accounting_authority(
+            self.limits,
+            self.budget_limits,
+        ):
+            raise ValueError("run_limit_accounting requires active run-scoped authority.")
         return self
 
     @field_validator("environment_name", "workspace_id", "task_id", "reason")
@@ -702,6 +712,7 @@ class PendingToolApprovalEventView(BaseModel):
         # view. The event carries only the resulting argument availability.
         payload.pop("publish_arguments", None)
         payload.pop("secret_resolution_scope", None)
+        payload.pop("run_limit_accounting", None)
         payload["arguments_state"] = state
         payload["arguments"] = None if arguments_quarantined else pending.arguments
         payload["tool_calls"] = [
@@ -833,6 +844,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         thinking=approval.thinking,
         max_steps=approval.max_steps,
         limits=copy_run_limits(approval.limits) if approval.limits is not None else None,
+        run_limit_accounting=approval.run_limit_accounting,
         budget_limits=(
             copy_budget_limits(approval.budget_limits, field_name="budget_limits")
             if approval.budget_limits is not None

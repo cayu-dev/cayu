@@ -2991,8 +2991,10 @@ adds the required Evals capability surface and authenticated corpus, run,
 result, cancellation, and comparison endpoints. Server contract version 9
 replaces the compatibility-only comparison response with the complete typed
 compatible-result regression projection used by the dashboard and local CI.
-Clients generated against contract version 1 through 8 must regenerate from the
-current OpenAPI document.
+Server contract version 10 adds bounded provider-operation cancellation and
+accounting reconciliation state to session inspection. Clients generated
+against contract version 1 through 9 must regenerate from the current OpenAPI
+document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
@@ -3590,13 +3592,59 @@ result. Before dispatch, the active stage also retains the secret-free
 continuation inputs needed to normalize and publish offline output: redacted
 request metadata, task linkage, thinking transcript policy, structured-output
 tool contract, run and budget limits, retry policy, and resolved billing
-identity. A completed retrieval is normalized through the ordinary model
-completion contract and atomically publishes one assistant step, terminal
+identity. It also freezes each original reservation id, budget-limit id, and
+pricing definition. Recovery loads those exact reservations and never performs
+budget admission again, grants a fresh allowance, resets run limits, or creates
+a second model attempt. For run-scoped token, tool-call, and elapsed-time limits,
+the stage carries the original aggregate usage baseline, one bounded invocation origin
+for each effective run-scoped budget, and a timezone-aware UTC run origin.
+Process recovery reconstructs the monotonic elapsed-time origin from that durable
+timestamp and propagates the same accounting authority through any recovered tool
+approval or user-input continuation; it does not baseline token, tool, elapsed-time,
+or estimated-cost allowances against events written by the interrupted run. A
+field-specific continuation override resets only that field's accounting authority:
+overriding `RunLimits` preserves inherited cost-budget origins, while overriding
+`budget_limits` preserves inherited token, tool-call, and elapsed-time accounting.
+Run-budget origins are intersected with the budget's current rolling or calendar
+window so recovery across a window boundary matches uninterrupted execution. A
+completed retrieval is normalized through
+the ordinary model completion contract and atomically publishes one assistant step, terminal
 completion event, transcript update, and usage record. Native structured-output
 decoding cannot yet resume at this boundary and fails closed to manual
 reconciliation; the provider-neutral structured-output tool path retains and
 validates its original contract. Repeated or competing recovery converges
-through the stage publication and run-epoch fences.
+through the stage publication and run-epoch fences. Terminal usage and cost are
+reconciled exactly once against the original reservation; settlement replay
+loads the already committed ledger record rather than charging again.
+
+Cancellation support is explicit. An adapter that can target a durable
+provider operation returns `ProviderOperationCancellationSupport.SUPPORTED`;
+the default is `UNSUPPORTED`. When interruption owns the current run epoch,
+Cayu records a bounded cancellation request and targets the exact stored
+operation id and continuation state. A stale epoch cannot invoke cancellation,
+publish its resolution, settle reservations, or terminalize recovered output.
+The request atomically acquires a private leased checkpoint claim bound to the
+stage, operation identity, and run epoch. The owner heartbeats that claim while
+the provider call, completion recovery, or original reservation settlement is
+in flight. A heartbeat failure cancels the local owner and its in-flight
+provider-cancellation task rather than allowing unfenced work to continue.
+Cancellation leases use UTC wall time consistently across runtime ownership,
+store fencing, and incomplete-session takeover; an injected evidence clock does
+not make a durable cancellation lease immortal or prematurely expired.
+Built-in store takeover paths refuse to advance the epoch while the lease
+remains active. Terminal resolution and settlement release the claim;
+after worker loss, expiry permits a replacement owner to fence the abandoned
+epoch, reacquire cancellation ownership, and recover or settle the same durable
+operation without trusting stale in-memory state. If the
+provider reports that completion won the cancellation race, Cayu retrieves and
+publishes that exact operation under the same claim before finishing the local
+interruption, so the model attempt, transcript, usage, and reservations do not
+remain unresolved.
+Confirmed cancellation conservatively settles the original reservations once.
+Unsupported cancellation and lost acknowledgements preserve ordinary local
+session interruption while reporting `unsupported` or `failed` instead of
+claiming that provider work stopped; their accounting remains reserved until a
+truthful provider terminal boundary is recovered or explicitly reconciled.
 
 For a reconnectable stream, every normalized provider event carries recovery
 metadata. Cayu accepts cursor `N + 1` only after cursor `N`; a gap, conflicting
@@ -3626,8 +3674,12 @@ process restoration: Cayu does not restore an SDK client, socket, task, or
 worker process. Operator inspection reports `synchronous`,
 `provider_operation_in_progress`, `reconnect_scheduled`,
 `reconnect_in_progress`, or `provider_operation_reconciled` plus bounded
-identity fields; it never exposes the original request or private recovery
-metadata. Repeated polls do not expand inspection work: Cayu reads the stable
+identity fields, cancellation status, accounting status, and reservation
+count; it never exposes the original request or private recovery metadata.
+For the active stage's bounded reservation set, inspection derives and reads
+each exact settlement-event identity; unrelated session reconciliations cannot
+evict or change the reported accounting state.
+Repeated polls do not expand inspection work: Cayu reads the stable
 attempt and operation identity plus only the latest reconnect transition.
 Run-epoch fencing on both event append and stage promotion prevents a
 stale invocation from creating authoritative operation evidence or publishing

@@ -596,6 +596,7 @@ def _approval_event_matches_checkpoint(
         payload.pop("arguments_state", None)
         payload.pop("publish_arguments", None)
         payload.pop("secret_resolution_scope", None)
+        payload.pop("run_limit_accounting", None)
         if omit_arguments:
             payload.pop("arguments", None)
         tool_calls = payload.get("tool_calls")

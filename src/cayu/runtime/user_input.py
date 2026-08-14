@@ -24,6 +24,10 @@ from cayu.runtime._assistant_tool_round_publication import (
     copy_assistant_tool_round_publication,
 )
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+from cayu.runtime._run_limit_accounting import (
+    RunLimitAccountingContext,
+    has_run_limit_accounting_authority,
+)
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
     ResolutionActor,
@@ -161,6 +165,7 @@ class PendingUserInput(BaseModel):
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
+    run_limit_accounting: RunLimitAccountingContext | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
 
@@ -182,6 +187,11 @@ class PendingUserInput(BaseModel):
         gating_call = gating_calls[0]
         if gating_call.tool_name != self.tool_name or gating_call.arguments != self.arguments:
             raise ValueError("Pending user-input call details do not match its tool-round record.")
+        if self.run_limit_accounting is not None and not has_run_limit_accounting_authority(
+            self.limits,
+            self.budget_limits,
+        ):
+            raise ValueError("run_limit_accounting requires active run-scoped authority.")
         if self.assistant_message_state == "quarantined":
             if self.quarantined_assistant_message is None:
                 raise ValueError(
@@ -345,6 +355,7 @@ def public_pending_user_input_event_payload(
     """Copy a pending-input payload without unproven prompt or policy output."""
 
     payload = pending.model_dump(mode="json")
+    payload.pop("run_limit_accounting", None)
     # Staged terminals are private crash-recovery evidence. They are published
     # only through the terminal event boundary after the round-wide secret
     # scope is finalized, never as part of a pending-input representation.
@@ -452,6 +463,7 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         thinking=pending.thinking,
         max_steps=pending.max_steps,
         limits=copy_run_limits(pending.limits) if pending.limits is not None else None,
+        run_limit_accounting=pending.run_limit_accounting,
         budget_limits=(
             copy_budget_limits(pending.budget_limits, field_name="budget_limits")
             if pending.budget_limits is not None

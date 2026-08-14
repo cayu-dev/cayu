@@ -138,7 +138,7 @@ def test_session_list_uses_project_target_and_emits_stable_json(
     assert payload == {
         "has_more": False,
         "next_cursor": None,
-        "schema_version": "5",
+        "schema_version": "6",
         "sessions": [
             {
                 "agent": "writer",
@@ -501,6 +501,9 @@ def test_session_show_summarizes_oversized_state_without_printing_content(
         "provider": None,
         "operation_id": None,
         "stream_protocol": None,
+        "cancellation_status": "not_requested",
+        "accounting_status": "not_applicable",
+        "reservation_count": 0,
     }
 
 
@@ -595,6 +598,9 @@ def test_session_show_reports_reconciled_provider_operation(
         "provider": "reconnectable",
         "operation_id": "response_123",
         "stream_protocol": "responses-v1",
+        "cancellation_status": "not_requested",
+        "accounting_status": "not_applicable",
+        "reservation_count": 0,
     }
 
 
@@ -1336,7 +1342,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "model_call",
         "unmatched_ledger",
     }
-    assert {row["schema_version"] for row in jsonl_rows} == {"5"}
+    assert {row["schema_version"] for row in jsonl_rows} == {"6"}
     aggregate_row = next(row for row in jsonl_rows if row["record_type"] == "aggregate")
     assert aggregate_row["total_tokens"] == "12"
 
@@ -1395,7 +1401,7 @@ def test_session_usage_json_serializes_aggregate_counters_losslessly(
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == "5"
+    assert payload["schema_version"] == "6"
     assert payload["aggregate"]["input_tokens"] == expected
     assert payload["aggregate"]["total_tokens"] == expected
 
@@ -2875,7 +2881,7 @@ def test_session_cli_lists_and_filters_response_scoped_interactions(
         == 0
     )
     listed = json.loads(capsys.readouterr().out)
-    assert listed["schema_version"] == "5"
+    assert listed["schema_version"] == "6"
     assert [item["interaction_id"] for item in listed["interactions"]] == [
         "interaction-b",
         "interaction-a",

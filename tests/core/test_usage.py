@@ -9,6 +9,7 @@ import pytest
 from tests.core._budget_ledger_contract import (
     assert_crash_safe_dispatch_and_settlement_outbox,
     assert_idempotent_terminal_settlements,
+    assert_load_reservation_reconstructs_exact_record,
     assert_portable_text_boundaries,
     assert_prepriced_reservation_stores_only_durable_billing_identity,
     assert_reservation_identity_collision_is_rejected,
@@ -1365,6 +1366,15 @@ def test_in_memory_budget_ledger_terminal_settlements_are_idempotent() -> None:
     )
 
 
+def test_in_memory_budget_ledger_reconstructs_reservations_by_identity() -> None:
+    asyncio.run(
+        assert_load_reservation_reconstructs_exact_record(
+            InMemoryBudgetLedger(),
+            _reservation_budget_limit(max_cost="0.25"),
+        )
+    )
+
+
 def test_in_memory_budget_ledger_has_crash_safe_settlement_outbox() -> None:
     clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
     asyncio.run(
@@ -1703,6 +1713,20 @@ def test_sqlite_budget_ledger_terminal_settlements_are_idempotent(tmp_path) -> N
                     window=BudgetWindow.rolling(seconds=60),
                 ),
                 clock=clock,
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_reconstructs_reservations_by_identity(tmp_path) -> None:
+    async def run() -> None:
+        ledger = SQLiteBudgetLedger(tmp_path / "budget-reservation-recovery.sqlite")
+        try:
+            await assert_load_reservation_reconstructs_exact_record(
+                ledger,
+                _reservation_budget_limit(max_cost="0.25"),
             )
         finally:
             await ledger.close()

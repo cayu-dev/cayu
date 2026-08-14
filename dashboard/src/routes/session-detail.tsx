@@ -2665,6 +2665,21 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             ) : state?.provider_operation.status === "synchronous" ? (
               <Badge variant="outline">Synchronous provider</Badge>
             ) : null}
+            {state?.provider_operation.cancellation_status &&
+              state.provider_operation.cancellation_status !== "not_requested" && (
+                <Badge variant="secondary">
+                  Cancellation {state.provider_operation.cancellation_status.replaceAll("_", " ")}
+                </Badge>
+              )}
+            {state?.provider_operation.accounting_status &&
+              state.provider_operation.accounting_status !== "not_applicable" && (
+                <Badge variant="outline">
+                  Accounting {state.provider_operation.accounting_status}
+                  {state.provider_operation.reservation_count > 0
+                    ? ` (${state.provider_operation.reservation_count})`
+                    : ""}
+                </Badge>
+              )}
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
             {workflowCapability.enabled && (

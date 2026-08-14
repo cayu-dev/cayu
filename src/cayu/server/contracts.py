@@ -1571,6 +1571,18 @@ class ApiProviderOperationInspection(ApiBaseModel):
     provider: str | None = Field(default=None, max_length=256)
     operation_id: str | None = Field(default=None, max_length=512)
     stream_protocol: str | None = Field(default=None, max_length=128)
+    cancellation_status: Literal[
+        "not_requested",
+        "requested",
+        "unsupported",
+        "pending",
+        "cancelled",
+        "completed",
+        "failed",
+        "unavailable",
+    ]
+    accounting_status: Literal["not_applicable", "reserved", "settled"]
+    reservation_count: StrictInt = Field(ge=0, le=32)
 
 
 class SessionStateResponse(ApiBaseModel):

@@ -12,6 +12,7 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
     ProviderOperationAdapter,
+    ProviderOperationCancellationSupport,
     ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationRecoveryMetadata,
@@ -134,6 +135,10 @@ class _ScriptedProviderOperationAdapter(ProviderOperationAdapter):
     def __init__(self, provider: ScriptedModelProvider) -> None:
         self.provider = provider
         self.operations: dict[str, _ScriptedProviderOperation] = {}
+
+    @property
+    def cancellation_support(self) -> ProviderOperationCancellationSupport:
+        return ProviderOperationCancellationSupport.SUPPORTED
 
     def _require_operation(self, state: ProviderOperationState) -> _ScriptedProviderOperation:
         try:

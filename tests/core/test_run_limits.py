@@ -36,6 +36,7 @@ from cayu.providers import (
 from cayu.runtime import AlwaysRequireApprovalToolPolicy, CayuApp
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._run_limit_accounting import RunBudgetAccountingAuthority
 from cayu.runtime._run_limits import (
     BudgetedOperationFailed,
     BudgetedOperationRejected,
@@ -54,9 +55,12 @@ from cayu.runtime.budgets import (
     BudgetReservationIdentityConflict,
     BudgetReservationResult,
     BudgetSettlementFallback,
+    BudgetWindow,
     InMemoryBudgetLedger,
     SessionBudgetStore,
+    _effective_budget_limit_id,
     has_deferred_contextual_price,
+    request_budget_limits_for_session,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.execution_units import (
@@ -374,6 +378,91 @@ async def _running_session(store: InMemorySessionStore, session_id: str) -> Sess
         identity=SessionIdentity(provider_name="fake", model="fake-model"),
     )
     return await store.update_status(session.id, SessionStatus.RUNNING)
+
+
+@pytest.mark.parametrize("window_kind", ["rolling", "calendar"])
+def test_recovered_run_budget_origin_survives_window_boundary(window_kind: str) -> None:
+    store = InMemorySessionStore()
+    run_started_at = datetime(2026, 1, 1, 23, 59, 59, tzinfo=UTC)
+    now = run_started_at + timedelta(seconds=2)
+    window = (
+        BudgetWindow.rolling(seconds=60)
+        if window_kind == "rolling"
+        else BudgetWindow.calendar(period="day", timezone="UTC")
+    )
+    limit = BudgetLimit(
+        scope="run",
+        max_estimated_cost=Decimal("0.000002"),
+        pricing=_pricing(),
+        window=window,
+    )
+
+    async def scenario() -> LimitEvaluation:
+        session = await _running_session(store, f"run-budget-{window_kind}")
+        effective_limit = request_budget_limits_for_session(
+            limits=(limit,),
+            agent_name="assistant",
+            causal_budget_id=session.causal_budget_id,
+        )[0]
+        pre_run_timestamp = (
+            run_started_at - timedelta(seconds=59)
+            if window_kind == "rolling"
+            else run_started_at - timedelta(seconds=1)
+        )
+        await store.append_events(
+            session.id,
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session.id,
+                    timestamp=pre_run_timestamp,
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": 5,
+                            "output_tokens": 0,
+                            "total_tokens": 5,
+                        }
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session.id,
+                    timestamp=run_started_at + timedelta(seconds=1),
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": 3,
+                            "output_tokens": 0,
+                            "total_tokens": 3,
+                        }
+                    },
+                ),
+            ],
+        )
+        return await _controller(store, clock=lambda: now).evaluate_request_limits(
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            limits=RunLimits(),
+            budget_limits=(limit,),
+            run_started_at=time.monotonic(),
+            run_budget_authorities={
+                _effective_budget_limit_id(effective_limit): RunBudgetAccountingAuthority(
+                    budget_limit_id=_effective_budget_limit_id(effective_limit),
+                    currency="USD",
+                    started_at=run_started_at,
+                )
+            },
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result.decision is not None
+    assert result.decision.limit is StopLimit.ESTIMATED_COST
+    assert result.decision.actual == Decimal("0.000003")
 
 
 @pytest.mark.parametrize(

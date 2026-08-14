@@ -338,6 +338,7 @@ def bounded_pending_approval_event_payload(
     # approval content.  Only a positively static scope proves that a policy's
     # argument-derived output cannot become a late-resolved workload secret.
     payload.pop("secret_resolution_scope", None)
+    payload.pop("run_limit_accounting", None)
     publish_policy_output = approval.secret_resolution_scope == "static" and publish_arguments
     if not publish_arguments:
         payload.pop("arguments", None)
@@ -475,6 +476,7 @@ def planned_tool_round_from_pending_approval(
         thinking=approval.thinking,
         max_steps=approval.max_steps,
         limits=approval.limits,
+        run_limit_accounting=approval.run_limit_accounting,
         budget_limits=approval.budget_limits,
         retry_policy=approval.retry_policy,
     )

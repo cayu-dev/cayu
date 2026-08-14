@@ -14,6 +14,7 @@ import pytest
 from tests.core._budget_ledger_contract import (
     assert_crash_safe_dispatch_and_settlement_outbox,
     assert_idempotent_terminal_settlements,
+    assert_load_reservation_reconstructs_exact_record,
     assert_portable_text_boundaries,
     assert_prepriced_reservation_stores_only_durable_billing_identity,
     assert_reservation_identity_collision_is_rejected,
@@ -197,6 +198,16 @@ def test_postgres_budget_ledger_terminal_settlements_are_idempotent(postgres_dsn
         )
 
     _run(postgres_dsn, ops, clock=clock)
+
+
+def test_postgres_budget_ledger_reconstructs_reservations_by_identity(postgres_dsn) -> None:
+    async def ops(ledger):
+        await assert_load_reservation_reconstructs_exact_record(
+            ledger,
+            _reservation_budget_limit(max_cost="0.25"),
+        )
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_budget_ledger_has_crash_safe_settlement_outbox(postgres_dsn) -> None:

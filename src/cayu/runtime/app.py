@@ -62,6 +62,7 @@ from cayu.environments import (
 )
 from cayu.providers import (
     ModelProvider,
+    ProviderOperationSnapshot,
     copy_usage_dialect,
 )
 from cayu.runtime import _approval_support as approval_support
@@ -107,6 +108,7 @@ from cayu.runtime._recovery_coordinator import (
     RecoveryTaskEventRequest,
     RecoveryTerminalEventRequest,
 )
+from cayu.runtime._run_limit_accounting import RunLimitAccountingContext
 from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
@@ -726,6 +728,7 @@ class CayuApp:
             abandoned_turn_completed=self._complete_abandoned_recovery_turn,
             resume_interaction=self._resume_recovery_interaction,
             recover_provider_operation=self._recover_provider_operation,
+            cancel_provider_operation=self._cancel_provider_operation,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self._runtime_session_store,
@@ -1725,6 +1728,7 @@ class CayuApp:
                     if publication_context.structured_output_attempt is not None
                     else 0
                 ),
+                run_limit_accounting=publication_context.run_limit_accounting,
             )
 
         return await self._model_step_executor.recover_provider_operation(
@@ -1736,6 +1740,24 @@ class CayuApp:
             environment_name=_environment_name(registered_environment),
             recovery_context=recovery_context,
             model_completion_publisher=publish,
+        )
+
+    async def _cancel_provider_operation(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> ProviderOperationSnapshot | None:
+        return await self._model_step_executor.cancel_provider_operation_for_interruption(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=_environment_name(registered_environment),
         )
 
     def _get_registered_provider(
@@ -2607,6 +2629,7 @@ class CayuApp:
             start_task_on_enter=request.start_task_on_enter,
             release_run_fence_on_exit=request.release_run_fence_on_exit,
             deliver_queued_input_before_first_step=False,
+            run_limit_accounting=request.run_limit_accounting,
         )
 
     def _emit_recovery_terminal_event_with_hooks(
@@ -2956,6 +2979,7 @@ class CayuApp:
         start_task_on_enter: bool = True,
         release_run_fence_on_exit: bool = True,
         deliver_queued_input_before_first_step: bool = True,
+        run_limit_accounting: RunLimitAccountingContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         stream = self._session_engine._run_session(
             session=session,
@@ -2980,6 +3004,7 @@ class CayuApp:
             start_task_on_enter=start_task_on_enter,
             release_run_fence_on_exit=release_run_fence_on_exit,
             deliver_queued_input_before_first_step=(deliver_queued_input_before_first_step),
+            run_limit_accounting=run_limit_accounting,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

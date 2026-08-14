@@ -1435,6 +1435,41 @@ class BudgetReservationRecord(BaseModel):
         return self
 
 
+class BudgetReservationRecoveryContext(BaseModel):
+    """Frozen pricing authority for one provider-operation reservation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    reservation_id: str
+    budget_limit_id: str
+    limit: BudgetLimit
+
+    @field_validator("reservation_id")
+    @classmethod
+    def validate_reservation_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "reservation_id")
+
+    @field_validator("budget_limit_id")
+    @classmethod
+    def validate_budget_limit_id(cls, value: str) -> str:
+        return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
+
+    @field_validator("limit", mode="before")
+    @classmethod
+    def copy_limit(cls, value: object) -> BudgetLimit:
+        if isinstance(value, BudgetLimit):
+            value = {
+                field_name: getattr(value, field_name) for field_name in BudgetLimit.model_fields
+            }
+        return BudgetLimit.model_validate(value)
+
+    @model_validator(mode="after")
+    def require_reservation_pricing(self) -> BudgetReservationRecoveryContext:
+        if self.limit.reservation is None:
+            raise ValueError("Recovered provider-operation budget limits must reserve capacity.")
+        return self
+
+
 class BudgetReservationResult(BaseModel):
     """Result of attempting to reserve budget before a model step."""
 
@@ -1901,6 +1936,22 @@ class BudgetLedger(ABC):
         A reservation with a committed dispatch fence is not releasable.
         """
 
+    async def load_reservation(
+        self,
+        reservation_id: str,
+    ) -> BudgetReservationRecord | None:
+        """Load one durable reservation for provider-operation reconstruction.
+
+        Custom ledgers that do not implement this optional recovery seam remain
+        usable for synchronous provider calls, but cannot resume a budgeted
+        provider-owned operation after worker loss.
+        """
+
+        del reservation_id
+        raise NotImplementedError(
+            "This budget ledger does not support provider-operation reservation recovery."
+        )
+
     @abstractmethod
     async def load_settlement(self, settlement_id: str) -> BudgetSettlementRecord | None:
         """Load one exact durable terminal transition by stable identity."""
@@ -2303,6 +2354,15 @@ class InMemoryBudgetLedger(BudgetLedger):
         async with self._lock:
             settlement = self._settlements.get(settlement_id)
             return None if settlement is None else settlement.model_copy(deep=True)
+
+    async def load_reservation(
+        self,
+        reservation_id: str,
+    ) -> BudgetReservationRecord | None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        async with self._lock:
+            record = self._records.get(reservation_id)
+            return None if record is None else record.model_copy(deep=True)
 
     async def list_pending_settlements(
         self,

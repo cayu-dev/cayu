@@ -5985,6 +5985,9 @@ def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
         "provider": None,
         "operation_id": None,
         "stream_protocol": None,
+        "cancellation_status": "not_requested",
+        "accounting_status": "not_applicable",
+        "reservation_count": 0,
     }
     assert body["updated_at"]
     assert body["last_activity_at"]
@@ -6070,6 +6073,9 @@ def test_server_session_state_exposes_provider_reconnect_in_progress() -> None:
         "provider": "reconnectable",
         "operation_id": "response_123",
         "stream_protocol": "responses-v1",
+        "cancellation_status": "not_requested",
+        "accounting_status": "not_applicable",
+        "reservation_count": 0,
     }
 
 
@@ -6159,6 +6165,9 @@ def test_server_session_state_keeps_ambiguous_start_and_model_error_visible() ->
         "provider": "reconnectable",
         "operation_id": None,
         "stream_protocol": None,
+        "cancellation_status": "not_requested",
+        "accounting_status": "not_applicable",
+        "reservation_count": 0,
     }
     assert model_error.status_code == 200
     assert model_error.json()["provider_operation"] == {
@@ -6166,6 +6175,9 @@ def test_server_session_state_keeps_ambiguous_start_and_model_error_visible() ->
         "provider": "reconnectable",
         "operation_id": "response_123",
         "stream_protocol": "responses-v1",
+        "cancellation_status": "not_requested",
+        "accounting_status": "not_applicable",
+        "reservation_count": 0,
     }
 
 

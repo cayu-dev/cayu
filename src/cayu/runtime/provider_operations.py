@@ -25,6 +25,7 @@ from cayu.providers.operations import (
     PROVIDER_OPERATION_ID_MAX_CHARS,
     PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS,
 )
+from cayu.runtime.budgets import budget_settlement_event_id, budget_settlement_id
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.sessions import (
     EventOrder,
@@ -38,6 +39,8 @@ from cayu.runtime.usage import is_conversational_model_completion_payload
 _INSPECTION_ATTEMPT_EVENT_TYPES = (
     EventType.PROVIDER_OPERATION_STARTING,
     EventType.PROVIDER_OPERATION_STARTED,
+    EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+    EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
     EventType.MODEL_COMPLETED,
     EventType.MODEL_ERROR,
     EventType.MODEL_ATTEMPT_DISCARDED,
@@ -87,6 +90,23 @@ class ProviderOperationInspectionStatus(StrEnum):
     PROVIDER_OPERATION_RECONCILED = "provider_operation_reconciled"
 
 
+class ProviderOperationCancellationStatus(StrEnum):
+    NOT_REQUESTED = "not_requested"
+    REQUESTED = "requested"
+    UNSUPPORTED = "unsupported"
+    PENDING = "pending"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+
+
+class ProviderOperationAccountingStatus(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    RESERVED = "reserved"
+    SETTLED = "settled"
+
+
 class ProviderOperationInspection(BaseModel):
     """Bounded public view of the latest model attempt's dispatch mode."""
 
@@ -102,6 +122,13 @@ class ProviderOperationInspection(BaseModel):
         default=None,
         max_length=PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS,
     )
+    cancellation_status: ProviderOperationCancellationStatus = (
+        ProviderOperationCancellationStatus.NOT_REQUESTED
+    )
+    accounting_status: ProviderOperationAccountingStatus = (
+        ProviderOperationAccountingStatus.NOT_APPLICABLE
+    )
+    reservation_count: int = Field(default=0, ge=0, le=32)
 
 
 class ProviderOperationEvidenceError(RuntimeError):
@@ -903,6 +930,15 @@ async def inspect_provider_operation(
     operation_events = [
         event for event in later_events if event.type == EventType.PROVIDER_OPERATION_STARTED
     ]
+    cancellation_events = [
+        event
+        for event in later_events
+        if event.type
+        in {
+            EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+            EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+        }
+    ]
     recovery_events = [event for event in later_events if event.type in _RECOVERY_EVENT_TYPES]
     owning_events = [
         event
@@ -911,6 +947,8 @@ async def inspect_provider_operation(
         in {
             EventType.PROVIDER_OPERATION_STARTING,
             EventType.PROVIDER_OPERATION_STARTED,
+            EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+            EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
             *_RECOVERY_EVENT_TYPES,
             EventType.MODEL_ERROR,
             EventType.MODEL_ATTEMPT_DISCARDED,
@@ -933,7 +971,12 @@ async def inspect_provider_operation(
             raise ProviderOperationEvidenceError(
                 "Model completion evidence is bound to a different provider or model."
             )
-    provider_evidence = [*starting_events, *operation_events, *recovery_events]
+    provider_evidence = [
+        *starting_events,
+        *operation_events,
+        *cancellation_events,
+        *recovery_events,
+    ]
     for evidence in provider_evidence:
         if _provider_scope(evidence, label="Provider-operation evidence") != current_provider_scope:
             raise ProviderOperationEvidenceError(
@@ -956,6 +999,10 @@ async def inspect_provider_operation(
     if recovery_events and not operation_events:
         raise ProviderOperationEvidenceError(
             "Provider-operation recovery evidence has no durable operation identity."
+        )
+    if cancellation_events and not operation_events:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence has no durable operation identity."
         )
     if not operation_events and not starting_events:
         return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
@@ -1037,6 +1084,97 @@ async def inspect_provider_operation(
             raise ProviderOperationEvidenceError(
                 "Provider-operation recovery evidence is bound to a different operation."
             )
+    cancellation_status = ProviderOperationCancellationStatus.NOT_REQUESTED
+    if cancellation_events:
+        latest_cancellation = cancellation_events[0]
+        if (
+            latest_cancellation.payload.get("operation_id") != state.operation_id
+            or latest_cancellation.payload.get("stream_protocol") != state.stream_protocol
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation cancellation evidence is bound to a different operation."
+            )
+        try:
+            cancellation_status = ProviderOperationCancellationStatus(
+                latest_cancellation.payload.get("cancellation_status")
+            )
+        except ValueError:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation cancellation evidence has an invalid status."
+            ) from None
+        if (
+            latest_cancellation.type is EventType.PROVIDER_OPERATION_CANCEL_REQUESTED
+            and cancellation_status is not ProviderOperationCancellationStatus.REQUESTED
+        ) or (
+            latest_cancellation.type is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED
+            and cancellation_status
+            in {
+                ProviderOperationCancellationStatus.NOT_REQUESTED,
+                ProviderOperationCancellationStatus.REQUESTED,
+            }
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation cancellation status conflicts with its event type."
+            )
+    active_stage = await session_store.load_active_model_completion_stage(session_id)
+    reservation_ids: tuple[str, ...] = ()
+    if active_stage is not None:
+        active_attempt_id = active_stage.stage.intent.get("model_attempt_id")
+        if (
+            active_stage.stage.logical_step_id == current_identity[-2]
+            and active_attempt_id == current_identity[-1]
+        ):
+            reservation_ids = active_stage.stage.reservation_ids
+    accounting_status = ProviderOperationAccountingStatus.NOT_APPLICABLE
+    reservation_count = len(reservation_ids)
+    if reservation_ids:
+        accounting_status = ProviderOperationAccountingStatus.RESERVED
+        settled_ids: set[str] = set()
+        for reservation_id in reservation_ids:
+            settlement_event_id = budget_settlement_event_id(budget_settlement_id(reservation_id))
+            settlement_records = await session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_id=settlement_event_id,
+                    after_sequence=started_record.sequence,
+                    limit=1,
+                )
+            )
+            if not settlement_records:
+                continue
+            settlement = settlement_records[0].event
+            if (
+                settlement.id != settlement_event_id
+                or settlement.type is not EventType.BUDGET_RECONCILED
+                or settlement.session_id != session_id
+                or settlement.payload.get("reservation_id") != reservation_id
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation accounting settlement evidence is contradictory."
+                )
+            settled_ids.add(reservation_id)
+        if set(reservation_ids) <= settled_ids:
+            accounting_status = ProviderOperationAccountingStatus.SETTLED
+    elif terminal_seen:
+        completed_event = next(
+            event
+            for event in owning_events
+            if event.type is EventType.MODEL_COMPLETED
+            and is_conversational_model_completion_payload(event.payload)
+        )
+        settlements = completed_event.payload.get("budget_settlements")
+        if type(settlements) is list and settlements:
+            reservation_count = len(settlements)
+            if reservation_count > 32:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation accounting evidence exceeds its bounded reservation set."
+                )
+            accounting_status = ProviderOperationAccountingStatus.SETTLED
+    inspection_fields = {
+        "cancellation_status": cancellation_status,
+        "accounting_status": accounting_status,
+        "reservation_count": reservation_count,
+    }
     latest_recovery_type = recovery_events[0].type if recovery_events else None
     if terminal_seen or latest_recovery_type == EventType.PROVIDER_OPERATION_RECONCILED:
         return ProviderOperationInspection(
@@ -1044,6 +1182,7 @@ async def inspect_provider_operation(
             provider=provider,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
+            **inspection_fields,
         )
     if latest_recovery_type == EventType.PROVIDER_OPERATION_RECONNECT_STARTED:
         return ProviderOperationInspection(
@@ -1051,6 +1190,7 @@ async def inspect_provider_operation(
             provider=provider,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
+            **inspection_fields,
         )
     if latest_recovery_type == EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED:
         return ProviderOperationInspection(
@@ -1058,6 +1198,7 @@ async def inspect_provider_operation(
             provider=provider,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
+            **inspection_fields,
         )
     if status.terminal:
         return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
@@ -1066,10 +1207,13 @@ async def inspect_provider_operation(
         provider=provider,
         operation_id=state.operation_id,
         stream_protocol=state.stream_protocol,
+        **inspection_fields,
     )
 
 
 __all__ = [
+    "ProviderOperationAccountingStatus",
+    "ProviderOperationCancellationStatus",
     "ProviderOperationEvidenceError",
     "ProviderOperationInspection",
     "ProviderOperationInspectionStatus",

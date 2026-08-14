@@ -82,6 +82,7 @@ from cayu.providers.openai_subscription import (
 from cayu.providers.operations import (
     PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES,
     ProviderOperationAdapter,
+    ProviderOperationCancellationSupport,
     ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationRecoveryMetadata,
@@ -155,6 +156,7 @@ __all__ = [
     "OpenAISubscriptionProvider",
     "OpenAITransport",
     "ProviderOperationAdapter",
+    "ProviderOperationCancellationSupport",
     "ProviderOperationConnection",
     "ProviderOperationMode",
     "ProviderOperationRecoveryMetadata",

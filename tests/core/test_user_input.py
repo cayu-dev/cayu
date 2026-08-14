@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from decimal import Decimal
 
 import pytest
 from tests.core._event_projection_support import (
@@ -21,6 +22,7 @@ from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
+    BudgetLimit,
     CayuApp,
     EventQuery,
     ForkSessionRequest,
@@ -53,6 +55,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CheckpointCompatibilityError,
 )
+from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor, StaticVault
 
@@ -106,6 +109,21 @@ class _RunConfigProvider(ModelProvider):
             return
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _RunCostConfigProvider(_RunConfigProvider):
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        async for event in super().stream(request):
+            if event.type == "completed":
+                input_tokens = 5 if len(self.requests) == 1 else 6
+                yield ModelStreamEvent.completed(
+                    {
+                        "finish_reason": event.payload.get("finish_reason"),
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                    }
+                )
+            else:
+                yield event
 
 
 class _BlockingContinuationProvider(_ScriptedProvider):
@@ -1019,6 +1037,83 @@ def test_resolve_user_input_explicit_limits_override_persisted_configuration() -
 
     assert "after input" in echo.metadata_by_text
     assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.parametrize("override_kind", ["limits", "budget_limits"])
+def test_resolve_user_input_field_override_preserves_other_run_accounting(
+    override_kind: str,
+) -> None:
+    store = InMemorySessionStore()
+    provider = _RunCostConfigProvider()
+    echo = _EchoTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UserInputTool(), echo],
+    )
+    session_id = f"s_input_preserves_{override_kind}"
+    cost_limit = BudgetLimit(
+        scope="run",
+        max_estimated_cost=Decimal("0.000007"),
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+    )
+    pause_events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+                limits=(
+                    RunLimits(scope="run")
+                    if override_kind == "limits"
+                    else RunLimits(max_total_tokens=10, scope="run")
+                ),
+                budget_limits=(cost_limit,) if override_kind == "limits" else (),
+            ),
+        )
+    )
+    input_id = next(
+        event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+    ).payload["input_id"]
+
+    events = asyncio.run(
+        _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="yes",
+                    limits=(
+                        RunLimits(max_total_tokens=1_000, scope="run")
+                        if override_kind == "limits"
+                        else None
+                    ),
+                    budget_limits=() if override_kind == "budget_limits" else None,
+                )
+            )
+        )
+    )
+
+    limit_event = next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED)
+    if override_kind == "limits":
+        assert limit_event.payload["limit"] == "estimated_cost"
+        assert limit_event.payload["actual"] == "0.000011"
+    else:
+        assert limit_event.payload["limit"] == "total_tokens"
+        assert limit_event.payload["actual"] == 11
+    assert len(provider.requests) == 2
+    assert echo.metadata_by_text == {}
 
 
 def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:

@@ -82,6 +82,9 @@ from cayu.runtime._model_completion_publication import (
     ModelStepPublicationCheckpoint,
 )
 from cayu.runtime._model_target import project_portable_transcript
+from cayu.runtime._provider_operation_cancellation_claim import (
+    active_provider_operation_cancellation_claim_from_checkpoint,
+)
 from cayu.runtime._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
@@ -8670,6 +8673,14 @@ class InMemorySessionStore(SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            if (
+                active_provider_operation_cancellation_claim_from_checkpoint(
+                    self._checkpoints.get(session_id),
+                    now=datetime.now(UTC),
+                )
+                is not None
+            ):
+                return None
             if session.status not in allowed_statuses or session.last_activity_at > inactive_before:
                 return None
             fenced = session.model_copy(
@@ -8701,6 +8712,16 @@ class InMemorySessionStore(SessionStore):
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(f"Session status cannot be fenced: {session.status}")
             current = self._checkpoints.get(session_id)
+            if (
+                active_provider_operation_cancellation_claim_from_checkpoint(
+                    current,
+                    now=datetime.now(UTC),
+                )
+                is not None
+            ):
+                raise SessionStatusConflict(
+                    "Provider-operation cancellation still owns the session run epoch."
+                )
             transformed = checkpoint_transform(
                 session.model_copy(deep=True),
                 None if current is None else deepcopy(current),
@@ -14621,6 +14642,7 @@ def _validate_assistant_model_completion_publication(
         "thinking",
         "max_steps",
         "limits",
+        "run_limit_accounting",
         "budget_limits",
         "retry_policy",
         "source_model_step_id",
@@ -14635,6 +14657,13 @@ def _validate_assistant_model_completion_publication(
         required_marker_keys | {"assistant_publication"}
     ):
         raise ValueError("The model-step pending tool-round marker has invalid fields.")
+    raw_run_limit_accounting = marker.get("run_limit_accounting")
+    if raw_run_limit_accounting is not None and (
+        type(raw_run_limit_accounting) is not dict
+        or type(raw_run_limit_accounting.get("baseline")) is not dict
+        or raw_run_limit_accounting["baseline"].get("session_id") != completed_event.session_id
+    ):
+        raise ValueError("The pending tool-round run-limit accounting owner is invalid.")
     if assistant_message_deferred:
         if assistant_message is None:
             raise AssertionError("Deferred assistant publication lost its private message.")
