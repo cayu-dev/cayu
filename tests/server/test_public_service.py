@@ -27,16 +27,21 @@ from cayu import (
     EventType,
     InMemorySessionStore,
     InMemoryTaskStore,
+    InvocationOrigin,
+    InvocationOriginTrust,
     Message,
     ModelStreamEvent,
     RunRequest,
     ScriptedModelProvider,
     SecretRedactor,
     SessionIdentity,
+    SessionInvocationBinding,
     SessionStatus,
     SQLiteSessionStore,
     SQLiteTaskStore,
     TaskCreate,
+    TaskExecutionSource,
+    TaskInvocationSnapshot,
     TaskStatus,
     Tool,
     ToolContext,
@@ -47,7 +52,10 @@ from cayu import (
     ToolResult,
     ToolSpec,
     run_to_completion,
+    session_invocation_from_task,
 )
+from cayu.runtime.sessions import run_request_with_task_invocation
+from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,
@@ -78,6 +86,27 @@ from cayu.server.service import (
 )
 
 
+def _product_task_create(
+    operation: ProductOperation,
+    *,
+    agent_name: str,
+) -> TaskCreate:
+    return task_create_with_runtime_invocation(
+        TaskCreate(
+            task_id=operation.task_id,
+            type="public_agent_operation",
+            session_id=operation.session_id,
+            assigned_agent_name=agent_name,
+        ),
+        source=TaskExecutionSource.PRODUCT_OPERATION,
+        verified_origin=InvocationOrigin(
+            trust=InvocationOriginTrust.SERVER_VERIFIED,
+            subject=operation.subject_id,
+            tenant=operation.tenant_id,
+        ),
+    )
+
+
 class MemoryProductStore:
     category = ServiceIdentityStoreKind.DURABLE
 
@@ -93,6 +122,7 @@ class MemoryProductStore:
         self,
         *,
         tenant_id: str,
+        subject_id: str,
         idempotency_key: str,
         request_fingerprint: str,
         public_id: str,
@@ -111,6 +141,7 @@ class MemoryProductStore:
             return ProductOperationReservation(operation=existing, created=False)
         operation = ProductOperation(
             tenant_id=tenant_id,
+            subject_id=subject_id,
             public_id=public_id,
             work_id=work_id,
             idempotency_key=idempotency_key,
@@ -434,9 +465,19 @@ def test_public_service_enforces_tenant_lookup_idempotency_and_safe_projection()
     public_id = created.json()["id"]
     operation = store.by_public_id[public_id]
     assert operation.tenant_id == "tenant-a"
+    assert operation.subject_id == "alice"
     assert operation.session_id
     assert operation.task_id
     assert operation.work_id in store.claimed_work_ids
+    task = asyncio.run(service.cayu_app.task_store.load_task(operation.task_id))
+    assert task is not None
+    assert task.invocation.origin == InvocationOrigin(
+        trust=InvocationOriginTrust.SERVER_VERIFIED,
+        subject="alice",
+        tenant="tenant-a",
+    )
+    assert task.invocation.root_session_id == operation.session_id
+    assert task.invocation.source is TaskExecutionSource.PRODUCT_OPERATION
 
     repeated = client.post("/api/operations", headers=headers_a, json={"request": "summarize"})
     assert repeated.status_code == 200
@@ -492,6 +533,7 @@ def test_pending_reservation_is_reconstructed_on_idempotent_redelivery() -> None
     asyncio.run(
         store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="restart-redelivery",
             request_fingerprint=_product_request_fingerprint("recover work"),
             public_id="op_restart",
@@ -528,6 +570,7 @@ def test_background_execution_rejects_agent_fingerprint_drift_and_releases_claim
         task_store = InMemoryTaskStore()
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="agent-drift",
             request_fingerprint=_product_request_fingerprint(
                 "bound work",
@@ -575,6 +618,7 @@ def test_precreated_product_task_is_verified_before_redelivery() -> None:
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="task-created-redelivery",
             request_fingerprint=_product_request_fingerprint("recover work"),
             public_id="op_task_created",
@@ -584,12 +628,7 @@ def test_precreated_product_task_is_verified_before_redelivery() -> None:
             request_text="recover work",
         )
         await service.cayu_app.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
 
         completed = await service.execute_work(reservation.operation.work_id)
@@ -615,6 +654,7 @@ def test_product_task_creation_acknowledgement_loss_is_reconstructed() -> None:
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="task-acknowledgement-loss",
             request_fingerprint=_product_request_fingerprint("recover work"),
             public_id="op_task_acknowledgement",
@@ -639,6 +679,7 @@ def test_existing_session_is_not_redispatched_while_product_task_is_pending() ->
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="session-created-redelivery",
             request_fingerprint=_product_request_fingerprint("do not repeat"),
             public_id="op_session_created",
@@ -648,12 +689,7 @@ def test_existing_session_is_not_redispatched_while_product_task_is_pending() ->
             request_text="do not repeat",
         )
         await service.cayu_app.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
         outcome = await run_to_completion(
             service.cayu_app,
@@ -703,6 +739,7 @@ def test_completed_cayu_work_is_settled_from_receipt_without_redispatch() -> Non
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="completed-redelivery",
             request_fingerprint=_product_request_fingerprint("complete once"),
             public_id="op_completed_redelivery",
@@ -760,6 +797,7 @@ def test_failed_cayu_work_is_settled_without_provider_redispatch() -> None:
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="failed-redelivery",
             request_fingerprint=_product_request_fingerprint("fail once"),
             public_id="op_failed_redelivery",
@@ -808,6 +846,7 @@ def test_result_receipt_is_durable_before_session_completion() -> None:
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="receipt-before-terminal",
             request_fingerprint=_product_request_fingerprint("publish once"),
             public_id="op_receipt_before_terminal",
@@ -880,6 +919,7 @@ def test_result_receipt_advances_only_under_the_current_claim() -> None:
         store = MemoryProductStore()
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="receipt-ordering",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_receipt_ordering",
@@ -993,6 +1033,7 @@ def test_terminal_redelivery_without_result_receipt_stays_pending() -> None:
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="terminal-without-receipt",
             request_fingerprint=_product_request_fingerprint("unreceipted execution"),
             public_id="op_terminal_without_receipt",
@@ -1002,12 +1043,7 @@ def test_terminal_redelivery_without_result_receipt_stays_pending() -> None:
             request_text="unreceipted execution",
         )
         await service.cayu_app.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
         outcome = await run_to_completion(
             service.cayu_app,
@@ -1055,6 +1091,7 @@ def test_terminal_redelivery_rejects_receipt_with_wrong_source_event() -> None:
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="wrong-receipt-source",
             request_fingerprint=_product_request_fingerprint("publish once"),
             public_id="op_wrong_receipt_source",
@@ -1149,6 +1186,7 @@ def test_product_approval_interruption_exposes_bounded_recovery_status() -> None
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="approval-recovery-status",
             request_fingerprint=_product_request_fingerprint("perform approved work"),
             public_id="op_approval_recovery_status",
@@ -1231,6 +1269,7 @@ def test_product_approval_continuation_records_receipt_before_terminal_settlemen
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="approval-continuation-receipt",
             request_fingerprint=_product_request_fingerprint("perform approved work"),
             public_id="op_approval_continuation",
@@ -1300,6 +1339,7 @@ def test_product_continuation_adoption_retry_survives_product_state_changes() ->
         operation = (
             await store.reserve(
                 tenant_id="tenant-a",
+                subject_id="test-subject",
                 idempotency_key="continuation-adoption-retry-operation",
                 request_fingerprint=_product_request_fingerprint("original work"),
                 public_id="op_continuation_adoption_retry",
@@ -1397,6 +1437,7 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="abandoned-session",
             request_fingerprint=_product_request_fingerprint("repair repository"),
             public_id="op_abandoned_session",
@@ -1405,25 +1446,34 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
             task_id="task_abandoned_session",
             request_text="repair repository",
         )
-        await task_store.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+        product_task = await task_store.create_task(
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
         await task_store.start_task(
             reservation.operation.task_id,
             session_id=reservation.operation.session_id,
+            session_invocation=SessionInvocationBinding(
+                id=reservation.operation.session_id,
+                invocation=session_invocation_from_task(
+                    product_task.invocation,
+                    session_id=reservation.operation.session_id,
+                ),
+            ),
         )
         original_message = Message.text("user", reservation.operation.request_text)
         await session_store.create(
-            RunRequest(
-                agent_name=service.agent_name,
-                messages=[original_message],
-                session_id=reservation.operation.session_id,
-                task_id=reservation.operation.task_id,
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name=service.agent_name,
+                    messages=[original_message],
+                    session_id=reservation.operation.session_id,
+                    task_id=reservation.operation.task_id,
+                ),
+                TaskInvocationSnapshot(
+                    id=product_task.id,
+                    session_id=product_task.session_id,
+                    invocation=product_task.invocation,
+                ),
             ),
             identity=profiled_session_identity(
                 provider_name=provider.name,
@@ -1485,6 +1535,7 @@ def test_progressed_product_work_release_reconciles_lost_acknowledgement() -> No
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="release-acknowledgement-loss",
             request_fingerprint=_product_request_fingerprint("do not repeat"),
             public_id="op_release_acknowledgement",
@@ -1495,15 +1546,20 @@ def test_progressed_product_work_release_reconciles_lost_acknowledgement() -> No
         )
         task_store = service.cayu_app.task_store
         assert task_store is not None
-        await task_store.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+        product_task = await task_store.create_task(
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
-        await task_store.start_task(reservation.operation.task_id)
+        await task_store.start_task(
+            reservation.operation.task_id,
+            session_id=reservation.operation.session_id,
+            session_invocation=SessionInvocationBinding(
+                id=reservation.operation.session_id,
+                invocation=session_invocation_from_task(
+                    product_task.invocation,
+                    session_id=reservation.operation.session_id,
+                ),
+            ),
+        )
 
         redelivered = await service.execute_work(reservation.operation.work_id)
 
@@ -1538,6 +1594,7 @@ def test_recovery_status_reconciles_lost_acknowledgement() -> None:
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="recovery-status-acknowledgement-loss",
             request_fingerprint=_product_request_fingerprint("recover later"),
             public_id="op_recovery_status_acknowledgement",
@@ -1548,15 +1605,20 @@ def test_recovery_status_reconciles_lost_acknowledgement() -> None:
         )
         task_store = service.cayu_app.task_store
         assert task_store is not None
-        await task_store.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+        product_task = await task_store.create_task(
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
-        await task_store.start_task(reservation.operation.task_id)
+        await task_store.start_task(
+            reservation.operation.task_id,
+            session_id=reservation.operation.session_id,
+            session_invocation=SessionInvocationBinding(
+                id=reservation.operation.session_id,
+                invocation=session_invocation_from_task(
+                    product_task.invocation,
+                    session_id=reservation.operation.session_id,
+                ),
+            ),
+        )
 
         pending = await service.execute_work(reservation.operation.work_id)
 
@@ -1586,6 +1648,7 @@ def test_progressed_product_work_release_resists_caller_cancellation() -> None:
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="cancelled-release",
             request_fingerprint=_product_request_fingerprint("do not repeat"),
             public_id="op_cancelled_release",
@@ -1596,15 +1659,20 @@ def test_progressed_product_work_release_resists_caller_cancellation() -> None:
         )
         task_store = service.cayu_app.task_store
         assert task_store is not None
-        await task_store.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+        product_task = await task_store.create_task(
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
-        await task_store.start_task(reservation.operation.task_id)
+        await task_store.start_task(
+            reservation.operation.task_id,
+            session_id=reservation.operation.session_id,
+            session_invocation=SessionInvocationBinding(
+                id=reservation.operation.session_id,
+                invocation=session_invocation_from_task(
+                    product_task.invocation,
+                    session_id=reservation.operation.session_id,
+                ),
+            ),
+        )
 
         execution = asyncio.create_task(service.execute_work(reservation.operation.work_id))
         await store.release_started.wait()
@@ -1638,6 +1706,7 @@ def test_product_reconciliation_failure_releases_execution_claim() -> None:
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="reconciliation-release",
             request_fingerprint=_product_request_fingerprint("recover later"),
             public_id="op_reconciliation_release",
@@ -1671,6 +1740,7 @@ def test_progressed_recovery_failure_releases_execution_claim(monkeypatch) -> No
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="recovery-failure-release",
             request_fingerprint=_product_request_fingerprint("recover later"),
             public_id="op_recovery_failure_release",
@@ -1681,25 +1751,34 @@ def test_progressed_recovery_failure_releases_execution_claim(monkeypatch) -> No
         )
         task_store = service.cayu_app.task_store
         assert task_store is not None
-        await task_store.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
-            )
+        product_task = await task_store.create_task(
+            _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
         await task_store.start_task(
             reservation.operation.task_id,
             session_id=reservation.operation.session_id,
+            session_invocation=SessionInvocationBinding(
+                id=reservation.operation.session_id,
+                invocation=session_invocation_from_task(
+                    product_task.invocation,
+                    session_id=reservation.operation.session_id,
+                ),
+            ),
         )
         original_message = Message.text("user", reservation.operation.request_text)
         await service.cayu_app.session_store.create(
-            RunRequest(
-                agent_name=service.agent_name,
-                messages=[original_message],
-                session_id=reservation.operation.session_id,
-                task_id=reservation.operation.task_id,
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name=service.agent_name,
+                    messages=[original_message],
+                    session_id=reservation.operation.session_id,
+                    task_id=reservation.operation.task_id,
+                ),
+                TaskInvocationSnapshot(
+                    id=product_task.id,
+                    session_id=product_task.session_id,
+                    invocation=product_task.invocation,
+                ),
             ),
             identity=SessionIdentity(
                 provider_name=provider.name,
@@ -1736,7 +1815,10 @@ def test_progressed_recovery_failure_releases_execution_claim(monkeypatch) -> No
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("secret_field", ["tenant_id", "idempotency_key", "request"])
+@pytest.mark.parametrize(
+    "secret_field",
+    ["tenant_id", "subject_id", "idempotency_key", "request"],
+)
 def test_secret_bearing_product_values_are_rejected_before_reservation(
     secret_field: str,
 ) -> None:
@@ -1746,7 +1828,7 @@ def test_secret_bearing_product_values_are_rejected_before_reservation(
     async def product_auth(_request: Request) -> ProductPrincipal:
         return ProductPrincipal(
             tenant_id=(secret if secret_field == "tenant_id" else "tenant-a"),
-            subject_id="alice",
+            subject_id=(secret if secret_field == "subject_id" else "alice"),
         )
 
     service, _store, provider = _build_service(
@@ -1779,6 +1861,7 @@ def test_concurrent_product_redelivery_does_not_execute_claimed_work_twice(
         service, _store, provider = _build_service(product_store=store)
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="concurrent-redelivery",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_concurrent",
@@ -1836,6 +1919,7 @@ def test_execution_claim_is_rechecked_before_provider_execution() -> None:
         service, _store, provider = _build_service(product_store=store)
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="pre-provider-fence",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_pre_provider_fence",
@@ -2040,6 +2124,7 @@ def test_product_lookup_must_preserve_authenticated_tenant_authority() -> None:
             del tenant_id
             return ProductOperation(
                 tenant_id="tenant-b",
+                subject_id="foreign-subject",
                 public_id=public_id,
                 work_id="foreign-work",
                 idempotency_key="foreign-key",
@@ -2126,6 +2211,7 @@ def test_product_execution_claim_must_preserve_requested_work_authority() -> Non
         service, _store, provider = _build_service(product_store=store)
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="work-authority",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_authority",
@@ -2140,6 +2226,32 @@ def test_product_execution_claim_must_preserve_requested_work_authority() -> Non
         assert provider.requests == []
 
     asyncio.run(scenario())
+
+
+def test_product_execution_claim_cannot_replace_the_authenticated_subject() -> None:
+    class InconsistentSubjectStore(MemoryProductStore):
+        async def claim_execution(self, **kwargs) -> ProductOperationExecutionClaim | None:
+            claim = await super().claim_execution(**kwargs)
+            assert claim is not None
+            return claim.model_copy(
+                update={
+                    "operation": claim.operation.model_copy(
+                        update={"subject_id": "replacement-subject"}
+                    )
+                }
+            )
+
+    service, _store, provider = _build_service(product_store=InconsistentSubjectStore())
+    response = TestClient(service.asgi_app, raise_server_exceptions=False).post(
+        "/api/operations",
+        headers={"Authorization": "Bearer tenant-a", "Idempotency-Key": "subject-authority"},
+        json={"request": "work"},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {"detail": "Internal server error."}
+    assert provider.requests == []
 
 
 def test_product_lookup_identifiers_are_bounded_before_store_access() -> None:
@@ -2190,6 +2302,37 @@ def test_product_finalization_must_confirm_terminal_state() -> None:
     response = TestClient(service.asgi_app, raise_server_exceptions=False).post(
         "/api/operations",
         headers={"Authorization": "Bearer tenant-a", "Idempotency-Key": "bad-finish"},
+        json={"request": "work"},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {"detail": "Internal server error."}
+    assert len(provider.requests) == 1
+
+
+def test_product_finalization_must_preserve_subject_authority() -> None:
+    class InconsistentFinalizationStore(MemoryProductStore):
+        async def finish(
+            self,
+            *,
+            work_id: str,
+            claim_id: str,
+            status: str,
+            result: str | None,
+        ) -> ProductOperation:
+            operation = await super().finish(
+                work_id=work_id,
+                claim_id=claim_id,
+                status=status,
+                result=result,
+            )
+            return operation.model_copy(update={"subject_id": "replacement-subject"})
+
+    service, _store, provider = _build_service(product_store=InconsistentFinalizationStore())
+    response = TestClient(service.asgi_app, raise_server_exceptions=False).post(
+        "/api/operations",
+        headers={"Authorization": "Bearer tenant-a", "Idempotency-Key": "bad-finish-subject"},
         json={"request": "work"},
     )
 
@@ -2269,6 +2412,7 @@ def test_public_projection_redacts_durable_result_on_read_and_idempotent_post() 
     pending = asyncio.run(
         store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="stored-secret",
             request_fingerprint=_product_request_fingerprint("safe work"),
             public_id="op_stored_secret",
@@ -2442,6 +2586,7 @@ def test_failed_result_publication_is_reconciled_without_provider_redispatch(
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="failed-publication-redelivery",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_failed_publication",
@@ -2473,6 +2618,7 @@ def test_public_projection_fails_closed_when_public_id_contains_a_secret() -> No
     store = MemoryProductStore()
     pending = ProductOperation(
         tenant_id="tenant-a",
+        subject_id="alice",
         public_id=secret,
         work_id="work_unsafe_authority",
         idempotency_key="unsafe-authority",
@@ -2559,6 +2705,7 @@ def test_stream_observation_failure_keeps_ambiguous_product_work_pending(
         service, _store, provider = _build_service(product_store=store)
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="ambiguous-stream-observation",
             request_fingerprint=_product_request_fingerprint("work once"),
             public_id="op_ambiguous_stream_observation",
@@ -3017,6 +3164,7 @@ def test_execution_cancellation_remains_authoritative_and_terminalizes_work(
     async def cancel_during_execution() -> asyncio.CancelledError:
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="cancelled",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_cancelled",
@@ -3049,6 +3197,7 @@ def test_completion_finalization_settles_before_cancellation_is_redelivered() ->
     async def cancel_during_completion() -> asyncio.CancelledError:
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="completed",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_completed",
@@ -3098,6 +3247,7 @@ def test_execution_heartbeat_remains_active_through_terminal_settlement(
     async def scenario() -> None:
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="heartbeat-through-finish",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_heartbeat",
@@ -3149,6 +3299,7 @@ def test_terminal_settlement_wins_an_in_flight_heartbeat(monkeypatch) -> None:
     async def scenario() -> None:
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="settlement-heartbeat-race",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_settlement_heartbeat",
@@ -3202,6 +3353,7 @@ def test_execution_stops_before_a_blocked_heartbeat_can_outlive_its_lease(
     async def scenario() -> None:
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="heartbeat-timeout",
             request_fingerprint=_product_request_fingerprint("work"),
             public_id="op_heartbeat_timeout",

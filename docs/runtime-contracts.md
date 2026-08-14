@@ -175,12 +175,12 @@ and the application-owned identity store declares durable state.
 
 Product authorization remains outside Cayu's native stores. The authenticated
 product dependency returns trusted subject and tenant identity; the product
-store atomically binds tenant, public resource, idempotency fingerprint, opaque
+store atomically binds subject, tenant, public resource, idempotency fingerprint, opaque
 work identity, and private Cayu session/task identities. Existing-resource
 operations perform a tenant-qualified product lookup before using either Cayu
 identity. Before reservation, the maintained assembler compares every
-caller-controlled value that will cross this durable boundary—the trusted tenant
-identity, idempotency key, and request text—against the application's configured
+caller-controlled value that will cross this durable boundary—the trusted subject
+and tenant identity, idempotency key, and request text—against the application's configured
 workload-secret registry. A collision is rejected without writing; the assembler
 does not persist a raw secret or replace executable request text with a redaction
 marker. Background execution receives only the opaque work identity and
@@ -207,6 +207,9 @@ Application `ProductOperationStore` implementations provide the exact indexed
 `find_by_session_id`, claim-fenced `record_result_receipt`, and bounded
 `record_recovery_status` operations used by this contract; these are durable
 authority operations, not scans or optional compatibility hooks.
+The store retains the originating subject on the pending operation so a
+replacement worker reconstructs the exact `server_verified` task origin after
+process loss; it is never returned by the public product projection.
 This boundary does not promise exactly-once provider effects if a process stalls
 beyond its lease or dies after external work begins; complete worker-replacement
 and external-effect reconciliation remain application concerns. Redelivery can
@@ -2024,14 +2027,14 @@ Creates and updates optional durable units of work.
 
 A task is not a PM-specific object. It is a generic work item that can represent a webhook job, background agent run, workflow step, orchestrator assignment, coding task, invoice-processing job, report generation job, or external automation. Simple one-off agent calls do not need tasks; they can use only sessions and events.
 
-`Task` values have type, status, optional session/parent-task/assigned-agent identity, an optional `available_at` UTC availability gate, JSON-object input, optional JSON-object result/error, JSON-object metadata, and lifecycle timestamps. `TaskStore` exposes:
+`Task` values have type, status, optional session/parent-task/assigned-agent identity, an optional `available_at` UTC availability gate, JSON-object input, optional JSON-object result/error, JSON-object metadata, lifecycle timestamps, and immutable bounded invocation provenance. `TaskStore` exposes:
 
 - `create_task(TaskCreate(...))`
-- `create_running_task(TaskCreate(session_id=...))`
+- `create_running_task(TaskCreate(session_id=...), session_invocation=...)`
 - `load_task(task_id)`
 - `list_tasks(TaskQuery(...))`
-- `start_task(task_id, session_id=...)`
-- `attach_task(task_id, session_id=..., worker_id=...)`
+- `start_task(task_id, session_id=..., session_invocation=...)`
+- `attach_task(task_id, session_id=..., session_invocation=..., worker_id=...)`
 - `pause_task(task_id, reason=..., payload=...)`
 - `block_task(task_id, reason=..., payload=...)`
 - `mark_task_needs_attention(task_id, reason=..., payload=...)`
@@ -2101,9 +2104,48 @@ requires revision 38. Migrate shared stores before deploying binaries that use
 the new capability; no receipts are inferred for legacy terminal tasks.
 
 `create_running_task(...)` performs one store-atomic insert with `status=running`,
-the required session attachment, and `started_at`. It is intended for control-plane
-commands that have already durably claimed their session and must not expose a
-crash window containing an attached, unclaimable pending task.
+the required session attachment, matching immutable session provenance, and
+`started_at`. It is intended for control-plane commands that have already
+durably claimed their session and must not expose a crash window containing an
+attached, unclaimable pending task. The session binding is required; stores do
+not infer authority from the session ID alone.
+
+Every task has a versioned `TaskInvocation` containing the root origin, a
+Cayu-minted `root_invocation_id`, an optional historical `root_session_id`, and
+the typed boundary that created the task. A direct SDK task is `unattributed`
+unless trusted host code supplies `TaskCreate.invocation_origin`, which Cayu
+records as `host_asserted`. Use `task_create_with_execution_source(...)` to
+classify trusted webhook and scheduled roots. Authenticated server and product
+boundaries mint `server_verified` origins internally; public request JSON cannot
+claim those sources or that trust level.
+
+`Task.id`, `Task.parent_task_id`, and `Task.session_id` remain the canonical
+task/session graph. Child tasks inherit their parent's exact root origin and
+invocation ID while their own source identifies the creation boundary. Claim,
+lease renewal, release, reclaim, worker replacement, scheduling eligibility,
+status changes, and terminal settlement never rewrite provenance. A task-backed
+session inherits the task origin and invocation ID and records `task` as the
+session creation source. Session attachment requires matching bounded session
+provenance; an unrelated session is rejected before task lifecycle state
+changes.
+
+Trusted task creation and attachment boundaries carry session provenance as a
+`SessionInvocationBinding`, which binds the immediate session ID to its
+immutable `SessionInvocation`. Stores must reject a non-null `TaskCreate.session_id`
+or lifecycle `session_id` that differs from the binding before inserting or
+updating a task. Starting a task that already carries `Task.session_id` also
+requires the matching binding even when `start_task(...)` omits its optional
+`session_id`; omission cannot bypass attachment validation or reassign a
+pre-bound task. A durable dispatch queue item is intentionally session-unbound
+so a worker pool can claim it; it may still inherit root provenance from a
+binding while the target session ID remains inside the dispatch payload. This
+does not attach the queue item structurally to that session.
+
+Configured workload secrets are rejected from task origin identity at the
+`CayuApp` boundary. Provenance is audit evidence, not authorization, tenant
+filtering, billing authority, or permission to use a task payload. Tokens,
+credentials, webhook bodies, prompts, and arbitrary task metadata are not
+provenance fields.
 
 `TaskCreate.available_at` and `Task.available_at` accept only timezone-aware
 datetimes and normalize them to UTC. Omitting the field means immediate
@@ -2139,6 +2181,21 @@ index. Pre-34 task workers do not enforce the gate and could claim future work
 early, so they must not share a revision-34 database. Stop older workers and
 migrate SQLite and PostgreSQL task databases before starting this build; an
 application-only rollback across the boundary is rejected.
+
+Breaking schema revision 39 adds required task invocation provenance. Populated
+pre-39 task databases are rejected rather than assigned fabricated origins;
+empty databases migrate normally. Custom `TaskStore` implementations must mint
+the final task ID, load and lock any parent, call
+`task_invocation_for_create(...)`, and persist the returned `TaskInvocation`
+inside the same atomic create boundary. They must preserve it exactly on every
+later update and validate matching session provenance during start/attachment.
+They must also implement the bounded `load_invocation_snapshot(...)` projection
+used before task-backed session creation; loading task payloads or metadata for
+that projection does not satisfy the contract.
+There is no compatibility shim or legacy provenance value.
+Custom `SessionStore` implementations must also provide the bounded
+`load_invocation_snapshot(...)` projection used by task and dispatch boundaries;
+materializing arbitrary session metadata there does not satisfy the contract.
 
 Valid task lifecycle is intentionally small for the foundation:
 
@@ -2208,7 +2265,7 @@ ordinary `ValueError` failures.
 
 Held tasks are not reclaimed by lease cleanup. If a worker claims a task and discovers a dependency or human-review requirement before attaching a session, it should call `block_task(...)`, `pause_task(...)`, or `mark_task_needs_attention(...)`; these clear worker ownership and lease state. Later, app/operator code can call `resume_task(...)` to return the task to the pending queue.
 
-The server exposes the same lifecycle for operator/backend integrations through `POST /api/tasks/{task_id}/pause`, `POST /api/tasks/{task_id}/block`, `POST /api/tasks/{task_id}/needs-attention`, and `POST /api/tasks/{task_id}/resume`. Hold endpoints accept optional `reason` and `payload` fields. `GET /api/tasks` stays a compact list view and does not include task input/result/error/metadata; it supports text search with `q`, filtering by status, type, session, parent task, assigned agent, offset/limit pagination, and `order_by` (`updated_at_desc` by default). Use `GET /api/tasks/{task_id}` to fetch full task detail, including input/result/error/metadata, for a selected task. Lifecycle mutation responses also return the full task detail for the task that was changed.
+The server exposes the same lifecycle for operator/backend integrations through `POST /api/tasks/{task_id}/pause`, `POST /api/tasks/{task_id}/block`, `POST /api/tasks/{task_id}/needs-attention`, and `POST /api/tasks/{task_id}/resume`. Hold endpoints accept optional `reason` and `payload` fields. `GET /api/tasks` stays a compact list view and does not include task input/result/error/metadata; it supports text search with `q`, filtering by status, type, session, parent task, assigned agent, offset/limit pagination, and `order_by` (`updated_at_desc` by default). Use `GET /api/tasks/{task_id}` to fetch full task detail, including the bounded invocation record and input/result/error/metadata, for a selected task. Task lists omit provenance identity. Lifecycle mutation responses also return the full task detail for the task that was changed.
 
 This is a durable ownership primitive, not a project-management system, retry scheduler, DAG engine, or agent messaging table. Apps own assignment policy, priorities, dependency graphs, retry timing, human workflows, and worker deployment. `examples/task_worker_loop.py` shows the queue-worker pattern with claim, heartbeat, run, failure, and reclaim paths.
 

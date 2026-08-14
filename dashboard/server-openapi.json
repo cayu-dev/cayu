@@ -2588,6 +2588,9 @@
             "title": "Input",
             "type": "object"
           },
+          "invocation": {
+            "$ref": "#/components/schemas/ApiTaskInvocation"
+          },
           "lease_expires_at": {
             "anyOf": [
               {
@@ -2724,6 +2727,7 @@
           "created_at",
           "updated_at",
           "completed_at",
+          "invocation",
           "input",
           "result",
           "error",
@@ -2731,6 +2735,47 @@
           "started_at"
         ],
         "title": "ApiTaskDetail",
+        "type": "object"
+      },
+      "ApiTaskInvocation": {
+        "additionalProperties": false,
+        "properties": {
+          "origin": {
+            "$ref": "#/components/schemas/ApiInvocationOrigin"
+          },
+          "root_invocation_id": {
+            "format": "uuid4",
+            "title": "Root Invocation Id",
+            "type": "string"
+          },
+          "root_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Root Session Id"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/TaskExecutionSource"
+          }
+        },
+        "required": [
+          "schema_version",
+          "origin",
+          "root_invocation_id",
+          "root_session_id",
+          "source"
+        ],
+        "title": "ApiTaskInvocation",
         "type": "object"
       },
       "ApiTaskListItem": {
@@ -10278,6 +10323,7 @@
           "sdk_run",
           "fork",
           "subagent",
+          "task",
           "workflow_step"
         ],
         "title": "SessionExecutionSource",
@@ -11414,6 +11460,19 @@
         },
         "title": "TaskAggregateFilter",
         "type": "object"
+      },
+      "TaskExecutionSource": {
+        "description": "The trusted boundary that created one durable task.",
+        "enum": [
+          "http_run",
+          "product_operation",
+          "scheduled",
+          "sdk_task",
+          "task_dispatch",
+          "webhook"
+        ],
+        "title": "TaskExecutionSource",
+        "type": "string"
       },
       "TaskHoldBody": {
         "properties": {

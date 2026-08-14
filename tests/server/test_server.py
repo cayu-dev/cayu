@@ -24,6 +24,7 @@ httpx = pytest.importorskip("httpx")
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
 from cayu import (
     REDACTED_SECRET,
@@ -108,6 +109,7 @@ from cayu.runtime._event_projection import (
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.runtime.sessions import run_request_with_runtime_generated_authority
 from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 from cayu.server import (
     DashboardConfig,
@@ -658,7 +660,7 @@ def test_mutation_acceptance_log_projects_private_session_identity(caplog) -> No
 
 def test_server_run_task_setup_failure_finalizes_claimed_session(caplog) -> None:
     class FailingTaskStore(InMemoryTaskStore):
-        async def create_running_task(self, request):
+        async def create_running_task(self, request, *, session_invocation):
             raise OSError("task store unavailable with secret-token")
 
     app = CayuApp(
@@ -2024,7 +2026,15 @@ def test_server_task_detail_returns_full_payload() -> None:
                 metadata={"tenant": "acme", "priority": "high"},
             )
         )
-        await task_store.start_task("detail_task", session_id="sess_detail")
+        await task_store.start_task(
+            "detail_task",
+            session_id="sess_detail",
+            session_invocation=await task_backed_session_invocation(
+                task_store,
+                "detail_task",
+                "sess_detail",
+            ),
+        )
         await task_store.complete_task("detail_task", {"accepted": True})
 
     asyncio.run(setup_task())
@@ -2149,7 +2159,15 @@ def test_server_task_lifecycle_endpoints_report_invalid_transitions() -> None:
 
     async def setup_task() -> None:
         await task_store.create_task(TaskCreate(task_id="attached_task", type="review"))
-        await task_store.start_task("attached_task", session_id="sess_attached")
+        await task_store.start_task(
+            "attached_task",
+            session_id="sess_attached",
+            session_invocation=await task_backed_session_invocation(
+                task_store,
+                "attached_task",
+                "sess_attached",
+            ),
+        )
 
     asyncio.run(setup_task())
 
@@ -9601,10 +9619,13 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
             self.create_started = asyncio.Event()
             self.release_create = asyncio.Event()
 
-        async def create_running_task(self, request):
+        async def create_running_task(self, request, *, session_invocation):
             self.create_started.set()
             await self.release_create.wait()
-            return await super().create_running_task(request)
+            return await super().create_running_task(
+                request,
+                session_invocation=session_invocation,
+            )
 
     task_store = BlockingTaskStore()
     app = CayuApp(task_store=task_store, enable_logging=False)
@@ -9613,6 +9634,19 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
     session_id = "session_interrupt_during_acceptance_bookkeeping"
 
     async def exercise() -> tuple[list[Event], list[dict[str, str]], SessionStatus]:
+        async def create_task_after_accept(_event: Event) -> None:
+            snapshot = await app.session_store.load_invocation_snapshot(session_id)
+            if snapshot is None:
+                raise AssertionError("Accepted run session was not persisted.")
+            await task_store.create_running_task(
+                TaskCreate(
+                    task_id="task_interrupt_during_acceptance_bookkeeping",
+                    type="run",
+                    session_id=session_id,
+                ),
+                session_invocation=snapshot,
+            )
+
         async def interrupt() -> list[Event]:
             return [
                 event
@@ -9621,25 +9655,21 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
                 )
             ]
 
+        run_request = run_request_with_runtime_generated_authority(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                task_id="task_interrupt_during_acceptance_bookkeeping",
+                messages=[Message.text("user", "hello")],
+            ),
+            "task_id",
+        )
         response_task = asyncio.create_task(
             _accepted_event_stream_response(
-                app.run(
-                    RunRequest(
-                        agent_name="assistant",
-                        session_id=session_id,
-                        task_id="task_interrupt_during_acceptance_bookkeeping",
-                        messages=[Message.text("user", "hello")],
-                    )
-                ),
+                app.run(run_request),
                 cayu_app=app,
                 session_id=session_id,
-                after_accept=lambda _event: task_store.create_running_task(
-                    TaskCreate(
-                        task_id="task_interrupt_during_acceptance_bookkeeping",
-                        type="run",
-                        session_id=session_id,
-                    )
-                ),
+                after_accept=create_task_after_accept,
             )
         )
         await asyncio.wait_for(task_store.create_started.wait(), timeout=1)
@@ -9677,12 +9707,12 @@ def test_run_route_interrupt_during_acceptance_state_read_keeps_task_linked() ->
             self.state_read_started = asyncio.Event()
             self.release_state_read = asyncio.Event()
 
-        async def load_state(self, session_id: str):
+        async def load_invocation_snapshot(self, session_id: str):
             if self.block_next_state_read:
                 self.block_next_state_read = False
                 self.state_read_started.set()
                 await self.release_state_read.wait()
-            return await super().load_state(session_id)
+            return await super().load_invocation_snapshot(session_id)
 
     session_store = BlockingAcceptanceStateStore()
     task_store = InMemoryTaskStore()

@@ -15,6 +15,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from tests.core.task_invocation_fixtures import unattributed_task_invocation
 
 from cayu import (
     EnvironmentFactoryRequest,
@@ -226,6 +227,7 @@ def test_pr_review_session_identity_includes_head_sha() -> None:
             "head_sha": "abcdef1234567890",
             "base_ref": "main",
         },
+        invocation=unattributed_task_invocation(),
     )
 
     asyncio.run(mod._handle_pr_review_task(FakeApp(), task, "worker-1"))

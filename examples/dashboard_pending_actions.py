@@ -588,12 +588,19 @@ async def seed_tasks(app: CayuApp) -> None:
             task_id="queue_running_session",
             type="run",
             title="Attached approval session",
+            session_id="sess_dashboard_awaiting_approval",
             assigned_agent_name="demo-approval",
         )
     )
+    approval_session = await app.session_store.load_invocation_snapshot(
+        "sess_dashboard_awaiting_approval"
+    )
+    if approval_session is None:
+        raise RuntimeError("Dashboard approval demo session was not created.")
     await app.task_store.start_task(
         "queue_running_session",
         session_id="sess_dashboard_awaiting_approval",
+        session_invocation=approval_session,
     )
     await app.create_task(
         TaskCreate(

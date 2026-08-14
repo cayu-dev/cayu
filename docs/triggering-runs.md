@@ -28,6 +28,26 @@ inherit both the root origin and Cayu-minted `root_invocation_id`
 automatically; applications must not copy either into child requests. That
 invocation ID remains unique even if a deleted root's session ID is reused.
 
+Task-only roots use the same bounded origin contract. Trusted application code
+may add `invocation_origin=InvocationOriginClaim(...)` to `TaskCreate`, which is
+recorded as `host_asserted`, and classify a webhook or scheduled root without
+putting that authority in task metadata:
+
+```python
+request = task_create_with_execution_source(
+    TaskCreate(
+        type="nightly-report",
+        invocation_origin=InvocationOriginClaim(subject="scheduler:nightly"),
+        available_at=next_run,
+    ),
+    source=TaskExecutionSource.SCHEDULED,
+)
+task = await app.create_task(request)
+```
+
+An unattributed `TaskCreate` remains valid. Parent tasks, durable dispatch, and
+task-backed sessions inherit the immutable root origin automatically.
+
 | Your trigger | Use | Notes |
 | --- | --- | --- |
 | A synchronous request you can await in-process | `app.run(RunRequest(...))` | The base case. Returns an async event stream. No durability beyond the session stores. |

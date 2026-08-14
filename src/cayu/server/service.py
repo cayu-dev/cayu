@@ -48,6 +48,11 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message
 from cayu.runtime.app import CayuApp
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    TaskExecutionSource,
+)
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.service_manifest import (
     PublicServiceManifest,
@@ -67,7 +72,12 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
 )
-from cayu.runtime.tasks import Task, TaskCreate, TaskStatus
+from cayu.runtime.tasks import (
+    Task,
+    TaskCreate,
+    TaskStatus,
+    task_create_with_runtime_invocation,
+)
 from cayu.runtime.usage import is_conversational_model_completion_payload
 from cayu.server.config import (
     AuthenticatedAccess,
@@ -552,6 +562,7 @@ class ProductOperation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     tenant_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    subject_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
     public_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
     work_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
     idempotency_key: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
@@ -566,6 +577,7 @@ class ProductOperation(BaseModel):
 
     @field_validator(
         "tenant_id",
+        "subject_id",
         "public_id",
         "work_id",
         "idempotency_key",
@@ -705,6 +717,7 @@ class ProductOperationStore(Protocol):
         self,
         *,
         tenant_id: str,
+        subject_id: str,
         idempotency_key: str,
         request_fingerprint: str,
         public_id: str,
@@ -918,6 +931,16 @@ class CayuService:
     async def execute_work(self, work_id: str) -> ProductOperation | None:
         """Reload trusted ownership from product storage, then run opaque queued work."""
 
+        return await self._execute_work(work_id, expected_operation=None)
+
+    async def _execute_work(
+        self,
+        work_id: str,
+        *,
+        expected_operation: ProductOperation | None,
+    ) -> ProductOperation | None:
+        """Execute work, optionally retaining authority already accepted by this request."""
+
         work_id = require_durable_clean_nonblank(work_id, "work_id")
         if len(work_id) > MAX_PRODUCT_IDENTITY_CHARS:
             raise ValueError(f"work_id must not exceed {MAX_PRODUCT_IDENTITY_CHARS} characters.")
@@ -938,10 +961,13 @@ class CayuService:
             )
         if type(claim.acquired) is not bool:
             raise TypeError("Product store returned an invalid execution claim.")
+        expected_claim_authority: dict[str, object] = {"work_id": work_id}
+        if expected_operation is not None:
+            expected_claim_authority = _product_operation_authority_fields(expected_operation)
         operation = _validated_product_store_operation(
             claim.operation,
             source="claim_execution",
-            expected={"work_id": work_id},
+            expected=expected_claim_authority,
         )
         if not claim.acquired:
             return operation
@@ -1094,7 +1120,7 @@ async def _settle_product_run_outcome(
         raise RuntimeError(f"Unsupported product runtime outcome: {outcome_status.value}.")
     return await _finish_product_operation_resisting_cancellation(
         service.product_store,
-        work_id=operation.work_id,
+        operation=operation,
         claim_id=claim_id,
         status=status,
         result=result,
@@ -1179,14 +1205,7 @@ async def _release_and_reload_pending_product_operation(
         reloaded,
         source="find",
         expected={
-            "tenant_id": operation.tenant_id,
-            "public_id": operation.public_id,
-            "work_id": operation.work_id,
-            "idempotency_key": operation.idempotency_key,
-            "request_fingerprint": operation.request_fingerprint,
-            "session_id": operation.session_id,
-            "task_id": operation.task_id,
-            "request_text": operation.request_text,
+            **_product_operation_authority_fields(operation),
         },
     )
 
@@ -1210,14 +1229,7 @@ async def _record_product_recovery_status(
         stored,
         source="record_recovery_status",
         expected={
-            "tenant_id": operation.tenant_id,
-            "public_id": operation.public_id,
-            "work_id": operation.work_id,
-            "idempotency_key": operation.idempotency_key,
-            "request_fingerprint": operation.request_fingerprint,
-            "session_id": operation.session_id,
-            "task_id": operation.task_id,
-            "request_text": operation.request_text,
+            **_product_operation_authority_fields(operation),
             "status": "pending",
             "recovery_status": recovery_status,
         },
@@ -1363,11 +1375,12 @@ def _bounded_public_result_text(value: str) -> str:
     return value[:MAX_PUBLIC_RESULT_CHARS]
 
 
-def _product_operation_loop_policy_authority(operation: ProductOperation) -> dict[str, str]:
-    """Return immutable product authority used by continuation policy behavior."""
+def _product_operation_authority_fields(operation: ProductOperation) -> dict[str, object]:
+    """Return every immutable product-store authority field."""
 
     return {
         "tenant_id": operation.tenant_id,
+        "subject_id": operation.subject_id,
         "public_id": operation.public_id,
         "work_id": operation.work_id,
         "idempotency_key": operation.idempotency_key,
@@ -1376,6 +1389,12 @@ def _product_operation_loop_policy_authority(operation: ProductOperation) -> dic
         "task_id": operation.task_id,
         "request_text": operation.request_text,
     }
+
+
+def _product_operation_loop_policy_authority(operation: ProductOperation) -> dict[str, object]:
+    """Return immutable product authority used by continuation policy behavior."""
+
+    return _product_operation_authority_fields(operation)
 
 
 class _ProductResultReceiptPolicy(LoopPolicy):
@@ -1510,14 +1529,7 @@ class _ProductContinuationReceiptPolicy(LoopPolicy):
             claim.operation,
             source="claim_execution",
             expected={
-                "tenant_id": self._operation.tenant_id,
-                "public_id": self._operation.public_id,
-                "work_id": self._operation.work_id,
-                "idempotency_key": self._operation.idempotency_key,
-                "request_fingerprint": self._operation.request_fingerprint,
-                "session_id": self._operation.session_id,
-                "task_id": self._operation.task_id,
-                "request_text": self._operation.request_text,
+                **_product_operation_authority_fields(self._operation),
             },
         )
         if claimed_operation.status != "pending":
@@ -1671,6 +1683,15 @@ async def _create_or_verify_product_task(
         session_id=operation.session_id,
         assigned_agent_name=service.agent_name,
     )
+    request = task_create_with_runtime_invocation(
+        request,
+        source=TaskExecutionSource.PRODUCT_OPERATION,
+        verified_origin=InvocationOrigin(
+            trust=InvocationOriginTrust.SERVER_VERIFIED,
+            subject=operation.subject_id,
+            tenant=operation.tenant_id,
+        ),
+    )
     try:
         task = await service.cayu_app.create_task(request)
     except Exception as creation_error:
@@ -1753,6 +1774,14 @@ def _validated_product_task(
         or task.session_id != operation.session_id
         or task.parent_task_id is not None
         or task.assigned_agent_name != agent_name
+        or task.invocation.origin
+        != InvocationOrigin(
+            trust=InvocationOriginTrust.SERVER_VERIFIED,
+            subject=operation.subject_id,
+            tenant=operation.tenant_id,
+        )
+        or task.invocation.root_session_id != operation.session_id
+        or task.invocation.source is not TaskExecutionSource.PRODUCT_OPERATION
     ):
         raise RuntimeError("Existing Cayu task conflicts with product work authority.")
     return task
@@ -1898,7 +1927,7 @@ async def _reconcile_terminal_product_work(
             return None
         return await _finish_product_operation_resisting_cancellation(
             service.product_store,
-            work_id=operation.work_id,
+            operation=operation,
             claim_id=claim_id,
             status="failed",
             result=None,
@@ -1913,7 +1942,7 @@ async def _reconcile_terminal_product_work(
         return None
     return await _finish_product_operation_resisting_cancellation(
         service.product_store,
-        work_id=operation.work_id,
+        operation=operation,
         claim_id=claim_id,
         status=receipt.publication_status,
         result=(receipt.result if receipt.publication_status == "completed" else None),
@@ -2181,7 +2210,7 @@ async def _terminalize_failed_product_operation(
     try:
         await _finish_product_operation_resisting_cancellation(
             product_store,
-            work_id=operation.work_id,
+            operation=operation,
             claim_id=claim_id,
             status="failed",
             result=None,
@@ -2210,7 +2239,7 @@ async def _terminalize_failed_product_operation(
 async def _finish_product_operation_resisting_cancellation(
     product_store: ProductOperationStore,
     *,
-    work_id: str,
+    operation: ProductOperation,
     claim_id: str,
     status: Literal["completed", "failed"],
     result: str | None,
@@ -2219,9 +2248,9 @@ async def _finish_product_operation_resisting_cancellation(
     """Settle one terminal product update before propagating caller cancellation."""
 
     async def finish() -> ProductOperation:
-        operation = await _reconcile_ambiguous_product_store_write(
+        finished_operation = await _reconcile_ambiguous_product_store_write(
             lambda: product_store.finish(
-                work_id=work_id,
+                work_id=operation.work_id,
                 claim_id=claim_id,
                 status=status,
                 result=result,
@@ -2229,9 +2258,13 @@ async def _finish_product_operation_resisting_cancellation(
             operation="product operation finalization",
         )
         return _validated_product_store_operation(
-            operation,
+            finished_operation,
             source="finish",
-            expected={"work_id": work_id, "status": status, "result": result},
+            expected={
+                **_product_operation_authority_fields(operation),
+                "status": status,
+                "result": result,
+            },
         )
 
     finalization_task = asyncio.create_task(
@@ -2542,6 +2575,7 @@ def create_agent_service(
             raise HTTPException(status_code=400, detail="A valid Idempotency-Key is required.")
         durable_product_input = {
             "tenant_id": principal.tenant_id,
+            "subject_id": principal.subject_id,
             "idempotency_key": idempotency_key,
             "request": body.request,
         }
@@ -2563,6 +2597,7 @@ def create_agent_service(
         try:
             reservation = await product_store.reserve(
                 tenant_id=principal.tenant_id,
+                subject_id=principal.subject_id,
                 idempotency_key=idempotency_key,
                 request_fingerprint=fingerprint,
                 public_id=candidate_authority["public_id"],
@@ -2588,7 +2623,12 @@ def create_agent_service(
         if reservation.created:
             expected_authority.update(candidate_authority)
             expected_authority.update(
-                {"request_text": body.request, "status": "pending", "result": None}
+                {
+                    "subject_id": principal.subject_id,
+                    "request_text": body.request,
+                    "status": "pending",
+                    "result": None,
+                }
             )
         operation = _validated_product_store_operation(
             reservation.operation,
@@ -2596,20 +2636,17 @@ def create_agent_service(
             expected=expected_authority,
         )
         if operation.status == "pending":
-            completed = await service.execute_work(operation.work_id)
+            completed = await service._execute_work(
+                operation.work_id,
+                expected_operation=operation,
+            )
             if completed is None:
                 raise RuntimeError("Reserved product work disappeared before execution.")
             operation = _validated_product_store_operation(
                 completed,
                 source="execute_work",
                 expected={
-                    "tenant_id": operation.tenant_id,
-                    "public_id": operation.public_id,
-                    "work_id": operation.work_id,
-                    "idempotency_key": operation.idempotency_key,
-                    "request_fingerprint": operation.request_fingerprint,
-                    "session_id": operation.session_id,
-                    "task_id": operation.task_id,
+                    **_product_operation_authority_fields(operation),
                 },
             )
         if not reservation.created:

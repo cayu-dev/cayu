@@ -767,6 +767,7 @@ class SQLiteProductOperationStore:
                     work_id TEXT PRIMARY KEY,
                     public_id TEXT NOT NULL UNIQUE,
                     tenant_id TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     request_fingerprint TEXT NOT NULL,
                     session_id TEXT NOT NULL UNIQUE,
@@ -780,6 +781,15 @@ class SQLiteProductOperationStore:
                     execution_claim_expires_at INTEGER
                 )"""
             )
+            columns = {
+                row[1]: (str(row[2]).upper(), int(row[3]))
+                for row in connection.execute("PRAGMA table_info(product_operations)")
+            }
+            if columns.get("subject_id") != ("TEXT", 1):
+                raise RuntimeError(
+                    "The product operation store predates required invocation "
+                    "provenance. Recreate the prerelease product database."
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -799,6 +809,7 @@ class SQLiteProductOperationStore:
         self,
         *,
         tenant_id: str,
+        subject_id: str,
         idempotency_key: str,
         request_fingerprint: str,
         public_id: str,
@@ -810,6 +821,7 @@ class SQLiteProductOperationStore:
         return await asyncio.to_thread(
             self._reserve_sync,
             tenant_id=tenant_id,
+            subject_id=subject_id,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint,
             public_id=public_id,
@@ -823,6 +835,7 @@ class SQLiteProductOperationStore:
         self,
         *,
         tenant_id: str,
+        subject_id: str,
         idempotency_key: str,
         request_fingerprint: str,
         public_id: str,
@@ -833,6 +846,7 @@ class SQLiteProductOperationStore:
     ) -> ProductOperationReservation:
         requested = ProductOperation(
             tenant_id=tenant_id,
+            subject_id=subject_id,
             public_id=public_id,
             work_id=work_id,
             idempotency_key=idempotency_key,
@@ -859,13 +873,14 @@ class SQLiteProductOperationStore:
                 return ProductOperationReservation(operation=operation, created=False)
             connection.execute(
                 """INSERT INTO product_operations (
-                    work_id, public_id, tenant_id, idempotency_key,
+                    work_id, public_id, tenant_id, subject_id, idempotency_key,
                     request_fingerprint, session_id, task_id, request_text, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
                 (
                     requested.work_id,
                     requested.public_id,
                     requested.tenant_id,
+                    requested.subject_id,
                     requested.idempotency_key,
                     requested.request_fingerprint,
                     requested.session_id,
@@ -1315,6 +1330,8 @@ from cayu import (
     InMemoryTaskStore,
     InteractionStatus,
     InteractionSummaryEvidence,
+    InvocationOrigin,
+    InvocationOriginTrust,
     Message,
     ModelStreamEvent,
     RunRequest,
@@ -1322,18 +1339,25 @@ from cayu import (
     SecretRedactor,
     SessionIdentity,
     SessionInvocationAdmission,
+    SessionInvocationBinding,
     SessionStatus,
     SQLiteSessionStore,
     SQLiteTaskStore,
     TaskCreate,
+    TaskExecutionSource,
+    TaskInvocationSnapshot,
     TaskStatus,
     build_execution_profile_identity,
+    session_invocation_from_task,
 )
+from cayu.runtime.sessions import run_request_with_task_invocation
+from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,
     BasicAuth,
     ProductExecutionClaimLost,
+    ProductOperation,
     ProductOperationSettlementConflict,
     ProductPrincipal,
     ProductResultReceipt,
@@ -1358,6 +1382,23 @@ def product_request_fingerprint(request_text: str, *, agent_name: str) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def product_task_create(operation: ProductOperation, *, agent_name: str) -> TaskCreate:
+    return task_create_with_runtime_invocation(
+        TaskCreate(
+            task_id=operation.task_id,
+            type="public_agent_operation",
+            session_id=operation.session_id,
+            assigned_agent_name=agent_name,
+        ),
+        source=TaskExecutionSource.PRODUCT_OPERATION,
+        verified_origin=InvocationOrigin(
+            trust=InvocationOriginTrust.SERVER_VERIFIED,
+            subject=operation.subject_id,
+            tenant=operation.tenant_id,
+        ),
+    )
 
 
 def profiled_session_identity(
@@ -1497,6 +1538,7 @@ def test_invalid_request_is_rejected_without_a_durable_reservation(tmp_path) -> 
         asyncio.run(
             store.reserve(
                 tenant_id="tenant-a",
+                subject_id="test-subject",
                 idempotency_key="invalid-direct",
                 request_fingerprint="invalid-fingerprint",
                 public_id="op_invalid",
@@ -1714,6 +1756,7 @@ def test_control_plane_separation_and_background_ownership_reload(tmp_path) -> N
     async def reserve_work():
         return await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="background",
             request_fingerprint=product_request_fingerprint(
                 "work", agent_name=producer_service.agent_name
@@ -1784,6 +1827,7 @@ def test_replacement_worker_recovers_reservation_and_precreated_task(
         )
         reservation = await first_store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key=f"initial-redelivery-{precreate_task}",
             request_fingerprint=product_request_fingerprint(
                 "recover work", agent_name=first_service.agent_name
@@ -1796,11 +1840,9 @@ def test_replacement_worker_recovers_reservation_and_precreated_task(
         )
         if precreate_task:
             await first_service.cayu_app.create_task(
-                TaskCreate(
-                    task_id=reservation.operation.task_id,
-                    type="public_agent_operation",
-                    session_id=reservation.operation.session_id,
-                    assigned_agent_name=first_service.agent_name,
+                product_task_create(
+                    reservation.operation,
+                    agent_name=first_service.agent_name,
                 )
             )
 
@@ -1857,6 +1899,7 @@ def test_replacement_worker_settles_terminal_receipt_without_redispatch(
         )
         reservation = await first_store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="replacement-terminal",
             request_fingerprint=product_request_fingerprint(
                 "work", agent_name=first_service.agent_name
@@ -1951,6 +1994,7 @@ def test_durable_receipt_and_settlement_acknowledgements_are_reconstructed(
         )
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="acknowledgement-reconstruction",
             request_fingerprint=product_request_fingerprint(
                 "work", agent_name=service.agent_name
@@ -2030,6 +2074,7 @@ def test_concurrent_durable_replacement_workers_dispatch_once(tmp_path) -> None:
         )
         reservation = await first_store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="concurrent-replacement",
             request_fingerprint=product_request_fingerprint(
                 "work", agent_name=first_service.agent_name
@@ -2084,6 +2129,7 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
         )
         reservation = await first_store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="replacement-continuation",
             request_fingerprint=product_request_fingerprint(
                 "recover work", agent_name=first_service.agent_name
@@ -2095,17 +2141,22 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
             request_text="recover work",
         )
         original_message = Message.text("user", reservation.operation.request_text)
-        await first_service.cayu_app.task_store.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=first_service.agent_name,
+        product_task = await first_service.cayu_app.task_store.create_task(
+            product_task_create(
+                reservation.operation,
+                agent_name=first_service.agent_name,
             )
         )
         await first_service.cayu_app.task_store.start_task(
             reservation.operation.task_id,
             session_id=reservation.operation.session_id,
+            session_invocation=SessionInvocationBinding(
+                id=reservation.operation.session_id,
+                invocation=session_invocation_from_task(
+                    product_task.invocation,
+                    session_id=reservation.operation.session_id,
+                ),
+            ),
         )
         session_identity = profiled_session_identity(
             first_service.cayu_app,
@@ -2114,11 +2165,18 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
             model="scripted-model",
         )
         await first_service.cayu_app.session_store.create(
-            RunRequest(
-                agent_name=first_service.agent_name,
-                session_id=reservation.operation.session_id,
-                task_id=reservation.operation.task_id,
-                messages=[original_message],
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name=first_service.agent_name,
+                    session_id=reservation.operation.session_id,
+                    task_id=reservation.operation.task_id,
+                    messages=[original_message],
+                ),
+                TaskInvocationSnapshot(
+                    id=product_task.id,
+                    session_id=product_task.session_id,
+                    invocation=product_task.invocation,
+                ),
             ),
             identity=session_identity,
         )
@@ -2305,6 +2363,7 @@ def test_product_execution_claim_and_terminal_settlement_are_authoritative(
     async def scenario() -> None:
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="claim",
             request_fingerprint="claim-fingerprint",
             public_id="op_claim",
@@ -2481,6 +2540,7 @@ def test_product_execution_claim_and_terminal_settlement_are_authoritative(
 
         await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="expired-claim",
             request_fingerprint="expired-fingerprint",
             public_id="op_expired",
@@ -2534,6 +2594,7 @@ def test_in_memory_product_store_keeps_one_shared_database() -> None:
     async def scenario() -> None:
         reservation = await store.reserve(
             tenant_id="tenant-a",
+            subject_id="test-subject",
             idempotency_key="memory-operation",
             request_fingerprint="memory-fingerprint",
             public_id="op_memory",

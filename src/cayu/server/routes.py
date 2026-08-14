@@ -159,6 +159,7 @@ from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
     SessionExecutionSource,
+    TaskExecutionSource,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import inspect_provider_operation
@@ -220,6 +221,7 @@ from cayu.runtime.tasks import (
     TaskTopologyStoreResult,
     TaskTopologyTraversalLimitExceeded,
     decode_task_topology_cursor,
+    task_create_with_runtime_invocation,
 )
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
@@ -3145,6 +3147,29 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
 def _serialize_task_detail(cayu_app: Any, task: Task) -> dict[str, Any]:
     return {
         **_serialize_task_list_item(cayu_app, task),
+        "invocation": {
+            "schema_version": task.invocation.schema_version,
+            "origin": {
+                "trust": task.invocation.origin.trust.value,
+                "subject": _redact_control_plane_json(
+                    cayu_app,
+                    task.invocation.origin.subject,
+                    "task.invocation.origin.subject",
+                ),
+                "tenant": _redact_control_plane_json(
+                    cayu_app,
+                    task.invocation.origin.tenant,
+                    "task.invocation.origin.tenant",
+                ),
+            },
+            "root_invocation_id": task.invocation.root_invocation_id,
+            "root_session_id": (
+                None
+                if task.invocation.root_session_id is None
+                else cayu_app.project_session_id_for_exposure(task.invocation.root_session_id)
+            ),
+            "source": task.invocation.source.value,
+        },
         "input": _redact_control_plane_json(cayu_app, task.input, "task.input"),
         "result": _redact_control_plane_json(cayu_app, task.result, "task.result"),
         "error": _redact_control_plane_json(cayu_app, task.error, "task.error"),
@@ -4972,20 +4997,20 @@ def create_router(
                         "Run acceptance event belongs to a different session: "
                         f"{first_event.session_id}"
                     )
-                state = await session_store.load_state(session_id)
-                if state is None:
+                snapshot = await session_store.load_invocation_snapshot(session_id)
+                if snapshot is None:
                     raise RuntimeError(f"Run session disappeared during acceptance: {session_id}")
                 # The runtime is paused at ``first_event`` while this callback
                 # executes. COMPLETED/FAILED therefore describe a terminal-prefix
                 # stream that needs no task. INTERRUPTING/INTERRUPTED can instead
                 # be a concurrent operator request; the task must still be linked
                 # so the interrupted session can resume it later.
-                if state.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+                if snapshot.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
                     return
                 redacted_prompt = cayu_app.redact_json(body.prompt)
                 if type(redacted_prompt) is not str:
                     raise TypeError("CayuApp prompt redaction must return a string.")
-                await task_store.create_running_task(
+                task_request = task_create_with_runtime_invocation(
                     TaskCreate(
                         task_id=task_id,
                         type="run",
@@ -4993,7 +5018,13 @@ def create_router(
                         session_id=session_id,
                         assigned_agent_name=body.agent,
                         input={"prompt": redacted_prompt},
-                    )
+                    ),
+                    source=TaskExecutionSource.HTTP_RUN,
+                    session_invocation=snapshot,
+                )
+                await task_store.create_running_task(
+                    task_request,
+                    session_invocation=snapshot,
                 )
 
             after_accept = create_run_task

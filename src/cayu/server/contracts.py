@@ -58,7 +58,11 @@ from cayu.runtime.costs import (
     SessionCostSummary,
 )
 from cayu.runtime.interactions import InteractionSummaryEvidence
-from cayu.runtime.invocation import InvocationOriginTrust, SessionExecutionSource
+from cayu.runtime.invocation import (
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    TaskExecutionSource,
+)
 from cayu.runtime.sessions import (
     MAX_USAGE_ROLLUP_WINDOW,
     SESSION_TOPOLOGY_DEFAULT_CHILD_LIMIT,
@@ -1695,7 +1699,16 @@ class ApiTaskListItem(ApiBaseModel):
     completed_at: str | None
 
 
+class ApiTaskInvocation(ApiBaseModel):
+    schema_version: Literal[1]
+    origin: ApiInvocationOrigin
+    root_invocation_id: UUID4
+    root_session_id: str | None
+    source: TaskExecutionSource
+
+
 class ApiTaskDetail(ApiTaskListItem):
+    invocation: ApiTaskInvocation
     input: dict[str, Any]
     result: dict[str, Any] | None
     error: dict[str, Any] | None

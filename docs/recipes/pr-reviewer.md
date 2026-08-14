@@ -43,11 +43,15 @@ inbound-webhook receiver. So the ingress is ordinary app code: a small HMAC-veri
 endpoint that translates the GitHub payload into a `Task`.
 
 ```python
-task = await task_store.create_task(TaskCreate(
-    type="review_pr",
-    assigned_agent_name="pr-reviewer",
-    input={"owner": ..., "repo": ..., "pr_number": ..., "repo_url": ...,
-           "head_ref": ..., "head_sha": ..., "base_ref": ...},
+task = await task_store.create_task(task_create_with_execution_source(
+    TaskCreate(
+        type="review_pr",
+        assigned_agent_name="pr-reviewer",
+        input={"owner": ..., "repo": ..., "pr_number": ..., "repo_url": ...,
+               "head_ref": ..., "head_sha": ..., "base_ref": ...},
+        invocation_origin=InvocationOriginClaim(subject=f"github:{owner}/{repo}"),
+    ),
+    source=TaskExecutionSource.WEBHOOK,
 ))
 ```
 
@@ -55,6 +59,9 @@ Verify the signature with `cayu.webhooks.verify_webhook_signature` (constant-tim
 HMAC), and derive the `task_id` from the delivery id with
 `cayu.webhooks.webhook_task_id("github", delivery_id)` — a redelivered webhook then
 maps to a duplicate id the task store rejects, so retries are idempotent for free.
+The verified receiver classifies the task as `webhook` and records only the
+bounded host assertion shown above; it never stores the signature, delivery
+payload, or GitHub credential as provenance.
 The endpoint returns immediately; the review happens later on a worker — that
 decoupling is what makes it "cloud".
 

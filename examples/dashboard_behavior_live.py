@@ -873,7 +873,10 @@ async def _seed_app() -> tuple[
         status=SessionStatus.RUNNING,
     )
 
-    await task_store.create_task(
+    workflow_invocation = await store.load_invocation_snapshot(WORKFLOW_FOCUS_SESSION_ID)
+    if workflow_invocation is None:
+        raise AssertionError("Workflow focus session disappeared during dashboard seeding.")
+    await app.create_task(
         TaskCreate(
             task_id=WORKFLOW_PARENT_TASK_ID,
             type="workflow",
@@ -882,12 +885,15 @@ async def _seed_app() -> tuple[
             assigned_agent_name=AGENT_NAME,
         )
     )
-    await task_store.start_task(WORKFLOW_PARENT_TASK_ID)
+    await task_store.start_task(
+        WORKFLOW_PARENT_TASK_ID,
+        session_invocation=workflow_invocation,
+    )
     for index in range(WORKFLOW_LINKED_TASK_COUNT - 1):
         task_id = (
             WORKFLOW_BLOCKED_TASK_ID if index == 0 else f"{WORKFLOW_LINKED_TASK_PREFIX}-{index:03d}"
         )
-        await task_store.create_task(
+        await app.create_task(
             TaskCreate(
                 task_id=task_id,
                 type="workflow_step",
@@ -905,7 +911,7 @@ async def _seed_app() -> tuple[
 
     for index in range(WORKFLOW_CHILD_TASK_COUNT):
         task_id = f"{WORKFLOW_CHILD_TASK_PREFIX}-{index:03d}"
-        await task_store.create_task(
+        await app.create_task(
             TaskCreate(
                 task_id=task_id,
                 type="workflow_substep",

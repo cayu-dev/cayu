@@ -1335,6 +1335,7 @@ export type ApiTaskDetail = {
     input: {
         [key: string]: unknown;
     };
+    invocation: ApiTaskInvocation;
     /**
      * Lease Expires At
      */
@@ -1393,6 +1394,26 @@ export type ApiTaskDetail = {
      * Worker Id
      */
     worker_id: string | null;
+};
+
+/**
+ * ApiTaskInvocation
+ */
+export type ApiTaskInvocation = {
+    origin: ApiInvocationOrigin;
+    /**
+     * Root Invocation Id
+     */
+    root_invocation_id: string;
+    /**
+     * Root Session Id
+     */
+    root_session_id: string | null;
+    /**
+     * Schema Version
+     */
+    schema_version: 1;
+    source: TaskExecutionSource;
 };
 
 /**
@@ -5311,7 +5332,7 @@ export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_is
  *
  * The runtime boundary that created one session.
  */
-export type SessionExecutionSource = 'http_run' | 'sdk_run' | 'fork' | 'subagent' | 'workflow_step';
+export type SessionExecutionSource = 'http_run' | 'sdk_run' | 'fork' | 'subagent' | 'task' | 'workflow_step';
 
 /**
  * SessionMessageDeliveryMode
@@ -5919,6 +5940,13 @@ export type TaskAggregateFilter = {
      */
     type?: string | null;
 };
+
+/**
+ * TaskExecutionSource
+ *
+ * The trusted boundary that created one durable task.
+ */
+export type TaskExecutionSource = 'http_run' | 'product_operation' | 'scheduled' | 'sdk_task' | 'task_dispatch' | 'webhook';
 
 /**
  * TaskHoldBody

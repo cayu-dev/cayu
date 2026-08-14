@@ -287,12 +287,11 @@ def test_task_topology_rejects_cycles_and_structural_secret_redaction() -> None:
 
     async def seed() -> None:
         await _session(sessions, "focus")
-        await tasks.create_task(
+        first = await tasks.create_task(
             TaskCreate(
                 task_id="task-cycle-a",
                 type="step",
                 session_id="focus",
-                parent_task_id="task-cycle-b",
             )
         )
         await tasks.create_task(
@@ -303,6 +302,8 @@ def test_task_topology_rejects_cycles_and_structural_secret_redaction() -> None:
                 parent_task_id="task-cycle-a",
             )
         )
+        stored = tasks._tasks
+        stored[first.id] = first.model_copy(update={"parent_task_id": "task-cycle-b"})
 
     asyncio.run(seed())
 

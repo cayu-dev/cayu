@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from cayu import (
     CayuApp,
+    InvocationOriginClaim,
     Message,
     RunLimits,
     RunRequest,
     SQLiteTaskStore,
     Task,
     TaskCreate,
+    TaskExecutionSource,
     TaskQuery,
     run_task_worker,
+    task_create_with_execution_source,
 )
 
 
@@ -26,20 +29,24 @@ async def enqueue_pr_review(
     task_id: str | None = None,
 ) -> Task:
     return await task_store.create_task(
-        TaskCreate(
-            task_id=task_id,
-            type="review_pr",
-            title=f"Review {owner}/{repo}#{pr_number}",
-            assigned_agent_name="pr-reviewer",
-            input={
-                "owner": owner,
-                "repo": repo,
-                "pr_number": pr_number,
-                "repo_url": repo_url,
-                "head_ref": head_ref,
-                "head_sha": head_sha,
-                "base_ref": base_ref,
-            },
+        task_create_with_execution_source(
+            TaskCreate(
+                task_id=task_id,
+                type="review_pr",
+                title=f"Review {owner}/{repo}#{pr_number}",
+                assigned_agent_name="pr-reviewer",
+                input={
+                    "owner": owner,
+                    "repo": repo,
+                    "pr_number": pr_number,
+                    "repo_url": repo_url,
+                    "head_ref": head_ref,
+                    "head_sha": head_sha,
+                    "base_ref": base_ref,
+                },
+                invocation_origin=InvocationOriginClaim(subject=f"github:{owner}/{repo}"),
+            ),
+            source=TaskExecutionSource.WEBHOOK,
         )
     )
 
