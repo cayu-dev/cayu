@@ -37,6 +37,23 @@ async def _close(store: TaskStore) -> None:
         await close()
 
 
+async def _force_parent_link(store: TaskStore, task_id: str, parent_task_id: str) -> None:
+    """Inject malformed durable topology to exercise defensive read validation."""
+
+    if isinstance(store, InMemoryTaskStore):
+        task = await store.load_task(task_id)
+        assert task is not None
+        tasks = store._tasks
+        tasks[task_id] = task.model_copy(update={"parent_task_id": parent_task_id})
+        return
+    connection = store._connection
+    with connection:
+        connection.execute(
+            "UPDATE cayu_tasks SET parent_task_id = ? WHERE id = ?",
+            (parent_task_id, task_id),
+        )
+
+
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_topology_store_conformance(store_factory, tmp_path: Path) -> None:
     async def run() -> None:
@@ -137,13 +154,9 @@ def test_task_topology_detects_loaded_cycles(store_factory, tmp_path: Path) -> N
         store = _store(store_factory, tmp_path)
         try:
             await store.create_task(
-                TaskCreate(
-                    task_id="task-loop",
-                    type="step",
-                    session_id="session-a",
-                    parent_task_id="task-loop",
-                )
+                TaskCreate(task_id="task-loop", type="step", session_id="session-a")
             )
+            await _force_parent_link(store, "task-loop", "task-loop")
             with pytest.raises(TaskTopologyCycle):
                 await store.query_task_topology(
                     TaskTopologyQuery(
@@ -167,7 +180,6 @@ def test_task_topology_detects_cycles_split_across_pages(store_factory, tmp_path
                     task_id="task-a",
                     type="step",
                     session_id="session-a",
-                    parent_task_id="task-b",
                 )
             )
             await store.create_task(
@@ -178,6 +190,7 @@ def test_task_topology_detects_cycles_split_across_pages(store_factory, tmp_path
                     parent_task_id="task-a",
                 )
             )
+            await _force_parent_link(store, "task-a", "task-b")
             with pytest.raises(TaskTopologyCycle):
                 await store.query_task_topology(
                     TaskTopologyQuery(
@@ -235,9 +248,9 @@ def test_task_topology_rejects_orphaned_parent_links(store_factory, tmp_path: Pa
                     task_id="orphan",
                     type="step",
                     session_id="session-a",
-                    parent_task_id="missing-parent",
                 )
             )
+            await _force_parent_link(store, "orphan", "missing-parent")
             with pytest.raises(TaskTopologyInconsistent, match="missing durable parent"):
                 await store.query_task_topology(
                     TaskTopologyQuery(linked_session_ids=("session-a",))
@@ -368,7 +381,7 @@ def test_sqlite_task_topology_uses_composite_branch_indexes(tmp_path: Path) -> N
     async def run() -> int:
         store = SQLiteTaskStore(tmp_path / "task-plan.sqlite")
         try:
-            await store.create_task(
+            parent = await store.create_task(
                 TaskCreate(
                     task_id="task-parent",
                     type="workflow",
@@ -386,14 +399,15 @@ def test_sqlite_task_topology_uses_composite_branch_indexes(tmp_path: Path) -> N
                     )
                     INSERT INTO cayu_tasks (
                         id, type, status, session_id, parent_task_id,
-                        input_json, metadata_json, created_at, updated_at
+                        input_json, metadata_json, created_at, updated_at,
+                        invocation_json
                     )
                     SELECT
                         printf('task-child-%06d', value), 'step', 'pending',
-                        'session-a', 'task-parent', '{}', '{}', ?, ?
+                        'session-a', 'task-parent', '{}', '{}', ?, ?, ?
                     FROM numbers
                     """,
-                    (timestamp, timestamp),
+                    (timestamp, timestamp, parent.invocation.model_dump_json()),
                 )
 
             session_plan = store._connection.execute(

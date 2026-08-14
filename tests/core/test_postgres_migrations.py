@@ -14,7 +14,7 @@ from dataclasses import replace
 
 import pytest
 
-from cayu import PostgresSessionStore, PostgresTaskStore
+from cayu import PostgresSessionStore, PostgresTaskStore, TaskCreate
 from cayu.core import Event, EventType, Message
 from cayu.runtime import EventOrder, EventQuery, RunRequest, SessionIdentity
 from cayu.storage import _session_store_sql as session_store_sql
@@ -574,6 +574,44 @@ def test_revision_thirty_six_rejects_populated_session_database(
     asyncio.run(runner())
 
 
+def test_revision_thirty_nine_rejects_populated_task_database(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.create_task(TaskCreate(task_id="existing", type="work"))
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 39")
+            await conn.commit()
+
+        migrator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match="requires invocation provenance for every task",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (38,)
+
+    asyncio.run(runner())
+
+
 @pytest.mark.parametrize(
     ("column_ddl", "expected_shape"),
     [
@@ -710,8 +748,9 @@ def test_revision_thirty_eight_rejects_receipt_table_without_primary_key_before_
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 38")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 38")
                 await cur.execute("DROP TABLE cayu_task_terminalization_receipts")
+                await cur.execute("ALTER TABLE cayu_tasks DROP COLUMN invocation")
                 await cur.execute(
                     """
                     CREATE TABLE cayu_task_terminalization_receipts (
@@ -781,7 +820,10 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         task_validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 38"):
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {postgres_storage.PostgresTaskStore._min_required_revision}",
+            ):
                 await task_validator.ensure_schema()
         finally:
             await task_validator.close()
@@ -905,6 +947,10 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             assert await cur.fetchone() == ("additive", 37)
             await cur.execute("SELECT to_regclass('cayu_task_terminalization_receipts')")
             assert (await cur.fetchone())[0] == "cayu_task_terminalization_receipts"
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 39"
+            )
+            assert await cur.fetchone() == ("breaking", 39)
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

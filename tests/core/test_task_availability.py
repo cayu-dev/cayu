@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
+from tests.core.task_invocation_fixtures import unattributed_task_invocation
 
 from cayu import (
     CayuApp,
@@ -37,7 +38,11 @@ def test_task_availability_requires_aware_time_and_normalizes_to_utc() -> None:
     )
 
     request = TaskCreate(type="scheduled", available_at=local_time)
-    task = Task(type="scheduled", available_at=local_time)
+    task = Task(
+        type="scheduled",
+        available_at=local_time,
+        invocation=unattributed_task_invocation(),
+    )
 
     expected = datetime(2026, 8, 8, 4, 0, tzinfo=UTC)
     assert request.available_at == expected
@@ -46,7 +51,11 @@ def test_task_availability_requires_aware_time_and_normalizes_to_utc() -> None:
     with pytest.raises(ValidationError, match="available_at must be timezone-aware"):
         TaskCreate(type="scheduled", available_at=datetime(2026, 8, 8, 4, 0))
     with pytest.raises(ValidationError, match="available_at must be timezone-aware"):
-        Task(type="scheduled", available_at=datetime(2026, 8, 8, 4, 0))
+        Task(
+            type="scheduled",
+            available_at=datetime(2026, 8, 8, 4, 0),
+            invocation=unattributed_task_invocation(),
+        )
 
 
 def test_in_memory_claims_only_tasks_available_at_the_store_clock() -> None:

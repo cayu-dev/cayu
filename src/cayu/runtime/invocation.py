@@ -30,7 +30,19 @@ class SessionExecutionSource(StrEnum):
     SDK_RUN = "sdk_run"
     FORK = "fork"
     SUBAGENT = "subagent"
+    TASK = "task"
     WORKFLOW_STEP = "workflow_step"
+
+
+class TaskExecutionSource(StrEnum):
+    """The trusted boundary that created one durable task."""
+
+    HTTP_RUN = "http_run"
+    PRODUCT_OPERATION = "product_operation"
+    SCHEDULED = "scheduled"
+    SDK_TASK = "sdk_task"
+    TASK_DISPATCH = "task_dispatch"
+    WEBHOOK = "webhook"
 
 
 class InvocationOriginClaim(BaseModel):
@@ -113,6 +125,59 @@ class SessionInvocation(BaseModel):
         return require_durable_clean_nonblank(value, "root_session_id")
 
 
+class SessionInvocationBinding(BaseModel):
+    """One immediate session identity bound to its immutable provenance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    id: str
+    invocation: SessionInvocation
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "id")
+
+    @field_validator("invocation")
+    @classmethod
+    def copy_invocation(cls, value: SessionInvocation) -> SessionInvocation:
+        return copy_session_invocation(value)
+
+
+class TaskInvocation(BaseModel):
+    """Versioned root provenance attached atomically to one durable task.
+
+    ``root_session_id`` is absent when the invocation began as task-only work.
+    A later task/session attachment remains structural state on ``Task`` and
+    cannot rewrite this immutable root record.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = INVOCATION_PROVENANCE_SCHEMA_VERSION
+    origin: InvocationOrigin
+    root_invocation_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=_CANONICAL_UUID4_PATTERN,
+        json_schema_extra={"format": "uuid4"},
+    )
+    root_session_id: str | None = None
+    source: TaskExecutionSource
+
+    @field_validator("root_invocation_id")
+    @classmethod
+    def validate_root_invocation_id(cls, value: str) -> str:
+        return SessionInvocation.validate_root_invocation_id(value)
+
+    @field_validator("root_session_id")
+    @classmethod
+    def validate_root_session_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "root_session_id")
+
+
 def copy_invocation_origin_claim(
     value: InvocationOriginClaim | None,
 ) -> InvocationOriginClaim | None:
@@ -141,6 +206,29 @@ def copy_session_invocation(value: SessionInvocation) -> SessionInvocation:
     )
 
 
+def copy_session_invocation_binding(
+    value: SessionInvocationBinding,
+) -> SessionInvocationBinding:
+    if not isinstance(value, SessionInvocationBinding):
+        raise TypeError("Session invocation binding must be a SessionInvocationBinding instance.")
+    return SessionInvocationBinding(
+        id=value.id,
+        invocation=copy_session_invocation(value.invocation),
+    )
+
+
+def copy_task_invocation(value: TaskInvocation) -> TaskInvocation:
+    if type(value) is not TaskInvocation:
+        raise TypeError("Task invocation provenance must be a TaskInvocation instance.")
+    return TaskInvocation(
+        schema_version=value.schema_version,
+        origin=copy_invocation_origin(value.origin),
+        root_invocation_id=value.root_invocation_id,
+        root_session_id=value.root_session_id,
+        source=value.source,
+    )
+
+
 def inherited_session_invocation(
     parent: SessionInvocation,
     *,
@@ -158,5 +246,59 @@ def inherited_session_invocation(
         origin=copy_invocation_origin(parent.origin),
         root_invocation_id=parent.root_invocation_id,
         root_session_id=parent.root_session_id,
+        source=source,
+    )
+
+
+def inherited_task_invocation(
+    parent: TaskInvocation | SessionInvocation,
+    *,
+    source: TaskExecutionSource,
+    root_session_id: str | None = None,
+) -> TaskInvocation:
+    """Derive exact task provenance from a trusted task or session snapshot."""
+
+    if type(parent) not in {TaskInvocation, SessionInvocation}:
+        raise TypeError("Parent invocation provenance must be task or session provenance.")
+    if type(source) is not TaskExecutionSource:
+        raise TypeError("source must be a TaskExecutionSource.")
+    inherited_root_session_id = parent.root_session_id
+    if root_session_id is not None:
+        root_session_id = require_durable_clean_nonblank(
+            root_session_id,
+            "root_session_id",
+        )
+        if inherited_root_session_id is not None and inherited_root_session_id != root_session_id:
+            raise ValueError("Task invocation root session conflicts with its parent.")
+        inherited_root_session_id = root_session_id
+    return TaskInvocation(
+        origin=copy_invocation_origin(parent.origin),
+        root_invocation_id=parent.root_invocation_id,
+        root_session_id=inherited_root_session_id,
+        source=source,
+    )
+
+
+def session_invocation_from_task(
+    task: TaskInvocation,
+    *,
+    session_id: str,
+    source: SessionExecutionSource = SessionExecutionSource.TASK,
+) -> SessionInvocation:
+    """Create the session-side root snapshot for task-backed execution."""
+
+    if type(task) is not TaskInvocation:
+        raise TypeError("Task-backed session provenance requires a TaskInvocation.")
+    session_id = require_durable_clean_nonblank(session_id, "session_id")
+    if type(source) is not SessionExecutionSource:
+        raise TypeError("source must be a SessionExecutionSource.")
+    if source is not SessionExecutionSource.TASK:
+        raise ValueError("Root task-backed sessions require a task execution source.")
+    if task.root_session_id is not None and task.root_session_id != session_id:
+        raise ValueError("Task invocation belongs to a different root session.")
+    return SessionInvocation(
+        origin=copy_invocation_origin(task.origin),
+        root_invocation_id=task.root_invocation_id,
+        root_session_id=session_id,
         source=source,
     )

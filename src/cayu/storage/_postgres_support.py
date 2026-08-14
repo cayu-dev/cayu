@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_label_map
-from cayu.runtime.invocation import SessionInvocation
+from cayu.runtime.invocation import SessionInvocation, TaskInvocation
 from cayu.runtime.sessions import (
     PendingActionSession,
     Session,
@@ -225,7 +225,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL,
         started_at TIMESTAMPTZ,
-        completed_at TIMESTAMPTZ
+        completed_at TIMESTAMPTZ,
+        invocation JSONB NOT NULL
     )
     """,
     """
@@ -579,6 +580,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         to_utc(task.updated_at),
         to_utc_optional(task.started_at),
         to_utc_optional(task.completed_at),
+        _dumps(task.invocation.model_dump(mode="json")),
     )
 
 
@@ -586,7 +588,7 @@ TASK_COLUMNS = (
     "id, type, title, description, status, session_id, parent_task_id, "
     "assigned_agent_name, available_at, worker_id, lease_expires_at, status_reason, "
     "status_payload, input, result, error, metadata, created_at, updated_at, started_at, "
-    "completed_at"
+    "completed_at, invocation"
 )
 
 
@@ -613,6 +615,7 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         updated_at=to_utc(row[18]),
         started_at=to_utc_optional(row[19]),
         completed_at=to_utc_optional(row[20]),
+        invocation=TaskInvocation.model_validate(_loads(row[21])),
     )
 
 

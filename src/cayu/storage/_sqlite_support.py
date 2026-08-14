@@ -18,7 +18,7 @@ from cayu._validation import (
     require_execution_unit_id,
 )
 from cayu.core.events import Event
-from cayu.runtime.invocation import SessionInvocation
+from cayu.runtime.invocation import SessionInvocation, TaskInvocation
 from cayu.runtime.sessions import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
     PendingActionSession,
@@ -365,7 +365,8 @@ _BASELINE_DDL = """
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         started_at TEXT,
-        completed_at TEXT
+        completed_at TEXT,
+        invocation_json TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS cayu_task_terminalization_receipts (
@@ -1539,6 +1540,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
     ),
     34: (("cayu_tasks", "available_at", "TEXT"),),
     36: (("cayu_sessions", "invocation_json", "TEXT NOT NULL"),),
+    39: (("cayu_tasks", "invocation_json", "TEXT NOT NULL"),),
 }
 
 # Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD
@@ -1597,6 +1599,17 @@ def _reject_populated_pre_invocation_database(connection: sqlite3.Connection) ->
         raise schema.SchemaTooOld(
             "Storage revision 36 requires invocation provenance for every session and "
             "cannot migrate a populated Cayu session database. Recreate the Cayu "
+            "database before starting this build."
+        )
+
+
+def _reject_populated_pre_task_invocation_database(
+    connection: sqlite3.Connection,
+) -> None:
+    if connection.execute("SELECT EXISTS(SELECT 1 FROM cayu_tasks)").fetchone()[0]:
+        raise schema.SchemaTooOld(
+            "Storage revision 39 requires invocation provenance for every task and "
+            "cannot migrate a populated Cayu task database. Recreate the Cayu "
             "database before starting this build."
         )
 
@@ -2456,6 +2469,8 @@ def reconcile_schema(
         _validate_revision_37_knowledge_fts_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
+    if app_min_supported >= 39:
+        _validate_task_invocation_column(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -2492,6 +2507,19 @@ def _validate_task_terminalization_receipt_table(
             "SQLite task terminalization receipt table conflicts with Cayu's "
             "revision-38 durability contract. Run `cayu storage migrate` or restore "
             "the database from a known-good backup."
+        )
+
+
+def _validate_task_invocation_column(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_tasks)")
+    }
+    if columns.get("invocation_json") != ("TEXT", 1):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_tasks.invocation_json' conflicts with "
+            "Cayu's required task invocation-provenance contract. Recreate the "
+            "Cayu database from a known-good revision-39 schema."
         )
 
 
@@ -2653,6 +2681,12 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         and any(revision.revision == 36 for revision in schema.pending(current))
     ):
         _reject_populated_pre_invocation_database(connection)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 39
+        and any(revision.revision == 39 for revision in schema.pending(current))
+    ):
+        _reject_populated_pre_task_invocation_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -2874,6 +2908,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         format_datetime(task.updated_at),
         format_optional_datetime(task.started_at),
         format_optional_datetime(task.completed_at),
+        json_dumps(task.invocation.model_dump(mode="json")),
     )
 
 
@@ -2903,6 +2938,7 @@ def task_from_row(row: sqlite3.Row) -> Task:
         updated_at=parse_datetime(row["updated_at"]),
         started_at=parse_optional_datetime(row["started_at"]),
         completed_at=parse_optional_datetime(row["completed_at"]),
+        invocation=TaskInvocation.model_validate(json.loads(row["invocation_json"])),
     )
 
 

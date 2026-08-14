@@ -173,10 +173,13 @@ from cayu.runtime.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
     SessionInvocation,
+    SessionInvocationBinding,
     copy_invocation_origin,
     copy_invocation_origin_claim,
     copy_session_invocation,
+    copy_task_invocation,
     inherited_session_invocation,
+    session_invocation_from_task,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.public_authority import (
@@ -195,6 +198,7 @@ from cayu.runtime.structured_output import (
     StructuredOutputValidation,
     copy_structured_output_spec,
 )
+from cayu.runtime.tasks import TaskInvocationSnapshot
 from cayu.runtime.usage import UsageMetrics
 from cayu.vaults.redaction import SecretRedactor
 
@@ -991,6 +995,7 @@ class RunRequest(BaseModel):
     _input_redactions_applied: bool = PrivateAttr(default=False)
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
+    _runtime_task_invocation: TaskInvocationSnapshot | None = PrivateAttr(default=None)
 
     @field_validator("messages")
     @classmethod
@@ -2078,6 +2083,14 @@ class SessionStateSnapshot(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(f"{info.field_name} must be timezone-aware.")
         return value.astimezone(UTC)
+
+
+class SessionInvocationSnapshot(SessionInvocationBinding):
+    """Bounded immutable invocation state for trusted task/dispatch boundaries."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    status: SessionStatus
 
 
 _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS = 128
@@ -6130,6 +6143,13 @@ class SessionStore(ABC):
         """Load bounded mutable state without labels or unbounded metadata."""
 
     @abstractmethod
+    async def load_invocation_snapshot(
+        self,
+        session_id: str,
+    ) -> SessionInvocationSnapshot | None:
+        """Load bounded immutable provenance without labels or metadata."""
+
+    @abstractmethod
     async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
         """Load bounded session identity without materializing session metadata."""
 
@@ -8299,6 +8319,21 @@ class InMemorySessionStore(SessionStore):
                 status=session.status,
                 updated_at=session.updated_at,
                 last_activity_at=session.last_activity_at,
+            )
+
+    async def load_invocation_snapshot(
+        self,
+        session_id: str,
+    ) -> SessionInvocationSnapshot | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            return SessionInvocationSnapshot(
+                id=session.id,
+                status=session.status,
+                invocation=session.invocation,
             )
 
     async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
@@ -12319,6 +12354,15 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         else copy_invocation_origin(request._verified_invocation_origin)
     )
     copied._runtime_invocation_source = request._runtime_invocation_source
+    copied._runtime_task_invocation = (
+        None
+        if request._runtime_task_invocation is None
+        else TaskInvocationSnapshot(
+            id=request._runtime_task_invocation.id,
+            session_id=request._runtime_task_invocation.session_id,
+            invocation=copy_task_invocation(request._runtime_task_invocation.invocation),
+        )
+    )
     return copied
 
 
@@ -12345,6 +12389,35 @@ def run_request_with_runtime_invocation(
     copied = copy_run_request(request)
     copied._runtime_invocation_source = source
     copied._verified_invocation_origin = verified_origin
+    return copied
+
+
+def run_request_with_task_invocation(
+    request: RunRequest,
+    task_invocation: TaskInvocationSnapshot,
+) -> RunRequest:
+    """Bind trusted durable task provenance to a session-creation request."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Task invocation authority requires a RunRequest.")
+    if request.task_id is None:
+        raise ValueError("Task invocation authority requires RunRequest.task_id.")
+    if type(task_invocation) is not TaskInvocationSnapshot:
+        raise TypeError("Task invocation authority requires a TaskInvocationSnapshot.")
+    if task_invocation.id != request.task_id:
+        raise ValueError("Task invocation identity conflicts with RunRequest.task_id.")
+    if task_invocation.session_id is not None and task_invocation.session_id != request.session_id:
+        raise ValueError("Task session identity conflicts with RunRequest.session_id.")
+    if request.invocation_origin is not None or request._verified_invocation_origin is not None:
+        raise ValueError("Task-backed sessions must inherit their task origin.")
+    copied = copy_run_request(request)
+    copied._runtime_task_invocation = TaskInvocationSnapshot(
+        id=task_invocation.id,
+        session_id=task_invocation.session_id,
+        invocation=copy_task_invocation(task_invocation.invocation),
+    )
+    if copied._runtime_invocation_source is None:
+        copied._runtime_invocation_source = SessionExecutionSource.TASK
     return copied
 
 
@@ -12676,6 +12749,7 @@ def session_invocation_for_run_request(
     session_id = _require_bounded_session_id(session_id, "session_id")
     source = request._runtime_invocation_source or SessionExecutionSource.SDK_RUN
     verified_origin = request._verified_invocation_origin
+    task_invocation = request._runtime_task_invocation
     if request.invocation_origin is not None and verified_origin is not None:
         raise ValueError("A run cannot carry both host-asserted and server-verified origins.")
     if parent_session is not None:
@@ -12685,10 +12759,21 @@ def session_invocation_for_run_request(
             raise ValueError("Derived sessions must inherit their root invocation origin.")
         if source is SessionExecutionSource.HTTP_RUN:
             raise ValueError("Derived sessions cannot claim a root HTTP run source.")
-        return inherited_session_invocation(
+        inherited = inherited_session_invocation(
             parent_session.invocation,
             source=source,
         )
+        if task_invocation is not None and (
+            task_invocation.id != request.task_id
+            or task_invocation.invocation.origin != inherited.origin
+            or task_invocation.invocation.root_invocation_id != inherited.root_invocation_id
+            or (
+                task_invocation.invocation.root_session_id is not None
+                and task_invocation.invocation.root_session_id != inherited.root_session_id
+            )
+        ):
+            raise ValueError("Task and parent session invocation provenance conflict.")
+        return inherited
     if request.parent_session_id is not None:
         raise ValueError("Parent session not found for invocation provenance.")
     if source in {
@@ -12696,6 +12781,20 @@ def session_invocation_for_run_request(
         SessionExecutionSource.SUBAGENT,
     }:
         raise ValueError(f"{source.value} invocation provenance requires a parent session.")
+    if task_invocation is not None:
+        if request.task_id is None:
+            raise ValueError("Task invocation provenance requires RunRequest.task_id.")
+        if request.invocation_origin is not None or verified_origin is not None:
+            raise ValueError("Task-backed sessions must inherit their task origin.")
+        if source is not SessionExecutionSource.TASK:
+            raise ValueError("Root task-backed sessions require a task execution source.")
+        return session_invocation_from_task(
+            task_invocation.invocation,
+            session_id=session_id,
+            source=source,
+        )
+    if source is SessionExecutionSource.TASK:
+        raise ValueError("Task session provenance requires a durable task invocation.")
     if verified_origin is not None:
         if source is not SessionExecutionSource.HTTP_RUN:
             raise ValueError("Server-verified invocation origins require an HTTP run source.")
@@ -12729,6 +12828,7 @@ def session_invocation_matches_run_request(
     if type(session) is not Session or type(request) is not RunRequest:
         return False
     source = request._runtime_invocation_source or SessionExecutionSource.SDK_RUN
+    task_invocation = request._runtime_task_invocation
     if parent_session is not None:
         if (
             request.parent_session_id != parent_session.id
@@ -12741,6 +12841,16 @@ def session_invocation_matches_run_request(
             expected = inherited_session_invocation(parent_session.invocation, source=source)
         except (TypeError, ValueError):
             return False
+        if task_invocation is not None and (
+            task_invocation.id != request.task_id
+            or task_invocation.invocation.origin != expected.origin
+            or task_invocation.invocation.root_invocation_id != expected.root_invocation_id
+            or (
+                task_invocation.invocation.root_session_id is not None
+                and task_invocation.invocation.root_session_id != expected.root_session_id
+            )
+        ):
+            return False
         return session.invocation == expected
     if request.parent_session_id is not None or session.parent_session_id is not None:
         return False
@@ -12748,6 +12858,31 @@ def session_invocation_matches_run_request(
         return False
     verified_origin = request._verified_invocation_origin
     if request.invocation_origin is not None and verified_origin is not None:
+        return False
+    if task_invocation is not None:
+        if (
+            request.task_id is None
+            or task_invocation.id != request.task_id
+            or task_invocation.session_id not in {None, session.id}
+            or request.invocation_origin is not None
+            or verified_origin is not None
+            or source is not SessionExecutionSource.TASK
+            or (
+                task_invocation.invocation.root_session_id is not None
+                and task_invocation.invocation.root_session_id != session.id
+            )
+        ):
+            return False
+        try:
+            expected = session_invocation_from_task(
+                task_invocation.invocation,
+                session_id=session.id,
+                source=source,
+            )
+        except (TypeError, ValueError):
+            return False
+        return session.invocation == expected
+    if source is SessionExecutionSource.TASK:
         return False
     if verified_origin is not None:
         if (

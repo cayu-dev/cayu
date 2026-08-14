@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import pytest
+from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
 from cayu import TaskCreate, TaskStore
 from cayu.runtime.tasks import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-    TaskTopologyCycle,
     TaskTopologyInconsistent,
     TaskTopologyQuery,
     decode_task_topology_cursor,
@@ -45,6 +45,7 @@ async def assert_task_topology_store_conformance(store: TaskStore) -> None:
             parent_task_id=parent.id,
         )
     )
+    await store.create_task(TaskCreate(task_id="unrelated-parent", type="workflow"))
     await store.create_task(
         TaskCreate(
             task_id="topology-unrelated",
@@ -144,42 +145,25 @@ async def assert_task_topology_store_conformance(store: TaskStore) -> None:
     }
 
     attachable = await store.create_task(TaskCreate(task_id="topology-attach", type="step"))
-    await store.start_task(attachable.id, session_id="session-c")
+    await store.start_task(
+        attachable.id,
+        session_id="session-c",
+        session_invocation=await task_backed_session_invocation(
+            store,
+            attachable.id,
+            "session-c",
+        ),
+    )
     attached = await store.query_task_topology(TaskTopologyQuery(linked_session_ids=("session-c",)))
     assert [task.id for task in attached.session_branches[0].tasks] == [attachable.id]
 
-    await store.create_task(
-        TaskCreate(
-            task_id="topology-orphan",
-            type="step",
-            session_id="session-orphan",
-            parent_task_id="topology-missing-parent",
-        )
-    )
-    with pytest.raises(TaskTopologyInconsistent, match="missing durable parent"):
-        await store.query_task_topology(TaskTopologyQuery(linked_session_ids=("session-orphan",)))
-
-    await store.create_task(
-        TaskCreate(
-            task_id="topology-cycle-a",
-            type="step",
-            session_id="session-cycle",
-            parent_task_id="topology-cycle-b",
-        )
-    )
-    await store.create_task(
-        TaskCreate(
-            task_id="topology-cycle-b",
-            type="step",
-            session_id="session-cycle",
-            parent_task_id="topology-cycle-a",
-        )
-    )
-    with pytest.raises(TaskTopologyCycle):
-        await store.query_task_topology(
-            TaskTopologyQuery(
-                linked_session_ids=("session-cycle",),
-                session_task_limit=1,
+    with pytest.raises(ValueError, match="Parent task not found"):
+        await store.create_task(
+            TaskCreate(
+                task_id="topology-orphan",
+                type="step",
+                session_id="session-orphan",
+                parent_task_id="topology-missing-parent",
             )
         )
 

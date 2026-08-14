@@ -50,6 +50,7 @@ from cayu.runtime.sessions import (
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
+from cayu.storage import sqlite as sqlite_storage
 
 
 def _tool_round_identity_payload() -> dict[str, str]:
@@ -1907,7 +1908,10 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 38"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_TASK_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteTaskStore(
             db_path,
             schema_mode=schema_migrations.SchemaMode.VALIDATE,
@@ -2603,6 +2607,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "lease_expires_at",
         "status_reason",
         "status_payload_json",
+        "invocation_json",
     }.issubset(task_columns)
     # The explicit catalog guards compatibility-floor regressions as new
     # additive and breaking revisions are appended.
@@ -2646,6 +2651,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (36, 36),
         (37, 37),
         (38, 37),
+        (39, 39),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

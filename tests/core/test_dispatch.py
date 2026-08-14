@@ -5,6 +5,7 @@ import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
+from uuid import uuid4
 
 import pytest
 from tests.core._execution_profile_fixtures import (
@@ -20,11 +21,17 @@ from cayu.runtime import (
     DispatchStatus,
     InMemorySessionStore,
     InMemoryTaskStore,
+    InvocationOrigin,
+    InvocationOriginTrust,
     RunRequest,
+    SessionExecutionSource,
+    SessionInvocation,
+    SessionInvocationBinding,
     SessionStatus,
     SessionStatusConflict,
     StructuredOutputSpec,
     TaskCreate,
+    TaskExecutionSource,
     TaskQuery,
     TaskStatus,
     TaskStore,
@@ -33,9 +40,11 @@ from cayu.runtime import (
 )
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime.dispatch import copy_dispatch_request
+from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 _DISPATCH_TASK_TYPE = "cayu.dispatch"
+_TEST_DISPATCH_ROOTS: dict[str, str] = {}
 
 
 class FakeProvider(ModelProvider):
@@ -84,6 +93,21 @@ class _SecretFreeDispatchRuntime:
             error,
             empty_message=empty_message,
             nonportable_message=nonportable_message,
+        )
+
+    @staticmethod
+    async def session_invocation_for_dispatch(session_id: str) -> SessionInvocationBinding:
+        return SessionInvocationBinding(
+            id=session_id,
+            invocation=SessionInvocation(
+                origin=InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED),
+                root_invocation_id=_TEST_DISPATCH_ROOTS.setdefault(
+                    session_id,
+                    str(uuid4()),
+                ),
+                root_session_id=session_id,
+                source=SessionExecutionSource.SDK_RUN,
+            ),
         )
 
 
@@ -166,6 +190,12 @@ def test_submit_enqueues_pending_task_without_running() -> None:
     assert task.session_id is None
     assert task.input["request"]["session_id"] == "sess_submit"
     assert task.input["request"]["dispatch_id"] == "d_submit"
+    session = asyncio.run(h.store.load("sess_submit"))
+    assert session is not None
+    assert task.invocation.origin == session.invocation.origin
+    assert task.invocation.root_invocation_id == session.invocation.root_invocation_id
+    assert task.invocation.root_session_id == session.invocation.root_session_id
+    assert task.invocation.source is TaskExecutionSource.TASK_DISPATCH
 
 
 def test_submit_redacts_workload_secrets_before_durable_dispatch_write() -> None:
@@ -618,19 +648,11 @@ def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:
         TaskStoreDispatcher(InMemoryTaskStore(), recover_stalled_sessions_after_seconds=-1)
 
 
-def test_failed_run_marks_dispatch_task_failed() -> None:
-    # A dispatch whose run raises (here: the session does not exist) fails the task.
+def test_missing_session_dispatch_is_rejected_before_queue_publication() -> None:
     h = _build([_batch("first answer")])
-    handle = asyncio.run(h.app.dispatch(_dispatch_request("sess_missing", "d_missing")))
-
-    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
-
-    assert result is not None
-    assert result.status == DispatchStatus.FAILED
-    task = asyncio.run(h.tasks.load_task(handle.metadata["queue_task_id"]))
-    assert task is not None
-    assert task.status == TaskStatus.FAILED
-    assert task.error is not None and "error" in task.error
+    with pytest.raises(KeyError, match="Session not found"):
+        asyncio.run(h.app.dispatch(_dispatch_request("sess_missing", "d_missing")))
+    assert asyncio.run(h.tasks.list_tasks()) == []
 
 
 def test_in_band_run_failure_marks_dispatch_task_failed() -> None:
@@ -666,6 +688,62 @@ def test_invalid_request_payload_fails_task_terminally() -> None:
     failed = asyncio.run(h.tasks.load_task(task.id))
     assert failed is not None
     assert failed.status == TaskStatus.FAILED
+
+
+def test_process_next_rejects_a_non_dispatch_task_with_a_valid_payload() -> None:
+    h = _build([_batch("first answer"), _batch("must not execute")])
+    _create_resumable_session(h.app, "sess_wrong_source")
+    request = _dispatch_request("sess_wrong_source", "d_wrong_source")
+    task = asyncio.run(
+        h.tasks.create_task(
+            TaskCreate(
+                type=_DISPATCH_TASK_TYPE,
+                input={"request": request.model_dump(mode="json")},
+            )
+        )
+    )
+
+    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
+
+    assert result is None
+    failed = asyncio.run(h.tasks.load_task(task.id))
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert len(h.provider.requests) == 1
+
+
+def test_process_next_rejects_dispatch_provenance_from_another_session_tree() -> None:
+    h = _build(
+        [
+            _batch("first answer"),
+            _batch("second answer"),
+            _batch("must not execute"),
+        ]
+    )
+    _create_resumable_session(h.app, "sess_dispatch_source")
+    _create_resumable_session(h.app, "sess_dispatch_target")
+    source_binding = asyncio.run(h.app.session_invocation_for_dispatch("sess_dispatch_source"))
+    request = _dispatch_request("sess_dispatch_target", "d_wrong_tree")
+    task = asyncio.run(
+        h.tasks.create_task(
+            task_create_with_runtime_invocation(
+                TaskCreate(
+                    type=_DISPATCH_TASK_TYPE,
+                    input={"request": request.model_dump(mode="json")},
+                ),
+                source=TaskExecutionSource.TASK_DISPATCH,
+                session_invocation=source_binding,
+            )
+        )
+    )
+
+    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
+
+    assert result is None
+    failed = asyncio.run(h.tasks.load_task(task.id))
+    assert failed is not None
+    assert failed.status is TaskStatus.FAILED
+    assert len(h.provider.requests) == 2
 
 
 def test_submit_rejects_loop_policies() -> None:

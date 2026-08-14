@@ -26,6 +26,11 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._diagnostics import ExceptionDiagnostic
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.invocation import (
+    SessionInvocationBinding,
+    TaskExecutionSource,
+    copy_session_invocation_binding,
+)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import (
@@ -41,6 +46,7 @@ from cayu.runtime.structured_output import (
     require_secret_free_structured_output_spec,
 )
 from cayu.runtime.tasks import (
+    Task,
     TaskClaimLost,
     TaskCreate,
     TaskOrder,
@@ -49,6 +55,7 @@ from cayu.runtime.tasks import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
     _terminalize_claimed_task_or_detect_peer_winner,
+    task_create_with_runtime_invocation,
 )
 from cayu.vaults import SecretRedactor
 
@@ -187,6 +194,12 @@ class _DurableDispatchRuntime(DispatchRuntime, Protocol):
     ) -> ExceptionDiagnostic:
         """Snapshot an exception without exposing workload secrets."""
 
+    async def session_invocation_for_dispatch(
+        self,
+        session_id: str,
+    ) -> SessionInvocationBinding:
+        """Load trusted immutable provenance for a durable dispatch target."""
+
 
 class Dispatcher(ABC):
     """Execution backend for dispatched session work."""
@@ -302,13 +315,20 @@ class TaskStoreDispatcher(Dispatcher):
         # an isolated snapshot, and the handle reads only immutable string fields.
         # The queue task must be session-unbound (``session_id is None``) to be claimable by
         # a worker pool; the target session_id rides inside the serialized request payload.
-        task = await self._tasks.create_task(
+        session_binding = await _load_dispatch_session_invocation(
+            durable_runtime,
+            request.session_id,
+        )
+        task_request = task_create_with_runtime_invocation(
             TaskCreate(
                 type=self._task_type,
                 parent_task_id=request.task_id,
                 input={"request": request.model_dump(mode="json")},
-            )
+            ),
+            source=TaskExecutionSource.TASK_DISPATCH,
+            session_invocation=session_binding,
         )
+        task = await self._tasks.create_task(task_request)
         return self._handle(request, DispatchStatus.SUBMITTED, queue_task_id=task.id)
 
     async def process_next(
@@ -332,21 +352,31 @@ class TaskStoreDispatcher(Dispatcher):
         )
         if task is None:
             return None
-        # Fail a malformed payload (missing or no-longer-valid request — e.g. an older
-        # serialization claimed after a schema change) terminally, rather than letting the
-        # error escape and leave the task to be reclaimed and re-fail forever.
+        # Fail malformed or unauthenticated queue authority terminally rather than letting
+        # the task be reclaimed and re-run forever. The payload can select executable work
+        # only after it agrees with the immutable task and target-session provenance.
         payload = task.input.get("request")
         try:
             if type(payload) is not dict:
                 raise ValueError("dispatch task request payload is not an object")
             request = DispatchRequest.model_validate(payload)
+            session_binding = await _load_dispatch_session_invocation(
+                durable_runtime,
+                request.session_id,
+            )
+            _require_dispatch_task_authority(
+                task,
+                request=request,
+                session_binding=session_binding,
+                task_type=self._task_type,
+            )
         except Exception as exc:
             diagnostic = _runtime_exception_diagnostic(
                 durable_runtime,
                 exc,
                 empty_message="invalid dispatch request",
                 nonportable_message=(
-                    "Invalid dispatch request contained a non-portable diagnostic."
+                    "Invalid dispatch authority contained a non-portable diagnostic."
                 ),
             )
             failure_payload = _safe_runtime_diagnostic_payload(
@@ -363,7 +393,7 @@ class TaskStoreDispatcher(Dispatcher):
                 )
             except TaskClaimLost:
                 logger.warning(
-                    "dispatch task %s lost its lease while rejecting a malformed request",
+                    "dispatch task %s lost its lease while rejecting invalid authority",
                     task.id,
                 )
             return None
@@ -668,6 +698,46 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
+
+
+async def _load_dispatch_session_invocation(
+    runtime: _DurableDispatchRuntime,
+    session_id: str,
+) -> SessionInvocationBinding:
+    try:
+        invocation_loader = runtime.session_invocation_for_dispatch
+    except (AttributeError, TypeError):
+        raise TypeError("Durable dispatch requires session invocation provenance.") from None
+    if not callable(invocation_loader):
+        raise TypeError("Durable dispatch requires session invocation provenance.")
+    binding = await invocation_loader(session_id)
+    if not isinstance(binding, SessionInvocationBinding):
+        raise TypeError("Durable dispatch returned invalid session invocation provenance.")
+    return copy_session_invocation_binding(binding)
+
+
+def _require_dispatch_task_authority(
+    task: Task,
+    *,
+    request: DispatchRequest,
+    session_binding: SessionInvocationBinding,
+    task_type: str,
+) -> None:
+    if not isinstance(task, Task):
+        raise TypeError("Dispatch task authority requires a Task.")
+    if task.type != task_type or task.session_id is not None:
+        raise ValueError("Dispatch task structural authority conflicts with its queue.")
+    if task.parent_task_id != request.task_id:
+        raise ValueError("Dispatch task parent authority conflicts with its request.")
+    invocation = task.invocation
+    target = session_binding.invocation
+    if (
+        invocation.source is not TaskExecutionSource.TASK_DISPATCH
+        or invocation.origin != target.origin
+        or invocation.root_invocation_id != target.root_invocation_id
+        or invocation.root_session_id != target.root_session_id
+    ):
+        raise ValueError("Dispatch task invocation provenance conflicts with its target session.")
 
 
 def redact_dispatch_request(

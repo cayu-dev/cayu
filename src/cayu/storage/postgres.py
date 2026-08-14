@@ -113,6 +113,7 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_tool_round_identity,
 )
+from cayu.runtime.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
@@ -172,6 +173,7 @@ from cayu.runtime.sessions import (
     SessionForkActiveModelStageConflict,
     SessionIdentity,
     SessionInspectionIdentity,
+    SessionInvocationSnapshot,
     SessionLineageNode,
     SessionLineageOrigin,
     SessionLineageQuery,
@@ -347,6 +349,7 @@ from cayu.runtime.tasks import (
     Task,
     TaskAggregateFilter,
     TaskCreate,
+    TaskInvocationSnapshot,
     TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
@@ -363,17 +366,23 @@ from cayu.runtime.tasks import (
     TaskTopologyStoreResult,
     _allocate_task_topology_branch_limits,
     _bounded_optional_task_topology_parent_id,
+    _can_attach_claimed_task_state,
+    _copy_optional_session_binding,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
+    _copy_required_session_binding,
     _ensure_can_hold_task,
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
+    _ensure_task_status_can_transition,
     _raise_task_claim_attach_error,
     _replay_task_terminalization_receipt,
     _running_task_from_create,
     _task_from_create,
+    _task_invocation_for_attachment,
+    _task_session_id_for_start,
     _validate_task_topology_ancestry,
     build_task_topology_result,
     copy_task_aggregate_filter,
@@ -476,7 +485,7 @@ _TASK_RETURNING_COLUMNS = (
     "task.parent_task_id, task.assigned_agent_name, task.available_at, task.worker_id, "
     "task.lease_expires_at, task.status_reason, task.status_payload, task.input, task.result, "
     "task.error, task.metadata, task.created_at, task.updated_at, task.started_at, "
-    "task.completed_at"
+    "task.completed_at, task.invocation"
 )
 _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
@@ -1298,6 +1307,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    39: ("ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS invocation JSONB NOT NULL",),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -2205,6 +2215,17 @@ async def _reject_populated_pre_invocation_database(cur: Any) -> None:
         )
 
 
+async def _reject_populated_pre_task_invocation_database(cur: Any) -> None:
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_tasks)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 39 requires invocation provenance for every task and "
+            "cannot migrate a populated Cayu task database. Recreate the Cayu "
+            "database before starting this build."
+        )
+
+
 async def _transcript_cursor(cur: Any, session_id: str) -> int:
     """Return the permanent next transcript position, independent of retention."""
 
@@ -2418,6 +2439,12 @@ class _PostgresStoreBase:
                         and any(revision.revision == 36 for revision in schema.pending(current))
                     ):
                         await _reject_populated_pre_invocation_database(cur)
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 39
+                        and any(revision.revision == 39 for revision in schema.pending(current))
+                    ):
+                        await _reject_populated_pre_task_invocation_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -2433,6 +2460,8 @@ class _PostgresStoreBase:
                             await self._validate_session_invocation_column(cur)
                         if self._min_required_revision >= 38:
                             await self._validate_task_terminalization_receipt_table(cur)
+                        if self._min_required_revision >= 39:
+                            await self._validate_task_invocation_column(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -2575,6 +2604,8 @@ class _PostgresStoreBase:
             await self._validate_session_invocation_column(cur)
         if self._min_required_revision >= 38:
             await self._validate_task_terminalization_receipt_table(cur)
+        if self._min_required_revision >= 39:
+            await self._validate_task_invocation_column(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -2613,6 +2644,23 @@ class _PostgresStoreBase:
                 "database from a known-good revision-36 schema."
             )
 
+    async def _validate_task_invocation_column(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, is_generated
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_tasks'
+              AND column_name = 'invocation'
+            """
+        )
+        if await cur.fetchone() != ("jsonb", "NO", "NEVER"):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_tasks.invocation' conflicts with "
+                "Cayu's required task invocation-provenance contract. Recreate the "
+                "Cayu database from a known-good revision-39 schema."
+            )
+
     async def _validate_revision_schema_objects(
         self,
         cur: Any,
@@ -2624,6 +2672,8 @@ class _PostgresStoreBase:
             await self._validate_session_invocation_column(cur)
         if revision.revision == 38:
             await self._validate_task_terminalization_receipt_table(cur)
+        if revision.revision == 39:
+            await self._validate_task_invocation_column(cur)
 
     async def _validate_task_terminalization_receipt_table(self, cur: Any) -> None:
         await cur.execute(
@@ -2897,6 +2947,12 @@ class _PostgresStoreBase:
             and any(revision.revision == 36 for revision in schema.pending(current))
         ):
             await _reject_populated_pre_invocation_database(cur)
+        if (
+            current != schema.UNINITIALIZED
+            and current < 39
+            and any(revision.revision == 39 for revision in schema.pending(current))
+        ):
+            await _reject_populated_pre_task_invocation_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -7265,6 +7321,29 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 status=SessionStatus(row[1]),
                 updated_at=pg_support.to_utc(row[2]),
                 last_activity_at=pg_support.to_utc(row[3]),
+            )
+
+    async def load_invocation_snapshot(
+        self,
+        session_id: str,
+    ) -> SessionInvocationSnapshot | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, status, invocation FROM cayu_sessions WHERE id = %s",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            invocation_value = row[2]
+            if isinstance(invocation_value, str):
+                invocation_value = json.loads(invocation_value)
+            return SessionInvocationSnapshot(
+                id=row[0],
+                status=SessionStatus(row[1]),
+                invocation=SessionInvocation.model_validate(invocation_value),
             )
 
     async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
@@ -14305,7 +14384,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
-    _min_required_revision = 38
+    _min_required_revision = 39
 
     def __init__(
         self,
@@ -14332,42 +14411,125 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         await self._ensure_ready()
-        task = _task_from_create(request)
-        await self._insert_task(task)
+        task = await self._insert_task(request, running=False)
         return task.model_copy(deep=True)
 
-    async def create_running_task(self, request: TaskCreate) -> Task:
+    async def create_running_task(
+        self,
+        request: TaskCreate,
+        *,
+        session_invocation: SessionInvocationBinding,
+    ) -> Task:
         request = copy_task_create(request)
+        session_binding = _copy_required_session_binding(session_invocation)
         await self._ensure_ready()
-        task = _running_task_from_create(request)
-        await self._insert_task(task)
+        task = await self._insert_task(
+            request,
+            running=True,
+            session_invocation=session_binding,
+        )
         return task.model_copy(deep=True)
 
-    async def _insert_task(self, task: Task) -> None:
+    async def _insert_task(
+        self,
+        request: TaskCreate,
+        *,
+        running: bool,
+        session_invocation: SessionInvocationBinding | None = None,
+    ) -> Task:
+        task_id = request.task_id or str(uuid4())
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    parent: TaskInvocationSnapshot | None = None
+                    if request.parent_task_id is not None:
+                        if request.parent_task_id == task_id:
+                            raise ValueError("Task cannot be its own parent.")
+                        await cur.execute(
+                            """
+                            SELECT id, session_id, invocation
+                            FROM cayu_tasks
+                            WHERE id = %s
+                            FOR KEY SHARE
+                            """,
+                            (request.parent_task_id,),
+                        )
+                        row = await cur.fetchone()
+                        if row is None:
+                            raise ValueError(f"Parent task not found: {request.parent_task_id}")
+                        invocation_value = row[2]
+                        if isinstance(invocation_value, str):
+                            invocation_value = json.loads(invocation_value)
+                        parent = TaskInvocationSnapshot(
+                            id=row[0],
+                            session_id=row[1],
+                            invocation=TaskInvocation.model_validate(invocation_value),
+                        )
+                    if running:
+                        if session_invocation is None:
+                            raise AssertionError(
+                                "Running task insertion requires session invocation provenance."
+                            )
+                        task = _running_task_from_create(
+                            request,
+                            task_id=task_id,
+                            parent_task=parent,
+                            session_invocation=session_invocation,
+                        )
+                    else:
+                        task = _task_from_create(
+                            request,
+                            task_id=task_id,
+                            parent_task=parent,
+                        )
                     await cur.execute(
                         f"""
                         INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
                         VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s
+                            %s, %s, %s, %s
                         )
                         """,
                         pg_support.task_insert_values(task),
                     )
                 await conn.commit()
+                return task
             except UniqueViolation as exc:
                 await conn.rollback()
                 raise ValueError(f"Task already exists: {task.id}") from exc
+            except BaseException:
+                await conn.rollback()
+                raise
 
     async def load_task(self, task_id: str) -> Task | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             return await self._load_task(cur, task_id)
+
+    async def load_invocation_snapshot(
+        self,
+        task_id: str,
+    ) -> TaskInvocationSnapshot | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, session_id, invocation FROM cayu_tasks WHERE id = %s",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            invocation_value = row[2]
+            if isinstance(invocation_value, str):
+                invocation_value = json.loads(invocation_value)
+            return TaskInvocationSnapshot(
+                id=row[0],
+                session_id=row[1],
+                invocation=TaskInvocation.model_validate(invocation_value),
+            )
 
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
         query = copy_task_query(query)
@@ -14727,13 +14889,40 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         task_id: str,
         *,
         session_id: str | None = None,
+        session_invocation: SessionInvocationBinding | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
+        session_binding = _copy_optional_session_binding(session_invocation)
         await self._ensure_ready()
         now = datetime.now(UTC)
         async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT status, session_id, invocation FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            _ensure_task_status_can_transition(
+                task_id,
+                TaskStatus(row[0]),
+                TaskStatus.RUNNING,
+            )
+            effective_session_id = _task_session_id_for_start(
+                task_id=task_id,
+                stored_session_id=row[1],
+                requested_session_id=session_id,
+            )
+            invocation_value = row[2]
+            if isinstance(invocation_value, str):
+                invocation_value = json.loads(invocation_value)
+            _task_invocation_for_attachment(
+                TaskInvocation.model_validate(invocation_value),
+                session_id=effective_session_id,
+                session_binding=session_binding,
+            )
             await cur.execute(
                 """
                 UPDATE cayu_tasks
@@ -14745,7 +14934,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 """,
                 (
                     str(TaskStatus.RUNNING),
-                    session_id,
+                    effective_session_id,
                     now,
                     now,
                     task_id,
@@ -14765,14 +14954,45 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         task_id: str,
         *,
         session_id: str,
+        session_invocation: SessionInvocationBinding,
         worker_id: str,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        session_binding = _copy_required_session_binding(session_invocation)
         await self._ensure_ready()
         now = datetime.now(UTC)
         async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT status, session_id, worker_id, lease_expires_at, invocation
+                FROM cayu_tasks
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (task_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if not _can_attach_claimed_task_state(
+                status=TaskStatus(row[0]),
+                session_id=row[1],
+                worker_id=row[2],
+                lease_expires_at=pg_support.to_utc_optional(row[3]),
+                expected_worker_id=worker_id,
+                now=now,
+            ):
+                await self._raise_task_claim_attach_error(cur, task_id, worker_id)
+            invocation_value = row[4]
+            if isinstance(invocation_value, str):
+                invocation_value = json.loads(invocation_value)
+            _task_invocation_for_attachment(
+                TaskInvocation.model_validate(invocation_value),
+                session_id=session_id,
+                session_binding=session_binding,
+            )
             await cur.execute(
                 f"""
                 UPDATE cayu_tasks

@@ -322,6 +322,7 @@ from cayu.runtime.interactions import (
     InteractionSummaryEvidence,
     interaction_usage_summary,
 )
+from cayu.runtime.invocation import SessionInvocationBinding
 from cayu.runtime.loop_policies import (
     BeforeStopAction,
     BeforeStopContext,
@@ -424,6 +425,7 @@ from cayu.runtime.sessions import (
     copy_run_request,
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
+    run_request_with_task_invocation,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     session_input_contract_evidence,
@@ -459,6 +461,7 @@ from cayu.runtime.tasks import (
     TaskStore,
     TaskTerminalizationRequest,
     TaskTerminalKind,
+    _task_invocation_for_attachment,
     _terminalize_claimed_task,
 )
 from cayu.runtime.tool_policy import (
@@ -4940,6 +4943,13 @@ class SessionEngine:
         session_id = request.session_id
         if session_id is None:
             raise AssertionError("Run request session identity was not assigned.")
+        if request.task_id is not None and self.task_store is not None:
+            source_task = await self.task_store.load_invocation_snapshot(request.task_id)
+            if source_task is not None and source_task.session_id in {None, session_id}:
+                request = run_request_with_task_invocation(
+                    request,
+                    source_task,
+                )
         interaction_id = str(uuid4())
         interaction_started_event = self._interaction_started_event_from_identity(
             session_id=session_id,
@@ -13135,6 +13145,10 @@ class SessionEngine:
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+        session_invocation = SessionInvocationBinding(
+            id=session.id,
+            invocation=session.invocation,
+        )
         existing = await self.task_store.load_task(task_id)
         if (
             worker_id is None
@@ -13143,14 +13157,24 @@ class SessionEngine:
             and existing.session_id == session.id
             and existing.worker_id is None
         ):
+            _task_invocation_for_attachment(
+                existing.invocation,
+                session_id=session.id,
+                session_binding=session_invocation,
+            )
             return existing
         if worker_id is not None:
             return await self.task_store.attach_task(
                 task_id,
                 session_id=session.id,
+                session_invocation=session_invocation,
                 worker_id=worker_id,
             )
-        return await self.task_store.start_task(task_id, session_id=session.id)
+        return await self.task_store.start_task(
+            task_id,
+            session_id=session.id,
+            session_invocation=session_invocation,
+        )
 
     async def _fail_task_for_run_setup_error(
         self,

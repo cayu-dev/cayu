@@ -9,11 +9,19 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Literal
+from uuid import uuid4
 
 import pytest
 from psycopg import errors as psycopg_errors
 from pydantic import ValidationError
-from tests.core.task_store_conformance import assert_task_claim_lost_conformance
+from tests.core.task_invocation_fixtures import (
+    task_backed_session_invocation,
+    unattributed_session_invocation_binding,
+)
+from tests.core.task_store_conformance import (
+    assert_task_claim_lost_conformance,
+    assert_task_session_invocation_binding_conformance,
+)
 from tests.core.task_terminalization_conformance import (
     assert_task_terminalization_acknowledgement_conformance,
 )
@@ -23,9 +31,14 @@ from tests.core.task_topology_conformance import (
 )
 
 from cayu import (
+    InvocationOrigin,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
     Task,
     TaskClaimLost,
     TaskCreate,
+    TaskExecutionSource,
+    TaskInvocation,
     TaskOrder,
     TaskQuery,
     TaskStatus,
@@ -35,6 +48,7 @@ from cayu import (
     TaskTerminalizationRetryPolicy,
     TaskTerminalKind,
     TaskTopologyQuery,
+    task_create_with_execution_source,
     terminalize_task_with_retry,
 )
 from cayu._validation import (
@@ -314,6 +328,58 @@ def test_postgres_task_store_task_claim_lost_conformance(postgres_dsn):
     _run(postgres_dsn, ops)
 
 
+def test_postgres_task_store_binds_session_identity_to_invocation(postgres_dsn):
+    async def ops(store):
+        await assert_task_session_invocation_binding_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_persists_and_inherits_invocation_provenance(postgres_dsn):
+    async def ops(store):
+        root = await store.create_task(
+            task_create_with_execution_source(
+                TaskCreate(
+                    task_id="provenance-root",
+                    type="webhook",
+                    invocation_origin=InvocationOriginClaim(
+                        subject="github:org/repo",
+                        tenant="customer-a",
+                    ),
+                ),
+                source=TaskExecutionSource.WEBHOOK,
+            )
+        )
+        child = await store.create_task(
+            TaskCreate(
+                task_id="provenance-child",
+                type="step",
+                parent_task_id=root.id,
+            )
+        )
+        assert root.invocation.origin.trust is InvocationOriginTrust.HOST_ASSERTED
+        assert child.invocation.origin == root.invocation.origin
+        assert child.invocation.root_invocation_id == root.invocation.root_invocation_id
+        assert child.invocation.source is TaskExecutionSource.SDK_TASK
+
+        snapshot = await store.load_invocation_snapshot(child.id)
+        assert snapshot is not None
+        assert snapshot.id == child.id
+        assert snapshot.session_id == child.session_id
+        assert snapshot.invocation == child.invocation
+        assert await store.load_invocation_snapshot("missing") is None
+
+        reopened = _new_store(postgres_dsn)
+        try:
+            loaded = await reopened.load_task(child.id)
+            assert loaded is not None
+            assert loaded.invocation == child.invocation
+        finally:
+            await reopened.close()
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_persists_availability_and_claims_once_at_exact_boundary(
     postgres_dsn,
 ):
@@ -452,28 +518,37 @@ def test_postgres_task_topology_uses_canonical_id_ordering(postgres_dsn):
         import psycopg
 
         await store.ensure_schema()
+        invocation = TaskInvocation(
+            origin=InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED),
+            root_invocation_id=str(uuid4()),
+            root_session_id="collation-session",
+            source=TaskExecutionSource.SDK_TASK,
+        ).model_dump_json()
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
                     INSERT INTO cayu_tasks (
                         id, type, status, session_id, input, metadata,
-                        created_at, updated_at
+                        created_at, updated_at, invocation
                     )
                     VALUES
                         (
                             'collation-a', 'step', 'pending', 'collation-session',
                             '{}'::jsonb, '{}'::jsonb,
                             TIMESTAMPTZ '2026-01-01T00:00:00Z',
-                            TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                            TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                            %s::jsonb
                         ),
                         (
                             'collation-B', 'step', 'pending', 'collation-session',
                             '{}'::jsonb, '{}'::jsonb,
                             TIMESTAMPTZ '2026-01-01T00:00:00Z',
-                            TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                            TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                            %s::jsonb
                         )
-                    """
+                    """,
+                    (invocation, invocation),
                 )
             await conn.commit()
 
@@ -507,7 +582,7 @@ def test_postgres_task_topology_branch_plan_is_bounded(postgres_dsn):
     async def ops(store):
         import psycopg
 
-        await store.create_task(
+        parent = await store.create_task(
             TaskCreate(
                 task_id="topology-plan-parent",
                 type="workflow",
@@ -522,7 +597,7 @@ def test_postgres_task_topology_branch_plan_is_bounded(postgres_dsn):
                 """
                 INSERT INTO cayu_tasks (
                     id, type, status, session_id, parent_task_id,
-                    input, metadata, created_at, updated_at
+                    input, metadata, created_at, updated_at, invocation
                 )
                 SELECT
                     'topology-plan-child-' || lpad(value::text, 6, '0'),
@@ -533,9 +608,11 @@ def test_postgres_task_topology_branch_plan_is_bounded(postgres_dsn):
                     '{}'::jsonb,
                     '{}'::jsonb,
                     TIMESTAMPTZ '2026-01-01T00:00:00Z',
-                    TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                    TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                    %s::jsonb
                 FROM generate_series(0, 99999) AS value
-                """
+                """,
+                (parent.invocation.model_dump_json(),),
             )
             await conn.commit()
             await cur.execute("SET LOCAL enable_seqscan = off")
@@ -650,7 +727,8 @@ def test_postgres_task_store_creates_running_task_atomically(postgres_dsn):
                 type="run",
                 session_id="sess_atomic_run",
                 input={"prompt": "hello"},
-            )
+            ),
+            session_invocation=unattributed_session_invocation_binding("sess_atomic_run"),
         )
 
         assert running.status is TaskStatus.RUNNING
@@ -665,10 +743,14 @@ def test_postgres_task_store_creates_running_task_atomically(postgres_dsn):
                     task_id="task_atomic_run",
                     type="duplicate",
                     session_id="sess_other",
-                )
+                ),
+                session_invocation=unattributed_session_invocation_binding("sess_other"),
             )
         with pytest.raises(ValueError, match="session_id is required"):
-            await store.create_running_task(TaskCreate(task_id="task_missing_session", type="run"))
+            await store.create_running_task(
+                TaskCreate(task_id="task_missing_session", type="run"),
+                session_invocation=unattributed_session_invocation_binding("sess_missing"),
+            )
         assert await store.load_task("task_missing_session") is None
 
     _run(postgres_dsn, ops)
@@ -678,7 +760,13 @@ def test_postgres_task_store_lifecycle_and_terminal_guards(postgres_dsn):
     async def ops(store):
         await store.create_task(TaskCreate(task_id="task_lifecycle", type="analyze_repository"))
 
-        running = await store.start_task("task_lifecycle", session_id="sess_analysis")
+        running = await store.start_task(
+            "task_lifecycle",
+            session_id="sess_analysis",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_lifecycle", "sess_analysis"
+            ),
+        )
         assert running.status == TaskStatus.RUNNING
         assert running.session_id == "sess_analysis"
         assert running.started_at is not None
@@ -761,7 +849,13 @@ def test_postgres_task_store_hold_resume_and_attention_states(postgres_dsn):
 def test_postgres_task_store_does_not_hold_attached_running_tasks(postgres_dsn):
     async def ops(store):
         await store.create_task(TaskCreate(task_id="task_attached_hold", type="review"))
-        await store.start_task("task_attached_hold", session_id="sess_attached_hold")
+        await store.start_task(
+            "task_attached_hold",
+            session_id="sess_attached_hold",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_attached_hold", "sess_attached_hold"
+            ),
+        )
 
         with pytest.raises(ValueError, match="already attached to session sess_attached_hold"):
             await store.pause_task("task_attached_hold", reason="not allowed")
@@ -805,7 +899,14 @@ def test_postgres_task_store_list_tasks_with_filters_and_pagination(postgres_dsn
                 assigned_agent_name="reviewer",
             )
         )
-        await store.start_task("task_1")
+        await store.start_task(
+            "task_1",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_1",
+                "sess_1",
+            ),
+        )
         await store.complete_task("task_2", {"posted": True})
 
         invoice_tasks = await store.list_tasks(
@@ -1026,6 +1127,11 @@ def test_postgres_task_store_attach_task_starts_claimed_task(postgres_dsn):
             await store.attach_task(
                 "task_claimed",
                 session_id="sess_unclaimed",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    "task_claimed",
+                    "sess_unclaimed",
+                ),
                 worker_id="worker_a",
             )
         unclaimed = await store.load_task("task_claimed")
@@ -1041,19 +1147,32 @@ def test_postgres_task_store_attach_task_starts_claimed_task(postgres_dsn):
         assert claimed.lease_expires_at is not None
 
         with pytest.raises(ValueError, match="session_id"):
-            await store.attach_task("task_claimed", session_id="", worker_id="worker_a")
+            await store.attach_task(
+                "task_claimed",
+                session_id="",
+                session_invocation=unattributed_session_invocation_binding("unused_session"),
+                worker_id="worker_a",
+            )
         with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_claimed", session_id="sess_wrong")
         with pytest.raises(ValueError, match="does not own"):
             await store.attach_task(
                 "task_claimed",
                 session_id="sess_wrong",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    "task_claimed",
+                    "sess_wrong",
+                ),
                 worker_id="worker_b",
             )
 
         started = await store.attach_task(
             "task_claimed",
             session_id="sess_claimed",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_claimed", "sess_claimed"
+            ),
             worker_id="worker_a",
         )
         assert started.status == TaskStatus.RUNNING
@@ -1089,6 +1208,9 @@ def test_postgres_task_store_rejects_release_after_session_attachment(postgres_d
         await store.attach_task(
             "task_attached_release",
             session_id="sess_attached",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_attached_release", "sess_attached"
+            ),
             worker_id="worker_a",
         )
 
@@ -1118,6 +1240,9 @@ def test_postgres_task_store_releases_attached_worker_without_requeueing(postgre
         attached = await store.attach_task(
             "task_attached_handoff",
             session_id="sess_attached_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_attached_handoff", "sess_attached_handoff"
+            ),
             worker_id="worker_a",
         )
 
@@ -1158,6 +1283,9 @@ def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_ds
         await store.attach_task(
             "task_wrong_worker",
             session_id="sess_wrong_worker",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_wrong_worker", "sess_wrong_worker"
+            ),
             worker_id="worker_a",
         )
         wrong_worker_before = await store.load_task("task_wrong_worker")
@@ -1170,6 +1298,9 @@ def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_ds
         await store.attach_task(
             "task_expired_worker",
             session_id="sess_expired_worker",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_expired_worker", "sess_expired_worker"
+            ),
             worker_id="worker_a",
         )
         await asyncio.sleep(1.05)
@@ -1208,6 +1339,9 @@ def test_postgres_task_store_does_not_reclaim_attached_expired_leases(postgres_d
         await store.attach_task(
             "task_attached_expired",
             session_id="sess_attached_expired",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_attached_expired", "sess_attached_expired"
+            ),
             worker_id="worker_a",
         )
 
@@ -1325,7 +1459,13 @@ def test_postgres_task_store_cancel_and_persistence(postgres_dsn):
                 assigned_agent_name="invoice_agent",
             )
         )
-        await store.start_task("task_cancel", session_id="sess_cancel")
+        await store.start_task(
+            "task_cancel",
+            session_id="sess_cancel",
+            session_invocation=await task_backed_session_invocation(
+                store, "task_cancel", "sess_cancel"
+            ),
+        )
         cancelled = await store.cancel_task("task_cancel", {"reason": "operator stop"})
         assert cancelled.status == TaskStatus.CANCELLED
         assert cancelled.error == {"reason": "operator stop"}
@@ -1352,7 +1492,13 @@ def test_postgres_task_store_rejects_stale_cross_pool_transitions(postgres_dsn):
 
         second = _new_store(postgres_dsn)
         try:
-            await store.start_task("task_claim", session_id="session_one")
+            await store.start_task(
+                "task_claim",
+                session_id="session_one",
+                session_invocation=await task_backed_session_invocation(
+                    store, "task_claim", "session_one"
+                ),
+            )
             with pytest.raises(ValueError, match="cannot transition to running"):
                 await second.start_task("task_claim", session_id="session_two")
 

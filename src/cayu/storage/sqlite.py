@@ -39,6 +39,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileRejectionResult,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.runtime.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
@@ -101,6 +102,7 @@ from cayu.runtime.sessions import (
     SessionForkActiveModelStageConflict,
     SessionIdentity,
     SessionInspectionIdentity,
+    SessionInvocationSnapshot,
     SessionLineageNode,
     SessionLineageOrigin,
     SessionLineageQuery,
@@ -275,6 +277,7 @@ from cayu.runtime.tasks import (
     Task,
     TaskAggregateFilter,
     TaskCreate,
+    TaskInvocationSnapshot,
     TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
@@ -291,17 +294,23 @@ from cayu.runtime.tasks import (
     TaskTopologyStoreResult,
     _allocate_task_topology_branch_limits,
     _bounded_optional_task_topology_parent_id,
+    _can_attach_claimed_task_state,
+    _copy_optional_session_binding,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
+    _copy_required_session_binding,
     _ensure_can_hold_task,
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
+    _ensure_task_status_can_transition,
     _raise_task_claim_attach_error,
     _replay_task_terminalization_receipt,
     _running_task_from_create,
     _task_from_create,
+    _task_invocation_for_attachment,
+    _task_session_id_for_start,
     _validate_task_topology_ancestry,
     build_task_topology_result,
     copy_task_aggregate_filter,
@@ -320,7 +329,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 36
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 38
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 39
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -1993,6 +2002,27 @@ class SQLiteSessionStore(SessionStore):
                 status=SessionStatus(row["status"]),
                 updated_at=sqlite_support.parse_datetime(row["updated_at"]),
                 last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
+            )
+
+        return await self._run_read(query)
+
+    async def load_invocation_snapshot(
+        self,
+        session_id: str,
+    ) -> SessionInvocationSnapshot | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def query(connection: sqlite3.Connection) -> SessionInvocationSnapshot | None:
+            row = connection.execute(
+                "SELECT id, status, invocation_json FROM cayu_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return SessionInvocationSnapshot(
+                id=row["id"],
+                status=SessionStatus(row["status"]),
+                invocation=SessionInvocation.model_validate(json.loads(row["invocation_json"])),
             )
 
         return await self._run_read(query)
@@ -8960,14 +8990,29 @@ class SQLiteTaskStore(TaskStore):
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         async with self._lock:
-            task = _task_from_create(request)
+            task_id = request.task_id or str(uuid4())
+            parent = self._task_parent_for_create_unlocked(request, task_id=task_id)
+            task = _task_from_create(request, task_id=task_id, parent_task=parent)
             self._insert_task_unlocked(task)
             return task.model_copy(deep=True)
 
-    async def create_running_task(self, request: TaskCreate) -> Task:
+    async def create_running_task(
+        self,
+        request: TaskCreate,
+        *,
+        session_invocation: SessionInvocationBinding,
+    ) -> Task:
         request = copy_task_create(request)
+        session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
-            task = _running_task_from_create(request)
+            task_id = request.task_id or str(uuid4())
+            parent = self._task_parent_for_create_unlocked(request, task_id=task_id)
+            task = _running_task_from_create(
+                request,
+                task_id=task_id,
+                parent_task=parent,
+                session_invocation=session_binding,
+            )
             self._insert_task_unlocked(task)
             return task.model_copy(deep=True)
 
@@ -8997,9 +9042,10 @@ class SQLiteTaskStore(TaskStore):
                         created_at,
                         updated_at,
                         started_at,
-                        completed_at
+                        completed_at,
+                        invocation_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     sqlite_support.task_to_row_values(task),
                 )
@@ -9012,6 +9058,24 @@ class SQLiteTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             return self._load_task_unlocked(task_id)
+
+    async def load_invocation_snapshot(
+        self,
+        task_id: str,
+    ) -> TaskInvocationSnapshot | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT id, session_id, invocation_json FROM cayu_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return TaskInvocationSnapshot(
+                id=row["id"],
+                session_id=row["session_id"],
+                invocation=TaskInvocation.model_validate(json.loads(row["invocation_json"])),
+            )
 
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
         query = copy_task_query(query)
@@ -9326,11 +9390,34 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         *,
         session_id: str | None = None,
+        session_invocation: SessionInvocationBinding | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
+        session_binding = _copy_optional_session_binding(session_invocation)
         async with self._lock:
+            row = self._connection.execute(
+                "SELECT status, session_id, invocation_json FROM cayu_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            _ensure_task_status_can_transition(
+                task_id,
+                TaskStatus(row["status"]),
+                TaskStatus.RUNNING,
+            )
+            effective_session_id = _task_session_id_for_start(
+                task_id=task_id,
+                stored_session_id=row["session_id"],
+                requested_session_id=session_id,
+            )
+            _task_invocation_for_attachment(
+                TaskInvocation.model_validate(json.loads(row["invocation_json"])),
+                session_id=effective_session_id,
+                session_binding=session_binding,
+            )
             now = datetime.now(UTC)
             with self._connection:
                 cursor = self._connection.execute(
@@ -9344,7 +9431,7 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     (
                         str(TaskStatus.RUNNING),
-                        session_id,
+                        effective_session_id,
                         sqlite_support.format_datetime(now),
                         sqlite_support.format_datetime(now),
                         task_id,
@@ -9363,13 +9450,39 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         *,
         session_id: str,
+        session_invocation: SessionInvocationBinding,
         worker_id: str,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        session_binding = _copy_required_session_binding(session_invocation)
         now = datetime.now(UTC)
         async with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT status, session_id, worker_id, lease_expires_at, invocation_json
+                FROM cayu_tasks
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if not _can_attach_claimed_task_state(
+                status=TaskStatus(row["status"]),
+                session_id=row["session_id"],
+                worker_id=row["worker_id"],
+                lease_expires_at=sqlite_support.parse_optional_datetime(row["lease_expires_at"]),
+                expected_worker_id=worker_id,
+                now=now,
+            ):
+                self._raise_task_claim_attach_error(task_id, worker_id)
+            _task_invocation_for_attachment(
+                TaskInvocation.model_validate(json.loads(row["invocation_json"])),
+                session_id=session_id,
+                session_binding=session_binding,
+            )
             with self._connection:
                 cursor = self._connection.execute(
                     """
@@ -9913,6 +10026,29 @@ class SQLiteTaskStore(TaskStore):
         if row is None:
             return None
         return sqlite_support.task_from_row(row)
+
+    def _task_parent_for_create_unlocked(
+        self,
+        request: TaskCreate,
+        *,
+        task_id: str,
+    ) -> TaskInvocationSnapshot | None:
+        parent_task_id = request.parent_task_id
+        if parent_task_id is None:
+            return None
+        if parent_task_id == task_id:
+            raise ValueError("Task cannot be its own parent.")
+        row = self._connection.execute(
+            "SELECT id, session_id, invocation_json FROM cayu_tasks WHERE id = ?",
+            (parent_task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Parent task not found: {parent_task_id}")
+        return TaskInvocationSnapshot(
+            id=row["id"],
+            session_id=row["session_id"],
+            invocation=TaskInvocation.model_validate(json.loads(row["invocation_json"])),
+        )
 
     def _require_task_unlocked(self, task_id: str) -> Task:
         task = self._load_task_unlocked(task_id)

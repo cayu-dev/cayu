@@ -226,6 +226,10 @@ REVISIONS: tuple[Revision, ...] = (
     # completion/failure methods and never claim replay safety, so the new table
     # does not change their write contract.
     Revision(revision=38, kind=RevisionKind.ADDITIVE, compatible_from=37),
+    # Every task now persists immutable root invocation provenance. Pre-39 task
+    # writers cannot populate the required value, so mixed-version task workers
+    # are unsafe and populated historical task tables require a clean rebuild.
+    Revision(revision=39, kind=RevisionKind.BREAKING, compatible_from=39),
 )
 
 #: The revision an empty database is initialized to.

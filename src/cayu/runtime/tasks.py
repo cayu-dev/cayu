@@ -19,6 +19,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -39,6 +40,19 @@ from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
 from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    SessionInvocationBinding,
+    TaskExecutionSource,
+    TaskInvocation,
+    copy_invocation_origin,
+    copy_invocation_origin_claim,
+    copy_session_invocation_binding,
+    copy_task_invocation,
+    inherited_task_invocation,
+)
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 
 
@@ -108,6 +122,7 @@ class Task(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    invocation: TaskInvocation = Field(frozen=True)
 
     @field_validator("input", "metadata", mode="before")
     @classmethod
@@ -159,6 +174,33 @@ class Task(BaseModel):
         return normalize_utc_datetime(value, "available_at")
 
 
+class TaskInvocationSnapshot(BaseModel):
+    """Bounded task identity and immutable provenance for delegation boundaries."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    id: str
+    session_id: str | None
+    invocation: TaskInvocation
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "id")
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "session_id")
+
+    @field_validator("invocation")
+    @classmethod
+    def copy_invocation(cls, value: TaskInvocation) -> TaskInvocation:
+        return copy_task_invocation(value)
+
+
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -172,6 +214,10 @@ class TaskCreate(BaseModel):
     available_at: datetime | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    invocation_origin: InvocationOriginClaim | None = None
+    _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
+    _runtime_invocation_source: TaskExecutionSource | None = PrivateAttr(default=None)
+    _runtime_session_binding: SessionInvocationBinding | None = PrivateAttr(default=None)
 
     @field_validator("input", "metadata", mode="before")
     @classmethod
@@ -1028,20 +1074,38 @@ class TaskStore(ABC):
 
     @abstractmethod
     async def create_task(self, request: TaskCreate) -> Task:
-        """Create a task."""
+        """Create a task and its immutable invocation provenance atomically.
+
+        Implementations must mint the final task ID, load any requested parent,
+        and call ``task_invocation_for_create`` inside the same create boundary.
+        """
 
     @abstractmethod
-    async def create_running_task(self, request: TaskCreate) -> Task:
+    async def create_running_task(
+        self,
+        request: TaskCreate,
+        *,
+        session_invocation: SessionInvocationBinding,
+    ) -> Task:
         """Atomically create a running task already attached to its session.
 
         ``request.session_id`` is required. This avoids leaving an attached,
         unclaimable pending task if a process stops between separate create and
-        start operations.
+        start operations. ``session_invocation`` must describe that exact
+        session so the atomic insert cannot create a contradictory structural
+        attachment and invocation record.
         """
 
     @abstractmethod
     async def load_task(self, task_id: str) -> Task | None:
         """Load a task by id."""
+
+    @abstractmethod
+    async def load_invocation_snapshot(
+        self,
+        task_id: str,
+    ) -> TaskInvocationSnapshot | None:
+        """Load bounded immutable provenance without task payloads or metadata."""
 
     @abstractmethod
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
@@ -1077,8 +1141,13 @@ class TaskStore(ABC):
         task_id: str,
         *,
         session_id: str | None = None,
+        session_invocation: SessionInvocationBinding | None = None,
     ) -> Task:
-        """Mark a pending task as running, optionally attached to a session."""
+        """Mark a pending task as running, optionally attached to a session.
+
+        A session provenance binding is required for attachment. Stores must
+        validate it before changing lifecycle state.
+        """
 
     @abstractmethod
     async def attach_task(
@@ -1086,6 +1155,7 @@ class TaskStore(ABC):
         task_id: str,
         *,
         session_id: str,
+        session_invocation: SessionInvocationBinding,
         worker_id: str,
     ) -> Task:
         """Attach a live worker-claimed task to a session and mark it running.
@@ -1241,16 +1311,31 @@ class InMemoryTaskStore(TaskStore):
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         async with self._lock:
-            task = _task_from_create(request)
+            task_id = request.task_id or str(uuid4())
+            parent = self._task_parent_for_create(request, task_id=task_id)
+            task = _task_from_create(request, task_id=task_id, parent_task=parent)
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
             self._store_task(task)
             return task.model_copy(deep=True)
 
-    async def create_running_task(self, request: TaskCreate) -> Task:
+    async def create_running_task(
+        self,
+        request: TaskCreate,
+        *,
+        session_invocation: SessionInvocationBinding,
+    ) -> Task:
         request = copy_task_create(request)
+        session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
-            task = _running_task_from_create(request)
+            task_id = request.task_id or str(uuid4())
+            parent = self._task_parent_for_create(request, task_id=task_id)
+            task = _running_task_from_create(
+                request,
+                task_id=task_id,
+                parent_task=parent,
+                session_invocation=session_binding,
+            )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
             self._store_task(task)
@@ -1263,6 +1348,21 @@ class InMemoryTaskStore(TaskStore):
             if task is None:
                 return None
             return task.model_copy(deep=True)
+
+    async def load_invocation_snapshot(
+        self,
+        task_id: str,
+    ) -> TaskInvocationSnapshot | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            return TaskInvocationSnapshot(
+                id=task.id,
+                session_id=task.session_id,
+                invocation=task.invocation,
+            )
 
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
         query = copy_task_query(query)
@@ -1393,18 +1493,30 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         *,
         session_id: str | None = None,
+        session_invocation: SessionInvocationBinding | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
+        session_binding = _copy_optional_session_binding(session_invocation)
         async with self._lock:
             task = self._require_task(task_id)
             now = datetime.now(UTC)
             _ensure_can_transition(task, TaskStatus.RUNNING)
+            effective_session_id = _task_session_id_for_start(
+                task_id=task.id,
+                stored_session_id=task.session_id,
+                requested_session_id=session_id,
+            )
+            _task_invocation_for_attachment(
+                task.invocation,
+                session_id=effective_session_id,
+                session_binding=session_binding,
+            )
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
-                    "session_id": (session_id if session_id is not None else task.session_id),
+                    "session_id": effective_session_id,
                     "started_at": task.started_at or now,
                     "updated_at": now,
                 }
@@ -1417,16 +1529,23 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         *,
         session_id: str,
+        session_invocation: SessionInvocationBinding,
         worker_id: str,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
             task = self._require_task(task_id)
             now = datetime.now(UTC)
             if not _can_attach_claimed_task(task, worker_id=worker_id, now=now):
                 _raise_task_claim_attach_error(task, worker_id, now=now)
+            _task_invocation_for_attachment(
+                task.invocation,
+                session_id=session_id,
+                session_binding=session_binding,
+            )
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
@@ -1761,6 +1880,26 @@ class InMemoryTaskStore(TaskStore):
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
         return task
+
+    def _task_parent_for_create(
+        self,
+        request: TaskCreate,
+        *,
+        task_id: str,
+    ) -> TaskInvocationSnapshot | None:
+        parent_task_id = request.parent_task_id
+        if parent_task_id is None:
+            return None
+        if parent_task_id == task_id:
+            raise ValueError("Task cannot be its own parent.")
+        parent = self._tasks.get(parent_task_id)
+        if parent is None:
+            raise ValueError(f"Parent task not found: {parent_task_id}")
+        return TaskInvocationSnapshot(
+            id=parent.id,
+            session_id=parent.session_id,
+            invocation=parent.invocation,
+        )
 
     def _require_owned_leased_task(self, task_id: str, worker_id: str) -> Task:
         task = self._require_task(task_id)
@@ -2340,6 +2479,7 @@ def copy_task(task: Task) -> Task:
         updated_at=task.updated_at,
         started_at=task.started_at,
         completed_at=task.completed_at,
+        invocation=copy_task_invocation(task.invocation),
     )
 
 
@@ -2625,7 +2765,7 @@ def _bounded_task_terminalization_evidence(value: str) -> str:
 def copy_task_create(request: TaskCreate) -> TaskCreate:
     if type(request) is not TaskCreate:
         raise TypeError("Task creation requires a TaskCreate instance.")
-    return TaskCreate(
+    copied = TaskCreate(
         task_id=request.task_id,
         type=request.type,
         title=request.title,
@@ -2636,7 +2776,231 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         available_at=request.available_at,
         input=copy_durable_json_object(request.input, "input"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
+        invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
     )
+    copied._verified_invocation_origin = (
+        None
+        if request._verified_invocation_origin is None
+        else copy_invocation_origin(request._verified_invocation_origin)
+    )
+    copied._runtime_invocation_source = request._runtime_invocation_source
+    copied._runtime_session_binding = _copy_optional_session_binding(
+        request._runtime_session_binding
+    )
+    return copied
+
+
+def task_create_with_runtime_invocation(
+    request: TaskCreate,
+    *,
+    source: TaskExecutionSource,
+    verified_origin: InvocationOrigin | None = None,
+    session_invocation: SessionInvocationBinding | None = None,
+) -> TaskCreate:
+    """Attach provenance authority minted by a trusted Cayu boundary."""
+
+    if type(request) is not TaskCreate:
+        raise TypeError("Runtime task invocation authority requires a TaskCreate request.")
+    if type(source) is not TaskExecutionSource:
+        raise TypeError("source must be a TaskExecutionSource.")
+    if verified_origin is not None:
+        verified_origin = copy_invocation_origin(verified_origin)
+        if verified_origin.trust is not InvocationOriginTrust.SERVER_VERIFIED:
+            raise ValueError("Runtime-verified task origins must use server_verified trust.")
+        if request.invocation_origin is not None:
+            raise ValueError("A verified task cannot also carry a host origin claim.")
+    session_binding = _copy_optional_session_binding(session_invocation)
+    if session_binding is not None and (
+        request.invocation_origin is not None or verified_origin is not None
+    ):
+        raise ValueError("Session-derived tasks must inherit their root invocation origin.")
+    copied = copy_task_create(request)
+    copied._runtime_invocation_source = source
+    copied._verified_invocation_origin = verified_origin
+    copied._runtime_session_binding = session_binding
+    return copied
+
+
+def task_create_with_execution_source(
+    request: TaskCreate,
+    *,
+    source: TaskExecutionSource,
+) -> TaskCreate:
+    """Classify work at a trusted direct-SDK host boundary.
+
+    The source is private model state rather than request JSON. Server-owned
+    sources are intentionally rejected; only Cayu's server/runtime adapters may
+    mint those classifications.
+    """
+
+    if type(source) is not TaskExecutionSource:
+        raise TypeError("source must be a TaskExecutionSource.")
+    if source not in {
+        TaskExecutionSource.SDK_TASK,
+        TaskExecutionSource.SCHEDULED,
+        TaskExecutionSource.WEBHOOK,
+    }:
+        raise ValueError("Direct SDK task sources must be sdk_task, scheduled, or webhook.")
+    return task_create_with_runtime_invocation(request, source=source)
+
+
+def task_invocation_for_create(
+    request: TaskCreate,
+    *,
+    task_id: str,
+    parent_task: Task | TaskInvocationSnapshot | None,
+    session_invocation: SessionInvocationBinding | None = None,
+) -> TaskInvocation:
+    """Derive exact provenance inside the atomic task-store create boundary."""
+
+    if type(request) is not TaskCreate:
+        raise TypeError("Task invocation derivation requires a TaskCreate request.")
+    task_id = require_clean_nonblank(task_id, "task_id")
+    source = request._runtime_invocation_source or TaskExecutionSource.SDK_TASK
+    verified_origin = request._verified_invocation_origin
+    request_session_binding = request._runtime_session_binding
+    supplied_session_binding = _copy_optional_session_binding(session_invocation)
+    if (
+        request_session_binding is not None
+        and supplied_session_binding is not None
+        and request_session_binding != supplied_session_binding
+    ):
+        raise ValueError("Task creation carries contradictory session invocation bindings.")
+    session_binding = supplied_session_binding or request_session_binding
+    if request.invocation_origin is not None and verified_origin is not None:
+        raise ValueError("A task cannot carry both host-asserted and verified origins.")
+    if parent_task is not None:
+        if type(parent_task) not in {Task, TaskInvocationSnapshot}:
+            raise TypeError("Parent task provenance must be a task or invocation snapshot.")
+        if request.parent_task_id != parent_task.id:
+            raise ValueError("Parent task identity conflicts with invocation derivation.")
+        if request.invocation_origin is not None or verified_origin is not None:
+            raise ValueError("Derived tasks must inherit their root invocation origin.")
+        if (
+            session_binding is not None
+            and request.session_id is not None
+            and request.session_id != session_binding.id
+        ):
+            raise ValueError("Task session identity conflicts with its provenance binding.")
+        if session_binding is not None and (
+            parent_task.invocation.origin != session_binding.invocation.origin
+            or parent_task.invocation.root_invocation_id
+            != session_binding.invocation.root_invocation_id
+        ):
+            raise ValueError("Parent task and attached session invocation provenance conflict.")
+        return inherited_task_invocation(
+            parent_task.invocation,
+            source=source,
+            root_session_id=(
+                None if session_binding is None else session_binding.invocation.root_session_id
+            ),
+        )
+    if request.parent_task_id is not None:
+        raise ValueError("Parent task not found for invocation provenance.")
+    if session_binding is not None:
+        if request.invocation_origin is not None or verified_origin is not None:
+            raise ValueError("Session-derived tasks must inherit their root invocation origin.")
+        if request.session_id is not None and request.session_id != session_binding.id:
+            raise ValueError("Task session identity conflicts with its provenance binding.")
+        return inherited_task_invocation(
+            session_binding.invocation,
+            source=source,
+        )
+    if source is TaskExecutionSource.TASK_DISPATCH:
+        raise ValueError("Task dispatch provenance requires a parent task or session.")
+    if verified_origin is not None:
+        if source not in {TaskExecutionSource.HTTP_RUN, TaskExecutionSource.PRODUCT_OPERATION}:
+            raise ValueError("Verified task origins require a server-owned task source.")
+        origin = copy_invocation_origin(verified_origin)
+    elif request.invocation_origin is not None:
+        if source not in {
+            TaskExecutionSource.SDK_TASK,
+            TaskExecutionSource.SCHEDULED,
+            TaskExecutionSource.WEBHOOK,
+        }:
+            raise ValueError("Host-asserted task origins require a trusted host source.")
+        origin = InvocationOrigin(
+            trust=InvocationOriginTrust.HOST_ASSERTED,
+            subject=request.invocation_origin.subject,
+            tenant=request.invocation_origin.tenant,
+        )
+    else:
+        if source not in {
+            TaskExecutionSource.SDK_TASK,
+            TaskExecutionSource.SCHEDULED,
+            TaskExecutionSource.WEBHOOK,
+        }:
+            raise ValueError(f"{source.value} task provenance requires a trusted origin.")
+        origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    return TaskInvocation(
+        origin=origin,
+        root_invocation_id=str(uuid4()),
+        root_session_id=request.session_id,
+        source=source,
+    )
+
+
+def _copy_optional_session_binding(
+    value: SessionInvocationBinding | None,
+) -> SessionInvocationBinding | None:
+    if value is None:
+        return None
+    return copy_session_invocation_binding(value)
+
+
+def _copy_required_session_binding(
+    value: SessionInvocationBinding,
+) -> SessionInvocationBinding:
+    if value is None:
+        raise TypeError("Running task creation requires session invocation provenance.")
+    return copy_session_invocation_binding(value)
+
+
+def _task_invocation_for_attachment(
+    task_invocation: TaskInvocation,
+    *,
+    session_id: str | None,
+    session_binding: SessionInvocationBinding | None,
+) -> TaskInvocation:
+    task_invocation = copy_task_invocation(task_invocation)
+    if session_id is None:
+        if session_binding is not None:
+            raise ValueError("Session provenance binding requires a session_id attachment.")
+        return task_invocation
+    if session_binding is None:
+        raise ValueError("Session provenance binding is required to attach this task.")
+    if session_binding.id != session_id:
+        raise ValueError("Task session identity conflicts with its provenance binding.")
+    session_invocation = session_binding.invocation
+    if (
+        task_invocation.origin != session_invocation.origin
+        or task_invocation.root_invocation_id != session_invocation.root_invocation_id
+    ):
+        raise ValueError("Task and session invocation provenance conflict.")
+    if (
+        task_invocation.root_session_id is not None
+        and task_invocation.root_session_id != session_invocation.root_session_id
+    ):
+        raise ValueError("Task and session root identities conflict.")
+    return task_invocation
+
+
+def _task_session_id_for_start(
+    *,
+    task_id: str,
+    stored_session_id: str | None,
+    requested_session_id: str | None,
+) -> str | None:
+    """Resolve one start transition's canonical session without allowing reassignment."""
+
+    task_id = require_clean_nonblank(task_id, "task_id")
+    if (
+        stored_session_id is not None
+        and requested_session_id is not None
+        and stored_session_id != requested_session_id
+    ):
+        raise ValueError(f"Task {task_id} is already bound to a different session.")
+    return stored_session_id if stored_session_id is not None else requested_session_id
 
 
 def copy_task_query(query: TaskQuery | None) -> TaskQuery:
@@ -2677,10 +3041,16 @@ def task_query_from_aggregate_filter(filters: TaskAggregateFilter) -> TaskQuery:
     )
 
 
-def _task_from_create(request: TaskCreate) -> Task:
+def _task_from_create(
+    request: TaskCreate,
+    *,
+    task_id: str,
+    parent_task: Task | TaskInvocationSnapshot | None,
+    session_invocation: SessionInvocationBinding | None = None,
+) -> Task:
     now = datetime.now(UTC)
     return Task(
-        id=request.task_id if request.task_id is not None else str(uuid4()),
+        id=task_id,
         type=request.type,
         title=request.title,
         description=request.description,
@@ -2693,11 +3063,28 @@ def _task_from_create(request: TaskCreate) -> Task:
         metadata=copy_durable_json_object(request.metadata, "metadata"),
         created_at=now,
         updated_at=now,
+        invocation=task_invocation_for_create(
+            request,
+            task_id=task_id,
+            parent_task=parent_task,
+            session_invocation=session_invocation,
+        ),
     )
 
 
-def _running_task_from_create(request: TaskCreate) -> Task:
-    task = _task_from_create(request)
+def _running_task_from_create(
+    request: TaskCreate,
+    *,
+    task_id: str,
+    parent_task: Task | TaskInvocationSnapshot | None,
+    session_invocation: SessionInvocationBinding,
+) -> Task:
+    task = _task_from_create(
+        request,
+        task_id=task_id,
+        parent_task=parent_task,
+        session_invocation=session_invocation,
+    )
     if task.session_id is None:
         raise ValueError("TaskCreate.session_id is required to create a running task.")
     return task.model_copy(
@@ -2709,14 +3096,22 @@ def _running_task_from_create(request: TaskCreate) -> Task:
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
-    if task.status in {
+    _ensure_task_status_can_transition(task.id, task.status, next_status)
+
+
+def _ensure_task_status_can_transition(
+    task_id: str,
+    status: TaskStatus,
+    next_status: TaskStatus,
+) -> None:
+    if status in {
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
     }:
-        raise ValueError(f"Task {task.id} is already terminal: {task.status}")
-    if next_status == TaskStatus.RUNNING and task.status != TaskStatus.PENDING:
-        raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
+        raise ValueError(f"Task {task_id} is already terminal: {status}")
+    if next_status == TaskStatus.RUNNING and status != TaskStatus.PENDING:
+        raise ValueError(f"Task {task_id} cannot transition to running from {status}")
 
 
 def _ensure_can_hold_task(task: Task, next_status: TaskStatus) -> None:
@@ -2752,12 +3147,31 @@ def _can_attach_claimed_task(
     now: datetime | None = None,
 ) -> bool:
     now = datetime.now(UTC) if now is None else now
+    return _can_attach_claimed_task_state(
+        status=task.status,
+        session_id=task.session_id,
+        worker_id=task.worker_id,
+        lease_expires_at=task.lease_expires_at,
+        expected_worker_id=worker_id,
+        now=now,
+    )
+
+
+def _can_attach_claimed_task_state(
+    *,
+    status: TaskStatus,
+    session_id: str | None,
+    worker_id: str | None,
+    lease_expires_at: datetime | None,
+    expected_worker_id: str,
+    now: datetime,
+) -> bool:
     return (
-        task.status is TaskStatus.CLAIMED
-        and task.worker_id == worker_id
-        and task.session_id is None
-        and task.lease_expires_at is not None
-        and task.lease_expires_at > now
+        status is TaskStatus.CLAIMED
+        and worker_id == expected_worker_id
+        and session_id is None
+        and lease_expires_at is not None
+        and lease_expires_at > now
     )
 
 

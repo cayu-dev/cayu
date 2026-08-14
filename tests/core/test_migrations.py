@@ -166,6 +166,24 @@ def test_revision_thirty_six_requires_session_invocation_provenance() -> None:
         )
 
 
+def test_revision_thirty_nine_requires_task_invocation_provenance() -> None:
+    revision = m.revision(39)
+    state = m.SchemaState(
+        revision=revision.revision,
+        compatible_from=revision.compatible_from,
+    )
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 39"):
+        m.validate(state, app_latest=38, app_min_supported=38)
+    m.validate(state, app_latest=39, app_min_supported=39)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 39"):
+        m.validate(
+            m.SchemaState(revision=38, compatible_from=37),
+            app_latest=39,
+            app_min_supported=39,
+        )
+
+
 def test_revision_fourteen_remains_compatible_with_older_binaries() -> None:
     m.validate(
         m.SchemaState(revision=14, compatible_from=10),

@@ -24,6 +24,7 @@ from tests._session_provenance import fixture_session_invocation
 from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._execution_unit_fixtures import model_attempt_identity
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
+from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -22474,7 +22475,7 @@ def test_cayu_app_dispatches_forked_session_with_task_linkage():
         )
     )
     task = asyncio.run(
-        tasks.create_task(
+        app.create_task(
             TaskCreate(
                 type="follow_up",
                 session_id="sess_dispatch_fork_child",
@@ -25806,6 +25807,11 @@ def test_cayu_app_does_not_fail_task_it_could_not_start():
         await task_store.start_task(
             "task_claimed_elsewhere",
             session_id="other_session",
+            session_invocation=await task_backed_session_invocation(
+                task_store,
+                "task_claimed_elsewhere",
+                "other_session",
+            ),
         )
         app = CayuApp(session_store=session_store, task_store=task_store)
         app.register_provider(provider, default=True)

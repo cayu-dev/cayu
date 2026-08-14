@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from psycopg.errors import DiskFull
 from pydantic import ValidationError
+from tests.core.task_invocation_fixtures import unattributed_task_invocation
 
 from cayu import (
     InMemoryTaskStore,
@@ -567,6 +568,7 @@ def test_terminalization_boundaries_reject_hostile_subclasses() -> None:
                     status="completed",
                     result={"summary": "done"},
                     completed_at=datetime.now(UTC),
+                    invocation=unattributed_task_invocation(),
                 ),
                 committed_at=datetime.now(UTC),
             )

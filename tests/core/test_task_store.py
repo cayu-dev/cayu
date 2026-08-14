@@ -6,7 +6,14 @@ from collections.abc import Callable
 
 import pytest
 from pydantic import ValidationError
-from tests.core.task_store_conformance import assert_task_claim_lost_conformance
+from tests.core.task_invocation_fixtures import (
+    task_backed_session_invocation,
+    unattributed_session_invocation_binding,
+)
+from tests.core.task_store_conformance import (
+    assert_task_claim_lost_conformance,
+    assert_task_session_invocation_binding_conformance,
+)
 from tests.core.task_terminalization_conformance import (
     assert_task_terminalization_acknowledgement_conformance,
 )
@@ -245,6 +252,19 @@ def test_task_stores_expose_detached_terminalization_receipt(
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_bind_session_identity_to_invocation(store_factory: StoreFactory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_task_session_invocation_binding_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_create_load_and_copy_boundary(store_factory: StoreFactory, tmp_path):
     store = _make_store(store_factory, tmp_path)
 
@@ -290,7 +310,8 @@ def test_task_stores_create_running_task_atomically(store_factory: StoreFactory,
                 type="run",
                 session_id="sess_atomic_run",
                 input={"prompt": "hello"},
-            )
+            ),
+            session_invocation=unattributed_session_invocation_binding("sess_atomic_run"),
         )
 
         assert running.status is TaskStatus.RUNNING
@@ -307,10 +328,14 @@ def test_task_stores_create_running_task_atomically(store_factory: StoreFactory,
                     task_id="task_atomic_run",
                     type="duplicate",
                     session_id="sess_other",
-                )
+                ),
+                session_invocation=unattributed_session_invocation_binding("sess_other"),
             )
         with pytest.raises(ValueError, match="session_id is required"):
-            await store.create_running_task(TaskCreate(task_id="task_missing_session", type="run"))
+            await store.create_running_task(
+                TaskCreate(task_id="task_missing_session", type="run"),
+                session_invocation=unattributed_session_invocation_binding("sess_missing"),
+            )
         assert await store.load_task("task_missing_session") is None
         await _close_store(store)
 
@@ -324,7 +349,15 @@ def test_task_stores_lifecycle_and_terminal_guards(store_factory: StoreFactory, 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_lifecycle", type="analyze_repository"))
 
-        running = await store.start_task("task_lifecycle", session_id="sess_analysis")
+        running = await store.start_task(
+            "task_lifecycle",
+            session_id="sess_analysis",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_lifecycle",
+                "sess_analysis",
+            ),
+        )
         assert running.status == TaskStatus.RUNNING
         assert running.session_id == "sess_analysis"
         assert running.started_at is not None
@@ -430,7 +463,15 @@ def test_task_stores_do_not_hold_attached_running_tasks(store_factory: StoreFact
 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_attached_hold", type="review"))
-        await store.start_task("task_attached_hold", session_id="sess_attached_hold")
+        await store.start_task(
+            "task_attached_hold",
+            session_id="sess_attached_hold",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_attached_hold",
+                "sess_attached_hold",
+            ),
+        )
 
         with pytest.raises(ValueError, match="already attached to session sess_attached_hold"):
             await store.pause_task("task_attached_hold", reason="not allowed")
@@ -482,7 +523,14 @@ def test_task_stores_list_tasks_with_filters_and_pagination(
                 assigned_agent_name="reviewer",
             )
         )
-        await store.start_task("task_1")
+        await store.start_task(
+            "task_1",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_1",
+                "sess_1",
+            ),
+        )
         await store.complete_task("task_2", {"posted": True})
 
         invoice_tasks = await store.list_tasks(
@@ -730,6 +778,11 @@ def test_task_stores_attach_task_starts_claimed_task(store_factory: StoreFactory
             await store.attach_task(
                 "task_claimed",
                 session_id="sess_unclaimed",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    "task_claimed",
+                    "sess_unclaimed",
+                ),
                 worker_id="worker_a",
             )
         unclaimed = await store.load_task("task_claimed")
@@ -745,19 +798,34 @@ def test_task_stores_attach_task_starts_claimed_task(store_factory: StoreFactory
         assert claimed.lease_expires_at is not None
 
         with pytest.raises(ValueError, match="session_id"):
-            await store.attach_task("task_claimed", session_id="", worker_id="worker_a")
+            await store.attach_task(
+                "task_claimed",
+                session_id="",
+                session_invocation=unattributed_session_invocation_binding("unused_session"),
+                worker_id="worker_a",
+            )
         with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_claimed", session_id="sess_wrong")
         with pytest.raises(ValueError, match="does not own"):
             await store.attach_task(
                 "task_claimed",
                 session_id="sess_wrong",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    "task_claimed",
+                    "sess_wrong",
+                ),
                 worker_id="worker_b",
             )
 
         started = await store.attach_task(
             "task_claimed",
             session_id="sess_claimed",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_claimed",
+                "sess_claimed",
+            ),
             worker_id="worker_a",
         )
         assert started.status == TaskStatus.RUNNING
@@ -806,6 +874,11 @@ def test_task_stores_reject_release_after_session_attachment(
         await store.attach_task(
             "task_attached_release",
             session_id="sess_attached",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_attached_release",
+                "sess_attached",
+            ),
             worker_id="worker_a",
         )
 
@@ -831,6 +904,8 @@ def test_task_stores_release_attached_task_worker_without_requeueing(
     store = _make_store(store_factory, tmp_path)
 
     async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="parent_review", type="review"))
+        await store.complete_task("parent_review", {"status": "delegated"})
         await store.create_task(
             TaskCreate(
                 task_id="task_attached_handoff",
@@ -846,6 +921,11 @@ def test_task_stores_release_attached_task_worker_without_requeueing(
         attached = await store.attach_task(
             "task_attached_handoff",
             session_id="sess_attached_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_attached_handoff",
+                "sess_attached_handoff",
+            ),
             worker_id="worker_a",
         )
 
@@ -898,6 +978,11 @@ def test_task_stores_reject_invalid_attached_worker_release(
         await store.attach_task(
             "task_wrong_worker",
             session_id="sess_wrong_worker",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_wrong_worker",
+                "sess_wrong_worker",
+            ),
             worker_id="worker_a",
         )
         wrong_worker_before = await store.load_task("task_wrong_worker")
@@ -910,6 +995,11 @@ def test_task_stores_reject_invalid_attached_worker_release(
         await store.attach_task(
             "task_expired_worker",
             session_id="sess_expired_worker",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_expired_worker",
+                "sess_expired_worker",
+            ),
             worker_id="worker_a",
         )
         await asyncio.sleep(1.05)
@@ -956,6 +1046,11 @@ def test_task_stores_do_not_reclaim_attached_expired_leases(
         await store.attach_task(
             "task_attached_expired",
             session_id="sess_attached_expired",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_attached_expired",
+                "sess_attached_expired",
+            ),
             worker_id="worker_a",
         )
 
@@ -1094,7 +1189,15 @@ def test_sqlite_task_store_persists_tasks_across_reopen(tmp_path):
                 assigned_agent_name="invoice_agent",
             )
         )
-        await store.start_task("task_persisted", session_id="sess_persisted")
+        await store.start_task(
+            "task_persisted",
+            session_id="sess_persisted",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_persisted",
+                "sess_persisted",
+            ),
+        )
         await store.fail_task("task_persisted", {"message": "external API failed"})
         await store.close()
 
@@ -1124,7 +1227,15 @@ def test_sqlite_task_store_rejects_stale_cross_connection_transitions(tmp_path):
     async def run_store_operations() -> None:
         await first.create_task(TaskCreate(task_id="task_claim", type="demo"))
 
-        await first.start_task("task_claim", session_id="session_one")
+        await first.start_task(
+            "task_claim",
+            session_id="session_one",
+            session_invocation=await task_backed_session_invocation(
+                first,
+                "task_claim",
+                "session_one",
+            ),
+        )
         with pytest.raises(ValueError, match="cannot transition to running"):
             await second.start_task("task_claim", session_id="session_two")
 
@@ -1404,50 +1515,46 @@ def test_sqlite_task_terminalization_converges_across_connections(tmp_path) -> N
     asyncio.run(run())
 
 
-def test_sqlite_revision_thirty_eight_preserves_legacy_terminal_tasks(tmp_path) -> None:
+def test_sqlite_revision_thirty_nine_rejects_populated_store_before_receipt_migration(
+    tmp_path,
+) -> None:
     db_path = tmp_path / "tasks.sqlite"
     current = SQLiteTaskStore(db_path)
 
-    async def create_legacy_terminal() -> None:
-        await current.create_task(TaskCreate(task_id="legacy_terminal", type="review"))
-        await current.complete_task("legacy_terminal", {"summary": "legacy"})
+    async def create_existing_terminal() -> None:
+        await current.create_task(TaskCreate(task_id="existing_terminal", type="review"))
+        await current.complete_task("existing_terminal", {"summary": "existing"})
         await current.close()
 
-    asyncio.run(create_legacy_terminal())
+    asyncio.run(create_existing_terminal())
     connection = sqlite3.connect(db_path)
     try:
         connection.execute("DROP TABLE cayu_task_terminalization_receipts")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 38")
+        connection.execute("ALTER TABLE cayu_tasks DROP COLUMN invocation_json")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 38")
         connection.execute("PRAGMA user_version = 37")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld):
-        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+    with pytest.raises(RuntimeError, match="revision 39 requires invocation provenance"):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
 
-    migrated = SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
-
-    async def validate_migration() -> None:
-        legacy = await migrated.load_task("legacy_terminal")
-        assert legacy is not None
-        assert legacy.status is TaskStatus.COMPLETED
-        assert (
-            await migrated.load_task_terminalization_receipt("legacy_terminal", "new-key") is None
-        )
-        with pytest.raises(TaskTerminalizationConflict):
-            await migrated.terminalize_task(
-                TaskTerminalizationRequest(
-                    task_id="legacy_terminal",
-                    worker_id="worker_a",
-                    kind=TaskTerminalKind.COMPLETED,
-                    result={"summary": "legacy"},
-                    idempotency_key="new-key",
-                )
-            )
-        await migrated.close()
-
-    asyncio.run(validate_migration())
+    connection = sqlite3.connect(db_path)
+    try:
+        revision = connection.execute("SELECT MAX(revision) FROM cayu_schema_migrations").fetchone()
+        receipt_table = connection.execute(
+            "SELECT type FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'cayu_task_terminalization_receipts'"
+        ).fetchone()
+        task = connection.execute(
+            "SELECT status, result_json FROM cayu_tasks WHERE id = 'existing_terminal'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert revision == (37,)
+    assert receipt_table is None
+    assert task == (str(TaskStatus.COMPLETED), '{"summary":"existing"}')
 
 
 def test_sqlite_task_store_rejects_missing_terminalization_receipt_table(tmp_path) -> None:
@@ -1474,7 +1581,8 @@ def test_sqlite_revision_thirty_eight_rejects_conflicting_table_before_recording
     connection = sqlite3.connect(db_path)
     try:
         connection.execute("DROP TABLE cayu_task_terminalization_receipts")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 38")
+        connection.execute("ALTER TABLE cayu_tasks DROP COLUMN invocation_json")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 38")
         connection.execute("PRAGMA user_version = 37")
         connection.execute(
             "CREATE TABLE cayu_task_terminalization_receipts (task_id TEXT PRIMARY KEY)"

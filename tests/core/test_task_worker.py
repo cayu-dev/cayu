@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core.task_invocation_fixtures import (
+    stored_session_invocation,
+    task_backed_session_invocation,
+)
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
@@ -26,6 +30,7 @@ from cayu import (
     Task,
     TaskCreate,
     TaskHandlerOutcome,
+    TaskInvocationSnapshot,
     TaskQuery,
     TaskStatus,
     TaskTerminalizationConflict,
@@ -41,7 +46,11 @@ from cayu import (
     run_task_worker,
 )
 from cayu.runtime import SessionStatus
-from cayu.runtime.sessions import SessionIdentity
+from cayu.runtime.sessions import (
+    SessionIdentity,
+    run_request_with_task_invocation,
+)
+from cayu.runtime.tasks import TaskExecutionSource, task_create_with_runtime_invocation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -706,16 +715,29 @@ def test_run_task_worker_fails_handoff_when_session_is_not_interrupted(
         await task_store.attach_task(
             task.id,
             session_id="session-invalid-handoff",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "session-invalid-handoff",
+            ),
             worker_id=worker_id,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
     async def scenario() -> Task | None:
+        created = await task_store.create_task(TaskCreate(type="job"))
         await session_store.create(
-            RunRequest(
-                agent_name="worker-agent",
-                session_id="session-invalid-handoff",
-                messages=[Message.text("user", "original")],
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="session-invalid-handoff",
+                    task_id=created.id,
+                    messages=[Message.text("user", "original")],
+                ),
+                TaskInvocationSnapshot(
+                    id=created.id,
+                    session_id=created.session_id,
+                    invocation=created.invocation,
+                ),
             ),
             identity=SessionIdentity(
                 provider_name="scripted",
@@ -724,7 +746,6 @@ def test_run_task_worker_fails_handoff_when_session_is_not_interrupted(
         )
         if session_status is not SessionStatus.PENDING:
             await session_store.update_status("session-invalid-handoff", session_status)
-        created = await task_store.create_task(TaskCreate(type="job"))
         await run_task_worker(
             app,
             task_store,
@@ -760,6 +781,11 @@ def test_run_task_worker_fails_handoff_for_missing_attached_session(tmp_path: Pa
         await store.attach_task(
             task.id,
             session_id="session-missing",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                task.id,
+                "session-missing",
+            ),
             worker_id=worker_id,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
@@ -842,11 +868,18 @@ def test_resume_completes_the_running_task_already_attached_to_the_session(
     async def scenario():
         task = await task_store.create_task(TaskCreate(task_id="task-resume", type="job"))
         await session_store.create(
-            RunRequest(
-                agent_name="worker-agent",
-                session_id="session-resume",
-                task_id=task.id,
-                messages=[Message.text("user", "original")],
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="session-resume",
+                    task_id=task.id,
+                    messages=[Message.text("user", "original")],
+                ),
+                TaskInvocationSnapshot(
+                    id=task.id,
+                    session_id=task.session_id,
+                    invocation=task.invocation,
+                ),
             ),
             identity=profiled_session_identity(
                 provider_name=provider.name,
@@ -854,7 +887,14 @@ def test_resume_completes_the_running_task_already_attached_to_the_session(
             ),
         )
         await session_store.update_status("session-resume", SessionStatus.INTERRUPTED)
-        await task_store.start_task(task.id, session_id="session-resume")
+        await task_store.start_task(
+            task.id,
+            session_id="session-resume",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "session-resume",
+            ),
+        )
 
         events = [
             event
@@ -910,8 +950,26 @@ def test_resume_rejects_multiple_running_tasks_attached_to_the_same_session(
             SessionStatus.INTERRUPTED,
         )
         for task_id in ("task-ambiguous-a", "task-ambiguous-b"):
-            await task_store.create_task(TaskCreate(task_id=task_id, type="job"))
-            await task_store.start_task(task_id, session_id="session-ambiguous-tasks")
+            session_invocation = await stored_session_invocation(
+                session_store,
+                "session-ambiguous-tasks",
+            )
+            await task_store.create_task(
+                task_create_with_runtime_invocation(
+                    TaskCreate(
+                        task_id=task_id,
+                        type="job",
+                        session_id="session-ambiguous-tasks",
+                    ),
+                    source=TaskExecutionSource.SDK_TASK,
+                    session_invocation=session_invocation,
+                )
+            )
+            await task_store.start_task(
+                task_id,
+                session_id="session-ambiguous-tasks",
+                session_invocation=session_invocation,
+            )
 
         async for _ in app.resume(
             ResumeRequest(

@@ -197,6 +197,11 @@ from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookPhase,
 )
+from cayu.runtime.invocation import (
+    SessionInvocationBinding,
+    TaskExecutionSource,
+    copy_session_invocation_binding,
+)
 from cayu.runtime.loop_policies import (
     LoopPolicy,
     validate_loop_policies,
@@ -269,6 +274,7 @@ from cayu.runtime.tasks import (
     TaskCreate,
     TaskStore,
     copy_task_create,
+    task_create_with_runtime_invocation,
 )
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
@@ -2080,6 +2086,18 @@ class CayuApp:
             deep=True,
         )
 
+    async def session_invocation_for_dispatch(
+        self,
+        session_id: str,
+    ) -> SessionInvocationBinding:
+        """Return immutable private provenance for a trusted dispatcher boundary."""
+
+        private_session_id, _ = await self._resolve_public_session_authority(session_id)
+        snapshot = await self.session_store.load_invocation_snapshot(private_session_id)
+        if snapshot is None:
+            raise KeyError(f"Session not found: {private_session_id}")
+        return copy_session_invocation_binding(snapshot)
+
     async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
         if type(request) is not DispatchRequest:
             raise TypeError("Inline dispatch requires a DispatchRequest.")
@@ -2148,6 +2166,27 @@ class CayuApp:
         if self.task_store is None:
             raise RuntimeError("task_store is required to create tasks.")
         request = copy_task_create(request)
+        for origin in (request.invocation_origin, request._verified_invocation_origin):
+            if origin is None:
+                continue
+            for value in (origin.subject, origin.tenant):
+                if value is not None and self._secret_redactor.redact_text(value) != value:
+                    raise ValueError(
+                        "Task invocation origin contains a workload secret and cannot be "
+                        "used as durable task authority."
+                    )
+        if (
+            request.session_id is not None
+            and request._verified_invocation_origin is None
+            and request._runtime_session_binding is None
+        ):
+            snapshot = await self.session_store.load_invocation_snapshot(request.session_id)
+            if snapshot is not None:
+                request = task_create_with_runtime_invocation(
+                    request,
+                    source=(request._runtime_invocation_source or TaskExecutionSource.SDK_TASK),
+                    session_invocation=snapshot,
+                )
         if request.available_at is not None and not self.task_store.supports_delayed_availability:
             raise NotImplementedError(
                 f"{type(self.task_store).__name__} does not support delayed task availability."
