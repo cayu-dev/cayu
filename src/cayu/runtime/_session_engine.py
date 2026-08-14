@@ -14,11 +14,20 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, NoReturn, TypeVar
+from typing import Any, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
-from pydantic import ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from cayu._exception_groups import (
     exception_cause,
@@ -325,6 +334,7 @@ from cayu.runtime.sessions import (
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
+    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
@@ -332,6 +342,8 @@ from cayu.runtime.sessions import (
     EventOrder,
     EventQuery,
     ForkSessionRequest,
+    ForkSystemPromptPolicy,
+    ForkSystemPromptReplacement,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryPage,
@@ -340,6 +352,7 @@ from cayu.runtime.sessions import (
     InteractionTransitionSpec,
     InterruptSessionRequest,
     ModelTarget,
+    PromptAnatomyTransitionReceipt,
     ResumeRequest,
     RunRequest,
     RuntimePublicationRequest,
@@ -377,6 +390,7 @@ from cayu.runtime.sessions import (
     _session_metadata_with_model_projection,
     _session_run_operation_from_checkpoint,
     _set_session_interaction_recovered_active_through,
+    apply_fork_system_prompt_replacement,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
     bind_runtime_session_create_claim,
@@ -393,6 +407,8 @@ from cayu.runtime.sessions import (
     session_input_contract_evidence,
     session_input_messages_sha256,
     session_model_projection_cursor,
+    session_prompt_anatomy_transition,
+    system_prompt_messages_sha256,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -467,6 +483,728 @@ _RESUMABLE_SESSION_STATUSES = {
 }
 
 _FORKABLE_SESSION_STATUSES = _RESUMABLE_SESSION_STATUSES
+_PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY = "prompt_anatomy_transition_intents"
+_PROMPT_ANATOMY_TRANSITION_INTENT_LIMIT = 256
+
+
+class _PromptTransitionIntentStatus(StrEnum):
+    PREPARED = "prepared"
+    COMPLETED = "completed"
+
+
+class _PromptTransitionIntent(BaseModel):
+    """Typed durable authority for one prompt-succession effect."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    transition_id: str
+    request_sha256: str
+    source_session_id: str
+    descendant_session_id: str
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    source_snapshot_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    status: _PromptTransitionIntentStatus
+    requested_at: datetime
+    descendant_created_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    @classmethod
+    def prepared(
+        cls,
+        *,
+        receipt: PromptAnatomyTransitionReceipt,
+        source_run_epoch: int,
+        source_snapshot_cursor: int,
+        requested_at: datetime,
+    ) -> _PromptTransitionIntent:
+        return cls(
+            transition_id=receipt.transition_id,
+            request_sha256=receipt.request_sha256,
+            source_session_id=receipt.source_session_id,
+            descendant_session_id=receipt.descendant_session_id,
+            source_run_epoch=source_run_epoch,
+            source_transcript_cursor=receipt.source_transcript_cursor,
+            source_snapshot_cursor=source_snapshot_cursor,
+            status=_PromptTransitionIntentStatus.PREPARED,
+            requested_at=requested_at,
+        )
+
+    @field_validator(
+        "transition_id",
+        "request_sha256",
+        "source_session_id",
+        "descendant_session_id",
+    )
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if info.field_name in {"transition_id", "request_sha256"} and (
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("requested_at", "descendant_created_at", "completed_at")
+    @classmethod
+    def validate_timestamps(cls, value: datetime | None, info) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> _PromptTransitionIntent:
+        completed = self.status is _PromptTransitionIntentStatus.COMPLETED
+        if completed != (self.descendant_created_at is not None and self.completed_at is not None):
+            raise ValueError("Prompt-transition intent completion evidence is inconsistent.")
+        return self
+
+    def same_identity(self, other: _PromptTransitionIntent) -> bool:
+        return (
+            self.transition_id,
+            self.request_sha256,
+            self.source_session_id,
+            self.descendant_session_id,
+            self.source_run_epoch,
+            self.source_transcript_cursor,
+            self.source_snapshot_cursor,
+        ) == (
+            other.transition_id,
+            other.request_sha256,
+            other.source_session_id,
+            other.descendant_session_id,
+            other.source_run_epoch,
+            other.source_transcript_cursor,
+            other.source_snapshot_cursor,
+        )
+
+
+class _PromptTransitionIntentLedger(BaseModel):
+    """Bounded parser and state machine for prompt-transition checkpoint authority."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    records: dict[str, _PromptTransitionIntent] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_records(self) -> _PromptTransitionIntentLedger:
+        if len(self.records) > _PROMPT_ANATOMY_TRANSITION_INTENT_LIMIT:
+            raise ValueError("Prompt-transition intent ledger exceeds its bounded record limit.")
+        if any(key != record.transition_id for key, record in self.records.items()):
+            raise ValueError("Prompt-transition intent ledger key conflicts with its record.")
+        return self
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint: dict[str, Any] | None,
+        *,
+        required: bool,
+    ) -> _PromptTransitionIntentLedger:
+        raw = (
+            None
+            if checkpoint is None
+            else checkpoint.get(_PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY)
+        )
+        if raw is None:
+            if required:
+                raise RuntimeError("Prompt-anatomy transition intent disappeared.")
+            return cls()
+        try:
+            return cls.model_validate(
+                copy_json_value(raw, _PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY)
+            )
+        except ValidationError as exc:
+            raise ValueError("Prompt-anatomy transition intent ledger is malformed.") from exc
+
+    def store_in(self, checkpoint: dict[str, Any]) -> None:
+        checkpoint[_PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY] = self.model_dump(mode="json")
+
+    def require_exact(self, candidate: _PromptTransitionIntent) -> _PromptTransitionIntent:
+        existing = self.records.get(candidate.transition_id)
+        if existing is None or not existing.same_identity(candidate):
+            raise RuntimeError("Prompt-anatomy transition intent conflicts with the exact request.")
+        return existing
+
+    def prepare(self, candidate: _PromptTransitionIntent) -> None:
+        for record in self.records.values():
+            if (
+                record.descendant_session_id == candidate.descendant_session_id
+                or record.request_sha256 == candidate.request_sha256
+            ) and not record.same_identity(candidate):
+                raise RuntimeError(
+                    "Existing prompt-anatomy transition intent conflicts with the exact request."
+                )
+        existing = self.records.get(candidate.transition_id)
+        if existing is not None:
+            self.require_exact(candidate)
+            return
+        if len(self.records) >= _PROMPT_ANATOMY_TRANSITION_INTENT_LIMIT:
+            completed = sorted(
+                (
+                    record
+                    for record in self.records.values()
+                    if record.status is _PromptTransitionIntentStatus.COMPLETED
+                ),
+                key=lambda record: record.completed_at or record.requested_at,
+            )
+            if completed:
+                del self.records[completed[0].transition_id]
+        if len(self.records) >= _PROMPT_ANATOMY_TRANSITION_INTENT_LIMIT:
+            raise RuntimeError("Prompt-transition intent ledger has no bounded capacity.")
+        self.records[candidate.transition_id] = candidate
+
+    def complete(
+        self,
+        candidate: _PromptTransitionIntent,
+        *,
+        descendant_created_at: datetime,
+        completed_at: datetime,
+    ) -> None:
+        existing = self.require_exact(candidate)
+        if (
+            existing.status is _PromptTransitionIntentStatus.COMPLETED
+            and existing.descendant_created_at == descendant_created_at
+        ):
+            return
+        self.records[candidate.transition_id] = existing.model_copy(
+            update={
+                "status": _PromptTransitionIntentStatus.COMPLETED,
+                "descendant_created_at": descendant_created_at,
+                "completed_at": completed_at,
+            }
+        )
+
+    def complete_from_receipt(
+        self,
+        receipt: PromptAnatomyTransitionReceipt,
+        *,
+        descendant_created_at: datetime,
+        completed_at: datetime,
+    ) -> bool:
+        """Complete surviving prepared authority from the durable descendant receipt."""
+
+        existing = self.records.get(receipt.transition_id)
+        if existing is None:
+            return False
+        if (
+            existing.request_sha256,
+            existing.source_session_id,
+            existing.descendant_session_id,
+            existing.source_transcript_cursor,
+        ) != (
+            receipt.request_sha256,
+            receipt.source_session_id,
+            receipt.descendant_session_id,
+            receipt.source_transcript_cursor,
+        ):
+            raise RuntimeError(
+                "Prompt-anatomy transition receipt conflicts with its durable intent."
+            )
+        if existing.status is _PromptTransitionIntentStatus.COMPLETED:
+            if existing.descendant_created_at != descendant_created_at:
+                raise RuntimeError(
+                    "Prompt-anatomy transition completion time conflicts with its descendant."
+                )
+            return False
+        self.records[receipt.transition_id] = existing.model_copy(
+            update={
+                "status": _PromptTransitionIntentStatus.COMPLETED,
+                "descendant_created_at": descendant_created_at,
+                "completed_at": completed_at,
+            }
+        )
+        return True
+
+    def has_prepared_intent(self) -> bool:
+        return any(
+            record.status is _PromptTransitionIntentStatus.PREPARED
+            for record in self.records.values()
+        )
+
+
+def _reject_prepared_prompt_transition_intent(
+    checkpoint: dict[str, Any] | None,
+) -> None:
+    ledger = _PromptTransitionIntentLedger.from_checkpoint(
+        checkpoint,
+        required=False,
+    )
+    if ledger.has_prepared_intent():
+        raise RuntimeError(
+            "Session has a prepared prompt-anatomy succession intent. Retry the exact "
+            "fork request before continuing or compacting the source session."
+        )
+
+
+async def _reconcile_committed_prompt_transition_intents(
+    *,
+    session_store: SessionStore,
+    source_session_id: str,
+    checkpoint: dict[str, Any] | None,
+    clock: Callable[[], datetime],
+) -> dict[str, Any] | None:
+    """Complete prepared intents whose descendants already prove the durable effect."""
+
+    ledger = _PromptTransitionIntentLedger.from_checkpoint(
+        checkpoint,
+        required=False,
+    )
+    committed_receipts: list[tuple[PromptAnatomyTransitionReceipt, datetime]] = []
+    for record in ledger.records.values():
+        if record.status is not _PromptTransitionIntentStatus.PREPARED:
+            continue
+        descendant = await session_store.load(record.descendant_session_id)
+        if descendant is None:
+            continue
+        receipt = session_prompt_anatomy_transition(descendant)
+        if receipt is None:
+            raise RuntimeError(
+                "Prepared prompt-anatomy descendant has no exact transition receipt."
+            )
+        committed_receipts.append((receipt, descendant.created_at))
+    if not committed_receipts:
+        return checkpoint
+
+    reconciled_checkpoint: dict[str, Any] | None = None
+
+    def reconcile(
+        _current_source: Session,
+        current_checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        nonlocal reconciled_checkpoint
+        if current_checkpoint is None:
+            raise RuntimeError("Prompt-anatomy transition intent disappeared.")
+        updated = copy_json_value(current_checkpoint, "checkpoint")
+        current_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+            updated,
+            required=True,
+        )
+        changed = False
+        for receipt, descendant_created_at in committed_receipts:
+            changed = (
+                current_ledger.complete_from_receipt(
+                    receipt,
+                    descendant_created_at=descendant_created_at,
+                    completed_at=clock(),
+                )
+                or changed
+            )
+        if changed:
+            current_ledger.store_in(updated)
+        reconciled_checkpoint = updated
+        return updated
+
+    await session_store.publish_checkpoint_and_events(
+        source_session_id,
+        checkpoint_transform=reconcile,
+        events=[],
+    )
+    return reconciled_checkpoint
+
+
+def _fork_session_request_digest(request: ForkSessionRequest) -> str:
+    return hashlib.sha256(
+        canonical_durable_json_bytes(
+            request.model_dump(mode="json"),
+            "fork_session_request",
+        )
+    ).hexdigest()
+
+
+def _prompt_fork_matches_prepared(existing: Session, prepared: Session) -> bool:
+    return (
+        existing.id,
+        existing.agent_name,
+        existing.provider_name,
+        existing.model,
+        existing.parent_session_id,
+        existing.causal_budget_id,
+        existing.runtime_name,
+        existing.runtime_version,
+        existing.environment_name,
+        existing.status,
+        existing.labels,
+        existing.metadata,
+        existing.run_epoch,
+    ) == (
+        prepared.id,
+        prepared.agent_name,
+        prepared.provider_name,
+        prepared.model,
+        prepared.parent_session_id,
+        prepared.causal_budget_id,
+        prepared.runtime_name,
+        prepared.runtime_version,
+        prepared.environment_name,
+        prepared.status,
+        prepared.labels,
+        prepared.metadata,
+        prepared.run_epoch,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PromptSuccessionWorkflow:
+    """Cohesive durable state and event projection for one prompt succession."""
+
+    request: ForkSessionRequest
+    receipt: PromptAnatomyTransitionReceipt
+
+    @classmethod
+    def recover(
+        cls,
+        *,
+        request: ForkSessionRequest,
+        descendant: Session,
+    ) -> _PromptSuccessionWorkflow:
+        receipt = session_prompt_anatomy_transition(descendant)
+        if receipt is None or receipt.request_sha256 != _fork_session_request_digest(request):
+            raise RuntimeError(
+                "Existing prompt-anatomy descendant conflicts with the exact request."
+            )
+        return cls(request=request, receipt=receipt)
+
+    def prepared_intent(
+        self,
+        *,
+        source_run_epoch: int,
+        source_snapshot_cursor: int,
+        requested_at: datetime,
+    ) -> _PromptTransitionIntent:
+        return _PromptTransitionIntent.prepared(
+            receipt=self.receipt,
+            source_run_epoch=source_run_epoch,
+            source_snapshot_cursor=source_snapshot_cursor,
+            requested_at=requested_at,
+        )
+
+    def raw_fork_event(self, descendant: Session) -> Event:
+        receipt = self.receipt
+        payload: dict[str, Any] = {
+            "source_session_id": receipt.source_session_id,
+            "source_status": receipt.source_status.value,
+            "parent_session_id": descendant.parent_session_id,
+            "causal_budget_id": descendant.causal_budget_id,
+            "transcript_cursor": self.request.transcript_cursor,
+            "copy_checkpoint": receipt.copy_checkpoint,
+            "agent_name": descendant.agent_name,
+            "provider_name": descendant.provider_name,
+            "model": descendant.model,
+            "environment_name": descendant.environment_name,
+            "inherited_taint_labels": list(receipt.inherited_taint_labels),
+            "prompt_anatomy_transition": {
+                "transition_id": receipt.transition_id,
+                "source_transcript_cursor": receipt.source_transcript_cursor,
+                "source_prompt_sha256": receipt.source_prompt_sha256,
+                "child_prompt_sha256": receipt.child_prompt_sha256,
+                "source_system_prompt_retained": receipt.source_system_prompt_retained,
+                "policy": receipt.policy.value,
+            },
+        }
+        return event_with_runtime_generated_id(
+            Event(
+                id=f"prompt-transition-{receipt.transition_id}",
+                type=EventType.SESSION_FORKED,
+                session_id=descendant.id,
+                timestamp=descendant.created_at,
+                agent_name=descendant.agent_name,
+                environment_name=descendant.environment_name,
+                payload=payload,
+            )
+        )
+
+
+@dataclass(slots=True)
+class _ForkPromptWorkflow:
+    """Own the prompt-policy branch of session forking behind one strategy seam."""
+
+    request: ForkSessionRequest
+    prompt_replacement: ForkSystemPromptReplacement | None = None
+    child_prompt_messages: tuple[Message, ...] = ()
+    prompt_environment_name: str | None = None
+    succession: _PromptSuccessionWorkflow | None = None
+    intent: _PromptTransitionIntent | None = None
+
+    @classmethod
+    async def prepare(
+        cls,
+        *,
+        request: ForkSessionRequest,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_lifecycle: EnvironmentLifecycle,
+    ) -> _ForkPromptWorkflow:
+        workflow = cls(request=request)
+        if request.system_prompt_policy is not ForkSystemPromptPolicy.CURRENT_AGENT:
+            return workflow
+        if request.session_id is None:
+            raise ValueError(
+                "Explicit prompt-anatomy succession requires a stable destination session_id."
+            )
+        if request.copy_checkpoint:
+            raise ValueError(
+                "Explicit prompt-anatomy succession cannot copy checkpoint state; "
+                "set copy_checkpoint=False."
+            )
+        if registered_environment is None or registered_environment.factory is not None:
+            raise ValueError(
+                "Explicit prompt-anatomy succession requires a concrete registered "
+                "environment so current workspace instructions can be rendered."
+            )
+        workflow.prompt_environment_name = registered_environment.spec.name
+        workspace_instructions = await environment_lifecycle.load_workspace_instructions(
+            registered_environment,
+        )
+        rendered_child_prompt, _prompt_contributions = (
+            render_initial_system_prompt_with_contributions(
+                agent_system_prompt=registered_agent.spec.system_prompt,
+                workspace_instructions=workspace_instructions,
+            )
+        )
+        workflow.child_prompt_messages = tuple(
+            transcript_helpers.initial_messages(
+                system_prompt=rendered_child_prompt,
+                request_messages=[],
+            )
+        )
+        workflow.prompt_replacement = ForkSystemPromptReplacement(
+            message=(workflow.child_prompt_messages[0] if workflow.child_prompt_messages else None),
+        )
+        return workflow
+
+    def requires_transcript_snapshot(
+        self,
+        *,
+        model_changed: bool,
+        source_projection_cursor: int,
+    ) -> bool:
+        return (
+            self.prompt_replacement is not None or model_changed or bool(source_projection_cursor)
+        )
+
+    def project_selected_messages(
+        self,
+        messages: list[Message],
+        interaction_ids: list[str | None],
+    ) -> tuple[list[Message], str | None]:
+        if self.prompt_replacement is None:
+            return messages, None
+        projected, projected_interaction_ids = apply_fork_system_prompt_replacement(
+            messages,
+            interaction_ids,
+            self.prompt_replacement,
+        )
+        projected_interaction_ids.clear()
+        return projected, system_prompt_messages_sha256(self.child_prompt_messages)
+
+    def requires_portability_validation(self, *, model_changed: bool) -> bool:
+        return model_changed or self.prompt_replacement is not None
+
+    def attach_receipt(
+        self,
+        metadata: dict[str, Any],
+        *,
+        source_session: Session,
+        destination_session_id: str,
+        selected_source_cursor: int,
+        source_prompt_sha256: str | None,
+        child_prompt_sha256: str | None,
+        child_agent_name: str,
+        provider_name: str,
+        model: str,
+        model_changed: bool,
+        inherited_taint_labels: set[str] | frozenset[str],
+    ) -> None:
+        if self.prompt_replacement is None:
+            return
+        if source_prompt_sha256 is None or child_prompt_sha256 is None:
+            raise AssertionError("Prompt succession lost its prompt digests.")
+        if self.prompt_environment_name is None:
+            raise AssertionError("Prompt succession lost its concrete environment identity.")
+        receipt = PromptAnatomyTransitionReceipt.create(
+            request_sha256=_fork_session_request_digest(self.request),
+            source_session_id=source_session.id,
+            descendant_session_id=destination_session_id,
+            source_status=source_session.status,
+            source_transcript_cursor=selected_source_cursor,
+            source_prompt_sha256=source_prompt_sha256,
+            child_prompt_sha256=child_prompt_sha256,
+            child_agent_name=child_agent_name,
+            child_environment_name=self.prompt_environment_name,
+            copy_checkpoint=self.request.copy_checkpoint,
+            source_provider_name=source_session.provider_name,
+            source_model=source_session.model,
+            provider_name=provider_name,
+            model=model,
+            model_target_changed=model_changed,
+            portability_preflight=(
+                "provider_portable_transcript_preflight"
+                if model_changed
+                else "context_messages_validated"
+            ),
+            inherited_taint_labels=tuple(sorted(inherited_taint_labels)),
+        )
+        self.succession = _PromptSuccessionWorkflow(
+            request=self.request,
+            receipt=receipt,
+        )
+        metadata[PROMPT_ANATOMY_TRANSITION_METADATA_KEY] = receipt.model_dump(mode="json")
+
+    def require_prepared_intent(self, source_checkpoint: dict[str, Any] | None) -> None:
+        if self.succession is None:
+            return
+        if self.intent is None or source_checkpoint is None:
+            raise RuntimeError("Prompt-anatomy transition intent disappeared.")
+        intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+            source_checkpoint,
+            required=True,
+        )
+        intent_ledger.require_exact(self.intent)
+
+    async def prepare_effect(
+        self,
+        *,
+        session_store: SessionStore,
+        source_session: Session,
+        source_snapshot_cursor: int,
+        fork_session: Session,
+        validate_source_checkpoint: Callable[
+            [Session, dict[str, Any] | None], dict[str, Any] | None
+        ],
+        clock: Callable[[], datetime],
+    ) -> Session:
+        if self.succession is None:
+            return fork_session
+        self.intent = self.succession.prepared_intent(
+            source_run_epoch=source_session.run_epoch,
+            source_snapshot_cursor=source_snapshot_cursor,
+            requested_at=clock(),
+        )
+
+        def persist_prompt_transition_intent(
+            current_source: Session,
+            source_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            validated = validate_source_checkpoint(current_source, source_checkpoint)
+            updated = {} if validated is None else copy_json_value(validated, "checkpoint")
+            intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+                updated,
+                required=False,
+            )
+            if self.intent is None:
+                raise AssertionError("Prompt succession lost its durable intent identity.")
+            intent_ledger.prepare(self.intent)
+            intent_ledger.store_in(updated)
+            return updated
+
+        await session_store.publish_checkpoint_and_events(
+            source_session.id,
+            checkpoint_transform=persist_prompt_transition_intent,
+            events=[],
+            expected_statuses=_FORKABLE_SESSION_STATUSES,
+            expected_run_epoch=source_session.run_epoch,
+            expected_transcript_cursor=source_snapshot_cursor,
+        )
+        descendant_created_at = clock()
+        return fork_session.model_copy(
+            update={
+                "created_at": descendant_created_at,
+                "updated_at": descendant_created_at,
+            }
+        )
+
+    async def recover_created_after_error(
+        self,
+        *,
+        session_store: SessionStore,
+        prepared: Session,
+        error: Exception,
+    ) -> Session:
+        if self.succession is None:
+            raise error
+        existing = await session_store.load(prepared.id)
+        if existing is None or not _prompt_fork_matches_prepared(existing, prepared):
+            raise error
+        existing_transition = session_prompt_anatomy_transition(existing)
+        if existing_transition != self.succession.receipt:
+            raise RuntimeError(
+                "Existing prompt-anatomy descendant conflicts with the exact request."
+            ) from error
+        return existing
+
+    async def complete_effect(
+        self,
+        *,
+        session_store: SessionStore,
+        source_session_id: str,
+        created: Session,
+        clock: Callable[[], datetime],
+    ) -> None:
+        if self.succession is None:
+            return
+        if self.intent is None:
+            raise AssertionError("Prompt succession lost its durable intent identity.")
+
+        def complete_prompt_transition_intent(
+            _current_source: Session,
+            source_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if source_checkpoint is None:
+                raise RuntimeError("Prompt-anatomy transition intent disappeared.")
+            updated = copy_json_value(source_checkpoint, "checkpoint")
+            intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+                updated,
+                required=True,
+            )
+            if self.intent is None:
+                raise AssertionError("Prompt succession lost its durable intent identity.")
+            intent_ledger.complete(
+                self.intent,
+                descendant_created_at=created.created_at,
+                completed_at=clock(),
+            )
+            intent_ledger.store_in(updated)
+            return updated
+
+        await session_store.publish_checkpoint_and_events(
+            source_session_id,
+            checkpoint_transform=complete_prompt_transition_intent,
+            events=[],
+        )
+
+    def raw_fork_event(
+        self,
+        *,
+        created: Session,
+        ordinary_event: Event,
+    ) -> Event:
+        if self.succession is None:
+            return ordinary_event
+        return self.succession.raw_fork_event(created)
+
+    async def publish_event(
+        self,
+        *,
+        event_writer: RuntimeEventWriter,
+        event: Event,
+    ) -> Event:
+        if self.succession is None:
+            return await event_writer.emit(event)
+        persisted = await event_writer.persist_exact_replay(event)
+        delivered = await event_writer.fan_out_persisted([persisted])
+        return delivered[0]
+
+
+def _fork_event_with_runtime_authority(event: Event) -> Event:
+    return event_with_runtime_payload_authority(
+        event_with_runtime_envelope_authority(event, "session_id"),
+        "source_session_id",
+        "parent_session_id",
+        "causal_budget_id",
+    )
+
 
 _INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
@@ -1306,6 +2044,7 @@ def _reject_unresumable_session_checkpoint(
     redactor: SecretRedactor,
     allow_active_operation: bool = False,
 ) -> None:
+    _reject_prepared_prompt_transition_intent(checkpoint)
     if _initial_transcript_pending_interaction_id(checkpoint) is not None:
         raise RuntimeError(
             "Session setup did not publish its authoritative initial transcript; "
@@ -2149,6 +2888,10 @@ def _replace_checkpoint_preserving_runtime_state(
             (_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY, "pending_interruption_cascade"),
             (_SESSION_OPERATIONS_CHECKPOINT_KEY, "session_operations"),
             (_SESSION_RUN_OPERATION_CHECKPOINT_KEY, "session_run_operation"),
+            (
+                _PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY,
+                "prompt_anatomy_transition_intents",
+            ),
             (
                 _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
                 "incomplete_session_recovery_claim",
@@ -4671,6 +5414,12 @@ class SessionEngine:
             )
         request_digest = _compact_session_request_digest(request)
         checkpoint_before_claim = await self.session_store.load_checkpoint(loaded_session.id)
+        checkpoint_before_claim = await _reconcile_committed_prompt_transition_intents(
+            session_store=self.session_store,
+            source_session_id=loaded_session.id,
+            checkpoint=checkpoint_before_claim,
+            clock=self._clock,
+        )
         persisted_before_claim = await self.session_store.load_session_operation(
             loaded_session.id,
             request.idempotency_key,
@@ -8502,6 +9251,7 @@ class SessionEngine:
                 raise RuntimeError(
                     f"Session has an active durable operation: {active_operation_id}"
                 )
+            _reject_prepared_prompt_transition_intent(updated_checkpoint)
             if (
                 approval_support.pending_approval_from_checkpoint(
                     updated_checkpoint,
@@ -8571,6 +9321,12 @@ class SessionEngine:
         # then repeat the same validation inside the atomic transition below so a
         # concurrent checkpoint update cannot bypass the guard.
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        checkpoint = await _reconcile_committed_prompt_transition_intents(
+            session_store=self.session_store,
+            source_session_id=loaded_session.id,
+            checkpoint=checkpoint,
+            clock=self._clock,
+        )
         validate_resumable_checkpoint(loaded_session, checkpoint)
         # An in-flight provider dispatch has an ambiguous external outcome and
         # must reject resume without mutating the session. Check that boundary
@@ -9174,6 +9930,50 @@ class SessionEngine:
         except ValueError:
             del source_session
             raise
+        if (
+            request.system_prompt_policy is ForkSystemPromptPolicy.CURRENT_AGENT
+            and request.session_id is not None
+        ):
+            existing_descendant = await self.session_store.load(request.session_id)
+            if existing_descendant is not None:
+                succession = _PromptSuccessionWorkflow.recover(
+                    request=request,
+                    descendant=existing_descendant,
+                )
+
+                def reconcile_surviving_intent(
+                    _current_source: Session,
+                    source_checkpoint: dict[str, Any] | None,
+                ) -> dict[str, Any] | None:
+                    if source_checkpoint is None:
+                        return None
+                    updated = copy_json_value(source_checkpoint, "checkpoint")
+                    intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+                        updated,
+                        required=False,
+                    )
+                    if intent_ledger.complete_from_receipt(
+                        succession.receipt,
+                        descendant_created_at=existing_descendant.created_at,
+                        completed_at=self._clock(),
+                    ):
+                        intent_ledger.store_in(updated)
+                    return updated
+
+                await self.session_store.publish_checkpoint_and_events(
+                    source_session.id,
+                    checkpoint_transform=reconcile_surviving_intent,
+                    events=[],
+                )
+                fork_event = self._event_writer.prepare(
+                    _fork_event_with_runtime_authority(
+                        succession.raw_fork_event(existing_descendant)
+                    )
+                )
+                persisted = await self._event_writer.persist_exact_replay(fork_event)
+                delivered = await self._event_writer.fan_out_persisted([persisted])
+                yield delivered[0]
+                return
         if source_session.status not in _FORKABLE_SESSION_STATUSES:
             raise ValueError(
                 "Only completed, failed, or interrupted sessions can be forked: "
@@ -9233,13 +10033,27 @@ class SessionEngine:
                 f"{registered_agent_provider_name} != {source_session.provider_name}"
             )
         registered_environment = self._get_registered_environment_for_session(environment_name)
+        prompt_workflow = await _ForkPromptWorkflow.prepare(
+            request=request,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_lifecycle=self._environment_lifecycle,
+        )
 
         source_projection_cursor = session_model_projection_cursor(source_session)
         model_changed = model != source_session.model
         expected_fork_transcript: tuple[Message, ...] | None = None
         fork_projection_cursor = 0
-        if model_changed or source_projection_cursor:
+        selected_source_cursor = 0
+        source_snapshot_cursor = 0
+        source_prompt_sha256: str | None = None
+        child_prompt_sha256: str | None = None
+        if prompt_workflow.requires_transcript_snapshot(
+            model_changed=model_changed,
+            source_projection_cursor=source_projection_cursor,
+        ):
             source_snapshot = await self.session_store.load_transcript_snapshot(source_session.id)
+            source_snapshot_cursor = source_snapshot.cursor
             if source_projection_cursor > source_snapshot.cursor:
                 del source_snapshot
                 raise ValueError(
@@ -9256,9 +10070,20 @@ class SessionEngine:
                 ]
             else:
                 selected_source_records = list(source_snapshot.records)
-            expected_fork_transcript = tuple(
-                detach_message(record.message) for record in selected_source_records
+            selected_source_cursor = (
+                source_snapshot.cursor
+                if request.transcript_cursor is None
+                else request.transcript_cursor
             )
+            selected_messages = [
+                detach_message(record.message) for record in selected_source_records
+            ]
+            source_prompt_sha256 = system_prompt_messages_sha256(selected_messages)
+            selected_messages, child_prompt_sha256 = prompt_workflow.project_selected_messages(
+                selected_messages,
+                [record.interaction_id for record in selected_source_records],
+            )
+            expected_fork_transcript = tuple(selected_messages)
             if (
                 self._secret_redactor.has_values
                 and not session_request_boundary.fork_transcript_is_secret_free(
@@ -9267,35 +10092,41 @@ class SessionEngine:
                 )
             ):
                 selected_source_records.clear()
+                selected_messages.clear()
                 expected_fork_transcript = None
                 del source_snapshot
                 raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
-            if model_changed:
+            if prompt_workflow.requires_portability_validation(model_changed=model_changed):
                 portable_projection = None
                 portable_messages: list[Message] = []
                 try:
-                    portable_projection = model_target.project_portable_transcript(
-                        list(expected_fork_transcript)
-                    )
-                    portable_messages = [
-                        detach_message(message) for message in portable_projection.messages
-                    ]
+                    if model_changed:
+                        portable_projection = model_target.project_portable_transcript(
+                            list(expected_fork_transcript)
+                        )
+                        portable_messages = [
+                            detach_message(message) for message in portable_projection.messages
+                        ]
+                    else:
+                        portable_messages = [
+                            detach_message(message) for message in expected_fork_transcript
+                        ]
                     if portable_messages:
                         validate_context_messages(portable_messages)
-                    hook_tools: list[dict[str, Any]] = []
-                    try:
-                        hook_tools = _model_request_tools(
-                            registered_agent=registered_agent,
-                            structured_output=None,
-                        )
-                        registered_provider.provider.preflight_portable_messages(
-                            model=model,
-                            messages=portable_messages,
-                            tools=hook_tools,
-                        )
-                    finally:
-                        portable_messages.clear()
-                        hook_tools.clear()
+                    if model_changed:
+                        hook_tools: list[dict[str, Any]] = []
+                        try:
+                            hook_tools = _model_request_tools(
+                                registered_agent=registered_agent,
+                                structured_output=None,
+                            )
+                            registered_provider.provider.preflight_portable_messages(
+                                model=model,
+                                messages=portable_messages,
+                                tools=hook_tools,
+                            )
+                        finally:
+                            hook_tools.clear()
                     fork_projection_cursor = len(expected_fork_transcript)
                 except BaseException:
                     expected_fork_transcript = None
@@ -9304,6 +10135,8 @@ class SessionEngine:
                     selected_source_records.clear()
                     del source_snapshot
                     raise
+                finally:
+                    portable_messages.clear()
             else:
                 fork_projection_cursor = sum(
                     record.index < source_projection_cursor for record in selected_source_records
@@ -9323,12 +10156,10 @@ class SessionEngine:
                 now=claim_now,
             )
 
-        def checkpoint_transform(
+        def validate_source_checkpoint(
             current_source: Session,
             source_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
-            """Validate live checkpoint state even when the fork will discard it."""
-
             source_checkpoint = reject_active_or_expired_recovery_claim(source_checkpoint)
             if _initial_transcript_pending_interaction_id(source_checkpoint) is not None:
                 raise RuntimeError(
@@ -9397,6 +10228,16 @@ class SessionEngine:
                     "Session has an incomplete background interruption cascade. "
                     "Retry the interruption before forking it."
                 )
+            return source_checkpoint
+
+        def checkpoint_transform(
+            current_source: Session,
+            source_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            """Validate live checkpoint state even when the fork will discard it."""
+
+            source_checkpoint = validate_source_checkpoint(current_source, source_checkpoint)
+            prompt_workflow.require_prepared_intent(source_checkpoint)
             fork_checkpoint = approval_support.checkpoint_for_fork(
                 checkpoint=source_checkpoint,
             )
@@ -9434,6 +10275,12 @@ class SessionEngine:
                 redactor=self._secret_redactor,
             )
 
+        runtime_generated_session_id: str | None = None
+        destination_session_id = request.session_id
+        if destination_session_id is None:
+            runtime_generated_session_id = str(uuid4())
+            destination_session_id = runtime_generated_session_id
+
         inherited_taint_labels = await self._tool_round_executor.prior_taint_labels_for_policy(
             session_id=source_session.id,
             policy=source_registered_agent.tool_policy,
@@ -9453,11 +10300,19 @@ class SessionEngine:
             ),
             transcript_cursor=fork_projection_cursor,
         )
-        runtime_generated_session_id: str | None = None
-        destination_session_id = request.session_id
-        if destination_session_id is None:
-            runtime_generated_session_id = str(uuid4())
-            destination_session_id = runtime_generated_session_id
+        prompt_workflow.attach_receipt(
+            fork_metadata,
+            source_session=source_session,
+            destination_session_id=destination_session_id,
+            selected_source_cursor=selected_source_cursor,
+            source_prompt_sha256=source_prompt_sha256,
+            child_prompt_sha256=child_prompt_sha256,
+            child_agent_name=agent_name,
+            provider_name=registered_provider.name,
+            model=model,
+            model_changed=model_changed,
+            inherited_taint_labels=inherited_taint_labels,
+        )
         fork_session = Session(
             id=destination_session_id,
             agent_name=agent_name,
@@ -9496,35 +10351,27 @@ class SessionEngine:
             agent_name = model = environment_name = destination_session_id = ""
             runtime_generated_session_id = None
             raise
-        fork_event = self._event_writer.prepare(
-            event_with_runtime_payload_authority(
-                event_with_runtime_envelope_authority(
-                    Event(
-                        type=EventType.SESSION_FORKED,
-                        session_id=fork_session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=_environment_name(registered_environment),
-                        payload={
-                            "source_session_id": source_session.id,
-                            "source_status": source_session.status.value,
-                            "parent_session_id": fork_session.parent_session_id,
-                            "causal_budget_id": fork_session.causal_budget_id,
-                            "transcript_cursor": request.transcript_cursor,
-                            "copy_checkpoint": request.copy_checkpoint,
-                            "agent_name": fork_session.agent_name,
-                            "provider_name": fork_session.provider_name,
-                            "model": fork_session.model,
-                            "environment_name": fork_session.environment_name,
-                            "inherited_taint_labels": sorted(inherited_taint_labels),
-                        },
-                    ),
-                    "session_id",
-                ),
-                "source_session_id",
-                "parent_session_id",
-                "causal_budget_id",
-            )
+        fork_session = await prompt_workflow.prepare_effect(
+            session_store=self.session_store,
+            source_session=source_session,
+            source_snapshot_cursor=source_snapshot_cursor,
+            fork_session=fork_session,
+            validate_source_checkpoint=validate_source_checkpoint,
+            clock=self._clock,
         )
+        fork_event_payload: dict[str, Any] = {
+            "source_session_id": source_session.id,
+            "source_status": source_session.status.value,
+            "parent_session_id": fork_session.parent_session_id,
+            "causal_budget_id": fork_session.causal_budget_id,
+            "transcript_cursor": request.transcript_cursor,
+            "copy_checkpoint": request.copy_checkpoint,
+            "agent_name": fork_session.agent_name,
+            "provider_name": fork_session.provider_name,
+            "model": fork_session.model,
+            "environment_name": fork_session.environment_name,
+            "inherited_taint_labels": sorted(inherited_taint_labels),
+        }
         try:
             if self._secret_redactor.has_values or expected_fork_transcript is not None:
                 created = await self.session_store.create_fork_with_transcript_validation(
@@ -9533,6 +10380,7 @@ class SessionEngine:
                     source_statuses=_FORKABLE_SESSION_STATUSES,
                     transcript_cursor=request.transcript_cursor,
                     checkpoint_transform=checkpoint_transform,
+                    system_prompt_replacement=prompt_workflow.prompt_replacement,
                     expected_source_run_epoch=source_session.run_epoch,
                     transcript_validator=transcript_validator,
                 )
@@ -9568,13 +10416,39 @@ class SessionEngine:
                 "Session fork fenced an expired incomplete-session recovery owner; retry "
                 "with current session state."
             ) from None
+        except Exception as error:
+            created = await prompt_workflow.recover_created_after_error(
+                session_store=self.session_store,
+                prepared=fork_session,
+                error=error,
+            )
         if (
             created.id != fork_session.id
             or created.parent_session_id != fork_session.parent_session_id
             or created.causal_budget_id != fork_session.causal_budget_id
         ):
             raise RuntimeError("Session store changed prepared fork identity authority.")
-        yield await self._event_writer.emit(fork_event)
+        await prompt_workflow.complete_effect(
+            session_store=self.session_store,
+            source_session_id=source_session.id,
+            created=created,
+            clock=self._clock,
+        )
+        raw_fork_event = prompt_workflow.raw_fork_event(
+            created=created,
+            ordinary_event=Event(
+                type=EventType.SESSION_FORKED,
+                session_id=fork_session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                payload=fork_event_payload,
+            ),
+        )
+        fork_event = self._event_writer.prepare(_fork_event_with_runtime_authority(raw_fork_event))
+        yield await prompt_workflow.publish_event(
+            event_writer=self._event_writer,
+            event=fork_event,
+        )
 
     async def _publish_assistant_model_completion(
         self,

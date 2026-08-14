@@ -11,6 +11,7 @@ import traceback
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
@@ -146,6 +147,7 @@ from cayu.runtime import (
     EventRecord,
     EventSink,
     ForkSessionRequest,
+    ForkSystemPromptPolicy,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -217,7 +219,9 @@ from cayu.runtime import (
     UserInputResponse,
     business_approval_audit,
     default_compaction_prompt,
+    session_prompt_anatomy_transition,
     strip_old_file_attachments,
+    system_prompt_messages_sha256,
     trim_context_messages,
     trim_context_turns,
 )
@@ -16849,6 +16853,687 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     ]
 
 
+def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "prompt-succession.sqlite"
+    parent_workspace = tmp_path / "parent-workspace"
+    child_workspace = tmp_path / "child-workspace"
+    parent_workspace.mkdir()
+    child_workspace.mkdir()
+    (parent_workspace / "AGENTS.md").write_text("parent workspace instructions")
+    (child_workspace / "AGENTS.md").write_text("child workspace instructions")
+    source_store = SQLiteSessionStore(database)
+    parent_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("durable parent memory"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    parent_app = CayuApp(session_store=source_store, enable_logging=False)
+    parent_app.register_provider(parent_provider, default=True)
+    parent_app.register_environment(
+        Environment(
+            EnvironmentSpec(name="body"),
+            workspace=LocalWorkspace(parent_workspace),
+            workspace_instructions=WorkspaceInstructionsConfig(paths=("AGENTS.md",)),
+        ),
+        default=True,
+    )
+    parent_app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="parent body prompt",
+        )
+    )
+    asyncio.run(
+        collect_events(
+            parent_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_parent",
+                environment_name="body",
+                messages=[Message.text("user", "remember this generation")],
+            ),
+        )
+    )
+
+    child_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("child continued"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    child_store = SQLiteSessionStore(database)
+    child_app = CayuApp(session_store=child_store, enable_logging=False)
+    child_app.register_provider(child_provider, default=True)
+    child_app.register_environment(
+        Environment(
+            EnvironmentSpec(name="body"),
+            workspace=LocalWorkspace(child_workspace),
+            workspace_instructions=WorkspaceInstructionsConfig(paths=("AGENTS.md",)),
+        ),
+        default=True,
+    )
+    child_app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="child body prompt",
+        ),
+        tools=[EchoTool()],
+    )
+    fork_request = ForkSessionRequest(
+        source_session_id="sess_prompt_parent",
+        session_id="sess_prompt_child",
+        agent_name="assistant",
+        copy_checkpoint=False,
+        system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+    )
+
+    fork_query_cutoff = datetime.now(UTC)
+    first_events = asyncio.run(collect_fork_events(child_app, fork_request))
+    replay_events = asyncio.run(collect_fork_events(child_app, fork_request))
+    source = asyncio.run(source_store.load("sess_prompt_parent"))
+    child = asyncio.run(child_store.load("sess_prompt_child"))
+    source_transcript = asyncio.run(source_store.load_transcript("sess_prompt_parent"))
+    child_transcript = asyncio.run(child_store.load_transcript("sess_prompt_child"))
+
+    assert child is not None and source is not None
+    assert [event.id for event in replay_events] == [event.id for event in first_events]
+    assert len(asyncio.run(child_store.load_events(child.id))) == 1
+    receipt = session_prompt_anatomy_transition(child)
+    assert receipt is not None
+    assert receipt.source_prompt_sha256 == system_prompt_messages_sha256(source_transcript)
+    assert receipt.child_prompt_sha256 == asyncio.run(
+        child_app.current_prompt_anatomy_sha256(
+            agent_name="assistant",
+            environment_name="body",
+        )
+    )
+    assert receipt.source_session_id == source.id
+    assert receipt.descendant_session_id == child.id
+    assert receipt.source_system_prompt_retained is False
+    assert receipt.source_prompt_sha256 != receipt.child_prompt_sha256
+    assert receipt.copy_checkpoint is False
+    assert receipt.source_provider_name == receipt.provider_name == "fake"
+    assert receipt.source_model == receipt.model == "fake-model"
+    assert receipt.model_target_changed is False
+    assert receipt.portability_preflight == "context_messages_validated"
+    assert receipt.portability_verified is True
+
+    invalid_digest_metadata = json.loads(json.dumps(child.metadata))
+    invalid_digest_metadata["cayu:prompt_anatomy_transition"]["transition_id"] = "0" * 64
+    with pytest.raises(ValueError, match="prompt-anatomy transition metadata is malformed"):
+        session_prompt_anatomy_transition(
+            child.model_copy(update={"metadata": invalid_digest_metadata})
+        )
+
+    invalid_policy_metadata = json.loads(json.dumps(child.metadata))
+    invalid_policy_receipt = invalid_policy_metadata["cayu:prompt_anatomy_transition"]
+    invalid_policy_receipt["source_system_prompt_retained"] = True
+    invalid_policy_receipt["copy_checkpoint"] = True
+    with pytest.raises(ValueError, match="prompt-anatomy transition metadata is malformed"):
+        session_prompt_anatomy_transition(
+            child.model_copy(update={"metadata": invalid_policy_metadata})
+        )
+    recent_fork_records = asyncio.run(
+        child_store.query_events(
+            EventQuery(
+                session_id=child.id,
+                event_types=(EventType.SESSION_FORKED,),
+                since=fork_query_cutoff,
+            )
+        )
+    )
+    assert [record.event.type for record in recent_fork_records] == [EventType.SESSION_FORKED]
+    assert recent_fork_records[0].event.timestamp >= fork_query_cutoff
+    source_text = [message.content[0].text for message in source_transcript]
+    child_text = [message.content[0].text for message in child_transcript]
+    assert "parent body prompt" in source_text[0]
+    assert "parent workspace instructions" in source_text[0]
+    assert source_text[1:] == ["remember this generation", "durable parent memory"]
+    assert "child body prompt" in child_text[0]
+    assert "child workspace instructions" in child_text[0]
+    assert "parent workspace instructions" not in child_text[0]
+    assert child_text[1:] == ["remember this generation", "durable parent memory"]
+
+    asyncio.run(
+        collect_resume_events(
+            child_app,
+            ResumeRequest(
+                session_id=child.id,
+                messages=[Message.text("user", "continue as the child")],
+            ),
+        )
+    )
+    request_text = [message.content[0].text for message in child_provider.requests[0].messages]
+    assert "child body prompt" in request_text[0]
+    assert "child workspace instructions" in request_text[0]
+    assert request_text[1:] == [
+        "remember this generation",
+        "durable parent memory",
+        "continue as the child",
+    ]
+    assert child_provider.requests[0].tools == [
+        {
+            "name": "echo",
+            "description": "Echo text.",
+            "input_schema": EchoTool.spec.input_schema,
+        }
+    ]
+
+
+def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -> None:
+    class CrashAfterForkStore(InMemorySessionStore):
+        crash_after_commit = True
+
+        async def create_fork_with_transcript_validation(self, *args, **kwargs):
+            created = await super().create_fork_with_transcript_validation(*args, **kwargs)
+            if self.crash_after_commit:
+                self.crash_after_commit = False
+                raise SystemExit("process died after descendant commit")
+            return created
+
+    store = CrashAfterForkStore()
+    parent_app = CayuApp(session_store=store, enable_logging=False)
+    parent_app.register_provider(
+        FakeProvider(
+            [
+                ModelStreamEvent.text_delta("remembered"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    parent_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="parent prompt")
+    )
+    asyncio.run(
+        collect_events(
+            parent_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_crash_parent",
+                messages=[Message.text("user", "start")],
+            ),
+        )
+    )
+    request = ForkSessionRequest(
+        source_session_id="sess_prompt_crash_parent",
+        session_id="sess_prompt_crash_child",
+        environment_name="body",
+        copy_checkpoint=False,
+        system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+    )
+
+    crashing_app = CayuApp(session_store=store, enable_logging=False)
+    crashing_app.register_provider(FakeProvider([]), default=True)
+    crashing_app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+    crashing_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="child prompt")
+    )
+    with pytest.raises(SystemExit, match="process died"):
+        asyncio.run(collect_fork_events(crashing_app, request))
+    assert asyncio.run(store.load("sess_prompt_crash_child")) is not None
+    assert asyncio.run(store.load_events("sess_prompt_crash_child")) == []
+
+    restarted_app = CayuApp(session_store=store, enable_logging=False)
+    restarted_app.register_provider(FakeProvider([]), default=True)
+    restarted_app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+    restarted_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="child prompt")
+    )
+    recovered = asyncio.run(collect_fork_events(restarted_app, request))
+
+    assert [event.type for event in recovered] == [EventType.SESSION_FORKED]
+    assert len(asyncio.run(store.load_events("sess_prompt_crash_child"))) == 1
+    completed_checkpoint = asyncio.run(store.load_checkpoint("sess_prompt_crash_parent"))
+    assert completed_checkpoint is not None
+    completed_intents = completed_checkpoint["prompt_anatomy_transition_intents"]
+    assert next(iter(completed_intents["records"].values()))["status"] == "completed"
+
+
+def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_death(
+    tmp_path: Path,
+) -> None:
+    class CrashAfterForkStore(SQLiteSessionStore):
+        async def create_fork_with_transcript_validation(self, *args, **kwargs):
+            await super().create_fork_with_transcript_validation(*args, **kwargs)
+            raise SystemExit("process died after descendant commit")
+
+    def register_body(
+        app: CayuApp,
+        provider: FakeProvider,
+        *,
+        system_prompt: str,
+    ) -> None:
+        app.register_provider(provider, default=True)
+        app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model", system_prompt=system_prompt)
+        )
+
+    async def scenario() -> None:
+        database = tmp_path / "prompt-postcommit-recovery.sqlite"
+        store = CrashAfterForkStore(database)
+        parent_app = CayuApp(session_store=store, enable_logging=False)
+        register_body(
+            parent_app,
+            FakeProvider(
+                [
+                    ModelStreamEvent.text_delta("first memory"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ),
+            system_prompt="parent prompt",
+        )
+        await collect_events(
+            parent_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_advanced_parent",
+                environment_name="body",
+                messages=[Message.text("user", "first turn")],
+            ),
+        )
+        request = ForkSessionRequest(
+            source_session_id="sess_prompt_advanced_parent",
+            session_id="sess_prompt_advanced_child",
+            agent_name="assistant",
+            environment_name="body",
+            copy_checkpoint=False,
+            system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+        )
+
+        crashing_app = CayuApp(session_store=store, enable_logging=False)
+        register_body(crashing_app, FakeProvider([]), system_prompt="child prompt")
+        with pytest.raises(SystemExit, match="descendant commit"):
+            await collect_fork_events(crashing_app, request)
+        assert await store.load("sess_prompt_advanced_child") is not None
+        assert await store.load_events("sess_prompt_advanced_child") == []
+        await store.close()
+
+        advanced_store = SQLiteSessionStore(database)
+        advanced_app = CayuApp(session_store=advanced_store, enable_logging=False)
+        register_body(
+            advanced_app,
+            FakeProvider(
+                [
+                    ModelStreamEvent.text_delta("second memory"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ),
+            system_prompt="parent prompt",
+        )
+        await collect_resume_events(
+            advanced_app,
+            ResumeRequest(
+                session_id="sess_prompt_advanced_parent",
+                messages=[Message.text("user", "second turn")],
+            ),
+        )
+        await advanced_store.close()
+
+        recovered_store = SQLiteSessionStore(database)
+        recovered_app = CayuApp(session_store=recovered_store, enable_logging=False)
+        register_body(recovered_app, FakeProvider([]), system_prompt="child prompt")
+        recovered = await collect_fork_events(recovered_app, request)
+
+        child = await recovered_store.load("sess_prompt_advanced_child")
+        assert child is not None
+        assert [event.type for event in recovered] == [EventType.SESSION_FORKED]
+        assert len(await recovered_store.load_events(child.id)) == 1
+        assert session_prompt_anatomy_transition(child) is not None
+        await recovered_store.close()
+
+    asyncio.run(scenario())
+
+
+def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
+    tmp_path: Path,
+) -> None:
+    class CrashBeforeForkStore(SQLiteSessionStore):
+        crash_before_commit = True
+
+        async def create_fork_with_transcript_validation(self, *args, **kwargs):
+            if self.crash_before_commit:
+                self.crash_before_commit = False
+                raise SystemExit("process died before descendant commit")
+            return await super().create_fork_with_transcript_validation(*args, **kwargs)
+
+    async def scenario() -> None:
+        database = tmp_path / "prompt-intent-recovery.sqlite"
+        store = CrashBeforeForkStore(database)
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_precommit_parent",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_transcript_messages(
+            source.id,
+            [Message.text("system", "parent prompt"), Message.text("user", "memory")],
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        request = ForkSessionRequest(
+            source_session_id="sess_prompt_precommit_parent",
+            session_id="sess_prompt_precommit_child",
+            environment_name="body",
+            copy_checkpoint=False,
+            system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+        )
+
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model", system_prompt="child prompt")
+        )
+        with pytest.raises(SystemExit, match="before descendant"):
+            await collect_fork_events(app, request)
+        assert await store.load("sess_prompt_precommit_child") is None
+        checkpoint = await store.load_checkpoint(source.id)
+        assert checkpoint is not None
+        intents = checkpoint["prompt_anatomy_transition_intents"]
+        assert len(intents["records"]) == 1
+        assert next(iter(intents["records"].values()))["status"] == "prepared"
+        await store.close()
+
+        reopened = SQLiteSessionStore(database)
+        restarted_app = CayuApp(session_store=reopened, enable_logging=False)
+        restarted_app.register_provider(FakeProvider([]), default=True)
+        restarted_app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+        restarted_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model", system_prompt="child prompt")
+        )
+        with pytest.raises(RuntimeError, match="prepared prompt-anatomy succession intent"):
+            await collect_resume_events(
+                restarted_app,
+                ResumeRequest(
+                    session_id=source.id,
+                    messages=[Message.text("user", "advance before retry")],
+                ),
+            )
+        fenced_source = await reopened.load(source.id)
+        assert fenced_source is not None
+        assert fenced_source.status is SessionStatus.COMPLETED
+        assert [
+            message.content[0].text for message in await reopened.load_transcript(source.id)
+        ] == ["parent prompt", "memory"]
+
+        recovered = await collect_fork_events(restarted_app, request)
+        child = await reopened.load("sess_prompt_precommit_child")
+        completed_checkpoint = await reopened.load_checkpoint(source.id)
+        assert completed_checkpoint is not None
+        completed_intents = completed_checkpoint["prompt_anatomy_transition_intents"]
+        assert next(iter(completed_intents["records"].values()))["status"] == "completed"
+        assert [event.type for event in recovered] == [EventType.SESSION_FORKED]
+        assert child is not None and session_prompt_anatomy_transition(child) is not None
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
+def test_prompt_anatomy_fork_requires_exact_intent_inside_atomic_create() -> None:
+    class IntentErasingStore(InMemorySessionStore):
+        async def create_fork_with_transcript_validation(self, *args, **kwargs):
+            await self.checkpoint(kwargs["source_session_id"], {})
+            return await super().create_fork_with_transcript_validation(*args, **kwargs)
+
+    store = IntentErasingStore()
+
+    async def scenario() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_intent_parent",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_transcript_messages(
+            source.id,
+            [Message.text("system", "parent prompt"), Message.text("user", "memory")],
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model", system_prompt="child prompt")
+        )
+
+        with pytest.raises(RuntimeError, match="intent disappeared"):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="sess_prompt_intent_child",
+                    environment_name="body",
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                ),
+            )
+
+        assert await store.load("sess_prompt_intent_child") is None
+
+    asyncio.run(scenario())
+
+
+def test_prompt_anatomy_fork_rejects_checkpoint_copy() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> None:
+        source = await store.create(
+            RunRequest(agent_name="assistant", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        with pytest.raises(ValueError, match="cannot copy checkpoint"):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="sess_prompt_checkpoint_child",
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                ),
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("factory_backed", [False, True])
+def test_prompt_anatomy_fork_requires_concrete_registered_environment(
+    factory_backed: bool,
+) -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(FakeProvider([]), default=True)
+    factory: RecordingEnvironmentFactory | None = None
+    environment_name: str | None = None
+    if factory_backed:
+        environment_name = "body"
+        factory = RecordingEnvironmentFactory(Environment(EnvironmentSpec(name="body")))
+        app.register_environment_factory(
+            EnvironmentSpec(name="body"),
+            factory,
+            default=True,
+        )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="current prompt")
+    )
+
+    async def scenario() -> None:
+        source = await store.create(
+            RunRequest(agent_name="assistant", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+
+        with pytest.raises(ValueError, match="concrete registered environment"):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id=f"sess_prompt_environment_child_{factory_backed}",
+                    environment_name=environment_name,
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                ),
+            )
+
+        assert await store.load(f"sess_prompt_environment_child_{factory_backed}") is None
+        checkpoint = await store.load_checkpoint(source.id)
+        assert checkpoint is None or "prompt_anatomy_transition_intents" not in checkpoint
+
+    asyncio.run(scenario())
+    if factory is not None:
+        assert factory.requests == []
+
+
+@pytest.mark.parametrize("status", [SessionStatus.RUNNING, SessionStatus.INTERRUPTING])
+def test_prompt_anatomy_fork_rejects_live_source_before_effects(
+    status: SessionStatus,
+) -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="current prompt")
+    )
+
+    async def scenario() -> None:
+        source = await store.create(
+            RunRequest(agent_name="assistant", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(source.id, SessionStatus.RUNNING)
+        if status is SessionStatus.INTERRUPTING:
+            await store.update_status(source.id, SessionStatus.INTERRUPTING)
+
+        with pytest.raises(ValueError, match="Only completed, failed, or interrupted"):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id=f"sess_prompt_live_child_{status.value}",
+                    environment_name="body",
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                ),
+            )
+
+        assert await store.load(f"sess_prompt_live_child_{status.value}") is None
+        checkpoint = await store.load_checkpoint(source.id)
+        assert checkpoint is None or "prompt_anatomy_transition_intents" not in checkpoint
+
+    asyncio.run(scenario())
+
+
+def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
+    store = InMemorySessionStore()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="current prompt")
+    )
+
+    async def scenario() -> None:
+        source = await store.create(
+            RunRequest(agent_name="assistant", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        checkpoint = {
+            "incomplete_session_recovery_claim": {
+                "version": 1,
+                "claim_id": "active-recovery-owner",
+                "claimed_at": now.isoformat(),
+                "claim_expires_at": (now + timedelta(minutes=5)).isoformat(),
+            }
+        }
+        await store.checkpoint(source.id, checkpoint)
+
+        with pytest.raises(RuntimeError, match="active incomplete-session recovery"):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="sess_prompt_active_recovery_child",
+                    environment_name="body",
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                ),
+            )
+
+        assert await store.load("sess_prompt_active_recovery_child") is None
+        assert await store.load_checkpoint(source.id) == checkpoint
+
+    asyncio.run(scenario())
+
+
+def test_prompt_anatomy_fork_rejects_pending_user_input_before_effects() -> None:
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_ask",
+                name="ask_user",
+                arguments={"question": "Proceed?"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="current prompt"),
+        tools=[UserInputTool()],
+    )
+
+    async def scenario() -> None:
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_pending_input_source",
+                environment_name="body",
+                messages=[Message.text("user", "ask me")],
+            ),
+        )
+        await store.update_status("sess_prompt_pending_input_source", SessionStatus.FAILED)
+        checkpoint = await store.load_checkpoint("sess_prompt_pending_input_source")
+        assert checkpoint is not None and "pending_user_input" in checkpoint
+
+        with pytest.raises(RuntimeError, match="awaiting user input cannot be forked"):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_prompt_pending_input_source",
+                    session_id="sess_prompt_pending_input_child",
+                    environment_name="body",
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                ),
+            )
+
+        assert await store.load("sess_prompt_pending_input_child") is None
+        assert await store.load_checkpoint("sess_prompt_pending_input_source") == checkpoint
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("copy_checkpoint", [False, True])
 def test_cayu_app_fences_expired_recovery_owner_before_fork(
     copy_checkpoint: bool,
@@ -17190,6 +17875,7 @@ def test_cayu_app_rejects_fork_to_agent_with_different_provider():
     app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
     app.register_provider(OtherProvider([]))
+    app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     app.register_agent(AgentSpec(name="other-agent", model="other-model", provider_name="other"))
 
@@ -17212,11 +17898,16 @@ def test_cayu_app_rejects_fork_to_agent_with_different_provider():
                     source_session_id="sess_fork_provider_source",
                     session_id="sess_fork_provider_child",
                     agent_name="other-agent",
+                    environment_name="body",
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
                 ),
             )
         )
 
     assert asyncio.run(store.load("sess_fork_provider_child")) is None
+    source_checkpoint = asyncio.run(store.load_checkpoint("sess_fork_provider_source"))
+    assert source_checkpoint is None or "prompt_anatomy_transition_intents" not in source_checkpoint
 
 
 def test_session_query_validates_label_selector_requirements():
@@ -20847,6 +21538,14 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
             "active_operation_id": None,
             "records": {"stale-operation": {"status": "completed"}},
         }
+        current_prompt_intents = {
+            "version": 1,
+            "records": {"current-transition": {"status": "prepared"}},
+        }
+        stale_prompt_intents = {
+            "version": 1,
+            "records": {"stale-transition": {"status": "prepared"}},
+        }
         await store.checkpoint(
             session_id,
             {
@@ -20856,6 +21555,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
                 },
                 "pending_interruption_cascade": current_marker,
                 "session_operations": current_operations,
+                "prompt_anatomy_transition_intents": current_prompt_intents,
                 "current": True,
             },
         )
@@ -20866,6 +21566,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
             },
             "pending_interruption_cascade": stale_marker,
             "session_operations": stale_operations,
+            "prompt_anatomy_transition_intents": stale_prompt_intents,
             "replacement": True,
         }
         await store.transform_checkpoint(
@@ -20905,9 +21606,19 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
             "active_operation_id": None,
             "records": {"current-operation": {"status": "completed"}},
         },
+        "prompt_anatomy_transition_intents": {
+            "version": 1,
+            "records": {"current-transition": {"status": "prepared"}},
+        },
         "replacement": True,
     }
-    assert after_clear == {"replacement": True}
+    assert after_clear == {
+        "prompt_anatomy_transition_intents": {
+            "version": 1,
+            "records": {"current-transition": {"status": "prepared"}},
+        },
+        "replacement": True,
+    }
 
 
 def test_pending_interruption_cascade_blocks_resume_and_fork():
@@ -37029,6 +37740,7 @@ def test_cayu_app_rejects_fork_with_pending_approval_checkpoint():
     )
     app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
     tool = SideEffectTool()
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -37078,7 +37790,9 @@ def test_cayu_app_rejects_fork_with_pending_approval_checkpoint():
                 ForkSessionRequest(
                     source_session_id="sess_interrupted_fork_source",
                     session_id="sess_failed_fork_without_checkpoint",
+                    environment_name="body",
                     copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
                 ),
             )
         )

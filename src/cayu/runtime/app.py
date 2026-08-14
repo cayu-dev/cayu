@@ -72,6 +72,7 @@ from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._environment_lifecycle import (
     DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
     EnvironmentLifecycle,
+    render_initial_system_prompt,
 )
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
@@ -247,6 +248,7 @@ from cayu.runtime.sessions import (
     copy_incomplete_sessions_recovery_request,
     copy_interrupt_session_request,
     copy_resume_request,
+    system_prompt_messages_sha256,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -1458,6 +1460,33 @@ class CayuApp:
                 name: _copy_registered_tool(tool) for name, tool in registered_agent.tools.items()
             },
         )
+
+    async def current_prompt_anatomy_sha256(
+        self,
+        *,
+        agent_name: str,
+        environment_name: str | None,
+    ) -> str:
+        """Return a content-free digest of the prompt the current body would install."""
+
+        registered_agent = self._get_registered_agent(agent_name)
+        registered_environment = (
+            None if environment_name is None else self._get_registered_environment(environment_name)
+        )
+        if registered_environment is not None and registered_environment.factory is not None:
+            raise RuntimeError(
+                "Prompt anatomy cannot be inspected for a factory-backed environment before "
+                "session materialization."
+            )
+        workspace_instructions = await self._environment_lifecycle.load_workspace_instructions(
+            registered_environment
+        )
+        rendered = render_initial_system_prompt(
+            agent_system_prompt=registered_agent.spec.system_prompt,
+            workspace_instructions=workspace_instructions,
+        )
+        messages = [] if rendered is None else [Message.text("system", rendered)]
+        return system_prompt_messages_sha256(messages)
 
     def list_agents(self) -> tuple[str, ...]:
         """Return the names of all registered agents, sorted."""

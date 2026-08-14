@@ -14,6 +14,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.runtime.public_authority import public_authority_alias_is_reserved
 from cayu.runtime.sessions import (
     MODEL_TARGET_PROJECTION_METADATA_KEY,
+    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     ForkSessionRequest,
@@ -333,6 +334,12 @@ def _require_secret_free_fork_policy_metadata(
         raise ForkAuthorityError(
             f"metadata[{MODEL_TARGET_PROJECTION_METADATA_KEY!r}] is runtime-owned "
             "model-target authority."
+        ) from None
+    if PROMPT_ANATOMY_TRANSITION_METADATA_KEY in metadata:
+        metadata.clear()
+        raise ForkAuthorityError(
+            f"metadata[{PROMPT_ANATOMY_TRANSITION_METADATA_KEY!r}] is runtime-owned "
+            "prompt-transition authority."
         ) from None
     try:
         labels = taint_labels_from_metadata(metadata)

@@ -679,6 +679,9 @@ SESSION_MESSAGE_DELIVERY_BATCH_LIMIT = 100
 MODEL_TARGET_PROJECTION_METADATA_KEY = "cayu:model_target_projection"
 MODEL_TARGET_PROJECTION_RECORD_TYPE = "cayu.model-target-projection"
 MODEL_TARGET_PROJECTION_SCHEMA_VERSION = 1
+PROMPT_ANATOMY_TRANSITION_METADATA_KEY = "cayu:prompt_anatomy_transition"
+PROMPT_ANATOMY_TRANSITION_RECORD_TYPE = "cayu.prompt-anatomy-transition"
+PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION = 1
 SESSION_CREATE_CLAIM_METADATA_KEY = "cayu:session_create_claim"
 SESSION_CREATE_CLAIM_RECORD_TYPE = "cayu.session-create-claim"
 SESSION_CREATE_CLAIM_SCHEMA_VERSION = 1
@@ -816,6 +819,40 @@ def session_model_projection_cursor(session: Session) -> int:
     if type(cursor) is not int or not 0 <= cursor <= MAX_DURABLE_JSON_INTEGER:
         raise ValueError("Session model-target projection cursor is malformed.")
     return cursor
+
+
+def session_prompt_anatomy_transition(
+    session: Session,
+) -> PromptAnatomyTransitionReceipt | None:
+    """Return verified durable prompt-succession evidence for one descendant."""
+
+    if type(session) is not Session:
+        raise TypeError("session must be a Session.")
+    raw = session.metadata.get(PROMPT_ANATOMY_TRANSITION_METADATA_KEY)
+    if raw is None:
+        return None
+    try:
+        receipt = PromptAnatomyTransitionReceipt.model_validate(raw)
+    except Exception as exc:
+        raise ValueError("Session prompt-anatomy transition metadata is malformed.") from exc
+    if (
+        receipt.descendant_session_id != session.id
+        or receipt.source_session_id != session.parent_session_id
+        or receipt.child_agent_name != session.agent_name
+        or receipt.child_environment_name != session.environment_name
+        or receipt.provider_name != session.provider_name
+        or receipt.model != session.model
+        or receipt.source_provider_name != receipt.provider_name
+        or receipt.model_target_changed != (receipt.source_model != receipt.model)
+        or receipt.portability_preflight
+        != (
+            "provider_portable_transcript_preflight"
+            if receipt.model_target_changed
+            else "context_messages_validated"
+        )
+    ):
+        raise ValueError("Session prompt-anatomy transition conflicts with session identity.")
+    return receipt
 
 
 class SessionMessageDeliveryMode(StrEnum):
@@ -959,6 +996,7 @@ class RunRequest(BaseModel):
                 for key in (
                     MODEL_TARGET_PROJECTION_METADATA_KEY,
                     EXECUTION_PROFILE_METADATA_KEY,
+                    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
                 )
                 if key in copied
             ),
@@ -968,8 +1006,10 @@ class RunRequest(BaseModel):
             copied.clear()
             if reserved_key == MODEL_TARGET_PROJECTION_METADATA_KEY:
                 authority_name = "model-target authority"
-            else:
+            elif reserved_key == EXECUTION_PROFILE_METADATA_KEY:
                 authority_name = "execution-profile authority"
+            else:
+                authority_name = "prompt-transition authority"
             raise ValueError(f"metadata[{reserved_key!r}] is runtime-owned {authority_name}.")
         return copied
 
@@ -1054,6 +1094,22 @@ def session_input_messages_sha256(messages: Sequence[Message]) -> str:
             raise TypeError("messages must contain exact Message instances.")
         document.append(message.model_dump(mode="json"))
     return sha256(canonical_durable_json_bytes(document, "messages")).hexdigest()
+
+
+def system_prompt_messages_sha256(messages: Sequence[Message]) -> str:
+    """Hash only the canonical system messages that define one prompt anatomy."""
+
+    if type(messages) not in {list, tuple}:
+        raise TypeError("messages must be a list or tuple.")
+    system_messages: list[dict[str, Any]] = []
+    for message in messages:
+        if type(message) is not Message:
+            raise TypeError("messages must contain exact Message instances.")
+        if message.role == MessageRole.SYSTEM:
+            system_messages.append(message.model_dump(mode="json"))
+    return sha256(
+        canonical_durable_json_bytes(system_messages, "system_prompt_messages")
+    ).hexdigest()
 
 
 def session_input_contract_evidence(
@@ -1594,6 +1650,13 @@ class InterruptSessionRequest(BaseModel):
         return copy_resolution_actor(value)
 
 
+class ForkSystemPromptPolicy(StrEnum):
+    """Select which body's system prompt becomes authoritative in a session fork."""
+
+    INHERIT_SOURCE = "inherit_source"
+    CURRENT_AGENT = "current_agent"
+
+
 class ForkSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1604,6 +1667,7 @@ class ForkSessionRequest(BaseModel):
     environment_name: str | None = None
     transcript_cursor: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     copy_checkpoint: StrictBool = True
+    system_prompt_policy: ForkSystemPromptPolicy = ForkSystemPromptPolicy.INHERIT_SOURCE
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("session_id")
@@ -1632,6 +1696,207 @@ class ForkSessionRequest(BaseModel):
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_durable_json_object(value, "metadata")
+
+
+class PromptAnatomyTransitionReceipt(BaseModel):
+    """Durable prompt-succession evidence that never contains prompt text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.prompt-anatomy-transition"] = PROMPT_ANATOMY_TRANSITION_RECORD_TYPE
+    schema_version: Literal[1] = PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION
+    transition_id: str
+    request_sha256: str
+    source_session_id: str
+    descendant_session_id: str
+    source_status: SessionStatus
+    source_transcript_cursor: int
+    source_prompt_sha256: str
+    child_prompt_sha256: str
+    source_system_prompt_retained: StrictBool
+    child_agent_name: str
+    child_environment_name: str
+    copy_checkpoint: StrictBool
+    source_provider_name: str
+    source_model: str
+    provider_name: str
+    model: str
+    model_target_changed: StrictBool
+    portability_preflight: Literal[
+        "context_messages_validated",
+        "provider_portable_transcript_preflight",
+    ]
+    portability_verified: Literal[True]
+    inherited_taint_labels: tuple[str, ...]
+    policy: Literal[ForkSystemPromptPolicy.CURRENT_AGENT] = ForkSystemPromptPolicy.CURRENT_AGENT
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        request_sha256: str,
+        source_session_id: str,
+        descendant_session_id: str,
+        source_status: SessionStatus,
+        source_transcript_cursor: int,
+        source_prompt_sha256: str,
+        child_prompt_sha256: str,
+        child_agent_name: str,
+        child_environment_name: str,
+        copy_checkpoint: bool,
+        source_provider_name: str,
+        source_model: str,
+        provider_name: str,
+        model: str,
+        model_target_changed: bool,
+        portability_preflight: Literal[
+            "context_messages_validated",
+            "provider_portable_transcript_preflight",
+        ],
+        inherited_taint_labels: tuple[str, ...],
+    ) -> PromptAnatomyTransitionReceipt:
+        """Build one canonical receipt and bind its digest to the same material."""
+
+        payload = {
+            "record_type": PROMPT_ANATOMY_TRANSITION_RECORD_TYPE,
+            "schema_version": PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION,
+            "request_sha256": request_sha256,
+            "source_session_id": source_session_id,
+            "descendant_session_id": descendant_session_id,
+            "source_status": source_status.value,
+            "source_transcript_cursor": source_transcript_cursor,
+            "source_prompt_sha256": source_prompt_sha256,
+            "child_prompt_sha256": child_prompt_sha256,
+            "source_system_prompt_retained": False,
+            "child_agent_name": child_agent_name,
+            "child_environment_name": child_environment_name,
+            "copy_checkpoint": copy_checkpoint,
+            "source_provider_name": source_provider_name,
+            "source_model": source_model,
+            "provider_name": provider_name,
+            "model": model,
+            "model_target_changed": model_target_changed,
+            "portability_preflight": portability_preflight,
+            "portability_verified": True,
+            "inherited_taint_labels": list(inherited_taint_labels),
+            "policy": ForkSystemPromptPolicy.CURRENT_AGENT.value,
+        }
+        transition_id = sha256(
+            canonical_durable_json_bytes(payload, "prompt_anatomy_transition")
+        ).hexdigest()
+        return cls.model_validate({"transition_id": transition_id, **payload})
+
+    @field_validator(
+        "transition_id",
+        "request_sha256",
+        "source_session_id",
+        "descendant_session_id",
+        "child_agent_name",
+        "source_provider_name",
+        "source_model",
+        "provider_name",
+        "model",
+    )
+    @classmethod
+    def validate_nonblank_receipt_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("child_environment_name")
+    @classmethod
+    def validate_environment(cls, value: str) -> str:
+        return require_clean_nonblank(value, "child_environment_name")
+
+    @field_validator(
+        "transition_id",
+        "request_sha256",
+        "source_prompt_sha256",
+        "child_prompt_sha256",
+    )
+    @classmethod
+    def validate_prompt_digest(cls, value: str, info) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("inherited_taint_labels")
+    @classmethod
+    def validate_inherited_taint_labels(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        labels = tuple(require_clean_nonblank(label, "inherited_taint_labels") for label in value)
+        if labels != tuple(sorted(set(labels))):
+            raise ValueError("inherited_taint_labels must be sorted and unique.")
+        return labels
+
+    @model_validator(mode="after")
+    def validate_exact_transition_authority(self) -> PromptAnatomyTransitionReceipt:
+        if self.source_system_prompt_retained or self.copy_checkpoint:
+            raise ValueError(
+                "Prompt-anatomy succession must replace the source prompt without checkpoint state."
+            )
+        if self.source_status not in {
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
+        }:
+            raise ValueError("Prompt-anatomy succession source status is not forkable.")
+        if self.source_provider_name != self.provider_name:
+            raise ValueError("Prompt-anatomy succession cannot change providers.")
+        if self.model_target_changed != (self.source_model != self.model):
+            raise ValueError("Prompt-anatomy succession model-target evidence is inconsistent.")
+        expected_preflight = (
+            "provider_portable_transcript_preflight"
+            if self.model_target_changed
+            else "context_messages_validated"
+        )
+        if self.portability_preflight != expected_preflight:
+            raise ValueError("Prompt-anatomy succession portability evidence is inconsistent.")
+        payload = self.model_dump(mode="json", exclude={"transition_id"})
+        expected_transition_id = sha256(
+            canonical_durable_json_bytes(payload, "prompt_anatomy_transition")
+        ).hexdigest()
+        if self.transition_id != expected_transition_id:
+            raise ValueError("Prompt-anatomy transition_id does not bind the exact receipt.")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class ForkSystemPromptReplacement:
+    """Store-boundary instruction to replace every inherited system message."""
+
+    message: Message | None
+
+
+def apply_fork_system_prompt_replacement(
+    messages: list[Message],
+    interaction_ids: list[str | None],
+    replacement: ForkSystemPromptReplacement | None,
+) -> tuple[list[Message], list[str | None]]:
+    """Install one authoritative system message while preserving non-system history."""
+
+    if len(messages) != len(interaction_ids):
+        raise RuntimeError("Fork transcript attribution does not match its messages.")
+    if replacement is None:
+        return messages, interaction_ids
+    replacement_message = replacement.message
+    if replacement_message is not None:
+        if (
+            type(replacement_message) is not Message
+            or replacement_message.role != MessageRole.SYSTEM
+        ):
+            raise TypeError("Fork prompt replacement must be a system Message.")
+        replacement_message = detach_message(replacement_message)
+    retained_messages: list[Message] = []
+    retained_interaction_ids: list[str | None] = []
+    for message, interaction_id in zip(messages, interaction_ids, strict=True):
+        if message.role == MessageRole.SYSTEM:
+            continue
+        retained_messages.append(message)
+        retained_interaction_ids.append(interaction_id)
+    if replacement_message is not None:
+        retained_messages.insert(0, replacement_message)
+        retained_interaction_ids.insert(0, None)
+    messages.clear()
+    interaction_ids.clear()
+    return retained_messages, retained_interaction_ids
 
 
 class SessionIdentity(BaseModel):
@@ -5671,9 +5936,15 @@ class SessionStore(ABC):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
     ) -> Session:
-        """Create a forked session with copied transcript/checkpoint state."""
+        """Create a forked session with copied transcript/checkpoint state.
+
+        A prompt replacement, when supplied by the runtime, atomically removes
+        inherited system messages and installs its one authoritative system
+        message while preserving non-system message attribution.
+        """
 
     async def create_fork_with_transcript_validation(
         self,
@@ -5683,14 +5954,17 @@ class SessionStore(ABC):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator,
     ) -> Session:
-        """Create a fork after validating the exact transcript inside the copy boundary.
+        """Create a fork after validating the final transcript inside the copy boundary.
 
         Custom stores must opt into this safety capability explicitly. The
         conservative default prevents the runtime from silently falling back to
-        a time-of-check/time-of-use transcript validation.
+        a time-of-check/time-of-use transcript validation. When prompt
+        replacement is requested, the validator receives the atomically
+        transformed child transcript rather than the source transcript.
         """
 
         raise NotImplementedError(
@@ -7563,6 +7837,7 @@ class InMemorySessionStore(SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
     ) -> Session:
         return await self._create_fork(
@@ -7571,6 +7846,7 @@ class InMemorySessionStore(SessionStore):
             source_statuses=source_statuses,
             transcript_cursor=transcript_cursor,
             checkpoint_transform=checkpoint_transform,
+            system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=None,
         )
@@ -7583,6 +7859,7 @@ class InMemorySessionStore(SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator,
     ) -> Session:
@@ -7592,6 +7869,7 @@ class InMemorySessionStore(SessionStore):
             source_statuses=source_statuses,
             transcript_cursor=transcript_cursor,
             checkpoint_transform=checkpoint_transform,
+            system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=transcript_validator,
         )
@@ -7604,6 +7882,7 @@ class InMemorySessionStore(SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator | None,
     ) -> Session:
@@ -7646,6 +7925,13 @@ class InMemorySessionStore(SessionStore):
                 copied_transcript = [
                     copy_message(message) for message in source_transcript[:transcript_cursor]
                 ]
+            source_interaction_ids = self._transcript_interaction_ids.get(source_session_id, [])
+            copied_interaction_ids = list(source_interaction_ids[: len(copied_transcript)])
+            copied_transcript, copied_interaction_ids = apply_fork_system_prompt_replacement(
+                copied_transcript,
+                copied_interaction_ids,
+                system_prompt_replacement,
+            )
             # A cursor may intentionally exclude legacy secret-bearing suffix
             # entries. The source store owns those records; this frame does not.
             source_transcript = []
@@ -7687,11 +7973,9 @@ class InMemorySessionStore(SessionStore):
             self._pending_action_event_records[fork.id] = {}
             self._session_operation_records[fork.id] = {}
             self._transcripts[fork.id] = copied_transcript
-            source_interaction_ids = self._transcript_interaction_ids.get(source_session_id, [])
-            copied_count = len(copied_transcript)
             # Historical attribution remains tied to the source session's
             # interactions; new child work receives new child interaction IDs.
-            self._transcript_interaction_ids[fork.id] = list(source_interaction_ids[:copied_count])
+            self._transcript_interaction_ids[fork.id] = copied_interaction_ids
             for interaction_id in set(self._transcript_interaction_ids[fork.id]):
                 if interaction_id is None:
                     continue
@@ -12414,6 +12698,7 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
         environment_name=request.environment_name,
         transcript_cursor=request.transcript_cursor,
         copy_checkpoint=request.copy_checkpoint,
+        system_prompt_policy=request.system_prompt_policy,
         metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
 

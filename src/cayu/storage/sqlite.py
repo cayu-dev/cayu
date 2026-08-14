@@ -68,6 +68,7 @@ from cayu.runtime.sessions import (
     EventQueryResultTooLarge,
     EventRecord,
     EventSummary,
+    ForkSystemPromptReplacement,
     ForkTranscriptValidator,
     InteractionAttribution,
     InteractionTransitionReceiptResult,
@@ -234,6 +235,7 @@ from cayu.runtime.sessions import (
     _validate_tool_round_call_ids,
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
+    apply_fork_system_prompt_replacement,
     build_session_topology_result,
     checkpoint_root_field_projection_from_storage,
     copy_enqueue_session_message_request,
@@ -1739,6 +1741,7 @@ class SQLiteSessionStore(SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
     ) -> Session:
         return await self._create_fork(
@@ -1747,6 +1750,7 @@ class SQLiteSessionStore(SessionStore):
             source_statuses=source_statuses,
             transcript_cursor=transcript_cursor,
             checkpoint_transform=checkpoint_transform,
+            system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=None,
         )
@@ -1759,6 +1763,7 @@ class SQLiteSessionStore(SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator,
     ) -> Session:
@@ -1768,6 +1773,7 @@ class SQLiteSessionStore(SessionStore):
             source_statuses=source_statuses,
             transcript_cursor=transcript_cursor,
             checkpoint_transform=checkpoint_transform,
+            system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=transcript_validator,
         )
@@ -1780,6 +1786,7 @@ class SQLiteSessionStore(SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator | None,
     ) -> Session:
@@ -1843,6 +1850,11 @@ class SQLiteSessionStore(SessionStore):
                 ]
                 copied_interaction_ids = [row["interaction_id"] for row in selected_transcript_rows]
                 selected_transcript_rows.clear()
+                copied_messages, copied_interaction_ids = apply_fork_system_prompt_replacement(
+                    copied_messages,
+                    copied_interaction_ids,
+                    system_prompt_replacement,
+                )
                 if not fork_transcript_is_accepted(copied_messages, transcript_validator):
                     copied_messages.clear()
                     copied_messages = []

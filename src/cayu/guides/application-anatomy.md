@@ -45,6 +45,56 @@ stores carry shared state across processes. In-memory stores and Python object
 identity do not. Registration and live resource ownership remain local to the
 process that constructed the app.
 
+## Resume versus anatomical succession
+
+Reconstructing an app and calling `resume(...)` keeps the same durable session.
+The current application graph supplies the registered tools and policies, but
+the session's existing transcript remains authoritative—including its original
+system prompt. Changing `AgentSpec.system_prompt` does not silently rewrite that
+history.
+
+When a new agent body must inherit conversation history but install its current
+prompt anatomy, create an explicit descendant instead:
+
+```python
+from cayu import ForkSessionRequest, ForkSystemPromptPolicy
+
+events = [
+    event
+    async for event in app.fork_session(
+        ForkSessionRequest(
+            source_session_id="agent-v1-session",
+            session_id="agent-v2-session",
+            agent_name="agent-v2",
+            copy_checkpoint=False,
+            system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+        )
+    )
+]
+```
+
+This opt-in fork renders the current registered agent prompt and current
+workspace instructions, atomically replaces inherited system messages, and
+preserves the selected non-system history. It records a durable
+`PromptAnatomyTransitionReceipt` containing source/child prompt SHA-256 digests
+and transition identities, plus source/child model identities and the successful
+portability check, never prompt text. Before descendant creation the source
+checkpoint records a durable transition intent, so a process restart can
+continue the exact request. The source transcript stays unchanged. Exact
+retries require the same explicit destination session ID and converge on that
+descendant and receipt.
+
+Prompt succession currently requires `copy_checkpoint=False` and a concrete
+registered environment. This is deliberate: a checkpoint or an unmaterialized
+environment factory can contain body-specific execution state that the runtime
+cannot prove compatible with the new prompt anatomy. Ordinary forks continue to
+inherit the source prompt by default.
+
+For a body upgrade that hopes to keep the exact session ID, compare the
+persisted transcript's `system_prompt_messages_sha256(...)` with
+`await app.current_prompt_anatomy_sha256(...)`. Only an equal digest proves the
+new application graph would install the same prompt anatomy; otherwise fork.
+
 ## Application lifecycle boundaries
 
 Keep these four responsibilities conceptually separate so a host makes its

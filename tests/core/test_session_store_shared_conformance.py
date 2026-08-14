@@ -69,6 +69,7 @@ from cayu.runtime import (
     EnqueueSessionMessageRequest,
     EventQuery,
     ForkSessionRequest,
+    ForkSystemPromptReplacement,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
@@ -14896,6 +14897,77 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
                         transcript_validator=lambda _messages, result=invalid_result: result,
                     )
                 assert await session_store.load(child_id) is None
+        finally:
+            await _close_store(session_store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_replaces_fork_system_prompt_atomically(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        session_store = await _open_store(session_store_case)
+        try:
+            source = await session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_prompt_replacement_source",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await session_store.append_transcript_messages(
+                source.id,
+                [Message.text("system", "source prompt")],
+            )
+            await session_store.append_transcript_messages(
+                source.id,
+                [Message.text("user", "inherited question")],
+                interaction_id="source-prompt-interaction",
+            )
+            source = await session_store.update_status(source.id, SessionStatus.COMPLETED)
+            observed: list[tuple[Message, ...]] = []
+
+            child = await session_store.create_fork_with_transcript_validation(
+                source_session_id=source.id,
+                fork=Session(
+                    id="sess_prompt_replacement_child",
+                    agent_name="assistant",
+                    provider_name="fake",
+                    model="fake-model",
+                    parent_session_id=source.id,
+                    invocation=fork_session_invocation(source),
+                    status=SessionStatus.COMPLETED,
+                ),
+                source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
+                transcript_cursor=None,
+                checkpoint_transform=None,
+                system_prompt_replacement=ForkSystemPromptReplacement(
+                    Message.text("system", "child prompt")
+                ),
+                transcript_validator=lambda messages: not observed.append(messages),
+            )
+
+            source_transcript = await session_store.load_transcript(source.id)
+            child_transcript = await session_store.load_transcript(child.id)
+            child_page = await session_store.query_transcript(
+                TranscriptQuery(session_id=child.id, limit=10)
+            )
+            assert [message.content[0].text for message in source_transcript] == [
+                "source prompt",
+                "inherited question",
+            ]
+            assert [message.content[0].text for message in child_transcript] == [
+                "child prompt",
+                "inherited question",
+            ]
+            assert observed == [tuple(child_transcript)]
+            assert [record.interaction_id for record in child_page.records] == [
+                None,
+                "source-prompt-interaction",
+            ]
         finally:
             await _close_store(session_store)
 

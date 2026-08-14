@@ -1305,6 +1305,43 @@ Background propagation persists a `pending_interruption_cascade` checkpoint mark
 
 `ForkSessionRequest` creates a new session branch from an existing `completed`, `failed`, or `interrupted` session without mutating the source. Fork keeps the source provider fixed, copies the source transcript, optionally applies a same-provider model override, and persists `parent_session_id` on the child session. A child that keeps the source model translates the source's absolute model-projection cursor into the copied child's contiguous transcript coordinates. A model override establishes a new full-prefix projection: Cayu removes provider-native state and thinking from the model-facing copy and calls the provider's side-effect-free portability preflight before creating the child. The store then validates the exact preflighted transcript inside its atomic copy transaction, so a changed source cannot create a child whose projection authority describes different history. Full-session forks copy checkpoint state by default and emit `session.forked` on the child session. Partial transcript forks use the source's permanent 1-based `transcript_cursor`; after physical retention they copy only retained rows whose absolute indexes precede that cursor, and must set `copy_checkpoint=False`. Checkpoint state is not safe to copy when it may refer to transcript messages omitted from the fork. Interrupted sessions cannot be forked without checkpoint state. A session awaiting tool approval or user input, or carrying an unresolved ordinary tool-round checkpoint, cannot be forked; resolve, resume, or recover that live round first so its execution identity is never writable from both the source and child sessions. The source agent must remain registered in the current app so Cayu can derive inherited taint from its tool policy; this remains required when the fork overrides the child agent. Fork preparation is fenced by the source `run_epoch`: if the source resumes and completes between application-level preparation and the store's atomic copy, the fork is rejected so the caller retries against the new transcript, checkpoint, and trust state.
 
+`ForkSystemPromptPolicy.CURRENT_AGENT` is the explicit anatomical-succession
+variant. It requires a caller-selected descendant ID, a concrete registered
+environment, and `copy_checkpoint=False`. The runtime renders the current
+registered agent prompt plus current workspace instructions, then asks the
+store to remove inherited system messages and install that single rendered
+message inside the same transaction that copies non-system transcript history.
+No-environment and factory-backed registrations fail before factory invocation,
+intent persistence, or descendant creation because v1 cannot prove the
+session-materialized workspace instructions before that atomic copy.
+Before the descendant effect, Cayu records an exact request/transition intent
+in the source checkpoint. A process restart can therefore retry the same
+request without losing whether the transition was prepared; a conflicting use
+of the destination or request identity fails closed. While an intent remains
+prepared, source resume and compaction fail closed until the caller retries the
+exact fork, preventing later source history from changing that pinned effect.
+After descendant creation,
+the intent is marked complete and exact acknowledgement-loss retries converge
+on the already-created child.
+
+The descendant carries a runtime-owned `PromptAnatomyTransitionReceipt` in
+session metadata. It contains source and child session/body identities,
+selected source cursor, prompt SHA-256 digests, checkpoint policy, source and
+child provider/model identities, whether the model target changed, and the
+successful portability-preflight kind and result. It never contains prompt
+text. `session_prompt_anatomy_transition(session)` validates this receipt
+against the descendant identity. The deterministic `session.forked` event is
+timestamped with the descendant's persisted creation time, so exact replay
+preserves both identity and truthful time-query semantics. Ordinary forks keep
+the source prompt and their existing store contract unless this policy is
+selected.
+
+Before choosing same-session reuse instead, an orchestrator can call
+`CayuApp.current_prompt_anatomy_sha256(...)` and compare it with
+`system_prompt_messages_sha256(...)` over the persisted session transcript.
+Both APIs expose only a digest; a mismatch means the current body cannot safely
+reuse the historical prompt and must use an explicit descendant fork.
+
 Fork authority is validated again after agent registration, model and environment resolution, topology inheritance, and taint propagation. The complete derived child must be safe before Cayu creates the child, copies transcript or checkpoint state, or publishes `session.forked`. Caller-supplied identities remain untrusted; positively store-resolved and runtime-generated topology identities may survive incidental short-secret collisions, but exact-secret identities and secret-bearing executable or policy authority fail closed before mutation.
 
 `DispatchRequest` asks a `Dispatcher` to submit work for an existing session and return a `DispatchHandle`. Dispatch is separate from fork: fork decides what state a branch starts from, while dispatch decides how a session run is placed. The default `InlineDispatcher` runs immediately in the current process by resuming the target session through the normal runtime loop, then returns a completed, failed, or interrupted handle based on the terminal session event. It is useful for tests, local execution, and proving orchestration logic, but it is not durable background execution. Production apps can provide another `Dispatcher` that submits work to an external queue or hosted runtime and returns a queued/submitted handle while events are observed through the session store. `CayuApp.dispatch_inline(...)` is the explicit local streaming API for callers that want to consume ordinary `session.resumed`, model, tool, task, interrupt, and terminal session events directly. `DispatchRequest.task_id` optionally links dispatched work to a task; using it with inline execution requires `CayuApp(task_store=...)`.
