@@ -2,7 +2,9 @@
 
 These compact references are shipped in the Cayu package. They describe the
 public seam to start from and the proof boundary to preserve. Use the smallest
-section that matches the requested behavior.
+section that matches the requested behavior. For an end-to-end operational
+change, start with `cayu guide durable-operations`; it composes the sessions,
+approvals, tool effects, pending actions, verification, and recovery seams below.
 
 ## domain-tool
 
@@ -100,6 +102,7 @@ runtime test, eval, and tracer-bullet check loop through Cayu.
 
 ## approvals
 
+The runnable proposal-to-verification recipe is `cayu guide durable-operations`.
 Tool effects describe replay risk; tool policies authorize execution. Use
 `AlwaysRequireApprovalToolPolicy` for a named external-effect tool that needs a
 human decision. Handle `SessionStatus.INTERRUPTED`, persist the pending action,

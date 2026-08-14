@@ -509,6 +509,7 @@ Start with the document that matches the job:
 | Choose Cayu concepts and build an application, by hand or with an AI coding agent | `cayu guide authoring#cayu-map` |
 | Configure primary or compatible model services | `cayu guide providers` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md)) |
 | Classify and verify tool mutation and replay behavior | `cayu guide tool-effects` |
+| Build a durable propose, authorize, act, verify, and recover lifecycle | `cayu guide durable-operations` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-operations.md)) |
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |

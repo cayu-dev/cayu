@@ -373,7 +373,9 @@ and `evals/agent.py` to prove that behavior. The project factory is `build_app()
 in `app.py`. Run `cayu guide anatomy` for its lifecycle contract.
 
 Run `uv run cayu guide authoring#cayu-map` to select another concept only when
-the requested behavior requires it. `uv run cayu guide references` contains the
+the requested behavior requires it. For durable operational changes, start with
+`uv run cayu guide durable-operations`; it covers propose, authorize, act once,
+verify, inspect, and recover. `uv run cayu guide references` contains the
 package-shipped offline references.
 
 ## Setup and prove the project
@@ -481,7 +483,9 @@ one only for a real capability outside the model, such as reading a repository
 or calling an API. Do not create echo, pass-through, or placeholder tools.
 
 Use the Cayu Map to choose only the concepts the job needs:
-`uv run cayu guide authoring#cayu-map`.
+`uv run cayu guide authoring#cayu-map`. If the job observes, proposes, authorizes,
+executes, verifies, or recovers an operational change, read the runnable paved
+path first: `uv run cayu guide durable-operations`.
 
 If another capability is required, use the smallest package-shipped reference
 from `uv run cayu guide references`.

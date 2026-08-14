@@ -613,6 +613,19 @@ def test_cayu_new_routes_provider_questions_to_the_package_compatibility_guide(
             assert service in text
 
 
+def test_cayu_new_routes_durable_operations_to_the_package_quickstart(tmp_path: Path) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myproj"
+
+    readme = " ".join((project / "README.md").read_text(encoding="utf-8").split())
+    agents = " ".join((project / "AGENTS.md").read_text(encoding="utf-8").split())
+    assert "For durable operational changes" in readme
+    assert "propose, authorize, act once, verify, inspect, and recover" in readme
+    assert "uv run cayu guide durable-operations" in readme
+    assert "If the job observes, proposes, authorizes, executes, verifies, or recovers" in agents
+    assert "uv run cayu guide durable-operations" in agents
+
+
 def test_cayu_new_uses_supported_hyphenated_project_name_for_the_agent(
     tmp_path: Path,
 ) -> None:

@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import re
 
 import pytest
 
+from cayu import (
+    AgentSpec,
+    ResolutionActor,
+    ResolutionActorSource,
+    Session,
+    ToolContext,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+)
 from cayu.cli import main
 
 
@@ -13,6 +23,7 @@ def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     assert "Package-shipped Cayu guides:" in listing
     assert "structured-output" in listing
     assert "Credential-free structured-output runtime proof." in listing
+    assert "durable-operations" in listing
     assert "providers" in listing
 
     with pytest.raises(SystemExit) as excinfo:
@@ -86,6 +97,142 @@ def test_package_shipped_application_anatomy_guide_is_discoverable(capsys) -> No
         "Test",
     ):
         assert role in anatomy
+
+
+def test_package_shipped_durable_operations_guide_is_runnable(capsys) -> None:
+    assert main(["guide", "durable-operations"]) == 0
+    guide = capsys.readouterr().out
+    normalized = guide.casefold()
+
+    assert "# Durable operations lifecycle" in guide
+    for phase in ("observe", "diagnose", "propose", "authorize", "act once", "verify", "recover"):
+        assert phase in normalized
+    assert "never automatically replay" in normalized
+    assert "effect=ToolEffect.IDEMPOTENT" in guide
+    assert "class RecordProposal(Tool)" in guide
+    assert "proposal_store.records[proposal.session.id]" in guide
+    assert "ResolutionActorSource.REQUEST" in guide
+    assert "resolved_by=authorized_operator" in guide
+    assert "self.system.observe_target(action_id)" in guide
+    assert 'self.system.apply_once(action_id, args["target"])' in guide
+    assert "verified = observed_target == ALLOWED_TARGET" in guide
+    assert "self.action.receipts.get" not in guide
+    guide.encode("cp437")
+    example = re.search(r"```python\n(.*?)```", guide, re.DOTALL)
+    assert example is not None
+    namespace: dict[str, object] = {}
+    exec(example.group(1), namespace)
+
+    proposal_store = namespace["ProposalStore"]()
+    record_proposal = namespace["RecordProposal"](proposal_store)
+    assert record_proposal.spec.parallel_safe is False
+    policy = namespace["ReviewedActionPolicy"](proposal_store)
+    session = Session(
+        id="same-round",
+        agent_name="operator",
+        provider_name="scripted",
+        model="scripted-model",
+    )
+    request = ToolPolicyRequest(
+        session=session,
+        agent=AgentSpec(name="operator", model="scripted-model"),
+        tool_name="apply_change",
+        tool_call_id="action-call",
+        arguments={
+            "action_id": "change-0001",
+            "target": "demo",
+            "reason": "observed_drift",
+        },
+    )
+    missing_record = asyncio.run(policy.authorize(request))
+    assert missing_record.decision is ToolPolicyDecision.DENY
+
+    proposal_store.records[session.id] = {
+        "action_id": "change-0002",
+        "target": "demo",
+        "reason": "observed_drift",
+    }
+    mismatch = asyncio.run(policy.authorize(request))
+    assert mismatch.decision is ToolPolicyDecision.DENY
+
+    unknown = request.model_copy(
+        update={
+            "tool_name": "future_effect",
+            "tool_call_id": "future-effect-call",
+            "arguments": {},
+        }
+    )
+    unknown_result = asyncio.run(policy.authorize(unknown))
+    assert unknown_result.decision is ToolPolicyDecision.DENY
+
+    system = namespace["FakeSystem"]()
+    action = namespace["ApplyChange"](namespace["ProposalStore"](), system)
+    assert action.spec.parallel_safe is False
+    invalid_action = asyncio.run(
+        action.run(
+            ToolContext(session_id="invalid-action"),
+            {
+                "action_id": "change-0001",
+                "target": "demo",
+                "reason": "secret",
+            },
+        )
+    )
+    assert invalid_action.is_error
+    assert system.operations == {}
+
+    with pytest.raises(ValueError, match="action_id"):
+        namespace["validate_proposal"](
+            {
+                "action_id": "change-١٢٣٤",
+                "target": "demo",
+                "reason": "observed_drift",
+            }
+        )
+
+    invalid_verification = asyncio.run(
+        namespace["VerifyChange"](system).run(
+            ToolContext(session_id="invalid-verification"),
+            {"action_id": "unbounded secret value"},
+        )
+    )
+    assert invalid_verification.is_error
+    assert invalid_verification.structured == {"verified": False}
+
+    malformed_actor = ResolutionActor(
+        subject="operator@example.test",
+        tenant="demo-tenant",
+        source=ResolutionActorSource.REQUEST,
+        claims={"roles": "operations-approver"},
+    )
+    with pytest.raises(PermissionError, match="role"):
+        namespace["require_authorized_operator"](
+            malformed_actor,
+            {
+                "action_id": "change-0001",
+                "target": "demo",
+                "reason": "observed_drift",
+            },
+        )
+
+    assert main(["guide", "durable-operations#recovery-decision-table"]) == 0
+    recovery = capsys.readouterr().out
+    assert recovery.startswith("## Recovery decision table")
+    assert "External action started but no trustworthy terminal receipt" in recovery
+    assert "## Unsafe shortcuts" not in recovery
+
+
+def test_authoring_and_reference_guides_route_operations_to_the_quickstart(capsys) -> None:
+    assert main(["guide", "authoring"]) == 0
+    authoring = " ".join(capsys.readouterr().out.split())
+    assert "Durable operational changes" in authoring
+    assert "cayu guide durable-operations" in authoring
+    assert "`cayu guide durable-operations`; model stable action identity" in authoring
+
+    assert main(["guide", "references#approvals"]) == 0
+    approvals = " ".join(capsys.readouterr().out.split())
+    assert "runnable proposal-to-verification recipe" in approvals
+    assert "cayu guide durable-operations" in approvals
 
 
 def test_package_shipped_tool_effect_guide_renders_canonical_decisions(capsys) -> None:

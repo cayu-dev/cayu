@@ -14,6 +14,7 @@ def test_readme_preserves_the_product_overview_and_routes_to_the_cayu_map() -> N
     assert "## Quickstart" in readme
     assert "This compact example shows the core API" in readme
     assert "src/cayu/guides/authoring.md#cayu-map" in readme
+    assert "cayu guide durable-operations" in readme
     assert "https://github.com/cayu-dev/cayu/blob/main/examples/README.md" in readme
     assert "one safe example tool" not in readme
 

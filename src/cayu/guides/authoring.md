@@ -33,6 +33,7 @@ only when the requested behavior requires it.
 | Model-specific routing or capabilities | provider registration, model catalog, thinking, structured output | `cayu guide providers`, `cayu guide structured-output` |
 | A capability outside the model | `Tool`, `ToolSpec`, `ToolContext` | `cayu guide references#domain-tool` |
 | Replay or mutation semantics | `ToolEffect`, idempotency keys | `cayu guide tool-effects` |
+| Durable operational changes | proposal, policy-bound approval, action receipt, verification, recovery | `cayu guide durable-operations` |
 | Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | `cayu guide references#approvals` |
 | Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
 | Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | `cayu guide references#artifacts` |
@@ -338,8 +339,9 @@ supported observer.
   eval citations and document decisions, not only final prose.
 - **Coding/repositories:** use a repository binding, isolated workspace/runner,
   narrow command policy, and human confirmation before commit/push/PR actions.
-- **Operations:** model idempotency, ambiguity, approvals, budgets, and restart
-  recovery before adding autonomous effects.
+- **Operations:** start with `cayu guide durable-operations`; model stable action
+  identity, idempotency, ambiguity, approvals, verification, and restart recovery
+  before adding autonomous effects.
 - **Durable workflows:** keep deterministic orchestration in application code
   and durable state; use Cayu tasks and workflow helpers where needed. Use
   model steps only where judgment is required.
