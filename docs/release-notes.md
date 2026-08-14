@@ -89,28 +89,74 @@ guard.
 
 ## Unreleased
 
-### MCP transports enforce explicit allocation and time bounds
+## v0.2.1
 
-`McpTransportLimits` now applies one validated message/event byte ceiling,
-aggregate HTTP response ceiling, idle timeout, and absolute call deadline to
-both stdio and Streamable HTTP MCP clients. Stdio framing and HTTP JSON/SSE
-bodies are consumed incrementally with typed overflow, idle, deadline, and
-premature-peer-closure failures. Excessively nested inbound JSON is rejected
-before recursive copying or workload-secret redaction. Fatal shared stdio
-framing closes every waiter; uncertain in-flight stdio timeout or cancellation
-also fences the shared process.
-Isolated HTTP content/protocol failures preserve the logical session only after
-bounded cleanup succeeds; outcome-uncertain timeout, cancellation, or peer/network
-failure fences it. Absolute deadline and cancellation delivery do not wait through
-a fresh cleanup timeout during initialization or built-in-session tool discovery;
-custom sessions that cannot prove synchronous fencing finish close before returning
-a discovery failure. Cancellation-resistant work remains owned by retained cleanup
-while the session is fenced. A server session identifier received during failed
-initialization is retained only for cleanup; after uncertain response work settles,
-Cayu attempts session termination before closing the HTTP client. An established
-session whose completed response misses its semantic-processing deadline receives
-the same bounded termination-before-close ownership. Existing timeout arguments and
-defaults remain compatible when no explicit limits object is supplied.
+`v0.2.1` gives durable Cayu sessions an explicit execution identity and hardens
+the boundaries that carry model, tool, workspace, knowledge, and MCP work across
+retries, restarts, and operator-directed changes.
+
+### Highlights
+
+- Sessions persist a versioned execution profile covering their model target,
+  provider configuration, tools, approval policy, environment, context policy,
+  and other execution-critical inputs. Ordinary resume fails closed on drift;
+  applications can explicitly inspect and authorize a compatible profile
+  adoption at a safe boundary.
+- Model targets can change through an atomic durable transition rather than
+  mutating live agent configuration. The selected provider and model remain
+  attributable through pending work, recovery, forked sessions, and restart.
+- Every new session records immutable root-invocation provenance. Derived
+  sessions preserve the same root while recording their immediate execution
+  source, and the protected server derives authenticated provenance instead of
+  accepting client-authored identity claims.
+- Stdio and Streamable HTTP MCP transports now enforce validated per-message,
+  aggregate-response, idle-timeout, and absolute-deadline limits. Ambiguous
+  timeout, cancellation, and peer-failure paths fence or terminate uncertain
+  shared sessions before reuse.
+- Model-authored knowledge publication is operation-owned and receipt-backed
+  across the built-in stores. Acknowledgement loss reconciles against immutable
+  evidence instead of compensating by deleting a shared deterministic entry.
+- Active `SyncBinding` generations reserve both source and target workspace
+  identities before provisioning, copy, and sync-back work. Bounded workspace
+  reads, runner listings, attachment limits, S3 deletion, provider cleanup,
+  reasoning-state replay, child-session identity, virtual-egress authority, and
+  internal event namespaces also fail closed at their public boundaries.
+- `cayu cloud` validates application slugs, distinguishes local and production
+  contexts, reports bounded deployment diagnostics, and waits for Agent service
+  health before declaring a deployment ready.
+
+### Upgrade from v0.2.0
+
+Python 3.11 or newer is required. Stop all `v0.2.0` workers and take an
+application-consistent backup of every configured SQLite or PostgreSQL store
+before upgrading. Do not run mixed `v0.2.0` and `v0.2.1` processes against the
+same stores.
+
+The storage schema advances from revision 34 to revision 36. Revision 35 adds
+operation-owned knowledge-publication receipts and is a mixed-writer boundary.
+Revision 36 requires immutable invocation provenance on every session. Because
+existing populated `v0.2.0` session stores never recorded that provenance, Cayu
+cannot truthfully infer it: archive any evidence that must be retained, then
+recreate each database containing session rows. Do not edit the database or
+fabricate invocation identities to bypass this guard. Empty databases and
+databases without session rows migrate normally. Run `cayu storage status` and
+`cayu storage migrate` against every explicitly configured session store,
+budget ledger, eval store, task store, and knowledge store, then confirm
+revision 36 with no pending migrations before starting `v0.2.1` workers.
+
+The server contract advances from version 9 to version 10. Upgrade independently
+deployed servers, packaged dashboards, and generated clients together. Portable
+trajectory documents advance from schema version 2 to version 3; regenerate
+version-2 exports from their authoritative source rather than assigning invented
+invocation provenance during loading.
+
+### Verification
+
+Install `cayu==0.2.1` in a clean environment and verify `cayu version`,
+`cayu cloud --help`, and `cayu check --json`. Use fresh stores for a
+current-contract smoke test, then exercise a durable session through restart,
+an explicit model or execution-profile transition, durable knowledge
+publication, one bounded MCP call, and the packaged `/cayu/` dashboard.
 
 ## v0.2.0
 
@@ -151,20 +197,8 @@ supports deploying and operating Cayu Cloud applications.
 - Tool output suppression, duplicate interaction model names, malformed webhook
   signatures, and out-of-domain eval comparison scores now fail explicitly and
   safely.
-- Active `SyncBinding` generations reserve both source and target workspace
-  identities before optional target provisioning, preventing overlapping setup,
-  copy, and sync-back ownership in any role. Target allocation that establishes
-  the stable workspace identity belongs in the surrounding `EnvironmentFactory`.
-  The ambiguous legacy `target_workspace_factory` entrance now fails before
-  invocation. Use `target_workspace_plan_factory` returning
-  `SyncTargetWorkspacePlan`, and perform attachment, cleaning, or other
-  post-identity work in its `provision` callback.
 - Provider, approval, budget, usage, vault, and eval evidence is detached from
   caller-owned mutable inputs, and HTTP/retry metadata is validated before use.
-- Model-authored knowledge publication is atomic and operation-owned across the
-  built-in stores; acknowledgement loss is reconciled through immutable receipts
-  and never compensated by deleting a shared deterministic entry identity.
-  Knowledge text is also withheld from terminal tool-event argument projections.
 
 ### Upgrade from v0.1.0
 
@@ -173,23 +207,12 @@ application-consistent backup, and upgrade independently deployed Cayu servers,
 dashboards, generated clients, and workers together. Do not run mixed `v0.1.0`
 and `v0.2.0` processes against the same stores.
 
-The storage schema advances from revision 29 to revision 36. Run
+The storage schema advances from revision 29 to revision 34. Run
 `cayu storage status` followed by `cayu storage migrate` against every
 explicitly configured SQLite or PostgreSQL session store, budget ledger, eval
-store, task store, and knowledge store, then confirm revision 36 with no pending
-migrations before starting `v0.2.0` workers. Revisions 34–36 include the durable
-eval catalog, run lifecycle, delayed task availability contract, immutable
-knowledge-publication receipts, and immutable root invocation provenance.
-Revision 35 is a breaking mixed-worker boundary: stop older workers before
-migrating because they do not honor operation-owned knowledge publication.
-Breaking revision 36 requires invocation provenance on every session, including
-a Cayu-minted root invocation ID that remains distinct when a deleted root's
-session ID is reused. Populated pre-36 prerelease session stores must be
-recreated rather than assigned guessed origins; empty stores migrate normally.
-Standalone trajectory documents advance from schema version 2 to version 3
-because session-backed trajectories now retain the same immutable invocation
-provenance. Version-2 exports must be regenerated rather than assigned an
-invented origin during loading.
+store, and task store, then confirm revision 34 with no pending migrations
+before starting `v0.2.0` workers. Revision 34 includes the durable eval catalog,
+run lifecycle, and delayed task availability contracts.
 
 ### Verification
 
