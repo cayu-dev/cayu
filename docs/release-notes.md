@@ -89,6 +89,21 @@ guard.
 
 ## Unreleased
 
+### SQLite knowledge updates no longer scan the global FTS corpus
+
+SQLite knowledge chunks now share a stable integer identity with their FTS5 rows.
+Updating, replacing, pruning, or deleting one entry addresses only that entry's
+chunks, avoiding corpus-sized work while the shared SQLite writer lock is held.
+Search behavior and BM25 ranking are unchanged.
+
+The storage schema advances from revision 36 to breaking revision 37. Stop older
+workers, take an application-consistent backup, run `cayu storage status` followed
+by `cayu storage migrate`, and confirm revision 37 before restarting workers. The
+SQLite migration rebuilds legacy knowledge FTS rows in one transaction. After an
+ambiguous interruption, run `cayu storage status`: retry when revision 36 remains,
+or proceed when the complete revision 37 commit is already visible. PostgreSQL
+records the shared revision without changing its knowledge schema.
+
 ## v0.2.1
 
 `v0.2.1` gives durable Cayu sessions an explicit execution identity and hardens

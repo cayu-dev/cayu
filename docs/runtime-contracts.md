@@ -5593,6 +5593,16 @@ SQLite FTS5/BM25 for durable keyword search. `PostgresKnowledgeStore` uses nativ
 Postgres full-text search with entry/chunk filters. These stores support `auto`
 and `keyword` query modes and reject semantic, hybrid, and external modes so apps
 do not mistake keyword stores for embedding or external retrieval backends.
+Each SQLite source chunk owns a stable integer key that is also its FTS5 rowid.
+Entry refresh, chunk replacement, hard deletion, and expiry pruning resolve those
+keys through the source entry/chunk index and maintain only the affected FTS rows;
+ordinary writes never scan the global FTS table by its `UNINDEXED` identifiers.
+Source and FTS changes share one SQLite writer transaction. Schema revision 37
+rebuilds legacy knowledge FTS data atomically from authoritative entry and chunk
+rows during the explicit migration step. After an interruption, the database is
+either a complete, searchable revision 36 or a complete revision 37, never a
+published partial rebuild. Inspect `cayu storage status` after an ambiguous
+interruption and retry the migration only when revision 36 remains.
 `InMemoryEmbeddingKnowledgeStore` is an opt-in in-memory semantic backend for
 tests, demos, and small single-process apps. It uses a configured
 `TextEmbeddingProvider`, keeps vectors outside chunk metadata, supports

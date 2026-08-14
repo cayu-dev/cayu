@@ -49,7 +49,7 @@ from cayu.storage.memory import (
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
-_SQLITE_MIN_REQUIRED_REVISION = 35
+_SQLITE_MIN_REQUIRED_REVISION = 37
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -82,8 +82,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
     async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         entry = copy_knowledge_entry(entry)
         async with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+            with sqlite_support._transaction(self._connection):
                 existing_entry = self._load_entry_unlocked(entry.id)
                 existing_chunks = self._load_chunks_unlocked(entry.id)
                 self._upsert_entry_unlocked(entry)
@@ -97,11 +96,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     self._replace_chunks_unlocked(entry.id, [_default_chunk_for_entry(entry)])
                 else:
                     self._refresh_entry_fts_unlocked(entry.id)
-                self._connection.commit()
-                return copy_knowledge_entry(entry)
-            except Exception:
-                self._connection.rollback()
-                raise
+            return copy_knowledge_entry(entry)
 
     async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
         clean_id = require_clean_nonblank(entry_id, "entry_id")
@@ -122,7 +117,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             if entry is None:
                 raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
             updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
-            with self._connection:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
                 cursor = self._connection.execute(
                     """
                     UPDATE cayu_knowledge_entries
@@ -189,7 +184,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 scope_params.extend([key, value])
             scope_sql = "".join(f" AND {clause}" for clause in scope_clauses)
-            with self._connection:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
                 cursor = self._connection.execute(
                     f"""
                     UPDATE cayu_knowledge_entries
@@ -239,7 +234,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             if entry is None:
                 return None
             if hard:
-                with self._connection:
+                with sqlite_support._transaction(self._connection, begin_immediate=False):
                     self._delete_chunks_unlocked(clean_id)
                     self._connection.execute(
                         "DELETE FROM cayu_knowledge_entries WHERE id = ?",
@@ -259,7 +254,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             expired_ids = [str(row["id"]) for row in rows]
             if not expired_ids:
                 return 0
-            with self._connection:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
                 # FTS is a virtual table (no FK cascade), so clear chunks/FTS explicitly; the
                 # entries DELETE then cascades to labels/aspects/impact_targets.
                 for entry_id in expired_ids:
@@ -280,7 +275,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         async with self._lock:
             if self._load_entry_unlocked(clean_id) is None:
                 raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-            with self._connection:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
                 self._replace_chunks_unlocked(clean_id, copied_chunks)
             return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
 
@@ -292,15 +287,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         copied_entry = copy_knowledge_entry(entry)
         copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
         async with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+            with sqlite_support._transaction(self._connection):
                 self._upsert_entry_unlocked(copied_entry)
                 self._replace_chunks_unlocked(copied_entry.id, copied_chunks)
-                self._connection.commit()
-                return copy_knowledge_entry(copied_entry)
-            except Exception:
-                self._connection.rollback()
-                raise
+            return copy_knowledge_entry(copied_entry)
 
     async def publish_entry_with_chunks(
         self,
@@ -313,8 +303,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             entry, chunks, operation_id=operation_id
         )
         async with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+            with sqlite_support._transaction(self._connection):
                 existing_receipt = self._load_publication_receipt_unlocked(operation_id)
                 if existing_receipt is not None:
                     _validate_knowledge_publication_replay(
@@ -322,7 +311,6 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         entry=copied_entry,
                         request_sha256=request_sha256,
                     )
-                    self._connection.commit()
                     return copy_knowledge_publication_receipt(
                         existing_receipt,
                         replayed=True,
@@ -340,11 +328,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 self._insert_entry_unlocked(copied_entry)
                 self._insert_chunks_unlocked(copied_entry, copied_chunks)
                 self._insert_publication_receipt_unlocked(receipt)
-                self._connection.commit()
-                return copy_knowledge_publication_receipt(receipt)
-            except Exception:
-                self._connection.rollback()
-                raise
+            return copy_knowledge_publication_receipt(receipt)
 
     async def load_entry_publication_receipt(
         self,
@@ -479,7 +463,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             SELECT COUNT(DISTINCT e.id)
             FROM cayu_knowledge_chunks_fts
             JOIN cayu_knowledge_chunks AS c
-                ON c.id = cayu_knowledge_chunks_fts.chunk_id
+                ON c.fts_rowid = cayu_knowledge_chunks_fts.rowid
             JOIN cayu_knowledge_entries AS e
                 ON e.id = c.entry_id
             WHERE cayu_knowledge_chunks_fts MATCH ?
@@ -512,7 +496,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     bm25(cayu_knowledge_chunks_fts) AS fts_score
                 FROM cayu_knowledge_chunks_fts
                 JOIN cayu_knowledge_chunks AS c
-                    ON c.id = cayu_knowledge_chunks_fts.chunk_id
+                    ON c.fts_rowid = cayu_knowledge_chunks_fts.rowid
                 JOIN cayu_knowledge_entries AS e
                     ON e.id = c.entry_id
                 WHERE cayu_knowledge_chunks_fts MATCH ?
@@ -815,16 +799,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             """,
             [_chunk_row_values(chunk) for chunk in chunks],
         )
-        self._connection.executemany(
-            """
-            INSERT INTO cayu_knowledge_chunks_fts (entry_id, chunk_id, title, text)
-            VALUES (?, ?, ?, ?)
-            """,
-            [
-                (entry.id, chunk.id, entry.title or "", _fts_text_for_entry_chunk(entry, chunk))
-                for chunk in chunks
-            ],
-        )
+        self._insert_entry_fts_unlocked(entry, chunks)
 
     def _load_publication_receipt_unlocked(
         self,
@@ -885,10 +860,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
 
     def _delete_chunks_unlocked(self, entry_id: str) -> None:
-        self._connection.execute(
-            "DELETE FROM cayu_knowledge_chunks_fts WHERE entry_id = ?",
-            (entry_id,),
-        )
+        self._delete_entry_fts_unlocked(entry_id)
         self._connection.execute(
             "DELETE FROM cayu_knowledge_chunks WHERE entry_id = ?",
             (entry_id,),
@@ -898,23 +870,60 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         entry = self._load_entry_unlocked(entry_id)
         if entry is None:
             return
-        self._connection.execute(
-            "DELETE FROM cayu_knowledge_chunks_fts WHERE entry_id = ?",
-            (entry_id,),
-        )
+        self._delete_entry_fts_unlocked(entry_id)
         chunks = self._load_chunks_unlocked(entry_id)
         if not chunks:
             return
+        self._insert_entry_fts_unlocked(entry, chunks)
+
+    def _delete_entry_fts_unlocked(self, entry_id: str) -> None:
+        rowids = self._load_chunk_fts_rowids_unlocked(entry_id)
+        if not rowids:
+            return
+        self._connection.executemany(
+            "DELETE FROM cayu_knowledge_chunks_fts WHERE rowid = ?",
+            [(rowid,) for rowid in rowids.values()],
+        )
+
+    def _insert_entry_fts_unlocked(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        rowids = self._load_chunk_fts_rowids_unlocked(entry.id)
+        expected_chunk_ids = {chunk.id for chunk in chunks}
+        if rowids.keys() != expected_chunk_ids:
+            raise RuntimeError("SQLite knowledge chunks changed while preparing their FTS rows.")
         self._connection.executemany(
             """
-            INSERT INTO cayu_knowledge_chunks_fts (entry_id, chunk_id, title, text)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO cayu_knowledge_chunks_fts (
+                rowid, entry_id, chunk_id, title, text
+            )
+            VALUES (?, ?, ?, ?, ?)
             """,
             [
-                (entry.id, chunk.id, entry.title or "", _fts_text_for_entry_chunk(entry, chunk))
+                (
+                    rowids[chunk.id],
+                    entry.id,
+                    chunk.id,
+                    entry.title or "",
+                    _fts_text_for_entry_chunk(entry, chunk),
+                )
                 for chunk in chunks
             ],
         )
+
+    def _load_chunk_fts_rowids_unlocked(self, entry_id: str) -> dict[str, int]:
+        rows = self._connection.execute(
+            """
+            SELECT id, fts_rowid
+            FROM cayu_knowledge_chunks INDEXED BY idx_cayu_knowledge_chunks_entry_index
+            WHERE entry_id = ?
+            ORDER BY chunk_index ASC
+            """,
+            (entry_id,),
+        ).fetchall()
+        return {str(row["id"]): int(row["fts_rowid"]) for row in rows}
 
     def _load_entry_unlocked(self, entry_id: str) -> KnowledgeEntry | None:
         row = self._connection.execute(

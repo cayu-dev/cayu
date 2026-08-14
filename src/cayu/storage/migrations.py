@@ -215,6 +215,12 @@ REVISIONS: tuple[Revision, ...] = (
     # execution source. Pre-36 writers cannot populate the required value, so they
     # must not share a revision-36 database.
     Revision(revision=36, kind=RevisionKind.BREAKING, compatible_from=36),
+    # SQLite knowledge chunks now own a stable integer key shared with their FTS5
+    # rows. Pre-37 SQLite writers do not preserve that relationship, so a mixed
+    # deployment could strand stale search rows after an update or deletion. The
+    # Postgres ledger advances without DDL, but the cross-backend compatibility
+    # floor still prevents unsafe old SQLite writers from sharing a migrated DB.
+    Revision(revision=37, kind=RevisionKind.BREAKING, compatible_from=37),
 )
 
 #: The revision an empty database is initialized to.

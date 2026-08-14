@@ -543,7 +543,7 @@ def test_revision_thirty_six_rejects_populated_session_database(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 36")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 36")
                 await cur.execute("ALTER TABLE cayu_sessions DROP COLUMN invocation")
             await conn.commit()
 
@@ -605,7 +605,7 @@ def test_revision_thirty_six_rejects_conflicting_invocation_column_before_record
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 36")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 36")
                 await cur.execute("ALTER TABLE cayu_sessions DROP COLUMN invocation")
                 await cur.execute(column_ddl)
             await conn.commit()
@@ -815,6 +815,10 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 36"
             )
             assert await cur.fetchone() == ("breaking", 36)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 37"
+            )
+            assert await cur.fetchone() == ("breaking", 37)
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

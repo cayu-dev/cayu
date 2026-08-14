@@ -678,7 +678,8 @@ _MIGRATION_STEPS: dict[int, str] = {
         );
 
         CREATE TABLE IF NOT EXISTS cayu_knowledge_chunks (
-            id TEXT PRIMARY KEY,
+            fts_rowid INTEGER PRIMARY KEY,
+            id TEXT NOT NULL UNIQUE,
             entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
             chunk_index INTEGER NOT NULL,
             text TEXT NOT NULL,
@@ -1819,6 +1820,206 @@ def _prepare_revision_twenty_five(connection: sqlite3.Connection) -> None:
         )
 
 
+_KNOWLEDGE_CHUNK_LEGACY_COLUMNS = (
+    "id",
+    "entry_id",
+    "chunk_index",
+    "text",
+    "content_hash",
+    "source_uri",
+    "metadata_json",
+)
+_KNOWLEDGE_CHUNK_KEYED_COLUMNS = ("fts_rowid", *_KNOWLEDGE_CHUNK_LEGACY_COLUMNS)
+
+
+def _sqlite_table_columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
+    return tuple(str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})"))
+
+
+def _sqlite_has_unique_index(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: tuple[str, ...],
+) -> bool:
+    for row in connection.execute(f"PRAGMA index_list({table})"):
+        if not bool(row[2]):
+            continue
+        index_columns = tuple(
+            str(column[2]) for column in connection.execute(f"PRAGMA index_info({row[1]})")
+        )
+        if index_columns == columns:
+            return True
+    return False
+
+
+def _validate_revision_37_knowledge_fts_schema(connection: sqlite3.Connection) -> None:
+    columns = connection.execute("PRAGMA table_info(cayu_knowledge_chunks)").fetchall()
+    if tuple(str(row[1]) for row in columns) != _KNOWLEDGE_CHUNK_KEYED_COLUMNS:
+        raise RuntimeError(
+            "SQLite knowledge chunks do not provide the revision-37 stable FTS key. "
+            "Restore the required schema from a known-good backup."
+        )
+    fts_rowid = columns[0]
+    if str(fts_rowid[2]).upper() != "INTEGER" or int(fts_rowid[5]) != 1:
+        raise RuntimeError(
+            "SQLite knowledge chunks have an invalid revision-37 FTS key. "
+            "Restore the required schema from a known-good backup."
+        )
+    if not _sqlite_has_unique_index(connection, "cayu_knowledge_chunks", ("id",)):
+        raise RuntimeError("SQLite knowledge chunks are missing their unique public id constraint.")
+    if not _sqlite_has_unique_index(
+        connection,
+        "cayu_knowledge_chunks",
+        ("entry_id", "chunk_index"),
+    ):
+        raise RuntimeError(
+            "SQLite knowledge chunks are missing their entry/chunk identity constraint."
+        )
+    entry_index = connection.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_cayu_knowledge_chunks_entry_index'"
+    ).fetchone()
+    entry_index_columns = (
+        tuple(
+            str(column[2])
+            for column in connection.execute(
+                "PRAGMA index_info(idx_cayu_knowledge_chunks_entry_index)"
+            )
+        )
+        if entry_index is not None
+        else ()
+    )
+    if (
+        entry_index is None
+        or entry_index[0] != "cayu_knowledge_chunks"
+        or entry_index_columns != ("entry_id", "chunk_index")
+    ):
+        raise RuntimeError("Required Cayu SQLite knowledge chunk index is missing.")
+    fts = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_knowledge_chunks_fts'"
+    ).fetchone()
+    normalized_fts = " ".join(str(fts[0]).lower().split()) if fts is not None else ""
+    required_fts = "using fts5(entry_id unindexed, chunk_id unindexed, title, text)"
+    if required_fts not in normalized_fts:
+        raise RuntimeError("SQLite knowledge FTS does not match the revision-37 search contract.")
+
+
+def _validate_revision_37_knowledge_fts_data(connection: sqlite3.Connection) -> None:
+    mismatch = connection.execute(
+        """
+        SELECT 1
+        FROM cayu_knowledge_chunks AS chunk
+        JOIN cayu_knowledge_entries AS entry ON entry.id = chunk.entry_id
+        LEFT JOIN cayu_knowledge_chunks_fts AS fts ON fts.rowid = chunk.fts_rowid
+        WHERE fts.rowid IS NULL
+           OR fts.entry_id IS NOT chunk.entry_id
+           OR fts.chunk_id IS NOT chunk.id
+           OR fts.title IS NOT COALESCE(entry.title, '')
+           OR fts.text IS NOT CASE
+                WHEN chunk.text = entry.text THEN chunk.text
+                ELSE entry.text || char(10) || chunk.text
+              END
+        LIMIT 1
+        """
+    ).fetchone()
+    extra = connection.execute(
+        """
+        SELECT 1
+        FROM cayu_knowledge_chunks_fts AS fts
+        LEFT JOIN cayu_knowledge_chunks AS chunk ON chunk.fts_rowid = fts.rowid
+        WHERE chunk.fts_rowid IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if mismatch is not None or extra is not None:
+        raise RuntimeError(
+            "SQLite revision-37 knowledge FTS rebuild did not preserve an exact "
+            "source-to-index relationship."
+        )
+
+
+def _migrate_revision_thirty_seven_knowledge_fts(connection: sqlite3.Connection) -> None:
+    columns = _sqlite_table_columns(connection, "cayu_knowledge_chunks")
+    if columns == _KNOWLEDGE_CHUNK_KEYED_COLUMNS:
+        # Greenfield baseline databases already have the current layout. This also
+        # makes an explicitly retried migration safe if the schema was prepared by
+        # a compatible deployment before its ledger marker was restored.
+        _validate_revision_37_knowledge_fts_schema(connection)
+        _validate_revision_37_knowledge_fts_data(connection)
+        return
+    if columns != _KNOWLEDGE_CHUNK_LEGACY_COLUMNS:
+        raise RuntimeError(
+            "SQLite knowledge chunks conflict with both the legacy and revision-37 "
+            "schemas. Restore the database from a known-good backup."
+        )
+
+    connection.execute("DROP TABLE cayu_knowledge_chunks_fts")
+    connection.execute(
+        """
+        CREATE TABLE cayu_knowledge_chunks_revision_37 (
+            fts_rowid INTEGER PRIMARY KEY,
+            id TEXT NOT NULL UNIQUE,
+            entry_id TEXT NOT NULL
+                REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            content_hash TEXT,
+            source_uri TEXT,
+            metadata_json TEXT NOT NULL,
+            UNIQUE (entry_id, chunk_index)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO cayu_knowledge_chunks_revision_37 (
+            fts_rowid, id, entry_id, chunk_index, text,
+            content_hash, source_uri, metadata_json
+        )
+        SELECT
+            rowid, id, entry_id, chunk_index, text,
+            content_hash, source_uri, metadata_json
+        FROM cayu_knowledge_chunks
+        ORDER BY rowid
+        """
+    )
+    connection.execute("DROP TABLE cayu_knowledge_chunks")
+    connection.execute(
+        "ALTER TABLE cayu_knowledge_chunks_revision_37 RENAME TO cayu_knowledge_chunks"
+    )
+    connection.execute(
+        "CREATE INDEX idx_cayu_knowledge_chunks_entry_index "
+        "ON cayu_knowledge_chunks(entry_id, chunk_index)"
+    )
+    connection.execute(
+        """
+        CREATE VIRTUAL TABLE cayu_knowledge_chunks_fts
+        USING fts5(entry_id UNINDEXED, chunk_id UNINDEXED, title, text)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO cayu_knowledge_chunks_fts (
+            rowid, entry_id, chunk_id, title, text
+        )
+        SELECT
+            chunk.fts_rowid,
+            chunk.entry_id,
+            chunk.id,
+            COALESCE(entry.title, ''),
+            CASE
+                WHEN chunk.text = entry.text THEN chunk.text
+                ELSE entry.text || char(10) || chunk.text
+            END
+        FROM cayu_knowledge_chunks AS chunk
+        JOIN cayu_knowledge_entries AS entry ON entry.id = chunk.entry_id
+        ORDER BY chunk.fts_rowid
+        """
+    )
+    _validate_revision_37_knowledge_fts_schema(connection)
+    _validate_revision_37_knowledge_fts_data(connection)
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -1828,6 +2029,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     21: _add_budget_billing_identity_if_present,
     23: _prepare_revision_twenty_three,
     25: _prepare_revision_twenty_five,
+    37: _migrate_revision_thirty_seven_knowledge_fts,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(
@@ -2225,6 +2427,10 @@ def reconcile_schema(
             _validate_workflow_replay_indexes(connection, require_all=True)
     if app_min_supported >= 36:
         _validate_session_invocation_column(connection)
+    if current.revision >= 37:
+        # Structural validation is intentionally constant-size. The full source/
+        # FTS census belongs to the one-time revision hook, never ordinary startup.
+        _validate_revision_37_knowledge_fts_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -2261,8 +2467,12 @@ def read_schema_state(connection: sqlite3.Connection) -> schema.SchemaState:
 
 
 @contextmanager
-def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
-    """Run a block inside one explicit SQLite transaction (BEGIN/COMMIT/ROLLBACK).
+def _transaction(
+    connection: sqlite3.Connection,
+    *,
+    begin_immediate: bool = True,
+) -> Iterator[None]:
+    """Run a block inside one owned SQLite transaction (BEGIN/COMMIT/ROLLBACK).
 
     Most revisions apply DDL, their data hook, and their revision marker
     atomically. Large revision-17 backfills instead use this helper for short,
@@ -2271,15 +2481,70 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
 
     ``executescript`` cannot be used here: it force-commits any open transaction,
     so revision DDL is executed statement-by-statement.
+
+    ``begin_immediate=False`` preserves ``sqlite3``'s implicit writer admission
+    for knowledge operations that previously used the connection context manager.
     """
-    connection.execute("BEGIN IMMEDIATE")
+    failure: BaseException | None = None
+    suppress_implicit_context = False
     try:
+        if begin_immediate:
+            connection.execute("BEGIN IMMEDIATE")
         yield
-    except BaseException:
-        connection.rollback()
-        raise
-    else:
         connection.commit()
+    except BaseException as primary:
+        failure = _settle_failed_transaction(connection, primary)
+        suppress_implicit_context = failure is not primary
+    if failure is not None:
+        # A context-manager body exception remains Python's active implicit
+        # context while __exit__ runs. Suppress that incidental chain because the
+        # primary is already a cleanup aggregate's first explicit member. Preserve
+        # an unchanged primary's own causal evidence when rollback succeeds.
+        if suppress_implicit_context:
+            raise failure from None
+        raise failure
+
+
+def _settle_failed_transaction(
+    connection: sqlite3.Connection,
+    primary: BaseException,
+) -> BaseException:
+    """Roll back ``primary`` or fence a connection whose cleanup is uncertain."""
+    try:
+        in_transaction = connection.in_transaction
+    except BaseException as state_error:
+        state_error.__context__ = None
+        return _fence_failed_transaction(connection, primary, state_error)
+    if not in_transaction:
+        # A commit may have completed before its caller observed the failure.
+        return primary
+    try:
+        connection.rollback()
+    except BaseException as rollback_error:
+        # The primary is already an explicit member of the aggregate. Remove only
+        # Python's incidental handler context so it is represented exactly once.
+        rollback_error.__context__ = None
+        return _fence_failed_transaction(connection, primary, rollback_error)
+    return primary
+
+
+def _fence_failed_transaction(
+    connection: sqlite3.Connection,
+    primary: BaseException,
+    cleanup_error: BaseException,
+) -> BaseException:
+    failures = [primary, cleanup_error]
+    try:
+        # Closing a SQLite connection abandons its active transaction and releases
+        # writer ownership. The closed connection then fails closed on later use.
+        connection.close()
+    except BaseException as close_error:
+        close_error.__context__ = None
+        failures.append(close_error)
+    return BaseExceptionGroup(
+        "SQLite transaction failed and cleanup could not prove rollback",
+        failures,
+    )
 
 
 def _iter_statements(script: str) -> Iterator[str]:

@@ -2144,7 +2144,7 @@ def test_sqlite_session_store_rejects_populated_pre_invocation_database(tmp_path
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 36")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 36")
         connection.execute("PRAGMA user_version = 35")
         connection.commit()
     finally:
@@ -2643,6 +2643,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (34, 34),
         (35, 35),
         (36, 36),
+        (37, 37),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
