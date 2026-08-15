@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Any
 
 import pytest
-from tests._session_provenance import fixture_session_invocation
+from tests._session_provenance import session_fixture
 
 from cayu import (
     AgentSpec,
     ResolutionActor,
     ResolutionActorSource,
-    Session,
     ToolContext,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -109,6 +109,7 @@ def test_package_shipped_durable_operations_guide_is_runnable(capsys) -> None:
     for phase in ("observe", "diagnose", "propose", "authorize", "act once", "verify", "recover"):
         assert phase in normalized
     assert "never automatically replay" in normalized
+    assert "cayu guide tool-effects#act-once-recovery" in guide
     assert "effect=ToolEffect.IDEMPOTENT" in guide
     assert "class RecordProposal(Tool)" in guide
     assert "proposal_store.records[proposal.session.id]" in guide
@@ -121,20 +122,18 @@ def test_package_shipped_durable_operations_guide_is_runnable(capsys) -> None:
     guide.encode("cp437")
     example = re.search(r"```python\n(.*?)```", guide, re.DOTALL)
     assert example is not None
-    namespace: dict[str, object] = {}
+    namespace: dict[str, Any] = {}
     exec(example.group(1), namespace)
 
     proposal_store = namespace["ProposalStore"]()
     record_proposal = namespace["RecordProposal"](proposal_store)
     assert record_proposal.spec.parallel_safe is False
     policy = namespace["ReviewedActionPolicy"](proposal_store)
-    session = Session(
+    session = session_fixture(
         id="same-round",
         agent_name="operator",
         provider_name="scripted",
         model="scripted-model",
-        causal_budget_id="same-round",
-        invocation=fixture_session_invocation("same-round"),
     )
     request = ToolPolicyRequest(
         session=session,
@@ -255,6 +254,180 @@ def test_package_shipped_tool_effect_guide_renders_canonical_decisions(capsys) -
     assert "verify_tool_effect" in guidance
     assert "bounded temporary Cayu workspace" in guidance
     assert "`cayu check` remains structural" in guidance
+
+
+def _load_act_once_example(
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[str, dict[str, Any]]:
+    assert main(["guide", "tool-effects#act-once-recovery"]) == 0
+    guidance = capsys.readouterr().out
+    example = re.search(r"```python\n(.*?)```", guidance, re.DOTALL)
+    assert example is not None
+    namespace: dict[str, Any] = {}
+    exec(example.group(1), namespace)
+    return guidance, namespace
+
+
+def test_act_once_recovery_example_reconciles_lost_acknowledgement_without_redispatch(
+    capsys,
+) -> None:
+    guidance, namespace = _load_act_once_example(capsys)
+    normalized = " ".join(guidance.split())
+
+    assert guidance.startswith("## Act-once recovery")
+    for state in (
+        "proposed",
+        "authorized",
+        "intent_recorded",
+        "completed",
+        "outcome_unknown",
+        "safe_to_retry",
+        "manual_review",
+    ):
+        assert state in guidance
+    assert "commit-then-raise" in normalized
+    assert "lost success acknowledgement" in normalized
+    assert "missing local receipt is not proof" in normalized
+    assert "reconcile before any retry" in normalized
+    assert "does not create generic exactly-once execution" in normalized
+    assert "`ToolEffect` classifies replay risk; it does not authorize execution" in normalized
+
+    operation_id = "change-0001"
+    record, external_system, timeline = namespace["run_commit_then_raise_contract"]()
+    assert record["state"] == "completed"
+    assert record["receipt"] == {
+        "operation_id": operation_id,
+        "target": "demo",
+        "status": "committed",
+    }
+    assert record["verification"] == {
+        "operation_id": operation_id,
+        "target": "demo",
+        "verified": True,
+    }
+    assert external_system.dispatch_count == 1
+    assert external_system.operation_ids_seen == [operation_id] * len(
+        external_system.operation_ids_seen
+    )
+    assert [state for state, _operation_id in timeline] == [
+        "proposed",
+        "authorized",
+        "intent_recorded",
+        "outcome_unknown",
+        "completed",
+    ]
+    assert {_operation_id for _state, _operation_id in timeline} == {operation_id}
+
+
+@pytest.mark.parametrize(
+    "verification",
+    [
+        {
+            "operation_id": "change-0001",
+            "target": "demo",
+            "verified": False,
+        },
+        {
+            "operation_id": "change-0001",
+            "target": "demo",
+        },
+        {
+            "operation_id": "different-operation",
+            "target": "demo",
+            "verified": True,
+        },
+        {
+            "operation_id": "change-0001",
+            "target": "different-target",
+            "verified": True,
+        },
+    ],
+)
+def test_act_once_recovery_example_requires_bound_positive_verification(
+    capsys,
+    verification: dict[str, object],
+) -> None:
+    _guidance, namespace = _load_act_once_example(capsys)
+    base_system = namespace["CommitThenRaiseSystem"]
+
+    class ContradictoryVerificationSystem(base_system):
+        def verify(self, operation_id: str) -> dict[str, object]:
+            self.operation_ids_seen.append(operation_id)
+            return verification
+
+    namespace["CommitThenRaiseSystem"] = ContradictoryVerificationSystem
+    record, external_system, timeline = namespace["run_commit_then_raise_contract"]()
+
+    assert record["state"] == "manual_review"
+    assert record["verification"] == verification
+    assert external_system.dispatch_count == 1
+    assert [state for state, _operation_id in timeline] == [
+        "proposed",
+        "authorized",
+        "intent_recorded",
+        "outcome_unknown",
+        "manual_review",
+    ]
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {
+            "operation_id": "different-operation",
+            "target": "demo",
+            "status": "committed",
+        },
+        {
+            "target": "demo",
+            "status": "committed",
+        },
+        {
+            "operation_id": "change-0001",
+            "target": "different-target",
+            "status": "committed",
+        },
+        {
+            "operation_id": "change-0001",
+            "status": "committed",
+        },
+        {
+            "operation_id": "change-0001",
+            "target": "demo",
+            "status": "failed",
+        },
+        {
+            "operation_id": "change-0001",
+            "target": "demo",
+        },
+    ],
+)
+def test_act_once_recovery_example_requires_bound_committed_receipt(
+    capsys,
+    receipt: dict[str, object],
+) -> None:
+    _guidance, namespace = _load_act_once_example(capsys)
+    base_system = namespace["CommitThenRaiseSystem"]
+
+    class ContradictoryReceiptSystem(base_system):
+        def reconcile(self, operation_id: str) -> dict[str, object]:
+            self.operation_ids_seen.append(operation_id)
+            return receipt
+
+    namespace["CommitThenRaiseSystem"] = ContradictoryReceiptSystem
+    record, external_system, timeline = namespace["run_commit_then_raise_contract"]()
+
+    assert record["state"] == "manual_review"
+    assert record["receipt"] == receipt
+    assert record["verification"] is None
+    assert external_system.dispatch_count == 1
+    assert [state for state, _operation_id in timeline] == [
+        "proposed",
+        "authorized",
+        "intent_recorded",
+        "outcome_unknown",
+        "manual_review",
+    ]
 
 
 def test_domain_tool_reference_documents_the_public_authoring_interface(capsys) -> None:

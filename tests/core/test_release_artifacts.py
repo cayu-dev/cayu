@@ -103,6 +103,11 @@ def _write_wheel(
     with zipfile.ZipFile(path, "w") as archive:
         for name in names:
             content: str | bytes = ""
+            if name in {
+                "cayu/guides/durable-operations.md",
+                "cayu/guides/tool-effects.md",
+            }:
+                content = (_ROOT / "src" / name).read_bytes()
             if name.startswith(prefix) and name.removeprefix(prefix) in sidecar:
                 content = sidecar[name.removeprefix(prefix)]
             dashboard_prefix = "cayu/server/dashboard/"
@@ -153,6 +158,11 @@ def _write_sdist(
     with tarfile.open(path, "w:gz") as archive:
         for relative_name in names:
             content: str | bytes = ""
+            if relative_name in {
+                "src/cayu/guides/durable-operations.md",
+                "src/cayu/guides/tool-effects.md",
+            }:
+                content = (_ROOT / relative_name).read_bytes()
             if relative_name.startswith(f"{prefix}/"):
                 sidecar_name = relative_name.removeprefix(f"{prefix}/")
                 if sidecar_name in sidecar:
@@ -232,6 +242,85 @@ def test_validate_wheel_requires_durable_operations_guide(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match=r"missing required wheel files: .*durable-operations"):
         validate_wheel(wheel)
+
+
+@pytest.mark.parametrize(
+    ("member_name", "contents", "missing_contract"),
+    [
+        (
+            "cayu/guides/tool-effects.md",
+            "# Choosing a ToolEffect\n",
+            "act-once recovery section",
+        ),
+        (
+            "cayu/guides/durable-operations.md",
+            "# Durable operations lifecycle\n",
+            "act-once recovery cross-link",
+        ),
+    ],
+)
+def test_validate_wheel_requires_act_once_recovery_guidance(
+    tmp_path: Path,
+    member_name: str,
+    contents: str,
+    missing_contract: str,
+) -> None:
+    wheel = tmp_path / "cayu.whl"
+    _write_wheel(
+        wheel,
+        _valid_wheel_names(),
+        contents_by_name={
+            "cayu/guides/tool-effects.md": (
+                "## Act-once recovery\n"
+                "commit-then-raise outcome_unknown reconcile before any retry\n"
+            ),
+            "cayu/guides/durable-operations.md": ("cayu guide tool-effects#act-once-recovery\n"),
+            member_name: contents,
+        },
+    )
+
+    with pytest.raises(ValueError, match=missing_contract):
+        validate_wheel(wheel)
+
+
+@pytest.mark.parametrize(
+    ("member_name", "contents", "missing_contract"),
+    [
+        (
+            "src/cayu/guides/tool-effects.md",
+            "# Choosing a ToolEffect\n",
+            "act-once recovery section",
+        ),
+        (
+            "src/cayu/guides/durable-operations.md",
+            "# Durable operations lifecycle\n",
+            "act-once recovery cross-link",
+        ),
+    ],
+)
+def test_validate_sdist_requires_act_once_recovery_guidance(
+    tmp_path: Path,
+    member_name: str,
+    contents: str,
+    missing_contract: str,
+) -> None:
+    sdist = tmp_path / "cayu.tar.gz"
+    _write_sdist(
+        sdist,
+        contents_by_name={
+            "src/cayu/guides/tool-effects.md": (
+                "## Act-once recovery\n"
+                "commit-then-raise outcome_unknown reconcile before any retry\n"
+            ),
+            "src/cayu/guides/durable-operations.md": (
+                "cayu guide tool-effects#act-once-recovery\n"
+            ),
+            member_name: contents,
+        },
+    )
+
+    with pytest.raises(ValueError, match=missing_contract):
+        validate_sdist(sdist)
 
 
 def test_validate_wheel_requires_sidecar_manifest(tmp_path: Path) -> None:

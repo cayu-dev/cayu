@@ -10,6 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
+from typing import Never
 
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli.dashboard import (
@@ -37,6 +38,8 @@ _SDIST_REQUIRED = {
     "src/cayu/data/__init__.py",
     "src/cayu/data/default_model_catalog.json",
     "src/cayu/data/default_price_book.json",
+    "src/cayu/guides/durable-operations.md",
+    "src/cayu/guides/tool-effects.md",
     "src/cayu/server/dashboard/LICENSE",
     "src/cayu/server/dashboard/NOTICE",
     "src/cayu/server/dashboard/REDISTRIBUTION.md",
@@ -82,6 +85,15 @@ _THIRD_PARTY_LICENSE_MARKERS = {
     "## tailwindcss -",
     "## tw-animate-css -",
 }
+_ACT_ONCE_GUIDANCE_MARKERS = {
+    "tool-effects.md": (
+        b"## Act-once recovery",
+        b"commit-then-raise",
+        b"outcome_unknown",
+        b"reconcile before any retry",
+    ),
+    "durable-operations.md": (b"cayu guide tool-effects#act-once-recovery",),
+}
 _FORBIDDEN_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "dist"}
 _NON_PUBLIC_IDENTIFIERS = (
     b"vertex" + b"kg",
@@ -95,7 +107,7 @@ class ValidatedReleaseContents:
     dashboard_bundle: bytes
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> Never:
     raise ValueError(message)
 
 
@@ -144,6 +156,26 @@ def _validate_publication_contents(
     normalized = contents.lower()
     if any(identifier in normalized for identifier in _NON_PUBLIC_IDENTIFIERS):
         _fail(f"{archive}: non-public identifier included in {member_name}")
+
+
+def _validate_act_once_guidance(
+    contents_by_name: dict[str, bytes],
+    *,
+    archive: Path,
+    guide_prefix: str,
+) -> None:
+    labels = {
+        "tool-effects.md": "act-once recovery section",
+        "durable-operations.md": "act-once recovery cross-link",
+    }
+    for guide_name, markers in _ACT_ONCE_GUIDANCE_MARKERS.items():
+        member_name = f"{guide_prefix}/{guide_name}"
+        contents = contents_by_name[member_name]
+        missing = [marker.decode("ascii") for marker in markers if marker not in contents]
+        if missing:
+            _fail(
+                f"{archive}: {labels[guide_name]} is missing required content: {', '.join(missing)}"
+            )
 
 
 def _metadata_version(contents: bytes, *, archive: Path, member_name: str) -> str:
@@ -209,6 +241,11 @@ def validate_sdist(archive: Path) -> ValidatedReleaseContents:
     missing = sorted(_SDIST_REQUIRED - relative_names)
     if missing:
         _fail(f"{archive}: missing required source files: {', '.join(missing)}")
+    _validate_act_once_guidance(
+        contents_by_relative_name,
+        archive=archive,
+        guide_prefix="src/cayu/guides",
+    )
     notice_name = "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
     _validate_third_party_licenses(contents_by_relative_name[notice_name], archive=archive)
     package_version = _metadata_version(
@@ -265,6 +302,11 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
     missing = sorted(_WHEEL_REQUIRED - name_set)
     if missing:
         _fail(f"{archive}: missing required wheel files: {', '.join(missing)}")
+    _validate_act_once_guidance(
+        file_contents,
+        archive=archive,
+        guide_prefix="cayu/guides",
+    )
     _validate_third_party_licenses(
         file_contents["cayu/server/dashboard/THIRD_PARTY_LICENSES.md"], archive=archive
     )

@@ -23,6 +23,11 @@ processes. In-memory stores are for hermetic tests, never production ownership.
 The `CayuApp` object remains process-local; every replacement process rebuilds
 it against the same stores.
 
+If dispatch can commit before its success acknowledgement becomes durable, use
+the focused `cayu guide tool-effects#act-once-recovery` protocol within the Act
+once and Inspect/recover phases. It adds durable uncertainty and bounded
+reconciliation dispositions; it is not a second lifecycle.
+
 ## Runnable public-API skeleton
 
 This credential-free program performs no real external effect. Its proposal and
