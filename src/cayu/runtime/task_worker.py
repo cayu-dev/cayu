@@ -22,11 +22,21 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
 from cayu.runtime.sessions import SessionStatus
-from cayu.runtime.tasks import Task, TaskClaimLost, TaskQuery, TaskStatus, TaskStore
+from cayu.runtime.tasks import (
+    Task,
+    TaskClaimLost,
+    TaskQuery,
+    TaskStatus,
+    TaskStore,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+    _terminalize_claimed_task_or_detect_peer_winner,
+)
 
 if TYPE_CHECKING:
     from cayu.runtime.app import CayuApp
@@ -272,14 +282,26 @@ async def _safe_fail_payload(
     payload: dict[str, Any],
 ) -> None:
     try:
-        await task_store.fail_task(
-            task_id,
-            payload,
-            worker_id=worker_id,
+        peer_terminalization_won = await _terminalize_claimed_task_or_detect_peer_winner(
+            task_store,
+            TaskTerminalizationRequest(
+                task_id=task_id,
+                worker_id=worker_id,
+                kind=TaskTerminalKind.FAILED,
+                error=payload,
+                idempotency_key=_worker_failure_terminalization_key(
+                    task_id,
+                    worker_id,
+                ),
+            ),
         )
+        if peer_terminalization_won:
+            return
     except TaskClaimLost:
         return
     except ValueError:
+        if task_store.supports_idempotent_terminalization:
+            raise
         # A handler can terminalize its task and then raise. Preserve that
         # authoritative terminal outcome, but never hide validation failures
         # for a task that is still live.
@@ -291,6 +313,18 @@ async def _safe_fail_payload(
         }:
             return
         raise
+
+
+def _worker_failure_terminalization_key(task_id: str, worker_id: str) -> str:
+    identity = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-worker-failure.v1",
+            "task_id": task_id,
+            "worker_id": worker_id,
+        },
+        "task_worker_failure",
+    )
+    return f"task-worker-failure:v1:{sha256(identity).hexdigest()}"
 
 
 async def _safe_fail_unfinished(

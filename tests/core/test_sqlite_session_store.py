@@ -1907,7 +1907,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 34"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 38"):
         SQLiteTaskStore(
             db_path,
             schema_mode=schema_migrations.SchemaMode.VALIDATE,
@@ -2645,6 +2645,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (35, 35),
         (36, 36),
         (37, 37),
+        (38, 37),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

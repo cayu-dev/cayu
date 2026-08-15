@@ -353,6 +353,10 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskStatusCounts,
     TaskStore,
+    TaskTerminalizationConflict,
+    TaskTerminalizationReceipt,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
     TaskTopologyInconsistent,
     TaskTopologyNode,
     TaskTopologyQuery,
@@ -367,6 +371,7 @@ from cayu.runtime.tasks import (
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
     _raise_task_claim_attach_error,
+    _replay_task_terminalization_receipt,
     _running_task_from_create,
     _task_from_create,
     _validate_task_topology_ancestry,
@@ -375,6 +380,8 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_task_terminalization,
+    prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
 )
 from cayu.storage import _postgres_aggregates as postgres_aggregates
@@ -1277,6 +1284,20 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_knowledge_publication_receipts(entry_id)",
     ),
     36: ("ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS invocation JSONB NOT NULL",),
+    38: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_task_terminalization_receipts (
+            task_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            terminal_kind TEXT NOT NULL,
+            task_json JSONB NOT NULL,
+            committed_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (task_id, idempotency_key)
+        )
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -2410,6 +2431,8 @@ class _PostgresStoreBase:
                         self._validate_postgres_revision(current_state)
                         if self._min_required_revision >= 36:
                             await self._validate_session_invocation_column(cur)
+                        if self._min_required_revision >= 38:
+                            await self._validate_task_terminalization_receipt_table(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -2550,6 +2573,8 @@ class _PostgresStoreBase:
         self._validate_postgres_revision(state)
         if self._min_required_revision >= 36:
             await self._validate_session_invocation_column(cur)
+        if self._min_required_revision >= 38:
+            await self._validate_task_terminalization_receipt_table(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -2597,6 +2622,49 @@ class _PostgresStoreBase:
 
         if revision.revision == 36:
             await self._validate_session_invocation_column(cur)
+        if revision.revision == 38:
+            await self._validate_task_terminalization_receipt_table(cur)
+
+    async def _validate_task_terminalization_receipt_table(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_task_terminalization_receipts'
+            ORDER BY ordinal_position
+            """
+        )
+        columns = tuple(await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_task_terminalization_receipts'
+              AND constraint_record.contype = 'p'
+            """
+        )
+        primary_keys = tuple(row[0] for row in await cur.fetchall())
+        expected = (
+            ("task_id", "text", "NO"),
+            ("idempotency_key", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("worker_id", "text", "NO"),
+            ("terminal_kind", "text", "NO"),
+            ("task_json", "jsonb", "NO"),
+            ("committed_at", "timestamp with time zone", "NO"),
+        )
+        if columns != expected or primary_keys != ("PRIMARY KEY (task_id, idempotency_key)",):
+            raise RuntimeError(
+                "Postgres task terminalization receipt table conflicts with Cayu's "
+                "revision-38 durability contract. Run `cayu storage migrate` or restore "
+                "the database from a known-good backup."
+            )
 
     async def _validate_budget_reservation_identity_registry(
         self,
@@ -14235,8 +14303,9 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
+    supports_idempotent_terminalization: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
-    _min_required_revision = 34
+    _min_required_revision = 38
 
     def __init__(
         self,
@@ -14754,6 +14823,147 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         error = copy_durable_json_object(error, "error")
         return await self._finish_task(
             task_id, TaskStatus.FAILED, result=None, error=error, worker_id=worker_id
+        )
+
+    async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
+        request, request_sha256 = prepare_task_terminalization(request)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
+                        "WHERE id = %s FOR UPDATE",
+                        (request.task_id,),
+                    )
+                    task_row = await cur.fetchone()
+                    if task_row is None:
+                        raise KeyError(f"Task not found: {request.task_id}")
+
+                    await cur.execute(
+                        "SELECT request_sha256, worker_id, terminal_kind, "
+                        "task_json, committed_at "
+                        "FROM cayu_task_terminalization_receipts "
+                        "WHERE task_id = %s AND idempotency_key = %s",
+                        (request.task_id, request.idempotency_key),
+                    )
+                    receipt_row = await cur.fetchone()
+                    if receipt_row is not None:
+                        receipt = _postgres_task_terminalization_receipt(
+                            task_id=request.task_id,
+                            idempotency_key=request.idempotency_key,
+                            row=receipt_row,
+                        )
+                        replayed = _replay_task_terminalization_receipt(
+                            request_sha256=request_sha256,
+                            receipt=receipt,
+                            current_task=pg_support.task_from_row(task_row),
+                        )
+                        await conn.commit()
+                        return replayed
+
+                    task = pg_support.task_from_row(task_row)
+                    if task.status in {
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    }:
+                        raise TaskTerminalizationConflict(
+                            "Task is terminal without the matching terminalization receipt."
+                        )
+                    _ensure_owned_active_task_lease(task, request.worker_id)
+                    now = datetime.now(UTC)
+                    status = (
+                        TaskStatus.COMPLETED
+                        if request.kind is TaskTerminalKind.COMPLETED
+                        else TaskStatus.FAILED
+                    )
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET status = %s,
+                            status_reason = NULL,
+                            status_payload = NULL,
+                            result = %s,
+                            error = %s,
+                            worker_id = NULL,
+                            lease_expires_at = NULL,
+                            started_at = COALESCE(started_at, %s),
+                            completed_at = %s,
+                            updated_at = %s
+                        WHERE id = %s
+                          AND status IN (%s, %s)
+                          AND worker_id = %s
+                          AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at > %s
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            str(status),
+                            None if request.result is None else _dumps(request.result),
+                            None if request.error is None else _dumps(request.error),
+                            now,
+                            now,
+                            now,
+                            request.task_id,
+                            str(TaskStatus.CLAIMED),
+                            str(TaskStatus.RUNNING),
+                            request.worker_id,
+                            now,
+                        ),
+                    )
+                    terminal_row = await cur.fetchone()
+                    if terminal_row is None:
+                        await self._raise_task_active_lease_error(
+                            cur, request.task_id, request.worker_id
+                        )
+                    assert terminal_row is not None
+                    terminal_task = pg_support.task_from_row(terminal_row)
+                    await cur.execute(
+                        "INSERT INTO cayu_task_terminalization_receipts "
+                        "(task_id, idempotency_key, request_sha256, worker_id, "
+                        "terminal_kind, task_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            request.task_id,
+                            request.idempotency_key,
+                            request_sha256,
+                            request.worker_id,
+                            request.kind.value,
+                            _dumps(terminal_task.model_dump(mode="json")),
+                            now,
+                        ),
+                    )
+                await conn.commit()
+                return terminal_task.model_copy(deep=True)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_task_terminalization_receipt(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskTerminalizationReceipt | None:
+        task_id, idempotency_key = prepare_task_terminalization_receipt_lookup(
+            task_id,
+            idempotency_key,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT request_sha256, worker_id, terminal_kind, task_json, committed_at "
+                "FROM cayu_task_terminalization_receipts "
+                "WHERE task_id = %s AND idempotency_key = %s",
+                (task_id, idempotency_key),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return _postgres_task_terminalization_receipt(
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            row=row,
         )
 
     async def cancel_task(
@@ -15348,6 +15558,26 @@ def _json_obj(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         return json.loads(value)
     return value
+
+
+def _postgres_task_terminalization_receipt(
+    *,
+    task_id: str,
+    idempotency_key: str,
+    row: Any,
+) -> TaskTerminalizationReceipt:
+    try:
+        return TaskTerminalizationReceipt(
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            request_sha256=row[0],
+            worker_id=row[1],
+            kind=row[2],
+            task=Task.model_validate(_json_obj(row[3])),
+            committed_at=pg_support.to_utc(row[4]),
+        )
+    except Exception as exc:
+        raise TaskTerminalizationConflict("Task terminalization receipt is malformed.") from exc
 
 
 def _json_list(value: Any) -> list[Any]:

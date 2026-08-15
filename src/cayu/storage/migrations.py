@@ -221,6 +221,11 @@ REVISIONS: tuple[Revision, ...] = (
     # Postgres ledger advances without DDL, but the cross-backend compatibility
     # floor still prevents unsafe old SQLite writers from sharing a migrated DB.
     Revision(revision=37, kind=RevisionKind.BREAKING, compatible_from=37),
+    # Add an immutable receipt table for the opt-in idempotent task
+    # terminalization operation. Older task writers keep using the legacy
+    # completion/failure methods and never claim replay safety, so the new table
+    # does not change their write contract.
+    Revision(revision=38, kind=RevisionKind.ADDITIVE, compatible_from=37),
 )
 
 #: The revision an empty database is initialized to.

@@ -129,6 +129,25 @@ def test_revision_thirty_four_adds_delayed_task_availability() -> None:
         )
 
 
+def test_revision_thirty_eight_adds_idempotent_task_terminalization_receipts() -> None:
+    revision = m.revision(38)
+    state = m.SchemaState(
+        revision=revision.revision,
+        compatible_from=revision.compatible_from,
+    )
+
+    # Older writers may keep using the legacy terminal methods against the new
+    # receipt table; they simply cannot claim acknowledgement-loss replay safety.
+    m.validate(state, app_latest=37, app_min_supported=37)
+    m.validate(state, app_latest=38, app_min_supported=38)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 38"):
+        m.validate(
+            m.SchemaState(revision=37, compatible_from=37),
+            app_latest=38,
+            app_min_supported=38,
+        )
+
+
 def test_revision_thirty_six_requires_session_invocation_provenance() -> None:
     revision = m.revision(36)
     state = m.SchemaState(

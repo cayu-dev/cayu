@@ -2027,7 +2027,62 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `reclaim_expired(query=..., max_reclaims=...)`
 - `complete_task(task_id, result)`
 - `fail_task(task_id, error)`
+- `terminalize_task(TaskTerminalizationRequest(...))`
+- `load_task_terminalization_receipt(task_id, idempotency_key)`
 - `cancel_task(task_id, error=...)`
+
+`terminalize_task(...)` is the claim-fenced, replay-safe completion/failure
+boundary for worker-owned tasks. A request carries the exact task and worker,
+terminal kind, terminal JSON payload, and a caller-stable idempotency key. On its
+first application, a supporting store verifies the live worker lease and commits
+both the terminal task snapshot and an immutable
+`TaskTerminalizationReceipt` in one lock or database transaction. The receipt
+binds the key to a deterministic SHA-256 digest of the whole logical request.
+The task snapshot clears `worker_id` and `lease_expires_at`.
+
+An exact retry returns the original detached terminal `Task` even though the
+successful commit cleared the lease. Reusing the same task/key with another
+worker, terminal kind, result/error payload, or digest raises
+`TaskTerminalizationConflict`. A different key cannot adopt a task that is
+already terminal, and a terminal task without the matching receipt is never
+treated as proof that the requested operation committed. Receipt and current
+task inconsistencies fail closed.
+
+`terminalize_task_with_retry(...)` adds a finite acknowledgement-recovery loop.
+It retries only connection, timeout, or explicitly supported database
+operational failures for which the store commit may have succeeded before the
+acknowledgement was lost. Generic operating-system failures such as missing
+paths, permissions, or exhausted storage fail immediately. Its typed policy
+bounds attempts, each store call, backoff growth, and maximum backoff; after
+each ambiguous failure it first loads the exact receipt. Validation failures,
+`TaskClaimLost`,
+`TaskTerminalizationConflict`, caller cancellation, and other
+`BaseException` exits are never retried. Exhaustion raises bounded,
+payload-free `TaskTerminalizationUncertain` evidence with the task/key,
+attempt count, coarse error category, monotonic elapsed time, and applied
+backoff. `TaskTerminalizationRetryResult` reports the attempt count, elapsed
+time, applied backoff, and whether receipt reconciliation supplied the answer.
+Each task/key evidence field remains within the idempotency-key UTF-8 byte
+limit even when it is truncated with a digest suffix.
+
+`TaskStore.supports_idempotent_terminalization` defaults to `False` so existing
+custom stores remain compatible. A custom store may set it to `True` only when
+both terminalization methods implement the atomic receipt contract above.
+`CayuApp` and `run_task_worker(...)` use the replay-safe boundary for
+worker-claimed tasks when the capability is present; otherwise they retain the
+legacy claim-fenced `complete_task(..., worker_id=...)` /
+`fail_task(..., worker_id=...)` path. The in-memory, SQLite, and PostgreSQL task
+stores implement the capability, although the in-memory receipt naturally does
+not survive process loss. When a worker or durable dispatcher observes a
+terminal task with no receipt under its own key, it preserves that peer winner
+and continues without claiming its own request committed; a receipt under its
+own key keeps changed-intent conflicts explicit.
+
+Additive schema revision 38 installs the SQLite/PostgreSQL terminalization
+receipt table. Revision-37 binaries can continue their legacy task mutations
+against a revision-38 database, but the replay-safe built-in task-store API
+requires revision 38. Migrate shared stores before deploying binaries that use
+the new capability; no receipts are inferred for legacy terminal tasks.
 
 `create_running_task(...)` performs one store-atomic insert with `status=running`,
 the required session attachment, and `started_at`. It is intended for control-plane

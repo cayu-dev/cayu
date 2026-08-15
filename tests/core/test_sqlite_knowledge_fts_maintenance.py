@@ -403,7 +403,10 @@ def test_revision_37_migrates_legacy_fts_and_preserves_ranking(tmp_path: Path) -
     assert [row[1] for row in after] == pytest.approx([row[1] for row in before])
     connection = sqlite3.connect(db_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == schema_migrations.LATEST_REVISION
+        )
         assert connection.execute(
             "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 37"
         ).fetchone() == ("breaking", 37)
@@ -548,7 +551,10 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
             boundary,  # type: ignore[arg-type]
             schema_migrations.SchemaMode.MIGRATE,
         )
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == schema_migrations.LATEST_REVISION
+        )
     finally:
         connection.close()
 
@@ -681,7 +687,9 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
     retry = sqlite_support.connect(db_path)
     try:
         sqlite_support.reconcile_schema(retry, schema_migrations.SchemaMode.MIGRATE)
-        assert retry.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert (
+            retry.execute("PRAGMA user_version").fetchone()[0] == schema_migrations.LATEST_REVISION
+        )
     finally:
         retry.close()
 

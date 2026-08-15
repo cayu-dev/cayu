@@ -29,6 +29,7 @@ from cayu.runtime import (
     TaskStatus,
     TaskStore,
     TaskStoreDispatcher,
+    TaskTerminalizationRequest,
 )
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime.dispatch import copy_dispatch_request
@@ -395,6 +396,63 @@ def test_process_next_claims_runs_and_completes() -> None:
     assert session.status == SessionStatus.COMPLETED
 
 
+def test_process_next_reconciles_terminalization_acknowledgement_loss() -> None:
+    class CommitThenRaiseStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminalize_calls = 0
+
+        async def terminalize_task(self, request: TaskTerminalizationRequest):
+            self.terminalize_calls += 1
+            await super().terminalize_task(request)
+            raise ConnectionError("acknowledgement lost")
+
+    tasks = CommitThenRaiseStore()
+    h = _build(
+        [_batch("first answer"), _batch("dispatch answer")],
+        task_store=tasks,
+    )
+    _create_resumable_session(h.app, "sess_ack_loss")
+    handle = asyncio.run(h.app.dispatch(_dispatch_request("sess_ack_loss", "d_ack_loss")))
+
+    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
+
+    assert result is not None
+    assert result.status is DispatchStatus.COMPLETED
+    assert tasks.terminalize_calls == 1
+    task = asyncio.run(tasks.load_task(handle.metadata["queue_task_id"]))
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+
+
+def test_process_next_returns_reclaimed_handle_when_peer_terminalization_wins() -> None:
+    class PeerWinningStore(InMemoryTaskStore):
+        async def terminalize_task(self, request: TaskTerminalizationRequest):
+            await super().complete_task(
+                request.task_id,
+                {"winner": "peer"},
+                worker_id=request.worker_id,
+            )
+            return await super().terminalize_task(request)
+
+    tasks = PeerWinningStore()
+    h = _build(
+        [_batch("first answer"), _batch("dispatch answer")],
+        task_store=tasks,
+    )
+    _create_resumable_session(h.app, "sess_peer_winner")
+    handle = asyncio.run(h.app.dispatch(_dispatch_request("sess_peer_winner", "d_peer_winner")))
+
+    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
+
+    assert result is not None
+    assert result.metadata["reclaimed"] is True
+    task = asyncio.run(tasks.load_task(handle.metadata["queue_task_id"]))
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+    assert task.result == {"winner": "peer"}
+
+
 def test_process_next_returns_none_when_queue_empty() -> None:
     h = _build([_batch("first answer")])
     _create_resumable_session(h.app, "sess_empty")
@@ -756,13 +814,13 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
 
 def test_malformed_dispatch_claim_loss_returns_without_clobbering_new_owner() -> None:
     class ReclaimBeforeMalformedFailureStore(InMemoryTaskStore):
-        async def fail_task(self, task_id, error, *, worker_id=None):
-            if worker_id is not None:
-                await super().release_task(task_id, worker_id)
+        async def terminalize_task(self, request: TaskTerminalizationRequest):
+            if request.worker_id is not None:
+                await super().release_task(request.task_id, request.worker_id)
                 reclaimed = await super().claim_task("worker_b", lease_seconds=300)
                 assert reclaimed is not None
-                assert reclaimed.id == task_id
-            return await super().fail_task(task_id, error, worker_id=worker_id)
+                assert reclaimed.id == request.task_id
+            return await super().terminalize_task(request)
 
     tasks = ReclaimBeforeMalformedFailureStore()
     dispatcher = TaskStoreDispatcher(tasks)

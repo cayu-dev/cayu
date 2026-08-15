@@ -205,6 +205,7 @@ from cayu.runtime import (
     TaintAwareToolPolicy,
     TaskCreate,
     TaskStatus,
+    TaskTerminalizationRequest,
     TieredPricing,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
@@ -24949,6 +24950,53 @@ def test_cayu_app_links_claimed_task_to_successful_run():
     assert events[1].payload["task_id"] == PRIVATE_EVENT_AUTHORITY
 
 
+def test_cayu_app_reconciles_claimed_task_completion_acknowledgement_loss():
+    class CommitThenRaiseTaskStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminalize_calls = 0
+
+        async def terminalize_task(self, request: TaskTerminalizationRequest):
+            self.terminalize_calls += 1
+            await super().terminalize_task(request)
+            raise ConnectionError("acknowledgement lost")
+
+    session_store = InMemorySessionStore()
+    task_store = CommitThenRaiseTaskStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+
+    async def run_task_session() -> tuple[list[Event], object]:
+        await task_store.create_task(TaskCreate(task_id="task_ack_loss", type="respond"))
+        assert await task_store.claim_task("worker_a", lease_seconds=300) is not None
+        app = CayuApp(session_store=session_store, task_store=task_store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_ack_loss",
+                task_id="task_ack_loss",
+                task_worker_id="worker_a",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        return events, await task_store.load_task("task_ack_loss")
+
+    events, task = asyncio.run(run_task_session())
+
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+    assert task_store.terminalize_calls == 1
+    assert sum(event.type is EventType.TASK_COMPLETED for event in events) == 1
+
+
 def test_cayu_app_fails_task_when_run_fails():
     session_store = InMemorySessionStore()
     task_store = InMemoryTaskStore()
@@ -24998,6 +25046,48 @@ def test_cayu_app_fails_task_when_run_fails():
         "error": "provider down",
         "error_type": "RuntimeError",
     }
+
+
+def test_cayu_app_reconciles_claimed_task_failure_acknowledgement_loss():
+    class CommitThenRaiseTaskStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminalize_calls = 0
+
+        async def terminalize_task(self, request: TaskTerminalizationRequest):
+            self.terminalize_calls += 1
+            await super().terminalize_task(request)
+            raise ConnectionError("acknowledgement lost")
+
+    session_store = InMemorySessionStore()
+    task_store = CommitThenRaiseTaskStore()
+    provider = FakeProvider([ModelStreamEvent.error("provider down")])
+
+    async def run_task_session() -> tuple[list[Event], object]:
+        await task_store.create_task(TaskCreate(task_id="task_failure_ack", type="respond"))
+        assert await task_store.claim_task("worker_a", lease_seconds=300) is not None
+        app = CayuApp(session_store=session_store, task_store=task_store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_failure_ack",
+                task_id="task_failure_ack",
+                task_worker_id="worker_a",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        return events, await task_store.load_task("task_failure_ack")
+
+    events, task = asyncio.run(run_task_session())
+
+    assert task is not None
+    assert task.status is TaskStatus.FAILED
+    assert task_store.terminalize_calls == 1
+    assert sum(event.type is EventType.TASK_FAILED for event in events) == 1
 
 
 def test_cayu_app_live_stream_includes_failed_interaction_terminal_before_turn_completed():

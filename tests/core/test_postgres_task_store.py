@@ -11,20 +11,31 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import pytest
+from psycopg import errors as psycopg_errors
 from pydantic import ValidationError
 from tests.core.task_store_conformance import assert_task_claim_lost_conformance
+from tests.core.task_terminalization_conformance import (
+    assert_task_terminalization_acknowledgement_conformance,
+)
 from tests.core.task_topology_conformance import (
     assert_task_topology_bounded_projection_conformance,
     assert_task_topology_store_conformance,
 )
 
 from cayu import (
+    Task,
     TaskClaimLost,
     TaskCreate,
     TaskOrder,
     TaskQuery,
     TaskStatus,
+    TaskTerminalizationConflict,
+    TaskTerminalizationReceipt,
+    TaskTerminalizationRequest,
+    TaskTerminalizationRetryPolicy,
+    TaskTerminalKind,
     TaskTopologyQuery,
+    terminalize_task_with_retry,
 )
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -35,6 +46,7 @@ from cayu._validation import (
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_task_terminalization_receipts",
     "cayu_knowledge_publication_receipts",
     "cayu_event_watcher_state",
     "cayu_budget_reservation_identities",
@@ -56,6 +68,199 @@ _TABLES = (
     "cayu_eval_corpora",
     "cayu_schema_migrations",
 )
+
+
+def test_postgres_task_store_replays_terminalization_and_receipt(postgres_dsn):
+    async def ops(store):
+        await store.create_task(TaskCreate(task_id="task_terminal", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        request = TaskTerminalizationRequest(
+            task_id="task_terminal",
+            worker_id="worker_a",
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
+            idempotency_key="terminal-attempt-1",
+        )
+
+        first = await store.terminalize_task(request)
+        replayed = await store.terminalize_task(request)
+        receipt = await store.load_task_terminalization_receipt(
+            "task_terminal", "terminal-attempt-1"
+        )
+
+        assert replayed == first
+        assert type(receipt) is TaskTerminalizationReceipt
+        assert receipt.task == first
+        assert receipt.worker_id == "worker_a"
+        assert receipt.request_sha256 == (
+            "f44314f4f13d93a708c544e83a90ecb2e2dea4d6dd7f4ceb0512b2f895d364a8"
+        )
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_terminalization_acknowledgement_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_task_terminalization_acknowledgement_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_connection_failure_subclass_is_acknowledgement_ambiguous(postgres_dsn):
+    async def ops(store):
+        await store.create_task(TaskCreate(task_id="task_connection_failure", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        terminalize = store.terminalize_task
+        calls = 0
+
+        async def fail_before_commit_once(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise psycopg_errors.ConnectionFailure("acknowledgement lost")
+            return await terminalize(request)
+
+        store.terminalize_task = fail_before_commit_once
+        outcome = await terminalize_task_with_retry(
+            store,
+            TaskTerminalizationRequest(
+                task_id="task_connection_failure",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"summary": "done"},
+                idempotency_key="connection-failure",
+            ),
+            policy=TaskTerminalizationRetryPolicy(
+                max_attempts=2,
+                initial_backoff_seconds=0,
+                max_backoff_seconds=0,
+            ),
+        )
+
+        assert outcome.attempt_count == 2
+        assert calls == 2
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_terminalization_rejects_wrong_worker_and_changed_intent(
+    postgres_dsn,
+):
+    async def ops(store):
+        await store.create_task(TaskCreate(task_id="task_wrong_worker", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        winner = TaskTerminalizationRequest(
+            task_id="task_wrong_worker",
+            worker_id="worker_a",
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "done"},
+            idempotency_key="terminal-key",
+        )
+        with pytest.raises(TaskClaimLost):
+            await store.terminalize_task(winner.model_copy(update={"worker_id": "worker_b"}))
+        assert (
+            await store.load_task_terminalization_receipt("task_wrong_worker", "terminal-key")
+            is None
+        )
+
+        terminal = await store.terminalize_task(winner)
+        conflicts = (
+            winner.model_copy(update={"worker_id": "worker_b"}),
+            winner.model_copy(update={"result": {"summary": "changed"}}),
+            TaskTerminalizationRequest(
+                task_id="task_wrong_worker",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.FAILED,
+                error={"message": "changed"},
+                idempotency_key="terminal-key",
+            ),
+        )
+        for conflicting in conflicts:
+            with pytest.raises(TaskTerminalizationConflict):
+                await store.terminalize_task(conflicting)
+        assert await store.load_task("task_wrong_worker") == terminal
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_terminalization_concurrency_converges_or_conflicts(
+    postgres_dsn,
+):
+    async def ops(store):
+        await store.create_task(TaskCreate(task_id="task_exact_race", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        exact = TaskTerminalizationRequest(
+            task_id="task_exact_race",
+            worker_id="worker_a",
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "done"},
+            idempotency_key="race-key",
+        )
+        exact_results = await asyncio.gather(*(store.terminalize_task(exact) for _ in range(8)))
+        assert all(result == exact_results[0] for result in exact_results)
+
+        await store.create_task(TaskCreate(task_id="task_conflict_race", type="review"))
+        assert await store.claim_task("worker_b") is not None
+        requests = (
+            TaskTerminalizationRequest(
+                task_id="task_conflict_race",
+                worker_id="worker_b",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"winner": "completed"},
+                idempotency_key="conflict-key",
+            ),
+            TaskTerminalizationRequest(
+                task_id="task_conflict_race",
+                worker_id="worker_b",
+                kind=TaskTerminalKind.FAILED,
+                error={"winner": "failed"},
+                idempotency_key="conflict-key",
+            ),
+        )
+
+        async def apply(request: TaskTerminalizationRequest):
+            try:
+                return await store.terminalize_task(request)
+            except TaskTerminalizationConflict as exc:
+                return exc
+
+        outcomes = await asyncio.gather(*(apply(request) for request in requests))
+        assert sum(type(outcome) is Task for outcome in outcomes) == 1
+        assert sum(isinstance(outcome, TaskTerminalizationConflict) for outcome in outcomes) == 1
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_replays_terminalization_after_reconstruction(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        request = TaskTerminalizationRequest(
+            task_id="task_restart",
+            worker_id="worker_a",
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "done"},
+            idempotency_key="restart-key",
+        )
+        first_store = _new_store(postgres_dsn)
+        try:
+            await first_store.create_task(TaskCreate(task_id="task_restart", type="review"))
+            assert await first_store.claim_task("worker_a") is not None
+            terminal = await first_store.terminalize_task(request)
+        finally:
+            await first_store.close()
+
+        reconstructed = _new_store(postgres_dsn)
+        try:
+            assert await reconstructed.terminalize_task(request) == terminal
+            receipt = await reconstructed.load_task_terminalization_receipt(
+                "task_restart", "restart-key"
+            )
+            assert receipt is not None
+            assert receipt.task == terminal
+        finally:
+            await reconstructed.close()
+
+    asyncio.run(run())
 
 
 async def _truncate(dsn: str) -> None:

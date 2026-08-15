@@ -554,7 +554,10 @@ arguments in a product API.
   is exactly once. If a process can die after starting an effect but before a
   terminal receipt is durable, classify the outcome as uncertain and reconcile
   it. Never turn "started without terminal evidence" into automatic retry or
-  assumed success.
+  assumed success. `TaskStore.terminalize_task(...)` makes Cayu's own durable
+  task completion/failure replay-safe after acknowledgement loss; its receipt
+  proves only that task state commit. It does not prove that a provider, tool,
+  webhook, payment, or other external effect happened exactly once.
 - **Verification by narration:** a successful action receipt is not post-action
   verification. Use a separate read-only observation and retain pass, fail, or
   inconclusive evidence tied to the same stable `action_id`.

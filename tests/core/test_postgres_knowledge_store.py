@@ -39,6 +39,7 @@ pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
     "cayu_knowledge_embeddings",
+    "cayu_task_terminalization_receipts",
     "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",

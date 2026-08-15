@@ -197,6 +197,7 @@ _POSTGRES_TABLES = (
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
+    "cayu_task_terminalization_receipts",
     "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",

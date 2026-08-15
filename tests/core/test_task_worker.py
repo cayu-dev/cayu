@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
 
 import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
@@ -28,6 +27,10 @@ from cayu import (
     TaskCreate,
     TaskHandlerOutcome,
     TaskQuery,
+    TaskStatus,
+    TaskTerminalizationConflict,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
     Tool,
     ToolApprovalDecision,
     ToolApprovalRequest,
@@ -127,6 +130,118 @@ def test_run_task_worker_claims_runs_and_completes_a_task(tmp_path: Path) -> Non
     assert handled == 1
     assert task is not None
     assert task.status == "completed"
+
+
+def test_run_task_worker_reconciles_failure_terminalization_acknowledgement_loss() -> None:
+    class CommitThenRaiseTaskStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminalize_calls = 0
+
+        async def terminalize_task(self, request: TaskTerminalizationRequest):
+            self.terminalize_calls += 1
+            await super().terminalize_task(request)
+            raise ConnectionError("acknowledgement lost")
+
+    store = CommitThenRaiseTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+
+    async def scenario() -> tuple[int, Task | None]:
+        await store.create_task(TaskCreate(task_id="worker-failure", type="job"))
+
+        async def fail_handler(_app: CayuApp, _task: Task, _worker_id: str):
+            raise RuntimeError("handler failed")
+
+        handled = await run_task_worker(
+            app,
+            store,
+            fail_handler,
+            worker_id="worker-a",
+            max_tasks=1,
+        )
+        return handled, await store.load_task("worker-failure")
+
+    handled, task = asyncio.run(scenario())
+
+    assert handled == 1
+    assert task is not None
+    assert task.status is TaskStatus.FAILED
+    assert store.terminalize_calls == 1
+
+
+def test_run_task_worker_continues_after_handler_terminalizes_then_raises() -> None:
+    store = InMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+
+    async def scenario() -> tuple[int, Task | None, Task | None]:
+        await store.create_task(TaskCreate(task_id="worker-first", type="job"))
+        await store.create_task(TaskCreate(task_id="worker-second", type="job"))
+
+        async def terminalize_then_raise(_app: CayuApp, task: Task, worker_id: str):
+            await store.complete_task(task.id, {"winner": "handler"}, worker_id=worker_id)
+            if task.id == "worker-first":
+                raise RuntimeError("handler raised after terminalizing")
+
+        handled = await run_task_worker(
+            app,
+            store,
+            terminalize_then_raise,
+            worker_id="worker-a",
+            max_tasks=2,
+        )
+        return (
+            handled,
+            await store.load_task("worker-first"),
+            await store.load_task("worker-second"),
+        )
+
+    handled, first, second = asyncio.run(scenario())
+    assert handled == 2
+    assert first is not None
+    assert first.status is TaskStatus.COMPLETED
+    assert first.result == {"winner": "handler"}
+    assert second is not None
+    assert second.status is TaskStatus.COMPLETED
+    assert second.result == {"winner": "handler"}
+
+
+def test_run_task_worker_keeps_same_key_changed_intent_conflict_explicit() -> None:
+    class ChangedIntentStore(InMemoryTaskStore):
+        async def terminalize_task(self, request: TaskTerminalizationRequest):
+            await super().terminalize_task(
+                TaskTerminalizationRequest(
+                    task_id=request.task_id,
+                    worker_id=request.worker_id,
+                    kind=TaskTerminalKind.COMPLETED,
+                    result={"winner": "other-intent"},
+                    idempotency_key=request.idempotency_key,
+                )
+            )
+            return await super().terminalize_task(request)
+
+    store = ChangedIntentStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+
+    async def scenario() -> Task | None:
+        await store.create_task(TaskCreate(task_id="worker-conflict", type="job"))
+
+        async def fail_handler(_app: CayuApp, _task: Task, _worker_id: str):
+            raise RuntimeError("handler failed")
+
+        with pytest.raises(TaskTerminalizationConflict):
+            await run_task_worker(
+                app,
+                store,
+                fail_handler,
+                worker_id="worker-a",
+                max_tasks=1,
+            )
+        return await store.load_task("worker-conflict")
+
+    task = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+    assert task.result == {"winner": "other-intent"}
 
 
 def test_run_task_worker_returns_immediately_when_stopped(tmp_path: Path) -> None:
@@ -363,16 +478,10 @@ def test_task_worker_cancellation_during_failure_write_does_not_retain_raw_error
             super().__init__()
             self.failure_started = asyncio.Event()
 
-        async def fail_task(
-            self,
-            task_id: str,
-            error: dict[str, Any],
-            *,
-            worker_id: str | None = None,
-        ) -> Task:
+        async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
             self.failure_started.set()
             await asyncio.Event().wait()
-            return await super().fail_task(task_id, error, worker_id=worker_id)
+            return await super().terminalize_task(request)
 
     store = BlockingFailureStore()
     app = CayuApp(

@@ -89,6 +89,24 @@ guard.
 
 ## Unreleased
 
+### Worker task terminalization survives lost acknowledgements
+
+Worker-claimed task completion and failure now commit a deterministic terminal
+receipt atomically with task state. Exact retries return the original terminal
+task after lease clearance, while changed worker, kind, payload, or digest
+intent fails closed. `CayuApp` and `run_task_worker(...)` use a bounded,
+observable retry helper for acknowledgement-ambiguous store failures; claim
+loss, deterministic operating-system failures, validation, conflicts, and
+cancellation are not retried. Success and uncertainty expose elapsed time and
+applied backoff, and worker/dispatcher loops preserve an independently won
+terminal outcome without masking same-key changed intent. This is durable task
+state idempotency, not an exactly-once guarantee for external effects.
+
+Additive schema revision 38 installs the receipt table in SQLite and PostgreSQL.
+Revision-37 binaries remain compatible with the new table, but new built-in
+task stores require revision 38. Migrate the shared database before deploying
+workers that use replay-safe task terminalization.
+
 ### SQLite knowledge updates no longer scan the global FTS corpus
 
 SQLite knowledge chunks now share a stable integer identity with their FTS5 rows.
@@ -96,13 +114,15 @@ Updating, replacing, pruning, or deleting one entry addresses only that entry's
 chunks, avoiding corpus-sized work while the shared SQLite writer lock is held.
 Search behavior and BM25 ranking are unchanged.
 
-The storage schema advances from revision 36 to breaking revision 37. Stop older
+The knowledge migration advances the storage schema from revision 36 to
+breaking revision 37 before the additive revision-38 task receipt migration. Stop older
 workers, take an application-consistent backup, run `cayu storage status` followed
-by `cayu storage migrate`, and confirm revision 37 before restarting workers. The
+by `cayu storage migrate`, and confirm revision 38 before restarting workers. The
 SQLite migration rebuilds legacy knowledge FTS rows in one transaction. After an
 ambiguous interruption, run `cayu storage status`: retry when revision 36 remains,
-or proceed when the complete revision 37 commit is already visible. PostgreSQL
-records the shared revision without changing its knowledge schema.
+or proceed with the task receipt migration when the complete revision 37 commit
+is already visible. PostgreSQL records revision 37 without changing its knowledge
+schema, then adds the shared terminalization receipt table at revision 38.
 
 ## v0.2.1
 

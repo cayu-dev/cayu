@@ -457,6 +457,9 @@ from cayu.runtime.tasks import (
     TaskQuery,
     TaskStatus,
     TaskStore,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+    _terminalize_claimed_task,
 )
 from cayu.runtime.tool_policy import (
     metadata_with_taint_labels,
@@ -3113,6 +3116,24 @@ def _task_event(
             if event.payload.get(field_name) is not None
         ),
     )
+
+
+def _task_terminalization_idempotency_key(
+    *,
+    task_id: str,
+    session_id: str,
+    kind: TaskTerminalKind,
+) -> str:
+    material = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.runtime-task-terminalization.v1",
+            "task_id": task_id,
+            "session_id": session_id,
+            "kind": kind.value,
+        },
+        "runtime_task_terminalization",
+    )
+    return f"runtime-task-terminal:v1:{hashlib.sha256(material).hexdigest()}"
 
 
 def _knowledge_store(
@@ -12470,6 +12491,7 @@ class SessionEngine:
                 await self._session_control.raise_if_interrupted(session.id)
                 task = await self._complete_task(
                     task_id=task_id,
+                    task_worker_id=task_worker_id,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -12866,9 +12888,11 @@ class SessionEngine:
                 and self.task_store is not None
             ):
                 try:
-                    task = await self.task_store.fail_task(
-                        task_id,
-                        task_failure_payload_from_diagnostic(
+                    task = await self._fail_task(
+                        task_id=task_id,
+                        task_worker_id=task_worker_id,
+                        session=session,
+                        error=task_failure_payload_from_diagnostic(
                             failure_diagnostic,
                             session_id=session.id,
                         ),
@@ -13163,13 +13187,14 @@ class SessionEngine:
             )
             if not ((attached_to_session and worker_matches) or owned_claim or unclaimed_pending):
                 return None, None
-            task = await self.task_store.fail_task(
-                task_id,
-                task_failure_payload_from_diagnostic(
+            task = await self._fail_task(
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                session=session,
+                error=task_failure_payload_from_diagnostic(
                     diagnostic,
                     session_id=session.id,
                 ),
-                worker_id=task_worker_id,
             )
             return (
                 await self._event_writer.emit(
@@ -13210,19 +13235,68 @@ class SessionEngine:
         self,
         *,
         task_id: str,
+        task_worker_id: str | None,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+        result = {
+            "session_id": session.id,
+            "agent_name": registered_agent.spec.name,
+            "environment_name": _environment_name(registered_environment),
+        }
+        if task_worker_id is not None:
+            return await _terminalize_claimed_task(
+                self.task_store,
+                TaskTerminalizationRequest(
+                    task_id=task_id,
+                    worker_id=task_worker_id,
+                    kind=TaskTerminalKind.COMPLETED,
+                    result=result,
+                    idempotency_key=_task_terminalization_idempotency_key(
+                        task_id=task_id,
+                        session_id=session.id,
+                        kind=TaskTerminalKind.COMPLETED,
+                    ),
+                ),
+            )
         return await self.task_store.complete_task(
             task_id,
-            {
-                "session_id": session.id,
-                "agent_name": registered_agent.spec.name,
-                "environment_name": _environment_name(registered_environment),
-            },
+            result,
+            worker_id=task_worker_id,
+        )
+
+    async def _fail_task(
+        self,
+        *,
+        task_id: str,
+        task_worker_id: str | None,
+        session: Session,
+        error: dict[str, Any],
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+        if task_worker_id is not None:
+            return await _terminalize_claimed_task(
+                self.task_store,
+                TaskTerminalizationRequest(
+                    task_id=task_id,
+                    worker_id=task_worker_id,
+                    kind=TaskTerminalKind.FAILED,
+                    error=error,
+                    idempotency_key=_task_terminalization_idempotency_key(
+                        task_id=task_id,
+                        session_id=session.id,
+                        kind=TaskTerminalKind.FAILED,
+                    ),
+                ),
+            )
+        return await self.task_store.fail_task(
+            task_id,
+            error,
+            worker_id=task_worker_id,
         )
 
     async def _apply_model_step_budget_evaluation(

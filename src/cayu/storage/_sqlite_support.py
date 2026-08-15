@@ -368,6 +368,17 @@ _BASELINE_DDL = """
         completed_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_task_terminalization_receipts (
+        task_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        terminal_kind TEXT NOT NULL,
+        task_json TEXT NOT NULL,
+        committed_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, idempotency_key)
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_event_watcher_state (
         watcher_name TEXT PRIMARY KEY,
         cursor_sequence INTEGER NOT NULL,
@@ -1459,6 +1470,18 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_publication_receipts_entry
             ON cayu_knowledge_publication_receipts(entry_id);
     """,
+    38: """
+        CREATE TABLE IF NOT EXISTS cayu_task_terminalization_receipts (
+            task_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            terminal_kind TEXT NOT NULL,
+            task_json TEXT NOT NULL,
+            committed_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, idempotency_key)
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2431,6 +2454,8 @@ def reconcile_schema(
         # Structural validation is intentionally constant-size. The full source/
         # FTS census belongs to the one-time revision hook, never ordinary startup.
         _validate_revision_37_knowledge_fts_schema(connection)
+    if app_min_supported >= 38:
+        _validate_task_terminalization_receipt_table(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -2443,6 +2468,30 @@ def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
             "SQLite schema object 'cayu_sessions.invocation_json' conflicts with "
             "Cayu's required invocation-provenance contract. Recreate the Cayu "
             "database from a known-good revision-36 schema."
+        )
+
+
+def _validate_task_terminalization_receipt_table(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_task_terminalization_receipts)")
+    )
+    expected = (
+        ("task_id", "TEXT", 1, 1),
+        ("idempotency_key", "TEXT", 1, 2),
+        ("request_sha256", "TEXT", 1, 0),
+        ("worker_id", "TEXT", 1, 0),
+        ("terminal_kind", "TEXT", 1, 0),
+        ("task_json", "TEXT", 1, 0),
+        ("committed_at", "TEXT", 1, 0),
+    )
+    if columns != expected:
+        raise RuntimeError(
+            "SQLite task terminalization receipt table conflicts with Cayu's "
+            "revision-38 durability contract. Run `cayu storage migrate` or restore "
+            "the database from a known-good backup."
         )
 
 
@@ -2639,6 +2688,14 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             for statement in _iter_statements(_MIGRATION_STEPS[29]):
                 connection.execute(statement)
             _validate_workflow_replay_indexes(connection, require_all=True)
+            _record_revision(connection, rev)
+            connection.execute(f"PRAGMA user_version = {rev.revision}")
+        return
+    if rev.revision == 38:
+        with _transaction(connection):
+            for statement in _iter_statements(_MIGRATION_STEPS[38]):
+                connection.execute(statement)
+            _validate_task_terminalization_receipt_table(connection)
             _record_revision(connection, rev)
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return

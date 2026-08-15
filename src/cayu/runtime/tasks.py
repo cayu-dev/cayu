@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
 from itertools import islice
 from typing import Any, ClassVar, Literal
 from uuid import uuid4
@@ -18,6 +20,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     field_validator,
     model_validator,
@@ -26,6 +29,7 @@ from pydantic import (
 from cayu._clock import normalize_utc_datetime, utc_clock
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
     copy_durable_json_object,
 )
 from cayu._validation import (
@@ -52,6 +56,18 @@ class TaskStatus(StrEnum):
 
 class TaskClaimLost(ValueError):
     """A worker no longer owns the active lease required for a task mutation."""
+
+
+class TaskTerminalizationConflict(ValueError):
+    """An idempotency key is already bound to another terminalization intent."""
+
+
+class TaskTerminalKind(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES = 256
 
 
 class TaskOrder(StrEnum):
@@ -193,6 +209,172 @@ class TaskCreate(BaseModel):
         if value is None:
             return None
         return normalize_utc_datetime(value, "available_at")
+
+
+class TaskTerminalizationRequest(BaseModel):
+    """One claim-fenced, replay-safe completion or failure intent."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    task_id: str
+    worker_id: str
+    kind: TaskTerminalKind
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    idempotency_key: str
+
+    @field_validator("task_id", "worker_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return _validate_task_terminalization_idempotency_key(value)
+
+    @field_validator("result", "error", mode="before")
+    @classmethod
+    def copy_payload(
+        cls,
+        value: dict[str, Any] | None,
+        info,
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return copy_durable_json_object(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_terminal_payload(self) -> TaskTerminalizationRequest:
+        if self.kind is TaskTerminalKind.COMPLETED:
+            if self.result is None or self.error is not None:
+                raise ValueError("Completed terminalization requires result and forbids error.")
+        elif self.error is None or self.result is not None:
+            raise ValueError("Failed terminalization requires error and forbids result.")
+        return self
+
+
+class TaskTerminalizationReceipt(BaseModel):
+    """Immutable commit evidence for one task terminalization intent."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    task_id: str
+    idempotency_key: str
+    worker_id: str
+    kind: TaskTerminalKind
+    request_sha256: str
+    task: Task
+    committed_at: datetime
+
+    @field_validator("task_id", "worker_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return _validate_task_terminalization_idempotency_key(value)
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("task", mode="before")
+    @classmethod
+    def copy_terminal_task(cls, value: Task) -> Task:
+        if type(value) is not Task:
+            raise TypeError("task must be a Task instance.")
+        return Task.model_validate(value.model_dump(mode="python"))
+
+    @field_validator("committed_at")
+    @classmethod
+    def normalize_committed_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "committed_at")
+
+    @model_validator(mode="after")
+    def validate_receipt_task(self) -> TaskTerminalizationReceipt:
+        expected_status = (
+            TaskStatus.COMPLETED if self.kind is TaskTerminalKind.COMPLETED else TaskStatus.FAILED
+        )
+        if self.task.id != self.task_id or self.task.status is not expected_status:
+            raise ValueError("Terminalization receipt conflicts with its terminal task.")
+        if self.task.worker_id is not None or self.task.lease_expires_at is not None:
+            raise ValueError("Terminalization receipt task retains live claim ownership.")
+        return self
+
+
+class TaskTerminalizationRetryPolicy(BaseModel):
+    """Finite retry and backoff bounds for acknowledgement-ambiguous writes."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    max_attempts: StrictInt = Field(default=3, ge=1, le=10)
+    attempt_timeout_seconds: StrictFloat = Field(default=30.0, gt=0, le=300)
+    initial_backoff_seconds: StrictFloat = Field(default=0.05, ge=0, le=60)
+    backoff_multiplier: StrictFloat = Field(default=2.0, ge=1, le=10)
+    max_backoff_seconds: StrictFloat = Field(default=1.0, ge=0, le=60)
+
+
+class TaskTerminalizationRetryResult(BaseModel):
+    """Detached terminal task plus observable retry/reconciliation evidence."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        hide_input_in_errors=True,
+        allow_inf_nan=False,
+    )
+
+    task: Task
+    attempt_count: StrictInt = Field(ge=1, le=10)
+    receipt_reconciled: StrictBool
+    elapsed_seconds: StrictFloat = Field(default=0.0, ge=0)
+    applied_backoff_seconds: StrictFloat = Field(default=0.0, ge=0)
+
+    @field_validator("task", mode="before")
+    @classmethod
+    def copy_terminal_task(cls, value: Task) -> Task:
+        if type(value) is not Task:
+            raise TypeError("task must be a Task instance.")
+        return Task.model_validate(value.model_dump(mode="python"))
+
+
+class TaskTerminalizationUncertain(RuntimeError):
+    """Bounded evidence that no exact terminalization receipt was observed."""
+
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        idempotency_key: str,
+        attempt_count: int,
+        error_category: str,
+        elapsed_seconds: float = 0.0,
+        applied_backoff_seconds: float = 0.0,
+    ) -> None:
+        for field_name, value in (
+            ("elapsed_seconds", elapsed_seconds),
+            ("applied_backoff_seconds", applied_backoff_seconds),
+        ):
+            if type(value) is not float:
+                raise TypeError(f"{field_name} must be a float.")
+            if value < 0 or not math.isfinite(value):
+                raise ValueError(f"{field_name} must be finite and non-negative.")
+        self.task_id = _bounded_task_terminalization_evidence(task_id)
+        self.idempotency_key = _bounded_task_terminalization_evidence(idempotency_key)
+        self.attempt_count = attempt_count
+        self.error_category = error_category
+        self.elapsed_seconds = elapsed_seconds
+        self.applied_backoff_seconds = applied_backoff_seconds
+        super().__init__(
+            "Task terminalization outcome is uncertain for "
+            f"task {self.task_id} after {attempt_count} attempts "
+            f"(category={error_category})."
+        )
 
 
 class TaskQuery(BaseModel):
@@ -841,6 +1023,7 @@ class TaskStore(ABC):
 
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
+    supports_idempotent_terminalization: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @abstractmethod
@@ -930,6 +1113,25 @@ class TaskStore(ABC):
         If ``worker_id`` is given, the update raises ``TaskClaimLost`` unless that
         worker still owns an active lease on the task.
         """
+
+    async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
+        """Atomically terminalize one live claim or replay its exact receipt.
+
+        Custom stores opt into this operation by overriding it. The default keeps
+        existing out-of-tree ``TaskStore`` implementations instantiable without
+        claiming acknowledgement-loss safety they do not provide.
+        """
+        raise NotImplementedError(
+            "This TaskStore does not support idempotent task terminalization."
+        )
+
+    async def load_task_terminalization_receipt(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskTerminalizationReceipt | None:
+        """Load exact durable commit evidence for receipt reconciliation."""
+        raise NotImplementedError("This TaskStore does not support task terminalization receipts.")
 
     @abstractmethod
     async def cancel_task(
@@ -1025,12 +1227,14 @@ class InMemoryTaskStore(TaskStore):
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
+    supports_idempotent_terminalization: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._lock = asyncio.Lock()
         self._clock = utc_clock(clock)
         self._tasks: dict[str, Task] = {}
+        self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
         self._task_keys_by_session: dict[str, list[tuple[datetime, str]]] = {}
         self._task_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
 
@@ -1260,6 +1464,75 @@ class InMemoryTaskStore(TaskStore):
                 result=None,
                 error=error,
                 worker_id=worker_id,
+            )
+
+    async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
+        request, request_sha256 = prepare_task_terminalization(request)
+        receipt_key = (request.task_id, request.idempotency_key)
+        async with self._lock:
+            existing = self._terminalization_receipts.get(receipt_key)
+            if existing is not None:
+                return _replay_task_terminalization_receipt(
+                    request_sha256=request_sha256,
+                    receipt=existing,
+                    current_task=self._tasks.get(request.task_id),
+                )
+
+            task = self._require_task(request.task_id)
+            if task.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                raise TaskTerminalizationConflict(
+                    "Task is terminal without the matching terminalization receipt."
+                )
+            _ensure_owned_active_task_lease(task, request.worker_id)
+
+            status = (
+                TaskStatus.COMPLETED
+                if request.kind is TaskTerminalKind.COMPLETED
+                else TaskStatus.FAILED
+            )
+            terminal_task = self._finish_task(
+                request.task_id,
+                status,
+                result=request.result,
+                error=request.error,
+                worker_id=request.worker_id,
+            )
+            self._terminalization_receipts[receipt_key] = TaskTerminalizationReceipt(
+                task_id=request.task_id,
+                idempotency_key=request.idempotency_key,
+                worker_id=request.worker_id,
+                kind=request.kind,
+                request_sha256=request_sha256,
+                task=terminal_task,
+                committed_at=datetime.now(UTC),
+            )
+            return terminal_task.model_copy(deep=True)
+
+    async def load_task_terminalization_receipt(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskTerminalizationReceipt | None:
+        task_id, idempotency_key = prepare_task_terminalization_receipt_lookup(
+            task_id,
+            idempotency_key,
+        )
+        async with self._lock:
+            receipt = self._terminalization_receipts.get((task_id, idempotency_key))
+            if receipt is None:
+                return None
+            return TaskTerminalizationReceipt(
+                task_id=receipt.task_id,
+                idempotency_key=receipt.idempotency_key,
+                worker_id=receipt.worker_id,
+                kind=receipt.kind,
+                request_sha256=receipt.request_sha256,
+                task=receipt.task.model_copy(deep=True),
+                committed_at=receipt.committed_at,
             )
 
     async def cancel_task(
@@ -2068,6 +2341,285 @@ def copy_task(task: Task) -> Task:
         started_at=task.started_at,
         completed_at=task.completed_at,
     )
+
+
+def prepare_task_terminalization(
+    request: TaskTerminalizationRequest,
+) -> tuple[TaskTerminalizationRequest, str]:
+    """Detach and deterministically digest one validated logical request."""
+
+    if type(request) is not TaskTerminalizationRequest:
+        raise TypeError(
+            "Task terminalization requests must be TaskTerminalizationRequest instances."
+        )
+    copied = TaskTerminalizationRequest.model_validate(request.model_dump(mode="python"))
+    material = {
+        "schema": "cayu.task-terminalization.v1",
+        "task_id": copied.task_id,
+        "idempotency_key": copied.idempotency_key,
+        "worker_id": copied.worker_id,
+        "kind": copied.kind.value,
+        "result": copied.result,
+        "error": copied.error,
+    }
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(material, "task_terminalization")
+    ).hexdigest()
+    return copied, request_sha256
+
+
+def prepare_task_terminalization_receipt_lookup(
+    task_id: str,
+    idempotency_key: str,
+) -> tuple[str, str]:
+    return (
+        require_clean_nonblank(task_id, "task_id"),
+        _validate_task_terminalization_idempotency_key(idempotency_key),
+    )
+
+
+def _validate_task_terminalization_idempotency_key(value: str) -> str:
+    value = require_clean_nonblank(value, "idempotency_key")
+    if len(value.encode("utf-8")) > TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES:
+        raise ValueError(
+            "idempotency_key must be at most "
+            f"{TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES} UTF-8 bytes."
+        )
+    return value
+
+
+def _replay_task_terminalization_receipt(
+    *,
+    request_sha256: str,
+    receipt: TaskTerminalizationReceipt,
+    current_task: Task | None,
+) -> Task:
+    """Validate durable replay proof and return a detached terminal task."""
+
+    if receipt.request_sha256 != request_sha256:
+        raise TaskTerminalizationConflict(
+            "Task terminalization idempotency key conflicts with another intent."
+        )
+    if current_task != receipt.task:
+        raise TaskTerminalizationConflict(
+            "Task terminalization receipt conflicts with the current terminal task."
+        )
+    return receipt.task.model_copy(deep=True)
+
+
+async def terminalize_task_with_retry(
+    task_store: TaskStore,
+    request: TaskTerminalizationRequest,
+    *,
+    policy: TaskTerminalizationRetryPolicy | None = None,
+) -> TaskTerminalizationRetryResult:
+    """Terminalize once, reconciling only acknowledgement-ambiguous failures."""
+
+    if not isinstance(task_store, TaskStore):
+        raise TypeError("task_store must be a TaskStore instance.")
+    if not task_store.supports_idempotent_terminalization:
+        raise ValueError("task_store must support idempotent task terminalization and receipts.")
+    request, request_sha256 = prepare_task_terminalization(request)
+    if policy is None:
+        policy = TaskTerminalizationRetryPolicy()
+    elif type(policy) is not TaskTerminalizationRetryPolicy:
+        raise TypeError("policy must be a TaskTerminalizationRetryPolicy instance.")
+    else:
+        policy = TaskTerminalizationRetryPolicy.model_validate(policy.model_dump(mode="python"))
+
+    clock = asyncio.get_running_loop()
+    started_at = clock.time()
+    applied_backoff_seconds = 0.0
+    delay = min(policy.initial_backoff_seconds, policy.max_backoff_seconds)
+    last_error_category = "store_error"
+    for attempt in range(1, policy.max_attempts + 1):
+        attempt_request = TaskTerminalizationRequest.model_validate(
+            request.model_dump(mode="python")
+        )
+        try:
+            task = await asyncio.wait_for(
+                task_store.terminalize_task(attempt_request),
+                timeout=policy.attempt_timeout_seconds,
+            )
+            return TaskTerminalizationRetryResult(
+                task=task,
+                attempt_count=attempt,
+                receipt_reconciled=False,
+                elapsed_seconds=max(0.0, clock.time() - started_at),
+                applied_backoff_seconds=applied_backoff_seconds,
+            )
+        except Exception as exc:
+            if not _task_terminalization_error_is_acknowledgement_ambiguous(exc):
+                raise
+            last_error_category = _task_terminalization_error_category(exc)
+
+        try:
+            receipt = await asyncio.wait_for(
+                task_store.load_task_terminalization_receipt(
+                    request.task_id,
+                    request.idempotency_key,
+                ),
+                timeout=policy.attempt_timeout_seconds,
+            )
+        except Exception as exc:
+            if not _task_terminalization_error_is_acknowledgement_ambiguous(exc):
+                raise
+            last_error_category = _task_terminalization_error_category(exc)
+            receipt = None
+
+        if receipt is not None:
+            if type(receipt) is not TaskTerminalizationReceipt:
+                raise TypeError(
+                    "Task terminalization receipt loads must return "
+                    "TaskTerminalizationReceipt instances."
+                )
+            if (
+                receipt.task_id != request.task_id
+                or receipt.idempotency_key != request.idempotency_key
+                or receipt.worker_id != request.worker_id
+                or receipt.kind is not request.kind
+                or receipt.request_sha256 != request_sha256
+            ):
+                raise TaskTerminalizationConflict(
+                    "Task terminalization receipt conflicts with the retry request."
+                )
+            try:
+                current_task = await asyncio.wait_for(
+                    task_store.load_task(request.task_id),
+                    timeout=policy.attempt_timeout_seconds,
+                )
+            except Exception as exc:
+                if not _task_terminalization_error_is_acknowledgement_ambiguous(exc):
+                    raise
+                last_error_category = _task_terminalization_error_category(exc)
+            else:
+                if current_task is not None and type(current_task) is not Task:
+                    raise TypeError("Task loads must return Task instances.")
+                reconciled_task = _replay_task_terminalization_receipt(
+                    request_sha256=request_sha256,
+                    receipt=receipt,
+                    current_task=current_task,
+                )
+                return TaskTerminalizationRetryResult(
+                    task=reconciled_task,
+                    attempt_count=attempt,
+                    receipt_reconciled=True,
+                    elapsed_seconds=max(0.0, clock.time() - started_at),
+                    applied_backoff_seconds=applied_backoff_seconds,
+                )
+
+        if attempt == policy.max_attempts:
+            raise TaskTerminalizationUncertain(
+                task_id=request.task_id,
+                idempotency_key=request.idempotency_key,
+                attempt_count=attempt,
+                error_category=last_error_category,
+                elapsed_seconds=max(0.0, clock.time() - started_at),
+                applied_backoff_seconds=applied_backoff_seconds,
+            )
+        if delay > 0:
+            await asyncio.sleep(delay)
+            applied_backoff_seconds += delay
+        delay = min(delay * policy.backoff_multiplier, policy.max_backoff_seconds)
+
+    raise AssertionError("Task terminalization retry loop exited without an outcome.")
+
+
+async def _terminalize_claimed_task(
+    task_store: TaskStore,
+    request: TaskTerminalizationRequest,
+) -> Task:
+    """Use receipt-safe terminalization when supported, with a legacy fallback."""
+
+    if task_store.supports_idempotent_terminalization:
+        return (await terminalize_task_with_retry(task_store, request)).task
+
+    request, _request_sha256 = prepare_task_terminalization(request)
+    if request.kind is TaskTerminalKind.COMPLETED:
+        if request.result is None:  # pragma: no cover - enforced by the request model
+            raise AssertionError("Completed task terminalization requires a result.")
+        return await task_store.complete_task(
+            request.task_id,
+            request.result,
+            worker_id=request.worker_id,
+        )
+    if request.error is None:  # pragma: no cover - enforced by the request model
+        raise AssertionError("Failed task terminalization requires an error.")
+    return await task_store.fail_task(
+        request.task_id,
+        request.error,
+        worker_id=request.worker_id,
+    )
+
+
+async def _terminalize_claimed_task_or_detect_peer_winner(
+    task_store: TaskStore,
+    request: TaskTerminalizationRequest,
+) -> bool:
+    """Terminalize the claim, or conservatively identify a peer winner.
+
+    ``True`` means the task is already terminal and this request's key has no
+    receipt, so another terminalization won. A receipt under this request's key
+    remains an explicit conflict because it may prove changed intent.
+    """
+
+    request, _request_sha256 = prepare_task_terminalization(request)
+    try:
+        await _terminalize_claimed_task(task_store, request)
+    except TaskTerminalizationConflict:
+        if not task_store.supports_idempotent_terminalization:
+            raise
+        receipt = await task_store.load_task_terminalization_receipt(
+            request.task_id,
+            request.idempotency_key,
+        )
+        if receipt is not None:
+            raise
+        task = await task_store.load_task(request.task_id)
+        if task is not None and task.status in _TERMINAL_TASK_STATUSES:
+            return True
+        raise
+    return False
+
+
+def _task_terminalization_error_is_acknowledgement_ambiguous(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (TaskClaimLost, TaskTerminalizationConflict, TypeError, ValueError),
+    ):
+        return False
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    for error_type in type(exc).__mro__:
+        module = error_type.__module__
+        name = error_type.__name__
+        if module == "sqlite3" and name == "OperationalError":
+            error_name = getattr(exc, "sqlite_errorname", None)
+            return isinstance(error_name, str) and (
+                error_name == "SQLITE_IOERR" or error_name.startswith("SQLITE_IOERR_")
+            )
+        if module.startswith("psycopg") and name == "OperationalError":
+            sqlstate = getattr(exc, "sqlstate", None)
+            return sqlstate is None or (isinstance(sqlstate, str) and sqlstate.startswith("08"))
+    return False
+
+
+def _task_terminalization_error_category(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, ConnectionError):
+        return "connection"
+    return "database_operational"
+
+
+def _bounded_task_terminalization_evidence(value: str) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES:
+        return value
+    suffix = f"...[sha256:{sha256(encoded).hexdigest()[:8]}]"
+    prefix_bytes = TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES - len(suffix.encode("utf-8"))
+    prefix = encoded[:prefix_bytes].decode("utf-8", "ignore")
+    return f"{prefix}{suffix}"
 
 
 def copy_task_create(request: TaskCreate) -> TaskCreate:

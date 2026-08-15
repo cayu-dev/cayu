@@ -1,27 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Callable
 
 import pytest
 from pydantic import ValidationError
 from tests.core.task_store_conformance import assert_task_claim_lost_conformance
+from tests.core.task_terminalization_conformance import (
+    assert_task_terminalization_acknowledgement_conformance,
+)
 
 from cayu import (
     InMemoryTaskStore,
     SQLiteTaskStore,
+    Task,
     TaskClaimLost,
     TaskCreate,
     TaskOrder,
     TaskQuery,
     TaskStatus,
     TaskStore,
+    TaskTerminalizationConflict,
+    TaskTerminalizationReceipt,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
 )
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
     extract_durable_value_error,
 )
+from cayu.storage import migrations as schema_migrations
 
 StoreFactory = Callable[[object], TaskStore]
 
@@ -35,6 +45,201 @@ def test_task_stores_task_claim_lost_conformance(store_factory: StoreFactory, tm
             await assert_task_claim_lost_conformance(store)
         finally:
             await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_reject_competing_terminalization_after_winner(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_conflict", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        winner = await store.terminalize_task(
+            TaskTerminalizationRequest(
+                task_id="task_conflict",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"summary": "winner"},
+                idempotency_key="winner-key",
+            )
+        )
+
+        with pytest.raises(TaskTerminalizationConflict):
+            await store.terminalize_task(
+                TaskTerminalizationRequest(
+                    task_id="task_conflict",
+                    worker_id="worker_a",
+                    kind=TaskTerminalKind.FAILED,
+                    error={"message": "loser"},
+                    idempotency_key="loser-key",
+                )
+            )
+
+        loaded = await store.load_task("task_conflict")
+        assert loaded == winner
+        assert loaded is not None
+        assert loaded.status is TaskStatus.COMPLETED
+        assert loaded.result == {"summary": "winner"}
+        assert await store.load_task_terminalization_receipt("task_conflict", "loser-key") is None
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_reject_wrong_worker_before_terminalization(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_wrong_worker", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        with pytest.raises(TaskClaimLost):
+            await store.terminalize_task(
+                TaskTerminalizationRequest(
+                    task_id="task_wrong_worker",
+                    worker_id="worker_b",
+                    kind=TaskTerminalKind.COMPLETED,
+                    result={"summary": "unauthorized"},
+                    idempotency_key="wrong-worker",
+                )
+            )
+        task = await store.load_task("task_wrong_worker")
+        assert task is not None
+        assert task.status is TaskStatus.CLAIMED
+        assert (
+            await store.load_task_terminalization_receipt("task_wrong_worker", "wrong-worker")
+            is None
+        )
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_store_retry_conformance_for_acknowledgement_failures(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await assert_task_terminalization_acknowledgement_conformance(store)
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_replay_exact_terminalization_after_lease_clearance(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_terminal", type="review"))
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
+
+        first = await store.terminalize_task(
+            TaskTerminalizationRequest(
+                task_id="task_terminal",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
+                idempotency_key="terminal-attempt-1",
+            )
+        )
+        replayed = await store.terminalize_task(
+            TaskTerminalizationRequest(
+                task_id="task_terminal",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"metrics": {"checked": 4, "changed": 2}, "summary": "done"},
+                idempotency_key="terminal-attempt-1",
+            )
+        )
+
+        assert first == replayed
+        assert replayed.status is TaskStatus.COMPLETED
+        assert replayed.result == {
+            "summary": "done",
+            "metrics": {"changed": 2, "checked": 4},
+        }
+        assert replayed.worker_id is None
+        assert replayed.lease_expires_at is None
+        receipt = await store.load_task_terminalization_receipt(
+            "task_terminal", "terminal-attempt-1"
+        )
+        assert receipt is not None
+        assert receipt.request_sha256 == (
+            "f44314f4f13d93a708c544e83a90ecb2e2dea4d6dd7f4ceb0512b2f895d364a8"
+        )
+
+        assert first.result is not None
+        first.result["summary"] = "mutated"
+        replayed_again = await store.terminalize_task(
+            TaskTerminalizationRequest(
+                task_id="task_terminal",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
+                idempotency_key="terminal-attempt-1",
+            )
+        )
+        assert replayed_again.result == {
+            "summary": "done",
+            "metrics": {"changed": 2, "checked": 4},
+        }
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_expose_detached_terminalization_receipt(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        assert await store.load_task_terminalization_receipt("task_receipt", "failure-1") is None
+        await store.create_task(TaskCreate(task_id="task_receipt", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        terminal_task = await store.terminalize_task(
+            TaskTerminalizationRequest(
+                task_id="task_receipt",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.FAILED,
+                error={"message": "provider unavailable"},
+                idempotency_key="failure-1",
+            )
+        )
+
+        receipt = await store.load_task_terminalization_receipt("task_receipt", "failure-1")
+        assert type(receipt) is TaskTerminalizationReceipt
+        assert receipt.task_id == "task_receipt"
+        assert receipt.idempotency_key == "failure-1"
+        assert receipt.worker_id == "worker_a"
+        assert receipt.kind is TaskTerminalKind.FAILED
+        assert len(receipt.request_sha256) == 64
+        assert receipt.task == terminal_task
+
+        assert receipt.task.error is not None
+        receipt.task.error["message"] = "mutated"
+        loaded_again = await store.load_task_terminalization_receipt("task_receipt", "failure-1")
+        assert loaded_again is not None
+        assert loaded_again.task.error == {"message": "provider unavailable"}
+        await _close_store(store)
 
     asyncio.run(run_store_operations())
 
@@ -1003,6 +1208,290 @@ def test_task_stores_search_tasks(store_factory: StoreFactory, tmp_path):
         await _close_store(store)
 
     asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_reject_same_key_with_changed_logical_intent(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_changed", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        winner = TaskTerminalizationRequest(
+            task_id="task_changed",
+            worker_id="worker_a",
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "winner"},
+            idempotency_key="shared-key",
+        )
+        terminal = await store.terminalize_task(winner)
+
+        conflicting_requests = (
+            winner.model_copy(update={"worker_id": "worker_b"}),
+            TaskTerminalizationRequest(
+                task_id="task_changed",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.FAILED,
+                error={"message": "failed"},
+                idempotency_key="shared-key",
+            ),
+            winner.model_copy(update={"result": {"summary": "changed"}}),
+        )
+        for conflicting in conflicting_requests:
+            with pytest.raises(TaskTerminalizationConflict):
+                await store.terminalize_task(conflicting)
+
+        assert await store.load_task("task_changed") == terminal
+        receipt = await store.load_task_terminalization_receipt("task_changed", "shared-key")
+        assert receipt is not None
+        assert receipt.task == terminal
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_concurrent_retries_converge_and_conflicts_choose_one_winner(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_exact_race", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        exact = TaskTerminalizationRequest(
+            task_id="task_exact_race",
+            worker_id="worker_a",
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "done"},
+            idempotency_key="race-key",
+        )
+        exact_results = await asyncio.gather(*(store.terminalize_task(exact) for _ in range(8)))
+        assert all(result == exact_results[0] for result in exact_results)
+
+        await store.create_task(TaskCreate(task_id="task_conflict_race", type="review"))
+        assert await store.claim_task("worker_b") is not None
+        requests = (
+            TaskTerminalizationRequest(
+                task_id="task_conflict_race",
+                worker_id="worker_b",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"winner": "completed"},
+                idempotency_key="conflict-key",
+            ),
+            TaskTerminalizationRequest(
+                task_id="task_conflict_race",
+                worker_id="worker_b",
+                kind=TaskTerminalKind.FAILED,
+                error={"winner": "failed"},
+                idempotency_key="conflict-key",
+            ),
+        )
+
+        async def apply(request: TaskTerminalizationRequest):
+            try:
+                return await store.terminalize_task(request)
+            except TaskTerminalizationConflict as exc:
+                return exc
+
+        outcomes = await asyncio.gather(*(apply(request) for request in requests))
+        winners = [outcome for outcome in outcomes if type(outcome) is Task]
+        conflicts = [
+            outcome for outcome in outcomes if isinstance(outcome, TaskTerminalizationConflict)
+        ]
+        assert len(winners) == 1
+        assert len(conflicts) == 1
+        assert await store.load_task("task_conflict_race") == winners[0]
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_sqlite_task_terminalization_receipt_survives_restart(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    store = SQLiteTaskStore(db_path)
+    request = TaskTerminalizationRequest(
+        task_id="task_restart",
+        worker_id="worker_a",
+        kind=TaskTerminalKind.COMPLETED,
+        result={"summary": "done"},
+        idempotency_key="restart-key",
+    )
+
+    async def first_process() -> Task:
+        await store.create_task(TaskCreate(task_id="task_restart", type="review"))
+        assert await store.claim_task("worker_a") is not None
+        terminal = await store.terminalize_task(request)
+        await store.close()
+        return terminal
+
+    terminal = asyncio.run(first_process())
+    reopened = SQLiteTaskStore(db_path)
+
+    async def second_process() -> None:
+        assert await reopened.terminalize_task(request) == terminal
+        receipt = await reopened.load_task_terminalization_receipt("task_restart", "restart-key")
+        assert receipt is not None
+        assert receipt.task == terminal
+        await reopened.close()
+
+    asyncio.run(second_process())
+
+
+def test_sqlite_task_terminalization_converges_across_connections(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    first_store = SQLiteTaskStore(db_path)
+    second_store = SQLiteTaskStore(db_path)
+
+    async def run() -> None:
+        try:
+            await first_store.create_task(TaskCreate(task_id="task_connection_race", type="review"))
+            assert await first_store.claim_task("worker_a") is not None
+            request = TaskTerminalizationRequest(
+                task_id="task_connection_race",
+                worker_id="worker_a",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"summary": "done"},
+                idempotency_key="connection-race",
+            )
+            first, replayed = await asyncio.gather(
+                first_store.terminalize_task(request),
+                second_store.terminalize_task(request),
+            )
+            assert first == replayed
+
+            await first_store.create_task(
+                TaskCreate(task_id="task_connection_conflict", type="review")
+            )
+            assert await first_store.claim_task("worker_b") is not None
+            completed = TaskTerminalizationRequest(
+                task_id="task_connection_conflict",
+                worker_id="worker_b",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"winner": "completed"},
+                idempotency_key="connection-conflict",
+            )
+            failed = TaskTerminalizationRequest(
+                task_id="task_connection_conflict",
+                worker_id="worker_b",
+                kind=TaskTerminalKind.FAILED,
+                error={"winner": "failed"},
+                idempotency_key="connection-conflict",
+            )
+
+            async def apply(store: TaskStore, request: TaskTerminalizationRequest):
+                try:
+                    return await store.terminalize_task(request)
+                except TaskTerminalizationConflict as exc:
+                    return exc
+
+            outcomes = await asyncio.gather(
+                apply(first_store, completed),
+                apply(second_store, failed),
+            )
+            assert sum(type(outcome) is Task for outcome in outcomes) == 1
+            assert (
+                sum(isinstance(outcome, TaskTerminalizationConflict) for outcome in outcomes) == 1
+            )
+        finally:
+            await first_store.close()
+            await second_store.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_revision_thirty_eight_preserves_legacy_terminal_tasks(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    current = SQLiteTaskStore(db_path)
+
+    async def create_legacy_terminal() -> None:
+        await current.create_task(TaskCreate(task_id="legacy_terminal", type="review"))
+        await current.complete_task("legacy_terminal", {"summary": "legacy"})
+        await current.close()
+
+    asyncio.run(create_legacy_terminal())
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_task_terminalization_receipts")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 38")
+        connection.execute("PRAGMA user_version = 37")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+    migrated = SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def validate_migration() -> None:
+        legacy = await migrated.load_task("legacy_terminal")
+        assert legacy is not None
+        assert legacy.status is TaskStatus.COMPLETED
+        assert (
+            await migrated.load_task_terminalization_receipt("legacy_terminal", "new-key") is None
+        )
+        with pytest.raises(TaskTerminalizationConflict):
+            await migrated.terminalize_task(
+                TaskTerminalizationRequest(
+                    task_id="legacy_terminal",
+                    worker_id="worker_a",
+                    kind=TaskTerminalKind.COMPLETED,
+                    result={"summary": "legacy"},
+                    idempotency_key="new-key",
+                )
+            )
+        await migrated.close()
+
+    asyncio.run(validate_migration())
+
+
+def test_sqlite_task_store_rejects_missing_terminalization_receipt_table(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    store = SQLiteTaskStore(db_path)
+    asyncio.run(store.close())
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_task_terminalization_receipts")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="terminalization receipt"):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_revision_thirty_eight_rejects_conflicting_table_before_recording(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    store = SQLiteTaskStore(db_path)
+    asyncio.run(store.close())
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_task_terminalization_receipts")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 38")
+        connection.execute("PRAGMA user_version = 37")
+        connection.execute(
+            "CREATE TABLE cayu_task_terminalization_receipts (task_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="terminalization receipt table"):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        revision = connection.execute("SELECT MAX(revision) FROM cayu_schema_migrations").fetchone()
+    finally:
+        connection.close()
+    assert revision == (37,)
 
 
 def _make_store(store_factory: StoreFactory, tmp_path) -> TaskStore:

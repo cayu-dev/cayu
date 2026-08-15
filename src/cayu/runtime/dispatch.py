@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_durable_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -38,7 +40,16 @@ from cayu.runtime.structured_output import (
     copy_structured_output_spec,
     require_secret_free_structured_output_spec,
 )
-from cayu.runtime.tasks import TaskClaimLost, TaskCreate, TaskOrder, TaskQuery, TaskStore
+from cayu.runtime.tasks import (
+    TaskClaimLost,
+    TaskCreate,
+    TaskOrder,
+    TaskQuery,
+    TaskStore,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+    _terminalize_claimed_task_or_detect_peer_winner,
+)
 from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
@@ -344,10 +355,11 @@ class TaskStoreDispatcher(Dispatcher):
             )
             diagnostic = None
             try:
-                await self._tasks.fail_task(
-                    task.id,
-                    failure_payload,
+                await self._commit_task_terminal(
+                    task_id=task.id,
                     worker_id=worker_id,
+                    kind=TaskTerminalKind.FAILED,
+                    payload=failure_payload,
                 )
             except TaskClaimLost:
                 logger.warning(
@@ -429,14 +441,36 @@ class TaskStoreDispatcher(Dispatcher):
         status: DispatchStatus,
         payload: dict[str, Any],
     ) -> DispatchHandle:
-        """Record the run's terminal outcome, guarded by lease ownership. If this worker lost
-        the lease (the task was reclaimed by another worker), don't clobber its record — log
-        and return a handle marked ``reclaimed``; the reclaiming worker re-runs it."""
+        """Record the run's terminal outcome, guarded by lease ownership.
+
+        If this worker lost the lease or another terminalization already won,
+        preserve the authoritative record and return a handle marked
+        ``reclaimed``.
+        """
         try:
-            if status is DispatchStatus.FAILED:
-                await self._tasks.fail_task(task_id, payload, worker_id=worker_id)
-            else:
-                await self._tasks.complete_task(task_id, payload, worker_id=worker_id)
+            kind = (
+                TaskTerminalKind.FAILED
+                if status is DispatchStatus.FAILED
+                else TaskTerminalKind.COMPLETED
+            )
+            peer_terminalization_won = await self._commit_task_terminal(
+                task_id=task_id,
+                worker_id=worker_id,
+                kind=kind,
+                payload=payload,
+            )
+            if peer_terminalization_won:
+                logger.warning(
+                    "dispatch %s (%s) observed a peer terminalization winner",
+                    request.dispatch_id,
+                    status.value,
+                )
+                return self._handle(
+                    request,
+                    status,
+                    queue_task_id=task_id,
+                    reclaimed=True,
+                )
         except TaskClaimLost:
             # The task is no longer ours (reclaimed / already terminalized elsewhere),
             # so do not clobber its current owner.
@@ -447,6 +481,30 @@ class TaskStoreDispatcher(Dispatcher):
             )
             return self._handle(request, status, queue_task_id=task_id, reclaimed=True)
         return self._handle(request, status, queue_task_id=task_id)
+
+    async def _commit_task_terminal(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        kind: TaskTerminalKind,
+        payload: dict[str, Any],
+    ) -> bool:
+        return await _terminalize_claimed_task_or_detect_peer_winner(
+            self._tasks,
+            TaskTerminalizationRequest(
+                task_id=task_id,
+                worker_id=worker_id,
+                kind=kind,
+                result=payload if kind is TaskTerminalKind.COMPLETED else None,
+                error=payload if kind is TaskTerminalKind.FAILED else None,
+                idempotency_key=_dispatch_terminalization_key(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    kind=kind,
+                ),
+            ),
+        )
 
     async def _recover_stalled_session(
         self,
@@ -822,6 +880,24 @@ def copy_dispatch_handle(handle: DispatchHandle) -> DispatchHandle:
         status=handle.status,
         metadata=copy_durable_json_value(handle.metadata, "metadata"),
     )
+
+
+def _dispatch_terminalization_key(
+    *,
+    task_id: str,
+    worker_id: str,
+    kind: TaskTerminalKind,
+) -> str:
+    identity = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.dispatch-task-terminalization.v1",
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "kind": kind.value,
+        },
+        "dispatch_task_terminalization",
+    )
+    return f"dispatch-task-terminal:v1:{sha256(identity).hexdigest()}"
 
 
 def _dispatch_status_after_event(

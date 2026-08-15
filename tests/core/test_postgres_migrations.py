@@ -296,6 +296,7 @@ def _request(agent_name: str) -> RunRequest:
 _TABLES = (
     "cayu_budget_settlements",
     "cayu_budget_reservations",
+    "cayu_task_terminalization_receipts",
     "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
@@ -664,6 +665,85 @@ def test_migrate_mode_rejects_recorded_revision_thirty_six_with_bad_column(
     asyncio.run(runner())
 
 
+def test_task_store_rejects_recorded_revision_thirty_eight_without_receipt_table(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_task_terminalization_receipts")
+            await conn.commit()
+
+        validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="terminalization receipt table"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
+
+    asyncio.run(runner())
+
+
+def test_revision_thirty_eight_rejects_receipt_table_without_primary_key_before_recording(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 38")
+                await cur.execute("DROP TABLE cayu_task_terminalization_receipts")
+                await cur.execute(
+                    """
+                    CREATE TABLE cayu_task_terminalization_receipts (
+                        task_id TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL,
+                        request_sha256 TEXT NOT NULL,
+                        worker_id TEXT NOT NULL,
+                        terminal_kind TEXT NOT NULL,
+                        task_json JSONB NOT NULL,
+                        committed_at TIMESTAMPTZ NOT NULL
+                    )
+                    """
+                )
+            await conn.commit()
+
+        migrator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="terminalization receipt table"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (37,)
+
+    asyncio.run(runner())
+
+
 def test_latest_migrates_queue_and_event_side_effect_handoff(
     postgres_dsn: str,
 ) -> None:
@@ -701,7 +781,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         task_validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 34"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 38"):
                 await task_validator.ensure_schema()
         finally:
             await task_validator.close()
@@ -819,6 +899,12 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 37"
             )
             assert await cur.fetchone() == ("breaking", 37)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 38"
+            )
+            assert await cur.fetchone() == ("additive", 37)
+            await cur.execute("SELECT to_regclass('cayu_task_terminalization_receipts')")
+            assert (await cur.fetchone())[0] == "cayu_task_terminalization_receipts"
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

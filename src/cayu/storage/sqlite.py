@@ -281,6 +281,10 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskStatusCounts,
     TaskStore,
+    TaskTerminalizationConflict,
+    TaskTerminalizationReceipt,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
     TaskTopologyInconsistent,
     TaskTopologyNode,
     TaskTopologyQuery,
@@ -295,6 +299,7 @@ from cayu.runtime.tasks import (
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
     _raise_task_claim_attach_error,
+    _replay_task_terminalization_receipt,
     _running_task_from_create,
     _task_from_create,
     _validate_task_topology_ancestry,
@@ -303,6 +308,8 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_task_terminalization,
+    prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
 )
 from cayu.storage import _session_store_sql as session_store_sql
@@ -313,7 +320,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 36
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 34
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 38
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -8920,6 +8927,7 @@ class SQLiteTaskStore(TaskStore):
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
+    supports_idempotent_terminalization: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -9419,6 +9427,136 @@ class SQLiteTaskStore(TaskStore):
                 result=None,
                 error=error,
                 worker_id=worker_id,
+            )
+
+    async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
+        request, request_sha256 = prepare_task_terminalization(request)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                receipt_row = self._connection.execute(
+                    "SELECT request_sha256, worker_id, terminal_kind, task_json, committed_at "
+                    "FROM cayu_task_terminalization_receipts "
+                    "WHERE task_id = ? AND idempotency_key = ?",
+                    (request.task_id, request.idempotency_key),
+                ).fetchone()
+                if receipt_row is not None:
+                    receipt = _sqlite_task_terminalization_receipt(
+                        task_id=request.task_id,
+                        idempotency_key=request.idempotency_key,
+                        row=receipt_row,
+                    )
+                    replayed = _replay_task_terminalization_receipt(
+                        request_sha256=request_sha256,
+                        receipt=receipt,
+                        current_task=self._load_task_unlocked(request.task_id),
+                    )
+                    self._connection.commit()
+                    return replayed
+
+                task = self._require_task_unlocked(request.task_id)
+                if task.status in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }:
+                    raise TaskTerminalizationConflict(
+                        "Task is terminal without the matching terminalization receipt."
+                    )
+
+                now = datetime.now(UTC)
+                status = (
+                    TaskStatus.COMPLETED
+                    if request.kind is TaskTerminalKind.COMPLETED
+                    else TaskStatus.FAILED
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET status = ?,
+                        status_reason = NULL,
+                        status_payload_json = NULL,
+                        result_json = ?,
+                        error_json = ?,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        started_at = COALESCE(started_at, ?),
+                        completed_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status IN (?, ?)
+                      AND worker_id = ?
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at > ?
+                    """,
+                    (
+                        str(status),
+                        (
+                            None
+                            if request.result is None
+                            else sqlite_support.json_dumps(request.result)
+                        ),
+                        (
+                            None
+                            if request.error is None
+                            else sqlite_support.json_dumps(request.error)
+                        ),
+                        sqlite_support.format_datetime(now),
+                        sqlite_support.format_datetime(now),
+                        sqlite_support.format_datetime(now),
+                        request.task_id,
+                        str(TaskStatus.CLAIMED),
+                        str(TaskStatus.RUNNING),
+                        request.worker_id,
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self._raise_task_active_lease_error(request.task_id, request.worker_id)
+                terminal_task = self._require_task_unlocked(request.task_id)
+                self._connection.execute(
+                    "INSERT INTO cayu_task_terminalization_receipts "
+                    "(task_id, idempotency_key, request_sha256, worker_id, "
+                    "terminal_kind, task_json, committed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        request.task_id,
+                        request.idempotency_key,
+                        request_sha256,
+                        request.worker_id,
+                        request.kind.value,
+                        sqlite_support.json_dumps(terminal_task.model_dump(mode="json")),
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+                self._connection.commit()
+                return terminal_task.model_copy(deep=True)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def load_task_terminalization_receipt(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskTerminalizationReceipt | None:
+        task_id, idempotency_key = prepare_task_terminalization_receipt_lookup(
+            task_id,
+            idempotency_key,
+        )
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT request_sha256, worker_id, terminal_kind, task_json, committed_at "
+                "FROM cayu_task_terminalization_receipts "
+                "WHERE task_id = ? AND idempotency_key = ?",
+                (task_id, idempotency_key),
+            ).fetchone()
+            if row is None:
+                return None
+            return _sqlite_task_terminalization_receipt(
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                row=row,
             )
 
     async def cancel_task(
@@ -9950,6 +10088,26 @@ class SQLiteTaskStore(TaskStore):
     def _raise_task_claim_attach_error(self, task_id: str, worker_id: str) -> None:
         task = self._require_task_unlocked(task_id)
         _raise_task_claim_attach_error(task, worker_id)
+
+
+def _sqlite_task_terminalization_receipt(
+    *,
+    task_id: str,
+    idempotency_key: str,
+    row: sqlite3.Row,
+) -> TaskTerminalizationReceipt:
+    try:
+        return TaskTerminalizationReceipt(
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            worker_id=row["worker_id"],
+            kind=row["terminal_kind"],
+            request_sha256=row["request_sha256"],
+            task=Task.model_validate(json.loads(row["task_json"])),
+            committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+        )
+    except Exception as exc:
+        raise TaskTerminalizationConflict("Task terminalization receipt is malformed.") from exc
 
 
 def _validate_task_positive_int(value: int, field_name: str) -> int:

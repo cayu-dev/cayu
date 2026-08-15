@@ -47,6 +47,7 @@ _POSTGRES_TABLES = (
     "cayu_mcp_manifest_baselines",
     "cayu_checkpoints",
     "cayu_session_operations",
+    "cayu_task_terminalization_receipts",
     "cayu_tasks",
     "cayu_sessions",
     "cayu_eval_results",
