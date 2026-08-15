@@ -1377,6 +1377,7 @@ def profiled_session_identity(
             "schema": tool.schema,
             "parallel_safe": tool.parallel_safe,
             "effect": tool.effect.value,
+            **({"workspace_mutation": True} if tool.workspace_mutation else {}),
         }
         for tool in registered_agent.tools.values()
     ]

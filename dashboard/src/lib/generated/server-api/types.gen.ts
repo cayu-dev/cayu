@@ -1617,6 +1617,10 @@ export type ApiToolSummary = {
      * Parallel Safe
      */
     parallel_safe: boolean;
+    /**
+     * Workspace Mutation
+     */
+    workspace_mutation: boolean;
 };
 
 /**

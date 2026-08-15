@@ -582,6 +582,7 @@ class E2BRunner(Runner):
     handing the command to E2B.
     """
 
+    pending_command_settlement_cancellation_safe = True
     isolation = "e2b"
 
     def __init__(

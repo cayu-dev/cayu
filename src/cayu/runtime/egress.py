@@ -21,7 +21,7 @@ import tempfile
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, TypeVar
 
 from cayu._exception_groups import (
     add_exception_note_safely,
@@ -29,7 +29,6 @@ from cayu._exception_groups import (
     exception_tree_contains,
     set_exception_cause,
 )
-from cayu._exception_state import exception_state
 from cayu._task_wait import (
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
@@ -37,6 +36,7 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._workspace_mutation import detached_workspace_mutation_process_signal
 from cayu.artifacts import ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.egress import (
@@ -109,6 +109,8 @@ from cayu.runners.base import (
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     copy_exec_command,
+    runner_pending_command_settlement_cancellation_safe,
+    runner_workspace_mutation_settlement,
 )
 from cayu.runtime._binding_cleanup import (
     BindingFinalizeFailure,
@@ -1118,41 +1120,7 @@ def _workspace_dispatch_settlement_kind(
     error: BaseException | None,
 ) -> Literal["complete", "runner_quiescent", "deferred", "uncertain"]:
     """Classify whether one returned command can still mutate its workspace."""
-
-    if result is not None and not result.timed_out and not result.cancelled:
-        return "complete"
-    raw_artifacts: object
-    if result is not None:
-        raw_artifacts = result.artifacts
-    elif error is not None:
-        raw_artifacts = exception_state(error, "artifacts")
-    else:
-        return "uncertain"
-    if type(raw_artifacts) is not list:
-        return "uncertain"
-    cleanup_results: list[tuple[str, str]] = []
-    for artifact in raw_artifacts:
-        if type(artifact) is not dict:
-            continue
-        artifact_fields = cast("dict[str, Any]", artifact)
-        if artifact_fields.get("type") != "cayu.runner_cleanup.v1":
-            continue
-        status = artifact_fields.get("status")
-        if (
-            artifact_fields.get("action") not in {"kill_command", "kill_sandbox"}
-            or type(status) is not str
-        ):
-            return "uncertain"
-        cleanup_results.append((cast("str", artifact_fields["action"]), status))
-    if cleanup_results and all(status == "completed" for _, status in cleanup_results):
-        if any(action == "kill_sandbox" for action, _ in cleanup_results):
-            return "runner_quiescent"
-        return "complete"
-    if cleanup_results and all(
-        status in {"completed", "deferred"} for _, status in cleanup_results
-    ):
-        return "deferred"
-    return "uncertain"
+    return runner_workspace_mutation_settlement(result=result, error=error)
 
 
 def _validated_runner_dispatch_kwargs(
@@ -1188,6 +1156,8 @@ class _EgressManagedRunner(Runner):
     but a caller that closes the runner before binding/finalization still tears
     down the egress proxy/network/grants and CA material.
     """
+
+    pending_command_settlement_cancellation_safe = True
 
     def __init__(
         self,
@@ -1272,6 +1242,36 @@ class _EgressManagedRunner(Runner):
         """Whether command cleanup positively terminated the target sandbox."""
 
         return self._workspace_target_unavailable_after_dispatch
+
+    async def await_pending_command_settlement(self) -> bool:
+        """Join the wrapper-owned dispatch settlement without starting it twice."""
+
+        await self._active_workspace_dispatches_drained.wait()
+        process_signal = self._claim_workspace_dispatch_process_signal()
+        if process_signal is not None:
+            raise process_signal from None
+        return not self._active_workspace_dispatches and not self._uncertain_workspace_dispatches
+
+    def _claim_workspace_dispatch_process_signal(self) -> BaseException | None:
+        """Claim sanitized deferred-settlement control evidence exactly once."""
+
+        process_signals: list[BaseException] = []
+        for dispatch_id, uncertainty in tuple(self._uncertain_workspace_dispatches.items()):
+            process_signal = detached_workspace_mutation_process_signal(uncertainty)
+            if process_signal is None:
+                continue
+            self._uncertain_workspace_dispatches[dispatch_id] = RuntimeError(
+                "Managed runner deferred command settlement remains uncertain."
+            )
+            process_signals.append(process_signal)
+        if len(process_signals) == 1:
+            return process_signals[0]
+        if process_signals:
+            return BaseExceptionGroup(
+                "Managed runner deferred command settlements carried process-control failures.",
+                process_signals,
+            )
+        return None
 
     def workspace_capability(
         self,
@@ -1493,6 +1493,15 @@ class _EgressManagedRunner(Runner):
             )
             return
 
+        if not runner_pending_command_settlement_cancellation_safe(self._runner):
+            self._retire_workspace_dispatch(
+                dispatch_id,
+                error=RuntimeError(
+                    "Managed runner deferred command settlement is not cancellation-safe."
+                ),
+            )
+            return
+
         async def settle_deferred_dispatch() -> None:
             settlement_error: BaseException | None = None
             try:
@@ -1510,7 +1519,10 @@ class _EgressManagedRunner(Runner):
                     operation="Managed runner deferred command settlement",
                 )
             except BaseException as exc:
-                settlement_error = exc
+                settlement_error = detached_workspace_mutation_process_signal(exc) or RuntimeError(
+                    "Managed runner deferred command settlement failed."
+                )
+                del exc
             self._retire_workspace_dispatch(
                 dispatch_id,
                 error=settlement_error,
@@ -1585,6 +1597,15 @@ class _EgressManagedRunner(Runner):
                     [drain_outcome.cancellation, drain_outcome.error],
                 ) from drain_outcome.error
             raise drain_outcome.error
+        process_signal = self._claim_workspace_dispatch_process_signal()
+        if process_signal is not None:
+            if drain_outcome.cancellation is not None:
+                raise BaseExceptionGroup(
+                    "Managed runner command settlement carried a process-control "
+                    "failure after caller cancellation.",
+                    [drain_outcome.cancellation, process_signal],
+                ) from process_signal
+            raise process_signal from None
         if self._uncertain_workspace_dispatches:
             uncertainties = tuple(self._uncertain_workspace_dispatches.values())
             if len(uncertainties) == 1:

@@ -388,15 +388,16 @@ async def _ensure_guest_root(sandbox: Any, root: str) -> None:
         raise RuntimeError(f"Failed to create Modal guest root {root!r} (exit {exit_code}).")
 
 
-async def _terminate(target: Any) -> None:
-    """Best-effort terminate of a Modal object exposing `terminate` (the sandbox)."""
+async def _terminate(target: Any) -> bool:
+    """Best-effort terminate; return only positive completion evidence."""
     if target is None:
-        return
+        return False
     terminate = getattr(target, "terminate", None)
     if terminate is None:
-        return
+        return False
     aio = getattr(terminate, "aio", None)
-    await (aio() if aio is not None else asyncio.to_thread(terminate))
+    result = await (aio() if aio is not None else asyncio.to_thread(terminate))
+    return result is not False
 
 
 async def _terminate_bounded(target: Any) -> bool:
@@ -406,8 +407,10 @@ async def _terminate_bounded(target: Any) -> bool:
     and reported as not-terminated in the cleanup diagnostic.
     """
     try:
-        await asyncio.wait_for(_terminate(target), timeout=DEFAULT_MODAL_CANCEL_TIMEOUT_S)
-        return True
+        return await asyncio.wait_for(
+            _terminate(target),
+            timeout=DEFAULT_MODAL_CANCEL_TIMEOUT_S,
+        )
     except Exception:
         return False
 
@@ -422,7 +425,7 @@ def _cleanup_artifact(adapter: str, terminated: bool) -> dict[str, Any]:
         "type": "cayu.runner_cleanup.v1",
         "adapter": adapter,
         "action": "kill_sandbox",
-        "status": "ok" if terminated else "failed",
+        "status": "completed" if terminated else "failed",
     }
 
 

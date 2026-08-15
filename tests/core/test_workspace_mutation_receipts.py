@@ -10,20 +10,34 @@ import warnings
 from collections.abc import AsyncIterator
 
 import pytest
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._tool_round_executor as tool_round_executor_module
-from cayu._exception_groups import exception_cause
+import cayu.tools._operation_boundary as operation_boundary_module
+import cayu.tools._runner as runner_module
+from cayu._exception_groups import exception_cause, iter_exception_tree
+from cayu._exception_state import set_exception_state
 from cayu.artifacts import ArtifactMetadata, LocalArtifactStore
 from cayu.core import AgentSpec, EventType, Message, Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
     DeterministicWorkspaceBinding,
     Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     EnvironmentSpec,
     GitRepositoryBinding,
     NativeBinding,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runners import LocalRunner
+from cayu.runners import (
+    DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ExecCommand,
+    ExecResult,
+    LocalRunner,
+    Runner,
+    attach_cancellation_artifacts,
+)
 from cayu.runtime import (
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
@@ -125,6 +139,121 @@ class _SingleToolProvider(ModelProvider):
                 id="call-workspace",
                 name=self.tool_name,
                 arguments=self.arguments,
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _DetachedRunnerThenFollowingProvider(ModelProvider):
+    name = "detached-runner-then-following"
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.requests += 1
+        if self.requests == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call-detached-runner",
+                name="detached_runner_mutation",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if self.requests == 2:
+            yield ModelStreamEvent.tool_call(
+                id="call-following-tool",
+                name="following_tool",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _AwaitedRunnerThenFollowingProvider(_DetachedRunnerThenFollowingProvider):
+    name = "awaited-runner-then-following"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        if self.requests == 0:
+            del request
+            self.requests += 1
+            yield ModelStreamEvent.tool_call(
+                id="call-awaited-runner",
+                name="awaited_runner_mutation",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        async for event in super().stream(request):
+            yield event
+
+
+class _AwaitedRunnerAndFollowingProvider(ModelProvider):
+    name = "awaited-runner-and-following"
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.requests += 1
+        if self.requests == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call-awaited-runner",
+                name="awaited_runner_mutation",
+                arguments={},
+            )
+            yield ModelStreamEvent.tool_call(
+                id="call-following-tool",
+                name="following_tool",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _PreDispatchRunnerReuseProvider(ModelProvider):
+    name = "pre-dispatch-runner-reuse"
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.requests += 1
+        if self.requests <= 2:
+            yield ModelStreamEvent.tool_call(
+                id=f"call-pre-dispatch-{self.requests}",
+                name="awaited_runner_mutation",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _ConcurrentFactoryMutationProvider(ModelProvider):
+    name = "concurrent-factory-mutation"
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.requests += 1
+        if self.requests <= 2:
+            yield ModelStreamEvent.tool_call(
+                id="call-awaited-runner",
+                name="awaited_runner_mutation",
+                arguments={},
             )
             yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
             return
@@ -537,6 +666,28 @@ class _DetachedWorkspaceMutationTool(Tool):
         return ToolResult(content="tool completed before mutation settlement")
 
 
+class _SupervisoryDetachedWorkspaceMutationTool(Tool):
+    spec = ToolSpec(
+        name="supervisory_detached_workspace_mutation",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del args
+        assert ctx.workspace is not None
+        mutation = asyncio.create_task(
+            ctx.workspace.create_bytes("settled-after-supervisory-exit.txt", b"settled"),
+            name="test-supervisory-detached-workspace-mutation",
+        )
+        await asyncio.sleep(0)
+        del mutation
+        raise self.failure
+
+
 class _AsyncBlockingWorkspace(LocalWorkspace):
     def __init__(self, root, *, workspace_id: str) -> None:
         super().__init__(root, workspace_id=workspace_id)
@@ -570,6 +721,378 @@ class _DetachedThenBlockingWorkspaceMutationTool(Tool):
         del mutation
         await asyncio.Event().wait()
         raise AssertionError("Cancelled tool execution unexpectedly resumed.")
+
+
+class _BarrierWorkspaceMutationRunner(Runner):
+    def __init__(self, root) -> None:
+        self.root = root
+        self.default_cwd = str(root)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
+        self.started.set()
+        await self.release.wait()
+        (self.root / "detached-runner.txt").write_bytes(b"settled")
+        return ExecResult(stdout="mutated", stdout_bytes=7)
+
+
+class _DeferredBackgroundMutationRunner(Runner):
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self, root) -> None:
+        self.root = root
+        self.default_cwd = str(root)
+        self.started = asyncio.Event()
+        self.settlement_started = asyncio.Event()
+        self.release_mutation = asyncio.Event()
+        self._mutation: asyncio.Task[None] | None = None
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        **kwargs,
+    ) -> ExecResult:
+        del command, kwargs
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            self._mutation = asyncio.create_task(
+                self._finish_mutation(),
+                name="test-deferred-runner-workspace-mutation",
+            )
+            attach_cancellation_artifacts(
+                cancellation,
+                [
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "e2b",
+                        "action": "kill_command",
+                        "status": "deferred",
+                        "timeout_s": 5.0,
+                    }
+                ],
+            )
+            raise
+        raise AssertionError("Deferred mutation runner unexpectedly resumed.")
+
+    async def _finish_mutation(self) -> None:
+        await self.release_mutation.wait()
+        (self.root / "deferred-runner.txt").write_bytes(b"settled")
+
+    async def await_pending_command_settlement(self) -> bool:
+        self.settlement_started.set()
+        assert self._mutation is not None
+        await asyncio.shield(self._mutation)
+        return True
+
+
+class _PreDispatchCancellingMutationRunner(Runner):
+    def __init__(self, root) -> None:
+        self.default_cwd = str(root)
+        self.cancel_preflight = True
+        self.exec_calls = 0
+        self.cancelled_task: asyncio.Task | None = None
+
+    def preflight_exec(self, command: ExecCommand, **kwargs) -> None:
+        del command, kwargs
+        if self.cancel_preflight:
+            self.cancel_preflight = False
+            current = asyncio.current_task()
+            assert current is not None
+            self.cancelled_task = current
+            current.cancel("cancel before public runner dispatch")
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        self.exec_calls += 1
+        return ExecResult()
+
+
+class _BlockedDeferredResultMutationRunner(Runner):
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self, root) -> None:
+        self.root = root
+        self.default_cwd = str(root)
+        self.settlement_started = asyncio.Event()
+        self.release_mutation = asyncio.Event()
+        self.mutation_finished = asyncio.Event()
+        self.settlement_calls = 0
+        self._mutation: asyncio.Task[None] | None = None
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        self._mutation = asyncio.create_task(
+            self._finish_mutation(),
+            name="test-supervisory-deferred-runner-mutation",
+        )
+        return ExecResult(
+            timed_out=True,
+            artifacts=[
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "e2b",
+                    "action": "kill_command",
+                    "status": "deferred",
+                }
+            ],
+        )
+
+    async def _finish_mutation(self) -> None:
+        await self.release_mutation.wait()
+        (self.root / "supervisory-settled.txt").write_bytes(b"settled")
+        self.mutation_finished.set()
+
+    async def await_pending_command_settlement(self) -> bool:
+        self.settlement_calls += 1
+        self.settlement_started.set()
+        assert self._mutation is not None
+        await asyncio.shield(self._mutation)
+        return True
+
+
+class _BlockedSupervisoryDispatchMutationRunner(Runner):
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self, root) -> None:
+        self.root = root
+        self.default_cwd = str(root)
+        self.started = asyncio.Event()
+        self.release_command = asyncio.Event()
+        self.settlement_started = asyncio.Event()
+        self.release_mutation = asyncio.Event()
+        self.mutation_finished = asyncio.Event()
+        self.settlement_calls = 0
+        self._mutation: asyncio.Task[None] | None = None
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        self._mutation = asyncio.create_task(
+            self._finish_mutation(),
+            name="test-supervisory-runner-dispatch-mutation",
+        )
+        self.started.set()
+        await self.release_command.wait()
+        return ExecResult(
+            timed_out=True,
+            artifacts=[
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "e2b",
+                    "action": "kill_command",
+                    "status": "deferred",
+                }
+            ],
+        )
+
+    async def _finish_mutation(self) -> None:
+        await self.release_mutation.wait()
+        (self.root / "supervisory-dispatch-settled.txt").write_bytes(b"settled")
+        self.mutation_finished.set()
+
+    async def await_pending_command_settlement(self) -> bool:
+        self.settlement_calls += 1
+        self.settlement_started.set()
+        assert self._mutation is not None
+        await asyncio.shield(self._mutation)
+        return True
+
+
+class _FailingDeferredBackgroundMutationRunner(Runner):
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self, root) -> None:
+        self.root = root
+        self.default_cwd = str(root)
+        self.started = asyncio.Event()
+        self.release_mutation = asyncio.Event()
+        self.mutation_finished = asyncio.Event()
+        self.reconciliation_started = asyncio.Event()
+        self._mutation: asyncio.Task[None] | None = None
+        self.settlement_calls = 0
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        self._mutation = asyncio.create_task(
+            self._finish_mutation(),
+            name="test-uncertain-runner-workspace-mutation",
+        )
+        self.started.set()
+        return ExecResult(
+            timed_out=True,
+            artifacts=[
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "e2b",
+                    "action": "kill_command",
+                    "status": "deferred",
+                    "timeout_s": 5.0,
+                }
+            ],
+        )
+
+    async def _finish_mutation(self) -> None:
+        await self.release_mutation.wait()
+        (self.root / "uncertain-runner.txt").write_bytes(b"late")
+        self.mutation_finished.set()
+
+    async def await_pending_command_settlement(self) -> bool:
+        self.settlement_calls += 1
+        if self.settlement_calls == 1:
+            raise RuntimeError("PRIVATE_RUNNER_SETTLEMENT_CANARY")
+        self.reconciliation_started.set()
+        await self.mutation_finished.wait()
+        return True
+
+
+class _HostileArtifactDiscriminator:
+    def __init__(self) -> None:
+        self.compared = False
+
+    def __eq__(self, other):
+        del other
+        self.compared = True
+        raise RuntimeError("PRIVATE_ARTIFACT_EQUALITY_CANARY")
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __repr__(self) -> str:
+        return "PRIVATE_ARTIFACT_REPR_CANARY"
+
+
+class _HostileArtifactBackgroundMutationRunner(Runner):
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self, root) -> None:
+        self.root = root
+        self.default_cwd = str(root)
+        self.discriminator = _HostileArtifactDiscriminator()
+        self.started = asyncio.Event()
+        self.release_mutation = asyncio.Event()
+        self.mutation_finished = asyncio.Event()
+        self._mutation: asyncio.Task[None] | None = None
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        self._mutation = asyncio.create_task(
+            self._finish_mutation(),
+            name="test-hostile-artifact-runner-workspace-mutation",
+        )
+        self.started.set()
+        failure = RuntimeError("Runner command failed.")
+        assert set_exception_state(
+            failure,
+            "artifacts",
+            [
+                {
+                    "type": self.discriminator,
+                    "action": "kill_command",
+                    "status": "deferred",
+                }
+            ],
+        )
+        raise failure
+
+    async def _finish_mutation(self) -> None:
+        await self.release_mutation.wait()
+        (self.root / "hostile-artifact-runner.txt").write_bytes(b"late")
+        self.mutation_finished.set()
+
+    async def await_pending_command_settlement(self) -> bool:
+        await self.mutation_finished.wait()
+        return True
+
+
+class _TrackingFinalizeBinding(DeterministicWorkspaceBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finalize_calls = 0
+        self.abandon_calls = 0
+
+    async def finalize(self, bound, *, outcome=None, metadata=None):
+        self.finalize_calls += 1
+        return await super().finalize(
+            bound,
+            outcome=outcome,
+            metadata=metadata,
+        )
+
+    def abandon(self, bound) -> bool:
+        self.abandon_calls += 1
+        return super().abandon(bound)
+
+
+class _AwaitedRunnerMutationTool(Tool):
+    spec = ToolSpec(
+        name="awaited_runner_mutation",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del args
+        assert ctx.runner is not None
+        await ctx.runner.exec(ExecCommand.process("mutate-workspace"))
+        return ToolResult(content="runner mutation completed")
+
+
+class _SupervisoryAwaitedRunnerMutationTool(_AwaitedRunnerMutationTool):
+    def __init__(self) -> None:
+        self.dispatching = False
+        self.task: asyncio.Task | None = None
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        self.task = asyncio.current_task()
+        self.dispatching = True
+        try:
+            return await super().run(ctx, args)
+        finally:
+            self.dispatching = False
+
+
+class _DetachedRunnerMutationTool(Tool):
+    spec = ToolSpec(
+        name="detached_runner_mutation",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del args
+        assert ctx.runner is not None
+        mutation = asyncio.create_task(
+            ctx.runner.exec(ExecCommand.process("mutate-workspace")),
+            name="test-detached-runner-mutation",
+        )
+        await asyncio.sleep(0)
+        del mutation
+        return ToolResult(content="runner mutation dispatched")
+
+
+class _FollowingTool(Tool):
+    spec = ToolSpec(name="following_tool", parallel_safe=False)
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        self.started.set()
+        return ToolResult(content="following tool completed")
 
 
 def test_workspace_mutation_classification_requires_exclusive_effectful_tool() -> None:
@@ -675,6 +1198,1231 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
     assert "created" not in before.model_dump_json()
     assert "created" not in after.model_dump_json()
     assert "created" not in receipt.model_dump_json()
+
+
+def test_detached_runner_mutation_settles_before_receipt_and_following_tool(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="detached-runner-workspace")
+        runner = _BarrierWorkspaceMutationRunner(tmp_path)
+        following = _FollowingTool()
+        provider = _DetachedRunnerThenFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_DetachedRunnerMutationTool(), following],
+        )
+
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-detached-runner-mutation",
+                    messages=[Message.text("user", "write")],
+                ),
+            )
+        )
+        await runner.started.wait()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not consumer.done()
+        assert not following.started.is_set()
+        assert provider.requests == 1
+        before_release = await store.query_events(
+            EventQuery(session_id="session-detached-runner-mutation")
+        )
+        assert not any(
+            record.event.type is EventType.WORKSPACE_MUTATION_RECORDED for record in before_release
+        )
+
+        runner.release.set()
+        public_events = await consumer
+        durable = await store.query_events(
+            EventQuery(session_id="session-detached-runner-mutation")
+        )
+        return public_events, [record.event for record in durable], following, provider
+
+    public_events, durable_events, following, provider = asyncio.run(run())
+
+    receipt = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_MUTATION_RECORDED
+    )
+    assert receipt.payload["status"] == "changed"
+    assert receipt.payload["paths"] == [
+        {"path": "detached-runner.txt", "change": "added", "renamed_from": None}
+    ]
+    assert following.started.is_set()
+    assert provider.requests == 3
+    assert any(event.type is EventType.TOOL_CALL_COMPLETED for event in public_events)
+
+
+@pytest.mark.parametrize(
+    "failure_factory",
+    [
+        lambda: SystemExit(17),
+        lambda: GeneratorExit("supervisor abandoned tool execution"),
+        lambda: BaseExceptionGroup(
+            "supervisory tool failures",
+            [SystemExit(17), RuntimeError("secondary tool cleanup failure")],
+        ),
+    ],
+    ids=("system-exit", "generator-exit", "grouped-system-exit"),
+)
+def test_supervisory_tool_exit_fences_environment_reuse_until_detached_mutation_settles(
+    tmp_path,
+    failure_factory,
+) -> None:
+    async def run():
+        workspace = _AsyncBlockingWorkspace(
+            tmp_path,
+            workspace_id="supervisory-detached-workspace",
+        )
+        provider = _SingleToolProvider(
+            tool_name="supervisory_detached_workspace_mutation",
+            arguments={},
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_SupervisoryDetachedWorkspaceMutationTool(failure_factory())],
+        )
+
+        with pytest.raises(BaseException) as raised:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-supervisory-detached-first",
+                    messages=[Message.text("user", "write")],
+                ),
+            )
+        if isinstance(raised.value, GeneratorExit):
+            assert raised.value.args == ("supervisor abandoned tool execution",)
+        else:
+            signals = [
+                candidate
+                for candidate in iter_exception_tree(raised.value)
+                if isinstance(candidate, SystemExit)
+            ]
+            assert len(signals) == 1
+            assert signals[0].code == 17
+        assert workspace.started.is_set()
+        assert not (tmp_path / "settled-after-supervisory-exit.txt").exists()
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-supervisory-detached-second",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 1
+
+        workspace.release.set()
+        contender_events = await contender
+        durable = await store.query_events(
+            EventQuery(session_id="session-supervisory-detached-first")
+        )
+        return contender_events, [record.event for record in durable], provider
+
+    contender_events, durable_events, provider = asyncio.run(run())
+
+    assert provider.requests == 2
+    assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+    assert (tmp_path / "settled-after-supervisory-exit.txt").read_bytes() == b"settled"
+
+
+def test_cancelled_runner_mutation_returns_promptly_and_fences_reuse(tmp_path) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="cancelled-runner-workspace")
+        runner = _DeferredBackgroundMutationRunner(tmp_path)
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+        session_id = "session-cancelled-runner-mutation"
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "write")],
+                ),
+            )
+        )
+        await runner.started.wait()
+        consumer.cancel("cancel runner mutation")
+        with pytest.raises(asyncio.CancelledError, match="cancel runner mutation"):
+            await asyncio.wait_for(consumer, timeout=1)
+        assert consumer.cancelling() == 1
+        assert consumer.cancelled() is True
+        assert following.started.is_set() is False
+        before_release = await store.query_events(EventQuery(session_id=session_id))
+        assert not any(
+            record.event.type is EventType.WORKSPACE_MUTATION_RECORDED for record in before_release
+        )
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-after-cancelled-runner-mutation",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await runner.settlement_started.wait()
+        assert contender.done() is False
+        assert provider.requests == 1
+        runner.release_mutation.set()
+        contender_events = await contender
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return [record.event for record in durable], contender_events, following, provider
+
+    durable_events, contender_events, following, provider = asyncio.run(run())
+
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+    assert (tmp_path / "deferred-runner.txt").read_bytes() == b"settled"
+    assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
+    assert following.started.is_set() is False
+    assert provider.requests == 2
+
+
+def test_public_runner_cancellation_before_dispatch_does_not_quarantine_reuse(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="pre-dispatch-runner-workspace")
+        runner = _PreDispatchCancellingMutationRunner(tmp_path)
+        provider = _PreDispatchRunnerReuseProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool()],
+        )
+
+        first_events: list = []
+        first_failure: BaseException | None = None
+        first_operation = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-runner-cancelled-before-dispatch",
+                    messages=[Message.text("user", "cancel before dispatch")],
+                ),
+            )
+        )
+        try:
+            first_events = await first_operation
+        except BaseException as exc:
+            first_failure = exc
+        assert runner.exec_calls == 0
+
+        second_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-runner-reused-after-pre-dispatch-cancel",
+                messages=[Message.text("user", "reuse environment")],
+            ),
+        )
+        return first_events, first_failure, first_operation, second_events, runner, provider
+
+    first_events, first_failure, first_operation, second_events, runner, provider = asyncio.run(
+        run()
+    )
+
+    assert first_failure is not None or any(
+        event.type in {EventType.SESSION_INTERRUPTED, EventType.SESSION_FAILED}
+        for event in first_events
+    )
+    assert runner.cancelled_task is not None
+    assert runner.cancelled_task is first_operation
+    assert runner.cancelled_task.cancelling() == 1
+    assert runner.cancelled_task.cancelled() is True
+    assert runner.exec_calls == 1
+    assert provider.requests == 3
+    assert any(event.type is EventType.SESSION_COMPLETED for event in second_events)
+
+
+def test_timed_out_runner_mutation_returns_promptly_and_fences_reuse(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="timed-out-runner-workspace")
+        runner = _DeferredBackgroundMutationRunner(tmp_path)
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            tool_timeout_seconds=0.01,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+        session_id = "session-timed-out-runner-mutation"
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "write")],
+                ),
+            )
+        )
+        public_events = await asyncio.wait_for(consumer, timeout=1)
+        assert following.started.is_set() is False
+        assert provider.requests == 1
+        before_release = await store.query_events(EventQuery(session_id=session_id))
+        assert not any(
+            record.event.type is EventType.WORKSPACE_MUTATION_RECORDED for record in before_release
+        )
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-after-timed-out-runner-mutation",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await runner.settlement_started.wait()
+        assert contender.done() is False
+        assert provider.requests == 1
+        runner.release_mutation.set()
+        contender_events = await contender
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return (
+            public_events,
+            [record.event for record in durable],
+            contender_events,
+            following,
+            provider,
+        )
+
+    public_events, durable_events, contender_events, following, provider = asyncio.run(run())
+
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+    assert (tmp_path / "deferred-runner.txt").read_bytes() == b"settled"
+    terminal = next(event for event in public_events if event.type is EventType.TOOL_CALL_FAILED)
+    assert terminal.payload["terminal_outcome"] == "tool_execution_timeout"
+    assert (
+        terminal.payload["workspace_mutation_capture_detail_code"] == "mutation_settlement_unproven"
+    )
+    assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
+    assert following.started.is_set() is False
+    assert provider.requests == 2
+
+
+def test_supervisory_runner_signal_retains_environment_fence_until_settlement(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="supervisory-runner-workspace")
+        runner = _BlockedDeferredResultMutationRunner(tmp_path)
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+
+        original_wait = runner_module.await_shielded_task_outcome
+        interrupted = False
+
+        async def supervisory_wait(task, **kwargs):
+            nonlocal interrupted
+            if not interrupted and task.get_name() == "cayu-runner-mutation-settlement":
+                interrupted = True
+                await runner.settlement_started.wait()
+                raise GeneratorExit("supervising tool invocation was abandoned")
+            return await original_wait(task, **kwargs)
+
+        monkeypatch.setattr(runner_module, "await_shielded_task_outcome", supervisory_wait)
+
+        first_failure: BaseException | None = None
+        try:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-supervisory-runner-signal",
+                    messages=[Message.text("user", "mutate")],
+                ),
+            )
+        except BaseException as exc:
+            first_failure = exc
+        assert interrupted is True
+        assert runner.mutation_finished.is_set() is False
+        assert following.started.is_set() is False
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-after-supervisory-runner-signal",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 1
+        assert runner.settlement_calls == 1
+
+        runner.release_mutation.set()
+        contender_events = await contender
+        return first_failure, contender_events, runner, following, provider
+
+    first_failure, contender_events, runner, following, provider = asyncio.run(run())
+
+    assert first_failure is not None
+    assert any(
+        isinstance(candidate, GeneratorExit) for candidate in iter_exception_tree(first_failure)
+    )
+    assert runner.mutation_finished.is_set()
+    assert runner.settlement_calls == 1
+    assert following.started.is_set() is False
+    assert provider.requests == 2
+    assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
+
+
+def test_supervisory_exit_during_runner_dispatch_fences_reuse_through_deferred_settlement(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="supervisory-dispatch-workspace")
+        runner = _BlockedSupervisoryDispatchMutationRunner(tmp_path)
+        tool = _SupervisoryAwaitedRunnerMutationTool()
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[tool, following],
+        )
+
+        original_shield = operation_boundary_module.asyncio.shield
+        interrupted = False
+
+        async def supervisory_shield(awaitable):
+            nonlocal interrupted
+            if not interrupted and tool.dispatching and asyncio.current_task() is tool.task:
+                await runner.started.wait()
+                interrupted = True
+                raise GeneratorExit("supervising runner dispatch was abandoned")
+            return await original_shield(awaitable)
+
+        monkeypatch.setattr(operation_boundary_module.asyncio, "shield", supervisory_shield)
+
+        first_failure: BaseException | None = None
+        try:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-supervisory-runner-dispatch",
+                    messages=[Message.text("user", "mutate")],
+                ),
+            )
+        except BaseException as exc:
+            first_failure = exc
+        assert interrupted is True
+        assert runner.started.is_set()
+        assert runner.mutation_finished.is_set() is False
+        assert following.started.is_set() is False
+        before_release = await store.query_events(
+            EventQuery(session_id="session-supervisory-runner-dispatch")
+        )
+        assert not any(
+            record.event.type is EventType.WORKSPACE_MUTATION_RECORDED for record in before_release
+        )
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-after-supervisory-runner-dispatch",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 1
+        assert runner.settlement_calls == 0
+
+        runner.release_command.set()
+        await runner.settlement_started.wait()
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 1
+        assert runner.mutation_finished.is_set() is False
+
+        runner.release_mutation.set()
+        contender_events = await contender
+        return first_failure, contender_events, runner, following, provider
+
+    first_failure, contender_events, runner, following, provider = asyncio.run(run())
+
+    assert isinstance(first_failure, GeneratorExit)
+    assert first_failure.args == ("supervising runner dispatch was abandoned",)
+    assert runner.mutation_finished.is_set()
+    assert runner.settlement_calls == 1
+    assert following.started.is_set() is False
+    assert provider.requests == 2
+    assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
+    assert (tmp_path / "supervisory-dispatch-settled.txt").read_bytes() == b"settled"
+
+
+def test_unproven_runner_mutation_stops_before_receipt_and_following_tool(
+    tmp_path,
+    caplog,
+    capsys,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="uncertain-runner-workspace")
+        runner = _FailingDeferredBackgroundMutationRunner(tmp_path)
+        binding = _TrackingFinalizeBinding()
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+        session_id = "session-uncertain-runner-mutation"
+        public_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "write")],
+            ),
+        )
+        assert runner.started.is_set()
+        assert runner.mutation_finished.is_set() is False
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        transcript = await store.load_transcript(session_id)
+        runner.release_mutation.set()
+        await runner.mutation_finished.wait()
+        return (
+            public_events,
+            [record.event for record in durable],
+            transcript,
+            following,
+            provider,
+            binding,
+        )
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        (
+            public_events,
+            durable_events,
+            transcript,
+            following,
+            provider,
+            binding,
+        ) = asyncio.run(run())
+    captured = capsys.readouterr()
+
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+    terminals = [
+        event
+        for event in durable_events
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    ]
+    assert len(terminals) == 1, [event.type for event in durable_events]
+    terminal = terminals[0]
+    assert terminal.payload["workspace_mutation_capture_status"] == "failed"
+    assert (
+        terminal.payload["workspace_mutation_capture_detail_code"] == "mutation_settlement_unproven"
+    )
+    assert any(event.type is EventType.SESSION_FAILED for event in public_events)
+    assert following.started.is_set() is False
+    assert provider.requests == 1
+    assert binding.finalize_calls == 0
+    assert binding.abandon_calls == 0
+    combined = repr(
+        (
+            [event.model_dump(mode="json") for event in public_events],
+            [event.model_dump(mode="json") for event in durable_events],
+            [message.model_dump(mode="json") for message in transcript],
+            captured_warnings,
+            [record.getMessage() for record in caplog.records],
+            captured.out,
+            captured.err,
+        )
+    )
+    assert "PRIVATE_RUNNER_SETTLEMENT_CANARY" not in combined
+
+
+def test_unproven_runner_mutation_fences_environment_reuse_until_settled(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="shared-runner-workspace")
+        runner = _FailingDeferredBackgroundMutationRunner(tmp_path)
+        binding = _TrackingFinalizeBinding()
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+
+        first = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-uncertain-runner-first",
+                messages=[Message.text("user", "write")],
+            ),
+        )
+        assert any(event.type is EventType.SESSION_FAILED for event in first)
+        assert runner.mutation_finished.is_set() is False
+        assert binding.finalize_calls == 0
+
+        second = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-uncertain-runner-second",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await runner.reconciliation_started.wait()
+        await asyncio.sleep(0)
+        assert second.done() is False
+        assert provider.requests == 1
+        assert binding.finalize_calls == 0
+        assert binding.abandon_calls == 0
+
+        runner.release_mutation.set()
+        second_events = await second
+        first_durable = await store.query_events(
+            EventQuery(session_id="session-uncertain-runner-first")
+        )
+        return first_durable, second_events, provider, following, binding, runner
+
+    first_durable, second_events, provider, following, binding, runner = asyncio.run(run())
+
+    assert not any(
+        record.event.type is EventType.WORKSPACE_MUTATION_RECORDED for record in first_durable
+    )
+    assert any(event.type is EventType.SESSION_COMPLETED for event in second_events)
+    assert runner.mutation_finished.is_set()
+    assert provider.requests == 2
+    assert following.started.is_set() is False
+    assert binding.finalize_calls == 1
+    # The retained first-session binding and the normally completed second
+    # session own distinct bound generations, so each is abandoned exactly
+    # once after the shared mutation fence proves quiescence.
+    assert binding.abandon_calls == 2
+
+
+def test_concurrent_factory_mutations_retain_every_child_settlement_owner(
+    tmp_path,
+) -> None:
+    class ConcurrentFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.initial_pair_created = asyncio.Event()
+            self.runners: dict[str, _FailingDeferredBackgroundMutationRunner] = {}
+            self.bindings: dict[str, _TrackingFinalizeBinding] = {}
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            root = tmp_path / request.session_id
+            root.mkdir()
+            runner = _FailingDeferredBackgroundMutationRunner(root)
+            binding = _TrackingFinalizeBinding()
+            self.runners[request.session_id] = runner
+            self.bindings[request.session_id] = binding
+            if len(self.runners) >= 2:
+                self.initial_pair_created.set()
+            await self.initial_pair_created.wait()
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    workspace=LocalWorkspace(
+                        root,
+                        workspace_id=f"factory-{request.session_id}",
+                    ),
+                    runner=runner,
+                    binding=binding,
+                )
+            )
+
+    async def run():
+        factory = ConcurrentFactory()
+        provider = _ConcurrentFactoryMutationProvider()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool()],
+        )
+
+        first_session = "session-factory-uncertain-a"
+        second_session = "session-factory-uncertain-b"
+        first_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=first_session,
+                    messages=[Message.text("user", "write a")],
+                ),
+            )
+        )
+        second_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=second_session,
+                    messages=[Message.text("user", "write b")],
+                ),
+            )
+        )
+        first_events, second_events = await asyncio.gather(first_task, second_task)
+        assert any(event.type is EventType.SESSION_FAILED for event in first_events)
+        assert any(event.type is EventType.SESSION_FAILED for event in second_events)
+        assert provider.requests == 2
+
+        first_runner = factory.runners[first_session]
+        second_runner = factory.runners[second_session]
+        first_binding = factory.bindings[first_session]
+        second_binding = factory.bindings[second_session]
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-factory-after-uncertainty",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await asyncio.gather(
+            first_runner.reconciliation_started.wait(),
+            second_runner.reconciliation_started.wait(),
+        )
+
+        first_runner.release_mutation.set()
+        await first_runner.mutation_finished.wait()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 2
+        assert len(factory.runners) == 2
+        assert second_binding.finalize_calls == 0
+        assert second_binding.abandon_calls == 0
+
+        second_runner.release_mutation.set()
+        contender_events = await contender
+        return (
+            contender_events,
+            provider,
+            factory,
+            first_runner,
+            second_runner,
+            first_binding,
+            second_binding,
+        )
+
+    (
+        contender_events,
+        provider,
+        factory,
+        first_runner,
+        second_runner,
+        first_binding,
+        second_binding,
+    ) = asyncio.run(run())
+
+    assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
+    assert provider.requests == 3
+    assert len(factory.runners) == 3
+    assert first_runner.settlement_calls == 2
+    assert second_runner.settlement_calls == 2
+    assert first_binding.finalize_calls == 0
+    assert second_binding.finalize_calls == 0
+    assert first_binding.abandon_calls == 1
+    assert second_binding.abandon_calls == 1
+
+
+def test_operator_cleanup_drain_settles_retained_runner_mutation_fence(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="drained-runner-workspace")
+        runner = _FailingDeferredBackgroundMutationRunner(tmp_path)
+        binding = _TrackingFinalizeBinding()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), _FollowingTool()],
+        )
+
+        first = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-uncertain-runner-drain",
+                messages=[Message.text("user", "write")],
+            ),
+        )
+        assert any(event.type is EventType.SESSION_FAILED for event in first)
+
+        drain = asyncio.create_task(app.drain_environment_cleanups(timeout_s=10))
+        await runner.reconciliation_started.wait()
+        await asyncio.sleep(0)
+        assert drain.done() is False
+        assert binding.finalize_calls == 0
+        assert binding.abandon_calls == 0
+
+        runner.release_mutation.set()
+        return await drain, runner, provider, binding
+
+    drained, runner, provider, binding = asyncio.run(run())
+
+    assert drained is True
+    assert runner.mutation_finished.is_set()
+    assert provider.requests == 1
+    # The durable finalize-failure evidence already made this owner safe to
+    # abandon; the drain must not retroactively synchronize the failed run.
+    assert binding.finalize_calls == 0
+    assert binding.abandon_calls == 1
+
+
+def test_cancelled_environment_reuse_wait_keeps_settlement_probe_owned(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="cancelled-reuse-workspace")
+        runner = _FailingDeferredBackgroundMutationRunner(tmp_path)
+        binding = _TrackingFinalizeBinding()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), _FollowingTool()],
+        )
+
+        first = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-uncertain-runner-before-cancelled-reuse",
+                messages=[Message.text("user", "write")],
+            ),
+        )
+        assert any(event.type is EventType.SESSION_FAILED for event in first)
+
+        cancelled_waiter = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-cancelled-runner-reuse",
+                    messages=[Message.text("user", "wait")],
+                ),
+            )
+        )
+        await runner.reconciliation_started.wait()
+        cancelled_waiter.cancel("stop waiting for runner settlement")
+        with pytest.raises(asyncio.CancelledError, match="stop waiting for runner settlement"):
+            await cancelled_waiter
+        assert cancelled_waiter.cancelling() == 1
+        assert cancelled_waiter.cancelled()
+        assert runner.mutation_finished.is_set() is False
+        assert provider.requests == 1
+        assert binding.finalize_calls == 0
+        assert binding.abandon_calls == 0
+
+        runner.release_mutation.set()
+        await runner.mutation_finished.wait()
+        third = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-runner-reuse-after-cancelled-wait",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+        return third, runner, provider, binding
+
+    third, runner, provider, binding = asyncio.run(run())
+
+    assert any(event.type is EventType.SESSION_COMPLETED for event in third)
+    assert runner.settlement_calls == 2
+    assert provider.requests == 2
+    assert binding.finalize_calls == 1
+    assert binding.abandon_calls == 2
+
+
+def test_hostile_runner_artifact_fails_closed_without_diagnostic_leakage(
+    tmp_path,
+    caplog,
+    capsys,
+) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="hostile-artifact-workspace")
+        runner = _HostileArtifactBackgroundMutationRunner(tmp_path)
+        binding = _TrackingFinalizeBinding()
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+        session_id = "session-hostile-runner-artifact"
+        public_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "write")],
+            ),
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        transcript = await store.load_transcript(session_id)
+        assert runner.mutation_finished.is_set() is False
+        runner.release_mutation.set()
+        await runner.mutation_finished.wait()
+        return (
+            public_events,
+            [record.event for record in durable],
+            transcript,
+            runner,
+            following,
+            binding,
+        )
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        (
+            public_events,
+            durable_events,
+            transcript,
+            runner,
+            following,
+            binding,
+        ) = asyncio.run(run())
+    captured = capsys.readouterr()
+
+    assert runner.discriminator.compared is False
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+    terminal = next(
+        event
+        for event in durable_events
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    )
+    assert terminal.payload["workspace_mutation_capture_status"] == "failed"
+    assert (
+        terminal.payload["workspace_mutation_capture_detail_code"] == "mutation_settlement_unproven"
+    )
+    assert any(event.type is EventType.SESSION_FAILED for event in public_events)
+    assert following.started.is_set() is False
+    assert binding.finalize_calls == 0
+    assert binding.abandon_calls == 0
+    combined = repr(
+        (
+            [event.model_dump(mode="json") for event in public_events],
+            [event.model_dump(mode="json") for event in durable_events],
+            [message.model_dump(mode="json") for message in transcript],
+            captured_warnings,
+            [record.getMessage() for record in caplog.records],
+            captured.out,
+            captured.err,
+        )
+    )
+    assert "PRIVATE_ARTIFACT_EQUALITY_CANARY" not in combined
+    assert "PRIVATE_ARTIFACT_REPR_CANARY" not in combined
+
+
+def test_runner_settlement_signal_is_sanitized_at_public_runtime_boundary(
+    tmp_path,
+    caplog,
+    capsys,
+) -> None:
+    class SignalSettlementRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+
+        def __init__(self) -> None:
+            self.default_cwd = str(tmp_path)
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "e2b",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            raise SystemExit("PRIVATE_RUNTIME_SETTLEMENT_SIGNAL_CANARY")
+
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="signal-runner-workspace")
+        runner = SignalSettlementRunner()
+        following = _FollowingTool()
+        provider = _AwaitedRunnerAndFollowingProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+        public_events = []
+        try:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-runner-settlement-signal",
+                    messages=[Message.text("user", "write")],
+                )
+            ):
+                public_events.append(event)
+        except BaseException as failure:
+            durable = await store.query_events(
+                EventQuery(session_id="session-runner-settlement-signal")
+            )
+            transcript = await store.load_transcript("session-runner-settlement-signal")
+            return (
+                failure,
+                public_events,
+                [record.event for record in durable],
+                transcript,
+                following,
+                provider,
+            )
+        raise AssertionError("Settlement process signal did not propagate.")
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        (
+            failure,
+            public_events,
+            durable_events,
+            transcript,
+            following,
+            provider,
+        ) = asyncio.run(run())
+    captured = capsys.readouterr()
+
+    signals = [
+        candidate for candidate in iter_exception_tree(failure) if isinstance(candidate, SystemExit)
+    ]
+    assert len(signals) == 1
+    assert signals[0].code == 1
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+    assert following.started.is_set() is False
+    assert provider.requests == 1
+    for candidate in iter_exception_tree(failure):
+        traceback = candidate.__traceback__
+        while traceback is not None:
+            if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+                assert "PRIVATE_RUNTIME_SETTLEMENT_SIGNAL_CANARY" not in repr(
+                    tuple(traceback.tb_frame.f_locals.values())
+                )
+            traceback = traceback.tb_next
+    combined = repr(
+        (
+            failure,
+            [event.model_dump(mode="json") for event in public_events],
+            [event.model_dump(mode="json") for event in durable_events],
+            [message.model_dump(mode="json") for message in transcript],
+            captured_warnings,
+            [record.getMessage() for record in caplog.records],
+            captured.out,
+            captured.err,
+        )
+    )
+    assert "PRIVATE_RUNTIME_SETTLEMENT_SIGNAL_CANARY" not in combined
 
 
 def test_cayu_app_records_git_workspace_mutation_receipt_before_initial_commit(
@@ -1059,6 +2807,63 @@ def test_multi_call_workspace_receipt_cannot_precede_sibling_secret_scope(
     assert all(
         receipt.payload["detail_code"] == "workspace_evidence_quarantined" for receipt in receipts
     )
+
+
+def test_stream_abandonment_remains_authoritative_during_staged_settlement_failure(
+    tmp_path,
+) -> None:
+    async def run() -> tuple[EventType, bool]:
+        workspace = LocalWorkspace(tmp_path, workspace_id="staged-settlement-workspace")
+        runner = _FailingDeferredBackgroundMutationRunner(tmp_path)
+        following = _FollowingTool()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(_AwaitedRunnerAndFollowingProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+                vault=StaticVault({"unused_dynamic_secret": "private"}),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_AwaitedRunnerMutationTool(), following],
+        )
+
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-staged-settlement-abandonment",
+                messages=[Message.text("user", "mutate and continue")],
+            )
+        )
+        terminal_type: EventType | None = None
+        async for event in stream:
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}:
+                terminal_type = event.type
+                assert (
+                    event.payload["workspace_mutation_capture_detail_code"]
+                    == "mutation_settlement_unproven"
+                )
+                break
+        assert terminal_type is not None
+
+        # Async-generator closure injects a real GeneratorExit at the staged
+        # terminal yield. It must not be replaced by the settlement failure.
+        try:
+            await stream.aclose()
+        finally:
+            runner.release_mutation.set()
+            await runner.mutation_finished.wait()
+        return terminal_type, following.started.is_set()
+
+    terminal_type, following_started = asyncio.run(run())
+
+    assert terminal_type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    assert following_started is False
 
 
 def test_approval_resume_preserves_workspace_receipt_model_step(tmp_path) -> None:
@@ -2469,3 +4274,114 @@ def test_repeated_cancellation_during_mutation_settlement_preserves_original(
             "renamed_from": None,
         }
     ]
+
+
+def test_supervisory_exit_during_cancelled_mutation_close_fences_environment_reuse(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run():
+        workspace = _AsyncBlockingWorkspace(
+            tmp_path,
+            workspace_id="supervisory-cancelled-close-workspace",
+        )
+        provider = _SingleToolProvider(
+            tool_name="detached_then_blocking_workspace_mutation",
+            arguments={},
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=workspace,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_DetachedThenBlockingWorkspaceMutationTool(dispatched=workspace.started)],
+        )
+
+        original_boundary = tool_round_executor_module.await_invocation_operation
+        original_shield = operation_boundary_module.asyncio.shield
+        inside_cancelled_close = False
+        supervisory_delivered = False
+
+        async def tracked_boundary(operation_factory, **kwargs):
+            nonlocal inside_cancelled_close
+            is_cancelled_close = (
+                getattr(operation_factory, "__name__", None) == "close_workspace_mutation_window"
+                and kwargs.get("cancellation") is not None
+            )
+            if not is_cancelled_close:
+                return await original_boundary(operation_factory, **kwargs)
+            inside_cancelled_close = True
+            try:
+                return await original_boundary(operation_factory, **kwargs)
+            finally:
+                inside_cancelled_close = False
+
+        async def supervisory_shield(awaitable):
+            nonlocal supervisory_delivered
+            if inside_cancelled_close and not supervisory_delivered:
+                supervisory_delivered = True
+                raise GeneratorExit("supervisor abandoned cancellation cleanup")
+            return await original_shield(awaitable)
+
+        monkeypatch.setattr(
+            tool_round_executor_module,
+            "await_invocation_operation",
+            tracked_boundary,
+        )
+        monkeypatch.setattr(operation_boundary_module.asyncio, "shield", supervisory_shield)
+
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-supervisory-cancelled-close",
+                    messages=[Message.text("user", "write")],
+                ),
+            )
+        )
+        await workspace.started.wait()
+        consumer.cancel("cancel before supervisory cleanup exit")
+        with pytest.raises(GeneratorExit, match="supervisor abandoned cancellation cleanup"):
+            await consumer
+        assert supervisory_delivered is True
+        assert consumer.cancelling() == 1
+        assert consumer.cancelled() is False
+        assert not (tmp_path / "settled-after-cancellation.txt").exists()
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-after-supervisory-cancelled-close",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 1
+
+        workspace.release.set()
+        contender_events = await contender
+        durable = await store.query_events(
+            EventQuery(session_id="session-supervisory-cancelled-close")
+        )
+        return contender_events, [record.event for record in durable], provider
+
+    contender_events, durable_events, provider = asyncio.run(run())
+
+    assert provider.requests == 2
+    assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+    assert (tmp_path / "settled-after-cancellation.txt").read_bytes() == b"settled"

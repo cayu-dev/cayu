@@ -136,6 +136,7 @@ from cayu.server.sse import (
     SSE_REPLAY_PAGE_EVENTS,
     SSE_SEND_TIMEOUT_SECONDS,
 )
+from cayu.tools import ExecCommandTool
 
 _LOCAL_SERVER_CONFIG = ServerConfig.local_development()
 _SHORT_REPLAY_SERVER_CONFIG = ServerConfig.local_development(
@@ -853,7 +854,7 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
             provider_options={"temperature": 0},
             system_prompt="Review runtime state.",
         ),
-        tools=[UserInputTool()],
+        tools=[UserInputTool(), ExecCommandTool()],
     )
     app.register_environment(
         Environment(
@@ -885,7 +886,15 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
     assert agents_body["agents"][0]["name"] == "reviewer"
     assert agents_body["agents"][0]["metadata"] == {"team": "platform"}
     assert agents_body["agents"][0]["has_system_prompt"] is True
-    assert [tool["name"] for tool in agents_body["agents"][0]["tools"]] == ["ask_user"]
+    tools = {tool["name"]: tool for tool in agents_body["agents"][0]["tools"]}
+    assert set(tools) == {"ask_user", "exec_command"}
+    assert tools["ask_user"]["workspace_mutation"] is False
+    assert tools["exec_command"]["workspace_mutation"] is True
+    agent_detail = client.get("/api/agents/reviewer")
+    assert agent_detail.status_code == 200
+    detail_tools = {tool["name"]: tool for tool in agent_detail.json()["agents"][0]["tools"]}
+    assert detail_tools["ask_user"]["workspace_mutation"] is False
+    assert detail_tools["exec_command"]["workspace_mutation"] is True
 
     environments = client.get("/api/environments")
     assert environments.status_code == 200

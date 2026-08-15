@@ -119,6 +119,16 @@ On `asyncio.CancelledError`, stop the running command, then raise
 `RunnerCancelledError` (a subclass of `asyncio.CancelledError` that carries
 optional cleanup `artifacts`). Do not swallow it.
 
+Cleanup evidence uses the canonical `cayu.runner_cleanup.v1` status values.
+Use `status="completed"` only after the selected `kill_command` or
+`kill_sandbox` boundary positively completed. `failed`, `timeout`,
+`unsupported`, and `skipped` do not prove that workspace mutation stopped. If
+cleanup is still owned asynchronously, report `status="deferred"`, implement
+`await_pending_command_settlement()`, and declare
+`pending_command_settlement_cancellation_safe = True` on the exact runner class
+only when cancelling that waiter stops observation without cancelling or
+releasing the underlying cleanup owner.
+
 ## Build a ModalRunner, step by step
 
 Follow [`examples/modal_runner.py`](../examples/modal_runner.py).

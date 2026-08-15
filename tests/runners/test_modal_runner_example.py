@@ -17,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from cayu import ExecCommand, RunnerCancelledError
+from cayu.runners.base import runner_workspace_mutation_settlement
 
 _EXAMPLE_PATH = Path(__file__).resolve().parents[2] / "examples" / "modal_runner.py"
 
@@ -426,7 +427,24 @@ def test_exec_cancellation_terminates_sandbox_with_diagnostic() -> None:
     assert artifact["type"] == "cayu.runner_cleanup.v1"
     assert artifact["adapter"] == "modal"
     assert artifact["action"] == "kill_sandbox"
-    assert artifact["status"] == "ok"
+    assert artifact["status"] == "completed"
+    assert (
+        runner_workspace_mutation_settlement(result=None, error=excinfo.value) == "runner_quiescent"
+    )
+
+
+def test_exec_cancellation_without_termination_capability_remains_uncertain() -> None:
+    sandbox = FakeSandbox(cancel=True)
+    del sandbox.terminate
+
+    async def run():
+        await mod.ModalRunner(sandbox).exec(ExecCommand.process("x"))
+
+    with pytest.raises(RunnerCancelledError) as excinfo:
+        asyncio.run(run())
+    artifact = excinfo.value.artifacts[0]
+    assert artifact["status"] == "failed"
+    assert runner_workspace_mutation_settlement(result=None, error=excinfo.value) == "uncertain"
 
 
 def test_exec_rejects_cwd_escape() -> None:

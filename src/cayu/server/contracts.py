@@ -1477,6 +1477,7 @@ class ApiToolSummary(ApiBaseModel):
     input_schema: dict[str, Any]
     parallel_safe: StrictBool
     effect: str
+    workspace_mutation: StrictBool
 
 
 class ApiAgentSummary(ApiBaseModel):

@@ -9,6 +9,7 @@ from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     Literal,
     LiteralString,
     NoReturn,
@@ -30,6 +31,7 @@ from pydantic import (
 )
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
+from cayu._exception_state import exception_state
 from cayu._validation import (
     DurableValueError,
     copy_json_value,
@@ -610,6 +612,80 @@ class ExecResult(BaseModel):
         return copy_json_value(value, "artifacts")
 
 
+RunnerWorkspaceMutationSettlement = Literal[
+    "complete",
+    "runner_quiescent",
+    "deferred",
+    "uncertain",
+]
+
+
+def runner_workspace_mutation_settlement(
+    *,
+    result: ExecResult | None,
+    error: BaseException | None,
+) -> RunnerWorkspaceMutationSettlement:
+    """Classify whether a returned command can still mutate its workspace."""
+
+    completed_result = False
+    raw_artifacts: object
+    if result is not None:
+        if type(result) is not ExecResult:
+            return "uncertain"
+        if type(result.timed_out) is not bool or type(result.cancelled) is not bool:
+            return "uncertain"
+        completed_result = not result.timed_out and not result.cancelled
+        raw_artifacts = result.artifacts
+    elif error is not None:
+        raw_artifacts = exception_state(error, "artifacts")
+    else:
+        return "uncertain"
+    if type(raw_artifacts) is not list:
+        return "uncertain"
+    cleanup_results: list[tuple[str, str]] = []
+    for artifact in list(raw_artifacts):
+        if type(artifact) is not dict:
+            continue
+        artifact_type: object | None = None
+        action: object | None = None
+        status: object | None = None
+        artifact_type_present = False
+        for key, value in dict.items(artifact):
+            if type(key) is not str:
+                continue
+            if key == "type":
+                artifact_type_present = True
+                artifact_type = value
+            elif key == "action":
+                action = value
+            elif key == "status":
+                status = value
+        if not artifact_type_present:
+            continue
+        if type(artifact_type) is not str:
+            return "uncertain"
+        if artifact_type != "cayu.runner_cleanup.v1":
+            continue
+        if (
+            type(action) is not str
+            or action not in {"kill_command", "kill_sandbox"}
+            or type(status) is not str
+        ):
+            return "uncertain"
+        cleanup_results.append((action, status))
+    if not cleanup_results:
+        return "complete" if completed_result else "uncertain"
+    if cleanup_results and all(status == "completed" for _, status in cleanup_results):
+        if any(action == "kill_sandbox" for action, _ in cleanup_results):
+            return "runner_quiescent"
+        return "complete"
+    if cleanup_results and all(
+        status in {"completed", "deferred"} for _, status in cleanup_results
+    ):
+        return "deferred"
+    return "uncertain"
+
+
 class Runner(ABC):
     """Executes commands/code in a workspace or sandbox.
 
@@ -628,6 +704,15 @@ class Runner(ABC):
       out-of-band that no stale command is running.
     - ``close()`` is terminal for command execution, even for adapters whose
       configured close action intentionally leaves a remote sandbox alive.
+    """
+
+    pending_command_settlement_cancellation_safe: ClassVar[bool] = False
+    """Whether the deferred-settlement waiter can be cancelled as an observer.
+
+    Cancellation of this waiter never proves that the underlying command has
+    stopped. The flag only permits Cayu to run the waiter in a caller-owned
+    event loop and cancel that observation during loop shutdown while keeping
+    the environment mutation fence closed for a later fresh probe.
     """
 
     isolation: str = "unknown"
@@ -903,4 +988,15 @@ class Runner(ABC):
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
         await self.close()
+        return False
+
+
+def runner_pending_command_settlement_cancellation_safe(runner: Runner) -> bool:
+    """Read one exact class-level settlement observer safety declaration."""
+
+    try:
+        runner_type = type(runner)
+        namespace = type.__getattribute__(runner_type, "__dict__")
+        return namespace.get("pending_command_settlement_cancellation_safe") is True
+    except BaseException:
         return False

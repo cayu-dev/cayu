@@ -7,17 +7,94 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
+from cayu._exception_groups import exception_tree_contains
+
 _ResultT = TypeVar("_ResultT")
 _CHILD_CANCELLATION_MESSAGE = "Invocation operation cancelled by caller."
 
 
 @dataclass(frozen=True, slots=True)
 class InvocationOperationOutcome(Generic[_ResultT]):
-    """One extension outcome plus independently authenticated caller cancellation."""
+    """One extension outcome plus independently authenticated caller cancellation.
 
+    ``operation_started=False`` is authoritative proof that the operation factory
+    was never invoked. ``True`` is conservative: the operation may have dispatched
+    external work even when no result is available.
+    """
+
+    operation_started: bool
     result: _ResultT | None = None
     error: BaseException | None = None
     cancellation: asyncio.CancelledError | None = None
+
+
+@dataclass(slots=True)
+class _InvocationOperationState:
+    """Boundary-owned proof that the operation factory began executing."""
+
+    started: bool = False
+
+
+class _RetainedInvocationOperationProbe:
+    """Retain one exact child until a later fence can prove it stopped."""
+
+    __slots__ = ("__child",)
+
+    def __init__(
+        self,
+        child: asyncio.Future[InvocationOperationOutcome[Any]],
+    ) -> None:
+        self.__child = child
+        child.add_done_callback(_observe_retained_invocation_operation)
+
+    async def __call__(self) -> bool:
+        child = self.__child
+        if not child.done() and child.get_loop() is not asyncio.get_running_loop():
+            return False
+        if not child.done():
+            try:
+                await asyncio.shield(child)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                if not child.done():
+                    raise
+        return child.done()
+
+    async def outcome(self) -> InvocationOperationOutcome[Any] | None:
+        """Return the exact retained outcome when its owner task settled safely."""
+
+        child = self.__child
+        if not child.done() and child.get_loop() is not asyncio.get_running_loop():
+            return None
+        if not child.done():
+            try:
+                await asyncio.shield(child)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                if not child.done():
+                    raise
+        if not child.done() or child.cancelled():
+            return None
+        try:
+            outcome = child.result()
+        except BaseException:
+            return None
+        return outcome if type(outcome) is InvocationOperationOutcome else None
+
+
+def _observe_retained_invocation_operation(
+    child: asyncio.Future[InvocationOperationOutcome[Any]],
+) -> None:
+    """Consume a detached child's task exception without discarding its result."""
+
+    if child.cancelled():
+        return
+    try:
+        child.exception()
+    except BaseException:
+        return
 
 
 class InvocationOperationCapacityError(RuntimeError):
@@ -91,6 +168,9 @@ async def await_invocation_operation(
     cancellation: asyncio.CancelledError | None = None,
     abandon_on_caller_cancellation: bool = False,
     operation_registry: BoundedInvocationOperationRegistry | None = None,
+    on_unsettled_supervisory_exit: (
+        Callable[[_RetainedInvocationOperationProbe], None] | None
+    ) = None,
 ) -> InvocationOperationOutcome[_ResultT]:
     """Run an extension in an owned task without surrendering caller cancellation.
 
@@ -123,6 +203,8 @@ async def await_invocation_operation(
         raise TypeError("abandon_on_caller_cancellation must be a bool.")
     if cancellation is not None and not isinstance(cancellation, asyncio.CancelledError):
         raise TypeError("cancellation must be a CancelledError or None.")
+    if on_unsettled_supervisory_exit is not None and not callable(on_unsettled_supervisory_exit):
+        raise TypeError("on_unsettled_supervisory_exit must be callable or None.")
     if abandon_on_caller_cancellation != (operation_registry is not None):
         raise ValueError(
             "abandon_on_caller_cancellation requires exactly one bounded operation registry."
@@ -146,9 +228,13 @@ async def await_invocation_operation(
         observed_requests = 0 if current_task is None else current_task.cancelling()
 
     if cancellation is not None and not resume_after_cancellation:
-        return InvocationOperationOutcome(cancellation=cancellation)
+        return InvocationOperationOutcome(
+            operation_started=False,
+            cancellation=cancellation,
+        )
 
     child: asyncio.Future[InvocationOperationOutcome[_ResultT]] | None = None
+    operation_state = _InvocationOperationState()
     factory_error: BaseException | None = None
     registry_reserved = False
     if operation_registry is not None:
@@ -159,7 +245,9 @@ async def await_invocation_operation(
             )
     if factory_error is None:
         try:
-            child = asyncio.ensure_future(_capture_child_operation(operation_factory))
+            child = asyncio.ensure_future(
+                _capture_child_operation(operation_factory, operation_state)
+            )
             if operation_registry is not None:
                 operation_registry.track(child)
                 registry_reserved = False
@@ -179,6 +267,7 @@ async def await_invocation_operation(
             if cancellation is None:
                 cancellation = exc
         return InvocationOperationOutcome(
+            operation_started=False,
             error=factory_error,
             cancellation=cancellation,
         )
@@ -196,10 +285,32 @@ async def await_invocation_operation(
                 if request_child_cancellation:
                     child.cancel(_CHILD_CANCELLATION_MESSAGE)
                 if abandon_on_caller_cancellation:
-                    return InvocationOperationOutcome(cancellation=cancellation)
+                    return InvocationOperationOutcome(
+                        # The retained child can still begin after this caller
+                        # stops waiting, so absence of an observed start is not
+                        # authoritative no-dispatch evidence here.
+                        operation_started=True,
+                        cancellation=cancellation,
+                    )
                 continue
             if child.done():
                 break
+            raise
+        except BaseExceptionGroup as exc:
+            if on_unsettled_supervisory_exit is not None and exception_tree_contains(
+                exc,
+                (KeyboardInterrupt, SystemExit, GeneratorExit),
+            ):
+                on_unsettled_supervisory_exit(_RetainedInvocationOperationProbe(child))
+            del child, on_unsettled_supervisory_exit, operation_state
+            raise
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            if on_unsettled_supervisory_exit is not None:
+                # A command child that completed concurrently can still carry
+                # deferred external cleanup. Let the caller inspect its exact
+                # outcome rather than treating task completion as quiescence.
+                on_unsettled_supervisory_exit(_RetainedInvocationOperationProbe(child))
+            del child, on_unsettled_supervisory_exit, operation_state
             raise
 
     # Child completion and caller cancellation can become ready in the same
@@ -216,16 +327,38 @@ async def await_invocation_operation(
                 cancellation = exc
         else:
             raise
+    except BaseExceptionGroup as exc:
+        if on_unsettled_supervisory_exit is not None and exception_tree_contains(
+            exc,
+            (KeyboardInterrupt, SystemExit, GeneratorExit),
+        ):
+            on_unsettled_supervisory_exit(_RetainedInvocationOperationProbe(child))
+        del child, on_unsettled_supervisory_exit, operation_state
+        raise
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        if on_unsettled_supervisory_exit is not None:
+            # Even a completed command coroutine may report deferred external
+            # cleanup. Transfer its exact outcome before control leaves this
+            # final post-completion checkpoint.
+            on_unsettled_supervisory_exit(_RetainedInvocationOperationProbe(child))
+        del child, on_unsettled_supervisory_exit, operation_state
+        raise
 
     if child.done():
         try:
             child_outcome = child.result()
         except BaseException as exc:
-            child_outcome = InvocationOperationOutcome(error=exc)
+            child_outcome = InvocationOperationOutcome(
+                operation_started=operation_state.started,
+                error=exc,
+            )
     if operation_registry is not None:
         operation_registry.release(child)
     child = None
     return InvocationOperationOutcome(
+        operation_started=(
+            operation_state.started if child_outcome is None else child_outcome.operation_started
+        ),
         result=None if child_outcome is None else child_outcome.result,
         error=None if child_outcome is None else child_outcome.error,
         cancellation=cancellation,
@@ -234,15 +367,23 @@ async def await_invocation_operation(
 
 async def _capture_child_operation(
     operation_factory: Callable[[], Awaitable[_ResultT]],
+    operation_state: _InvocationOperationState,
 ) -> InvocationOperationOutcome[_ResultT]:
     """Dispatch and await an extension entirely inside its owned child task."""
 
     operation: Awaitable[_ResultT] | None = None
     try:
+        operation_state.started = True
         operation = operation_factory()
         result = await operation
     except BaseException as error:
-        return InvocationOperationOutcome(error=error)
+        return InvocationOperationOutcome(
+            operation_started=True,
+            error=error,
+        )
     finally:
-        del operation_factory, operation
-    return InvocationOperationOutcome(result=result)
+        del operation_factory, operation, operation_state
+    return InvocationOperationOutcome(
+        operation_started=True,
+        result=result,
+    )

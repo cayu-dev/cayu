@@ -14,6 +14,7 @@ class ShieldedTaskOutcome(Generic[_ResultT]):
     result: _ResultT | None = None
     error: BaseException | None = None
     cancellation: asyncio.CancelledError | None = None
+    cancellation_requests_consumed: int = 0
     timed_out: bool = False
 
 
@@ -68,6 +69,7 @@ async def await_shielded_task_outcome(
 
     current_task = asyncio.current_task()
     historical_requests = 0 if current_task is None else current_task.cancelling()
+    cancellation_requests_consumed = 0
     loop = asyncio.get_running_loop()
     deadline = None if timeout_s is None else loop.time() + timeout_s
     if cancellation is not None and timeout_after_cancellation_s is not None:
@@ -81,11 +83,13 @@ async def await_shielded_task_outcome(
             return ShieldedTaskOutcome(
                 result=task.result(),
                 cancellation=cancellation,
+                cancellation_requests_consumed=cancellation_requests_consumed,
             )
         except BaseException as child_error:
             return ShieldedTaskOutcome(
                 error=child_error,
                 cancellation=cancellation,
+                cancellation_requests_consumed=cancellation_requests_consumed,
             )
 
     def capture_pending_cancellation(
@@ -93,16 +97,21 @@ async def await_shielded_task_outcome(
         *,
         preserve_requests: int,
     ) -> bool:
-        nonlocal cancellation, deadline
+        nonlocal cancellation, cancellation_requests_consumed, deadline
         if current_task is None or current_task.cancelling() <= preserve_requests:
             return False
         # This helper deliberately suppresses cancellation only long enough to
         # classify the child outcome. Normalize every request now so nested
         # cleanup phases do not rediscover and duplicate the same cancellation;
         # the returned outcome makes its wrapper responsible for redelivery.
+        requests_before_consumption = current_task.cancelling()
         cancellation = consume_pending_task_cancellation(
             cancellation or observed,
             preserve_requests=preserve_requests,
+        )
+        cancellation_requests_consumed += max(
+            requests_before_consumption - current_task.cancelling(),
+            0,
         )
         if timeout_after_cancellation_s is not None:
             cancellation_deadline = loop.time() + timeout_after_cancellation_s
@@ -116,10 +125,16 @@ async def await_shielded_task_outcome(
         # One request belongs to the delivered signal; older handled requests
         # remain historical state and must not be claimed by this cleanup.
         preserve_requests = max(historical_requests - 1, 0)
+        requests_before_consumption = historical_requests
         cancellation = consume_pending_task_cancellation(
             cancellation,
             preserve_requests=preserve_requests,
         )
+        if current_task is not None:
+            cancellation_requests_consumed += max(
+                requests_before_consumption - current_task.cancelling(),
+                0,
+            )
         historical_requests = preserve_requests
 
     # Use a real cancellation checkpoint to distinguish a request that has not
@@ -149,6 +164,7 @@ async def await_shielded_task_outcome(
     if deadline is not None and loop.time() >= deadline:
         return ShieldedTaskOutcome(
             cancellation=cancellation,
+            cancellation_requests_consumed=cancellation_requests_consumed,
             timed_out=True,
         )
     while not task.done():
@@ -160,6 +176,7 @@ async def await_shielded_task_outcome(
                 if remaining <= 0:
                     return ShieldedTaskOutcome(
                         cancellation=cancellation,
+                        cancellation_requests_consumed=cancellation_requests_consumed,
                         timed_out=True,
                     )
                 await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
@@ -176,6 +193,7 @@ async def await_shielded_task_outcome(
             if not task.done():
                 return ShieldedTaskOutcome(
                     cancellation=cancellation,
+                    cancellation_requests_consumed=cancellation_requests_consumed,
                     timed_out=True,
                 )
         except BaseException:

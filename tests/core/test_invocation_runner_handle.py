@@ -10,12 +10,18 @@ from typing import Any
 import pytest
 from pydantic import SecretStr, ValidationError
 from tests.core._workload_secret_support import FakeProvider, collect_events
-from tests.provider_traceback_assertions import is_cayu_source_filename
+from tests.provider_traceback_assertions import (
+    assert_cayu_traceback_does_not_retain,
+    is_cayu_source_filename,
+)
 
 import cayu.runners.local as local_runner_module
 import cayu.runtime._invocation_secrets as invocation_secrets_module
+import cayu.tools._operation_boundary as operation_boundary_module
+import cayu.tools._resources as resources_module
 import cayu.tools._runner as runner_module
 from cayu._exception_groups import iter_exception_tree
+from cayu._workspace_mutation import WorkspaceMutationProcessFence
 from cayu.core import AgentSpec, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
@@ -31,11 +37,15 @@ from cayu.runners import (
     RunnerUnavailableError,
     attach_cancellation_artifacts,
 )
-from cayu.runners._cleanup import sanitize_runner_artifacts
+from cayu.runners._cleanup import runner_cancellation_failure, sanitize_runner_artifacts
 from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest, SessionStatus
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
 from cayu.runtime._tool_execution import run_tool
 from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._resources import (
+    InvocationWorkspaceMutationOwner,
+    WorkspaceMutationSettlementError,
+)
 from cayu.tools._runner import (
     InvocationRunnerHandle,
     is_current_runner_cancellation_group,
@@ -170,6 +180,121 @@ class _RevisionRunner(Runner):
         self.started.set()
         await self.release.wait()
         return self.result
+
+
+class _DeferredSettlementRunner(Runner):
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self, *, cancelled: bool) -> None:
+        self.cancelled = cancelled
+        self.started: asyncio.Event | None = None
+        self.settlement_started: asyncio.Event | None = None
+        self.release_settlement: asyncio.Event | None = None
+        self.settlement_calls = 0
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        assert self.started is not None
+        self.started.set()
+        artifact = {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "deferred",
+            "timeout_s": 5.0,
+        }
+        if not self.cancelled:
+            return ExecResult(timed_out=True, artifacts=[artifact])
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            attach_cancellation_artifacts(cancellation, [artifact])
+            raise
+        raise AssertionError("Cancellation runner unexpectedly resumed.")
+
+    async def await_pending_command_settlement(self) -> bool:
+        self.settlement_calls += 1
+        assert self.settlement_started is not None
+        assert self.release_settlement is not None
+        self.settlement_started.set()
+        await self.release_settlement.wait()
+        return True
+
+
+class _PostReturnMutatingSettlementRunner(_DeferredSettlementRunner):
+    """Mutate extension-owned evidence after the dispatch boundary receives it."""
+
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self) -> None:
+        super().__init__(cancelled=False)
+        self.result_mutated: asyncio.Event | None = None
+        self.returned_result: ExecResult | None = None
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        result = await super().exec(command, **kwargs)
+        self.returned_result = result
+        asyncio.get_running_loop().call_soon(self._mutate_returned_result)
+        return result
+
+    def _mutate_returned_result(self) -> None:
+        assert self.returned_result is not None
+        assert self.result_mutated is not None
+        self.returned_result.timed_out = False
+        self.returned_result.artifacts.clear()
+        self.result_mutated.set()
+
+
+class _PostRaiseMutatingSettlementRunner(_DeferredSettlementRunner):
+    """Mutate exception cleanup evidence after the dispatch boundary receives it."""
+
+    pending_command_settlement_cancellation_safe = True
+
+    def __init__(self) -> None:
+        super().__init__(cancelled=False)
+        self.error_mutated: asyncio.Event | None = None
+        self.returned_error: RuntimeError | None = None
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        assert self.started is not None
+        self.started.set()
+        error = RuntimeError("runner dispatch failed")
+        error.artifacts = [
+            {
+                "type": "cayu.runner_cleanup.v1",
+                "adapter": "e2b",
+                "action": "kill_command",
+                "status": "deferred",
+                "timeout_s": 5.0,
+            }
+        ]
+        self.returned_error = error
+        asyncio.get_running_loop().call_soon(self._mutate_returned_error)
+        raise error
+
+    def _mutate_returned_error(self) -> None:
+        assert self.returned_error is not None
+        assert self.error_mutated is not None
+        self.returned_error.artifacts.clear()
+        self.error_mutated.set()
+
+
+class _UncertainTimeoutRunner(Runner):
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        return ExecResult(
+            timed_out=True,
+            artifacts=[
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "e2b",
+                    "action": "kill_command",
+                    "status": "timeout",
+                    "timeout_s": 5.0,
+                }
+            ],
+        )
 
 
 class _OpaqueFailureRunner(Runner):
@@ -1741,6 +1866,67 @@ def test_invocation_runner_handle_preserves_cancellation_before_dispatch() -> No
     assert runner.started.is_set() is False
 
 
+def test_runner_cancellation_before_owned_dispatch_does_not_quarantine_reuse() -> None:
+    class PreDispatchCancellingRunner(Runner):
+        def __init__(self) -> None:
+            self.cancel_preflight = True
+            self.exec_calls = 0
+
+        def preflight_exec(self, command: ExecCommand, **kwargs) -> None:
+            del command, kwargs
+            if self.cancel_preflight:
+                self.cancel_preflight = False
+                current = asyncio.current_task()
+                assert current is not None
+                current.cancel("cancel before owned runner dispatch")
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            self.exec_calls += 1
+            return ExecResult()
+
+    runner = PreDispatchCancellingRunner()
+    fence = WorkspaceMutationProcessFence()
+
+    def handle(owner: InvocationWorkspaceMutationOwner) -> InvocationRunnerHandle:
+        return InvocationRunnerHandle(
+            runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+            mutation_owner=owner,
+        )
+
+    async def scenario() -> tuple[asyncio.Task[ExecResult], ExecResult]:
+        first_owner = InvocationWorkspaceMutationOwner(
+            on_settlement_unproven=fence.fail_closed,
+        )
+        first = asyncio.create_task(handle(first_owner).exec(ExecCommand.process("not-dispatched")))
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="cancel before owned runner dispatch",
+        ):
+            await first
+        await first_owner.seal_and_wait()
+        fence.require_available_nowait()
+
+        second_owner = InvocationWorkspaceMutationOwner(
+            on_settlement_unproven=fence.fail_closed,
+        )
+        result = await handle(second_owner).exec(ExecCommand.process("dispatched"))
+        await second_owner.seal_and_wait()
+        fence.require_available_nowait()
+        return first, result
+
+    first, result = asyncio.run(scenario())
+
+    assert first.cancelling() == 1
+    assert first.cancelled() is True
+    assert runner.exec_calls == 1
+    assert result.exit_code == 0
+
+
 def test_invocation_runner_handle_redacts_caller_cancellation_reason() -> None:
     secret = "caller-cancellation-secret-canary-ABCDEFGHIJKLMNOP"
     runner = _BlockingRunner()
@@ -2762,6 +2948,989 @@ def test_invocation_runner_handle_rejects_invalid_redactor_before_dispatch() -> 
         asyncio.run(handle.exec(ExecCommand.process("never-dispatched")))
 
     assert runner.started is None
+
+
+def test_invocation_runner_handle_rejects_dispatch_after_mutation_window_seals() -> None:
+    runner = _RevisionRunner(ExecResult())
+    owner = InvocationWorkspaceMutationOwner()
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=owner,
+    )
+
+    async def scenario() -> RunnerExecutionError:
+        await owner.seal_and_wait()
+        with pytest.raises(RunnerExecutionError) as raised:
+            await handle.exec(ExecCommand.process("must-not-dispatch"))
+        return raised.value
+
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        failure = asyncio.run(scenario())
+
+    assert runner.last_kwargs == {}
+    assert failure.diagnostic["error_type"] == "RuntimeError"
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
+    assert not any("never awaited" in str(record.message) for record in emitted)
+
+
+def test_supervisory_exit_during_owner_settlement_transfers_pending_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[SystemExit, SystemExit, bool]:
+        fence = WorkspaceMutationProcessFence()
+        owner = InvocationWorkspaceMutationOwner(
+            on_settlement_unproven=fence.fail_closed,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def mutation() -> str:
+            started.set()
+            await release.wait()
+            return "settled"
+
+        operation = asyncio.create_task(owner.run(mutation))
+        await started.wait()
+        original_shield = asyncio.shield
+        signal = SystemExit(17)
+
+        async def supervisory_shield(awaitable):  # type: ignore[no-untyped-def]
+            del awaitable
+            raise signal
+
+        monkeypatch.setattr(resources_module.asyncio, "shield", supervisory_shield)
+        try:
+            with pytest.raises(SystemExit) as raised:
+                await owner.seal_and_wait()
+        finally:
+            monkeypatch.setattr(resources_module.asyncio, "shield", original_shield)
+
+        settlement = asyncio.create_task(fence.wait_until_available())
+        await asyncio.sleep(0)
+        assert settlement.done() is False
+
+        release.set()
+        assert await operation == "settled"
+        await settlement
+        return raised.value, signal, operation.done()
+
+    raised_signal, original_signal, operation_done = asyncio.run(scenario())
+
+    assert raised_signal is original_signal
+    assert raised_signal.code == 17
+    assert operation_done is True
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_invocation_runner_handle_retains_deferred_mutation_until_positive_settlement(
+    cancelled: bool,
+) -> None:
+    runner = _DeferredSettlementRunner(cancelled=cancelled)
+    fence = WorkspaceMutationProcessFence()
+    owner = InvocationWorkspaceMutationOwner(
+        on_settlement_unproven=fence.fail_closed,
+    )
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=owner,
+    )
+
+    async def scenario() -> tuple[asyncio.Task[ExecResult], ExecResult | None]:
+        runner.started = asyncio.Event()
+        runner.settlement_started = asyncio.Event()
+        runner.release_settlement = asyncio.Event()
+        operation = asyncio.create_task(handle.exec(ExecCommand.process("mutate")))
+        await runner.started.wait()
+        if cancelled:
+            operation.cancel("stop mutating command")
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError, match="stop mutating command"):
+                await operation
+            with pytest.raises(WorkspaceMutationSettlementError):
+                await owner.seal_and_wait()
+            fence_waiter = asyncio.create_task(fence.wait_until_available())
+            await runner.settlement_started.wait()
+            assert fence_waiter.done() is False
+            runner.release_settlement.set()
+            await fence_waiter
+            result = None
+        else:
+            await runner.settlement_started.wait()
+            await asyncio.sleep(0)
+            assert operation.done() is False
+            runner.release_settlement.set()
+            result = await operation
+            await owner.seal_and_wait()
+        fence.require_available_nowait()
+        return operation, result
+
+    operation, result = asyncio.run(scenario())
+
+    assert operation.cancelled() is cancelled
+    assert operation.cancelling() == int(cancelled)
+    assert runner.settlement_calls == 1
+    if result is not None:
+        assert result.timed_out is True
+
+
+def test_invocation_runner_handle_fails_closed_without_mutation_settlement_proof() -> None:
+    owner = InvocationWorkspaceMutationOwner()
+    handle = InvocationRunnerHandle(
+        _UncertainTimeoutRunner(),
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=owner,
+    )
+
+    async def scenario() -> ExecResult:
+        result = await handle.exec(ExecCommand.process("mutate"))
+        with pytest.raises(WorkspaceMutationSettlementError):
+            await owner.seal_and_wait()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result.timed_out is True
+
+
+@pytest.mark.parametrize("declaration", ("inherited", "wrong_type"))
+def test_invocation_runner_handle_does_not_start_unsafe_settlement_waiter(
+    declaration: str,
+) -> None:
+    class DeclaredSettlementRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+
+    class UnsafeSettlementRunner(DeclaredSettlementRunner):
+        def __init__(self) -> None:
+            self.settlement_calls = 0
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            self.settlement_calls += 1
+            await asyncio.Event().wait()
+            return True
+
+    if declaration == "wrong_type":
+        # Truthiness is not authority; only the exact bool on the concrete
+        # implementation class may opt into caller-loop task ownership.
+        UnsafeSettlementRunner.pending_command_settlement_cancellation_safe = 1  # type: ignore[assignment]
+
+    runner = UnsafeSettlementRunner()
+    fence = WorkspaceMutationProcessFence()
+    owner = InvocationWorkspaceMutationOwner(on_settlement_unproven=fence.fail_closed)
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=owner,
+    )
+
+    async def scenario() -> ExecResult:
+        result = await handle.exec(ExecCommand.process("mutate"))
+        with pytest.raises(WorkspaceMutationSettlementError):
+            await owner.seal_and_wait()
+        with pytest.raises(WorkspaceMutationSettlementError):
+            fence.require_available_nowait()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result.timed_out is True
+    assert runner.settlement_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("settlement_failure", "cancellation_reasons"),
+    [
+        (
+            RuntimeError("PRIVATE_SETTLEMENT_RACE_CANARY"),
+            ("caller cancelled during settlement",),
+        ),
+        (
+            RuntimeError("PRIVATE_REPEATED_SETTLEMENT_RACE_CANARY"),
+            ("first settlement cancellation", "second settlement cancellation"),
+        ),
+        (
+            SystemExit("PRIVATE_SETTLEMENT_RACE_CANARY"),
+            ("caller cancelled during settlement",),
+        ),
+    ],
+)
+def test_invocation_runner_handle_preserves_cancellation_racing_settlement_failure(
+    settlement_failure: BaseException,
+    cancellation_reasons: tuple[str, ...],
+) -> None:
+    class RacingSettlementRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+
+        def __init__(self) -> None:
+            self.parent: asyncio.Task[ExecResult] | None = None
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            assert self.parent is not None
+            for reason in cancellation_reasons:
+                self.parent.cancel(reason)
+            raise settlement_failure
+
+    runner = RacingSettlementRunner()
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=InvocationWorkspaceMutationOwner(),
+    )
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        operation = asyncio.create_task(handle.exec(ExecCommand.process("mutate")))
+        runner.parent = operation
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await operation
+        return raised.value, operation.cancelling(), operation.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancellation.args == (cancellation_reasons[-1],)
+    assert cancelling == len(cancellation_reasons)
+    assert cancelled is True
+    failure = runner_cancellation_failure(cancellation)
+    assert failure is not None
+    leaves = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if not isinstance(candidate, BaseExceptionGroup)
+    ]
+    assert len(leaves) == 1
+    if isinstance(settlement_failure, SystemExit):
+        assert isinstance(leaves[0], SystemExit)
+        assert leaves[0].code == 1
+    else:
+        assert type(leaves[0]) is RuntimeError
+        assert str(leaves[0]) == "Runner mutation settlement failed."
+    assert "PRIVATE_" not in repr(cancellation)
+    assert "PRIVATE_" not in repr(failure)
+
+
+def test_invocation_runner_handle_transfers_exact_settlement_after_foreground_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _DeferredSettlementRunner(cancelled=False)
+    fence = WorkspaceMutationProcessFence()
+    owner = InvocationWorkspaceMutationOwner(
+        on_settlement_unproven=fence.fail_closed,
+    )
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=owner,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_RUNNER_MUTATION_SETTLEMENT_FOREGROUND_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def scenario() -> ExecResult:
+        runner.started = asyncio.Event()
+        runner.settlement_started = asyncio.Event()
+        runner.release_settlement = asyncio.Event()
+        operation = asyncio.create_task(handle.exec(ExecCommand.process("mutate")))
+        await runner.started.wait()
+        await runner.settlement_started.wait()
+        result = await asyncio.wait_for(operation, timeout=1)
+        with pytest.raises(WorkspaceMutationSettlementError):
+            await owner.seal_and_wait()
+
+        fence_waiter = asyncio.create_task(fence.wait_until_available())
+        await asyncio.sleep(0)
+        assert fence_waiter.done() is False
+        assert runner.settlement_calls == 1
+        runner.release_settlement.set()
+        await fence_waiter
+        fence.require_available_nowait()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result.timed_out is True
+    assert runner.settlement_calls == 1
+
+
+def test_supervisory_generator_exit_transfers_active_runner_settlement_owner() -> None:
+    runner = _DeferredSettlementRunner(cancelled=False)
+    fence = WorkspaceMutationProcessFence()
+    owner = InvocationWorkspaceMutationOwner(
+        on_settlement_unproven=fence.fail_closed,
+    )
+
+    async def scenario() -> tuple[GeneratorExit, int]:
+        runner.started = asyncio.Event()
+        runner.settlement_started = asyncio.Event()
+        runner.release_settlement = asyncio.Event()
+        settlement = runner_module._settle_invocation_runner_mutation(
+            runner=runner,
+            owner=owner,
+            settlement="deferred",
+            settlement_error=None,
+            cancellation=None,
+        )
+        iterator = settlement.__await__()
+        assert iterator.send(None) is None
+        assert runner.settlement_started is not None
+        await runner.settlement_started.wait()
+
+        supervisory_signal = GeneratorExit("supervising invocation was abandoned")
+        with pytest.raises(GeneratorExit) as raised:
+            iterator.throw(supervisory_signal)
+        assert raised.value is supervisory_signal
+        with pytest.raises(WorkspaceMutationSettlementError):
+            await owner.seal_and_wait()
+
+        later = asyncio.create_task(fence.wait_until_available())
+        await asyncio.sleep(0)
+        assert later.done() is False
+        assert runner.settlement_calls == 1
+        assert runner.release_settlement is not None
+        runner.release_settlement.set()
+        await later
+        fence.require_available_nowait()
+        return supervisory_signal, runner.settlement_calls
+
+    signal, calls = asyncio.run(scenario())
+
+    assert signal.args == ("supervising invocation was abandoned",)
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "runner_type",
+    [_PostReturnMutatingSettlementRunner, _PostRaiseMutatingSettlementRunner],
+    ids=("mutated-result", "mutated-error"),
+)
+def test_supervisory_exit_after_runner_child_completion_retains_deferred_settlement(
+    runner_type: type[_PostReturnMutatingSettlementRunner]
+    | type[_PostRaiseMutatingSettlementRunner],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = runner_type()
+    fence = WorkspaceMutationProcessFence()
+    owner = InvocationWorkspaceMutationOwner(
+        on_settlement_unproven=fence.fail_closed,
+    )
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=owner,
+    )
+    original_sleep = operation_boundary_module.asyncio.sleep
+    delivered = False
+
+    async def supervisory_sleep(delay):
+        nonlocal delivered
+        result = await original_sleep(delay)
+        if runner.started is not None and runner.started.is_set() and not delivered:
+            delivered = True
+            raise GeneratorExit("supervisory exit after command completion")
+        return result
+
+    monkeypatch.setattr(operation_boundary_module.asyncio, "sleep", supervisory_sleep)
+
+    async def scenario() -> int:
+        runner.started = asyncio.Event()
+        runner.settlement_started = asyncio.Event()
+        runner.release_settlement = asyncio.Event()
+        if isinstance(runner, _PostReturnMutatingSettlementRunner):
+            runner.result_mutated = asyncio.Event()
+        else:
+            runner.error_mutated = asyncio.Event()
+        with pytest.raises(
+            GeneratorExit,
+            match="supervisory exit after command completion",
+        ):
+            await handle.exec(ExecCommand.process("mutate"))
+        assert delivered is True
+        if isinstance(runner, _PostReturnMutatingSettlementRunner):
+            assert runner.result_mutated is not None
+            await runner.result_mutated.wait()
+            assert runner.returned_result is not None
+            assert runner.returned_result.timed_out is False
+            assert runner.returned_result.artifacts == []
+        else:
+            assert runner.error_mutated is not None
+            await runner.error_mutated.wait()
+            assert runner.returned_error is not None
+            assert runner.returned_error.artifacts == []
+        with pytest.raises(WorkspaceMutationSettlementError):
+            await owner.seal_and_wait()
+
+        later = asyncio.create_task(fence.wait_until_available())
+        assert runner.settlement_started is not None
+        await asyncio.wait_for(runner.settlement_started.wait(), timeout=1)
+        assert later.done() is False
+        assert runner.settlement_calls == 1
+        assert runner.release_settlement is not None
+        runner.release_settlement.set()
+        await asyncio.wait_for(later, timeout=1)
+        fence.require_available_nowait()
+        return runner.settlement_calls
+
+    calls = asyncio.run(scenario())
+
+    assert calls == 1
+
+
+def test_grouped_supervisory_exit_during_owner_settlement_transfers_pending_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[BaseExceptionGroup, BaseExceptionGroup]:
+        fence = WorkspaceMutationProcessFence()
+        owner = InvocationWorkspaceMutationOwner(
+            on_settlement_unproven=fence.fail_closed,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def mutation() -> str:
+            started.set()
+            await release.wait()
+            return "settled"
+
+        operation = asyncio.create_task(owner.run(mutation))
+        await started.wait()
+        original_shield = asyncio.shield
+        signal = BaseExceptionGroup(
+            "supervisory owner failures",
+            [SystemExit(17), RuntimeError("secondary cleanup failure")],
+        )
+
+        async def supervisory_shield(awaitable):  # type: ignore[no-untyped-def]
+            del awaitable
+            raise signal
+
+        monkeypatch.setattr(resources_module.asyncio, "shield", supervisory_shield)
+        try:
+            with pytest.raises(BaseExceptionGroup) as raised:
+                await owner.seal_and_wait()
+        finally:
+            monkeypatch.setattr(resources_module.asyncio, "shield", original_shield)
+
+        settlement = asyncio.create_task(fence.wait_until_available())
+        await asyncio.sleep(0)
+        assert settlement.done() is False
+        release.set()
+        assert await operation == "settled"
+        await settlement
+        return raised.value, signal
+
+    raised_signal, original_signal = asyncio.run(scenario())
+
+    assert raised_signal is original_signal
+
+
+def test_supervisory_signal_after_foreground_wait_still_transfers_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _DeferredSettlementRunner(cancelled=False)
+    fence = WorkspaceMutationProcessFence()
+    owner = InvocationWorkspaceMutationOwner(
+        on_settlement_unproven=fence.fail_closed,
+    )
+
+    class InterruptedOutcome:
+        @property
+        def timed_out(self) -> bool:
+            raise GeneratorExit("supervisory signal during settlement classification")
+
+    async def interrupted_wait(task, **kwargs):
+        del task, kwargs
+        assert runner.settlement_started is not None
+        await runner.settlement_started.wait()
+        return InterruptedOutcome()
+
+    monkeypatch.setattr(runner_module, "await_shielded_task_outcome", interrupted_wait)
+
+    async def scenario() -> int:
+        runner.started = asyncio.Event()
+        runner.settlement_started = asyncio.Event()
+        runner.release_settlement = asyncio.Event()
+        with pytest.raises(
+            GeneratorExit,
+            match="supervisory signal during settlement classification",
+        ):
+            await runner_module._settle_invocation_runner_mutation(
+                runner=runner,
+                owner=owner,
+                settlement="deferred",
+                settlement_error=None,
+                cancellation=None,
+            )
+        with pytest.raises(WorkspaceMutationSettlementError):
+            await owner.seal_and_wait()
+
+        later = asyncio.create_task(fence.wait_until_available())
+        await asyncio.sleep(0)
+        assert later.done() is False
+        assert runner.settlement_calls == 1
+        assert runner.release_settlement is not None
+        runner.release_settlement.set()
+        await later
+        fence.require_available_nowait()
+        return runner.settlement_calls
+
+    assert asyncio.run(scenario()) == 1
+
+
+@pytest.mark.parametrize(
+    ("settlement_failure", "expected_exit_code"),
+    [
+        (SystemExit(17), 17),
+        (SystemExit("PRIVATE_SETTLEMENT_SIGNAL_CANARY"), 1),
+    ],
+)
+def test_invocation_runner_handle_sanitizes_settlement_system_exit(
+    settlement_failure: SystemExit,
+    expected_exit_code: int,
+) -> None:
+    class SignalRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "e2b",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            raise settlement_failure
+
+    runner = SignalRunner()
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=InvocationWorkspaceMutationOwner(),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(handle.exec(ExecCommand.process("mutate")))
+
+    assert raised.value.code == expected_exit_code
+    assert "PRIVATE_SETTLEMENT_SIGNAL_CANARY" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert_cayu_traceback_does_not_retain(raised.value, runner)
+
+
+def test_invocation_runner_handle_sanitizes_settlement_signal_group() -> None:
+    class SignalGroupRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "e2b",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            raise BaseExceptionGroup(
+                "PRIVATE_SETTLEMENT_GROUP_CANARY",
+                [
+                    SystemExit(17),
+                    RuntimeError("PRIVATE_SETTLEMENT_FAILURE_CANARY"),
+                ],
+            )
+
+    handle = InvocationRunnerHandle(
+        SignalGroupRunner(),
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=InvocationWorkspaceMutationOwner(),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        asyncio.run(handle.exec(ExecCommand.process("mutate")))
+
+    leaves = [
+        candidate
+        for candidate in iter_exception_tree(raised.value)
+        if not isinstance(candidate, BaseExceptionGroup)
+    ]
+    assert len(leaves) == 2
+    assert any(isinstance(candidate, SystemExit) and candidate.code == 17 for candidate in leaves)
+    assert sum(isinstance(candidate, RuntimeError) for candidate in leaves) == 1
+    assert "PRIVATE_SETTLEMENT" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_invocation_runner_handle_fails_closed_when_settlement_classifier_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained_probes: list[Any] = []
+    owner = InvocationWorkspaceMutationOwner(
+        on_settlement_unproven=retained_probes.append,
+    )
+    handle = InvocationRunnerHandle(
+        _UncertainTimeoutRunner(),
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+        mutation_owner=owner,
+    )
+
+    def fail_classifier(**kwargs):
+        del kwargs
+        raise RuntimeError("PRIVATE_SETTLEMENT_CLASSIFIER_CANARY")
+
+    monkeypatch.setattr(
+        runner_module,
+        "runner_workspace_mutation_settlement",
+        fail_classifier,
+    )
+
+    async def scenario() -> tuple[ExecResult, WorkspaceMutationSettlementError]:
+        result = await handle.exec(ExecCommand.process("mutate"))
+        with pytest.raises(WorkspaceMutationSettlementError) as raised:
+            await owner.seal_and_wait()
+        return result, raised.value
+
+    result, failure = asyncio.run(scenario())
+
+    assert result.timed_out is True
+    assert len(retained_probes) == 1
+    assert "PRIVATE_SETTLEMENT_CLASSIFIER_CANARY" not in str(failure)
+
+
+def test_workspace_mutation_fence_shares_one_positive_probe_between_waiters() -> None:
+    async def scenario() -> int:
+        fence = WorkspaceMutationProcessFence()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def probe() -> bool:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return True
+
+        fence.fail_closed(probe)
+        first = asyncio.create_task(fence.wait_until_available())
+        second = asyncio.create_task(fence.wait_until_available())
+        await started.wait()
+        release.set()
+        await asyncio.gather(first, second)
+        fence.require_available_nowait()
+        return calls
+
+    assert asyncio.run(scenario()) == 1
+
+
+def test_workspace_mutation_fence_preserves_supervisory_generator_exit_and_probe() -> None:
+    async def scenario() -> tuple[GeneratorExit, int]:
+        fence = WorkspaceMutationProcessFence()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def probe() -> bool:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return True
+
+        fence.fail_closed(probe)
+        first = fence.wait_until_available()
+        iterator = first.__await__()
+        iterator.send(None)
+        await started.wait()
+
+        supervisory_signal = GeneratorExit("supervising fence waiter was abandoned")
+        with pytest.raises(GeneratorExit) as raised:
+            iterator.throw(supervisory_signal)
+        assert raised.value is supervisory_signal
+
+        later = asyncio.create_task(fence.wait_until_available())
+        await asyncio.sleep(0)
+        assert later.done() is False
+        assert calls == 1
+        release.set()
+        await later
+        fence.require_available_nowait()
+        return supervisory_signal, calls
+
+    signal, calls = asyncio.run(scenario())
+
+    assert signal.args == ("supervising fence waiter was abandoned",)
+    assert calls == 1
+
+
+def test_workspace_mutation_fence_waits_for_every_factory_child_owner() -> None:
+    async def scenario() -> tuple[int, int]:
+        registration_fence = WorkspaceMutationProcessFence()
+        first_child = registration_fence.child_fence()
+        second_child = registration_fence.child_fence()
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_first = asyncio.Event()
+        release_second = asyncio.Event()
+        first_calls = 0
+        second_calls = 0
+
+        async def first_probe() -> bool:
+            nonlocal first_calls
+            first_calls += 1
+            first_started.set()
+            await release_first.wait()
+            return True
+
+        async def second_probe() -> bool:
+            nonlocal second_calls
+            second_calls += 1
+            second_started.set()
+            await release_second.wait()
+            return True
+
+        first_child.fail_closed(first_probe)
+        second_child.fail_closed(second_probe)
+        waiter = asyncio.create_task(registration_fence.wait_until_available())
+        await asyncio.gather(first_started.wait(), second_started.wait())
+
+        release_first.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        first_child.require_available_nowait()
+        with pytest.raises(WorkspaceMutationSettlementError):
+            second_child.require_available_nowait()
+        assert waiter.done() is False
+
+        release_second.set()
+        await waiter
+        registration_fence.require_available_nowait()
+        return first_calls, second_calls
+
+    assert asyncio.run(scenario()) == (1, 1)
+
+
+def test_workspace_mutation_fence_preserves_active_system_exit_code() -> None:
+    async def scenario() -> int:
+        fence = WorkspaceMutationProcessFence()
+        calls = 0
+
+        async def probe() -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise SystemExit(17)
+            return True
+
+        fence.fail_closed(probe)
+        with pytest.raises(SystemExit) as raised:
+            await fence.wait_until_available()
+        assert raised.value.code == 17
+        await fence.wait_until_available()
+        fence.require_available_nowait()
+        return calls
+
+    assert asyncio.run(scenario()) == 2
+
+
+def test_workspace_mutation_fence_delivers_active_signal_group_once() -> None:
+    async def scenario() -> tuple[list[BaseException], int]:
+        fence = WorkspaceMutationProcessFence()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def probe() -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release.wait()
+                raise BaseExceptionGroup(
+                    "PRIVATE_SETTLEMENT_GROUP_CANARY",
+                    [
+                        SystemExit(17),
+                        RuntimeError("PRIVATE_SETTLEMENT_FAILURE_CANARY"),
+                    ],
+                )
+            return True
+
+        async def observe() -> BaseException:
+            try:
+                await fence.wait_until_available()
+            except BaseException as exc:
+                return exc
+            raise AssertionError("Unsettled fence unexpectedly became available.")
+
+        fence.fail_closed(probe)
+        first = asyncio.create_task(observe())
+        second = asyncio.create_task(observe())
+        await started.wait()
+        release.set()
+        failures = await asyncio.gather(first, second)
+        await fence.wait_until_available()
+        return failures, calls
+
+    failures, calls = asyncio.run(scenario())
+
+    groups = [failure for failure in failures if isinstance(failure, BaseExceptionGroup)]
+    quarantines = [
+        failure for failure in failures if isinstance(failure, WorkspaceMutationSettlementError)
+    ]
+    assert len(groups) == 1
+    assert len(quarantines) == 1
+    signals = [
+        candidate
+        for candidate in iter_exception_tree(groups[0])
+        if isinstance(candidate, SystemExit)
+    ]
+    assert len(signals) == 1
+    assert signals[0].code == 17
+    assert "PRIVATE_SETTLEMENT" not in repr(failures)
+    assert calls == 2
+
+
+def test_workspace_mutation_fence_preserves_signal_and_sibling_failure() -> None:
+    async def scenario() -> BaseException:
+        fence = WorkspaceMutationProcessFence()
+        signal_child = fence.child_fence()
+        failed_child = fence.child_fence()
+
+        async def signal_probe() -> bool:
+            raise SystemExit(17)
+
+        async def failed_probe() -> bool:
+            return False
+
+        signal_child.fail_closed(signal_probe)
+        failed_child.fail_closed(failed_probe)
+        try:
+            await fence.wait_until_available()
+        except BaseException as exc:
+            return exc
+        raise AssertionError("Unsettled fence unexpectedly became available.")
+
+    failure = asyncio.run(scenario())
+
+    assert isinstance(failure, BaseExceptionGroup)
+    leaves = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if not isinstance(candidate, BaseExceptionGroup)
+    ]
+    assert len(leaves) == 2
+    signals = [candidate for candidate in leaves if isinstance(candidate, SystemExit)]
+    assert len(signals) == 1
+    assert signals[0].code == 17
+    assert sum(isinstance(candidate, RuntimeError) for candidate in leaves) == 1
+
+
+def test_workspace_mutation_fence_does_not_replay_historical_process_signal() -> None:
+    async def scenario() -> tuple[asyncio.Task[None], int]:
+        fence = WorkspaceMutationProcessFence()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        first_finished = asyncio.Event()
+        calls = 0
+
+        async def probe() -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release.wait()
+                first_finished.set()
+                raise SystemExit("historical settlement signal")
+            return True
+
+        fence.fail_closed(probe)
+        cancelled_waiter = asyncio.create_task(fence.wait_until_available())
+        await started.wait()
+        cancelled_waiter.cancel("caller stopped waiting")
+        with pytest.raises(asyncio.CancelledError, match="caller stopped waiting"):
+            await cancelled_waiter
+        release.set()
+        await first_finished.wait()
+        await asyncio.sleep(0)
+        await fence.wait_until_available()
+        return cancelled_waiter, calls
+
+    cancelled_waiter, calls = asyncio.run(scenario())
+
+    assert cancelled_waiter.cancelling() == 1
+    assert cancelled_waiter.cancelled()
+    assert calls == 2
 
 
 def test_concurrent_invocation_runner_handles_keep_secret_scopes_separate() -> None:

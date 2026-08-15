@@ -2611,6 +2611,7 @@ def _serialize_tool(cayu_app: Any, tool: Any) -> dict[str, Any]:
         "input_schema": _redact_control_plane_json(cayu_app, tool.schema, "input_schema"),
         "parallel_safe": tool.parallel_safe,
         "effect": effect,
+        "workspace_mutation": tool.workspace_mutation,
     }
 
 

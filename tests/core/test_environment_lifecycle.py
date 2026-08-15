@@ -11,6 +11,7 @@ from tests.core._workload_secret_support import FakeProvider, collect_events
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 from cayu._exception_groups import iter_exception_tree
+from cayu._workspace_mutation import WorkspaceMutationSettlementError
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.environments import (
     BoundWorkspace,
@@ -2548,6 +2549,11 @@ def test_environment_cleanup_drain_timeout_keeps_mutation_task_owned(
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
+        _environment = Environment(EnvironmentSpec(name="timeout-retained-cleanup"))
+        registered_environment = runtime_records.RegisteredEnvironment(
+            spec=_environment.spec,
+            environment=_environment,
+        )
 
     async def run() -> tuple[bool, asyncio.Task[Any]]:
         app = CayuApp(enable_logging=False)
@@ -2602,6 +2608,11 @@ def test_environment_cleanup_drain_cancellation_keeps_mutation_task_owned(
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
+        _environment = Environment(EnvironmentSpec(name="cancelled-retained-cleanup"))
+        registered_environment = runtime_records.RegisteredEnvironment(
+            spec=_environment.spec,
+            environment=_environment,
+        )
 
     async def run() -> tuple[asyncio.Task[Any], asyncio.Task[Any]]:
         app = CayuApp(enable_logging=False)
@@ -2701,6 +2712,58 @@ def test_aborted_setup_retained_owner_retries_on_first_cleanup_sweep() -> None:
     binding = asyncio.run(run())
     assert binding.finalize_calls == 2
     assert binding.abandon_calls == 2
+
+
+def test_binding_settlement_error_is_not_misclassified_as_runtime_quarantine() -> None:
+    collision = WorkspaceMutationSettlementError("binding-owned settlement failure")
+
+    class CollisionBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("bind should not run")
+
+        async def finalize(
+            self,
+            bound: BoundWorkspace,
+            *,
+            outcome: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> WorkspaceSnapshot | None:
+            raise AssertionError("finalize should not run")
+
+        def abandon(self, bound: BoundWorkspace) -> bool:
+            del bound
+            raise collision
+
+    async def run() -> EnvironmentLifecycle:
+        app = CayuApp(enable_logging=False)
+        lifecycle = app._environment_lifecycle
+        binding = CollisionBinding()
+        environment = Environment(EnvironmentSpec(name="collision"), binding=binding)
+        registered_environment = runtime_records.RegisteredEnvironment(
+            spec=environment.spec,
+            environment=environment,
+            bound_workspace=BoundWorkspace(),
+        )
+        owner = environment_lifecycle_module._ActiveEnvironmentSetup(
+            registered_environment,
+            cleanup_started=True,
+            cleanup_finished=True,
+            cleanup_error=RuntimeError("terminal cleanup already failed"),
+            cleanup_release_safe=True,
+        )
+        lifecycle._active_environment_setups["collision-session"] = owner
+
+        with pytest.raises(WorkspaceMutationSettlementError) as raised:
+            await lifecycle.abort_environment_setup(
+                session_id="collision-session",
+                original_error=None,
+            )
+        assert raised.value is collision
+        return lifecycle
+
+    lifecycle = asyncio.run(run())
+
+    assert "collision-session" in lifecycle._active_environment_setups
 
 
 def test_lazy_environment_cleanup_retries_fatal_only_finalization() -> None:

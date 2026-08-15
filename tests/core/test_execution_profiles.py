@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import warnings
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -71,12 +72,33 @@ from cayu.runtime.sessions import (
 )
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/cayu/cli/scaffold.py",
+        "examples/dashboard_behavior_live.py",
+    ],
+)
+def test_exact_runtime_profile_mirrors_include_workspace_mutation(path: str) -> None:
+    source = (Path(__file__).resolve().parents[2] / path).read_text(encoding="utf-8")
+
+    assert '**({"workspace_mutation": True} if tool.workspace_mutation else {})' in source
+
+
 class RecordingTool(Tool):
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        parallel_safe: bool = True,
+        workspace_mutation: bool = False,
+    ) -> None:
         self.spec = ToolSpec(
             name=name,
             description="Record execution.",
             input_schema={"type": "object", "properties": {}},
+            parallel_safe=parallel_safe,
+            workspace_mutation=workspace_mutation,
         )
         super().__init__()
         self.calls: list[dict] = []
@@ -673,6 +695,119 @@ def test_public_resume_rejects_changed_direct_tools_before_work() -> None:
         )
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("original_workspace_mutation", "replacement_workspace_mutation"),
+    [(False, True), (True, False)],
+)
+def test_public_resume_rejects_changed_workspace_mutation_declaration_before_work(
+    original_workspace_mutation: bool,
+    replacement_workspace_mutation: bool,
+) -> None:
+    async def exercise() -> None:
+        session_id = (
+            "execution-profile-workspace-mutation-"
+            f"{int(original_workspace_mutation)}-{int(replacement_workspace_mutation)}"
+        )
+        store = InMemorySessionStore()
+        original_provider = _completed_provider()
+        original_tool = RecordingTool(
+            "workspace_tool",
+            parallel_safe=False,
+            workspace_mutation=original_workspace_mutation,
+        )
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(original_provider, default=True)
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[original_tool],
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        replacement_provider = _completed_provider()
+        replacement_tool = RecordingTool(
+            "workspace_tool",
+            parallel_safe=False,
+            workspace_mutation=replacement_workspace_mutation,
+        )
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(replacement_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[replacement_tool],
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "second")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.DIRECT_TOOLS,
+        )
+        assert replacement_provider.requests == []
+        assert replacement_tool.calls == []
+
+    asyncio.run(exercise())
+
+
+def test_default_false_workspace_mutation_keeps_legacy_direct_tool_profile_shape() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_completed_provider(), default=True)
+        tool = RecordingTool("legacy_tool", parallel_safe=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+        )
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-legacy-workspace-mutation-false",
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        session = await store.load("execution-profile-legacy-workspace-mutation-false")
+        assert session is not None
+        return session
+
+    session = asyncio.run(exercise())
+    stored = execution_profile_from_session_metadata(session.metadata)
+    legacy = build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version=session.runtime_version,
+        provider_name="fake",
+        model="fake-model",
+        durable_system_prompt=None,
+        direct_tools=[
+            {
+                "name": "legacy_tool",
+                "description": "Record execution.",
+                "schema": {"type": "object", "properties": {}},
+                "parallel_safe": False,
+                "effect": "external",
+            }
+        ],
+    )
+
+    assert stored == legacy
 
 
 def test_explicit_authorized_tool_profile_adoption_is_atomic_and_replayable() -> None:

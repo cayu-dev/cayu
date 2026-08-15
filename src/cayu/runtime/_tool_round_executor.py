@@ -189,6 +189,7 @@ from cayu.tools._operation_boundary import (
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (
     InvocationWorkspaceMutationOwner,
+    WorkspaceMutationSettlementError,
     invocation_artifact_store_handle,
     invocation_workspace_handle,
 )
@@ -2129,8 +2130,16 @@ class ToolRoundExecutor:
         raw_workspace = _workspace(registered_environment)
         raw_artifact_store = _artifact_store(registered_environment)
         workspace_mutation_owner = (
-            InvocationWorkspaceMutationOwner()
-            if registered_tool.workspace_mutation and raw_workspace is not None
+            InvocationWorkspaceMutationOwner(
+                on_settlement_unproven=(
+                    registered_environment.workspace_mutation_fence.fail_closed
+                ),
+            )
+            if (
+                registered_environment is not None
+                and registered_tool.workspace_mutation
+                and raw_workspace is not None
+            )
             else None
         )
         (
@@ -2162,6 +2171,7 @@ class ToolRoundExecutor:
                 ambiguous_capture_observer=(
                     invocation_secret_scope.record_ambiguous_output_capture
                 ),
+                mutation_owner=workspace_mutation_owner,
             ),
             invocation_secret_redactor=redactor_provider,
             invocation_secret_snapshot_provider=invocation_secret_scope.snapshot,
@@ -2260,6 +2270,11 @@ class ToolRoundExecutor:
                 close_workspace_mutation_window,
                 request_child_cancellation=False,
                 cancellation=cancellation,
+                on_unsettled_supervisory_exit=(
+                    workspace_mutation_owner.fail_closed
+                    if workspace_mutation_owner is not None
+                    else None
+                ),
             )
             if _contains_process_signal(outcome.error):
                 if outcome.error is None:  # pragma: no cover - narrowed by the helper
@@ -2279,7 +2294,13 @@ class ToolRoundExecutor:
                 timeout_seconds=self._tool_timeout_seconds,
             )
         except BaseExceptionGroup as exc:
-            if is_current_runner_cancellation_group(exc):
+            if any(
+                isinstance(candidate, (KeyboardInterrupt, SystemExit, GeneratorExit))
+                for candidate in iter_exception_tree(exc)
+            ):
+                if workspace_mutation_owner is not None:
+                    workspace_mutation_owner.seal_and_transfer_pending()
+            elif is_current_runner_cancellation_group(exc):
                 group_cancellation: asyncio.CancelledError | None = None
                 for candidate in iter_exception_tree(exc):
                     if not isinstance(candidate, asyncio.CancelledError):
@@ -2334,11 +2355,16 @@ class ToolRoundExecutor:
                 ):
                     yield event, None
             raise
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            if workspace_mutation_owner is not None:
+                workspace_mutation_owner.seal_and_transfer_pending()
+            raise
         result = execution_outcome.result
         redactor = invocation_secret_scope.redactor
         output_redactor = redactor
         workspace_events: tuple[Event, ...] = ()
         post_tool_cancellation: asyncio.CancelledError | None = None
+        workspace_settlement_failure: WorkspaceMutationSettlementError | None = None
         workspace_capture_payload: dict[str, str] = {}
         if workspace_window_id is not None:
             try:
@@ -2359,11 +2385,23 @@ class ToolRoundExecutor:
                     "workspace_mutation_capture_status": "interrupted",
                     "workspace_mutation_capture_detail_code": "receipt_publication_interrupted",
                 }
-            except Exception:
-                workspace_capture_payload = {
-                    "workspace_mutation_capture_status": "failed",
-                    "workspace_mutation_capture_detail_code": "receipt_publication_failed",
-                }
+            except Exception as exc:
+                if any(
+                    isinstance(candidate, WorkspaceMutationSettlementError)
+                    for candidate in iter_exception_tree(exc)
+                ):
+                    workspace_settlement_failure = WorkspaceMutationSettlementError(
+                        "Workspace mutation settlement could not be proven."
+                    )
+                    workspace_capture_payload = {
+                        "workspace_mutation_capture_status": "failed",
+                        "workspace_mutation_capture_detail_code": "mutation_settlement_unproven",
+                    }
+                else:
+                    workspace_capture_payload = {
+                        "workspace_mutation_capture_status": "failed",
+                        "workspace_mutation_capture_detail_code": "receipt_publication_failed",
+                    }
             else:
                 workspace_capture_payload = {
                     "workspace_mutation_capture_status": "recorded",
@@ -2566,6 +2604,8 @@ class ToolRoundExecutor:
                     yield terminal_event
             if post_tool_cancellation is not None:
                 raise post_tool_cancellation
+            if workspace_settlement_failure is not None:
+                raise workspace_settlement_failure from None
             return
         if published_terminal_event is not None:
             hook_tool_call = _project_tool_call_for_hook(
@@ -2602,6 +2642,8 @@ class ToolRoundExecutor:
                 raise SessionInterruptedByRequest(session.id)
             if post_tool_cancellation is not None:
                 raise post_tool_cancellation
+            if workspace_settlement_failure is not None:
+                raise workspace_settlement_failure from None
             return
         if result_event is None:
             raise AssertionError("Ordinary tool result event was not constructed.")
@@ -2656,6 +2698,8 @@ class ToolRoundExecutor:
             cancellation=post_tool_cancellation,
         ):
             raise SessionInterruptedByRequest(session.id)
+        if workspace_settlement_failure is not None:
+            raise workspace_settlement_failure from None
 
     async def emit_mcp_manifest_checks(
         self,
@@ -4284,6 +4328,27 @@ class ToolRoundRun:
                     break
             if self.stopped_for_limit:
                 return
+        except WorkspaceMutationSettlementError as settlement_failure:
+            if publication_coordinator is not None:
+                expected_stage_ids = set(staged_private_outcomes)
+                try:
+                    async for event in publish_staged_round_terminals(expected_stage_ids):
+                        yield event
+                        if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
+                            durable_lifecycle_events.append(copy_event(event))
+                except asyncio.CancelledError as cancellation:
+                    raise cancellation from settlement_failure
+                except BaseException as publication_failure:
+                    if any(
+                        isinstance(
+                            candidate,
+                            (KeyboardInterrupt, SystemExit, GeneratorExit),
+                        )
+                        for candidate in iter_exception_tree(publication_failure)
+                    ):
+                        raise
+                    raise settlement_failure from publication_failure
+            raise settlement_failure
         except BaseExceptionGroup as exc:
             if not is_current_runner_cancellation_group(exc):
                 raise

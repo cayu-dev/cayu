@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import warnings
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 from tests.runners.lambda_microvm_harness import (
     ConformanceLambdaClient,
     SupervisorTransport,
 )
 
+from cayu._exception_groups import iter_exception_tree
 from cayu.artifacts import LocalArtifactStore
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core import AgentSpec, Event, EventType, Message, Tool, ToolContext, ToolResult, ToolSpec
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
@@ -2550,9 +2553,12 @@ def test_egress_teardown_waits_for_deferred_command_settlement_before_sync(
     allow_settlement = asyncio.Event()
 
     class _DeferredMutationRunner(_FakeDockerRunner):
+        pending_command_settlement_cancellation_safe = True
+
         def __init__(self, name: str) -> None:
             super().__init__(name)
             self.settlement_task: asyncio.Task[None] | None = None
+            self.settlement_calls = 0
 
         async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
             del command, kwargs
@@ -2580,12 +2586,17 @@ def test_egress_teardown_waits_for_deferred_command_settlement_before_sync(
                 raise
 
         async def await_pending_command_settlement(self) -> bool:
+            self.settlement_calls += 1
             assert self.settlement_task is not None
             await asyncio.shield(self.settlement_task)
             return True
 
+    created_runners: list[_DeferredMutationRunner] = []
+
     async def runner_factory(request: Any) -> Runner:
-        return _DeferredMutationRunner(request.name)
+        runner = _DeferredMutationRunner(request.name)
+        created_runners.append(runner)
+        return runner
 
     def target_factory(context):  # type: ignore[no-untyped-def]
         assert context.runner is not None
@@ -2632,17 +2643,23 @@ def test_egress_teardown_waits_for_deferred_command_settlement_before_sync(
         with pytest.raises(asyncio.CancelledError, match="interrupt deferred command"):
             await command_task
 
+        invocation_settlement = asyncio.create_task(runner.await_pending_command_settlement())
         finalize_task = asyncio.create_task(binding.finalize(bound, outcome="interrupted"))
         while runner._workspace_dispatch_gate_owner is None:  # type: ignore[attr-defined]
             await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not invocation_settlement.done()
         assert not finalize_task.done()
         assert not (source_root / "late.txt").exists()
+        assert created_runners[0].settlement_calls == 1
 
         allow_settlement.set()
+        assert await invocation_settlement is True
         snapshot = await finalize_task
         assert snapshot is not None
         assert (source_root / "late.txt").read_bytes() == b"written-by-deferred-command"
         assert runner.is_closed
+        assert created_runners[0].settlement_calls == 1
         assert inner._states == {}
 
     asyncio.run(run())
@@ -2661,6 +2678,8 @@ def test_egress_teardown_retries_only_after_deferred_sync_command_settles(
     allow_settlement = asyncio.Event()
 
     class _DeferredSyncCommandRunner(_FakeDockerRunner):
+        pending_command_settlement_cancellation_safe = True
+
         settlement_task: asyncio.Task[None] | None = None
 
         async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
@@ -2874,6 +2893,8 @@ def test_egress_teardown_retains_owner_when_command_settlement_is_uncertain(
     local_target = LocalWorkspace(target_root, workspace_id="uncertain-command-storage")
 
     class _UncertainMutationRunner(_FakeDockerRunner):
+        pending_command_settlement_cancellation_safe = True
+
         async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
             del command, kwargs
             return ExecResult(
@@ -2968,6 +2989,11 @@ def test_egress_teardown_retains_owner_when_command_settlement_is_uncertain(
             "action": "future_cleanup_action",
             "status": "completed",
         },
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "action": ["kill_command"],
+            "status": "completed",
+        },
     ],
 )
 def test_workspace_dispatch_settlement_rejects_ambiguous_cleanup_evidence(
@@ -2986,6 +3012,20 @@ def test_workspace_dispatch_settlement_rejects_ambiguous_cleanup_evidence(
     )
 
     assert _workspace_dispatch_settlement_kind(result=result, error=None) == "uncertain"
+
+
+def test_workspace_dispatch_settlement_rejects_success_conflicting_with_cleanup() -> None:
+    result = ExecResult(
+        artifacts=[
+            {
+                "type": "cayu.runner_cleanup.v1",
+                "action": "kill_command",
+                "status": "deferred",
+            }
+        ],
+    )
+
+    assert _workspace_dispatch_settlement_kind(result=result, error=None) == "deferred"
 
 
 def test_cancelled_egress_teardown_retains_gate_until_dispatched_write_syncs(
@@ -5577,6 +5617,342 @@ def test_managed_runner_retains_genuine_post_admission_failure_as_uncertain() ->
     asyncio.run(run())
 
     assert adapter.torn_down == 1
+
+
+def test_managed_runner_detaches_deferred_settlement_process_signal() -> None:
+    canary = "PRIVATE_EGRESS_SETTLEMENT_SIGNAL_CANARY"
+    raw_signal = SystemExit(canary)
+
+    class _SignalRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            raise raw_signal
+
+    inner = _SignalRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> tuple[BaseException, bool]:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_managed_settlement_signal",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+        owner_key = "managed-settlement-signal-owner"
+        managed.begin_workspace_binding()
+        managed.finish_workspace_binding(
+            require_mutation_quiescence=True,
+            workspace_owner_key=owner_key,
+        )
+
+        command_result = await managed.exec(ExecCommand.process("mutate"))
+        assert command_result.timed_out is True
+        await managed._active_workspace_dispatches_drained.wait()
+        with pytest.raises(SystemExit) as raised:
+            await managed.prepare_workspace_sync(owner_key)
+        replayed = await managed.await_pending_command_settlement()
+        return raised.value, replayed
+
+    failure, replayed = asyncio.run(run())
+
+    assert isinstance(failure, SystemExit)
+    assert failure.code == 1
+    assert canary not in repr(failure)
+    assert replayed is False
+    assert_cayu_traceback_does_not_retain(failure, raw_signal)
+
+
+def test_managed_runner_invocation_settlement_delivers_process_signal_once() -> None:
+    canary = "PRIVATE_EGRESS_INVOCATION_SETTLEMENT_SIGNAL_CANARY"
+    raw_signal = SystemExit(canary)
+
+    class _SignalRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            raise raw_signal
+
+    inner = _SignalRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> tuple[BaseException, bool]:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_managed_invocation_settlement_signal",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+
+        command_result = await managed.exec(ExecCommand.process("mutate"))
+        assert command_result.timed_out is True
+        await managed._active_workspace_dispatches_drained.wait()
+        with pytest.raises(SystemExit) as raised:
+            await managed.await_pending_command_settlement()
+        replayed = await managed.await_pending_command_settlement()
+        return raised.value, replayed
+
+    failure, replayed = asyncio.run(run())
+
+    assert isinstance(failure, SystemExit)
+    assert failure.code == 1
+    assert canary not in repr(failure)
+    assert replayed is False
+    assert_cayu_traceback_does_not_retain(failure, raw_signal)
+
+
+def test_runtime_propagates_managed_runner_settlement_signal_once(
+    tmp_path: Path,
+    caplog,
+    capsys,
+) -> None:
+    canary = "PRIVATE_EGRESS_RUNTIME_SETTLEMENT_SIGNAL_CANARY"
+    raw_signal = SystemExit(canary)
+
+    class _SignalRunner(Runner):
+        pending_command_settlement_cancellation_safe = True
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        @property
+        def resource_key(self) -> tuple[object, ...]:
+            return ("test-signal-runner", id(self))
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            raise raw_signal
+
+    class _MutationTool(Tool):
+        spec = ToolSpec(
+            name="managed_runner_mutation",
+            parallel_safe=False,
+            workspace_mutation=True,
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            await ctx.runner.exec(ExecCommand.process("mutate"))
+            raise AssertionError("Settlement process signal did not propagate.")
+
+    class _ToolProvider(ModelProvider):
+        name = "managed-signal"
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.requests += 1
+            yield ModelStreamEvent.tool_call(
+                id="call-managed-runner-mutation",
+                name="managed_runner_mutation",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+
+    inner = _SignalRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace_delegate = LocalWorkspace(
+        workspace_root,
+        workspace_id="managed-signal-workspace-storage",
+    )
+
+    class _ManagedRunnerWorkspace(_ClosedRejectingRunnerWorkspace):
+        @property
+        def bound_runner_resource_key(self) -> tuple[object, ...] | None:
+            return self._runner.resource_key
+
+    def workspace_factory(runner: Runner) -> RunnerBoundWorkspace:
+        return _ManagedRunnerWorkspace(
+            runner,
+            workspace_delegate,
+            workspace_id="managed-signal-workspace",
+        )
+
+    async def run() -> tuple[BaseException, list[Event], _ToolProvider]:
+        store = InMemorySessionStore()
+        provider = _ToolProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress-env"),
+            _virtual_factory(
+                adapter=adapter,
+                workspace_factory=workspace_factory,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="managed-signal-model"),
+            tools=[_MutationTool()],
+        )
+
+        try:
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_managed_runtime_settlement_signal",
+                        messages=[Message.text("user", "mutate")],
+                    )
+                )
+            ]
+        except BaseException as failure:
+            return (
+                failure,
+                await store.load_events("sess_managed_runtime_settlement_signal"),
+                provider,
+            )
+        raise AssertionError("Managed settlement process signal did not propagate.")
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        failure, events, provider = asyncio.run(run())
+    captured = capsys.readouterr()
+
+    signals = [
+        candidate for candidate in iter_exception_tree(failure) if isinstance(candidate, SystemExit)
+    ]
+    assert len(signals) == 1
+    assert signals[0].code == 1
+    assert provider.requests == 1
+    assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in events)
+    assert_cayu_traceback_does_not_retain(failure, raw_signal)
+    combined = repr(
+        (
+            failure,
+            [event.model_dump(mode="json") for event in events],
+            captured_warnings,
+            [record.getMessage() for record in caplog.records],
+            captured.out,
+            captured.err,
+        )
+    )
+    assert canary not in combined
+
+
+def test_managed_runner_does_not_start_undeclared_inner_settlement_waiter() -> None:
+    class _UnsafeSettlementRunner(Runner):
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        def __init__(self) -> None:
+            self.settlement_calls = 0
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            self.settlement_calls += 1
+            await asyncio.Event().wait()
+            return True
+
+    inner = _UnsafeSettlementRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> BaseException:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_managed_unsafe_settlement",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+        owner_key = "managed-unsafe-settlement-owner"
+        managed.begin_workspace_binding()
+        managed.finish_workspace_binding(
+            require_mutation_quiescence=True,
+            workspace_owner_key=owner_key,
+        )
+
+        assert (await managed.exec(ExecCommand.process("mutate"))).timed_out is True
+        await managed._active_workspace_dispatches_drained.wait()
+        with pytest.raises(RuntimeError) as raised:
+            await managed.prepare_workspace_sync(owner_key)
+        return raised.value
+
+    failure = asyncio.run(run())
+
+    assert str(failure) == "Managed runner deferred command settlement is not cancellation-safe."
+    assert inner.settlement_calls == 0
 
 
 @pytest.mark.parametrize("method", ("exec", "exec_redacted", "exec_system"))

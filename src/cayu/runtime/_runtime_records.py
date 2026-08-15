@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from cayu._validation import require_durable_clean_nonblank
+from cayu._workspace_mutation import WorkspaceMutationProcessFence
 from cayu.core.agents import AgentSpec
 from cayu.core.tools import Tool, ToolEffect, ToolResult
 from cayu.environments import (
@@ -101,6 +102,11 @@ class RegisteredEnvironment:
     preserve_factory_allocation: bool = False
     registration_source: str | None = None
     registration_symbol: str | None = None
+    workspace_mutation_fence: WorkspaceMutationProcessFence = field(
+        default_factory=WorkspaceMutationProcessFence,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)

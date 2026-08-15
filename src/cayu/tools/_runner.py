@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -15,7 +16,9 @@ from cayu._exception_groups import (
     rebuild_exception_group,
     set_exception_cause,
 )
+from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import require_durable_nonblank
+from cayu._workspace_mutation import detached_workspace_mutation_process_signal
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -44,16 +47,23 @@ from cayu.runners._subprocess import (
     validate_timeout,
 )
 from cayu.runners.base import (
+    RunnerWorkspaceMutationSettlement,
     _clear_preflight_traceback_frames,
     copy_exec_command,
     runner_execution_error,
+    runner_pending_command_settlement_cancellation_safe,
+    runner_workspace_mutation_settlement,
 )
 from cayu.tools._operation_boundary import (
+    _RetainedInvocationOperationProbe,
     await_invocation_cancellation_checkpoint,
     await_invocation_operation,
 )
 from cayu.tools._redaction import resolve_invocation_redactor_snapshot
-from cayu.tools._resources import invocation_workspace_authenticated_cwd
+from cayu.tools._resources import (
+    InvocationWorkspaceMutationOwner,
+    invocation_workspace_authenticated_cwd,
+)
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace
 
@@ -69,6 +79,7 @@ _CURRENT_CANCELLATION_GROUP_ATTRIBUTE = "_cayu_current_runner_cancellation_group
 _CURRENT_CANCELLATION_GROUP_TOKEN = object()
 _SAFE_RUNNER_CANCELLATION_MESSAGE = "Runner command was cancelled."
 _MAX_RUNNER_CANCELLATION_REASON_BYTES = 2048
+_RUNNER_MUTATION_SETTLEMENT_FOREGROUND_TIMEOUT_SECONDS = 30.0
 
 
 class InvocationRunnerHandle:
@@ -76,6 +87,7 @@ class InvocationRunnerHandle:
 
     __slots__ = (
         "__ambiguous_capture_observer",
+        "__mutation_owner",
         "__redactor_snapshot_provider",
         "__runner",
     )
@@ -86,6 +98,7 @@ class InvocationRunnerHandle:
         *,
         redactor_snapshot_provider: Callable[[], Any],
         ambiguous_capture_observer: Callable[[int], None] | None = None,
+        mutation_owner: InvocationWorkspaceMutationOwner | None = None,
     ) -> None:
         if not isinstance(runner, Runner):
             raise TypeError("Invocation runner handle requires a Runner.")
@@ -93,9 +106,15 @@ class InvocationRunnerHandle:
             raise TypeError("redactor_snapshot_provider must be callable.")
         if ambiguous_capture_observer is not None and not callable(ambiguous_capture_observer):
             raise TypeError("ambiguous_capture_observer must be callable or None.")
+        if (
+            mutation_owner is not None
+            and type(mutation_owner) is not InvocationWorkspaceMutationOwner
+        ):
+            raise TypeError("Invocation runner mutation owner is invalid.")
         self.__runner = runner
         self.__redactor_snapshot_provider = redactor_snapshot_provider
         self.__ambiguous_capture_observer = ambiguous_capture_observer
+        self.__mutation_owner = mutation_owner
 
     async def preflight_exec(
         self,
@@ -291,40 +310,165 @@ class InvocationRunnerHandle:
         if owned_env_remove:
             kwargs["env_remove"] = owned_env_remove
 
+        mutation_tracker = None
+        mutation_admission_failure: RunnerExecutionError | None = None
+        if self.__mutation_owner is not None:
+            try:
+                mutation_tracker = self.__mutation_owner.track_current_task()
+                mutation_tracker.__enter__()
+            except RuntimeError as error:
+                mutation_admission_failure = _safe_runner_execution_error(
+                    self.__runner,
+                    error,
+                )
+                error.__traceback__ = None
+                del error
+        if mutation_admission_failure is not None:
+            published_failure = mutation_admission_failure
+            del (
+                mutation_admission_failure,
+                mutation_tracker,
+                owned_command,
+                owned_cwd,
+                owned_env,
+                owned_env_remove,
+                owned_timeout,
+                owned_stdin,
+                cwd,
+                env,
+                env_remove,
+                timeout_s,
+                stdin,
+                output_limit_bytes,
+                kwargs,
+                initial,
+                self,
+                result,
+                failure,
+                grouped_failure,
+                cancellation_cause,
+                cancellation,
+            )
+            raise published_failure from None
+
         def operation_factory(
             runner: Runner = self.__runner,
             command: ExecCommand = owned_command,
             kwargs: dict[str, Any] = kwargs,
-        ) -> Awaitable[ExecResult]:
-            return runner.exec_redacted(command, **kwargs)
+            capture_settlement: bool = self.__mutation_owner is not None,
+        ) -> Awaitable[_RunnerDispatchOutcome]:
+            return _capture_runner_dispatch_outcome(
+                runner=runner,
+                command=command,
+                kwargs=kwargs,
+                capture_settlement=capture_settlement,
+            )
 
-        operation = await_invocation_operation(operation_factory)
-        del operation_factory
-        # The boundary coroutine now exclusively owns the request factory.
-        # Remove raw command input before this public frame starts awaiting.
-        del (
-            owned_command,
-            owned_cwd,
-            owned_env,
-            owned_env_remove,
-            owned_timeout,
-            owned_stdin,
-            cwd,
-            env,
-            env_remove,
-            timeout_s,
-            stdin,
-            output_limit_bytes,
-            kwargs,
-            initial,
-        )
+        operation = None
+        caller_cancellation: asyncio.CancelledError | None = None
+        settlement_failure: BaseException | None = None
+        restore_settlement_cancellation_requests = 0
+
+        def retain_unsettled_runner_operation(
+            retained_operation: _RetainedInvocationOperationProbe,
+            *,
+            mutation_owner: InvocationWorkspaceMutationOwner | None = self.__mutation_owner,
+            runner: Runner = self.__runner,
+        ) -> None:
+            if mutation_owner is None:  # pragma: no cover - callback installation invariant
+                raise AssertionError("Runner mutation owner is unavailable.")
+            mutation_owner.fail_closed(
+                _RetainedRunnerDispatchSettlementProbe(
+                    operation=retained_operation,
+                    runner=runner,
+                )
+            )
+
         try:
-            outcome = await operation
+            operation = await_invocation_operation(
+                operation_factory,
+                on_unsettled_supervisory_exit=(
+                    retain_unsettled_runner_operation if self.__mutation_owner is not None else None
+                ),
+            )
+            del operation_factory
+            # The boundary coroutine now exclusively owns the request factory.
+            # Remove raw command input before this public frame starts awaiting.
+            del (
+                owned_command,
+                owned_cwd,
+                owned_env,
+                owned_env_remove,
+                owned_timeout,
+                owned_stdin,
+                cwd,
+                env,
+                env_remove,
+                timeout_s,
+                stdin,
+                output_limit_bytes,
+                kwargs,
+                initial,
+            )
+            try:
+                outcome = await operation
+            finally:
+                del operation
+            dispatch_outcome = (
+                outcome.result if type(outcome.result) is _RunnerDispatchOutcome else None
+            )
+            if dispatch_outcome is None:
+                runner_result = None
+                runner_error = outcome.error
+                settlement = "runner_quiescent" if outcome.operation_started is False else None
+                settlement_error = None
+            else:
+                runner_result = dispatch_outcome.result
+                runner_error = dispatch_outcome.error
+                settlement = dispatch_outcome.settlement
+                settlement_error = dispatch_outcome.settlement_error
+            caller_cancellation = outcome.cancellation
+            if self.__mutation_owner is not None:
+                settlement_outcome = await _settle_invocation_runner_mutation(
+                    runner=self.__runner,
+                    owner=self.__mutation_owner,
+                    settlement=settlement,
+                    settlement_error=settlement_error,
+                    cancellation=caller_cancellation,
+                )
+                if caller_cancellation is None:
+                    caller_cancellation = settlement_outcome.cancellation
+                settlement_failure = settlement_outcome.failure
+                restore_settlement_cancellation_requests = (
+                    settlement_outcome.restore_cancellation_requests
+                )
+                del settlement_outcome
         finally:
-            del operation
-        result = outcome.result
-        raw_error = outcome.error
-        caller_cancellation = outcome.cancellation
+            if mutation_tracker is not None:
+                mutation_tracker.__exit__(None, None, None)
+        del mutation_tracker
+        if settlement_failure is not None and caller_cancellation is None:
+            published_settlement_signal = settlement_failure
+            del (
+                cancellation,
+                cancellation_cause,
+                caller_cancellation,
+                failure,
+                grouped_failure,
+                outcome,
+                dispatch_outcome,
+                runner_error,
+                runner_result,
+                settlement,
+                settlement_error,
+                result,
+                restore_settlement_cancellation_requests,
+                self,
+                settlement_failure,
+            )
+            _raise_clean_runner_settlement_signal(published_settlement_signal)
+        result = cast("ExecResult | None", runner_result)
+        raw_error = runner_error
         if caller_cancellation is not None:
             current_redactor = _current_runner_redactor(
                 self.__redactor_snapshot_provider,
@@ -406,9 +550,35 @@ class InvocationRunnerHandle:
                 )
             else:
                 fatal_error = raw_error
-                del outcome, raw_error, caller_cancellation, self, result
+                del (
+                    outcome,
+                    dispatch_outcome,
+                    raw_error,
+                    runner_error,
+                    runner_result,
+                    settlement,
+                    settlement_error,
+                    caller_cancellation,
+                    self,
+                    result,
+                )
                 raise fatal_error from None
-        del outcome, raw_error, caller_cancellation
+        if settlement_failure is not None:
+            cancellation_cause = _combine_runner_cancellation_causes(
+                cancellation_cause,
+                settlement_failure,
+            )
+        del (
+            outcome,
+            dispatch_outcome,
+            raw_error,
+            runner_error,
+            runner_result,
+            settlement,
+            settlement_error,
+            caller_cancellation,
+            settlement_failure,
+        )
         if cancellation is not None:
             # Do not leave an object path from the public traceback back into
             # adapter/SDK state that may still retain the transferred request.
@@ -427,6 +597,7 @@ class InvocationRunnerHandle:
                 cancellation_args,
                 cancellation_artifacts,
                 cause=safe_cause,
+                restore_cancellation_requests=restore_settlement_cancellation_requests,
             )
         if grouped_failure is not None:
             safe_grouped_failure = grouped_failure
@@ -483,12 +654,334 @@ class InvocationRunnerHandle:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class _RunnerSettlementCallOutcome:
+    result: object | None = None
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RunnerDispatchOutcome:
+    """Extension result plus immutable runtime-owned settlement authority."""
+
+    result: object | None = None
+    error: BaseException | None = None
+    settlement: RunnerWorkspaceMutationSettlement | None = None
+    settlement_error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RunnerMutationSettlementOutcome:
+    cancellation: asyncio.CancelledError | None = None
+    failure: BaseException | None = None
+    restore_cancellation_requests: int = 0
+
+
+async def _capture_runner_dispatch_outcome(
+    *,
+    runner: Runner,
+    command: ExecCommand,
+    kwargs: dict[str, Any],
+    capture_settlement: bool,
+) -> _RunnerDispatchOutcome:
+    """Freeze settlement evidence before an extension can mutate its outcome."""
+
+    result: object | None = None
+    error: BaseException | None = None
+    try:
+        result = await runner.exec_redacted(command, **kwargs)
+    except BaseException as exc:
+        error = exc
+
+    if not capture_settlement:
+        return _RunnerDispatchOutcome(result=result, error=error)
+
+    try:
+        settlement = _invocation_runner_mutation_settlement(
+            operation_started=True,
+            result=result,
+            error=error,
+        )
+    except BaseException as exc:
+        return _RunnerDispatchOutcome(
+            result=result,
+            error=error,
+            settlement_error=exc,
+        )
+    return _RunnerDispatchOutcome(
+        result=result,
+        error=error,
+        settlement=settlement,
+    )
+
+
+async def _run_runner_settlement_call(
+    factory: Callable[[], Awaitable[bool]],
+) -> _RunnerSettlementCallOutcome:
+    """Contain extension-owned control signals inside the owned task."""
+
+    try:
+        return _RunnerSettlementCallOutcome(result=await factory())
+    except BaseException as error:
+        return _RunnerSettlementCallOutcome(error=error)
+
+
+class _RetainedRunnerSettlementProbe:
+    """Join one exact settlement task before allowing a later fresh probe."""
+
+    __slots__ = ("__factory", "__task")
+
+    def __init__(
+        self,
+        task: asyncio.Task[_RunnerSettlementCallOutcome],
+        factory: Callable[[], Awaitable[bool]],
+    ) -> None:
+        self.__task: asyncio.Task[_RunnerSettlementCallOutcome] | None = task
+        self.__factory = factory
+        task.add_done_callback(_observe_retained_runner_settlement_task)
+
+    async def __call__(self) -> bool:
+        task = self.__task
+        if task is None:
+            return await self.__factory()
+        if not task.done() and task.get_loop() is not asyncio.get_running_loop():
+            # An active task is affine to its original event loop. Starting a
+            # replacement probe here could clear the fence while that task is
+            # still operating, so cross-loop uncertainty remains quarantined.
+            return False
+        try:
+            outcome = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                self.__task = None
+            raise
+        except BaseException:
+            self.__task = None
+            raise
+        self.__task = None
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.result is True
+
+
+class _RetainedRunnerDispatchSettlementProbe:
+    """Join one abandoned runner dispatch through positive mutation settlement."""
+
+    __slots__ = ("__operation", "__runner")
+
+    def __init__(
+        self,
+        *,
+        operation: _RetainedInvocationOperationProbe,
+        runner: Runner,
+    ) -> None:
+        self.__operation = operation
+        self.__runner = runner
+
+    async def __call__(self) -> bool:
+        outcome = await self.__operation.outcome()
+        if outcome is None:
+            return False
+        if outcome.operation_started is False:
+            return True
+        dispatch_outcome = (
+            outcome.result if type(outcome.result) is _RunnerDispatchOutcome else None
+        )
+        if dispatch_outcome is None:
+            return False
+        if dispatch_outcome.settlement_error is not None:
+            raise dispatch_outcome.settlement_error
+        settlement = dispatch_outcome.settlement
+        if settlement is None:
+            return False
+        if settlement in {"complete", "runner_quiescent"}:
+            return True
+        if settlement != "deferred":
+            return False
+        if not runner_pending_command_settlement_cancellation_safe(self.__runner):
+            return False
+        settled = await self.__runner.await_pending_command_settlement()
+        return type(settled) is bool and settled
+
+
+def _observe_retained_runner_settlement_task(
+    task: asyncio.Task[_RunnerSettlementCallOutcome],
+) -> None:
+    """Consume diagnostics while retaining the task's replayable outcome."""
+
+    try:
+        task.exception()
+    except BaseException:
+        return
+
+
+async def _unavailable_runner_settlement_probe() -> bool:
+    """Keep an unsafe extension waiter permanently fail-closed."""
+
+    return False
+
+
+def _runner_settlement_probe(
+    runner: Runner,
+    factory: Callable[[], Awaitable[bool]],
+) -> tuple[Callable[[], Awaitable[bool]], bool]:
+    """Return a probe only when its observer task may be cancelled safely."""
+
+    cancellation_safe = runner_pending_command_settlement_cancellation_safe(runner)
+    if cancellation_safe:
+        return factory, True
+    return _unavailable_runner_settlement_probe, False
+
+
+def _runner_settlement_failure() -> RuntimeError:
+    return RuntimeError("Runner mutation settlement failed.")
+
+
+def _invocation_runner_mutation_settlement(
+    *,
+    operation_started: object,
+    result: object,
+    error: BaseException | None,
+) -> RunnerWorkspaceMutationSettlement | None:
+    """Validate one owned dispatch outcome before classifying quiescence."""
+
+    if type(operation_started) is not bool:
+        return None
+    if not operation_started:
+        return "runner_quiescent"
+    if result is not None and type(result) is not ExecResult:
+        return None
+    return runner_workspace_mutation_settlement(
+        result=result,
+        error=error,
+    )
+
+
+async def _settle_invocation_runner_mutation(
+    *,
+    runner: Runner,
+    owner: InvocationWorkspaceMutationOwner,
+    settlement: RunnerWorkspaceMutationSettlement | None,
+    settlement_error: BaseException | None,
+    cancellation: asyncio.CancelledError | None,
+) -> _RunnerMutationSettlementOutcome:
+    """Keep the receipt owner until runner cleanup proves mutation quiescence."""
+
+    def settlement_factory() -> Awaitable[bool]:
+        return runner.await_pending_command_settlement()
+
+    retry_probe, cancellation_safe = _runner_settlement_probe(runner, settlement_factory)
+
+    if settlement_error is not None:
+        owner.fail_closed(retry_probe)
+        process_signal = detached_workspace_mutation_process_signal(settlement_error)
+        if process_signal is not None:
+            return _RunnerMutationSettlementOutcome(
+                cancellation=cancellation,
+                failure=process_signal,
+            )
+        return _RunnerMutationSettlementOutcome(
+            cancellation=cancellation,
+            failure=_runner_settlement_failure() if cancellation is not None else None,
+        )
+    if settlement is None:
+        owner.fail_closed(retry_probe)
+        return _RunnerMutationSettlementOutcome(cancellation=cancellation)
+    if settlement in {"complete", "runner_quiescent"}:
+        return _RunnerMutationSettlementOutcome(cancellation=cancellation)
+    if settlement == "uncertain":
+        owner.fail_closed(retry_probe)
+        return _RunnerMutationSettlementOutcome(cancellation=cancellation)
+    if not cancellation_safe:
+        owner.fail_closed(retry_probe)
+        return _RunnerMutationSettlementOutcome(cancellation=cancellation)
+    if cancellation is not None:
+        # Do not start an extension-owned waiter after cancellation is already
+        # authoritative. The process fence can invoke the declared-safe probe
+        # if this environment is reused without leaving a task in a closing loop.
+        owner.fail_closed(retry_probe)
+        return _RunnerMutationSettlementOutcome(cancellation=cancellation)
+
+    settlement_task = asyncio.create_task(
+        _run_runner_settlement_call(settlement_factory),
+        name="cayu-runner-mutation-settlement",
+    )
+    retained_probe = _RetainedRunnerSettlementProbe(
+        settlement_task,
+        settlement_factory,
+    )
+    settlement_owner_resolved = False
+    try:
+        settlement_outcome = await await_shielded_task_outcome(
+            settlement_task,
+            timeout_s=_RUNNER_MUTATION_SETTLEMENT_FOREGROUND_TIMEOUT_SECONDS,
+            timeout_after_cancellation_s=0.0,
+        )
+        if settlement_outcome.timed_out:
+            owner.fail_closed(retained_probe)
+            settlement_owner_resolved = True
+            return _RunnerMutationSettlementOutcome(
+                cancellation=settlement_outcome.cancellation,
+                restore_cancellation_requests=(settlement_outcome.cancellation_requests_consumed),
+            )
+        settlement_call_outcome = settlement_outcome.result
+        if type(settlement_call_outcome) is not _RunnerSettlementCallOutcome:
+            settlement_call_outcome = _RunnerSettlementCallOutcome(
+                error=RuntimeError("Runner mutation settlement returned an invalid outcome."),
+            )
+        settlement_error = settlement_outcome.error or settlement_call_outcome.error
+        if settlement_error is not None:
+            process_signal = detached_workspace_mutation_process_signal(settlement_error)
+        else:
+            process_signal = None
+        if process_signal is not None:
+            owner.fail_closed(retry_probe)
+            settlement_owner_resolved = True
+            settlement_cancellation = settlement_outcome.cancellation
+            settlement_cancellation_requests = settlement_outcome.cancellation_requests_consumed
+            del (
+                retained_probe,
+                settlement_call_outcome,
+                settlement_error,
+                settlement_outcome,
+                settlement_task,
+            )
+            return _RunnerMutationSettlementOutcome(
+                cancellation=settlement_cancellation,
+                failure=process_signal,
+                restore_cancellation_requests=settlement_cancellation_requests,
+            )
+        if settlement_error is not None or settlement_call_outcome.result is not True:
+            owner.fail_closed(retry_probe)
+            settlement_owner_resolved = True
+            return _RunnerMutationSettlementOutcome(
+                cancellation=settlement_outcome.cancellation,
+                failure=(
+                    _runner_settlement_failure()
+                    if settlement_outcome.cancellation is not None
+                    else None
+                ),
+                restore_cancellation_requests=(settlement_outcome.cancellation_requests_consumed),
+            )
+        settlement_owner_resolved = True
+        return _RunnerMutationSettlementOutcome(
+            cancellation=settlement_outcome.cancellation,
+            restore_cancellation_requests=(settlement_outcome.cancellation_requests_consumed),
+        )
+    finally:
+        if not settlement_owner_resolved:
+            # Once the exact task exists, every abnormal supervisor exit must
+            # transfer it before the original control signal continues.
+            owner.fail_closed(retained_probe)
+
+
 def _raise_clean_runner_cancellation(
     cancellation_type: type[asyncio.CancelledError],
     args: tuple[object, ...],
     artifacts: list[dict[str, Any]],
     *,
     cause: BaseException | None = None,
+    restore_cancellation_requests: int = 0,
 ) -> NoReturn:
     """Raise cancellation without retaining a runner or raw-request traceback.
 
@@ -500,7 +993,32 @@ def _raise_clean_runner_cancellation(
     cancellation = _clean_runner_cancellation(cancellation_type, args, artifacts)
     if cause is not None:
         attach_runner_cancellation_failure(cancellation, cause)
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        for _request in range(restore_cancellation_requests):
+            current_task.cancel()
     raise cancellation from cause
+
+
+def _combine_runner_cancellation_causes(
+    command_failure: BaseException | None,
+    settlement_failure: BaseException,
+) -> BaseException:
+    if command_failure is None or command_failure is settlement_failure:
+        return settlement_failure
+    return BaseExceptionGroup(
+        "Runner command and mutation settlement failed after caller cancellation.",
+        [command_failure, settlement_failure],
+    )
+
+
+def _raise_clean_runner_settlement_signal(signal: BaseException) -> NoReturn:
+    """Raise a detached process signal without any runner-owned frame locals."""
+
+    signal.__traceback__ = None
+    signal.__cause__ = None
+    signal.__context__ = None
+    raise signal from None
 
 
 def _clean_runner_cancellation(
@@ -673,6 +1191,7 @@ def invocation_runner_handle(
     *,
     redactor_snapshot_provider: Callable[[], Any],
     ambiguous_capture_observer: Callable[[int], None] | None = None,
+    mutation_owner: InvocationWorkspaceMutationOwner | None = None,
 ) -> InvocationRunnerHandle | None:
     """Build the narrow runtime runner capability for one tool invocation."""
 
@@ -684,6 +1203,7 @@ def invocation_runner_handle(
         runner,
         redactor_snapshot_provider=redactor_snapshot_provider,
         ambiguous_capture_observer=ambiguous_capture_observer,
+        mutation_owner=mutation_owner,
     )
 
 

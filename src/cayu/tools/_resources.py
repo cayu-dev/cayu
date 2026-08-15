@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from cayu._exception_groups import exception_tree_contains, rebuild_exception_group
+from cayu._workspace_mutation import WorkspaceMutationSettlementError
 from cayu.artifacts import (
     ArtifactReadResult,
     ArtifactStore,
@@ -52,11 +54,35 @@ def _bounded_workspace_mutation_failure(
 class InvocationWorkspaceMutationOwner:
     """Fence invocation-dispatched workspace mutations until proven settled."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        on_settlement_unproven: (Callable[[Callable[[], Awaitable[bool]]], None] | None) = None,
+    ) -> None:
+        if on_settlement_unproven is not None and not callable(on_settlement_unproven):
+            raise TypeError("Workspace mutation settlement observer must be callable.")
         self.__active: set[asyncio.Task[Any]] = set()
         self.__sealed = False
+        self.__settlement_unproven = False
+        self.__on_settlement_unproven = on_settlement_unproven
 
-    async def run(self, operation_factory: Callable[[], Awaitable[Any]]) -> Any:
+    def fail_closed(
+        self,
+        settlement_probe: Callable[[], Awaitable[bool]],
+    ) -> None:
+        """Fence the window after a mutation loses positive settlement proof."""
+
+        if not callable(settlement_probe):
+            raise TypeError("Workspace mutation settlement probe must be callable.")
+        self.__sealed = True
+        self.__settlement_unproven = True
+        if self.__on_settlement_unproven is not None:
+            self.__on_settlement_unproven(settlement_probe)
+
+    @contextmanager
+    def track_current_task(self) -> Iterator[None]:
+        """Register the current invocation task until its mutation settles."""
+
         if self.__sealed:
             raise RuntimeError("Workspace mutation is unavailable after invocation settlement.")
         current = asyncio.current_task()
@@ -64,12 +90,17 @@ class InvocationWorkspaceMutationOwner:
             raise RuntimeError("Workspace mutation requires an asyncio task owner.")
         self.__active.add(current)
         try:
+            yield
+        finally:
+            self.__active.discard(current)
+
+    async def run(self, operation_factory: Callable[[], Awaitable[Any]]) -> Any:
+        with self.track_current_task():
             outcome = await await_invocation_operation(
                 operation_factory,
                 request_child_cancellation=False,
+                on_unsettled_supervisory_exit=self.fail_closed,
             )
-        finally:
-            self.__active.discard(current)
         mutation_error = outcome.error
         if mutation_error is not None and exception_tree_contains(
             mutation_error,
@@ -92,6 +123,15 @@ class InvocationWorkspaceMutationOwner:
             raise mutation_error
         return outcome.result
 
+    def seal_and_transfer_pending(self) -> None:
+        """Transfer detached mutation tasks without delaying a supervisory exit."""
+
+        self.__sealed = True
+        current = asyncio.current_task()
+        pending = tuple(task for task in self.__active if task is not current and not task.done())
+        if pending:
+            self.fail_closed(_RetainedWorkspaceMutationTasksProbe(pending))
+
     async def seal_and_wait(self) -> None:
         """Reject new mutations and wait for every dispatched mutation owner."""
 
@@ -109,9 +149,29 @@ class InvocationWorkspaceMutationOwner:
                     cancellation = exc
                 pending = {task for task in pending if not task.done()}
                 continue
+            except BaseExceptionGroup as exc:
+                if exception_tree_contains(
+                    exc,
+                    (KeyboardInterrupt, SystemExit, GeneratorExit),
+                ):
+                    pending = {task for task in pending if not task.done()}
+                    if pending:
+                        self.fail_closed(_RetainedWorkspaceMutationTasksProbe(tuple(pending)))
+                raise
+            except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                pending = {task for task in pending if not task.done()}
+                if pending:
+                    self.fail_closed(_RetainedWorkspaceMutationTasksProbe(tuple(pending)))
+                raise
             pending.clear()
 
         failures: list[BaseException] = []
+        if self.__settlement_unproven:
+            failures.append(
+                WorkspaceMutationSettlementError(
+                    "Workspace mutation settlement could not be proven."
+                )
+            )
         for task in owned:
             try:
                 task.result()
@@ -130,9 +190,13 @@ class InvocationWorkspaceMutationOwner:
                 process_failures,
             )
         bounded_failures = [
-            _bounded_workspace_mutation_failure(
-                failure,
-                operation="Detached invocation workspace mutation",
+            (
+                failure
+                if isinstance(failure, WorkspaceMutationSettlementError)
+                else _bounded_workspace_mutation_failure(
+                    failure,
+                    operation="Detached invocation workspace mutation",
+                )
             )
             for failure in failures
         ]
@@ -156,6 +220,44 @@ class InvocationWorkspaceMutationOwner:
                 "Detached workspace mutations failed during settlement.",
                 bounded_failures,
             )
+
+
+class _RetainedWorkspaceMutationTasksProbe:
+    """Join exact invocation tasks retained after a supervisory tool exit."""
+
+    __slots__ = ("__tasks",)
+
+    def __init__(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
+        self.__tasks = tasks
+        for task in tasks:
+            task.add_done_callback(_observe_retained_workspace_mutation_task)
+
+    async def __call__(self) -> bool:
+        current_loop = asyncio.get_running_loop()
+        if any(not task.done() and task.get_loop() is not current_loop for task in self.__tasks):
+            return False
+        pending = tuple(task for task in self.__tasks if not task.done())
+        if pending:
+            waiter = asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                if not all(task.done() for task in pending):
+                    raise
+        return all(task.done() for task in self.__tasks)
+
+
+def _observe_retained_workspace_mutation_task(task: asyncio.Task[Any]) -> None:
+    """Consume a detached mutation failure after quiescence is established."""
+
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        return
 
 
 _MAX_RESOURCE_CANCELLATION_REASON_BYTES = 2_048
@@ -794,6 +896,7 @@ __all__ = [
     "InvocationResourceReadError",
     "InvocationWorkspaceHandle",
     "InvocationWorkspaceMutationOwner",
+    "WorkspaceMutationSettlementError",
     "invocation_artifact_store_handle",
     "invocation_workspace_authenticated_cwd",
     "invocation_workspace_handle",

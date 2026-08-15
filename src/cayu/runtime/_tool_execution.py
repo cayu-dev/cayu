@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     FrozenJsonDict,
     copy_durable_json_object,
@@ -190,6 +191,8 @@ async def _run_tool(
         return _execution_outcome(result, controls)
     except BaseExceptionGroup as exc:
         ctx._discard_policy_denials_for(tool)
+        if exception_tree_contains(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
         if timer is not None and timer.expired():
             result, controls = tool_results.terminal_failure_result(
                 terminal_outcome="tool_execution_timeout",

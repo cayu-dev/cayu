@@ -29,6 +29,7 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
 )
+from cayu._workspace_mutation import WorkspaceMutationSettlementError
 from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
 from cayu.environments import (
     BoundWorkspace,
@@ -42,6 +43,7 @@ from cayu.environments import (
     ExecutionAdmissionCandidate,
     ExecutionAdmissionError,
     ExecutionRequirements,
+    WorkspaceBinding,
     WorkspaceInstructions,
     WorkspaceSnapshot,
     copy_environment,
@@ -435,6 +437,7 @@ class EnvironmentLifecycle:
     ) -> WorkspaceInstructions | None:
         if registered_environment is None:
             return None
+        await registered_environment.workspace_mutation_fence.wait_until_available()
         return await load_workspace_instructions(registered_environment.environment)
 
     async def _settle_retained_environment_cleanups(self) -> None:
@@ -713,6 +716,8 @@ class EnvironmentLifecycle:
     ) -> Event | None:
         """Persist the factory acceptance boundary before provisioning begins."""
 
+        if registered_environment is not None:
+            await registered_environment.workspace_mutation_fence.wait_until_available()
         await self._settle_retained_environment_cleanups()
         self._require_no_retained_cleanup_for_session(session.id)
         if registered_environment is None or registered_environment.factory is None:
@@ -993,6 +998,9 @@ class EnvironmentLifecycle:
                     None if admission_candidate is None else admission_candidate.candidate
                 ),
                 unclaimed_factory_result=result,
+                workspace_mutation_fence=(
+                    registered_environment.workspace_mutation_fence.child_fence()
+                ),
             )
             self._promote_environment_owner_admission(
                 session.id,
@@ -1307,6 +1315,14 @@ class EnvironmentLifecycle:
             if started_event is not None:
                 raise AssertionError("Binding start event exists without an environment.")
             return EnvironmentBindingResult(registered_environment=None, events=[])
+        try:
+            await registered_environment.workspace_mutation_fence.wait_until_available()
+        except Exception as exc:
+            return EnvironmentBindingResult(
+                registered_environment=registered_environment,
+                events=[],
+                error=exc,
+            )
         if registered_environment.bound_workspace is not None:
             if started_event is not None:
                 raise AssertionError("Binding start event exists for an already-bound workspace.")
@@ -1552,6 +1568,7 @@ class EnvironmentLifecycle:
             preserve_factory_allocation=(
                 registered_environment.unclaimed_factory_result is not None
             ),
+            workspace_mutation_fence=(registered_environment.workspace_mutation_fence),
         )
         # Binding owns the live handles from this point. Record that transfer
         # before publishing it so cancellation or an event-store failure cannot
@@ -1629,10 +1646,37 @@ class EnvironmentLifecycle:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
+            # A retained mutation fence is part of the cleanup owner's
+            # authority. Explicit operator drain is therefore also a valid
+            # positive-settlement entrance; polling guarded finalization alone
+            # cannot start the runner-owned probe.
+            seen_fences: set[int] = set()
+            fence_unavailable = False
+            for owner in retained:
+                fence = owner.registered_environment.workspace_mutation_fence
+                fence_identity = id(fence)
+                if fence_identity in seen_fences:
+                    continue
+                seen_fences.add(fence_identity)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                try:
+                    async with asyncio.timeout(remaining):
+                        await fence.wait_until_available()
+                except WorkspaceMutationSettlementError:
+                    fence_unavailable = True
+                except TimeoutError:
+                    return False
             try:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
                 async with asyncio.timeout(remaining):
                     await self._settle_retained_environment_cleanups()
             except TimeoutError:
+                return False
+            if fence_unavailable:
                 return False
             if (
                 not any(
@@ -1821,7 +1865,9 @@ class EnvironmentLifecycle:
 
         try:
             final_snapshot = await environment_operation_boundary.await_environment_operation(
-                lambda: binding.finalize(
+                lambda: _finalize_binding_after_mutation_quiescence(
+                    registered_environment,
+                    binding,
                     bound_workspace,
                     outcome=outcome,
                     metadata=finalize_metadata,
@@ -2057,7 +2103,14 @@ class EnvironmentLifecycle:
             ):
                 if setup_owner.cleanup_release_safe:
                     try:
-                        released = binding.abandon(bound_workspace)
+                        released = _abandon_binding_after_mutation_quiescence(
+                            registered_environment,
+                            binding,
+                            bound_workspace,
+                        )
+                        if released is _BINDING_ABANDON_BLOCKED_BY_MUTATION_FENCE:
+                            setup_owner.cleanup_settlement_started = False
+                            return
                     except BaseException as abandon_error:
                         setup_owner.cleanup_settlement_started = False
                         if original_error is None or abandon_error is original_error:
@@ -2085,7 +2138,9 @@ class EnvironmentLifecycle:
             async def retry_binding_finalize() -> BaseException | None:
                 try:
                     await environment_operation_boundary.await_environment_operation(
-                        lambda: binding.finalize(
+                        lambda: _finalize_binding_after_mutation_quiescence(
+                            registered_environment,
+                            binding,
                             bound_workspace,
                             outcome=setup_owner.cleanup_retry_outcome,
                             metadata=setup_owner.cleanup_retry_metadata,
@@ -2157,7 +2212,14 @@ class EnvironmentLifecycle:
                 try:
                     # `False` is an explicit refusal: a composite binding still
                     # owns an executable resource and must retain this handle.
-                    released = binding.abandon(bound_workspace)
+                    released = _abandon_binding_after_mutation_quiescence(
+                        registered_environment,
+                        binding,
+                        bound_workspace,
+                    )
+                    if released is _BINDING_ABANDON_BLOCKED_BY_MUTATION_FENCE:
+                        setup_owner.cleanup_settlement_started = False
+                        return
                 except BaseException as abandon_error:
                     setup_owner.cleanup_settlement_started = False
                     if original_error is None or abandon_error is original_error:
@@ -2171,7 +2233,14 @@ class EnvironmentLifecycle:
                     retry_error = await retry_binding_finalize()
                     if retry_error is None:
                         try:
-                            released = binding.abandon(bound_workspace)
+                            released = _abandon_binding_after_mutation_quiescence(
+                                registered_environment,
+                                binding,
+                                bound_workspace,
+                            )
+                            if released is _BINDING_ABANDON_BLOCKED_BY_MUTATION_FENCE:
+                                setup_owner.cleanup_settlement_started = False
+                                return
                         except BaseException as abandon_error:
                             setup_owner.cleanup_settlement_started = False
                             if original_error is None or abandon_error is original_error:
@@ -2252,7 +2321,9 @@ class EnvironmentLifecycle:
         cleanup_error: BaseException | None = None
         try:
             await environment_operation_boundary.await_environment_operation(
-                lambda: binding.finalize(
+                lambda: _finalize_binding_after_mutation_quiescence(
+                    registered_environment,
+                    binding,
                     bound_workspace,
                     outcome="interrupted",
                     metadata=setup_owner.cleanup_retry_metadata,
@@ -2287,8 +2358,17 @@ class EnvironmentLifecycle:
             # No lifecycle owner survives this abort path. Finalize success
             # makes this a no-op; failure leaves retry state that must now be
             # released by the exact bound generation.
-            released = binding.abandon(bound_workspace) is not False
+            release_outcome = _abandon_binding_after_mutation_quiescence(
+                registered_environment,
+                binding,
+                bound_workspace,
+            )
+            if release_outcome is _BINDING_ABANDON_BLOCKED_BY_MUTATION_FENCE:
+                setup_owner.cleanup_settlement_started = False
+                return
+            released = release_outcome is not False
         except BaseException as exc:
+            setup_owner.cleanup_settlement_started = False
             abandon_error = exc
             diagnostic = exception_diagnostic(
                 abandon_error,
@@ -2690,6 +2770,43 @@ def _environment_cleanup_settlement_error(
         "Environment binding failure evidence fan-out failed after caller cancellation.",
         [fanout_error, cancellation],
     )
+
+
+async def _finalize_binding_after_mutation_quiescence(
+    registered_environment: runtime_records.RegisteredEnvironment,
+    binding: WorkspaceBinding,
+    bound_workspace: BoundWorkspace,
+    *,
+    outcome: str | None,
+    metadata: dict[str, Any] | None,
+) -> WorkspaceSnapshot | None:
+    registered_environment.workspace_mutation_fence.require_available_nowait()
+    return await binding.finalize(
+        bound_workspace,
+        outcome=outcome,
+        metadata=metadata,
+    )
+
+
+class _BindingAbandonBlockedByMutationFence:
+    """Private result distinct from every valid binding abandonment result."""
+
+
+_BINDING_ABANDON_BLOCKED_BY_MUTATION_FENCE = _BindingAbandonBlockedByMutationFence()
+
+
+def _abandon_binding_after_mutation_quiescence(
+    registered_environment: runtime_records.RegisteredEnvironment,
+    binding: WorkspaceBinding,
+    bound_workspace: BoundWorkspace,
+) -> bool | None | _BindingAbandonBlockedByMutationFence:
+    try:
+        registered_environment.workspace_mutation_fence.require_available_nowait()
+    except WorkspaceMutationSettlementError:
+        # Keep the runtime-owned guard state structurally separate from an
+        # extension binding that happens to raise the same public exception.
+        return _BINDING_ABANDON_BLOCKED_BY_MUTATION_FENCE
+    return binding.abandon(bound_workspace)
 
 
 def _binding_finalize_error_payload(

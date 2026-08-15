@@ -217,11 +217,14 @@ _TERMINAL_CONTROL_KEYS = frozenset(
         "durable_value_error_path",
     }
 )
-_WORKSPACE_MUTATION_CAPTURE_DETAILS = {
-    "recorded": None,
-    "failed": "receipt_publication_failed",
-    "interrupted": "receipt_publication_interrupted",
-}
+_WORKSPACE_MUTATION_CAPTURE_CONTROLS = frozenset(
+    {
+        ("recorded", None),
+        ("failed", "mutation_settlement_unproven"),
+        ("failed", "receipt_publication_failed"),
+        ("interrupted", "receipt_publication_interrupted"),
+    }
+)
 
 _SESSION_STATUS_VALUES = frozenset(
     {"pending", "running", "interrupting", "completed", "failed", "interrupted"}
@@ -3594,8 +3597,7 @@ def _recognized_controls(
             if capture_status is not None or capture_detail is not None:
                 if (
                     type(capture_status) is not str
-                    or capture_status not in _WORKSPACE_MUTATION_CAPTURE_DETAILS
-                    or capture_detail != _WORKSPACE_MUTATION_CAPTURE_DETAILS[capture_status]
+                    or (capture_status, capture_detail) not in _WORKSPACE_MUTATION_CAPTURE_CONTROLS
                 ):
                     raise ValueError("Invalid workspace mutation capture controls.")
                 controls["workspace_mutation_capture_status"] = capture_status

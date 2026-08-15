@@ -3203,6 +3203,10 @@
           "parallel_safe": {
             "title": "Parallel Safe",
             "type": "boolean"
+          },
+          "workspace_mutation": {
+            "title": "Workspace Mutation",
+            "type": "boolean"
           }
         },
         "required": [
@@ -3210,7 +3214,8 @@
           "description",
           "input_schema",
           "parallel_safe",
-          "effect"
+          "effect",
+          "workspace_mutation"
         ],
         "title": "ApiToolSummary",
         "type": "object"
