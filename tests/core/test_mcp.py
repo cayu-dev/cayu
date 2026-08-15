@@ -71,6 +71,10 @@ from cayu.runtime import (
     ToolPolicyResult,
 )
 from cayu.runtime._event_projection import public_event_sequence
+from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
 from cayu.runtime.sessions import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
@@ -615,7 +619,15 @@ def test_runtime_composes_mcp_session_secrets_before_durable_tool_checkpoint() -
 
     assert events[-1].type == EventType.SESSION_FAILED
     assert calls == 0
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert checkpoint is not None
+    checkpoint_without_active_profile = dict(checkpoint)
+    assert (
+        checkpoint_without_active_profile.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+        is not None
+    )
+    assert checkpoint_without_active_profile == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
+    }
     assert secret not in serialized
 
 

@@ -9,8 +9,9 @@ from tests.core.checkpoint_schema_conformance import (
     assert_assistant_publication_checkpoint_conformance,
     assert_current_checkpoint_publication_upgrade_conformance,
     assert_future_checkpoint_rejection_conformance,
-    assert_versionless_checkpoint_resume_conformance,
+    assert_runtime_publication_rejects_invocation_authority_mutation,
     assert_versionless_noop_transform_stamps_conformance,
+    assert_versionless_pending_continuation_fails_closed_conformance,
 )
 
 from cayu import (
@@ -25,6 +26,7 @@ from cayu.runtime import _model_completion_publication as model_completion_publi
 from cayu.runtime import _session_engine as session_engine
 from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
 from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CheckpointMigration,
     CheckpointMigrationDefinitionError,
     CheckpointMigrator,
@@ -231,6 +233,81 @@ def test_v1_model_publication_pointer_is_upcast_to_v2() -> None:
     assert original_pointer["schema_version"] == 1
 
 
+def test_v2_root_checkpoint_is_upcast_to_v3_without_inventing_invocation_authority() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        "future_additive_field": {"kept": True},
+    }
+
+    decoded = decode_runtime_checkpoint(source, session_id="sess-v2-root")
+
+    assert decoded is not None
+    assert decoded == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "future_additive_field": {"kept": True},
+    }
+    assert ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY not in decoded
+    assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+
+
+def test_v2_root_checkpoint_discards_reserved_invocation_authority_collision() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY: {
+            "record_type": "cayu.active-invocation-execution-profile",
+            "session_id": "forged-session",
+        },
+        "future_additive_field": {"kept": True},
+    }
+
+    decoded = decode_runtime_checkpoint(source, session_id="sess-v2-authority-collision")
+
+    assert decoded == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "future_additive_field": {"kept": True},
+    }
+    assert ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY in source
+    assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+
+
+@pytest.mark.parametrize("writer_version", [1, 2])
+def test_older_writer_view_rejects_active_invocation_profile_authority(
+    writer_version: int,
+) -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY: {
+            "record_type": "cayu.active-invocation-execution-profile",
+        },
+    }
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        runtime_checkpoint_writer_view(
+            source,
+            writer_version=writer_version,
+            session_id="sess-active-profile-writer-view",
+        )
+
+
+def test_v2_writer_view_projects_v3_state_without_active_invocation_authority() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "future_additive_field": {"kept": True},
+    }
+
+    projected = runtime_checkpoint_writer_view(
+        source,
+        writer_version=2,
+        session_id="sess-v2-writer-view",
+    )
+
+    assert projected == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        "future_additive_field": {"kept": True},
+    }
+    assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+
+
 def test_v1_writer_view_rejects_unrecognized_current_model_publication_pointer() -> None:
     source = {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -269,6 +346,15 @@ def test_current_root_checkpoint_is_defensively_copied() -> None:
     assert decoded is not source
     assert decoded is not None
     assert decoded["nested"] is not source["nested"]
+
+
+def test_in_memory_runtime_publication_rejects_invocation_authority_mutation() -> None:
+    asyncio.run(
+        assert_runtime_publication_rejects_invocation_authority_mutation(
+            InMemorySessionStore(),
+            session_id_prefix="sess-memory-reserved-invocation-publication",
+        )
+    )
 
 
 def test_non_object_root_checkpoint_fails_with_typed_evidence() -> None:
@@ -459,7 +545,7 @@ def test_checkpoint_upcaster_verifies_reported_target_version() -> None:
 def test_in_memory_checkpoint_schema_runtime_conformance() -> None:
     async def run() -> None:
         store = InMemorySessionStore()
-        await assert_versionless_checkpoint_resume_conformance(
+        await assert_versionless_pending_continuation_fails_closed_conformance(
             store,
             session_id="sess-memory-versionless-checkpoint",
         )
@@ -475,6 +561,10 @@ def test_in_memory_checkpoint_schema_runtime_conformance() -> None:
             store,
             session_id_prefix="sess-memory-current-publication",
         )
+        await assert_runtime_publication_rejects_invocation_authority_mutation(
+            store,
+            session_id_prefix="sess-memory-invocation-authority-publication",
+        )
         await assert_assistant_publication_checkpoint_conformance(
             store,
             session_id="sess-memory-assistant-publication",
@@ -487,7 +577,7 @@ def test_sqlite_checkpoint_schema_runtime_conformance(tmp_path) -> None:
     async def run() -> None:
         store = SQLiteSessionStore(tmp_path / "checkpoint-schema.sqlite")
         try:
-            await assert_versionless_checkpoint_resume_conformance(
+            await assert_versionless_pending_continuation_fails_closed_conformance(
                 store,
                 session_id="sess-sqlite-versionless-checkpoint",
             )
@@ -502,6 +592,10 @@ def test_sqlite_checkpoint_schema_runtime_conformance(tmp_path) -> None:
             await assert_current_checkpoint_publication_upgrade_conformance(
                 store,
                 session_id_prefix="sess-sqlite-current-publication",
+            )
+            await assert_runtime_publication_rejects_invocation_authority_mutation(
+                store,
+                session_id_prefix="sess-sqlite-invocation-authority-publication",
             )
             await assert_assistant_publication_checkpoint_conformance(
                 store,

@@ -147,6 +147,16 @@ from cayu.runtime.budgets import (
 )
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.errors import InteractionLifecyclePublicationRejected
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
+    ExecutionProfileIdentity,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
+    checkpoint_with_active_invocation_execution_profile,
+    execution_profile_from_session_metadata,
+)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -172,6 +182,7 @@ from cayu.runtime.sessions import (
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
     MAX_SESSION_LIST_CURSOR_BYTES,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
+    ActiveModelCompletionStage,
     CheckpointTransform,
     EventOrder,
     EventQuery,
@@ -196,6 +207,7 @@ from cayu.runtime.sessions import (
     _activate_session_interaction,
     _activate_session_run_fence,
     _checkpoint_with_session_run_operation,
+    _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _event_with_session_run_operation,
@@ -759,6 +771,7 @@ class RecoverySessionRunRequest:
     registered_agent: runtime_records.RegisteredAgentState
     registered_provider: runtime_records.RegisteredProvider
     registered_environment: runtime_records.RegisteredEnvironment | None
+    active_invocation_profile: ActiveInvocationExecutionProfile
     messages: list[Message]
     messages_to_append: list[Message]
     max_steps: int
@@ -778,6 +791,17 @@ class RecoverySessionRunRequest:
     run_limit_accounting: RunLimitAccountingContext | None = None
 
 
+def _rebound_active_invocation_profile(
+    session: Session,
+    snapshot: ActiveInvocationExecutionProfile,
+) -> ActiveInvocationExecutionProfile:
+    """Carry one validated profile into the run epoch claimed for recovery."""
+
+    if snapshot.session_id != session.id:
+        raise RuntimeError("Recovery profile authority belongs to a different session.")
+    return snapshot.model_copy(update={"run_epoch": session.run_epoch})
+
+
 @dataclass(frozen=True)
 class DeferredInputMaterialization:
     messages: list[Message]
@@ -791,6 +815,7 @@ class RecoveryTerminalEventRequest:
     session: Session
     registered_agent: runtime_records.RegisteredAgentState
     registered_environment: runtime_records.RegisteredEnvironment | None
+    execution_profile: ExecutionProfileIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -809,6 +834,7 @@ class RecoveryLimitStopRequest:
     deferred_messages: list[Message]
     requested_approval_decision: ToolApprovalDecision | None
     approval_resolution_request_digest: str | None
+    execution_profile: ExecutionProfileIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -826,6 +852,7 @@ class RecoveryInterruptionRequest:
     registered_agent: runtime_records.RegisteredAgentState
     registered_environment: runtime_records.RegisteredEnvironment | None
     environment_name: str | None
+    execution_profile: ExecutionProfileIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -837,6 +864,7 @@ class RecoveryAbandonedTurnRequest:
     run_started_at: float | None
     usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
+    execution_profile: ExecutionProfileIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -850,6 +878,7 @@ class RecoveryAbandonedSessionRequest:
     active_run: ActiveSessionRun[SessionUsageTracker] | None = None
     interaction_transition_failures: tuple[dict[str, Any], ...] = ()
     interaction_transition: InteractionTransitionSpec | None = None
+    execution_profile: ExecutionProfileIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -952,6 +981,15 @@ TaskEventFactory = Callable[[RecoveryTaskEventRequest], Event]
 RegisteredAgentResolver = Callable[[str], runtime_records.RegisteredAgentState]
 RegisteredProviderResolver = Callable[[str], runtime_records.RegisteredProvider]
 RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.RegisteredEnvironment | None]
+ExecutionProfileContinuationValidator = Callable[
+    [
+        Session,
+        dict[str, Any] | None,
+        runtime_records.RegisteredAgentState,
+        runtime_records.RegisteredProvider,
+    ],
+    Awaitable[ActiveInvocationExecutionProfile],
+]
 RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterator[Event]]
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
@@ -1017,6 +1055,7 @@ class RecoveryCoordinator:
         resolve_registered_agent: RegisteredAgentResolver,
         resolve_registered_provider: RegisteredProviderResolver,
         resolve_registered_environment: RegisteredEnvironmentResolver,
+        validate_execution_profile_continuation: ExecutionProfileContinuationValidator,
         interrupt_session_for_recovery: RecoveryInterruptionStream,
         pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
         abandoned_turn_completed: AbandonedTurnCompleted,
@@ -1042,6 +1081,7 @@ class RecoveryCoordinator:
         self._resolve_registered_agent = resolve_registered_agent
         self._resolve_registered_provider = resolve_registered_provider
         self._resolve_registered_environment = resolve_registered_environment
+        self._validate_execution_profile_continuation = validate_execution_profile_continuation
         self._interrupt_session_for_recovery = interrupt_session_for_recovery
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
         self._abandoned_turn_completed = abandoned_turn_completed
@@ -1052,6 +1092,8 @@ class RecoveryCoordinator:
     async def _recoverable_provider_operation(
         self,
         stage: ModelCompletionStage,
+        *,
+        registered_provider: runtime_records.RegisteredProvider | None = None,
     ) -> tuple[RecoverableProviderOperation, runtime_records.RegisteredProvider] | None:
         try:
             operation = await load_recoverable_provider_operation(self._session_store, stage)
@@ -1062,9 +1104,12 @@ class RecoveryCoordinator:
             ) from evidence_error
         if operation is None:
             return None
-        try:
-            registered_provider = self._resolve_registered_provider(operation.provider)
-        except KeyError:
+        if registered_provider is None:
+            try:
+                registered_provider = self._resolve_registered_provider(operation.provider)
+            except KeyError:
+                return None
+        elif registered_provider.name != operation.provider:
             return None
         provider = registered_provider.provider
         if (
@@ -1077,16 +1122,44 @@ class RecoveryCoordinator:
             return None
         return operation, registered_provider
 
-    async def preflight_model_completion_boundary(self, session: Session) -> bool:
-        """Reject a non-terminal dispatch and report terminal work to promote."""
+    async def load_model_completion_boundary(
+        self,
+        session: Session,
+    ) -> ActiveModelCompletionStage | None:
+        """Load and validate durable model work without consulting a provider."""
 
         active = await self._session_store.load_active_model_completion_stage(session.id)
+        if active is not None:
+            self._validate_active_model_completion_stage(session, active.stage)
+        return active
+
+    async def preflight_model_completion_boundary(
+        self,
+        session: Session,
+        *,
+        registered_provider: runtime_records.RegisteredProvider | None = None,
+        active_stage: ActiveModelCompletionStage | None = None,
+    ) -> bool:
+        """Reject a non-terminal dispatch and report terminal work to promote."""
+
+        if active_stage is None:
+            active = await self.load_model_completion_boundary(session)
+        else:
+            if type(active_stage) is not ActiveModelCompletionStage:
+                raise TypeError("active_stage must be an ActiveModelCompletionStage.")
+            active = active_stage.model_copy(deep=True)
         if active is None:
             return False
         stage = active.stage
         self._validate_active_model_completion_stage(session, stage)
         if stage.state == "in_flight":
-            if await self._recoverable_provider_operation(stage) is not None:
+            if (
+                await self._recoverable_provider_operation(
+                    stage,
+                    registered_provider=registered_provider,
+                )
+                is not None
+            ):
                 return True
             raise ModelCompletionManualRecoveryRequired(
                 "The active model-completion dispatch has no durable terminal response. "
@@ -1095,32 +1168,66 @@ class RecoveryCoordinator:
             )
         return True
 
-    async def cancel_provider_operation_for_interruption(self, session: Session) -> bool:
+    async def cancel_provider_operation_for_interruption(
+        self,
+        session: Session,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState | None = None,
+        registered_provider: runtime_records.RegisteredProvider | None = None,
+        registered_environment: runtime_records.RegisteredEnvironment | None = None,
+    ) -> ActiveInvocationExecutionProfile | None:
         """Address one durable in-flight provider operation without a live worker."""
+
+        if registered_agent is None and registered_provider is not None:
+            raise ValueError("Frozen provider-operation cancellation requires the original agent.")
 
         active = await self._session_store.load_active_model_completion_stage(session.id)
         if active is None or active.stage.state != "in_flight":
-            return False
+            return None
         stage = active.stage
         self._validate_active_model_completion_stage(session, stage)
-        recoverable = await self._recoverable_provider_operation(stage)
-        if recoverable is None:
-            return False
-        operation, registered_provider = recoverable
-        try:
-            registered_agent = self._resolve_registered_agent(session.agent_name)
-            registered_environment = self._resolve_registered_environment(session.environment_name)
-        except KeyError as registration_error:
+        if registered_agent is not None and registered_provider is None:
             raise ModelCompletionManualRecoveryRequired(
-                "Provider-operation cancellation requires the original agent, provider, "
-                "and environment registrations."
-            ) from registration_error
+                "Provider-operation cancellation requires the original provider registration."
+            )
+        recoverable = await self._recoverable_provider_operation(
+            stage,
+            registered_provider=registered_provider,
+        )
+        if recoverable is None:
+            return None
+        operation, recovered_provider = recoverable
+        if registered_agent is None or registered_provider is None:
+            try:
+                registered_agent = self._resolve_registered_agent(session.agent_name)
+                registered_provider = recovered_provider
+                registered_environment = self._resolve_registered_environment(
+                    session.environment_name
+                )
+            except KeyError as registration_error:
+                raise ModelCompletionManualRecoveryRequired(
+                    "Provider-operation cancellation requires the original agent, provider, "
+                    "and environment registrations."
+                ) from registration_error
+        elif registered_provider is not recovered_provider:
+            if registered_provider.name != recovered_provider.name:
+                raise ModelCompletionManualRecoveryRequired(
+                    "Provider-operation cancellation resolved a different provider identity."
+                )
+            recovered_provider = registered_provider
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            session,
+            checkpoint,
+            registered_agent,
+            recovered_provider,
+        )
         cancellation = await self._cancel_provider_operation(
             session,
             stage,
             operation,
             registered_agent,
-            registered_provider,
+            recovered_provider,
             registered_environment,
         )
         if cancellation is not None and cancellation.status is ProviderOperationStatus.COMPLETED:
@@ -1129,20 +1236,250 @@ class RecoveryCoordinator:
                 stage,
                 operation,
                 registered_agent,
-                registered_provider,
+                recovered_provider,
                 registered_environment,
             )
             if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:
                 raise ModelCompletionManualRecoveryRequired(
                     "Provider completion won cancellation but could not be reconciled."
                 )
-        return True
+        return execution_profile_snapshot
+
+    async def claim_provider_operation_interruption(
+        self,
+        session: Session,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        *,
+        interruption_request_id: str,
+    ) -> Session:
+        """Fence a dead provider worker and bind interruption to one recovery epoch."""
+
+        if type(execution_profile_snapshot) is not ActiveInvocationExecutionProfile:
+            raise TypeError(
+                "Provider-operation interruption requires active invocation profile authority."
+            )
+        interruption_request_id = require_clean_nonblank(
+            interruption_request_id,
+            "interruption_request_id",
+        )
+
+        def claim_interruption(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            current_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            pending_interrupt = (
+                None
+                if checkpoint is None
+                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            )
+            if (
+                type(pending_interrupt) is not dict
+                or interruption_request_id_from_payload(pending_interrupt)
+                != interruption_request_id
+                or _incomplete_recovery_claim_from_checkpoint(checkpoint) is not None
+            ):
+                raise SessionRunFenced(
+                    "Provider-operation interruption request ownership changed before claim."
+                )
+            if (
+                type(current_profile) is not ActiveInvocationExecutionProfile
+                or current_profile != execution_profile_snapshot
+            ):
+                raise RuntimeError(
+                    "Provider-operation interruption profile changed before recovery claimed it."
+                )
+            if (
+                current_profile.session_id != current_session.id
+                or current_profile.run_epoch != current_session.run_epoch
+            ):
+                raise SessionRunFenced(
+                    "Provider-operation interruption no longer owns the active invocation epoch."
+                )
+            return checkpoint_with_active_invocation_execution_profile(
+                checkpoint,
+                session_id=current_session.id,
+                interaction_id=current_profile.interaction_id,
+                run_epoch=current_session.run_epoch + 1,
+                profile=current_profile.profile,
+                expected=current_profile,
+            )
+
+        claim_task = asyncio.create_task(
+            self._session_store.fence_run_and_transform_checkpoint(
+                session.id,
+                statuses={SessionStatus.INTERRUPTING},
+                checkpoint_transform=claim_interruption,
+            )
+        )
+        outcome = await await_shielded_task_outcome(claim_task)
+        error = outcome.error
+        if isinstance(error, asyncio.CancelledError) and outcome.cancellation is None:
+            error = unexpected_child_cancellation_error(
+                error,
+                operation="Provider-operation interruption claim",
+            )
+        cancellation = outcome.cancellation
+        claimed = outcome.result
+        if error is not None:
+            reconciliation = await await_shielded_task_outcome(
+                asyncio.create_task(
+                    self._load_claimed_provider_operation_interruption(
+                        session_id=session.id,
+                        interaction_id=execution_profile_snapshot.interaction_id,
+                        run_epoch=session.run_epoch + 1,
+                        execution_profile=execution_profile_snapshot.profile,
+                        interruption_request_id=interruption_request_id,
+                    )
+                ),
+                cancellation=cancellation,
+            )
+            cancellation = reconciliation.cancellation or cancellation
+            reconciliation_error = reconciliation.error
+            if (
+                isinstance(reconciliation_error, asyncio.CancelledError)
+                and reconciliation.cancellation is None
+            ):
+                reconciliation_error = unexpected_child_cancellation_error(
+                    reconciliation_error,
+                    operation="Provider-operation interruption claim reconciliation",
+                )
+            if reconciliation_error is not None:
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Provider-operation interruption claim reconciliation also failed: "
+                        f"{type(reconciliation_error).__name__}."
+                    )
+                    _prepend_exception_cause(
+                        cancellation,
+                        BaseExceptionGroup(
+                            "Provider-operation interruption claim failures",
+                            [error, reconciliation_error],
+                        ),
+                    )
+                    raise cancellation
+                if not isinstance(reconciliation_error, Exception):
+                    raise reconciliation_error from error
+                error.add_note(
+                    "Provider-operation interruption claim reconciliation failed: "
+                    f"{type(reconciliation_error).__name__}."
+                )
+                raise error from reconciliation_error
+            claimed = reconciliation.result
+            if claimed is None:
+                if cancellation is not None:
+                    cancellation.add_note(
+                        f"Provider-operation interruption claim also failed: {type(error).__name__}."
+                    )
+                    raise cancellation from error
+                raise error
+            _activate_session_run_fence(claimed)
+            authoritative_failure = cancellation or error
+            try:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=authoritative_failure,
+                    steps=(
+                        (
+                            "failed provider-operation interruption claim release",
+                            lambda: (
+                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                    session_id=claimed.id,
+                                    execution_profile=execution_profile_snapshot.profile,
+                                )
+                            ),
+                        ),
+                    ),
+                )
+            finally:
+                _deactivate_session_run_fence(claimed.id)
+            if cancellation is not None:
+                cancellation.add_note(
+                    f"Provider-operation interruption claim also failed: {type(error).__name__}."
+                )
+                raise cancellation from error
+            raise error
+        if claimed is None:
+            missing = RuntimeError(
+                "Provider-operation interruption claim returned no session authority."
+            )
+            if cancellation is not None:
+                cancellation.add_note(str(missing))
+                raise cancellation from missing
+            raise missing
+        _activate_session_run_fence(claimed)
+        if cancellation is not None:
+            try:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=cancellation,
+                    steps=(
+                        (
+                            "cancelled provider-operation interruption run-fence release",
+                            lambda: (
+                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                    session_id=claimed.id,
+                                    execution_profile=execution_profile_snapshot.profile,
+                                )
+                            ),
+                        ),
+                    ),
+                )
+            finally:
+                _deactivate_session_run_fence(claimed.id)
+            raise cancellation
+        return claimed
+
+    async def _load_claimed_provider_operation_interruption(
+        self,
+        *,
+        session_id: str,
+        interaction_id: str,
+        run_epoch: int,
+        execution_profile: ExecutionProfileIdentity,
+        interruption_request_id: str,
+    ) -> Session | None:
+        """Reconcile acknowledgement loss only against the complete claimed identity."""
+
+        current = await self._session_store.load(session_id)
+        if (
+            current is None
+            or current.status is not SessionStatus.INTERRUPTING
+            or current.run_epoch != run_epoch
+        ):
+            return None
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        current_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        pending_interrupt = (
+            None
+            if checkpoint is None
+            else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+        )
+        if (
+            current_profile is None
+            or current_profile.session_id != session_id
+            or current_profile.interaction_id != interaction_id
+            or current_profile.run_epoch != run_epoch
+            or current_profile.profile != execution_profile
+            or type(pending_interrupt) is not dict
+            or interruption_request_id_from_payload(pending_interrupt) != interruption_request_id
+            or _incomplete_recovery_claim_from_checkpoint(checkpoint) is not None
+        ):
+            return None
+        return current
 
     async def reconcile_model_completion_boundary(
         self,
         session: Session,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState | None = None,
+        registered_provider: runtime_records.RegisteredProvider | None = None,
+        registered_environment: runtime_records.RegisteredEnvironment | None = None,
     ) -> ModelCompletionBoundaryReconciliation:
         """Promote terminal model evidence or verify an already-published boundary."""
+
+        if (registered_agent is None) != (registered_provider is None):
+            raise ValueError(
+                "Frozen model-completion reconciliation requires both agent and provider."
+            )
 
         # Fail closed for this session's own accounting before scanning the
         # shared ledger. The global pass may retain rows owned by another
@@ -1161,31 +1498,58 @@ class RecoveryCoordinator:
         if active is not None:
             stage = active.stage
             self._validate_active_model_completion_stage(session, stage)
+            if session.status in {
+                SessionStatus.COMPLETED,
+                SessionStatus.INTERRUPTED,
+            }:
+                raise ModelCompletionManualRecoveryRequired(
+                    "A terminal session retains an active model-completion stage. "
+                    "Provider output and linked reservations require explicit manual "
+                    f"reconciliation before the stage can be cleared: {stage.stage_id}"
+                )
             if stage.state == "in_flight":
-                recoverable = await self._recoverable_provider_operation(stage)
+                recoverable = await self._recoverable_provider_operation(
+                    stage,
+                    registered_provider=registered_provider,
+                )
                 if recoverable is None:
                     raise ModelCompletionManualRecoveryRequired(
                         "The active model-completion dispatch has no durable terminal response. "
                         "Its provider outcome and linked budget reservations require manual "
                         f"reconciliation before retrying: {stage.stage_id}"
                     )
-                operation, registered_provider = recoverable
-                try:
-                    registered_agent = self._resolve_registered_agent(session.agent_name)
-                    registered_environment = self._resolve_registered_environment(
-                        session.environment_name
-                    )
-                except KeyError as registration_error:
-                    raise ModelCompletionManualRecoveryRequired(
-                        "Provider-operation recovery requires the original agent, provider, "
-                        "and environment registrations."
-                    ) from registration_error
+                operation, recovered_provider = recoverable
+                if registered_agent is None or registered_provider is None:
+                    try:
+                        registered_agent = self._resolve_registered_agent(session.agent_name)
+                        registered_provider = recovered_provider
+                        registered_environment = self._resolve_registered_environment(
+                            session.environment_name
+                        )
+                    except KeyError as registration_error:
+                        raise ModelCompletionManualRecoveryRequired(
+                            "Provider-operation recovery requires the original agent, provider, "
+                            "and environment registrations."
+                        ) from registration_error
+                elif registered_provider is not recovered_provider:
+                    if registered_provider.name != recovered_provider.name:
+                        raise ModelCompletionManualRecoveryRequired(
+                            "Provider-operation recovery resolved a different provider identity."
+                        )
+                    recovered_provider = registered_provider
+                checkpoint = await self._session_store.load_checkpoint(session.id)
+                await self._validate_execution_profile_continuation(
+                    session,
+                    checkpoint,
+                    registered_agent,
+                    recovered_provider,
+                )
                 recovered = await self._recover_provider_operation(
                     session,
                     stage,
                     operation,
                     registered_agent,
-                    registered_provider,
+                    recovered_provider,
                     registered_environment,
                 )
                 recovery_events = recovered.events
@@ -2023,10 +2387,13 @@ class RecoveryCoordinator:
         *,
         stream: AsyncGenerator[Event, None] | None,
         session_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
         authoritative_failure: BaseException | None,
         finalize_abandoned: bool,
         release_run_fence: bool,
         abort_environment_setup: bool = True,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
         if stream is not None:
@@ -2035,7 +2402,12 @@ class RecoveryCoordinator:
             cleanup_steps.append(
                 (
                     "abandoned session finalization",
-                    lambda: self.finalize_abandoned_session_by_id(session_id),
+                    lambda: self.finalize_abandoned_session_by_id(
+                        session_id,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                    ),
                 )
             )
         if abort_environment_setup and authoritative_failure is not None:
@@ -2045,12 +2417,19 @@ class RecoveryCoordinator:
                     lambda: self._environment_lifecycle.abort_environment_setup(
                         session_id=session_id,
                         original_error=authoritative_failure,
+                        execution_profile=execution_profile,
                     ),
                 )
             )
         if release_run_fence:
             cleanup_steps.append(
-                ("run fence release", lambda: self._session_store.release_run_fence(session_id))
+                (
+                    "run fence release",
+                    lambda: self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                        session_id=session_id,
+                        execution_profile=execution_profile,
+                    ),
+                )
             )
         await _run_recovery_cleanup_steps(
             authoritative_failure=authoritative_failure,
@@ -2062,19 +2441,25 @@ class RecoveryCoordinator:
         *,
         stream: AsyncGenerator[Event, None] | None,
         session_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
         authoritative_failure: BaseException | None,
         finalize_abandoned: bool,
         release_run_fence: bool,
         abort_environment_setup: bool = True,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         try:
             await self._cleanup_recovery_handoff(
                 stream=stream,
                 session_id=session_id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=finalize_abandoned,
                 release_run_fence=release_run_fence,
                 abort_environment_setup=abort_environment_setup,
+                execution_profile=execution_profile,
             )
         finally:
             # Cleanup can run in a shielded child task with copied context. The
@@ -2104,8 +2489,11 @@ class RecoveryCoordinator:
         loaded_session: Session,
         *,
         checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
         from_statuses: set[SessionStatus] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
 
@@ -2127,6 +2515,21 @@ class RecoveryCoordinator:
                 session=loaded_session,
                 checkpoint=checkpoint,
             )
+            if execution_profile_snapshot is not None:
+                reconciled_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+                if (
+                    reconciled_profile is None
+                    or reconciled_profile.session_id != execution_profile_snapshot.session_id
+                    or reconciled_profile.interaction_id
+                    != execution_profile_snapshot.interaction_id
+                    or reconciled_profile.profile != execution_profile_snapshot.profile
+                ):
+                    raise RuntimeError(
+                        "Active invocation profile changed during terminal-evidence recovery."
+                    )
+                execution_profile_snapshot = execution_profile_snapshot.model_copy(
+                    update={"run_epoch": reconciled_profile.run_epoch}
+                )
         session_id = loaded_session.id
         latest_events = await self._session_store.query_events(
             EventQuery(
@@ -2144,6 +2547,13 @@ class RecoveryCoordinator:
         interaction_id = latest_events[0].event.interaction_id
         if interaction_id is None:
             raise RuntimeError("Interaction lifecycle event has no interaction identity.")
+        if (
+            execution_profile_snapshot is not None
+            and execution_profile_snapshot.interaction_id != interaction_id
+        ):
+            raise RuntimeError(
+                "Active invocation execution profile belongs to another interaction."
+            )
         run_operation_id = str(uuid4())
 
         def reject_active_incomplete_recovery(
@@ -2156,6 +2566,28 @@ class RecoveryCoordinator:
             )
             if checkpoint_transform is not None:
                 checkpoint = checkpoint_transform(current_session, checkpoint)
+            if execution_profile_snapshot is not None:
+                current_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+                if current_profile is None or current_profile != execution_profile_snapshot:
+                    raise RuntimeError(
+                        "Active invocation profile changed before continuation claimed it."
+                    )
+                if not active_invocation_execution_profile_is_released(
+                    current_profile,
+                    session_id=current_session.id,
+                    run_epoch=current_session.run_epoch,
+                ):
+                    raise SessionRunFenced(
+                        "The previous invocation still owns terminal hooks or trailing cleanup."
+                    )
+                checkpoint = checkpoint_with_active_invocation_execution_profile(
+                    checkpoint,
+                    session_id=current_session.id,
+                    interaction_id=interaction_id,
+                    run_epoch=current_session.run_epoch + 1,
+                    profile=execution_profile_snapshot.profile,
+                    expected=execution_profile_snapshot,
+                )
             return _checkpoint_with_session_run_operation(
                 checkpoint=checkpoint,
                 current_session=current_session,
@@ -2209,8 +2641,6 @@ class RecoveryCoordinator:
         _activate_session_run_fence(session)
         _activate_session_interaction(session.id, interaction_id)
         try:
-            registered_agent = self._resolve_registered_agent(session.agent_name)
-            registered_environment = self._resolve_registered_environment(session.environment_name)
             resumed_event = await self._resume_interaction(
                 session,
                 registered_agent,
@@ -2223,11 +2653,29 @@ class RecoveryCoordinator:
                     steps=(
                         (
                             "abandoned session finalization",
-                            lambda: self.finalize_abandoned_session_by_id(session.id),
+                            lambda: self.finalize_abandoned_session_by_id(
+                                session.id,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=(
+                                    None
+                                    if execution_profile_snapshot is None
+                                    else execution_profile_snapshot.profile
+                                ),
+                            ),
                         ),
                         (
                             "run fence release",
-                            lambda: self._session_store.release_run_fence(session.id),
+                            lambda: (
+                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                    session_id=session.id,
+                                    execution_profile=(
+                                        None
+                                        if execution_profile_snapshot is None
+                                        else execution_profile_snapshot.profile
+                                    ),
+                                )
+                            ),
                         ),
                     ),
                 )
@@ -2244,11 +2692,29 @@ class RecoveryCoordinator:
                 steps=(
                     (
                         "abandoned session finalization",
-                        lambda: self.finalize_abandoned_session_by_id(session.id),
+                        lambda: self.finalize_abandoned_session_by_id(
+                            session.id,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=(
+                                None
+                                if execution_profile_snapshot is None
+                                else execution_profile_snapshot.profile
+                            ),
+                        ),
                     ),
                     (
                         "run fence release",
-                        lambda: self._session_store.release_run_fence(session.id),
+                        lambda: (
+                            self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                session_id=session.id,
+                                execution_profile=(
+                                    None
+                                    if execution_profile_snapshot is None
+                                    else execution_profile_snapshot.profile
+                                ),
+                            )
+                        ),
                     ),
                 ),
             )
@@ -2298,6 +2764,12 @@ class RecoveryCoordinator:
 
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            loaded_session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+        )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
         )
@@ -2315,6 +2787,9 @@ class RecoveryCoordinator:
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
             checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         if resumed_event is not None:
             yield resumed_event
@@ -2326,6 +2801,7 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -2340,9 +2816,12 @@ class RecoveryCoordinator:
             await self._cleanup_entrypoint_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
+                execution_profile=execution_profile_snapshot.profile,
             )
 
     async def recover_user_input_request(
@@ -2387,6 +2866,12 @@ class RecoveryCoordinator:
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            loaded_session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+        )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
         )
@@ -2404,6 +2889,9 @@ class RecoveryCoordinator:
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
             checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         if resumed_event is not None:
             yield resumed_event
@@ -2416,6 +2904,7 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         authoritative_failure: BaseException | None = None
         try:
@@ -2428,9 +2917,12 @@ class RecoveryCoordinator:
             await self._cleanup_entrypoint_handoff(
                 stream=recovery_stream,
                 session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=False,
                 release_run_fence=False,
+                execution_profile=execution_profile_snapshot.profile,
             )
 
     async def resolve_tool_approval(
@@ -2543,6 +3035,12 @@ class RecoveryCoordinator:
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            loaded_session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+        )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
         )
@@ -2607,7 +3105,10 @@ class RecoveryCoordinator:
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
             checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
             checkpoint_transform=claim_exact_approval,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         if pending_approval is None or pending_round is None:
             raise RuntimeError("Tool approval claim completed without approval state.")
@@ -2620,6 +3121,7 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            execution_profile_snapshot=execution_profile_snapshot,
             deferred_messages=pending_round.deferred_messages,
             claimed_resolution_intent=claimed_intent,
         )
@@ -2636,9 +3138,12 @@ class RecoveryCoordinator:
             await self._cleanup_entrypoint_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
+                execution_profile=execution_profile_snapshot.profile,
             )
 
     async def recover_tool_approval_request(
@@ -2676,6 +3181,12 @@ class RecoveryCoordinator:
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            loaded_session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+        )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
         )
@@ -2727,7 +3238,10 @@ class RecoveryCoordinator:
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
             checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
             checkpoint_transform=claim_exact_approval,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         if pending_approval is None or pending_round is None:
             raise RuntimeError("Tool approval recovery claim completed without approval state.")
@@ -2742,6 +3256,7 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            execution_profile_snapshot=execution_profile_snapshot,
             deferred_messages=pending_round.deferred_messages,
             claimed_resolution_intent=claimed_resolution_intent,
         )
@@ -2756,9 +3271,12 @@ class RecoveryCoordinator:
             await self._cleanup_entrypoint_handoff(
                 stream=recovery_stream,
                 session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=False,
                 release_run_fence=False,
+                execution_profile=execution_profile_snapshot.profile,
             )
 
     def _reject_approval_owned_tool_round_recovery(
@@ -2835,6 +3353,12 @@ class RecoveryCoordinator:
                 f"Pending tool round belongs to a different agent: {pending_round.agent_name}."
             )
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            loaded_session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+        )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
         )
@@ -2881,6 +3405,12 @@ class RecoveryCoordinator:
                 pending_calls=pending_round.tool_calls,
                 tool_call_id=request.tool_call_id,
             )
+            execution_profile_snapshot = await self._validate_execution_profile_continuation(
+                loaded_session,
+                checkpoint,
+                registered_agent,
+                registered_provider,
+            )
         if self._session_control.has_active_tasks(loaded_session.id):
             raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
         # Reserve the in-process slot before awaiting the durable transition. The
@@ -2914,6 +3444,7 @@ class RecoveryCoordinator:
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
                 effective_structured_output=effective_structured_output,
+                execution_profile_snapshot=execution_profile_snapshot,
             )
             async for event in recovery_stream:
                 yield event
@@ -2925,10 +3456,13 @@ class RecoveryCoordinator:
                 await self._cleanup_entrypoint_handoff(
                     stream=recovery_stream,
                     session_id=loaded_session.id,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
                     authoritative_failure=authoritative_failure,
                     finalize_abandoned=False,
                     release_run_fence=False,
                     abort_environment_setup=False,
+                    execution_profile=execution_profile_snapshot.profile,
                 )
             finally:
                 if interaction_id is not None:
@@ -2948,6 +3482,7 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
         emit_resume_event: bool = True,
     ) -> AsyncGenerator[Event, None]:
         environment_name = _environment_name(registered_environment)
@@ -3011,6 +3546,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
                 operation=EnvironmentFactoryOperation.RECONNECT,
+                execution_profile=execution_profile_snapshot.profile,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -3053,6 +3589,7 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=binding_started_event,
+                execution_profile=execution_profile_snapshot.profile,
             )
             registered_environment = binding_result.registered_environment
             for event in binding_result.events:
@@ -3288,6 +3825,7 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=result,
                         task_id=pending.task_id,
+                        execution_profile=execution_profile_snapshot.profile,
                         redactor=(
                             None
                             if publication_coordinator is None
@@ -3374,6 +3912,7 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=blocked_result,
                         task_id=pending.task_id,
+                        execution_profile=execution_profile_snapshot.profile,
                         redactor=(
                             None
                             if publication_coordinator is None
@@ -3415,6 +3954,7 @@ class RecoveryCoordinator:
                         policy_evidence=policy_evidence,
                         tool_round_identity=tool_round_identity,
                         task_id=pending.task_id,
+                        execution_profile=execution_profile_snapshot.profile,
                         input_id=pending.input_id,
                         deferred_terminal_stager=(
                             None if publication_coordinator is None else stage_round_terminal
@@ -3442,6 +3982,7 @@ class RecoveryCoordinator:
                     tool_call=tool_call,
                     request_metadata=response.metadata,
                     task_id=pending.task_id,
+                    execution_profile=execution_profile_snapshot.profile,
                     check_policy=False,
                     policy_result=policy_result,
                     policy_output_secret_resolution_scope=pause_secret_resolution_scope,
@@ -3482,6 +4023,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     tool_calls=round_tool_calls,
                     task_id=pending.task_id,
+                    execution_profile=execution_profile_snapshot.profile,
                     hook_modes=staged_hook_modes,
                     pause_authority={"input_id": pending.input_id},
                     already_published_ids=set(recorded_outcomes),
@@ -3531,6 +4073,10 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
                     registered_environment=registered_environment,
+                    active_invocation_profile=_rebound_active_invocation_profile(
+                        session,
+                        execution_profile_snapshot,
+                    ),
                     messages=transcript,
                     messages_to_append=[],
                     max_steps=effective_max_steps,
@@ -3604,6 +4150,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -3628,6 +4175,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_calls: list[runtime_records.ToolCallRequest],
         task_id: str | None,
+        execution_profile: ExecutionProfileIdentity,
         hook_modes: dict[str, tuple[bool, bool]],
         pause_authority: dict[str, str],
         already_published_ids: set[str],
@@ -3697,6 +4245,7 @@ class RecoveryCoordinator:
                 tool_call=tool_call,
                 result=result,
                 task_id=task_id,
+                execution_profile=execution_profile,
                 redactor=coordinator.redactor,
                 output_redactor=coordinator.redactor,
                 argument_projection=unavailable,
@@ -3809,6 +4358,7 @@ class RecoveryCoordinator:
         policy_evidence: ToolPolicyEvidence,
         tool_round_identity: ToolRoundIdentity,
         task_id: str | None,
+        execution_profile: ExecutionProfileIdentity,
         approval_id: str | None = None,
         input_id: str | None = None,
         requested_decision: ToolApprovalDecision | None = None,
@@ -3912,6 +4462,7 @@ class RecoveryCoordinator:
             tool_call=tool_call,
             result=result,
             task_id=task_id,
+            execution_profile=execution_profile,
             deferred_terminal_stager=deferred_terminal_stager,
             publication_snapshot=publication_snapshot,
         ):
@@ -3926,6 +4477,7 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
         deferred_messages: list[Message] | None = None,
         emit_resume_event: bool = True,
         enforce_expiry: bool = True,
@@ -4115,6 +4667,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
                 operation=EnvironmentFactoryOperation.RECONNECT,
+                execution_profile=execution_profile_snapshot.profile,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -4178,6 +4731,7 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=binding_started_event,
+                execution_profile=execution_profile_snapshot.profile,
             )
             registered_environment = binding_result.registered_environment
             for event in binding_result.events:
@@ -4276,6 +4830,7 @@ class RecoveryCoordinator:
                             deferred_messages=deferred_messages,
                             requested_approval_decision=original_resolution_decision,
                             approval_resolution_request_digest=resolution_request_digest,
+                            execution_profile=execution_profile_snapshot.profile,
                         )
                     ):
                         yield event
@@ -4481,6 +5036,7 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=result,
                         task_id=pending_approval.task_id,
+                        execution_profile=execution_profile_snapshot.profile,
                         redactor=(
                             None
                             if publication_coordinator is None
@@ -4578,6 +5134,7 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=result,
                         task_id=pending_approval.task_id,
+                        execution_profile=execution_profile_snapshot.profile,
                         redactor=(
                             None
                             if publication_coordinator is None
@@ -4619,6 +5176,7 @@ class RecoveryCoordinator:
                         policy_evidence=policy_evidence,
                         tool_round_identity=tool_round_identity,
                         task_id=pending_approval.task_id,
+                        execution_profile=execution_profile_snapshot.profile,
                         approval_id=pending_approval.approval_id,
                         requested_decision=request.decision,
                         resolved_by_payload=resolved_by_payload,
@@ -4648,6 +5206,7 @@ class RecoveryCoordinator:
                     tool_call=tool_call,
                     request_metadata=request.metadata,
                     task_id=pending_approval.task_id,
+                    execution_profile=execution_profile_snapshot.profile,
                     check_policy=False,
                     emit_started=True,
                     policy_output_secret_resolution_scope=pause_secret_resolution_scope,
@@ -4688,6 +5247,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     tool_calls=round_tool_calls,
                     task_id=pending_approval.task_id,
+                    execution_profile=execution_profile_snapshot.profile,
                     hook_modes=staged_hook_modes,
                     pause_authority={"approval_id": pending_approval.approval_id},
                     already_published_ids=set(recorded_outcomes),
@@ -4818,6 +5378,10 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
                     registered_environment=registered_environment,
+                    active_invocation_profile=_rebound_active_invocation_profile(
+                        session,
+                        execution_profile_snapshot,
+                    ),
                     messages=transcript,
                     messages_to_append=[],
                     max_steps=effective_max_steps,
@@ -4856,7 +5420,12 @@ class RecoveryCoordinator:
                 await forwarded_stream.aclose()
                 raise
         except GeneratorExit:
-            await self.finalize_abandoned_session_by_id(session.id)
+            await self.finalize_abandoned_session_by_id(
+                session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+            )
             raise
         except Exception as exc:
             failure_diagnostic = exception_diagnostic(
@@ -4896,6 +5465,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -4952,6 +5522,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -5013,6 +5584,7 @@ class RecoveryCoordinator:
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    execution_profile=execution_profile_snapshot.profile,
                 )
             ):
                 yield event
@@ -5122,6 +5694,7 @@ class RecoveryCoordinator:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity,
         payload: dict[str, Any],
     ) -> AsyncGenerator[Event, None]:
         """Close a durable or acknowledgement-ambiguous recovery to resumable state."""
@@ -5143,6 +5716,7 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
                 )
             ):
                 yield event
@@ -5160,6 +5734,7 @@ class RecoveryCoordinator:
                 session=interrupted,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             )
         ):
             yield event
@@ -5233,6 +5808,7 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
     ) -> AsyncGenerator[Event, None]:
         tool_round_identity = ToolRoundIdentity(
             tool_round_id=pending.tool_round_id,
@@ -5287,6 +5863,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
                 operation=EnvironmentFactoryOperation.RECONNECT,
+                execution_profile=execution_profile_snapshot.profile,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5318,6 +5895,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -5394,6 +5972,7 @@ class RecoveryCoordinator:
                 tool_call=tool_call,
                 result=public_recovered_result,
                 task_id=pending.task_id,
+                execution_profile=execution_profile_snapshot.profile,
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
@@ -5455,6 +6034,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
@@ -5498,6 +6078,7 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -5507,9 +6088,12 @@ class RecoveryCoordinator:
                 await self._cleanup_recovery_handoff(
                     stream=None,
                     session_id=session.id,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
                     authoritative_failure=authoritative_failure,
                     finalize_abandoned=abandoned,
                     release_run_fence=True,
+                    execution_profile=execution_profile_snapshot.profile,
                 )
 
         continuation_stream: AsyncGenerator[Event, None] | None = None
@@ -5539,6 +6123,7 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
+                execution_profile_snapshot=execution_profile_snapshot,
                 emit_resume_event=False,
             )
             async for event in continuation_stream:
@@ -5557,9 +6142,12 @@ class RecoveryCoordinator:
             await self._cleanup_recovery_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
+                execution_profile=execution_profile_snapshot.profile,
             )
 
     async def recover_tool_approval(
@@ -5573,6 +6161,7 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
         deferred_messages: list[Message],
         claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None,
     ) -> AsyncGenerator[Event, None]:
@@ -5627,6 +6216,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
                 operation=EnvironmentFactoryOperation.RECONNECT,
+                execution_profile=execution_profile_snapshot.profile,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5662,6 +6252,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -5735,6 +6326,7 @@ class RecoveryCoordinator:
                 tool_call=tool_call,
                 result=public_recovered_result,
                 task_id=pending_approval.task_id,
+                execution_profile=execution_profile_snapshot.profile,
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
@@ -5796,6 +6388,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
@@ -5842,6 +6435,7 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -5851,9 +6445,12 @@ class RecoveryCoordinator:
                 await self._cleanup_recovery_handoff(
                     stream=None,
                     session_id=session.id,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
                     authoritative_failure=authoritative_failure,
                     finalize_abandoned=abandoned,
                     release_run_fence=True,
+                    execution_profile=execution_profile_snapshot.profile,
                 )
 
         continuation_stream: AsyncGenerator[Event, None] | None = None
@@ -5884,6 +6481,7 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
+                execution_profile_snapshot=execution_profile_snapshot,
                 deferred_messages=deferred_messages,
                 emit_resume_event=False,
                 enforce_expiry=False,
@@ -5906,9 +6504,12 @@ class RecoveryCoordinator:
             await self._cleanup_recovery_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
+                execution_profile=execution_profile_snapshot.profile,
             )
 
     async def _claim_manual_tool_round_recovery(
@@ -5917,6 +6518,9 @@ class RecoveryCoordinator:
         session: Session,
         pending_round: tool_round_recovery.PendingToolRound,
         pending_tool_call: PendingToolCallApproval,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
     ) -> _IncompleteRecoveryClaim | _ManualRecoveryInterruptionFence:
         """Claim recovery or fence an operator interruption that won the race."""
         claim_id = str(uuid4())
@@ -5988,6 +6592,14 @@ class RecoveryCoordinator:
             claim_run_epoch = current_session.run_epoch + 1
             session_before_fence = current_session.model_copy(deep=True)
             updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            updated = checkpoint_with_active_invocation_execution_profile(
+                updated,
+                session_id=current_session.id,
+                interaction_id=execution_profile_snapshot.interaction_id,
+                run_epoch=current_session.run_epoch + 1,
+                profile=execution_profile_snapshot.profile,
+                expected=execution_profile_snapshot,
+            )
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
                 "version": 1,
                 "claim_id": claim_id,
@@ -6045,6 +6657,30 @@ class RecoveryCoordinator:
                     claim_run_epoch = _current_session.run_epoch + 1
                     updated = (
                         {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+                    )
+                    current_profile = active_invocation_execution_profile_from_checkpoint(updated)
+                    if (
+                        current_profile is None
+                        or current_profile.interaction_id
+                        != execution_profile_snapshot.interaction_id
+                        or current_profile.profile != execution_profile_snapshot.profile
+                        or not active_invocation_execution_profile_matches_session_epoch(
+                            current_profile,
+                            session_id=_current_session.id,
+                            run_epoch=_current_session.run_epoch,
+                        )
+                    ):
+                        raise _ManualRecoveryInterrupted(
+                            "Active invocation profile changed before the interrupted "
+                            "manual recovery was fenced."
+                        )
+                    updated = checkpoint_with_active_invocation_execution_profile(
+                        updated,
+                        session_id=_current_session.id,
+                        interaction_id=current_profile.interaction_id,
+                        run_epoch=claim_run_epoch,
+                        profile=current_profile.profile,
+                        expected=current_profile,
                     )
                     updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
                         "version": 1,
@@ -6173,7 +6809,12 @@ class RecoveryCoordinator:
                     steps=(
                         (
                             "ambiguous manual recovery claim finalization",
-                            lambda: self.finalize_abandoned_session_by_id(reconciled_session.id),
+                            lambda: self.finalize_abandoned_session_by_id(
+                                reconciled_session.id,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=execution_profile_snapshot.profile,
+                            ),
                         ),
                         (
                             "ambiguous manual recovery claim cleanup",
@@ -6214,7 +6855,12 @@ class RecoveryCoordinator:
                 steps=(
                     (
                         "abandoned manual recovery finalization",
-                        lambda: self.finalize_abandoned_session_by_id(claimed_session.id),
+                        lambda: self.finalize_abandoned_session_by_id(
+                            claimed_session.id,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=execution_profile_snapshot.profile,
+                        ),
                     ),
                     (
                         "manual recovery claim cleanup",
@@ -6246,7 +6892,12 @@ class RecoveryCoordinator:
             steps=(
                 (
                     "abandoned manual recovery finalization",
-                    lambda: self.finalize_abandoned_session_by_id(claimed_session.id),
+                    lambda: self.finalize_abandoned_session_by_id(
+                        claimed_session.id,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
+                    ),
                 ),
                 (
                     "manual recovery claim cleanup",
@@ -6271,6 +6922,7 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         effective_structured_output: StructuredOutputSpec | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
     ) -> AsyncGenerator[Event, None]:
         """Claim one manual recovery durably and stream its owned continuation."""
         caller_runtime_task = asyncio.current_task()
@@ -6282,6 +6934,9 @@ class RecoveryCoordinator:
             session=loaded_session,
             pending_round=pending_round,
             pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         if isinstance(claim, _ManualRecoveryInterruptionFence):
             authoritative_failure = claim.error
@@ -6290,6 +6945,7 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=_environment_name(registered_environment),
+                execution_profile=execution_profile_snapshot.profile,
             )
 
             async def finalize_owned_interruption() -> None:
@@ -6360,6 +7016,7 @@ class RecoveryCoordinator:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             effective_structured_output=effective_structured_output,
+            execution_profile_snapshot=execution_profile_snapshot,
         )
         deliveries: asyncio.Queue[_ManualRecoveryEventDelivery | _ManualRecoveryStreamOutcome] = (
             asyncio.Queue(maxsize=2)
@@ -6489,9 +7146,12 @@ class RecoveryCoordinator:
                                 lambda: self._cleanup_recovery_handoff(
                                     stream=recovery_stream,
                                     session_id=claim.session.id,
+                                    registered_agent=registered_agent,
+                                    registered_environment=registered_environment,
                                     authoritative_failure=authoritative_failure,
                                     finalize_abandoned=authoritative_failure is not None,
                                     release_run_fence=False,
+                                    execution_profile=execution_profile_snapshot.profile,
                                 ),
                             ),
                             ("manual tool-round recovery heartbeat stop", stop_claim_heartbeat),
@@ -6623,6 +7283,7 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         effective_structured_output: StructuredOutputSpec | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
     ) -> AsyncGenerator[Event, None]:
         """Persist one operator-verified ordinary tool outcome and continue safely."""
         if run_operation is None:
@@ -6670,6 +7331,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
                 operation=EnvironmentFactoryOperation.RECONNECT,
+                execution_profile=execution_profile_snapshot.profile,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -6680,6 +7342,7 @@ class RecoveryCoordinator:
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    execution_profile=execution_profile_snapshot.profile,
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                         **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
@@ -6760,6 +7423,7 @@ class RecoveryCoordinator:
                 tool_call=tool_call,
                 result=public_recovered_result,
                 task_id=pending_round.task_id,
+                execution_profile=execution_profile_snapshot.profile,
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
@@ -6780,6 +7444,7 @@ class RecoveryCoordinator:
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    execution_profile=execution_profile_snapshot.profile,
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                         "manual_recovery_required": True,
@@ -6796,7 +7461,12 @@ class RecoveryCoordinator:
                 steps=(
                     (
                         "abandoned session finalization",
-                        lambda: self.finalize_abandoned_session_by_id(session.id),
+                        lambda: self.finalize_abandoned_session_by_id(
+                            session.id,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=execution_profile_snapshot.profile,
+                        ),
                     ),
                 ),
             )
@@ -6821,7 +7491,12 @@ class RecoveryCoordinator:
                             steps=(
                                 (
                                     "abandoned session finalization",
-                                    lambda: self.finalize_abandoned_session_by_id(session.id),
+                                    lambda: self.finalize_abandoned_session_by_id(
+                                        session.id,
+                                        registered_agent=registered_agent,
+                                        registered_environment=registered_environment,
+                                        execution_profile=execution_profile_snapshot.profile,
+                                    ),
                                 ),
                             ),
                         )
@@ -6836,7 +7511,12 @@ class RecoveryCoordinator:
                         steps=(
                             (
                                 "abandoned session finalization",
-                                lambda: self.finalize_abandoned_session_by_id(session.id),
+                                lambda: self.finalize_abandoned_session_by_id(
+                                    session.id,
+                                    registered_agent=registered_agent,
+                                    registered_environment=registered_environment,
+                                    execution_profile=execution_profile_snapshot.profile,
+                                ),
                             ),
                         ),
                     )
@@ -6864,6 +7544,7 @@ class RecoveryCoordinator:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
                         payload={
                             "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                             **tool_round_recovery.pending_tool_round_identity(
@@ -6911,6 +7592,7 @@ class RecoveryCoordinator:
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
                             environment_name=_environment_name(registered_environment),
+                            execution_profile=execution_profile_snapshot.profile,
                         )
                     ):
                         yield event
@@ -6937,6 +7619,7 @@ class RecoveryCoordinator:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
                 payload={
                     "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                     **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
@@ -6960,6 +7643,7 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile_snapshot.profile,
                     )
                 ):
                     yield event
@@ -6969,7 +7653,12 @@ class RecoveryCoordinator:
                     steps=(
                         (
                             "abandoned session finalization",
-                            lambda: self.finalize_abandoned_session_by_id(session.id),
+                            lambda: self.finalize_abandoned_session_by_id(
+                                session.id,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=execution_profile_snapshot.profile,
+                            ),
                         ),
                     ),
                 )
@@ -6985,6 +7674,10 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
                     registered_environment=registered_environment,
+                    active_invocation_profile=_rebound_active_invocation_profile(
+                        session,
+                        execution_profile_snapshot,
+                    ),
                     messages=transcript,
                     messages_to_append=[],
                     max_steps=request.max_steps or _DEFAULT_APPROVAL_MAX_STEPS,
@@ -7012,6 +7705,8 @@ class RecoveryCoordinator:
             await self._cleanup_recovery_handoff(
                 stream=session_stream,
                 session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=(
                     _recovery_abandonment_signal(
@@ -7022,6 +7717,7 @@ class RecoveryCoordinator:
                 ),
                 release_run_fence=False,
                 abort_environment_setup=False,
+                execution_profile=execution_profile_snapshot.profile,
             )
 
     async def close_interrupted_tool_round(
@@ -7145,6 +7841,7 @@ class RecoveryCoordinator:
                 tool_call=interrupted_result.call,
                 result=interrupted_result.result,
                 task_id=pending_round.task_id,
+                execution_profile=request.execution_profile,
             ):
                 emitted_events.append(event)
                 if outcome is not None and outcome != expected_public_outcome:
@@ -7697,6 +8394,7 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
+        execution_profile: ExecutionProfileIdentity | None = None,
         tail_message_count: int = 0,
         incomplete_recovery_claimed: bool = False,
         expected_transcript_cursor: int | None = None,
@@ -8147,6 +8845,7 @@ class RecoveryCoordinator:
                 tool_call=expected_outcome.call,
                 result=expected_outcome.result,
                 task_id=pending_round.task_id,
+                execution_profile=execution_profile,
                 allow_modification=hooks_state == "pending",
                 publish_before_hooks=hooks_state == "observational",
                 deferred_terminal_projection_recorder=(
@@ -8231,6 +8930,7 @@ class RecoveryCoordinator:
                     run_started_at=request.run_started_at,
                     usage_tracker=request.turn_usage_tracker,
                     active_run=request.active_run,
+                    execution_profile=request.execution_profile,
                 )
             )
         except InteractionLifecyclePublicationRejected:
@@ -8281,6 +8981,7 @@ class RecoveryCoordinator:
                     session=finalized,
                     registered_agent=request.registered_agent,
                     registered_environment=request.registered_environment,
+                    execution_profile=request.execution_profile,
                 )
             ):
                 pass
@@ -8303,9 +9004,32 @@ class RecoveryCoordinator:
 
         if request.interaction_transition is None:
             return False
-        expected = copy_interaction_transition_spec(request.interaction_transition)
+        return await self._record_durable_interaction_transition_cancellation(
+            session=request.session,
+            transition=request.interaction_transition,
+            failures=request.interaction_transition_failures,
+            agent_name=request.registered_agent.spec.name,
+            environment_name=request.environment_name,
+        )
+
+    async def _record_durable_interaction_transition_cancellation(
+        self,
+        *,
+        session: Session,
+        transition: InteractionTransitionSpec,
+        failures: tuple[dict[str, Any], ...],
+        agent_name: str,
+        environment_name: str | None,
+    ) -> bool:
+        """Record an exact transition failure without resolving mutable registrations."""
+
+        if agent_name != session.agent_name or environment_name != session.environment_name:
+            raise RuntimeError(
+                "Interaction transition cancellation identity conflicts with its session."
+            )
+        expected = copy_interaction_transition_spec(transition)
         if (
-            expected.event.session_id != request.session.id
+            expected.event.session_id != session.id
             or expected.event.interaction_id is None
             or expected.event.type
             not in {
@@ -8318,18 +9042,18 @@ class RecoveryCoordinator:
                 "for the abandoned session."
             )
         receipt = await self._session_store.load_interaction_transition_receipt(
-            request.session.id,
+            session.id,
             transition=expected,
         )
         if receipt is None:
             return False
         receipt = InteractionTransitionReceiptResult.model_validate(receipt)
-        if receipt.transition != expected or receipt.session.id != request.session.id:
+        if receipt.transition != expected or receipt.session.id != session.id:
             raise RuntimeError(
                 "Interaction transition cancellation evidence conflicts with its durable receipt."
             )
         copied_failures = copy_durable_json_value(
-            list(request.interaction_transition_failures),
+            list(failures),
             "interaction transition cancellation diagnostics",
         )
         if type(copied_failures) is not list:
@@ -8338,9 +9062,9 @@ class RecoveryCoordinator:
             event_with_runtime_envelope_authority(
                 Event(
                     type=(EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED),
-                    session_id=request.session.id,
-                    agent_name=request.registered_agent.spec.name,
-                    environment_name=request.environment_name,
+                    session_id=session.id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
                     payload={
                         "transition_event_type": str(expected.event.type),
                         "interaction_transition_failures": copied_failures,
@@ -8356,6 +9080,9 @@ class RecoveryCoordinator:
         session_id: str,
         *,
         propagate_interaction_publication_rejection: bool = False,
+        registered_agent: runtime_records.RegisteredAgentState | None = None,
+        registered_environment: runtime_records.RegisteredEnvironment | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         """Idempotently finalize a live session when setup-time streaming is abandoned."""
         try:
@@ -8368,16 +9095,26 @@ class RecoveryCoordinator:
             SessionStatus.INTERRUPTING,
         }:
             return
-        try:
-            registered_agent = self._resolve_registered_agent(session.agent_name)
-        except Exception:
-            await self._finalize_abandoned_without_registered_runtime(session.id)
-            return
-        try:
-            registered_environment = self._resolve_registered_environment(session.environment_name)
-        except Exception:
-            await self._finalize_abandoned_without_registered_runtime(session.id)
-            return
+        if registered_agent is None:
+            try:
+                registered_agent = self._resolve_registered_agent(session.agent_name)
+            except Exception:
+                await self._finalize_abandoned_without_registered_runtime(session.id)
+                return
+            try:
+                registered_environment = self._resolve_registered_environment(
+                    session.environment_name
+                )
+            except Exception:
+                await self._finalize_abandoned_without_registered_runtime(session.id)
+                return
+        elif (
+            registered_agent.spec.name != session.agent_name
+            or _environment_name(registered_environment) != session.environment_name
+        ):
+            raise RuntimeError(
+                "Frozen abandonment runtime does not match the durable session identity."
+            )
         if session.status == SessionStatus.INTERRUPTING:
             try:
                 async for _ in self._interrupt_session_for_recovery(
@@ -8386,6 +9123,7 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
                     )
                 ):
                     pass
@@ -8401,6 +9139,7 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
                 )
             )
         except InteractionLifecyclePublicationRejected:
@@ -8718,6 +9457,17 @@ class RecoveryCoordinator:
     ) -> IncompleteSessionRecoveryResult:
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if active_invocation_profile is not None and not (
+            active_invocation_execution_profile_matches_session_epoch(
+                active_invocation_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            )
+        ):
+            raise RuntimeError(
+                "Active invocation execution profile does not match the recovery epoch."
+            )
         pending_approval = approval_support.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -8737,12 +9487,6 @@ class RecoveryCoordinator:
         active_model_completion = await self._session_store.load_active_model_completion_stage(
             session.id
         )
-        recoverable_provider_operation_pending = bool(
-            active_model_completion is not None
-            and active_model_completion.stage.state == "in_flight"
-            and await self._recoverable_provider_operation(active_model_completion.stage)
-            is not None
-        )
         terminal_repair_required = False
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES:
             terminal_repair = await self._terminal_evidence_repair_required(
@@ -8755,9 +9499,22 @@ class RecoveryCoordinator:
                 or pending_user_input is not None
                 or pending_tool_round is not None
                 or deferred_input is not None
-                or recoverable_provider_operation_pending
+                or active_model_completion is not None
             )
             if not terminal_repair and not has_pending_work:
+                if active_invocation_profile is not None and not (
+                    active_invocation_execution_profile_is_released(
+                        active_invocation_profile,
+                        session_id=session.id,
+                        run_epoch=session.run_epoch,
+                    )
+                ):
+                    return await self._settle_terminal_invocation_closure_owned(
+                        session=session,
+                        inactive_before=inactive_before,
+                        previous_status=previous_status,
+                        execution_profile_snapshot=active_invocation_profile,
+                    )
                 return IncompleteSessionRecoveryResult(
                     session_id=session.id,
                     previous_status=previous_status,
@@ -8800,6 +9557,54 @@ class RecoveryCoordinator:
                     previous_status=previous_status,
                 )
             raise
+        registered_provider = self._resolve_registered_provider(session.provider_name)
+        pre_admission_profiled_session = False
+        if (
+            session.status is SessionStatus.PENDING
+            and session.run_epoch == 0
+            and active_invocation_profile is None
+            and pending_approval is None
+            and pending_user_input is None
+            and pending_tool_round is None
+            and deferred_input is None
+            and active_model_completion is None
+            and EXECUTION_PROFILE_METADATA_KEY in session.metadata
+        ):
+            interaction_records = await self._session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            if not interaction_records:
+                # Presence of the reserved metadata key is not authority. A
+                # pristine session is exempt only when its complete baseline
+                # survives defensive reconstruction.
+                execution_profile_from_session_metadata(session.metadata)
+                pre_admission_profiled_session = True
+        requires_execution_profile = (
+            pending_approval is not None
+            or pending_user_input is not None
+            or pending_tool_round is not None
+            or deferred_input is not None
+            or active_model_completion is not None
+            or active_invocation_profile is not None
+            or (
+                not pre_admission_profiled_session
+                and session.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES
+                and EXECUTION_PROFILE_METADATA_KEY in session.metadata
+            )
+        )
+        execution_profile_snapshot = None
+        if requires_execution_profile:
+            execution_profile_snapshot = await self._validate_execution_profile_continuation(
+                session,
+                checkpoint,
+                registered_agent,
+                registered_provider,
+            )
 
         claim: _IncompleteRecoveryClaim | None = None
         authoritative_failure: BaseException | None = None
@@ -8807,6 +9612,7 @@ class RecoveryCoordinator:
             claim = await self._claim_incomplete_recovery(
                 session=session,
                 inactive_before=inactive_before,
+                execution_profile_snapshot=execution_profile_snapshot,
             )
             if claim is None:
                 current = await self._require_session(session.id)
@@ -8828,9 +9634,58 @@ class RecoveryCoordinator:
                     reason=reason,
                     metadata=metadata,
                     registered_agent=registered_agent,
+                    registered_provider=registered_provider,
                     registered_environment=registered_environment,
                     claim_id=claim.claim_id,
+                    execution_profile_snapshot=execution_profile_snapshot,
                 ),
+            )
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            if claim is not None:
+                await self._cleanup_incomplete_recovery_claim(
+                    session_id=session.id,
+                    claim_id=claim.claim_id,
+                    authoritative_failure=authoritative_failure,
+                )
+
+    async def _settle_terminal_invocation_closure_owned(
+        self,
+        *,
+        session: Session,
+        inactive_before: datetime | None,
+        previous_status: SessionStatus,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
+    ) -> IncompleteSessionRecoveryResult:
+        """Fence a dead terminal owner whose hooks never released its run epoch."""
+
+        claim: _IncompleteRecoveryClaim | None = None
+        authoritative_failure: BaseException | None = None
+        try:
+            claim = await self._claim_incomplete_recovery(
+                session=session,
+                inactive_before=inactive_before,
+                execution_profile_snapshot=execution_profile_snapshot,
+            )
+            if claim is None:
+                current = await self._require_session(session.id)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=current.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    events=(),
+                    message="Terminal invocation ownership is still active.",
+                )
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=claim.session.status,
+                actions=(IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,),
+                events=(),
+                message="Recovered terminal invocation ownership after worker loss.",
             )
         except BaseException as exc:
             authoritative_failure = exc
@@ -9362,13 +10217,23 @@ class RecoveryCoordinator:
         claim_id: str,
         authoritative_failure: BaseException | None,
     ) -> None:
+        recovery_run_epoch = _current_session_run_epoch(session_id)
+
+        async def release_recovery_run_fence() -> None:
+            await self._session_store.release_run_fence(session_id)
+            if recovery_run_epoch is not None:
+                self._environment_lifecycle.retire_repaired_run_fence_releases(
+                    session_id=session_id,
+                    repaired_run_epoch=recovery_run_epoch,
+                )
+
         try:
             await _run_recovery_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(
                     (
                         "run fence release",
-                        lambda: self._session_store.release_run_fence(session_id),
+                        release_recovery_run_fence,
                     ),
                     (
                         "incomplete recovery claim release",
@@ -9407,6 +10272,7 @@ class RecoveryCoordinator:
         session: Session,
         inactive_before: datetime | None,
         required_expired_claim_id: str | None = None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
     ) -> _IncompleteRecoveryClaim | None:
         if required_expired_claim_id is not None:
             required_expired_claim_id = require_clean_nonblank(
@@ -9451,6 +10317,22 @@ class RecoveryCoordinator:
                 claim_run_epoch = next_run_epoch
                 session_before_fence = current_session.model_copy(deep=True)
                 updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+                current_profile = active_invocation_execution_profile_from_checkpoint(updated)
+                if execution_profile_snapshot is not None and (
+                    current_profile != execution_profile_snapshot
+                ):
+                    raise _IncompleteRecoveryClaimLost(
+                        "Active invocation profile changed before recovery takeover."
+                    )
+                if current_profile is not None:
+                    updated = checkpoint_with_active_invocation_execution_profile(
+                        updated,
+                        session_id=current_session.id,
+                        interaction_id=current_profile.interaction_id,
+                        run_epoch=next_run_epoch,
+                        profile=current_profile.profile,
+                        expected=current_profile,
+                    )
                 updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
                     "version": 1,
                     "claim_id": claim_id,
@@ -9607,6 +10489,22 @@ class RecoveryCoordinator:
             claim_run_epoch = next_run_epoch
             session_before_fence = current_session.model_copy(deep=True)
             updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            current_profile = active_invocation_execution_profile_from_checkpoint(updated)
+            if execution_profile_snapshot is not None and (
+                current_profile != execution_profile_snapshot
+            ):
+                raise _IncompleteRecoveryClaimLost(
+                    "Active invocation profile changed before recovery was claimed."
+                )
+            if current_profile is not None:
+                updated = checkpoint_with_active_invocation_execution_profile(
+                    updated,
+                    session_id=current_session.id,
+                    interaction_id=current_profile.interaction_id,
+                    run_epoch=next_run_epoch,
+                    profile=current_profile.profile,
+                    expected=current_profile,
+                )
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
                 "version": 1,
                 "claim_id": claim_id,
@@ -9956,8 +10854,10 @@ class RecoveryCoordinator:
         reason: str,
         metadata: dict[str, Any],
         registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         claim_id: str,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile | None,
     ) -> IncompleteSessionRecoveryResult:
         actions: list[IncompleteSessionRecoveryAction] = []
         events: list[Event] = []
@@ -10018,8 +10918,14 @@ class RecoveryCoordinator:
 
         provider_operation_addressed = False
         if session.status is SessionStatus.INTERRUPTING:
-            provider_operation_addressed = await self.cancel_provider_operation_for_interruption(
-                session
+            provider_operation_addressed = (
+                await self.cancel_provider_operation_for_interruption(
+                    session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                )
+                is not None
             )
             session = await self._require_session(session.id)
         active_model_stage = await self._session_store.load_active_model_completion_stage(
@@ -10036,7 +10942,12 @@ class RecoveryCoordinator:
                 session=session,
             )
         else:
-            model_boundary = await self.reconcile_model_completion_boundary(session)
+            model_boundary = await self.reconcile_model_completion_boundary(
+                session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+            )
         session = model_boundary.session
         events.extend(copy_event(event) for event in model_boundary.recovery_events)
         if model_boundary.state == "provider_operation_pending":
@@ -10161,6 +11072,11 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     messages=transcript,
+                    execution_profile=(
+                        None
+                        if execution_profile_snapshot is None
+                        else execution_profile_snapshot.profile
+                    ),
                     incomplete_recovery_claimed=True,
                     expected_transcript_cursor=expected_transcript_cursor,
                 ):
@@ -10212,6 +11128,11 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 events=events,
+                execution_profile=(
+                    None
+                    if execution_profile_snapshot is None
+                    else execution_profile_snapshot.profile
+                ),
             )
             actions.append(IncompleteSessionRecoveryAction.PENDING_APPROVAL)
             return IncompleteSessionRecoveryResult(
@@ -10236,6 +11157,11 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 events=events,
+                execution_profile=(
+                    None
+                    if execution_profile_snapshot is None
+                    else execution_profile_snapshot.profile
+                ),
             )
             actions.append(IncompleteSessionRecoveryAction.PENDING_USER_INPUT)
             return IncompleteSessionRecoveryResult(
@@ -10255,6 +11181,11 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 events=events,
+                execution_profile=(
+                    None
+                    if execution_profile_snapshot is None
+                    else execution_profile_snapshot.profile
+                ),
             )
             actions.append(
                 IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT
@@ -10284,6 +11215,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
         events: list[Event],
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> Session:
         if session.status == SessionStatus.INTERRUPTING:
             async for event in self._interrupt_session_for_recovery(
@@ -10292,6 +11224,7 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=environment_name,
+                    execution_profile=execution_profile,
                 )
             ):
                 events.append(event)

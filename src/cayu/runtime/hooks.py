@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -24,6 +24,9 @@ from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
 from cayu.runtime.sessions import ForkSessionRequest, Session, copy_fork_session_request
 from cayu.runtime.tasks import Task, TaskCreate, copy_task
+
+if TYPE_CHECKING:
+    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 
 
 class RuntimeHookPhase(StrEnum):
@@ -74,6 +77,7 @@ class _HookActionContext:
         phase: RuntimeHookPhase,
         session: Session,
         publication_actions_allowed: bool = True,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         self._runtime = runtime
         self._hook_name = require_durable_clean_nonblank(hook_name, "hook_name")
@@ -81,6 +85,7 @@ class _HookActionContext:
         self._session = session.model_copy(deep=True)
         self._actions: list[dict[str, Any]] = []
         self._publication_actions_allowed = publication_actions_allowed
+        self._execution_profile = execution_profile
 
     @property
     def hook_name(self) -> str:
@@ -93,6 +98,12 @@ class _HookActionContext:
     @property
     def session(self) -> Session:
         return self._session.model_copy(deep=True)
+
+    @property
+    def execution_profile(self) -> ExecutionProfileIdentity | None:
+        """Return the exact immutable profile resolved for this invocation."""
+
+        return self._execution_profile
 
     @property
     def actions(self) -> list[dict[str, Any]]:
@@ -212,12 +223,14 @@ class RuntimeHookContext(_HookActionContext):
         phase: RuntimeHookPhase,
         session: Session,
         terminal_event: Event,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         super().__init__(
             runtime=runtime,
             hook_name=hook_name,
             phase=phase,
             session=session,
+            execution_profile=execution_profile,
         )
         self._terminal_event = copy_event(terminal_event)
 
@@ -241,6 +254,7 @@ class ToolCallHookContext(_HookActionContext):
         result: ToolResult,
         task_id: str | None,
         publication_actions_allowed: bool = True,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         super().__init__(
             runtime=runtime,
@@ -248,6 +262,7 @@ class ToolCallHookContext(_HookActionContext):
             phase=phase,
             session=session,
             publication_actions_allowed=publication_actions_allowed,
+            execution_profile=execution_profile,
         )
         self._tool_event = copy_event(tool_event)
         self._tool_name = require_clean_nonblank(tool_name, "tool_name")
@@ -302,6 +317,7 @@ class BeforeToolCallHookContext(_HookActionContext):
         arguments: dict[str, Any],
         task_id: str | None,
         publication_actions_allowed: bool = True,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         super().__init__(
             runtime=runtime,
@@ -309,6 +325,7 @@ class BeforeToolCallHookContext(_HookActionContext):
             phase=phase,
             session=session,
             publication_actions_allowed=publication_actions_allowed,
+            execution_profile=execution_profile,
         )
         self._tool_name = require_clean_nonblank(tool_name, "tool_name")
         self._tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")

@@ -790,6 +790,7 @@ def test_lazy_environment_cleanup_sweep_rotates_failed_prefix(
             session_id: str,
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
+            execution_profile: Any = None,
         ) -> None:
             del original_error
             assert allow_deferred_settlement
@@ -998,6 +999,7 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
             session_id: str,
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
+            execution_profile: Any = None,
         ) -> None:
             nonlocal attempts, settlement_task
             if session_id != "cancelled-cleanup-owner":
@@ -1005,6 +1007,7 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
                     session_id=session_id,
                     original_error=original_error,
                     allow_deferred_settlement=allow_deferred_settlement,
+                    execution_profile=execution_profile,
                 )
                 return
             assert allow_deferred_settlement
@@ -1102,6 +1105,7 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
             session_id: str,
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
+            execution_profile: Any = None,
         ) -> None:
             nonlocal attempts
             if session_id != "blocked-owner":
@@ -1109,6 +1113,7 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
                     session_id=session_id,
                     original_error=original_error,
                     allow_deferred_settlement=allow_deferred_settlement,
+                    execution_profile=execution_profile,
                 )
                 return
             assert allow_deferred_settlement

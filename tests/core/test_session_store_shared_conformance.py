@@ -68,6 +68,8 @@ from cayu.runtime import (
     ContextCompactor,
     EnqueueSessionMessageRequest,
     EventQuery,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
     IncompleteSessionRecoveryAction,
@@ -1141,7 +1143,9 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                 assert session.status == status
                 assert session.run_epoch == original_epochs[session_id] + 2
                 assert [record.event.type for record in records] == [expected_type]
-                assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+                assert await store.load_checkpoint(session_id) == {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
+                }
 
             class CompleteThenBlockProvider(ModelProvider):
                 name = "fake"
@@ -1480,7 +1484,9 @@ def test_session_store_conformance_repairs_pre_boundary_resume_failure(
                 EventType.SESSION_FAILED,
             ]
             assert records[-1].event.payload["session_run_operation_id"] == operation_id
-            assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+            assert await store.load_checkpoint(session_id) == {
+                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
+            }
         finally:
             await _close_store(store)
 
@@ -1581,7 +1587,9 @@ def test_session_store_conformance_repairs_terminal_older_than_current_lifecycle
             ]
             assert records[-1].event.payload["terminal_evidence_repaired"] is True
             assert records[-1].event.payload["session_run_operation_id"] == operation_id
-            assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+            assert await store.load_checkpoint(session_id) == {
+                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
+            }
 
             store = await _reopen_store(session_store_case, store)
             settled = await CayuApp(
@@ -3431,7 +3439,7 @@ def test_session_store_conformance_lost_policy_authority_never_becomes_executabl
     asyncio.run(run())
 
 
-def test_session_store_conformance_registration_drift_cannot_authorize_paused_call(
+def test_session_store_conformance_registration_drift_rejects_paused_call(
     session_store_case,
 ) -> None:
     class MixedProvider(ModelProvider):
@@ -3503,10 +3511,8 @@ def test_session_store_conformance_registration_drift_cannot_authorize_paused_ca
 
             store = await _reopen_store(session_store_case, store)
             resumed_app = CayuApp(session_store=store, enable_logging=False)
-            resumed_app.register_provider(
-                _ApprovalRecoveryProvider(complete_without_tools=True),
-                default=True,
-            )
+            resumed_provider = _ApprovalRecoveryProvider(complete_without_tools=True)
+            resumed_app.register_provider(resumed_provider, default=True)
             resumed_app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[
@@ -3515,36 +3521,26 @@ def test_session_store_conformance_registration_drift_cannot_authorize_paused_ca
                 ],
                 tool_policy=AllowAllToolPolicy(),
             )
-            resolved = [
-                event
-                async for event in resumed_app.resolve_tool_approval(
-                    ToolApprovalRequest(
-                        session_id=session_id,
-                        approval_id=approval.approval_id,
-                        tool_round_id=approval.tool_round_id,
-                        tool_call_id=approval.tool_call_id,
-                        decision=ToolApprovalDecision.APPROVE,
+            with pytest.raises(ExecutionProfileMismatchError) as raised:
+                _ = [
+                    event
+                    async for event in resumed_app.resolve_tool_approval(
+                        ToolApprovalRequest(
+                            session_id=session_id,
+                            approval_id=approval.approval_id,
+                            tool_round_id=approval.tool_round_id,
+                            tool_call_id=approval.tool_call_id,
+                            decision=ToolApprovalDecision.APPROVE,
+                        )
                     )
-                )
-            ]
+                ]
 
+            assert raised.value.changed_component_classes == (
+                ExecutionProfileComponentClass.DIRECT_TOOLS,
+            )
             assert late_calls == []
-            assert protected_calls == [{"value": "approved effect"}]
-            private_resolved = [
-                await _private_event_for_public_event(store, event) for event in resolved
-            ]
-            late_failure = next(
-                event
-                for event in private_resolved
-                if event.type is EventType.TOOL_CALL_FAILED
-                and event.payload.get("tool_call_id") == "call_late"
-            )
-            assert late_failure.payload["registration_state"] == "unregistered_at_policy_plan"
-            assert not any(
-                event.type is EventType.TOOL_CALL_STARTED
-                and event.payload.get("tool_call_id") == "call_late"
-                for event in private_resolved
-            )
+            assert protected_calls == []
+            assert resumed_provider.requests == []
         finally:
             await _close_store(store)
 
@@ -13494,7 +13490,7 @@ def test_session_store_conformance_create_atomically_claims_and_admits_first_int
             assert deferred.source_messages == []
             checkpoint = await store.load_checkpoint(session.id)
             assert checkpoint == {
-                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
                 "initial_transcript_pending": {
                     "version": 1,
                     "interaction_id": "interaction-atomic-create",
@@ -13600,7 +13596,9 @@ def test_session_store_conformance_initial_transcript_publication_clears_authori
             )
 
             store = await _reopen_store(session_store_case, store)
-            assert await store.load_checkpoint(session.id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+            assert await store.load_checkpoint(session.id) == {
+                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
+            }
             transcript = await store.query_transcript(
                 TranscriptQuery(session_id=session.id, limit=10)
             )

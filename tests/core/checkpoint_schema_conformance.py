@@ -23,6 +23,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     CheckpointCompatibilityError,
@@ -145,6 +146,50 @@ async def assert_current_checkpoint_publication_upgrade_conformance(
         }
 
 
+async def assert_runtime_publication_rejects_invocation_authority_mutation(
+    store: SessionStore,
+    *,
+    session_id_prefix: str,
+) -> None:
+    """Generic publications cannot create or remove invocation authority."""
+
+    current_store = runtime_checkpoint_session_store(store)
+    for action in ("set", "delete"):
+        session_id = f"{session_id_prefix}-{action}"
+        await store.create(
+            RunRequest(agent_name="checkpoint-agent", session_id=session_id, messages=[]),
+            identity=SessionIdentity(
+                provider_name="checkpoint-conformance",
+                model="checkpoint-model",
+            ),
+        )
+        operation = RuntimePublicationCheckpointOperation(
+            key=ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+            expected_value_digest="0" * 64 if action == "delete" else None,
+            action=action,
+            value={} if action == "set" else None,
+        )
+        request = RuntimePublicationRequest(
+            publication_id=f"checkpoint-invocation-authority-{action}",
+            kind="approval-open",
+            intent={"kind": "checkpoint-invocation-authority-conformance"},
+            mutation=RuntimePublicationMutation(operations=(operation,)),
+            transcript_messages=(),
+            events=(),
+        )
+
+        with pytest.raises(ValueError, match="active invocation"):
+            await current_store.publish_runtime_publication(
+                session_id,
+                request=request,
+                expected_statuses={SessionStatus.PENDING},
+                expected_run_epoch=0,
+                expected_transcript_cursor=0,
+            )
+
+        assert await store.load_checkpoint(session_id) is None
+
+
 async def assert_assistant_publication_checkpoint_conformance(
     store: SessionStore,
     *,
@@ -237,7 +282,7 @@ async def _pause_session(
     return awaiting.payload["input_id"]
 
 
-async def assert_versionless_checkpoint_resume_conformance(
+async def assert_versionless_pending_continuation_fails_closed_conformance(
     store: SessionStore,
     *,
     session_id: str,
@@ -258,24 +303,31 @@ async def assert_versionless_checkpoint_resume_conformance(
     assert len(pending.actions) + len(pending.issues) == 1
 
     provider = _CompleteProvider()
-    events = [
-        event
-        async for event in _app(store, provider).resolve_user_input(
-            UserInputResponse(
-                session_id=session_id,
-                input_id=input_id,
-                answer="yes",
+    with pytest.raises(
+        RuntimeError,
+        match="no durable active invocation execution profile",
+    ):
+        _ = [
+            event
+            async for event in _app(store, provider).resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="yes",
+                )
             )
-        )
-    ]
+        ]
 
-    assert events[-1].type is EventType.SESSION_COMPLETED
-    assert provider.calls == 1
+    assert provider.calls == 0
+    session = await store.load(session_id)
     checkpoint = await store.load_checkpoint(session_id)
+    assert session is not None
+    assert session.status is SessionStatus.INTERRUPTED
     assert checkpoint is not None
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+    assert CHECKPOINT_SCHEMA_VERSION_KEY not in checkpoint
     assert checkpoint["future_additive_field"] == {"kept": True}
-    assert "pending_user_input" not in checkpoint
+    assert "pending_user_input" in checkpoint
+    assert ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY in checkpoint
 
 
 async def assert_versionless_noop_transform_stamps_conformance(

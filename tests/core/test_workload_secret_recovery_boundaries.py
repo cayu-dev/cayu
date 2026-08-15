@@ -13,6 +13,7 @@ from tests.core._workload_secret_support import (
     collect_tool_approval_recovery_events,
 )
 
+import cayu.runtime.execution_profiles as execution_profiles_module
 from cayu import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.core import AgentSpec, EventType, Message
 from cayu.providers import ModelStreamEvent
@@ -29,6 +30,7 @@ from cayu.runtime import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
@@ -122,8 +124,19 @@ def test_cayu_app_never_executes_new_tool_call_with_redaction_marker() -> None:
 
     assert events[-1].type == EventType.SESSION_FAILED
     assert tool.calls == []
-    assert asyncio.run(store.load_checkpoint("sess_new_tool_marker")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2
+    checkpoint = asyncio.run(store.load_checkpoint("sess_new_tool_marker"))
+    assert checkpoint is not None
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
+    assert REDACTED_SECRET not in str(active_profile.model_dump(mode="json"))
+    checkpoint_without_active_profile = dict(checkpoint)
+    checkpoint_without_active_profile.pop(
+        execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+    )
+    assert checkpoint_without_active_profile == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
     }
 
 
@@ -169,7 +182,19 @@ def test_cayu_app_rejects_workload_secret_before_approval_checkpoint() -> None:
     transcript = asyncio.run(store.load_transcript("sess_tool_approval_redaction"))
     assert events[-1].type == EventType.SESSION_FAILED
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert checkpoint is not None
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
+    assert REDACTED_SECRET not in str(active_profile.model_dump(mode="json"))
+    checkpoint_without_active_profile = dict(checkpoint)
+    checkpoint_without_active_profile.pop(
+        execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+    )
+    assert checkpoint_without_active_profile == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
+    }
     assert tool.calls == []
     assert secret not in str([event.model_dump(mode="json") for event in events])
     assert secret not in str([message.model_dump(mode="json") for message in transcript])

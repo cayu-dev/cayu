@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.messages import ToolCallPart, ToolResultPart
@@ -23,7 +24,6 @@ from cayu.runtime import (
     RunLimits,
     RunRequest,
     Session,
-    SessionIdentity,
     SessionStatus,
     StructuredOutputSpec,
 )
@@ -32,6 +32,9 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime.execution_profiles import (
+    checkpoint_with_active_invocation_execution_profile,
+)
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.sessions import (
     ModelCompletionStageRequest,
@@ -172,6 +175,7 @@ async def _publish_structured_model_step(
     provider_name: str,
     spec: StructuredOutputSpec,
     tool_calls: list[runtime_records.ToolCallRequest],
+    tools: tuple[Tool, ...] = (),
     redactor: SecretRedactor | None = None,
 ) -> _PublishedStructuredStep:
     user_message = Message.text("user", "produce the final structured answer")
@@ -191,6 +195,22 @@ async def _publish_structured_model_step(
             started_at=started_at,
         ).model_dump(mode="json"),
     )
+    session_identity = profiled_session_identity(
+        provider_name=provider_name,
+        model="fake-model",
+        direct_tools=(
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "schema": tool.schema,
+                "parallel_safe": tool.spec.parallel_safe,
+                "effect": tool.spec.effect.value,
+            }
+            for tool in tools
+        ),
+    )
+    execution_profile = session_identity.execution_profile
+    assert execution_profile is not None
     running = await store.create(
         RunRequest(
             agent_name="assistant",
@@ -198,12 +218,18 @@ async def _publish_structured_model_step(
             messages=[user_message],
             structured_output=spec,
         ),
-        identity=SessionIdentity(
-            provider_name=provider_name,
-            model="fake-model",
-        ),
+        identity=session_identity,
         interaction_started_event=started_event,
         interaction_source_messages=[user_message],
+        checkpoint_transform=lambda current_session, checkpoint: (
+            checkpoint_with_active_invocation_execution_profile(
+                checkpoint,
+                session_id=current_session.id,
+                interaction_id=interaction_id,
+                run_epoch=current_session.run_epoch,
+                profile=execution_profile,
+            )
+        ),
     )
     await store.replace_initial_transcript_messages(
         session_id,
@@ -267,8 +293,9 @@ async def _publish_structured_model_step(
             validation,
             redactor,
         )
+    checkpoint = await store.load_checkpoint(session_id)
     target_checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
-        None,
+        checkpoint,
         agent_name="assistant",
         environment_name=None,
         task_id=None,
@@ -335,7 +362,7 @@ async def _publish_structured_model_step(
         kind="model-step",
         interaction_id=interaction_id,
         intent=intent,
-        mutation=runtime_publication_checkpoint_mutation(None, target_checkpoint),
+        mutation=runtime_publication_checkpoint_mutation(checkpoint, target_checkpoint),
         transcript_messages=(assistant_message,),
         events=(completion_event,),
     )
@@ -769,6 +796,7 @@ def test_incomplete_recovery_fails_mixed_round_without_retry_or_side_effects() -
                     output={"answer": "invalid mixed round"},
                 ),
             ],
+            tools=(side_effect,),
         )
         await store.release_run_fence(staged.session.id)
         app = _register_runtime(store, provider, tools=[side_effect])

@@ -10,6 +10,9 @@ from tests.core._event_projection_support import (
     private_event_for_public_event,
     private_events_for_public_events,
 )
+from tests.core._execution_profile_fixtures import (
+    checkpoint_with_rebound_test_invocation_profile,
+)
 
 from cayu.core import (
     AgentSpec,
@@ -25,6 +28,8 @@ from cayu.runtime import (
     BudgetLimit,
     CayuApp,
     EventQuery,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
     ForkSessionRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -53,9 +58,14 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
     CheckpointCompatibilityError,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+    checkpoint_with_active_invocation_execution_profile,
+)
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor, StaticVault
 
@@ -404,7 +414,7 @@ def test_ask_user_pauses_the_session() -> None:
     assert interrupted.payload["interruption_type"] == "user_input_required"
     assert asyncio.run(store.load("s_pause")).status == SessionStatus.INTERRUPTED
     checkpoint = asyncio.run(store.load_checkpoint("s_pause"))
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert "pending_user_input" in checkpoint
 
 
@@ -479,8 +489,8 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     assert "pending_user_input" not in asyncio.run(store.load_checkpoint("s_resume"))
 
 
-def test_resolve_user_input_lifts_versionless_root_checkpoint() -> None:
-    async def run() -> dict:
+def test_resolve_user_input_rejects_versionless_root_with_reserved_authority() -> None:
+    async def run() -> tuple[SessionStatus, dict]:
         session_id = "s_resume_versionless_root_checkpoint"
         app, store = _build(
             [("call_1", "ask_user", {"question": "Which env?"})],
@@ -503,25 +513,32 @@ def test_resolve_user_input_lifts_versionless_root_checkpoint() -> None:
         versionless["future_additive_field"] = {"kept": True}
         await store.checkpoint(session_id, versionless)
 
-        resume_events = await _drain(
-            app.resolve_user_input(
-                UserInputResponse(
-                    session_id=session_id,
-                    input_id=input_id,
-                    answer="prod",
+        with pytest.raises(
+            RuntimeError,
+            match="no durable active invocation execution profile",
+        ):
+            await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="prod",
+                    )
                 )
             )
-        )
-        assert resume_events[-1].type == EventType.SESSION_COMPLETED
+        session = await store.load(session_id)
         checkpoint = await store.load_checkpoint(session_id)
+        assert session is not None
         assert checkpoint is not None
-        return checkpoint
+        return session.status, checkpoint
 
-    checkpoint = asyncio.run(run())
+    status, checkpoint = asyncio.run(run())
 
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert status is SessionStatus.INTERRUPTED
+    assert CHECKPOINT_SCHEMA_VERSION_KEY not in checkpoint
     assert checkpoint["future_additive_field"] == {"kept": True}
-    assert "pending_user_input" not in checkpoint
+    assert "pending_user_input" in checkpoint
+    assert active_invocation_execution_profile_from_checkpoint(checkpoint) is not None
 
 
 def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() -> None:
@@ -551,7 +568,7 @@ def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() 
         ).payload["input_id"]
         future_checkpoint = await store.load_checkpoint(session_id)
         assert future_checkpoint is not None
-        future_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = 3
+        future_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
         await store.checkpoint(session_id, future_checkpoint)
 
         with pytest.raises(CheckpointCompatibilityError) as caught:
@@ -575,7 +592,9 @@ def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() 
     assert error.reason == "checkpoint_schema_version_too_new"
     assert provider_calls == 1
     assert status is SessionStatus.INTERRUPTED
-    assert checkpoint_after[CHECKPOINT_SCHEMA_VERSION_KEY] == 3
+    assert checkpoint_after[CHECKPOINT_SCHEMA_VERSION_KEY] == (
+        CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
+    )
     assert "pending_user_input" in checkpoint_after
 
 
@@ -1203,13 +1222,16 @@ def test_ask_user_is_opt_in_not_registered_by_default() -> None:
 
 
 def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() -> None:
-    """Registration drift cannot turn a durable non-authority into execution."""
+    """Registration drift cannot replace a paused invocation's frozen profile."""
 
     class FinalProvider(ModelProvider):
         name = "fake"
 
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
         async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-            del request
+            self.requests.append(request)
             yield ModelStreamEvent.text_delta("done")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
@@ -1238,39 +1260,28 @@ def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() 
     assert pending_calls[0]["policy_evidence"] == "unregistered"
     assert pending_calls[1]["policy_evidence"] == "authoritative"
 
+    final_provider = FinalProvider()
     resumed_app = CayuApp(session_store=store, enable_logging=False)
-    resumed_app.register_provider(FinalProvider(), default=True)
+    resumed_app.register_provider(final_provider, default=True)
     resumed_app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[UserInputTool(), echo],
     )
-    events = asyncio.run(
-        _drain(
-            resumed_app.resolve_user_input(
-                UserInputResponse(
-                    session_id="s_registration_drift",
-                    input_id=awaiting.payload["input_id"],
-                    answer="yes",
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            _drain(
+                resumed_app.resolve_user_input(
+                    UserInputResponse(
+                        session_id="s_registration_drift",
+                        input_id=awaiting.payload["input_id"],
+                        answer="yes",
+                    )
                 )
             )
         )
-    )
-
+    assert caught.value.changed_component_classes == (ExecutionProfileComponentClass.DIRECT_TOOLS,)
     assert echo.metadata_by_text == {}
-    private_events = asyncio.run(private_events_for_public_events(store, events))
-    failed = next(
-        event
-        for event in private_events
-        if event.type is EventType.TOOL_CALL_FAILED
-        and event.payload.get("tool_call_id") == "call_late"
-    )
-    assert failed.payload["registration_state"] == "unregistered_at_policy_plan"
-    assert not any(
-        event.type is EventType.TOOL_CALL_STARTED
-        and event.payload.get("tool_call_id") == "call_late"
-        for event in private_events
-    )
-    assert events[-1].type is EventType.SESSION_COMPLETED
+    assert final_provider.requests == []
 
 
 def test_ask_user_pauses_whole_round_before_any_tool_runs() -> None:
@@ -2680,8 +2691,29 @@ def test_worker_recovery_preserves_pending_user_input() -> None:
     private_input_id = asyncio.run(private_event_for_public_event(store, awaiting)).payload[
         "input_id"
     ]
-    # Simulate the crash window: status flipped back to RUNNING with the checkpoint intact.
-    asyncio.run(store.update_status("s_crashrec", SessionStatus.RUNNING))
+    # Simulate the crash window with the profile rebound in the same running-epoch claim.
+    checkpoint = asyncio.run(store.load_checkpoint("s_crashrec"))
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    assert active_profile is not None
+
+    def claim_running(current_session: Session, current_checkpoint: dict | None) -> dict:
+        return checkpoint_with_active_invocation_execution_profile(
+            current_checkpoint,
+            session_id=current_session.id,
+            interaction_id=active_profile.interaction_id,
+            run_epoch=current_session.run_epoch + 1,
+            profile=active_profile.profile,
+            expected=active_profile,
+        )
+
+    asyncio.run(
+        store.transition_status_and_checkpoint(
+            "s_crashrec",
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=claim_running,
+        )
+    )
     result = asyncio.run(
         app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id="s_crashrec"))
     )
@@ -2746,10 +2778,15 @@ def test_worker_recovery_rejects_corrupted_pending_user_input(
             return updated
 
         await store.transform_checkpoint(session_id, corrupt_checkpoint)
+        await store.transition_status_and_checkpoint(
+            session_id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=checkpoint_with_rebound_test_invocation_profile,
+        )
         checkpoint_before = await store.load_checkpoint(session_id)
         transcript_before = await store.load_transcript(session_id)
         events_before = await store.load_events(session_id)
-        await store.update_status(session_id, SessionStatus.RUNNING)
 
         with pytest.raises(
             ValueError,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from math import isfinite
@@ -99,10 +100,13 @@ from cayu.runtime._environment_allocation import (
     require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.sessions import (
     CheckpointTransform,
     Session,
     SessionStore,
+    _current_session_run_epoch,
+    _deactivate_session_run_fence,
     session_user_metadata,
 )
 from cayu.vaults import SecretRedactor
@@ -112,6 +116,10 @@ _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_releas
 _MAX_LAZY_ENVIRONMENT_CLEANUP_SETTLEMENTS = 16
 _LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
 DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS = 256
+
+_RunFenceReleaseKey = tuple[str, int]
+
+logger = logging.getLogger(__name__)
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 
@@ -149,6 +157,7 @@ class _EnvironmentCleanupSettlementOutcome:
 @dataclass
 class _ActiveEnvironmentSetup:
     registered_environment: runtime_records.RegisteredEnvironment
+    execution_profile: ExecutionProfileIdentity | None = None
     cleanup_started: bool = False
     cleanup_finished: bool = False
     prebind_release_tombstone: bool = False
@@ -165,6 +174,19 @@ class _ActiveEnvironmentSetup:
         default=None,
         repr=False,
     )
+
+
+def _retain_cleanup_execution_profile(
+    owner: _ActiveEnvironmentSetup,
+    execution_profile: ExecutionProfileIdentity | None,
+) -> None:
+    if execution_profile is None:
+        return
+    if owner.execution_profile is None:
+        owner.execution_profile = execution_profile
+        return
+    if owner.execution_profile != execution_profile:
+        raise RuntimeError("Environment cleanup owner execution profile changed.")
 
 
 class EnvironmentLifecycle:
@@ -202,6 +224,175 @@ class EnvironmentLifecycle:
         self._active_environment_setups: dict[str, _ActiveEnvironmentSetup] = {}
         self._pending_environment_owner_admissions: set[str] = set()
         self._deferred_factory_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
+        self._deferred_factory_cleanup_profiles: dict[str, ExecutionProfileIdentity] = {}
+        self._deferred_run_fence_release_events: dict[_RunFenceReleaseKey, asyncio.Event] = {}
+        self._deferred_run_fence_release_tasks: dict[_RunFenceReleaseKey, asyncio.Task[None]] = {}
+
+    def _retain_deferred_factory_cleanup_execution_profile(
+        self,
+        session_id: str,
+        execution_profile: ExecutionProfileIdentity | None,
+    ) -> None:
+        if execution_profile is None:
+            return
+        profiles = getattr(self, "_deferred_factory_cleanup_profiles", None)
+        if profiles is None:
+            profiles = {}
+            self._deferred_factory_cleanup_profiles = profiles
+        current = profiles.get(session_id)
+        if current is None:
+            profiles[session_id] = execution_profile
+            return
+        if current != execution_profile:
+            raise RuntimeError("Environment cleanup owner execution profile changed.")
+
+    def _has_retained_environment_cleanup(self, session_id: str) -> bool:
+        return (
+            session_id in self._active_environment_setups
+            or session_id in self._deferred_factory_cleanup_tasks
+        )
+
+    def _signal_environment_cleanup_state_changed(self, session_id: str) -> None:
+        events = getattr(self, "_deferred_run_fence_release_events", None)
+        if events is None:
+            return
+        for (owned_session_id, _run_epoch), event in tuple(events.items()):
+            if owned_session_id == session_id:
+                event.set()
+
+    def _deferred_factory_cleanup_completed(
+        self,
+        session_id: str,
+        _task: asyncio.Task[None],
+    ) -> None:
+        self._harvest_deferred_factory_cleanups()
+        self._signal_environment_cleanup_state_changed(session_id)
+
+    def _harvest_deferred_run_fence_release(
+        self,
+        key: _RunFenceReleaseKey,
+        task: asyncio.Task[None],
+    ) -> None:
+        tasks = getattr(self, "_deferred_run_fence_release_tasks", None)
+        if tasks is None or tasks.get(key) is not task:
+            return
+        session_id, run_epoch = key
+        try:
+            task.result()
+        except BaseException as error:
+            # Failure or loop-shutdown cancellation leaves the durable epoch
+            # fenced for explicit worker-startup recovery.
+            diagnostic = exception_diagnostic(
+                error,
+                empty_message="run fence release failed",
+                nonportable_message="Run fence release failed with a non-portable diagnostic.",
+                redactor=self._secret_redactor,
+            )
+            logger.warning(
+                "Deferred environment run-fence release failed: "
+                "session_id=%s run_epoch=%s error_type=%s error=%s",
+                session_id,
+                run_epoch,
+                diagnostic.error_type,
+                diagnostic.message,
+            )
+            return
+        del tasks[key]
+        events = getattr(self, "_deferred_run_fence_release_events", None)
+        if events is not None:
+            events.pop(key, None)
+
+    def retire_repaired_run_fence_releases(
+        self,
+        *,
+        session_id: str,
+        repaired_run_epoch: int,
+    ) -> None:
+        """Forget failed older release tasks after durable recovery supersedes them."""
+
+        tasks = getattr(self, "_deferred_run_fence_release_tasks", None)
+        if tasks is None:
+            return
+        events = getattr(self, "_deferred_run_fence_release_events", None)
+        for key, task in tuple(tasks.items()):
+            owned_session_id, owned_run_epoch = key
+            if (
+                owned_session_id == session_id
+                and owned_run_epoch < repaired_run_epoch
+                and task.done()
+            ):
+                del tasks[key]
+                if events is not None:
+                    events.pop(key, None)
+
+    async def release_run_fence_after_environment_cleanup(
+        self,
+        *,
+        session_id: str,
+        execution_profile: ExecutionProfileIdentity | None = None,
+    ) -> None:
+        """Release one invocation epoch only after retained cleanup is quiescent."""
+
+        run_epoch = _current_session_run_epoch(session_id)
+        if run_epoch is None:
+            raise RuntimeError("Environment cleanup has no active session run-fence epoch.")
+        key = (session_id, run_epoch)
+        tasks = getattr(self, "_deferred_run_fence_release_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._deferred_run_fence_release_tasks = tasks
+        events = getattr(self, "_deferred_run_fence_release_events", None)
+        if events is None:
+            events = {}
+            self._deferred_run_fence_release_events = events
+        self.retire_repaired_run_fence_releases(
+            session_id=session_id,
+            repaired_run_epoch=run_epoch,
+        )
+
+        setup_owner = self._active_environment_setups.get(session_id)
+        if setup_owner is not None:
+            _retain_cleanup_execution_profile(setup_owner, execution_profile)
+        if session_id in self._deferred_factory_cleanup_tasks:
+            self._retain_deferred_factory_cleanup_execution_profile(
+                session_id,
+                execution_profile,
+            )
+        existing = tasks.get(key)
+        if existing is not None:
+            if not self._has_retained_environment_cleanup(session_id):
+                self._signal_environment_cleanup_state_changed(session_id)
+            _deactivate_session_run_fence(session_id)
+            return
+        if not self._has_retained_environment_cleanup(session_id):
+            await self._session_store.release_run_fence(session_id)
+            return
+        state_changed = asyncio.Event()
+        events[key] = state_changed
+
+        async def release_when_quiescent() -> None:
+            while self._has_retained_environment_cleanup(session_id):
+                state_changed.clear()
+                if not self._has_retained_environment_cleanup(session_id):
+                    break
+                await state_changed.wait()
+            await self._session_store.release_run_fence(session_id)
+
+        task = asyncio.create_task(
+            release_when_quiescent(),
+            name=f"cayu-environment-run-fence-release-{session_id}",
+        )
+        tasks[key] = task
+        # ``asyncio.create_task`` copied the caller's exact run-fence context.
+        # The retained cleanup owner now owns that token; the caller must not
+        # continue to present itself as a second in-process owner.
+        _deactivate_session_run_fence(session_id)
+        task.add_done_callback(
+            lambda completed, owned_key=key: self._harvest_deferred_run_fence_release(
+                owned_key,
+                completed,
+            )
+        )
 
     def _reserve_environment_owner_admission(self, session_id: str) -> None:
         if (
@@ -267,9 +458,9 @@ class EnvironmentLifecycle:
             session_id: str,
             expected_owner: _ActiveEnvironmentSetup,
         ) -> _EnvironmentCleanupSettlementOutcome:
-            if self._active_environment_setups.get(session_id) is not expected_owner:
-                return _EnvironmentCleanupSettlementOutcome()
             try:
+                if self._active_environment_setups.get(session_id) is not expected_owner:
+                    return _EnvironmentCleanupSettlementOutcome()
                 await self.abort_environment_setup(
                     session_id=session_id,
                     original_error=None,
@@ -283,6 +474,8 @@ class EnvironmentLifecycle:
                 )
             except BaseException as error:
                 return _EnvironmentCleanupSettlementOutcome(error=error)
+            finally:
+                self._signal_environment_cleanup_state_changed(session_id)
             return _EnvironmentCleanupSettlementOutcome()
 
         def harvest_completed(
@@ -373,6 +566,7 @@ class EnvironmentLifecycle:
         tasks = (
             *tasks,
             *(task for task in self._deferred_factory_cleanup_tasks.values() if not task.done()),
+            *(task for task in self._deferred_run_fence_release_tasks.values() if not task.done()),
         )
         if tasks:
             await asyncio.wait(
@@ -422,7 +616,11 @@ class EnvironmentLifecycle:
                 continue
             if self._deferred_factory_cleanup_tasks.get(session_id) is task:
                 del self._deferred_factory_cleanup_tasks[session_id]
+                profiles = getattr(self, "_deferred_factory_cleanup_profiles", None)
+                if profiles is not None:
+                    profiles.pop(session_id, None)
                 self._release_pending_environment_owner_admission(session_id)
+                self._signal_environment_cleanup_state_changed(session_id)
 
     def _retry_failed_deferred_factory_cleanups(
         self,
@@ -440,6 +638,14 @@ class EnvironmentLifecycle:
                 replacement = retry_environment_factory_cleanup_settlement_task(task)
                 if replacement is not task:
                     self._deferred_factory_cleanup_tasks[session_id] = replacement
+                    replacement.add_done_callback(
+                        lambda completed, owned_session_id=session_id: (
+                            self._deferred_factory_cleanup_completed(
+                                owned_session_id,
+                                completed,
+                            )
+                        )
+                    )
                     attempted_sessions.add(session_id)
 
     def _transfer_deferred_factory_cleanup(
@@ -450,9 +656,11 @@ class EnvironmentLifecycle:
     ) -> None:
         """Transfer a timed-out factory release out of an active setup owner."""
 
+        setup_owner = self._active_environment_setups.get(session_id)
         task = self._adopt_deferred_factory_cleanup(
             session_id=session_id,
             error=error,
+            execution_profile=(None if setup_owner is None else setup_owner.execution_profile),
         )
         if task is None:
             return
@@ -467,6 +675,7 @@ class EnvironmentLifecycle:
         *,
         session_id: str,
         error: BaseException,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> asyncio.Task[None] | None:
         """Retain every authenticated cleanup owner carried by one failure tree."""
 
@@ -481,6 +690,18 @@ class EnvironmentLifecycle:
         )
         if task is not None:
             self._deferred_factory_cleanup_tasks[session_id] = task
+            self._retain_deferred_factory_cleanup_execution_profile(
+                session_id,
+                execution_profile,
+            )
+            task.add_done_callback(
+                lambda completed, owned_session_id=session_id: (
+                    self._deferred_factory_cleanup_completed(
+                        owned_session_id,
+                        completed,
+                    )
+                )
+            )
         return task
 
     async def emit_factory_started(
@@ -523,6 +744,7 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         started_event: Event | None,
         operation: EnvironmentFactoryOperation,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> EnvironmentFactoryResolutionResult:
         if registered_environment is None or registered_environment.factory is None:
             if started_event is not None:
@@ -774,12 +996,16 @@ class EnvironmentLifecycle:
             )
             self._promote_environment_owner_admission(
                 session.id,
-                _ActiveEnvironmentSetup(registered_environment=resolved_environment),
+                _ActiveEnvironmentSetup(
+                    registered_environment=resolved_environment,
+                    execution_profile=execution_profile,
+                ),
             )
         except BaseException as exc:
             self._adopt_deferred_factory_cleanup(
                 session_id=session.id,
                 error=exc,
+                execution_profile=execution_profile,
             )
             if result is not None:
                 release_action = (
@@ -1075,6 +1301,7 @@ class EnvironmentLifecycle:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         started_event: Event | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> EnvironmentBindingResult:
         if registered_environment is None:
             if started_event is not None:
@@ -1151,8 +1378,13 @@ class EnvironmentLifecycle:
         base_payload = _binding_base_payload(registered_environment)
         setup_owner = self._active_environment_setups.get(session.id)
         if setup_owner is None:
-            setup_owner = _ActiveEnvironmentSetup(registered_environment=registered_environment)
+            setup_owner = _ActiveEnvironmentSetup(
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+            )
             self._active_environment_setups[session.id] = setup_owner
+        else:
+            _retain_cleanup_execution_profile(setup_owner, execution_profile)
         self._release_pending_environment_owner_admission(session.id)
         release_failed_binding_reservations: Callable[[], None] | None = None
         try:
@@ -1388,7 +1620,11 @@ class EnvironmentLifecycle:
                 for owner in self._active_environment_setups.values()
                 if owner.cleanup_started and owner.cleanup_finished
             )
-            if not retained and not self._deferred_factory_cleanup_tasks:
+            if (
+                not retained
+                and not self._deferred_factory_cleanup_tasks
+                and not self._deferred_run_fence_release_tasks
+            ):
                 return True
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -1404,6 +1640,7 @@ class EnvironmentLifecycle:
                     for owner in self._active_environment_setups.values()
                 )
                 and not self._deferred_factory_cleanup_tasks
+                and not self._deferred_run_fence_release_tasks
             ):
                 return True
             if (
@@ -1418,6 +1655,23 @@ class EnvironmentLifecycle:
                 # terminal failure. Retain ownership and return control so an
                 # operator can correct provider state before retrying.
                 return False
+            if (
+                not any(
+                    owner.cleanup_started and owner.cleanup_finished
+                    for owner in self._active_environment_setups.values()
+                )
+                and not self._deferred_factory_cleanup_tasks
+                and self._deferred_run_fence_release_tasks
+                and all(task.done() for task in self._deferred_run_fence_release_tasks.values())
+                and any(
+                    task.cancelled() or task.exception() is not None
+                    for task in self._deferred_run_fence_release_tasks.values()
+                )
+            ):
+                # Cleanup is quiescent, but the durable fence could not be
+                # advanced. Worker-startup recovery remains the safe retry
+                # boundary; an explicit drain must not report success.
+                return False
             # Retry unavailable cleanup without turning the explicit drain path
             # into a busy loop. In-flight mutation tasks remain singly owned.
             await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
@@ -1428,8 +1682,16 @@ class EnvironmentLifecycle:
         event: Event,
         session: Session,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> EnvironmentBindingFinalizeResult:
         setup_owner = self._active_environment_setups.get(session.id)
+        if setup_owner is not None:
+            _retain_cleanup_execution_profile(setup_owner, execution_profile)
+        if session.id in self._deferred_factory_cleanup_tasks:
+            self._retain_deferred_factory_cleanup_execution_profile(
+                session.id,
+                execution_profile,
+            )
         owns_cleanup = setup_owner is not None and not setup_owner.cleanup_started
         owns_prebind_tombstone = setup_owner is not None and setup_owner.prebind_release_tombstone
         try:
@@ -1465,6 +1727,7 @@ class EnvironmentLifecycle:
                 and self._active_environment_setups.get(session.id) is setup_owner
             ):
                 del self._active_environment_setups[session.id]
+            self._signal_environment_cleanup_state_changed(session.id)
 
     async def _finalize_terminal_event_once(
         self,
@@ -1737,16 +2000,43 @@ class EnvironmentLifecycle:
         session_id: str,
         original_error: BaseException | None,
         allow_deferred_settlement: bool = False,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         """Release a live setup when no terminal event can own its cleanup."""
 
+        try:
+            await self._abort_environment_setup_once(
+                session_id=session_id,
+                original_error=original_error,
+                allow_deferred_settlement=allow_deferred_settlement,
+                execution_profile=execution_profile,
+            )
+        finally:
+            self._signal_environment_cleanup_state_changed(session_id)
+
+    async def _abort_environment_setup_once(
+        self,
+        *,
+        session_id: str,
+        original_error: BaseException | None,
+        allow_deferred_settlement: bool = False,
+        execution_profile: ExecutionProfileIdentity | None = None,
+    ) -> None:
+        """Perform one exact-owner setup cleanup attempt."""
+
         setup_owner = self._active_environment_setups.get(session_id)
         if setup_owner is None:
+            if session_id in self._deferred_factory_cleanup_tasks:
+                self._retain_deferred_factory_cleanup_execution_profile(
+                    session_id,
+                    execution_profile,
+                )
             # A stream may be abandoned after the durable started event but
             # before factory creation or binding mutation begins.
             if session_id not in self._deferred_factory_cleanup_tasks:
                 self._release_pending_environment_owner_admission(session_id)
             return
+        _retain_cleanup_execution_profile(setup_owner, execution_profile)
         if setup_owner.cleanup_started and not setup_owner.cleanup_finished:
             return
         if setup_owner.cleanup_settlement_started:

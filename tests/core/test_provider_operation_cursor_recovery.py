@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message, ThinkingConfig, ThinkingPart
@@ -35,11 +36,14 @@ from cayu.runtime import (
     ModelCompletionManualRecoveryRequired,
     RunRequest,
     Session,
-    SessionIdentity,
     SessionRunFenced,
     SessionStatus,
     SessionStore,
     session_usage_summary,
+)
+from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
+from cayu.runtime.execution_profiles import (
+    checkpoint_with_active_invocation_execution_profile,
 )
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
@@ -752,6 +756,7 @@ def test_partial_tool_call_replay_materializes_one_pending_call() -> None:
             session_id=session_id,
             provider=provider,
             partial_events=(accepted_tool,),
+            tools=(_LookupTool(),),
         )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
@@ -1659,6 +1664,7 @@ async def _stage_partial_operation(
     advances: int = 1,
     partial_events: tuple[ModelStreamEvent, ...] | None = None,
     thinking: ThinkingConfig | None = None,
+    tools: tuple[Tool, ...] = (),
     operation_identity_overrides: dict[str, object] | None = None,
 ) -> tuple[ModelCompletionStage, ModelAttemptIdentity, ProviderOperationState]:
     if advances not in {1, 2}:
@@ -1667,13 +1673,29 @@ async def _stage_partial_operation(
     interaction_id = f"interaction-{session_id}"
     started_event_id = f"{session_id}:interaction-started"
     started_at = datetime.now(UTC)
+    session_identity = profiled_session_identity(
+        provider_name=provider.name,
+        model="fake-model",
+        direct_tools=(
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "schema": tool.schema,
+                "parallel_safe": tool.spec.parallel_safe,
+                "effect": tool.spec.effect.value,
+            }
+            for tool in tools
+        ),
+    )
+    execution_profile = session_identity.execution_profile
+    assert execution_profile is not None
     session = await store.create(
         RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
         ),
-        identity=SessionIdentity(provider_name=provider.name, model="fake-model"),
+        identity=session_identity,
         interaction_started_event=Event(
             id=started_event_id,
             type=EventType.INTERACTION_STARTED,
@@ -1688,6 +1710,15 @@ async def _stage_partial_operation(
             ).model_dump(mode="json"),
         ),
         interaction_source_messages=[user_message],
+        checkpoint_transform=lambda current_session, checkpoint: (
+            checkpoint_with_active_invocation_execution_profile(
+                checkpoint,
+                session_id=current_session.id,
+                interaction_id=interaction_id,
+                run_epoch=current_session.run_epoch,
+                profile=execution_profile,
+            )
+        ),
     )
     await store.replace_initial_transcript_messages(
         session_id,
@@ -1715,18 +1746,10 @@ async def _stage_partial_operation(
                 "requested_model": "fake-model",
                 "source_transcript_cursor": 1,
                 "request_fingerprint": "c" * 64,
-                "recovery_context": {
-                    "schema_version": 1,
-                    "max_steps": 16,
-                    "limits": {},
-                    "budget_limits": [],
-                    "retry_policy": {},
-                    **(
-                        {"thinking": thinking.model_dump(mode="json")}
-                        if thinking is not None
-                        else {}
-                    ),
-                },
+                "recovery_context": ModelCompletionRecoveryContext(
+                    execution_profile_fingerprint=execution_profile.fingerprint,
+                    thinking=thinking,
+                ).model_dump(mode="json"),
             },
         ),
         expected_statuses={session.status},

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    checkpoint_with_rebound_test_invocation_profile,
+    profiled_session_identity,
+    runtime_interaction_started_event,
+)
 
 from cayu import (
     AgentSpec,
@@ -56,8 +60,26 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
                 model="scripted-model",
             ),
         )
-        await store.append_transcript_messages("stateful-policy-resume", [initial])
-        await store.update_status("stateful-policy-resume", SessionStatus.RUNNING)
+        interaction_id = "interaction_stateful_policy_resume"
+        await store.transition_status_and_checkpoint(
+            "stateful-policy-resume",
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda session, checkpoint: (
+                checkpoint_with_rebound_test_invocation_profile(
+                    session,
+                    checkpoint,
+                    interaction_id=interaction_id,
+                )
+            ),
+            interaction_started_event=runtime_interaction_started_event(
+                app,
+                session_id="stateful-policy-resume",
+                interaction_id=interaction_id,
+                agent_name="assistant",
+            ),
+            interaction_source_messages=[initial],
+        )
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id="stateful-policy-resume")
         )

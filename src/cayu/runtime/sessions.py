@@ -75,6 +75,10 @@ from cayu.core.messages import (
     copy_message,
     detach_message,
 )
+from cayu.core.runtime_authority import (
+    CheckpointValueAuthority,
+    checkpoint_value_authority,
+)
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime._model_completion_publication import (
@@ -141,13 +145,17 @@ from cayu.runtime.checkpoints import (
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
     EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileComponentClass,
     ExecutionProfileDecision,
     ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
     ExecutionProfileRejectionResult,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
     changed_execution_profile_components,
+    checkpoint_with_active_invocation_execution_profile,
     copy_execution_profile_adoption_intent,
     copy_execution_profile_decision,
     execution_profile_from_session_metadata,
@@ -2204,6 +2212,143 @@ CheckpointTransform = Callable[
     dict[str, Any] | None,
 ]
 CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS = 32
+
+
+@dataclass(frozen=True)
+class SessionInvocationAdmission:
+    """One valid atomic admission of a profiled session invocation.
+
+    A clean resume starts a new interaction and compares ``execution_profile``
+    with session metadata. A continuation keeps the historical interaction and
+    compares ``expected_active_invocation_profile`` with checkpoint authority.
+    The store binds either profile to the newly claimed run epoch in the same
+    transaction as status and interaction admission.
+    """
+
+    from_statuses: frozenset[SessionStatus]
+    checkpoint_transform: CheckpointTransform
+    execution_profile: ExecutionProfileIdentity
+    interaction_source_messages: tuple[Message, ...]
+    interaction_started_event: Event | None = None
+    continued_interaction_id: str | None = None
+    defer_interaction_source: bool = False
+    model_transition: SessionModelTransition | None = None
+    execution_profile_decision: ExecutionProfileDecision | None = None
+    expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None
+    allow_unprofiled_derived_session: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.from_statuses) is not frozenset or not self.from_statuses:
+            raise ValueError("from_statuses must be a non-empty frozenset.")
+        if any(not isinstance(status, SessionStatus) for status in self.from_statuses):
+            raise TypeError("from_statuses must contain only SessionStatus values.")
+        if not callable(self.checkpoint_transform):
+            raise TypeError("checkpoint_transform must be callable.")
+        if type(self.execution_profile) is not ExecutionProfileIdentity:
+            raise TypeError("execution_profile must be an ExecutionProfileIdentity.")
+        object.__setattr__(
+            self,
+            "execution_profile",
+            ExecutionProfileIdentity.model_validate(self.execution_profile.model_dump(mode="json")),
+        )
+        if type(self.allow_unprofiled_derived_session) is not bool:
+            raise TypeError("allow_unprofiled_derived_session must be a boolean.")
+        if type(self.interaction_source_messages) is not tuple:
+            raise TypeError("interaction_source_messages must be a tuple.")
+        object.__setattr__(
+            self,
+            "interaction_source_messages",
+            tuple(detach_message(message) for message in self.interaction_source_messages),
+        )
+        if self.interaction_started_event is not None:
+            if type(self.interaction_started_event) is not Event:
+                raise TypeError("interaction_started_event must be an Event.")
+            object.__setattr__(
+                self,
+                "interaction_started_event",
+                copy_event(self.interaction_started_event),
+            )
+        if (
+            self.model_transition is not None
+            and type(self.model_transition) is not SessionModelTransition
+        ):
+            raise TypeError("model_transition must be a SessionModelTransition.")
+        if (
+            self.execution_profile_decision is not None
+            and type(self.execution_profile_decision) is not ExecutionProfileDecision
+        ):
+            raise TypeError("execution_profile_decision must be an ExecutionProfileDecision.")
+        if self.execution_profile_decision is not None:
+            object.__setattr__(
+                self,
+                "execution_profile_decision",
+                copy_execution_profile_decision(self.execution_profile_decision),
+            )
+        if (
+            self.expected_active_invocation_profile is not None
+            and type(self.expected_active_invocation_profile)
+            is not ActiveInvocationExecutionProfile
+        ):
+            raise TypeError(
+                "expected_active_invocation_profile must be an ActiveInvocationExecutionProfile."
+            )
+        if self.expected_active_invocation_profile is not None:
+            object.__setattr__(
+                self,
+                "expected_active_invocation_profile",
+                ActiveInvocationExecutionProfile.model_validate(
+                    self.expected_active_invocation_profile.model_dump(mode="json")
+                ),
+            )
+        starts_interaction = self.interaction_started_event is not None
+        continues_interaction = self.continued_interaction_id is not None
+        if starts_interaction == continues_interaction:
+            raise ValueError(
+                "Invocation admission requires exactly one new or continued interaction."
+            )
+        if starts_interaction:
+            if self.expected_active_invocation_profile is not None:
+                raise ValueError(
+                    "A new interaction cannot reuse active invocation profile authority."
+                )
+            if (
+                self.allow_unprofiled_derived_session
+                and self.execution_profile_decision is not None
+            ):
+                raise ValueError(
+                    "An unprofiled derived session cannot carry an execution-profile decision."
+                )
+            if self.defer_interaction_source:
+                raise ValueError("A new interaction cannot defer its source messages.")
+            return
+        if self.allow_unprofiled_derived_session:
+            raise ValueError(
+                "Only a new invocation can establish authority for an unprofiled derived session."
+            )
+        if self.expected_active_invocation_profile is None:
+            raise ValueError(
+                "A continued interaction requires active invocation profile authority."
+            )
+        if self.execution_profile_decision is not None:
+            raise ValueError("A continued interaction cannot adopt an execution profile.")
+        if self.model_transition is not None:
+            raise ValueError("A continued interaction cannot change its model target.")
+        if not self.defer_interaction_source:
+            raise ValueError("A continued interaction must defer its source messages.")
+        continued_interaction_id = self.continued_interaction_id
+        if continued_interaction_id is None:
+            raise AssertionError("Continued invocation admission lost its interaction identity.")
+        continued_interaction_id = require_clean_nonblank(
+            continued_interaction_id,
+            "continued_interaction_id",
+        )
+        active_profile = self.expected_active_invocation_profile
+        if active_profile.interaction_id != continued_interaction_id:
+            raise ValueError(
+                "Continued interaction identity conflicts with active profile authority."
+            )
+        if active_profile.profile != self.execution_profile:
+            raise ValueError("Continued execution profile conflicts with active profile authority.")
 
 
 def _validate_checkpoint_codec_pair(
@@ -4514,6 +4659,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     SKIPPED_ACTIVE = "skipped_active"
     SKIPPED_TERMINAL = "skipped_terminal"
     SKIPPED_UNREGISTERED_AGENT = "skipped_unregistered_agent"
+    REPAIRED_TERMINAL_OWNERSHIP = "repaired_terminal_ownership"
     REPAIRED_TERMINAL_EVIDENCE = "repaired_terminal_evidence"
     PENDING_APPROVAL = "pending_approval"
     PENDING_USER_INPUT = "pending_user_input"
@@ -5853,6 +5999,7 @@ class SessionStore(ABC):
     supports_terminal_session_evidence: ClassVar[bool] = False
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
     supports_execution_profile_admission: ClassVar[bool] = False
+    supports_active_invocation_execution_profiles: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @property
@@ -6053,6 +6200,113 @@ class SessionStore(ABC):
             execution_profile_decision=execution_profile_decision,
         )
 
+    async def admit_session_invocation(
+        self,
+        session_id: str,
+        *,
+        admission: SessionInvocationAdmission,
+    ) -> Session:
+        """Atomically claim one valid profiled invocation and its interaction."""
+
+        if not self._supports_active_invocation_execution_profile_protocol():
+            raise NotImplementedError(
+                "This SessionStore does not support atomic active-invocation execution profiles."
+            )
+        if not self.supports_execution_profile_admission:
+            raise NotImplementedError(
+                "This SessionStore does not support atomic execution-profile admission."
+            )
+        if type(admission) is not SessionInvocationAdmission:
+            raise TypeError("admission must be a SessionInvocationAdmission.")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        active_profile = admission.expected_active_invocation_profile
+        if active_profile is not None and active_profile.session_id != session_id:
+            raise ValueError("Active invocation profile belongs to another session.")
+        interaction_id = (
+            admission.continued_interaction_id
+            if admission.interaction_started_event is None
+            else admission.interaction_started_event.interaction_id
+        )
+        if interaction_id is None:
+            raise ValueError("Invocation admission has no interaction identity.")
+
+        def bind_active_invocation_profile(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if admission.allow_unprofiled_derived_session and (
+                current_session.parent_session_id is None
+                or EXECUTION_PROFILE_METADATA_KEY in current_session.metadata
+            ):
+                raise RuntimeError(
+                    "Unprofiled derived-session invocation authority changed before admission."
+                )
+            current_active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if current_active_profile is not None and not (
+                active_invocation_execution_profile_is_released(
+                    current_active_profile,
+                    session_id=current_session.id,
+                    run_epoch=current_session.run_epoch,
+                )
+            ):
+                raise SessionRunFenced(
+                    "The previous invocation still owns terminal hooks or trailing cleanup."
+                )
+            updated = admission.checkpoint_transform(current_session, checkpoint)
+            return checkpoint_with_active_invocation_execution_profile(
+                updated,
+                session_id=current_session.id,
+                interaction_id=interaction_id,
+                run_epoch=current_session.run_epoch + 1,
+                profile=admission.execution_profile,
+                expected=active_profile,
+            )
+
+        transition_kwargs: dict[str, Any] = {
+            "from_statuses": set(admission.from_statuses),
+            "to_status": SessionStatus.RUNNING,
+            "checkpoint_transform": bind_active_invocation_profile,
+            "interaction_started_event": admission.interaction_started_event,
+            "interaction_source_messages": list(admission.interaction_source_messages),
+            "continued_interaction_id": admission.continued_interaction_id,
+            "defer_interaction_source": admission.defer_interaction_source,
+            "model_transition": admission.model_transition,
+            "execution_profile_decision": admission.execution_profile_decision,
+        }
+        if active_profile is None:
+            if admission.allow_unprofiled_derived_session:
+                return await self.transition_status_and_checkpoint(
+                    session_id,
+                    **transition_kwargs,
+                )
+            return await self.admit_execution_profile_resume(
+                session_id,
+                execution_profile=admission.execution_profile,
+                **transition_kwargs,
+            )
+        return await self.transition_status_and_checkpoint(
+            session_id,
+            **transition_kwargs,
+        )
+
+    def _supports_active_invocation_execution_profile_protocol(self) -> bool:
+        """Return whether the advertised capability covers the active store methods."""
+
+        capability_owner_index = next(
+            index
+            for index, owner in enumerate(type(self).__mro__)
+            if "supports_active_invocation_execution_profiles" in owner.__dict__
+        )
+        rejection_owner_index = next(
+            index
+            for index, owner in enumerate(type(self).__mro__)
+            if "reject_execution_profile_resume" in owner.__dict__
+        )
+        return (
+            self.supports_active_invocation_execution_profiles is True
+            and capability_owner_index <= rejection_owner_index
+        )
+
     async def reject_execution_profile_resume(
         self,
         session_id: str,
@@ -6063,11 +6317,45 @@ class SessionStore(ABC):
         candidate_profile: ExecutionProfileIdentity,
         event: Event,
         decision: ExecutionProfileDecision | None = None,
+        expected_active_invocation_profile_authority: CheckpointValueAuthority | None = None,
     ) -> ExecutionProfileRejectionResult:
         """Atomically reject a changed resume profile without admitting work."""
 
         raise NotImplementedError(
             "This SessionStore does not support atomic execution-profile rejection."
+        )
+
+    async def reject_active_invocation_execution_profile(
+        self,
+        session_id: str,
+        *,
+        expected_statuses: set[SessionStatus],
+        expected_run_epoch: int,
+        expected_active_invocation_profile: ActiveInvocationExecutionProfile,
+        candidate_profile: ExecutionProfileIdentity,
+        event: Event,
+        decision: ExecutionProfileDecision | None = None,
+    ) -> ExecutionProfileRejectionResult:
+        """Atomically compare checkpoint authority and reject changed continuation."""
+
+        if not self._supports_active_invocation_execution_profile_protocol():
+            raise NotImplementedError(
+                "This SessionStore does not support atomic active-invocation "
+                "execution-profile rejection."
+            )
+        expected_authority = checkpoint_value_authority(
+            expected_active_invocation_profile.model_dump(mode="json"),
+            "expected_active_invocation_execution_profile",
+        )
+        return await self.reject_execution_profile_resume(
+            session_id,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_profile=expected_active_invocation_profile.profile,
+            candidate_profile=candidate_profile,
+            event=event,
+            decision=decision,
+            expected_active_invocation_profile_authority=expected_authority,
         )
 
     @abstractmethod
@@ -7307,6 +7595,7 @@ class InMemorySessionStore(SessionStore):
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
+    supports_active_invocation_execution_profiles: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
@@ -8293,6 +8582,7 @@ class InMemorySessionStore(SessionStore):
         candidate_profile: ExecutionProfileIdentity,
         event: Event,
         decision: ExecutionProfileDecision | None = None,
+        expected_active_invocation_profile_authority: CheckpointValueAuthority | None = None,
     ) -> ExecutionProfileRejectionResult:
         (
             session_id,
@@ -8316,10 +8606,14 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _validate_execution_profile_rejection_session(
                 session,
+                checkpoint=self._checkpoints.get(session_id),
                 expected_statuses=statuses,
                 expected_run_epoch=expected_run_epoch,
                 expected_profile=expected_profile,
                 event=copied_event,
+                expected_active_invocation_profile_authority=(
+                    expected_active_invocation_profile_authority
+                ),
             )
             for existing in self._events.get(session_id, []):
                 if existing.id != copied_event.id:
@@ -12946,10 +13240,12 @@ def _prepare_execution_profile_rejection(
 def _validate_execution_profile_rejection_session(
     session: Session,
     *,
+    checkpoint: dict[str, Any] | None,
     expected_statuses: set[SessionStatus],
     expected_run_epoch: int,
     expected_profile: ExecutionProfileIdentity,
     event: Event,
+    expected_active_invocation_profile_authority: CheckpointValueAuthority | None = None,
 ) -> None:
     if session.status not in expected_statuses:
         raise SessionStatusConflict(
@@ -12960,9 +13256,24 @@ def _validate_execution_profile_rejection_session(
             f"Session run epoch changed before profile rejection: expected "
             f"{expected_run_epoch}, current {session.run_epoch}."
         )
-    current_profile = execution_profile_from_session_metadata(session.metadata)
-    if current_profile != expected_profile:
-        raise RuntimeError("Session execution-profile expectation changed concurrently.")
+    if expected_active_invocation_profile_authority is None:
+        current_profile = execution_profile_from_session_metadata(session.metadata)
+        if current_profile != expected_profile:
+            raise RuntimeError("Session execution-profile expectation changed concurrently.")
+    else:
+        if type(expected_active_invocation_profile_authority) is not CheckpointValueAuthority:
+            raise TypeError(
+                "expected_active_invocation_profile_authority must be a CheckpointValueAuthority."
+            )
+        current_active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if current_active_profile is None or current_active_profile.profile != expected_profile:
+            raise RuntimeError("Active invocation execution profile changed concurrently.")
+        current_authority = checkpoint_value_authority(
+            current_active_profile.model_dump(mode="json"),
+            "active_invocation_execution_profile",
+        )
+        if current_authority != expected_active_invocation_profile_authority:
+            raise RuntimeError("Active invocation execution profile changed concurrently.")
     if event.agent_name != session.agent_name or event.environment_name != session.environment_name:
         raise ValueError("Execution-profile rejection event does not match session authority.")
 
@@ -14570,12 +14881,11 @@ def _validate_assistant_model_completion_publication(
             raise ValueError(
                 "The model-step publication pointer has an unsupported schema version."
             )
-        if schema_operation is not None and schema_operation.value != raw_pointer_schema_version:
-            raise ValueError(
-                "The model-step publication pointer schema conflicts with its root schema."
-            )
+        root_schema_version = (
+            raw_pointer_schema_version if schema_operation is None else schema_operation.value
+        )
         staged_checkpoint = {
-            CHECKPOINT_SCHEMA_VERSION_KEY: raw_pointer_schema_version,
+            CHECKPOINT_SCHEMA_VERSION_KEY: root_schema_version,
             LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY: pointer_operation.value,
         }
         if type(pending_marker) is dict:
@@ -14630,6 +14940,7 @@ def _validate_assistant_model_completion_publication(
         "agent_name",
         "environment_name",
         "task_id",
+        "execution_profile_fingerprint",
         "tool_calls",
         "policy_state",
         "policy_context_version",

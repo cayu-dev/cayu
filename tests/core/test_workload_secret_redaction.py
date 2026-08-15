@@ -19,6 +19,7 @@ from tests.core._workload_secret_support import (
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._invocation_secrets as invocation_secrets_module
+import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.sessions as sessions_module
 from cayu import (
     InMemoryKnowledgeStore,
@@ -74,8 +75,24 @@ from cayu.runtime import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
-from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
+
+
+def checkpoint_without_active_invocation_profile(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any]:
+    assert checkpoint is not None
+    assert (
+        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
+        is not None
+    )
+    copied = dict(checkpoint)
+    copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    return copied
 
 
 def _assert_cayu_traceback_does_not_retain_text(error: BaseException, text: str) -> None:
@@ -165,8 +182,10 @@ def test_runtime_managed_context_rejects_secret_checkpoint_before_publication(
     )
 
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint("secret_context_checkpoint")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("secret_context_checkpoint"))
+    ) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
     }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
@@ -251,9 +270,9 @@ def test_runtime_managed_context_rejects_secret_checkpoint_event_payload_before_
     )
 
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint(f"secret_context_event_{secret_location}")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2
-    }
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint(f"secret_context_event_{secret_location}"))
+    ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
     assert events[-1].type is EventType.SESSION_FAILED
@@ -313,8 +332,10 @@ def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure()
     )
 
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint("secret_context_failure_checkpoint")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("secret_context_failure_checkpoint"))
+    ) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
     }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
@@ -3545,7 +3566,7 @@ def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
     child_checkpoint = asyncio.run(scenario())
 
     assert child_checkpoint == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "safe_state": {"value": "copied"},
     }
     assert secret not in repr(child_checkpoint)
@@ -4819,6 +4840,25 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
             }
         },
         redactor=SecretRedactor("status"),
+    )
+
+
+def test_active_invocation_profile_unknown_extension_remains_secret_scanned() -> None:
+    from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+    from cayu.vaults import SecretRedactor
+
+    secret = "active-profile-extension-secret"
+    checkpoint = {
+        execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY: {
+            "unknown_extension": {
+                "session_id": secret,
+            }
+        }
+    }
+
+    assert durable_value_contains_secret(
+        checkpoint,
+        redactor=SecretRedactor(secret),
     )
 
 

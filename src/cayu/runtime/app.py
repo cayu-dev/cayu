@@ -188,7 +188,11 @@ from cayu.runtime.event_watchers import (
     event_watcher_error_payload,
     run_event_watcher_handler,
 )
-from cayu.runtime.execution_profiles import ExecutionProfilePolicy
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileIdentity,
+    ExecutionProfilePolicy,
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookPhase,
@@ -721,6 +725,16 @@ class CayuApp:
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_provider=self._get_registered_provider,
             resolve_registered_environment=self._get_registered_environment_for_session,
+            validate_execution_profile_continuation=(
+                lambda session, checkpoint, registered_agent, registered_provider: (
+                    self._session_engine.validate_execution_profile_continuation(
+                        session=session,
+                        checkpoint=checkpoint,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                    )
+                )
+            ),
             interrupt_session_for_recovery=self._interrupt_session_for_recovery,
             pending_session_interrupt_checkpoint=(
                 self._pending_session_interrupt_checkpoint_for_recovery
@@ -2603,15 +2617,28 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
-    def _run_recovery_session(
+    async def _run_recovery_session(
         self,
         request: RecoverySessionRunRequest,
     ) -> AsyncGenerator[Event, None]:
-        return self._run_session(
+        checkpoint = await self._runtime_session_store.load_checkpoint(request.session.id)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        expected_profile = request.active_invocation_profile
+        if (
+            active_profile != expected_profile
+            or expected_profile.session_id != request.session.id
+            or expected_profile.run_epoch != request.session.run_epoch
+        ):
+            raise RuntimeError(
+                "Recovery run does not reference the active invocation execution profile."
+            )
+        execution_profile = expected_profile.profile
+        stream = self._run_session(
             session=request.session,
             registered_agent=request.registered_agent,
             registered_provider=request.registered_provider,
             registered_environment=request.registered_environment,
+            execution_profile=execution_profile,
             messages=request.messages,
             messages_to_append=request.messages_to_append,
             max_steps=request.max_steps,
@@ -2631,6 +2658,9 @@ class CayuApp:
             deliver_queued_input_before_first_step=False,
             run_limit_accounting=request.run_limit_accounting,
         )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
 
     def _emit_recovery_terminal_event_with_hooks(
         self,
@@ -2642,6 +2672,7 @@ class CayuApp:
             session=request.session,
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
         )
 
     def _stop_recovery_session_for_limit_reached(
@@ -2663,6 +2694,7 @@ class CayuApp:
             deferred_messages=request.deferred_messages,
             requested_approval_decision=request.requested_approval_decision,
             approval_resolution_request_digest=request.approval_resolution_request_digest,
+            execution_profile=request.execution_profile,
         )
 
     def _interrupt_session_for_recovery(
@@ -2674,6 +2706,7 @@ class CayuApp:
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             environment_name=request.environment_name,
+            execution_profile=request.execution_profile,
         )
 
     def _pending_session_interrupt_checkpoint_for_recovery(
@@ -2696,6 +2729,7 @@ class CayuApp:
             registered_environment=request.registered_environment,
             environment_name=request.environment_name,
             to_status=SessionStatus.INTERRUPTED,
+            execution_profile=request.execution_profile,
         )
         if request.run_started_at is not None and request.usage_tracker is not None:
             await self._emit_turn_completed_once(
@@ -2962,6 +2996,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None,
         messages: list[Message],
         messages_to_append: list[Message],
         max_steps: int,
@@ -2986,6 +3021,7 @@ class CayuApp:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            execution_profile=execution_profile,
             messages=messages,
             messages_to_append=messages_to_append,
             max_steps=max_steps,
@@ -3090,6 +3126,7 @@ class CayuApp:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncIterator[Event]:
         # This adapter is owned by RecoveryCoordinator, not SessionEngine._run_session,
         # so its terminal transition must consume the sibling cancellation handoff.
@@ -3111,6 +3148,7 @@ class CayuApp:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
             reconcile_transition_cancellation=True,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -3199,6 +3237,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -3208,6 +3247,7 @@ class CayuApp:
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             environment_name=environment_name,
+            execution_profile=execution_profile,
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
@@ -3303,6 +3343,7 @@ class CayuApp:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncIterator[Event]:
         stream = self._session_engine._emit_terminal_event_with_hooks(
             event=event,
@@ -3310,6 +3351,7 @@ class CayuApp:
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+            execution_profile=execution_profile,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

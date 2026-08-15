@@ -39,6 +39,7 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -46,18 +47,25 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
-from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileIdentity,
+    build_execution_profile_identity,
+    checkpoint_with_active_invocation_execution_profile,
+)
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.sessions import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
-    RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     RuntimePublicationRequest,
     runtime_publication_checkpoint_mutation,
-    runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.user_input import PendingUserInput
+from cayu.tools import UserInputTool
 
 
 class _RecordingProvider(ModelProvider):
@@ -77,7 +85,7 @@ class _RecordingProvider(ModelProvider):
 
 
 class _LegacyTerminalModelCompletionMixin:
-    """Persist terminal model material exactly as a v1 checkpoint writer did."""
+    """Persist terminal model material in its legacy v1 nested schema."""
 
     async def complete_model_completion_stage(
         self,
@@ -103,21 +111,6 @@ class _LegacyTerminalModelCompletionMixin:
                 legacy_value.pop("quarantined_assistant_message", None)
                 legacy_value.pop("assistant_publication", None)
             operations.append(operation.model_copy(update={"value": legacy_value}, deep=True))
-        operations.append(
-            RuntimePublicationCheckpointOperation(
-                key=CHECKPOINT_SCHEMA_VERSION_KEY,
-                expected_value_digest=runtime_publication_checkpoint_value_digest(1),
-                action="set",
-                value=1,
-            )
-        )
-
-        def install_v1_root(_session, checkpoint):
-            copied = {} if checkpoint is None else dict(checkpoint)
-            copied[CHECKPOINT_SCHEMA_VERSION_KEY] = 1
-            return copied
-
-        await super().transform_checkpoint(session_id, install_v1_root)
         return await super().complete_model_completion_stage(
             session_id,
             stage_id=stage_id,
@@ -165,6 +158,39 @@ class _NeverExecutedTool(Tool):
         del ctx, args
         self.calls += 1
         return ToolResult(content="must not execute during recovery")
+
+
+def _test_execution_profile(
+    *,
+    provider_name: str,
+    tool_name: str | None = None,
+) -> ExecutionProfileIdentity:
+    tool_spec = None
+    if tool_name == _NeverExecutedTool.spec.name:
+        tool_spec = _NeverExecutedTool.spec
+    elif tool_name == UserInputTool.spec.name:
+        tool_spec = UserInputTool.spec
+    elif tool_name is not None:
+        raise ValueError(f"Unsupported test tool: {tool_name}")
+    direct_tools = []
+    if tool_spec is not None:
+        direct_tools.append(
+            {
+                "name": tool_spec.name,
+                "description": tool_spec.description,
+                "schema": tool_spec.input_schema,
+                "parallel_safe": tool_spec.parallel_safe,
+                "effect": tool_spec.effect.value,
+            }
+        )
+    return build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version=session_engine._runtime_version(),
+        provider_name=provider_name,
+        model="fake-model",
+        durable_system_prompt=None,
+        direct_tools=direct_tools,
+    )
 
 
 class _PromotionAcknowledgementLostStore(InMemorySessionStore):
@@ -346,6 +372,27 @@ async def _stage_completed_model_boundary(
             started_at=started_at,
         ).model_dump(mode="json"),
     )
+    execution_profile = _test_execution_profile(
+        provider_name=provider_name,
+        tool_name=tool_name if with_tool_call else None,
+    )
+
+    def freeze_initial_invocation_profile(
+        current_session: Session,
+        checkpoint: dict | None,
+    ) -> dict:
+        return checkpoint_with_active_invocation_execution_profile(
+            (
+                {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
+                if checkpoint is None
+                else checkpoint
+            ),
+            session_id=current_session.id,
+            interaction_id=interaction_id,
+            run_epoch=current_session.run_epoch,
+            profile=execution_profile,
+        )
+
     created = await store.create(
         RunRequest(
             agent_name="assistant",
@@ -355,9 +402,11 @@ async def _stage_completed_model_boundary(
         identity=SessionIdentity(
             provider_name=provider_name,
             model="fake-model",
+            execution_profile=execution_profile,
         ),
         interaction_started_event=started_event,
         interaction_source_messages=[user_message],
+        checkpoint_transform=freeze_initial_invocation_profile,
     )
     await store.replace_initial_transcript_messages(
         created.id,
@@ -383,6 +432,9 @@ async def _stage_completed_model_boundary(
         "requested_model": "fake-model",
         "source_transcript_cursor": source_cursor,
         "request_fingerprint": "0" * 64,
+        "recovery_context": ModelCompletionRecoveryContext(
+            execution_profile_fingerprint=execution_profile.fingerprint,
+        ).model_dump(mode="json"),
     }
     await store.prepare_model_completion_stage(
         session_id,
@@ -400,7 +452,9 @@ async def _stage_completed_model_boundary(
     )
 
     tool_round_id: str | None = None
-    target_checkpoint: dict = {}
+    source_checkpoint = await store.load_checkpoint(session_id)
+    assert source_checkpoint is not None
+    target_checkpoint = dict(source_checkpoint)
     if with_tool_call:
         if not 1 <= tool_call_count <= 256:
             raise ValueError("tool_call_count must be between 1 and 256.")
@@ -438,7 +492,7 @@ async def _stage_completed_model_boundary(
         )
         tool_round_id = tool_round_identity.tool_round_id
         target_checkpoint, _pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
-            None,
+            source_checkpoint,
             agent_name="assistant",
             environment_name=None,
             task_id=None,
@@ -500,7 +554,10 @@ async def _stage_completed_model_boundary(
         kind="model-step",
         interaction_id=interaction_id,
         intent=intent,
-        mutation=runtime_publication_checkpoint_mutation(None, target_checkpoint),
+        mutation=runtime_publication_checkpoint_mutation(
+            source_checkpoint,
+            target_checkpoint,
+        ),
         transcript_messages=(assistant_message,),
         events=(completion_event,),
     )
@@ -566,7 +623,7 @@ def test_current_worker_promotes_v1_terminal_model_completion(
         ]
         checkpoint = await app._runtime_session_store.load_checkpoint(staged.session.id)
         assert checkpoint is not None
-        assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+        assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
         pointer = checkpoint[
             model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY
         ]
@@ -591,7 +648,37 @@ async def _stage_in_flight_model_boundary(
     provider_name: str,
 ) -> tuple[Session, Message, ModelCompletionStage]:
     user_message = Message.text("user", "do not dispatch twice")
-    await store.create(
+    interaction_id = f"interaction-{session_id}"
+    started_event_id = f"{session_id}:interaction-started"
+    started_at = datetime.now(UTC)
+    started_event = Event(
+        id=started_event_id,
+        type=EventType.INTERACTION_STARTED,
+        session_id=session_id,
+        interaction_id=interaction_id,
+        timestamp=started_at,
+        agent_name="assistant",
+        payload=InteractionSummaryEvidence(
+            status=InteractionStatus.ACTIVE,
+            start_event_id=started_event_id,
+            started_at=started_at,
+        ).model_dump(mode="json"),
+    )
+    execution_profile = _test_execution_profile(provider_name=provider_name)
+
+    def freeze_active_invocation_profile(
+        current_session: Session,
+        checkpoint: dict | None,
+    ) -> dict:
+        return checkpoint_with_active_invocation_execution_profile(
+            checkpoint,
+            session_id=current_session.id,
+            interaction_id=interaction_id,
+            run_epoch=current_session.run_epoch,
+            profile=execution_profile,
+        )
+
+    running = await store.create(
         RunRequest(
             agent_name="assistant",
             session_id=session_id,
@@ -600,13 +687,17 @@ async def _stage_in_flight_model_boundary(
         identity=SessionIdentity(
             provider_name=provider_name,
             model="fake-model",
+            execution_profile=execution_profile,
         ),
+        interaction_started_event=started_event,
+        interaction_source_messages=[user_message],
+        checkpoint_transform=freeze_active_invocation_profile,
     )
-    await store.append_transcript_messages(session_id, [user_message])
-    running = await store.transition_status(
-        session_id,
-        from_statuses={SessionStatus.PENDING},
-        to_status=SessionStatus.RUNNING,
+    await store.replace_initial_transcript_messages(
+        running.id,
+        [user_message],
+        [user_message],
+        interaction_id=interaction_id,
     )
     logical_step_id = f"mstep_{'4' * 32}"
     prepared = await store.prepare_model_completion_stage(
@@ -623,6 +714,9 @@ async def _stage_in_flight_model_boundary(
                 "requested_model": "fake-model",
                 "source_transcript_cursor": 1,
                 "request_fingerprint": "1" * 64,
+                "recovery_context": ModelCompletionRecoveryContext(
+                    execution_profile_fingerprint=execution_profile.fingerprint,
+                ).model_dump(mode="json"),
             },
             reservation_ids=("reservation:ambiguous-dispatch",),
         ),

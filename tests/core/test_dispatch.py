@@ -7,6 +7,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
 import pytest
+from tests.core._execution_profile_fixtures import (
+    checkpoint_with_rebound_test_invocation_profile,
+    runtime_interaction_started_event,
+)
 
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -500,11 +504,26 @@ def test_conflict_after_worker_crash_recovers_stalled_session_and_reruns() -> No
     _create_resumable_session(h.app, "sess_crash")
     handle = asyncio.run(h.app.dispatch(_dispatch_request("sess_crash", "d_crash")))
     # Simulate the crash: the session is stuck RUNNING with no live run anywhere.
+    interaction_id = "interaction_dispatch_worker_crash"
     asyncio.run(
-        h.store.transition_status(
+        h.store.transition_status_and_checkpoint(
             "sess_crash",
             from_statuses={SessionStatus.COMPLETED},
             to_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda session, checkpoint: (
+                checkpoint_with_rebound_test_invocation_profile(
+                    session,
+                    checkpoint,
+                    interaction_id=interaction_id,
+                )
+            ),
+            interaction_started_event=runtime_interaction_started_event(
+                h.app,
+                session_id="sess_crash",
+                interaction_id=interaction_id,
+                agent_name="assistant",
+            ),
+            interaction_source_messages=[],
         )
     )
 

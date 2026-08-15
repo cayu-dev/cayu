@@ -37,6 +37,7 @@ from cayu.runtime.approvals import (
     copy_distinct_pending_tool_call_approvals,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import Session, SessionStatus
@@ -75,6 +76,12 @@ class PendingToolRound(BaseModel):
     agent_name: str
     environment_name: str | None = None
     task_id: str | None = None
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     tool_calls: list[PendingToolCallApproval]
     policy_state: Literal["unplanned", "planned"] = "unplanned"
     policy_context_version: Literal[1] | None = None
@@ -760,6 +767,7 @@ def checkpoint_with_pending_tool_round(
         raise RuntimeError("Session already has a pending tool round.")
 
     identity = copy_tool_round_identity(tool_round_identity)
+    active_profile = active_invocation_execution_profile_from_checkpoint(copied_checkpoint)
     durable_request_metadata = (
         {} if request_metadata is None else resolved_redactor.redact_json_values(request_metadata)
     )
@@ -788,6 +796,9 @@ def checkpoint_with_pending_tool_round(
         agent_name=agent_name,
         environment_name=environment_name,
         task_id=task_id,
+        execution_profile_fingerprint=(
+            None if active_profile is None else active_profile.profile.fingerprint
+        ),
         tool_calls=pending_tool_call_records(
             tool_calls=tool_calls,
             policy_outcomes=policy_outcomes,

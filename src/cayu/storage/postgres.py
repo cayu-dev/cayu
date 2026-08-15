@@ -46,6 +46,7 @@ from cayu._validation import (
 from cayu.core.billing import BillingIdentity, copy_billing_identity
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import Message, MessageRole
+from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.embeddings import (
     TextEmbeddingProvider,
@@ -6268,6 +6269,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
+    supports_active_invocation_execution_profiles: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -7810,6 +7812,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         candidate_profile: ExecutionProfileIdentity,
         event: Event,
         decision: ExecutionProfileDecision | None = None,
+        expected_active_invocation_profile_authority: CheckpointValueAuthority | None = None,
     ) -> ExecutionProfileRejectionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -7838,10 +7841,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
                     _validate_execution_profile_rejection_session(
                         session,
+                        checkpoint=await self._load_checkpoint(cur, session_id),
                         expected_statuses=statuses,
                         expected_run_epoch=expected_run_epoch,
                         expected_profile=expected_profile,
                         event=copied_event,
+                        expected_active_invocation_profile_authority=(
+                            expected_active_invocation_profile_authority
+                        ),
                     )
                     await cur.execute(
                         "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",

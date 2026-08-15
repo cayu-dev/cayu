@@ -40,6 +40,7 @@ from cayu.runtime import (
     UsageRollupQuery,
 )
 from cayu.runtime.aggregates import AggregateUsageMetrics
+from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
 from cayu.runtime.sessions import (
     BudgetReservationIdentityConflict,
     ModelCompletionStageRequest,
@@ -1546,7 +1547,7 @@ def test_sqlite_session_store_persists_forked_session_state(tmp_path):
         ]
         checkpoint = await reopened.load_checkpoint("sess_sqlite_fork_child")
         assert checkpoint == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+            CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
             "context_compaction": {},
         }
         children = (

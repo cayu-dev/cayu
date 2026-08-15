@@ -88,6 +88,7 @@ from cayu.providers import (
 )
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _model_target as model_target
@@ -148,6 +149,7 @@ from cayu.runtime._model_step_executor import (
     _model_request_messages,
     _model_request_tools,
     _session_agent_spec,
+    model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired,
@@ -226,6 +228,10 @@ from cayu.runtime.budgets import (
     has_deferred_contextual_price,
     request_budget_limits_for_session,
 )
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
 from cayu.runtime.context import (
     _COMPACTION_ATTEMPT_ID_KEY,
     CheckpointCompactionContextPolicy,
@@ -259,7 +265,9 @@ from cayu.runtime.errors import (
     _runtime_interaction_lifecycle_publication_rejected,
 )
 from cayu.runtime.execution_profiles import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAdoptionRejected,
     ExecutionProfileAuthorityDecision,
@@ -274,12 +282,16 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyError,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
-    build_execution_profile_identity,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
     changed_execution_profile_components,
+    checkpoint_with_active_invocation_execution_profile,
     copy_execution_profile_policy_result,
     execution_profile_decision_payload,
     execution_profile_from_session_metadata,
     execution_profile_with_component,
+    execution_profile_with_durable_system_projection_digest,
     unavailable_execution_profile_components,
 )
 from cayu.runtime.execution_units import (
@@ -352,6 +364,7 @@ from cayu.runtime.sessions import (
     ForkSessionRequest,
     ForkSystemPromptPolicy,
     ForkSystemPromptReplacement,
+    IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryPage,
@@ -368,6 +381,7 @@ from cayu.runtime.sessions import (
     SessionForkActiveModelStageConflict,
     SessionForkSourceNotFound,
     SessionIdentity,
+    SessionInvocationAdmission,
     SessionMessageDeliveryBatch,
     SessionModelTransition,
     SessionOperationPublication,
@@ -2577,24 +2591,13 @@ def _execution_profile_identity(
     model: str,
     durable_system_prompt: str | None,
 ) -> ExecutionProfileIdentity:
-    runtime_version = _runtime_version()
-    direct_tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "schema": tool.schema,
-            "parallel_safe": tool.parallel_safe,
-            "effect": tool.effect.value,
-        }
-        for tool in registered_agent.tools.values()
-    ]
-    return build_execution_profile_identity(
-        runtime_name="cayu",
-        runtime_version=runtime_version,
+    return execution_profile_admission.resolve_execution_profile_identity(
+        registered_agent=registered_agent,
         provider_name=provider_name,
         model=model,
         durable_system_prompt=durable_system_prompt,
-        direct_tools=direct_tools,
+        runtime_name="cayu",
+        runtime_version=_runtime_version(),
     )
 
 
@@ -2846,8 +2849,27 @@ def _checkpoint_with_pending_session_interrupt(
         datetime.now(UTC) if cascade_created_at is None else cascade_created_at.astimezone(UTC)
     )
 
-    def transform(_session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+    def transform(session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
         copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        active_profile = active_invocation_execution_profile_from_checkpoint(copied_checkpoint)
+        if active_profile is not None:
+            if not active_invocation_execution_profile_matches_session_epoch(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            ):
+                raise RuntimeError(
+                    "Active invocation execution profile does not match the interrupted "
+                    "session run epoch."
+                )
+            copied_checkpoint = checkpoint_with_active_invocation_execution_profile(
+                copied_checkpoint,
+                session_id=session.id,
+                interaction_id=active_profile.interaction_id,
+                run_epoch=session.run_epoch,
+                profile=active_profile.profile,
+                expected=active_profile,
+            )
         copied_checkpoint[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY] = copy_json_value(
             copied_payload,
             "interrupt_payload",
@@ -2887,7 +2909,12 @@ def _replace_checkpoint_preserving_runtime_state(
 
     def transform(_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
         updated = copy_json_value(replacement, "checkpoint")
+        updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
         for key, field_name in (
+            (
+                ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                "active_invocation_execution_profile",
+            ),
             (
                 INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
                 "initial_transcript_pending",
@@ -3226,6 +3253,102 @@ class SessionEngine:
         """Consume a live raw output without making it part of durable session state."""
 
         return self._workflow_structured_output_handoff.take(session_id)
+
+    async def validate_execution_profile_continuation(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+    ) -> ActiveInvocationExecutionProfile:
+        """Resolve a recovery continuation against its durable invocation profile."""
+
+        active_model_completion = await self.session_store.load_active_model_completion_stage(
+            session.id
+        )
+        model_completion_context = (
+            None
+            if active_model_completion is None
+            else model_completion_recovery_context_from_stage(active_model_completion.stage)
+        )
+        plan = execution_profile_admission.prepare_execution_profile_continuation(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            runtime_version=_runtime_version(),
+            redactor=self._secret_redactor,
+            additional_profile_fingerprints=(
+                ()
+                if active_model_completion is None
+                else (
+                    None
+                    if model_completion_context is None
+                    else model_completion_context.execution_profile_fingerprint,
+                )
+            ),
+        )
+        snapshot = plan.snapshot
+        candidate = plan.candidate_profile
+        changed = plan.changed_component_classes
+        if not changed:
+            latest_interactions = await self.session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            if not latest_interactions or (
+                latest_interactions[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES
+            ):
+                raise RuntimeError(
+                    "Active invocation execution profile has no authoritative open interaction."
+                )
+            open_interaction_id = latest_interactions[0].event.interaction_id
+            if open_interaction_id is None:
+                raise RuntimeError("Interaction lifecycle event has no interaction identity.")
+            if snapshot.interaction_id != open_interaction_id:
+                raise RuntimeError(
+                    "Active invocation execution profile belongs to another interaction."
+                )
+            return snapshot
+
+        policy_identity = "cayu:active-invocation-profile:v1"
+        decision = _execution_profile_decision_event(
+            session=session,
+            expected_profile=snapshot.profile,
+            candidate_profile=candidate,
+            changed_component_classes=changed,
+            kind=ExecutionProfileDecisionKind.REJECTED,
+            policy_identity=policy_identity,
+            policy_reason="Active invocation profiles require exact recovery reuse.",
+            authority_decision=ExecutionProfileAuthorityDecision.NOT_REQUIRED,
+            intent=None,
+            adoption_request_fingerprint=None,
+            fallback_actor=None,
+            fallback_reason="The active invocation profile changed before continuation.",
+            clock=self._clock,
+        )
+        rejection = await self.session_store.reject_active_invocation_execution_profile(
+            session.id,
+            expected_statuses={session.status},
+            expected_run_epoch=session.run_epoch,
+            expected_active_invocation_profile=snapshot,
+            candidate_profile=candidate,
+            event=decision.event,
+            decision=decision,
+        )
+        if not rejection.replayed:
+            await self._event_writer.fan_out_persisted([rejection.event])
+        raise ExecutionProfileMismatchError(
+            session_id=session.id,
+            expected_profile_fingerprint=snapshot.profile.fingerprint,
+            candidate_profile_fingerprint=candidate.fingerprint,
+            changed_component_classes=changed,
+        )
 
     async def _classify_execution_profile(
         self,
@@ -3881,37 +4004,109 @@ class SessionEngine:
             raise RuntimeError(f"Interaction has no durable activity: {interaction_id}")
         return records[0].event.timestamp
 
+    async def _publish_durable_recovery_interaction_transition(
+        self,
+        *,
+        session: Session,
+        recovered_active_through: datetime | None,
+    ) -> tuple[Session, Event | None, bool]:
+        """Publish terminal recovery evidence without mutable runtime registrations."""
+
+        try:
+            return await self._publish_interaction_transition(
+                session=session,
+                agent_name=session.agent_name,
+                environment_name=session.environment_name,
+                to_status=session.status,
+                from_statuses={session.status},
+                recovered_active_through=recovered_active_through,
+            )
+        except asyncio.CancelledError as cancellation:
+            if _is_interaction_transition_run_fence(cancellation):
+                pop_exception_state(
+                    cancellation,
+                    _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
+                )
+                pop_exception_state(
+                    cancellation,
+                    _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
+                )
+                raise
+
+            transition_cancellation_outcome = _pop_interaction_transition_cancellation_outcome(
+                cancellation
+            )
+            if transition_cancellation_outcome is None:
+                transition_settled = False
+                interaction_transition_failures: list[dict[str, Any]] = []
+                interaction_transition: InteractionTransitionSpec | None = None
+            else:
+                (
+                    transition_settled,
+                    interaction_transition_failures,
+                    interaction_transition,
+                ) = transition_cancellation_outcome
+
+            async def reconcile_terminal_interaction() -> None:
+                if interaction_transition_failures and interaction_transition is not None:
+                    committed = await self._recovery_coordinator._record_durable_interaction_transition_cancellation(
+                        session=session,
+                        transition=interaction_transition,
+                        failures=tuple(interaction_transition_failures),
+                        agent_name=session.agent_name,
+                        environment_name=session.environment_name,
+                    )
+                    if committed:
+                        return
+                if transition_settled or _latest_session_invocation_interaction_is_settled(
+                    session.id
+                ):
+                    return
+                await self._publish_interaction_transition(
+                    session=session,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                    to_status=session.status,
+                    from_statuses={session.status},
+                    recovered_active_through=recovered_active_through,
+                )
+
+            await _run_interaction_transition_cancellation_cleanup_steps(
+                cancellation,
+                steps=(
+                    (
+                        "terminal recovery interaction reconciliation",
+                        reconcile_terminal_interaction,
+                    ),
+                ),
+            )
+            raise
+
     async def _reconcile_recovered_interaction(
         self,
         result: IncompleteSessionRecoveryResult,
         *,
         recovered_active_through: datetime | None,
     ) -> IncompleteSessionRecoveryResult:
+        if IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT in result.actions:
+            return result
         if _current_session_interaction_id(result.session_id) is None:
             return result
         session = await self.session_store.load(result.session_id)
         if session is None:
             return result
-        try:
-            registered_agent = self._get_registered_agent(session.agent_name)
-        except KeyError:
-            return result
-        registered_environment = self._get_registered_environment_for_session(
-            session.environment_name
-        )
         if result.status not in {
             SessionStatus.COMPLETED,
             SessionStatus.FAILED,
             SessionStatus.INTERRUPTED,
         }:
             return result
-        _, interaction_event, _ = await self._publish_sibling_interaction_transition(
+        # Recovery already owns a terminal durable session. Interaction summary
+        # publication needs only that session's durable authority; consulting the
+        # mutable application registry here could silently switch runtime profiles
+        # after recovery admission.
+        _, interaction_event, _ = await self._publish_durable_recovery_interaction_transition(
             session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            environment_name=_environment_name(registered_environment),
-            to_status=session.status,
-            from_statuses={session.status},
             recovered_active_through=recovered_active_through,
         )
         if interaction_event is None:
@@ -4029,7 +4224,7 @@ class SessionEngine:
         self,
         *,
         session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
+        agent_name: str,
         environment_name: str | None,
         event_type: EventType,
         status: InteractionStatus,
@@ -4198,7 +4393,7 @@ class SessionEngine:
                 session_id=session.id,
                 interaction_id=interaction_id,
                 timestamp=observed_at,
-                agent_name=registered_agent.spec.name,
+                agent_name=agent_name,
                 environment_name=environment_name,
                 payload=evidence.model_dump(mode="json"),
             ),
@@ -4246,7 +4441,7 @@ class SessionEngine:
     ) -> Event | None:
         event = await self._prepare_interaction_state_event(
             session=session,
-            registered_agent=registered_agent,
+            agent_name=registered_agent.spec.name,
             environment_name=environment_name,
             event_type=event_type,
             status=status,
@@ -4261,7 +4456,7 @@ class SessionEngine:
         self,
         *,
         session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
+        agent_name: str,
         environment_name: str | None,
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
@@ -4308,7 +4503,7 @@ class SessionEngine:
 
         event = await self._prepare_interaction_state_event(
             session=session,
-            registered_agent=registered_agent,
+            agent_name=agent_name,
             environment_name=environment_name,
             event_type=event_type,
             status=interaction_status,
@@ -4511,6 +4706,7 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
+        execution_profile: ExecutionProfileIdentity | None,
         finalize_unsettled: bool,
     ) -> None:
         """Consume transition handoff evidence outside the main run loop."""
@@ -4554,6 +4750,7 @@ class SessionEngine:
             environment_name=environment_name,
             interaction_transition_failures=tuple(interaction_transition_failures),
             interaction_transition=interaction_transition,
+            execution_profile=execution_profile,
         )
         if interaction_transition_failures and interaction_transition is not None:
             committed_transition_recorded = False
@@ -4608,6 +4805,7 @@ class SessionEngine:
         from_statuses: set[SessionStatus] | None = None,
         recovered_active_through: datetime | None = None,
         observed_at: datetime | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
         finalize_unsettled_cancellation: bool = True,
     ) -> tuple[Session, Event | None, bool]:
         """Publish from a caller not enclosed by ``_run_session`` cleanup."""
@@ -4615,7 +4813,7 @@ class SessionEngine:
         try:
             return await self._publish_interaction_transition(
                 session=session,
-                registered_agent=registered_agent,
+                agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 to_status=to_status,
                 only_if_no_queued_messages=only_if_no_queued_messages,
@@ -4630,6 +4828,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
+                execution_profile=execution_profile,
                 finalize_unsettled=finalize_unsettled_cancellation,
             )
             raise
@@ -4737,11 +4936,25 @@ class SessionEngine:
             identity=session_identity,
             interaction_started_event=interaction_started_event,
         )
+
+        def freeze_initial_invocation_profile(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            return checkpoint_with_active_invocation_execution_profile(
+                checkpoint,
+                session_id=current_session.id,
+                interaction_id=interaction_id,
+                run_epoch=current_session.run_epoch,
+                profile=execution_profile,
+            )
+
         session = await self.session_store.create(
             request,
             identity=session_identity,
             interaction_started_event=interaction_started_event,
             interaction_source_messages=request.messages,
+            checkpoint_transform=freeze_initial_invocation_profile,
         )
         _activate_session_interaction(session.id, interaction_id)
         current_task = asyncio.current_task()
@@ -4800,6 +5013,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
                 operation=EnvironmentFactoryOperation.CREATE,
+                execution_profile=execution_profile,
             )
             registered_environment = resolution.registered_environment
             for event in resolution.events:
@@ -4857,6 +5071,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
                 ):
                     yield event
                 return
@@ -4868,6 +5083,9 @@ class SessionEngine:
                         lambda: self._recovery_coordinator.finalize_abandoned_session_by_id(
                             session.id,
                             propagate_interaction_publication_rejection=True,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=execution_profile,
                         ),
                     ),
                 ),
@@ -4922,6 +5140,7 @@ class SessionEngine:
                 environment_name=_environment_name(registered_environment),
                 to_status=SessionStatus.FAILED,
                 observed_at=failure_interaction_observed_at,
+                execution_profile=execution_profile,
             )
             if interaction_failed_event is not None:
                 yield interaction_failed_event
@@ -4949,6 +5168,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             ):
                 yield event
                 async for queued_event in self._session_control.drain_out_of_band_events(
@@ -4970,6 +5190,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
                 ):
                     yield event
                 raise exc
@@ -4987,6 +5208,7 @@ class SessionEngine:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
                     ):
                         pass
                 except Exception as finalization_failure:
@@ -5004,11 +5226,17 @@ class SessionEngine:
                     await self._environment_lifecycle.abort_environment_setup(
                         session_id=session.id,
                         original_error=sys.exception(),
+                        execution_profile=execution_profile,
                     )
             finally:
                 try:
                     if release_before_run:
-                        await self.session_store.release_run_fence(session.id)
+                        await (
+                            self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                session_id=session.id,
+                                execution_profile=execution_profile,
+                            )
+                        )
                 finally:
                     try:
                         if current_task is not None and active_factory_run is not None:
@@ -5028,6 +5256,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
                 messages=messages,
                 messages_to_append=[],
                 max_steps=request.max_steps,
@@ -5065,10 +5294,14 @@ class SessionEngine:
                 await self._environment_lifecycle.abort_environment_setup(
                     session_id=session.id,
                     original_error=exc,
+                    execution_profile=execution_profile,
                 )
             finally:
                 try:
-                    await self.session_store.release_run_fence(session.id)
+                    await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                        session_id=session.id,
+                        execution_profile=execution_profile,
+                    )
                 finally:
                     _deactivate_session_interaction(session.id)
             raise
@@ -5129,6 +5362,7 @@ class SessionEngine:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
                     ):
                         yield event
                 except Exception:
@@ -5163,6 +5397,7 @@ class SessionEngine:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
                     ):
                         yield event
                 except Exception:
@@ -5182,6 +5417,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
                 ):
                     yield event
                 return
@@ -5199,6 +5435,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
+                    execution_profile=execution_profile,
                 ):
                     yield event
             raise propagated_cancellation_group
@@ -7911,7 +8148,7 @@ class SessionEngine:
         try:
             return await self._publish_interaction_transition(
                 session=session,
-                registered_agent=registered_agent,
+                agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 to_status=SessionStatus.COMPLETED,
                 only_if_no_queued_messages=True,
@@ -7937,6 +8174,7 @@ class SessionEngine:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> tuple[bool, list[Event]]:
         if step < max_steps:
             return True, await self._deliver_queued_session_messages(
@@ -7960,6 +8198,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                execution_profile=execution_profile,
             )
         ]
         return False, events
@@ -8904,6 +9143,15 @@ class SessionEngine:
         if loaded_session.status not in _INTERRUPTIBLE_SESSION_STATUSES:
             raise ValueError(f"Session cannot be interrupted from status: {loaded_session.status}")
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        try:
+            registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        except (KeyError, RuntimeError):
+            # A live run owns its already-frozen provider and can still be
+            # interrupted when the application registry has changed. If no live
+            # owner remains and durable provider work requires cancellation, the
+            # recovery boundary below fails closed instead of re-resolving the
+            # mutable registry after the interrupt transition.
+            registered_provider = None
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -8944,9 +9192,15 @@ class SessionEngine:
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
-            provider_operation_addressed = (
-                await self._recovery_coordinator.cancel_provider_operation_for_interruption(session)
+            provider_operation_profile = (
+                await self._recovery_coordinator.cancel_provider_operation_for_interruption(
+                    session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                )
             )
+            provider_operation_addressed = provider_operation_profile is not None
             if loaded_session.status == SessionStatus.RUNNING and not provider_operation_addressed:
                 existing_interrupt_event = (
                     await self._session_control.wait_for_active_interrupted_event(
@@ -8960,6 +9214,12 @@ class SessionEngine:
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
+            if provider_operation_profile is not None:
+                session = await self._recovery_coordinator.claim_provider_operation_interruption(
+                    session,
+                    provider_operation_profile,
+                    interruption_request_id=interrupt_payload["interruption_request_id"],
+                )
         except ValueError:
             reloaded_session = await self.session_store.load(loaded_session.id)
             if reloaded_session is None:
@@ -9008,6 +9268,28 @@ class SessionEngine:
                 self._session_control.end_interruption_request(loaded_session.id)
             raise
 
+        async def release_offline_provider_interruption(
+            authoritative_failure: BaseException | None,
+            *,
+            operation: str,
+        ) -> None:
+            if provider_operation_profile is None:
+                return
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=(
+                    (
+                        operation,
+                        lambda: (
+                            self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                session_id=session.id,
+                                execution_profile=provider_operation_profile.profile,
+                            )
+                        ),
+                    ),
+                ),
+            )
+
         terminal_event_stream: AsyncIterator[Event] | None = None
         try:
             (
@@ -9020,22 +9302,45 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=_environment_name(registered_environment),
                 to_status=SessionStatus.INTERRUPTED,
+                execution_profile=(
+                    None
+                    if provider_operation_profile is None
+                    else provider_operation_profile.profile
+                ),
             )
-        except BaseException:
-            if request_marker_active:
-                request_marker_active = False
-                self._session_control.end_interruption_request(loaded_session.id)
+        except BaseException as transition_failure:
+            try:
+                await release_offline_provider_interruption(
+                    transition_failure,
+                    operation="failed offline interruption run-fence release",
+                )
+            finally:
+                if request_marker_active:
+                    request_marker_active = False
+                    self._session_control.end_interruption_request(loaded_session.id)
             raise
-        payload = await self._load_pending_session_interrupt_payload(
-            session.id,
-            default={
-                "reason": request.reason,
-                "metadata": request.metadata,
-                "requested_by": resolution_actor_payload(request.requested_by),
-                "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-                "interruption_request_id": interrupt_payload["interruption_request_id"],
-            },
-        )
+        try:
+            payload = await self._load_pending_session_interrupt_payload(
+                session.id,
+                default={
+                    "reason": request.reason,
+                    "metadata": request.metadata,
+                    "requested_by": resolution_actor_payload(request.requested_by),
+                    "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+                    "interruption_request_id": interrupt_payload["interruption_request_id"],
+                },
+            )
+        except BaseException as payload_failure:
+            try:
+                await release_offline_provider_interruption(
+                    payload_failure,
+                    operation="offline interruption payload run-fence release",
+                )
+            finally:
+                if request_marker_active:
+                    request_marker_active = False
+                    self._session_control.end_interruption_request(loaded_session.id)
+            raise
         try:
             existing_interrupt_event = await self._session_control.latest_interrupted_event(
                 session.id,
@@ -9069,6 +9374,11 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=(
+                    None
+                    if provider_operation_profile is None
+                    else provider_operation_profile.profile
+                ),
             )
             terminal_prefix, interrupted_event = await _collect_through_event_type(
                 terminal_event_stream,
@@ -9087,14 +9397,27 @@ class SessionEngine:
                 yield event
             async for event in terminal_event_stream:
                 yield event
-        except Exception:
+        except BaseException as terminal_failure:
             if terminal_event_stream is not None:
-                with contextlib.suppress(Exception):
-                    await _close_async_iterator(terminal_event_stream)
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=terminal_failure,
+                    steps=(
+                        (
+                            "offline interruption terminal stream close",
+                            lambda: _close_async_iterator(terminal_event_stream),
+                        ),
+                    ),
+                )
             raise
         finally:
-            if request_marker_active:
-                self._session_control.end_interruption_request(loaded_session.id)
+            try:
+                await release_offline_provider_interruption(
+                    sys.exception(),
+                    operation="offline provider interruption run-fence release",
+                )
+            finally:
+                if request_marker_active:
+                    self._session_control.end_interruption_request(loaded_session.id)
         return
 
     async def _resume_session(
@@ -9227,6 +9550,7 @@ class SessionEngine:
                 del preflight_snapshot
 
         run_operation_id = str(uuid4())
+        continuing_execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None
 
         def validate_resumable_checkpoint(
             current_session: Session,
@@ -9335,13 +9659,42 @@ class SessionEngine:
             clock=self._clock,
         )
         validate_resumable_checkpoint(loaded_session, checkpoint)
+        active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if active_invocation_profile is not None and not (
+            active_invocation_execution_profile_is_released(
+                active_invocation_profile,
+                session_id=loaded_session.id,
+                run_epoch=loaded_session.run_epoch,
+            )
+        ):
+            raise SessionRunFenced(
+                "The previous invocation still owns terminal hooks or trailing cleanup."
+            )
         # An in-flight provider dispatch has an ambiguous external outcome and
         # must reject resume without mutating the session. Check that boundary
         # before terminal-evidence reconciliation, which may perform a fenced
         # repair and advance the durable run epoch.
-        pending_model_completion = (
-            await self._recovery_coordinator.preflight_model_completion_boundary(loaded_session)
+        active_model_completion_boundary = (
+            await self._recovery_coordinator.load_model_completion_boundary(loaded_session)
         )
+        if active_model_completion_boundary is None:
+            pending_model_completion = False
+        else:
+            continuing_execution_profile_snapshot = (
+                await self.validate_execution_profile_continuation(
+                    session=loaded_session,
+                    checkpoint=checkpoint,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                )
+            )
+            pending_model_completion = (
+                await self._recovery_coordinator.preflight_model_completion_boundary(
+                    loaded_session,
+                    registered_provider=registered_provider,
+                    active_stage=active_model_completion_boundary,
+                )
+            )
         if target_changed and pending_model_completion:
             raise RuntimeError(
                 "A session model target cannot change while model-completion recovery is pending."
@@ -9375,10 +9728,7 @@ class SessionEngine:
             raise RuntimeError(
                 "A legacy fork without a durable execution profile cannot adopt a new profile."
             )
-        if not continuing_recovery_boundary and not legacy_unprofiled_fork:
-            expected_execution_profile = execution_profile_from_session_metadata(
-                loaded_session.metadata
-            )
+        if not continuing_recovery_boundary:
             candidate_execution_profile = _execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=registered_provider.name,
@@ -9389,64 +9739,89 @@ class SessionEngine:
                 ),
                 durable_system_prompt=None,
             )
-            # A resumed session executes the already-durable system projection.
-            # The current AgentSpec prompt is not re-injected on resume.
-            candidate_execution_profile = execution_profile_with_component(
-                candidate_execution_profile,
-                expected_execution_profile.component(
-                    ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
-                ),
-            )
-            changed_profile_components = changed_execution_profile_components(
-                expected_execution_profile,
-                candidate_execution_profile,
-            )
-            execution_profile_decision = await self._classify_execution_profile(
-                session=loaded_session,
-                expected_profile=expected_execution_profile,
-                candidate_profile=candidate_execution_profile,
-                changed_component_classes=changed_profile_components,
-                intent=request.profile_adoption,
-                adoption_request_fingerprint=adoption_request_fingerprint,
-                target_changed=target_changed,
-                target_provider_name=registered_provider.name,
-                target_model=(
-                    requested_target.model
-                    if target_changed and requested_target is not None
-                    else loaded_session.model
-                ),
-            )
-            if execution_profile_decision.kind in {
-                ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
-                ExecutionProfileDecisionKind.REJECTED,
-            }:
-                rejection = await self.session_store.reject_execution_profile_resume(
-                    loaded_session.id,
-                    expected_statuses=_RESUMABLE_SESSION_STATUSES,
-                    expected_run_epoch=loaded_session.run_epoch,
+            if legacy_unprofiled_fork:
+                fork_transcript = await self.session_store.load_transcript(loaded_session.id)
+                try:
+                    candidate_execution_profile = (
+                        execution_profile_with_durable_system_projection_digest(
+                            candidate_execution_profile,
+                            system_prompt_messages_sha256(fork_transcript),
+                        )
+                    )
+                finally:
+                    fork_transcript.clear()
+            else:
+                expected_execution_profile = execution_profile_from_session_metadata(
+                    loaded_session.metadata
+                )
+                # A resumed session executes the already-durable system projection.
+                # The current AgentSpec prompt is not re-injected on resume.
+                candidate_execution_profile = execution_profile_with_component(
+                    candidate_execution_profile,
+                    expected_execution_profile.component(
+                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                    ),
+                )
+            if not legacy_unprofiled_fork:
+                changed_profile_components = changed_execution_profile_components(
+                    expected_execution_profile,
+                    candidate_execution_profile,
+                )
+                execution_profile_decision = await self._classify_execution_profile(
+                    session=loaded_session,
                     expected_profile=expected_execution_profile,
                     candidate_profile=candidate_execution_profile,
-                    event=execution_profile_decision.event,
-                    decision=execution_profile_decision,
-                )
-                if not rejection.replayed:
-                    await self._event_writer.fan_out_persisted([rejection.event])
-                error_type = (
-                    ExecutionProfileMigrationRequired
-                    if execution_profile_decision.kind
-                    is ExecutionProfileDecisionKind.MIGRATION_REQUIRED
-                    else (
-                        ExecutionProfileAdoptionRejected
-                        if request.profile_adoption is not None
-                        else ExecutionProfileMismatchError
-                    )
-                )
-                raise error_type(
-                    session_id=loaded_session.id,
-                    expected_profile_fingerprint=expected_execution_profile.fingerprint,
-                    candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
                     changed_component_classes=changed_profile_components,
+                    intent=request.profile_adoption,
+                    adoption_request_fingerprint=adoption_request_fingerprint,
+                    target_changed=target_changed,
+                    target_provider_name=registered_provider.name,
+                    target_model=(
+                        requested_target.model
+                        if target_changed and requested_target is not None
+                        else loaded_session.model
+                    ),
                 )
+                if execution_profile_decision.kind in {
+                    ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+                    ExecutionProfileDecisionKind.REJECTED,
+                }:
+                    rejection = await self.session_store.reject_execution_profile_resume(
+                        loaded_session.id,
+                        expected_statuses=_RESUMABLE_SESSION_STATUSES,
+                        expected_run_epoch=loaded_session.run_epoch,
+                        expected_profile=expected_execution_profile,
+                        candidate_profile=candidate_execution_profile,
+                        event=execution_profile_decision.event,
+                        decision=execution_profile_decision,
+                    )
+                    if not rejection.replayed:
+                        await self._event_writer.fan_out_persisted([rejection.event])
+                    error_type = (
+                        ExecutionProfileMigrationRequired
+                        if execution_profile_decision.kind
+                        is ExecutionProfileDecisionKind.MIGRATION_REQUIRED
+                        else (
+                            ExecutionProfileAdoptionRejected
+                            if request.profile_adoption is not None
+                            else ExecutionProfileMismatchError
+                        )
+                    )
+                    raise error_type(
+                        session_id=loaded_session.id,
+                        expected_profile_fingerprint=expected_execution_profile.fingerprint,
+                        candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
+                        changed_component_classes=changed_profile_components,
+                    )
+        if continuing_recovery_boundary:
+            continuing_execution_profile_snapshot = (
+                await self.validate_execution_profile_continuation(
+                    session=loaded_session,
+                    checkpoint=checkpoint,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                )
+            )
         # Provider-owned schema validation runs only after the current process's
         # execution profile has been frozen and any ordinary-resume drift has
         # been rejected. It remains before the durable status transition.
@@ -9609,29 +9984,31 @@ class SessionEngine:
             ),
             *request.messages,
         ]
-        model_transition_kwargs: dict[str, Any] = {}
-        if model_transition is not None:
-            model_transition_kwargs["model_transition"] = model_transition
-        if candidate_execution_profile is not None:
-            model_transition_kwargs["execution_profile"] = candidate_execution_profile
-        if execution_profile_decision is not None:
-            model_transition_kwargs["execution_profile_decision"] = execution_profile_decision
+        invocation_profile = (
+            continuing_execution_profile_snapshot.profile
+            if continuing_execution_profile_snapshot is not None
+            else candidate_execution_profile
+        )
+        if invocation_profile is None:
+            raise AssertionError("Session invocation admission produced no execution profile.")
         try:
-            transition = (
-                self.session_store.admit_execution_profile_resume
-                if candidate_execution_profile is not None
-                else self.session_store.transition_status_and_checkpoint
-            )
-            session = await transition(
+            session = await self.session_store.admit_session_invocation(
                 loaded_session.id,
-                from_statuses=_RESUMABLE_SESSION_STATUSES,
-                to_status=SessionStatus.RUNNING,
-                checkpoint_transform=claim_resumable_checkpoint,
-                interaction_started_event=interaction_started_event,
-                interaction_source_messages=interaction_source_messages,
-                continued_interaction_id=(interaction_id if continuing_recovery_boundary else None),
-                defer_interaction_source=continuing_recovery_boundary,
-                **model_transition_kwargs,
+                admission=SessionInvocationAdmission(
+                    from_statuses=frozenset(_RESUMABLE_SESSION_STATUSES),
+                    checkpoint_transform=claim_resumable_checkpoint,
+                    execution_profile=invocation_profile,
+                    interaction_started_event=interaction_started_event,
+                    continued_interaction_id=(
+                        interaction_id if continuing_recovery_boundary else None
+                    ),
+                    interaction_source_messages=tuple(interaction_source_messages),
+                    defer_interaction_source=continuing_recovery_boundary,
+                    model_transition=model_transition,
+                    execution_profile_decision=execution_profile_decision,
+                    expected_active_invocation_profile=(continuing_execution_profile_snapshot),
+                    allow_unprofiled_derived_session=legacy_unprofiled_fork,
+                ),
             )
         except (SessionStatusConflict, ValueError):
             if request.profile_adoption is not None and candidate_execution_profile is not None:
@@ -9687,7 +10064,10 @@ class SessionEngine:
                         continue
                     yield admission_event
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
-                session
+                session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
             )
             session = model_boundary.session
             for recovery_event in model_boundary.recovery_events:
@@ -9706,7 +10086,10 @@ class SessionEngine:
                     session.id,
                     SessionStatus.INTERRUPTED,
                 )
-                await self.session_store.release_run_fence(session.id)
+                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                    session_id=session.id,
+                    execution_profile=invocation_profile,
+                )
                 _deactivate_session_interaction(session.id)
                 return
             projection_cursor = session_model_projection_cursor(session)
@@ -9741,12 +10124,20 @@ class SessionEngine:
                         (
                             "cancelled resume setup finalization",
                             lambda: self._recovery_coordinator.finalize_abandoned_session_by_id(
-                                session.id
+                                session.id,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=invocation_profile,
                             ),
                         ),
                         (
                             "cancelled resume run-fence release",
-                            lambda: self.session_store.release_run_fence(session.id),
+                            lambda: (
+                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                    session_id=session.id,
+                                    execution_profile=invocation_profile,
+                                )
+                            ),
                         ),
                     ),
                 )
@@ -9814,6 +10205,7 @@ class SessionEngine:
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
                         to_status=SessionStatus.FAILED,
+                        execution_profile=invocation_profile,
                     )
                 if interaction_failed_event is not None:
                     yield interaction_failed_event
@@ -9847,13 +10239,19 @@ class SessionEngine:
                 yield persisted_failure
             finally:
                 try:
-                    await self.session_store.release_run_fence(session.id)
+                    await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                        session_id=session.id,
+                        execution_profile=invocation_profile,
+                    )
                 finally:
                     _deactivate_session_interaction(session.id)
             return
         except BaseException:
             try:
-                await self.session_store.release_run_fence(session.id)
+                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                    session_id=session.id,
+                    execution_profile=invocation_profile,
+                )
             finally:
                 _deactivate_session_interaction(session.id)
             raise
@@ -9867,6 +10265,11 @@ class SessionEngine:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            execution_profile=(
+                continuing_execution_profile_snapshot.profile
+                if continuing_execution_profile_snapshot is not None
+                else candidate_execution_profile
+            ),
             messages=messages,
             messages_to_append=(
                 interaction_source_messages if continuing_recovery_boundary else request.messages
@@ -10253,6 +10656,12 @@ class SessionEngine:
             if fork_checkpoint is not None:
                 fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
                 fork_checkpoint.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
+                # Active invocation authority is bound to the source session's
+                # interaction and run epoch, never to the derived child.
+                fork_checkpoint.pop(
+                    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                    None,
+                )
                 # A model-step publication receipt belongs to the source session.
                 # The child inherits transcript state, not its reconstruction pointer.
                 fork_checkpoint.pop(
@@ -10654,6 +11063,7 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None,
         messages: list[Message],
         messages_to_append: list[Message],
         max_steps: int,
@@ -10860,7 +11270,10 @@ class SessionEngine:
                 run_baseline = session_usage_summary(session.id, baseline_events)
 
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
-                session
+                session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
             )
             session = model_boundary.session
             if model_boundary.blocks_provider_dispatch and not messages_to_append:
@@ -10890,6 +11303,7 @@ class SessionEngine:
                     if start_event_type is EventType.SESSION_STARTED
                     else EnvironmentFactoryOperation.RECONNECT
                 ),
+                execution_profile=execution_profile,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -10914,6 +11328,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=binding_started_event,
+                execution_profile=execution_profile,
             )
             registered_environment = binding_result.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -11032,6 +11447,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 messages=messages,
+                execution_profile=execution_profile,
                 tail_message_count=recovery_tail_message_count,
                 expected_transcript_cursor=recovery_expected_transcript_cursor,
             ):
@@ -11117,6 +11533,7 @@ class SessionEngine:
                         run_started_at=run_started_at,
                         turn_usage_tracker=turn_usage_tracker,
                         active_run=active_run,
+                        execution_profile=execution_profile,
                     )
                     for event in queued_events:
                         yield event
@@ -11172,18 +11589,25 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                execution_profile=execution_profile,
             )
 
             def model_completion_recovery_context(
                 billing_identity: BillingIdentity | None,
                 reservations: tuple[BudgetStepReservation, ...],
             ) -> ModelCompletionRecoveryContext | None:
+                execution_profile_fingerprint = (
+                    None if execution_profile is None else execution_profile.fingerprint
+                )
                 if (
                     registered_provider.provider.provider_operation_mode
                     is not ProviderOperationMode.BACKGROUND
                 ):
-                    return None
+                    return ModelCompletionRecoveryContext(
+                        execution_profile_fingerprint=execution_profile_fingerprint
+                    )
                 context = ModelCompletionRecoveryContext(
+                    execution_profile_fingerprint=execution_profile_fingerprint,
                     task_id=task_id,
                     request_metadata=request_metadata,
                     structured_output=structured_output,
@@ -11270,6 +11694,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                execution_profile=execution_profile,
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )
@@ -11317,6 +11742,7 @@ class SessionEngine:
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
+                    execution_profile=execution_profile,
                 ):
                     yield event
                 if budget_evaluation.check is not None:
@@ -11334,6 +11760,7 @@ class SessionEngine:
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
+                    execution_profile=execution_profile,
                 ):
                     yield event
                 if limit_evaluation.decision is not None:
@@ -11461,6 +11888,7 @@ class SessionEngine:
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
+                    execution_profile=execution_profile,
                 ):
                     yield event
                 if limit_evaluation.decision is not None:
@@ -11482,6 +11910,7 @@ class SessionEngine:
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
+                    execution_profile=execution_profile,
                 ):
                     yield event
                 if budget_evaluation.check is not None:
@@ -11701,6 +12130,7 @@ class SessionEngine:
                                 run_started_at=run_started_at,
                                 turn_usage_tracker=turn_usage_tracker,
                                 active_run=active_run,
+                                execution_profile=execution_profile,
                             )
                             for event in queued_events:
                                 yield event
@@ -11791,6 +12221,7 @@ class SessionEngine:
                                         run_started_at=run_started_at,
                                         turn_usage_tracker=turn_usage_tracker,
                                         active_run=active_run,
+                                        execution_profile=execution_profile,
                                     )
                                     for event in queued_events:
                                         yield event
@@ -11896,6 +12327,7 @@ class SessionEngine:
                                     run_started_at=run_started_at,
                                     turn_usage_tracker=turn_usage_tracker,
                                     active_run=active_run,
+                                    execution_profile=execution_profile,
                                 ):
                                     yield event
                                 return
@@ -11924,7 +12356,7 @@ class SessionEngine:
                                 _,
                             ) = await self._publish_interaction_transition(
                                 session=session,
-                                registered_agent=registered_agent,
+                                agent_name=registered_agent.spec.name,
                                 environment_name=environment_name,
                                 to_status=SessionStatus.INTERRUPTED,
                             )
@@ -11961,6 +12393,7 @@ class SessionEngine:
                                 session=session,
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
+                                execution_profile=execution_profile,
                             ):
                                 yield event
                             return
@@ -11994,6 +12427,7 @@ class SessionEngine:
                             run_started_at=run_started_at,
                             turn_usage_tracker=turn_usage_tracker,
                             active_run=active_run,
+                            execution_profile=execution_profile,
                         )
                         for event in queued_events:
                             yield event
@@ -12027,6 +12461,7 @@ class SessionEngine:
                         run_started_at=run_started_at,
                         turn_usage_tracker=turn_usage_tracker,
                         active_run=active_run,
+                        execution_profile=execution_profile,
                     ):
                         yield event
                     return
@@ -12072,6 +12507,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             ):
                 yield event
         except ToolApprovalRequired as exc:
@@ -12086,6 +12522,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
+                execution_profile=execution_profile,
             )
             if interaction_paused_event is not None:
                 yield interaction_paused_event
@@ -12123,6 +12560,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             ):
                 yield event
         except UserInputRequired as exc:
@@ -12137,6 +12575,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
+                execution_profile=execution_profile,
             )
             if interaction_paused_event is not None:
                 yield interaction_paused_event
@@ -12171,6 +12610,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             ):
                 yield event
         except SessionInterruptedByRequest:
@@ -12181,6 +12621,7 @@ class SessionEngine:
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    execution_profile=execution_profile,
                 ):
                     interruption_events.append(event)
             async for event in self._handle_session_interrupted(
@@ -12188,6 +12629,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
+                execution_profile=execution_profile,
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
@@ -12241,6 +12683,7 @@ class SessionEngine:
                             active_run=active_run,
                             interaction_transition_failures=tuple(interaction_transition_failures),
                             interaction_transition=interaction_transition,
+                            execution_profile=execution_profile,
                         )
                     )
 
@@ -12275,6 +12718,7 @@ class SessionEngine:
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
+                        execution_profile=execution_profile,
                     ):
                         interruption_events.append(event)
                 async for event in self._handle_session_interrupted(
@@ -12282,6 +12726,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=environment_name,
+                    execution_profile=execution_profile,
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
@@ -12299,6 +12744,7 @@ class SessionEngine:
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    execution_profile=execution_profile,
                 ):
                     pass
 
@@ -12320,6 +12766,7 @@ class SessionEngine:
                             active_run=active_run,
                             interaction_transition_failures=tuple(interaction_transition_failures),
                             interaction_transition=interaction_transition,
+                            execution_profile=execution_profile,
                         )
                     ),
                 ),
@@ -12356,6 +12803,7 @@ class SessionEngine:
                         run_started_at=run_started_at,
                         turn_usage_tracker=turn_usage_tracker,
                         active_run=active_run,
+                        execution_profile=execution_profile,
                     )
                 )
             except Exception as finalization_failure:
@@ -12450,6 +12898,7 @@ class SessionEngine:
                 environment_name=environment_name,
                 to_status=SessionStatus.FAILED,
                 observed_at=failure_interaction_observed_at,
+                execution_profile=execution_profile,
             )
             if interaction_failed_event is not None:
                 yield interaction_failed_event
@@ -12511,6 +12960,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             ):
                 yield event
         finally:
@@ -12518,12 +12968,18 @@ class SessionEngine:
                 await self._environment_lifecycle.abort_environment_setup(
                     session_id=session.id,
                     original_error=sys.exception(),
+                    execution_profile=execution_profile,
                 )
             finally:
                 self._session_control.discard_interrupt_signal(session.id)
                 try:
                     if release_run_fence_on_exit:
-                        await self.session_store.release_run_fence(session.id)
+                        await (
+                            self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                session_id=session.id,
+                                execution_profile=execution_profile,
+                            )
+                        )
                 finally:
                     try:
                         if current_task is not None:
@@ -12783,6 +13239,7 @@ class SessionEngine:
             run_started_at=request.run_started_at,
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
+            execution_profile=request.execution_profile,
         )
         try:
             async for event in events:
@@ -12804,6 +13261,7 @@ class SessionEngine:
             run_started_at=request.run_started_at,
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
+            execution_profile=request.execution_profile,
         )
         try:
             async for event in events:
@@ -12825,6 +13283,7 @@ class SessionEngine:
             run_started_at=request.run_started_at,
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
+            execution_profile=request.execution_profile,
         )
         try:
             async for event in events:
@@ -12849,6 +13308,7 @@ class SessionEngine:
             run_started_at=request.run_started_at,
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
+            execution_profile=request.execution_profile,
         ):
             yield event
 
@@ -12867,6 +13327,7 @@ class SessionEngine:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> AsyncGenerator[Event, None]:
         for event in evaluation.events:
             yield event
@@ -12889,6 +13350,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -12907,6 +13369,7 @@ class SessionEngine:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> AsyncGenerator[Event, None]:
         for event in evaluation.events:
             yield event
@@ -12925,6 +13388,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
         ):
             yield event
 
@@ -12949,6 +13413,7 @@ class SessionEngine:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        execution_profile: ExecutionProfileIdentity | None,
         reconcile_transition_cancellation: bool,
     ) -> AsyncGenerator[Event, None]:
         if type(reconcile_transition_cancellation) is not bool:
@@ -13001,6 +13466,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
+                execution_profile=execution_profile,
             )
         else:
             (
@@ -13009,7 +13475,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_interaction_transition(
                 session=session,
-                registered_agent=registered_agent,
+                agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
             )
@@ -13044,6 +13510,7 @@ class SessionEngine:
             session=interrupted_session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+            execution_profile=execution_profile,
         ):
             yield event
 
@@ -13060,6 +13527,7 @@ class SessionEngine:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> AsyncGenerator[Event, None]:
         usage_summary = session_usage_summary(
             session.id,
@@ -13088,6 +13556,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -13104,6 +13573,7 @@ class SessionEngine:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncGenerator[Event, None]:
         payload = budget_reservation_payload(result)
         yield await self._event_writer.emit(
@@ -13137,6 +13607,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -13156,6 +13627,7 @@ class SessionEngine:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncGenerator[Event, None]:
         payload = budget_limit_reached_payload(check)
         yield await self._event_writer.emit(
@@ -13190,6 +13662,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -13897,6 +14370,7 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -13923,6 +14397,7 @@ class SessionEngine:
                     registered_environment=registered_environment,
                     environment_name=environment_name,
                     to_status=SessionStatus.INTERRUPTED,
+                    execution_profile=execution_profile,
                     finalize_unsettled_cancellation=False,
                 )
             payload = await self._load_pending_session_interrupt_payload(session.id, default={})
@@ -13947,6 +14422,7 @@ class SessionEngine:
                     environment_name=environment_name,
                     to_status=SessionStatus.INTERRUPTED,
                     from_statuses={SessionStatus.INTERRUPTED},
+                    execution_profile=execution_profile,
                     finalize_unsettled_cancellation=False,
                 )
             if interaction_event is not None:
@@ -14000,6 +14476,7 @@ class SessionEngine:
                 session=loaded_interrupted,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             )
             terminal_prefix, interrupted_event = await _collect_through_event_type(
                 terminal_event_stream,
@@ -14027,6 +14504,7 @@ class SessionEngine:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Close a round when interruption precedes creation of its live runner."""
         checkpoint = await self.session_store.load_checkpoint(session.id)
@@ -14044,6 +14522,7 @@ class SessionEngine:
             tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
             cancellation_artifacts=None,
             cancellation_artifacts_by_id=None,
+            execution_profile=execution_profile,
         )
         async for event in self._recovery_coordinator.close_interrupted_tool_round(request):
             yield event
@@ -14140,6 +14619,7 @@ class SessionEngine:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncGenerator[Event, None]:
         event = await self._bind_event_to_session_run_operation(
             event,
@@ -14149,6 +14629,7 @@ class SessionEngine:
             event=event,
             session=session,
             registered_environment=registered_environment,
+            execution_profile=execution_profile,
         )
         for binding_event in finalize_result.events:
             yield binding_event
@@ -14210,6 +14691,7 @@ class SessionEngine:
             registered_environment=registered_environment,
             hooks=self._runtime_hooks,
             scope="app",
+            execution_profile=execution_profile,
         ):
             yield hook_event
         async for hook_event in self._run_runtime_hooks(
@@ -14220,6 +14702,7 @@ class SessionEngine:
             registered_environment=registered_environment,
             hooks=registered_agent.runtime_hooks,
             scope="agent",
+            execution_profile=execution_profile,
         ):
             yield hook_event
 
@@ -14233,6 +14716,7 @@ class SessionEngine:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         scope: str,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncGenerator[Event, None]:
         for registered_hook in hooks:
             hook = registered_hook.hook
@@ -14261,6 +14745,7 @@ class SessionEngine:
                 phase=phase,
                 session=session,
                 terminal_event=terminal_event,
+                execution_profile=execution_profile,
             )
             try:
                 await _call_runtime_hook(hook=hook, phase=phase, context=context)

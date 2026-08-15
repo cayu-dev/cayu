@@ -8,9 +8,18 @@ from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_value,
     require_durable_clean_nonblank,
@@ -22,10 +31,12 @@ from cayu.runtime.approvals import (
     copy_resolution_actor,
     resolution_actor_payload,
 )
+from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
 
 EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
 _EXECUTION_PROFILE_RECORD_TYPE = "cayu.execution-profile"
+_ACTIVE_INVOCATION_EXECUTION_PROFILE_RECORD_TYPE = "cayu.active-invocation-execution-profile"
 EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS = 4096
 EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS = 256
 
@@ -422,6 +433,33 @@ class ExecutionProfileIdentity(BaseModel):
         raise KeyError(f"Execution profile has no {component_class.value} component.")
 
 
+class ActiveInvocationExecutionProfile(BaseModel):
+    """Durable profile authority for one active interaction and run epoch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    record_type: Literal["cayu.active-invocation-execution-profile"] = (
+        _ACTIVE_INVOCATION_EXECUTION_PROFILE_RECORD_TYPE
+    )
+    schema_version: Literal[1] = EXECUTION_PROFILE_SCHEMA_VERSION
+    session_id: str
+    interaction_id: str
+    run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    profile: ExecutionProfileIdentity
+
+    @field_validator("session_id", "interaction_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def copy_profile(cls, value: object) -> ExecutionProfileIdentity:
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json")
+        return ExecutionProfileIdentity.model_validate(value)
+
+
 class ExecutionProfileMismatchError(RuntimeError):
     """Raised after durable evidence rejects a changed execution profile."""
 
@@ -648,6 +686,25 @@ def execution_profile_with_component(
     )
 
 
+def execution_profile_with_durable_system_projection_digest(
+    profile: ExecutionProfileIdentity,
+    digest: str,
+) -> ExecutionProfileIdentity:
+    """Bind a canonical durable-system message digest without raw prompt text."""
+
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("durable system projection digest must be a lowercase SHA-256 digest.")
+    return execution_profile_with_component(
+        profile,
+        ExecutionProfileComponentIdentity(
+            component_class=ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+            strength=ExecutionProfileIdentityStrength.STRUCTURAL,
+            availability=ExecutionProfileIdentityAvailability.AVAILABLE,
+            fingerprint=digest,
+        ),
+    )
+
+
 def execution_profile_session_metadata(
     profile: ExecutionProfileIdentity,
 ) -> dict[str, Any]:
@@ -703,6 +760,76 @@ def execution_profile_from_session_metadata(
     return ExecutionProfileIdentity.model_validate(
         copy_durable_json_value(raw["expected"], "execution_profile.expected")
     )
+
+
+def active_invocation_execution_profile_from_checkpoint(
+    checkpoint: Mapping[str, Any] | None,
+) -> ActiveInvocationExecutionProfile | None:
+    """Load the active invocation profile, failing closed on malformed authority."""
+
+    if checkpoint is None:
+        return None
+    raw = checkpoint.get(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    if raw is None:
+        return None
+    return ActiveInvocationExecutionProfile.model_validate(
+        copy_durable_json_value(raw, "active_invocation_execution_profile")
+    )
+
+
+def active_invocation_execution_profile_matches_session_epoch(
+    snapshot: ActiveInvocationExecutionProfile,
+    *,
+    session_id: str,
+    run_epoch: int,
+) -> bool:
+    """Return whether active authority can continue from this durable epoch."""
+
+    permitted_epochs = {run_epoch}
+    if run_epoch > 0:
+        # Releasing a completed, paused run fences that epoch by advancing the
+        # session once. The invocation snapshot continues to own the open
+        # interaction until a continuation atomically rebinds it.
+        permitted_epochs.add(run_epoch - 1)
+    return snapshot.session_id == session_id and snapshot.run_epoch in permitted_epochs
+
+
+def active_invocation_execution_profile_is_released(
+    snapshot: ActiveInvocationExecutionProfile,
+    *,
+    session_id: str,
+    run_epoch: int,
+) -> bool:
+    """Whether trailing work released the exact invocation's durable run fence."""
+
+    return (
+        snapshot.session_id == session_id and run_epoch > 0 and snapshot.run_epoch == run_epoch - 1
+    )
+
+
+def checkpoint_with_active_invocation_execution_profile(
+    checkpoint: Mapping[str, Any] | None,
+    *,
+    session_id: str,
+    interaction_id: str,
+    run_epoch: int,
+    profile: ExecutionProfileIdentity,
+    expected: ActiveInvocationExecutionProfile | None = None,
+) -> dict[str, Any]:
+    """Bind one profile to an interaction epoch with optional CAS authority."""
+
+    current = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if expected is not None and current != expected:
+        raise RuntimeError("Active invocation execution profile changed before it was claimed.")
+    snapshot = ActiveInvocationExecutionProfile(
+        session_id=session_id,
+        interaction_id=interaction_id,
+        run_epoch=run_epoch,
+        profile=profile,
+    )
+    updated = {} if checkpoint is None else copy_durable_json_value(dict(checkpoint), "checkpoint")
+    updated[ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY] = snapshot.model_dump(mode="json")
+    return updated
 
 
 def _available_component(

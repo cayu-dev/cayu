@@ -109,6 +109,7 @@ from cayu.runtime.approvals import (
     copy_pending_tool_approval,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -275,6 +276,7 @@ class ToolRoundLimitRequest:
     run_started_at: float
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
+    execution_profile: ExecutionProfileIdentity | None
 
 
 @dataclass(frozen=True)
@@ -289,6 +291,7 @@ class InterruptedToolRoundRequest:
     cancellation_artifacts: list[dict[str, Any]] | None
     cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None
     cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
+    execution_profile: ExecutionProfileIdentity | None = None
 
 
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
@@ -699,6 +702,7 @@ class ToolRoundExecutor:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> ToolRoundRun:
         return ToolRoundRun(
             self,
@@ -718,6 +722,7 @@ class ToolRoundExecutor:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
         )
 
     async def policy_plan(
@@ -1049,6 +1054,7 @@ class ToolRoundExecutor:
             environment_name=_environment_name(registered_environment),
             workspace_id=_workspace_id(registered_environment),
             task_id=task_id,
+            execution_profile_fingerprint=pending_round.execution_profile_fingerprint,
             publish_arguments=_tool_round_publishes_arguments(
                 registered_agent,
                 tool_calls,
@@ -1425,6 +1431,7 @@ class ToolRoundExecutor:
             environment_name=_environment_name(registered_environment),
             workspace_id=_workspace_id(registered_environment),
             task_id=task_id,
+            execution_profile_fingerprint=pending_round.execution_profile_fingerprint,
             tool_calls=approval_support.pending_tool_call_approvals(
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
@@ -1613,6 +1620,7 @@ class ToolRoundExecutor:
         request_metadata: dict[str, Any],
         task_id: str | None,
         model_step: int | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
         check_policy: bool = True,
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
@@ -1812,6 +1820,7 @@ class ToolRoundExecutor:
                 tool_call=tool_call,
                 result=result,
                 task_id=task_id,
+                execution_profile=execution_profile,
                 redactor=invocation_redactor,
                 output_redactor=provisional_output_redactor,
                 deferred_terminal_stager=deferred_terminal_stager,
@@ -1873,6 +1882,7 @@ class ToolRoundExecutor:
                     tool_call=tool_call,
                     result=result,
                     task_id=task_id,
+                    execution_profile=execution_profile,
                     redactor=invocation_redactor,
                     output_redactor=provisional_output_redactor,
                     deferred_terminal_stager=deferred_terminal_stager,
@@ -1927,6 +1937,7 @@ class ToolRoundExecutor:
             tool_call=tool_call,
             anchor_event=anchor_event,
             task_id=task_id,
+            execution_profile=execution_profile,
             resolution=before_resolution,
             redactor=invocation_redactor,
             output_redactor=provisional_output_redactor,
@@ -1964,6 +1975,7 @@ class ToolRoundExecutor:
                     **effective_arguments_payload,
                 },
                 task_id=task_id,
+                execution_profile=execution_profile,
                 tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
@@ -1999,6 +2011,7 @@ class ToolRoundExecutor:
                     **effective_arguments_payload,
                 },
                 task_id=task_id,
+                execution_profile=execution_profile,
                 tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
@@ -2069,6 +2082,7 @@ class ToolRoundExecutor:
                         "idempotency_key": idempotency_key,
                     },
                     task_id=task_id,
+                    execution_profile=execution_profile,
                     tool_round_identity=tool_round_identity,
                     approval_id=approval_id,
                     input_id=input_id,
@@ -2516,6 +2530,7 @@ class ToolRoundExecutor:
                         ),
                     },
                     task_id=task_id,
+                    execution_profile=execution_profile,
                     tool_round_identity=tool_round_identity,
                     approval_id=approval_id,
                     input_id=input_id,
@@ -2567,6 +2582,7 @@ class ToolRoundExecutor:
                     tool_call=hook_tool_call,
                     result=result,
                     task_id=task_id,
+                    execution_profile=execution_profile,
                     redactor=redactor,
                     output_redactor=output_redactor,
                     allow_modification=False,
@@ -2600,6 +2616,7 @@ class ToolRoundExecutor:
                 tool_call=effective_tool_call,
                 result=result,
                 task_id=task_id,
+                execution_profile=execution_profile,
                 redactor=redactor,
                 output_redactor=output_redactor,
                 argument_projection=argument_projection,
@@ -3075,6 +3092,7 @@ class ToolRoundExecutor:
         result: ToolResult,
         extra_payload: dict[str, Any],
         task_id: str | None,
+        execution_profile: ExecutionProfileIdentity | None,
         tool_round_identity: ToolRoundIdentity,
         approval_id: str | None,
         input_id: str | None,
@@ -3110,6 +3128,7 @@ class ToolRoundExecutor:
             tool_call=tool_call,
             result=result,
             task_id=task_id,
+            execution_profile=execution_profile,
             redactor=redactor,
             output_redactor=output_redactor,
             argument_projection=argument_projection,
@@ -3131,6 +3150,7 @@ class ToolRoundExecutor:
         resolution: _BeforeToolCallResolution,
         redactor: SecretRedactor,
         output_redactor: SecretRedactor,
+        execution_profile: ExecutionProfileIdentity | None,
         quarantine_output: bool = False,
     ) -> AsyncIterator[Event]:
         for hooks, scope in (
@@ -3174,6 +3194,7 @@ class ToolRoundExecutor:
                     arguments=resolution.arguments,
                     task_id=task_id,
                     publication_actions_allowed=not quarantine_output,
+                    execution_profile=execution_profile,
                 )
                 try:
                     decision = await hook.before_tool_call(context)
@@ -3268,6 +3289,7 @@ class ToolRoundExecutor:
         deferred_terminal_finalizer: DeferredTerminalFinalizer | None = None,
         hooks_already_completed: bool = False,
         publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         if publish_before_hooks and allow_modification:
             raise ValueError("Pre-hook tool-result publication cannot allow hook modification.")
@@ -3396,6 +3418,7 @@ class ToolRoundExecutor:
                 tool_call=hook_tool_call,
                 result=result,
                 task_id=task_id,
+                execution_profile=execution_profile,
                 redactor=resolved_redactor,
                 output_redactor=resolved_output_redactor,
                 allow_modification=False,
@@ -3418,6 +3441,7 @@ class ToolRoundExecutor:
             tool_call=hook_tool_call,
             result=final_result,
             task_id=task_id,
+            execution_profile=execution_profile,
             redactor=resolved_redactor,
             output_redactor=resolved_output_redactor,
             allow_modification=allow_modification,
@@ -3569,6 +3593,7 @@ class ToolRoundExecutor:
         task_id: str | None,
         redactor: SecretRedactor,
         output_redactor: SecretRedactor,
+        execution_profile: ExecutionProfileIdentity | None = None,
         allow_modification: bool = False,
         quarantine_output: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
@@ -3585,6 +3610,7 @@ class ToolRoundExecutor:
                 tool_call=tool_call,
                 result=current_result,
                 task_id=task_id,
+                execution_profile=execution_profile,
                 hooks=hooks,
                 scope=scope,
                 redactor=redactor,
@@ -3610,6 +3636,7 @@ class ToolRoundExecutor:
         scope: str,
         redactor: SecretRedactor,
         output_redactor: SecretRedactor,
+        execution_profile: ExecutionProfileIdentity | None = None,
         allow_modification: bool = False,
         quarantine_output: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
@@ -3664,6 +3691,7 @@ class ToolRoundExecutor:
                 ),
                 task_id=task_id,
                 publication_actions_allowed=not quarantine_output,
+                execution_profile=execution_profile,
             )
             try:
                 decision = await hook.after_tool_call(context)
@@ -3768,6 +3796,7 @@ class ToolRoundRun:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> None:
         self._executor = executor
         self._session = session
@@ -3786,7 +3815,14 @@ class ToolRoundRun:
         self._run_started_at = run_started_at
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
+        self._execution_profile = execution_profile
         self.stopped_for_limit = False
+
+    @property
+    def execution_profile(self) -> ExecutionProfileIdentity | None:
+        """Return the exact immutable profile resolved for this invocation."""
+
+        return self._execution_profile
 
     async def run(
         self,
@@ -4146,6 +4182,7 @@ class ToolRoundRun:
                     tool_call=tool_call,
                     result=result,
                     task_id=self._task_id,
+                    execution_profile=self._execution_profile,
                     redactor=publication_coordinator.redactor,
                     output_redactor=publication_coordinator.redactor,
                     argument_projection=unavailable,
@@ -4394,6 +4431,7 @@ class ToolRoundRun:
             run_started_at=self._run_started_at,
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
+            execution_profile=self._execution_profile,
         )
         async for event in self._executor._apply_limit_evaluation(request):
             yield event
@@ -4472,6 +4510,7 @@ class ToolRoundRun:
             cancellation_artifacts=cancellation_artifacts,
             cancellation_artifacts_by_id=cancellation_artifacts_by_id,
             cancellation_redactors_by_id=cancellation_redactors_by_id,
+            execution_profile=self._execution_profile,
         )
         async for event in self._executor._close_interrupted_round(request):
             yield event
@@ -4554,6 +4593,7 @@ class ToolRoundRun:
                 request_metadata=self._request_metadata,
                 task_id=self._task_id,
                 model_step=model_step,
+                execution_profile=self._execution_profile,
                 policy_result=policy_results_by_id.get(tool_call.id),
                 tool_round_identity=tool_round_identity,
                 taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
@@ -4607,6 +4647,7 @@ class ToolRoundRun:
                         request_metadata=self._request_metadata,
                         task_id=self._task_id,
                         model_step=model_step,
+                        execution_profile=self._execution_profile,
                         policy_result=policy_results_by_id.get(tool_call.id),
                         tool_round_identity=tool_round_identity,
                         taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),

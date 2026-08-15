@@ -156,6 +156,12 @@ class PendingUserInput(BaseModel):
     environment_name: str | None = None
     workspace_id: str | None = None
     task_id: str | None = None
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     tool_calls: list[PendingToolCallApproval]
     assistant_message_state: Literal["published", "quarantined"] = "published"
     quarantined_assistant_message: Message | None = None
@@ -447,6 +453,7 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         environment_name=pending.environment_name,
         workspace_id=pending.workspace_id,
         task_id=pending.task_id,
+        execution_profile_fingerprint=pending.execution_profile_fingerprint,
         tool_calls=[copy_pending_tool_call_approval(call) for call in pending.tool_calls],
         assistant_message_state=pending.assistant_message_state,
         quarantined_assistant_message=(

@@ -205,6 +205,7 @@ from cayu.runtime.context import (
     sanitize_context_compaction_telemetry,
 )
 from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
@@ -330,6 +331,12 @@ class ModelCompletionRecoveryContext(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     schema_version: Literal[1] = 1
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     task_id: str | None = None
     request_metadata: dict[str, Any] = Field(default_factory=dict)
     structured_output: StructuredOutputSpec | None = None
@@ -1426,6 +1433,7 @@ class ModelStepBudgetEvaluationRequest:
     run_started_at: float
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
+    execution_profile: ExecutionProfileIdentity | None
 
 
 @dataclass(frozen=True)
@@ -1439,6 +1447,7 @@ class ModelStepLimitEvaluationRequest:
     run_started_at: float
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
+    execution_profile: ExecutionProfileIdentity | None
 
 
 @dataclass(frozen=True)
@@ -1452,6 +1461,7 @@ class ModelStepBudgetReservationFailureRequest:
     run_started_at: float
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
+    execution_profile: ExecutionProfileIdentity | None
 
 
 BudgetEvaluationEventStream = Callable[
@@ -2871,6 +2881,7 @@ class ModelStepExecutor:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
         model_completion_recovery_context_factory: (
             ModelCompletionRecoveryContextFactory | None
         ) = None,
@@ -2895,6 +2906,7 @@ class ModelStepExecutor:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            execution_profile=execution_profile,
             model_completion_recovery_context_factory=(
                 model_completion_recovery_context_factory
                 or (
@@ -4950,6 +4962,7 @@ class ModelStepRun:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        execution_profile: ExecutionProfileIdentity | None,
         model_completion_recovery_context_factory: ModelCompletionRecoveryContextFactory,
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> None:
@@ -4971,6 +4984,7 @@ class ModelStepRun:
         self._run_started_at = run_started_at
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
+        self._execution_profile = execution_profile
         self._model_completion_recovery_context_factory = model_completion_recovery_context_factory
         self._reservation_identity_guard = (
             self._executor._run_limit_controller.reservation_identity_guard()
@@ -4992,6 +5006,12 @@ class ModelStepRun:
             )
             for limit in contextual_limits
         )
+
+    @property
+    def execution_profile(self) -> ExecutionProfileIdentity | None:
+        """Return the exact immutable profile resolved for this invocation."""
+
+        return self._execution_profile
 
     async def _abandon_pre_dispatch_model_stage(
         self,
@@ -6278,6 +6298,7 @@ class ModelStepRun:
                     run_started_at=self._run_started_at,
                     turn_usage_tracker=self._turn_usage_tracker,
                     active_run=self._active_run,
+                    execution_profile=self._execution_profile,
                 )
             )
         if rejection.limit_evaluation is None:
@@ -6295,6 +6316,7 @@ class ModelStepRun:
                 run_started_at=self._run_started_at,
                 turn_usage_tracker=self._turn_usage_tracker,
                 active_run=self._active_run,
+                execution_profile=self._execution_profile,
             )
         )
 
@@ -7196,6 +7218,7 @@ class ModelStepRun:
             run_started_at=self._run_started_at,
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
+            execution_profile=self._execution_profile,
         )
         budget_events = self._executor._apply_budget_evaluation(request)
         try:
@@ -7219,6 +7242,7 @@ class ModelStepRun:
             run_started_at=self._run_started_at,
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
+            execution_profile=self._execution_profile,
         )
         limit_events = self._executor._apply_limit_evaluation(request)
         try:
@@ -7251,6 +7275,7 @@ class ModelStepRun:
             run_started_at=self._run_started_at,
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
+            execution_profile=self._execution_profile,
         )
         budget_events = self._executor._apply_budget_evaluation(request)
         try:
@@ -7275,6 +7300,7 @@ class ModelStepRun:
             run_started_at=self._run_started_at,
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
+            execution_profile=self._execution_profile,
         )
         limit_events = self._executor._apply_limit_evaluation(request)
         try:
@@ -7303,6 +7329,7 @@ class ModelStepRun:
             run_started_at=self._run_started_at,
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
+            execution_profile=self._execution_profile,
         )
         terminal_events = self._executor._stop_for_budget_reservation_failure(request)
         try:

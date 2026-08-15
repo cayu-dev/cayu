@@ -16,6 +16,13 @@ from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
 )
+from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 
 pytestmark = [
     pytest.mark.process,
@@ -29,10 +36,12 @@ pytestmark = [
 
 def _assert_only_model_step_publication(checkpoint: dict) -> None:
     assert set(checkpoint) == {
+        ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+    assert active_invocation_execution_profile_from_checkpoint(checkpoint) is not None
     publication = model_step_publication_from_checkpoint(checkpoint)
     assert publication is not None
     assert publication.assistant_message_published is True

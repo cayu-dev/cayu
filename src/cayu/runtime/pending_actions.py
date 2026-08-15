@@ -160,6 +160,7 @@ def pending_action_evidence_round_from_checkpoint(
         agent_name=candidate.agent_name,
         environment_name=candidate.environment_name,
         task_id=candidate.task_id,
+        execution_profile_fingerprint=candidate.execution_profile_fingerprint,
         tool_calls=candidate.tool_calls,
         policy_state="planned",
         policy_context_version=1,
@@ -597,6 +598,7 @@ def _approval_event_matches_checkpoint(
         payload.pop("publish_arguments", None)
         payload.pop("secret_resolution_scope", None)
         payload.pop("run_limit_accounting", None)
+        payload.pop("execution_profile_fingerprint", None)
         if omit_arguments:
             payload.pop("arguments", None)
         tool_calls = payload.get("tool_calls")

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import wraps
 from typing import Any, cast
 
+from cayu._validation import copy_durable_json_object
 from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
@@ -20,6 +23,7 @@ from cayu.runtime.sessions import (
     RuntimePublicationMutation,
     RuntimePublicationRequest,
     Session,
+    SessionInvocationAdmission,
     SessionOperationPublication,
     SessionStore,
     _apply_runtime_publication_checkpoint_mutation,
@@ -45,6 +49,7 @@ def _versioned_checkpoint_transform(
     checkpoint_transform: CheckpointTransform,
     *,
     stamp_noop: bool = False,
+    stamp_empty: bool = False,
 ) -> CheckpointTransform:
     if checkpoint_transform is None:
         raise TypeError("checkpoint_transform is required.")
@@ -60,6 +65,8 @@ def _versioned_checkpoint_transform(
             decoded = decode_runtime_checkpoint(checkpoint, session_id=session_id)
             transformed = checkpoint_transform(session, decoded)
             if transformed is None:
+                if stamp_empty:
+                    return {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
                 return decoded if stamp_noop and checkpoint is not None else None
             return decode_runtime_checkpoint(transformed, session_id=session_id)
         except BaseException:
@@ -249,6 +256,24 @@ class _RuntimeCheckpointSessionStore:
             **kwargs,
         )
 
+    async def admit_session_invocation(
+        self,
+        session_id: str,
+        *,
+        admission: SessionInvocationAdmission,
+    ) -> Session:
+        return await self._store.admit_session_invocation(
+            session_id,
+            admission=replace(
+                admission,
+                checkpoint_transform=_versioned_checkpoint_transform(
+                    session_id,
+                    admission.checkpoint_transform,
+                    stamp_empty=True,
+                ),
+            ),
+        )
+
     async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
@@ -405,6 +430,14 @@ class _RuntimeCheckpointSessionStore:
             raise ValueError(
                 "Runtime publication callers cannot mutate the root checkpoint schema version."
             )
+        if any(
+            operation.key == ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+            for operation in request.mutation.operations
+        ):
+            raise ValueError(
+                "Runtime publication callers cannot mutate active invocation "
+                "execution-profile authority."
+            )
         schema_operation = RuntimePublicationCheckpointOperation(
             key=CHECKPOINT_SCHEMA_VERSION_KEY,
             expected_value_digest=runtime_publication_checkpoint_value_digest(
@@ -478,8 +511,36 @@ class _RuntimeCheckpointSessionStore:
                 if type(pointer_version) is int:
                     writer_version = pointer_version
 
+        writer_checkpoint = raw_checkpoint
+        preserved_active_profile: dict[str, Any] | None = None
+        if writer_version != CURRENT_CHECKPOINT_SCHEMA_VERSION and raw_checkpoint is not None:
+            current_checkpoint = decode_runtime_checkpoint(
+                raw_checkpoint,
+                session_id=session.id,
+            )
+            if (
+                current_checkpoint is not None
+                and ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY in current_checkpoint
+            ):
+                if any(
+                    operation.key == ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+                    for operation in mutation.operations
+                ):
+                    raise ValueError(
+                        "An older runtime publication cannot mutate active invocation "
+                        "execution-profile authority."
+                    )
+                writer_checkpoint = copy_durable_json_object(
+                    current_checkpoint,
+                    "checkpoint",
+                )
+                preserved_active_profile = copy_durable_json_object(
+                    writer_checkpoint.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY),
+                    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                )
+
         source_checkpoint = runtime_checkpoint_writer_view(
-            raw_checkpoint,
+            writer_checkpoint,
             writer_version=writer_version,
             session_id=session.id,
         )
@@ -488,7 +549,17 @@ class _RuntimeCheckpointSessionStore:
             mutation,
             source_checkpoint,
         )
-        return decode_runtime_checkpoint(target_checkpoint, session_id=session.id)
+        decoded_target = decode_runtime_checkpoint(target_checkpoint, session_id=session.id)
+        if preserved_active_profile is not None:
+            if decoded_target is None:
+                raise ValueError(
+                    "An older runtime publication cannot remove active invocation "
+                    "execution-profile authority."
+                )
+            decoded_target[ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY] = (
+                preserved_active_profile
+            )
+        return decoded_target
 
     async def publish_runtime_publication(
         self,

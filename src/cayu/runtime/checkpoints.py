@@ -15,7 +15,8 @@ if TYPE_CHECKING:
     from cayu.runtime.sessions import CheckpointRootFieldProjection
 
 CHECKPOINT_SCHEMA_VERSION_KEY = "checkpoint_schema_version"
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 2
+ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY = "active_invocation_execution_profile"
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 3
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -247,6 +248,15 @@ def _migrate_checkpoint_v1_to_v2(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_checkpoint_v2_to_v3(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Reserve active-invocation execution-profile authority for v3 readers."""
+
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    migrated.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 3
+    return migrated
+
+
 _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
     current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
     migrations=(
@@ -254,6 +264,11 @@ _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
             source_version=1,
             target_version=2,
             migrate=_migrate_checkpoint_v1_to_v2,
+        ),
+        CheckpointMigration(
+            source_version=2,
+            target_version=3,
+            migrate=_migrate_checkpoint_v2_to_v3,
         ),
     ),
 )
@@ -329,10 +344,18 @@ def runtime_checkpoint_writer_view(
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
         return copy_durable_json_object(current, "checkpoint")
-    if writer_version != 1:
+    if writer_version not in {1, 2}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     projected = copy_durable_json_object(current, "checkpoint")
+    if ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY in projected:
+        raise ValueError(
+            "Active invocation execution-profile authority cannot be represented by an "
+            f"older v{writer_version} writer."
+        )
+    if writer_version == 2:
+        projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+        return projected
     publication = projected.get("last_model_step_publication")
     if type(publication) is dict:
         try:

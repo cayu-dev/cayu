@@ -1297,6 +1297,7 @@ _SERVICE_SECURITY_TEST_PY = """from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from datetime import UTC, datetime
 from importlib.metadata import version
 
 import pytest
@@ -1304,16 +1305,23 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from cayu import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
     AgentSpec,
     CayuApp,
+    Event,
+    EventType,
     InMemorySessionStore,
     InMemoryTaskStore,
+    InteractionStatus,
+    InteractionSummaryEvidence,
     Message,
     ModelStreamEvent,
     RunRequest,
     ScriptedModelProvider,
     SecretRedactor,
     SessionIdentity,
+    SessionInvocationAdmission,
     SessionStatus,
     SQLiteSessionStore,
     SQLiteTaskStore,
@@ -2098,6 +2106,12 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
             reservation.operation.task_id,
             session_id=reservation.operation.session_id,
         )
+        session_identity = profiled_session_identity(
+            first_service.cayu_app,
+            agent_name=first_service.agent_name,
+            provider_name=provider.name,
+            model="scripted-model",
+        )
         await first_service.cayu_app.session_store.create(
             RunRequest(
                 agent_name=first_service.agent_name,
@@ -2105,20 +2119,41 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 task_id=reservation.operation.task_id,
                 messages=[original_message],
             ),
-            identity=profiled_session_identity(
-                first_service.cayu_app,
-                agent_name=first_service.agent_name,
-                provider_name=provider.name,
-                model="scripted-model",
+            identity=session_identity,
+        )
+        execution_profile = session_identity.execution_profile
+        assert execution_profile is not None
+        interaction_id = "interaction_replacement_continuation"
+        interaction_started_at = datetime.now(UTC)
+        interaction_started_event_id = "interaction_start_replacement_continuation"
+        interaction_started_event = Event(
+            id=interaction_started_event_id,
+            type=EventType.INTERACTION_STARTED,
+            session_id=reservation.operation.session_id,
+            interaction_id=interaction_id,
+            timestamp=interaction_started_at,
+            agent_name=first_service.agent_name,
+            payload=InteractionSummaryEvidence(
+                status=InteractionStatus.ACTIVE,
+                start_event_id=interaction_started_event_id,
+                started_at=interaction_started_at,
+            ).model_dump(mode="json"),
+        )
+        await first_service.cayu_app.session_store.admit_session_invocation(
+            reservation.operation.session_id,
+            admission=SessionInvocationAdmission(
+                from_statuses=frozenset({SessionStatus.PENDING}),
+                checkpoint_transform=lambda _session, checkpoint: (
+                    {
+                        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                    }
+                    if checkpoint is None
+                    else checkpoint
+                ),
+                execution_profile=execution_profile,
+                interaction_started_event=interaction_started_event,
+                interaction_source_messages=(original_message,),
             ),
-        )
-        await first_service.cayu_app.session_store.append_transcript_messages(
-            reservation.operation.session_id,
-            [original_message],
-        )
-        await first_service.cayu_app.session_store.update_status(
-            reservation.operation.session_id,
-            SessionStatus.RUNNING,
         )
 
         replacement_store = SQLiteProductOperationStore(product_path)

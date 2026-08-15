@@ -469,6 +469,7 @@ def planned_tool_round_from_pending_approval(
         agent_name=approval.agent_name,
         environment_name=approval.environment_name,
         task_id=approval.task_id,
+        execution_profile_fingerprint=approval.execution_profile_fingerprint,
         tool_calls=approval.tool_calls,
         policy_state="planned",
         policy_context_version=1,

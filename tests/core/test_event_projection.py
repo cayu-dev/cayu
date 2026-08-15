@@ -190,11 +190,17 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
         frozenset(PendingToolCallApproval.model_fields) | {"arguments_state"}
         == event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES
     )
-    assert (frozenset(PendingToolApproval.model_fields) - {"run_limit_accounting"}) | {
-        "arguments_state"
-    } == event_projection_module._PENDING_APPROVAL_FIELD_NAMES
     assert (
-        frozenset(PendingUserInput.model_fields) - {"run_limit_accounting", "staged_terminals"}
+        frozenset(PendingToolApproval.model_fields)
+        - {"execution_profile_fingerprint", "run_limit_accounting"}
+    ) | {"arguments_state"} == event_projection_module._PENDING_APPROVAL_FIELD_NAMES
+    assert (
+        frozenset(PendingUserInput.model_fields)
+        - {
+            "execution_profile_fingerprint",
+            "run_limit_accounting",
+            "staged_terminals",
+        }
     ) | {"arguments_state"} == event_projection_module._PENDING_USER_INPUT_FIELD_NAMES
 
 

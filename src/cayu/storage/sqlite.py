@@ -26,6 +26,7 @@ from cayu._validation import (
 )
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import Message, MessageRole
+from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
@@ -1006,6 +1007,7 @@ class SQLiteSessionStore(SessionStore):
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
+    supports_active_invocation_execution_profiles: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -2629,6 +2631,7 @@ class SQLiteSessionStore(SessionStore):
         candidate_profile: ExecutionProfileIdentity,
         event: Event,
         decision: ExecutionProfileDecision | None = None,
+        expected_active_invocation_profile_authority: CheckpointValueAuthority | None = None,
     ) -> ExecutionProfileRejectionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -2656,10 +2659,14 @@ class SQLiteSessionStore(SessionStore):
                     raise KeyError(f"Session not found: {session_id}")
                 _validate_execution_profile_rejection_session(
                     session,
+                    checkpoint=self._load_checkpoint_unlocked(session_id),
                     expected_statuses=statuses,
                     expected_run_epoch=expected_run_epoch,
                     expected_profile=expected_profile,
                     event=copied_event,
+                    expected_active_invocation_profile_authority=(
+                        expected_active_invocation_profile_authority
+                    ),
                 )
                 existing_row = self._connection.execute(
                     "SELECT * FROM cayu_events WHERE session_id = ? AND event_id = ?",

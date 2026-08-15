@@ -26,6 +26,7 @@ from cayu.runtime import (
     EventQuery,
     EventSink,
     IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InMemoryTaskStore,
@@ -2119,13 +2120,34 @@ def test_setup_failure_transition_cancellation_is_reconciled_at_sibling_boundary
     commit_before_release: bool,
 ) -> None:
     async def run() -> None:
+        terminal_profiles: list[object | None] = []
+
+        class RecordingInterruptedHook(RuntimeHook):
+            async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
+                terminal_profiles.append(context.execution_profile)
+
         store = BlockingSiblingInteractionTransitionStore(
             commit_before_release=commit_before_release
         )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(CompletingProvider(), default=True)
-        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            runtime_hooks=[RecordingInterruptedHook()],
+        )
         session_id = f"sess_cancel_setup_failure_{commit_before_release}"
+        transition_profiles: list[object | None] = []
+        original_publish_transition = app._session_engine._publish_sibling_interaction_transition
+
+        async def capture_transition_profile(**kwargs):
+            transition_profiles.append(kwargs.get("execution_profile"))
+            return await original_publish_transition(**kwargs)
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_publish_sibling_interaction_transition",
+            capture_transition_profile,
+        )
 
         async def fail_initial_transcript_publication(*args, **kwargs) -> None:
             del args, kwargs
@@ -2181,7 +2203,9 @@ def test_setup_failure_transition_cancellation_is_reconciled_at_sibling_boundary
             if commit_before_release
             else EventType.INTERACTION_INTERRUPTED
         )
-        assert sum(event.type == expected_interaction_type for event in durable) == 1
+        assert sum(event.type == expected_interaction_type for event in durable) == 1, [
+            str(event.type) for event in durable
+        ]
         assert (
             sum(
                 event.type
@@ -2195,9 +2219,14 @@ def test_setup_failure_transition_cancellation_is_reconciled_at_sibling_boundary
             == 0
         )
         assert len(store.attempted_events) == 1
+        assert transition_profiles[0] is not None
         if commit_before_release:
+            assert len(transition_profiles) == 1
             assert sum(event.type == EventType.SESSION_INTERRUPTED for event in durable) == 0
+            assert terminal_profiles == []
         else:
+            assert len(transition_profiles) == 2
+            assert all(profile is transition_profiles[0] for profile in transition_profiles)
             interrupted = next(
                 event for event in durable if event.type == EventType.SESSION_INTERRUPTED
             )
@@ -2207,6 +2236,8 @@ def test_setup_failure_transition_cancellation_is_reconciled_at_sibling_boundary
                     "error_type": "ConnectionError",
                 }
             ]
+            assert terminal_profiles == [transition_profiles[0]]
+            assert terminal_profiles[0] is transition_profiles[0]
 
     asyncio.run(run())
 
@@ -4044,6 +4075,87 @@ def test_batch_recovery_fault_isolates_and_retries_interaction_reconciliation() 
 
         retried_page = await app.recover_incomplete_sessions(request)
         assert retried_page.results == ()
+        events = await store.load_events(session_id)
+        assert [event.type for event in events].count(EventType.SESSION_INTERRUPTED) == 1
+        assert [event.type for event in events].count(EventType.INTERACTION_INTERRUPTED) == 1
+        assert store.interaction_attempts == 4
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_terminal_recovery_settles_interaction_reconciliation() -> None:
+    class CancelledInteractionReconciliationStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interaction_failures_remaining = 3
+            self.interaction_attempts = 0
+            self.second_attempt_dispatched = asyncio.Event()
+            self.release_second_attempt = asyncio.Event()
+
+        async def publish_interaction_transition(self, session_id: str, **kwargs):
+            event = kwargs["event"]
+            if event.type == EventType.INTERACTION_INTERRUPTED:
+                self.interaction_attempts += 1
+                if self.interaction_attempts == 2:
+                    self.second_attempt_dispatched.set()
+                    await self.release_second_attempt.wait()
+                if self.interaction_failures_remaining > 0:
+                    self.interaction_failures_remaining -= 1
+                    raise ConnectionError("interaction transition unavailable")
+            return await super().publish_interaction_transition(session_id, **kwargs)
+
+    async def scenario() -> None:
+        store = CancelledInteractionReconciliationStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        provider = CompletingProvider()
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "sess_cancelled_terminal_interaction_reconciliation"
+        interaction_id = "interaction-cancelled-terminal-reconciliation"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name=provider.name, model="fake-model"),
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        started_at = datetime.now(UTC) - timedelta(seconds=1)
+        await store.append_event(
+            session_id,
+            Event(
+                id="interaction-cancelled-terminal-reconciliation-start",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                timestamp=started_at,
+                payload=InteractionSummaryEvidence(
+                    status=InteractionStatus.ACTIVE,
+                    start_event_id=("interaction-cancelled-terminal-reconciliation-start"),
+                    started_at=started_at,
+                ).model_dump(mode="json"),
+            ),
+        )
+
+        recovery_task = asyncio.create_task(
+            app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
+        )
+        await asyncio.wait_for(store.second_attempt_dispatched.wait(), timeout=1)
+        assert recovery_task.cancelling() == 0
+        recovery_task.cancel("cancel terminal interaction reconciliation")
+        assert recovery_task.cancelling() == 1
+        store.release_second_attempt.set()
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="cancel terminal interaction reconciliation",
+        ):
+            await recovery_task
+        assert recovery_task.cancelled() is True
+
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
         events = await store.load_events(session_id)
         assert [event.type for event in events].count(EventType.SESSION_INTERRUPTED) == 1
         assert [event.type for event in events].count(EventType.INTERACTION_INTERRUPTED) == 1

@@ -5,10 +5,10 @@ import gc
 import weakref
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from importlib.metadata import version
 from typing import Any
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
@@ -64,7 +64,6 @@ from cayu.providers.base import _preflight_provider_portable_messages
 from cayu.runtime import SessionStore
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.execution_profiles import build_execution_profile_identity
 
 
 class _NamedProvider(ModelProvider):
@@ -309,26 +308,18 @@ class _EchoTool(Tool):
 def _profiled_source_identity(*, tool: Tool | None = None) -> SessionIdentity:
     direct_tool = tool or _EchoTool()
     spec = direct_tool.spec
-    return SessionIdentity(
+    return profiled_session_identity(
         provider_name="source",
         model="source-model",
-        runtime_version=version("cayu"),
-        execution_profile=build_execution_profile_identity(
-            runtime_name="cayu",
-            runtime_version=version("cayu"),
-            provider_name="source",
-            model="source-model",
-            durable_system_prompt=None,
-            direct_tools=[
-                {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "schema": direct_tool.schema,
-                    "parallel_safe": spec.parallel_safe,
-                    "effect": spec.effect.value,
-                }
-            ],
-        ),
+        direct_tools=[
+            {
+                "name": spec.name,
+                "description": spec.description,
+                "schema": direct_tool.schema,
+                "parallel_safe": spec.parallel_safe,
+                "effect": spec.effect.value,
+            }
+        ],
     )
 
 

@@ -194,6 +194,8 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
         "oversized",
         "profiled_session_identity",
         "build_execution_profile_identity",
+        "SessionInvocationAdmission",
+        "admit_session_invocation",
     ):
         assert phrase in security_test
 
@@ -216,6 +218,36 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert "pytest -q tests/test_public_service_security.py" in output
     assert "Product API: http://127.0.0.1:8000/api/operations" in output
     assert "Operator control plane: http://127.0.0.1:8000/cayu/" in output
+
+
+def test_scaffolded_service_replacement_recovery_uses_profiled_admission(
+    tmp_path: Path,
+) -> None:
+    assert main(["new", "myservice", "--template", "service", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myservice"
+    environment = os.environ.copy()
+    for name in ("CAYU_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        environment.pop(name, None)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import runpy, tempfile; from pathlib import Path; "
+                "tests = runpy.run_path('tests/test_public_service_security.py'); "
+                "context = tempfile.TemporaryDirectory(prefix='cayu-scaffold-profile-'); "
+                "tests['test_replacement_worker_continues_same_durable_session']"
+                "(Path(context.name)); context.cleanup()"
+            ),
+        ],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_auth(

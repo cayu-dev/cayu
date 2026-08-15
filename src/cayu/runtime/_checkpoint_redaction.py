@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from cayu._validation import copy_json_value
-from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
+from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+)
 from cayu.runtime.structured_output import json_schema_contains_secret
 from cayu.vaults import SecretRedactor
 
@@ -40,6 +43,10 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "type",
         "workflow_name",
         "workspace_id",
+        "record_type",
+        "component_class",
+        "strength",
+        "availability",
     }
 )
 _DURABLE_ENUM_STRING_FIELDS = frozenset(
@@ -63,10 +70,14 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
     {
         "resolution_request_digest",
         "user_message_sha256",
+        "fingerprint",
+        "execution_profile_fingerprint",
     }
 )
 _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
     "approval_close_intent",
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    "components",
     "assistant_publication",
     "approval_resolution_intent",
     "pending_tool_approval",
@@ -158,6 +169,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "pricing_model",
     "provenance",
     "provider_name",
+    "profile",
     "records",
     "question",
     "quarantined_assistant_message",
@@ -176,11 +188,13 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "retry_policy",
     "retry_request",
     "scope",
+    "schema_version",
     "score",
     "score_kind",
     "score_normalized",
     "schedules",
     "session_operations",
+    "session_id",
     "source",
     "source_id",
     "source_type",
@@ -231,6 +245,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "request_digest",
     "request_metadata",
     "source_run_epoch",
+    "run_epoch",
     "source_transcript_cursor",
     "status",
     "staged_terminals",
@@ -284,6 +299,7 @@ _QUARANTINED_ASSISTANT_MESSAGE_UNTRUSTED_CONTAINERS = frozenset(
 )
 _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
     {
+        ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         "context_compaction",
         "environment_factory_allocation_owner",
@@ -299,6 +315,20 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
         "pending_user_input",
         "session_operations",
         "usage_triggered_context",
+    }
+)
+_ACTIVE_INVOCATION_PROFILE_ROOT_IDENTITY_PATHS = frozenset(
+    {
+        (ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, "record_type"),
+        (ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, "session_id"),
+        (ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, "interaction_id"),
+    }
+)
+_ACTIVE_INVOCATION_PROFILE_COMPONENT_IDENTITY_FIELDS = frozenset(
+    {
+        "component_class",
+        "strength",
+        "availability",
     }
 )
 
@@ -339,6 +369,11 @@ def durable_value_contains_secret(
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
     if type(value) is str:
+        if _is_active_invocation_profile_identity_path(path):
+            # The active profile is runtime-owned authority reconstructed
+            # through its frozen typed model. These identities were already
+            # admitted before the checkpoint record was created.
+            return False
         if path and path[-1] in _DURABLE_ENUM_STRING_FIELDS and _path_has_typed_schema(path[:-1]):
             # Typed model validation owns these finite protocol values. A
             # credential that happens to equal "deny", "planned", or another
@@ -396,6 +431,21 @@ def durable_value_contains_secret(
                 return True
         return False
     raise AssertionError("Durable checkpoint contains non-JSON-compatible data.")
+
+
+def _is_active_invocation_profile_identity_path(path: tuple[str, ...]) -> bool:
+    if path in _ACTIVE_INVOCATION_PROFILE_ROOT_IDENTITY_PATHS:
+        return True
+    return (
+        len(path) == 4
+        and path[:3]
+        == (
+            ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+            "profile",
+            "components",
+        )
+        and path[-1] in _ACTIVE_INVOCATION_PROFILE_COMPONENT_IDENTITY_FIELDS
+    )
 
 
 def _path_has_typed_schema(path: tuple[str, ...]) -> bool:

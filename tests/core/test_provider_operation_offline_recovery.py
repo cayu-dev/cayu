@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 from cayu import SQLiteBudgetLedger, SQLiteSessionStore
 from cayu.core import (
@@ -40,7 +41,9 @@ from cayu.runtime import (
     BudgetPolicy,
     BudgetReservation,
     CayuApp,
+    IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
     InMemoryBudgetLedger,
     InMemorySessionStore,
     InteractionStatus,
@@ -50,7 +53,8 @@ from cayu.runtime import (
     RetryPolicy,
     RunLimits,
     RunRequest,
-    SessionIdentity,
+    RuntimeHook,
+    RuntimeHookContext,
     SessionRunFenced,
     SessionStatus,
     SessionStore,
@@ -67,6 +71,11 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileIdentity,
+    active_invocation_execution_profile_from_checkpoint,
+    checkpoint_with_active_invocation_execution_profile,
+)
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationAccountingStatus,
@@ -405,6 +414,21 @@ class _FenceOnCancellationRequestStore(InMemorySessionStore):
         return await super().publish_checkpoint_and_events(session_id, **kwargs)
 
 
+class _CommitThenRaiseInterruptionClaimStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interruption_claim_committed = False
+
+    async def fence_run_and_transform_checkpoint(self, session_id: str, **kwargs):
+        result = await super().fence_run_and_transform_checkpoint(session_id, **kwargs)
+        if not self.interruption_claim_committed and kwargs["statuses"] == {
+            SessionStatus.INTERRUPTING
+        }:
+            self.interruption_claim_committed = True
+            raise ConnectionError("interruption claim acknowledgement lost after commit")
+        return result
+
+
 class _CrashAfterCancellationEventStore(InMemorySessionStore):
     def __init__(self, crash_after: EventType) -> None:
         super().__init__()
@@ -444,6 +468,28 @@ class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
         ):
             await asyncio.sleep(0.03)
         return result
+
+
+class _BlockingInterruptionTransitionStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transition_entered = asyncio.Event()
+        self.transition_release = asyncio.Event()
+
+    async def transition_status_and_checkpoint(self, session_id: str, **kwargs):
+        self.transition_entered.set()
+        await self.transition_release.wait()
+        return await super().transition_status_and_checkpoint(session_id, **kwargs)
+
+
+class _RecordingInterruptedProfileHook(RuntimeHook):
+    name = "offline-interruption-profile-hook"
+
+    def __init__(self) -> None:
+        self.execution_profiles: list[ExecutionProfileIdentity | None] = []
+
+    async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
+        self.execution_profiles.append(context.execution_profile)
 
 
 class _IdentityAwareOfflineProvider(_OfflineOperationProvider):
@@ -520,6 +566,7 @@ async def _stage_offline_operation(
     recovery_context: dict | None = None,
     started_at: datetime | None = None,
     prior_events: tuple[Event, ...] = (),
+    tools: tuple[Tool, ...] = (),
 ) -> Message:
     user_message = Message.text("user", "finish this while no worker is attached")
     interaction_id = f"interaction-{session_id}"
@@ -538,15 +585,40 @@ async def _stage_offline_operation(
             started_at=started_at,
         ).model_dump(mode="json"),
     )
+    session_identity = profiled_session_identity(
+        provider_name=provider.name,
+        model="fake-model",
+        direct_tools=(
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "schema": tool.schema,
+                "parallel_safe": tool.spec.parallel_safe,
+                "effect": tool.spec.effect.value,
+            }
+            for tool in tools
+        ),
+    )
+    execution_profile = session_identity.execution_profile
+    assert execution_profile is not None
     session = await store.create(
         RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
         ),
-        identity=SessionIdentity(provider_name=provider.name, model="fake-model"),
+        identity=session_identity,
         interaction_started_event=started_event,
         interaction_source_messages=[user_message],
+        checkpoint_transform=lambda current_session, checkpoint: (
+            checkpoint_with_active_invocation_execution_profile(
+                checkpoint,
+                session_id=current_session.id,
+                interaction_id=interaction_id,
+                run_epoch=current_session.run_epoch,
+                profile=execution_profile,
+            )
+        ),
     )
     await store.replace_initial_transcript_messages(
         session_id,
@@ -571,8 +643,10 @@ async def _stage_offline_operation(
         "source_transcript_cursor": 1,
         "request_fingerprint": "c" * 64,
     }
-    if recovery_context is not None:
-        intent["recovery_context"] = recovery_context
+    typed_recovery_context = ModelCompletionRecoveryContext.model_validate(
+        {} if recovery_context is None else recovery_context
+    ).model_copy(update={"execution_profile_fingerprint": execution_profile.fingerprint})
+    intent["recovery_context"] = typed_recovery_context.model_dump(mode="json")
     await store.prepare_model_completion_stage(
         session_id,
         request=ModelCompletionStageRequest(
@@ -666,6 +740,120 @@ async def assert_offline_provider_operation_recovery(store: SessionStore) -> Non
     assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
 
 
+async def assert_terminal_session_fails_closed_with_active_provider_operation(
+    store: SessionStore,
+) -> None:
+    session_id = "terminal-with-active-provider-operation"
+    provider = _OfflineOperationProvider(ProviderOperationStatus.COMPLETED)
+    await _stage_offline_operation(
+        store,
+        session_id=session_id,
+        provider=provider,
+    )
+    await store.update_status(session_id, SessionStatus.COMPLETED)
+    await store.append_event(
+        session_id,
+        Event(type=EventType.SESSION_COMPLETED, session_id=session_id),
+    )
+
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(
+        ModelCompletionManualRecoveryRequired,
+        match="terminal session retains an active model-completion stage",
+    ):
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+
+    assert provider.adapter.retrieve_calls == []
+    assert await store.load_active_model_completion_stage(session_id) is not None
+
+
+async def assert_terminal_session_fails_closed_without_active_provider(
+    store: SessionStore,
+) -> None:
+    session_id = "terminal-with-unregistered-active-provider"
+    provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+    await _stage_offline_operation(
+        store,
+        session_id=session_id,
+        provider=provider,
+    )
+    await store.update_status(session_id, SessionStatus.COMPLETED)
+    await store.append_event(
+        session_id,
+        Event(type=EventType.SESSION_COMPLETED, session_id=session_id),
+    )
+
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    with pytest.raises(KeyError, match="Provider not registered"):
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+
+    assert provider.adapter.retrieve_calls == []
+    assert await store.load_active_model_completion_stage(session_id) is not None
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_unregistered_agent_recovery_leaves_terminal_interaction_and_stage_untouched(
+    batched: bool,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        session_id = f"terminal-unregistered-agent-{'batch' if batched else 'single'}"
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await store.update_status(session_id, SessionStatus.COMPLETED)
+        await store.append_event(
+            session_id,
+            Event(type=EventType.SESSION_COMPLETED, session_id=session_id),
+        )
+
+        before_session = await store.load(session_id)
+        before_checkpoint = await store.load_checkpoint(session_id)
+        before_stage = await store.load_active_model_completion_stage(session_id)
+        before_events = await store.load_events(session_id)
+
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        if batched:
+            page = await app.recover_incomplete_sessions(
+                IncompleteSessionsRecoveryRequest(
+                    statuses={SessionStatus.COMPLETED},
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+            assert len(page.results) == 1
+            result = page.results[0]
+        else:
+            result = await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+
+        assert result.actions == (IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT,)
+        assert result.events == ()
+        assert await store.load(session_id) == before_session
+        assert await store.load_checkpoint(session_id) == before_checkpoint
+        assert await store.load_active_model_completion_stage(session_id) == before_stage
+        assert await store.load_events(session_id) == before_events
+
+    asyncio.run(scenario())
+
+
 async def assert_pending_provider_operation_later_completes(
     store: SessionStore,
     *,
@@ -720,6 +908,32 @@ def test_completed_operation_is_retrieved_and_published_exactly_once(
             await store.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_terminal_session_does_not_skip_active_provider_operation(
+    store_kind: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "terminal-provider-recovery.sqlite3")
+        )
+        try:
+            await assert_terminal_session_fails_closed_with_active_provider_operation(store)
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_session_with_unregistered_active_provider_fails_closed() -> None:
+    asyncio.run(
+        assert_terminal_session_fails_closed_without_active_provider(InMemorySessionStore())
+    )
 
 
 async def assert_budgeted_offline_provider_operation_recovery(
@@ -915,6 +1129,7 @@ async def assert_offline_provider_operation_reuses_run_limit_accounting(
             )
             for index in range(2)
         )
+    tool = _RecordingLookupTool()
     await _stage_offline_operation(
         store,
         session_id=session_id,
@@ -922,9 +1137,9 @@ async def assert_offline_provider_operation_reuses_run_limit_accounting(
         recovery_context=recovery_context,
         started_at=started_at,
         prior_events=prior_events,
+        tools=(tool,),
     )
 
-    tool = _RecordingLookupTool()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(
@@ -1206,6 +1421,49 @@ def test_worker_loss_interruption_reports_unsupported_provider_cancellation() ->
     asyncio.run(scenario())
 
 
+def test_interruption_claim_acknowledgement_loss_releases_committed_epoch() -> None:
+    async def scenario() -> None:
+        session_id = "offline-provider-interruption-claim-ack-loss"
+        store = _CommitThenRaiseInterruptionClaimStore()
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(
+            ConnectionError,
+            match="interruption claim acknowledgement lost after commit",
+        ):
+            async for _event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="lose the interruption claim acknowledgement",
+                )
+            ):
+                pass
+
+        assert store.interruption_claim_committed is True
+        interrupted = await store.load(session_id)
+        interrupted_profile = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert interrupted is not None
+        assert interrupted.status is SessionStatus.INTERRUPTING
+        assert interrupted_profile is not None
+        assert interrupted_profile.run_epoch == interrupted.run_epoch - 1
+
+        replacement = await store.fence_stalled_run(
+            session_id,
+            statuses={SessionStatus.INTERRUPTING},
+            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+        )
+        assert replacement is not None
+        await store.release_run_fence(session_id)
+
+    asyncio.run(scenario())
+
+
 def test_budgeted_unsupported_cancellation_retains_then_settles_original_reservation() -> None:
     async def scenario() -> None:
         session_id = "offline-budget-cancellation-unsupported"
@@ -1249,6 +1507,13 @@ def test_budgeted_unsupported_cancellation_retains_then_settles_original_reserva
         interrupted = await inspect_provider_operation(store, session_id)
         assert interrupted.cancellation_status is ProviderOperationCancellationStatus.UNSUPPORTED
         assert interrupted.accounting_status is ProviderOperationAccountingStatus.RESERVED
+        interrupted_session = await store.load(session_id)
+        interrupted_profile = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert interrupted_session is not None
+        assert interrupted_profile is not None
+        assert interrupted_profile.run_epoch == interrupted_session.run_epoch - 1
 
         provider.adapter.status = ProviderOperationStatus.COMPLETED
         provider.adapter.start_events = (
@@ -1321,6 +1586,57 @@ def test_stale_worker_loss_owner_cannot_cancel_or_resolve_provider_operation() -
             }
         ]
         assert cancellation_events == []
+
+    asyncio.run(scenario())
+
+
+def test_offline_interruption_keeps_provider_frozen_across_status_transition() -> None:
+    async def scenario() -> None:
+        store = _BlockingInterruptionTransitionStore()
+        provider = _CancellableOfflineOperationProvider()
+        replacement_provider = _CancellableOfflineOperationProvider()
+        hook = _RecordingInterruptedProfileHook()
+        session_id = "offline-interruption-frozen-provider"
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        active_profile = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert active_profile is not None
+
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            runtime_hooks=[hook],
+        )
+        replacement_app = CayuApp(enable_logging=False)
+        replacement_app.register_provider(replacement_provider, default=True)
+
+        async def interrupt() -> list[Event]:
+            return [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id=session_id,
+                        reason="freeze the admitted provider runtime",
+                    )
+                )
+            ]
+
+        interrupt_task = asyncio.create_task(interrupt())
+        await asyncio.wait_for(store.transition_entered.wait(), timeout=1)
+        app._providers[provider.name] = replacement_app._providers[provider.name]
+        store.transition_release.set()
+
+        assert [event.type for event in await interrupt_task] == [
+            EventType.SESSION_INTERRUPTED,
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        ]
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+        assert replacement_provider.adapter.cancel_calls == []
+        assert hook.execution_profiles == [active_profile.profile]
+        assert hook.execution_profiles[0] is not None
 
     asyncio.run(scenario())
 
@@ -1502,6 +1818,30 @@ def test_provider_completion_winning_cancellation_is_reconciled_before_interrupt
         inspection = await inspect_provider_operation(store, session_id)
         assert inspection.cancellation_status is ProviderOperationCancellationStatus.COMPLETED
         assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
+
+        interrupted_session = await store.load(session_id)
+        interrupted_profile = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert interrupted_session is not None
+        assert interrupted_profile is not None
+        assert interrupted_profile.run_epoch == interrupted_session.run_epoch - 1
+
+        provider.adapter.start_events = (
+            ModelStreamEvent.text_delta("new invocation after interruption"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        )
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "continue after interruption")],
+                )
+            )
+        ]
+        assert resumed[-1].type is EventType.SESSION_COMPLETED
+        assert provider.adapter.start_calls == 1
 
     asyncio.run(scenario())
 
@@ -2129,6 +2469,7 @@ def test_offline_recovery_preserves_an_ordinary_tool_call_during_structured_outp
             session_id=session_id,
             provider=provider,
             recovery_context=context.model_dump(mode="json"),
+            tools=(_LookupTool(),),
         )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)

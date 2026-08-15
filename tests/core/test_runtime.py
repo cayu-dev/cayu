@@ -37,6 +37,7 @@ import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime.app as runtime_app_module
 import cayu.runtime.budgets as budgets_module
 import cayu.runtime.context as runtime_context_module
+import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.execution_units as execution_units_module
 import cayu.runtime.sessions as sessions_module
 from cayu.artifacts import (
@@ -146,6 +147,8 @@ from cayu.runtime import (
     EventQuery,
     EventRecord,
     EventSink,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
     ForkSessionRequest,
     ForkSystemPromptPolicy,
     IncompleteSessionRecoveryAction,
@@ -196,6 +199,7 @@ from cayu.runtime import (
     SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
+    SessionStore,
     StaticToolPolicy,
     StructuredOutputSpec,
     TaintAwareToolPolicy,
@@ -243,7 +247,10 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation_group,
 )
 from cayu.runtime._session_engine import _require_native_structured_output_support
-from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
 from cayu.runtime.context import (
     _KNOWLEDGE_CANDIDATES_CLOSE_TAG,
     _KNOWLEDGE_CANDIDATES_FORMAT_VERSION,
@@ -569,6 +576,15 @@ class NativeStructuredOutputFakeProvider(FakeProvider):
 class SchemaRejectingProvider(NativeStructuredOutputFakeProvider):
     def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
         raise NativeStructuredOutputSchemaInvalid("$: rejected by provider preflight.")
+
+
+class RecordingNativeStructuredOutputProvider(NativeStructuredOutputFakeProvider):
+    def __init__(self, events: list[ModelStreamEvent] | list[list[ModelStreamEvent]]) -> None:
+        super().__init__(events)
+        self.preflight_schemas: list[dict[str, Any]] = []
+
+    def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
+        self.preflight_schemas.append(json_schema)
 
 
 class MutatingProvider(FakeProvider):
@@ -1525,11 +1541,16 @@ def assert_only_model_step_publication_checkpoint(
     assert checkpoint is not None
     assert set(checkpoint) == {
         CHECKPOINT_SCHEMA_VERSION_KEY,
+        execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert (
         model_completion_publication_module.model_step_publication_from_checkpoint(checkpoint)
+        is not None
+    )
+    assert (
+        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
         is not None
     )
 
@@ -1544,7 +1565,49 @@ def checkpoint_without_model_step_publication(
     )
     copied = dict(checkpoint)
     copied.pop(model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
+    copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
     return copied
+
+
+def checkpoint_without_active_invocation_profile(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any]:
+    assert checkpoint is not None
+    assert (
+        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
+        is not None
+    )
+    copied = dict(checkpoint)
+    copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    return copied
+
+
+async def transition_runtime_session_to_running(
+    store: SessionStore,
+    session_id: str,
+) -> Session:
+    session = await store.load(session_id)
+    checkpoint = await store.load_checkpoint(session_id)
+    assert session is not None
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
+    return await store.transition_status_and_checkpoint(
+        session_id,
+        from_statuses={session.status},
+        to_status=SessionStatus.RUNNING,
+        checkpoint_transform=lambda current_session, current_checkpoint: (
+            execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+                current_checkpoint,
+                session_id=current_session.id,
+                interaction_id=active_profile.interaction_id,
+                run_epoch=current_session.run_epoch + 1,
+                profile=active_profile.profile,
+                expected=active_profile,
+            )
+        ),
+    )
 
 
 def interruption_payload_without_request_id(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5082,9 +5145,11 @@ def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoi
         "recent_message_count": 1,
         "model_step_id": model_step_id,
     }
-    checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_fail_closed_after_compaction"))
+    checkpoint = checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("sess_knowledge_fail_closed_after_compaction"))
+    )
     assert checkpoint == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "context_compaction": {
             "version": 2,
             "summary": "old|old answer",
@@ -5192,7 +5257,7 @@ def test_knowledge_injection_policy_composes_with_checkpoint_compaction() -> Non
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_injection_compaction"))
     durable_checkpoint = checkpoint_without_model_step_publication(checkpoint)
-    assert durable_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert durable_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert durable_checkpoint["context_compaction"] == {
         "version": 2,
         "summary": "old|old answer",
@@ -7738,6 +7803,14 @@ def test_environment_factory_result_release_is_bounded(tmp_path):
             default=True,
         )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        captured_cleanup_profiles: list[Any] = []
+        original_resolve_factory = app._environment_lifecycle.resolve_factory
+
+        async def capture_resolve_factory(**kwargs):
+            captured_cleanup_profiles.append(kwargs["execution_profile"])
+            return await original_resolve_factory(**kwargs)
+
+        app._environment_lifecycle.resolve_factory = capture_resolve_factory
 
         events = await collect_events(
             app,
@@ -7755,9 +7828,16 @@ def test_environment_factory_result_release_is_bounded(tmp_path):
         assert "sess_factory_release_timeout" in (
             app._environment_lifecycle._pending_environment_owner_admissions
         )
+        assert (
+            app._environment_lifecycle._deferred_factory_cleanup_profiles[
+                "sess_factory_release_timeout"
+            ]
+            is captured_cleanup_profiles[0]
+        )
         finish_release.set()
         assert await app.drain_environment_cleanups(timeout_s=0.2) is True
         assert release_completed.is_set()
+        assert app._environment_lifecycle._deferred_factory_cleanup_profiles == {}
         return events
 
     events = asyncio.run(run())
@@ -16826,7 +16906,7 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     assert fork.metadata == {"purpose": "alternate path"}
     fork_checkpoint = asyncio.run(store.load_checkpoint("sess_fork_child"))
     assert fork_checkpoint is not None
-    assert fork_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert fork_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert fork_checkpoint["future_additive_field"] == {"kept": True}
 
     fork_transcript = asyncio.run(store.load_transcript("sess_fork_child"))
@@ -17632,7 +17712,7 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
             assert after_takeover.metadata == {"stale_owner_write_before_atomic_takeover": True}
             source_checkpoint = await store.load_checkpoint(session_id)
             assert source_checkpoint == {
-                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
                 "custom_state": {"value": 1},
             }
         finally:
@@ -17651,7 +17731,7 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
         child_checkpoint = await store.load_checkpoint(child_id)
         expected_checkpoint = (
             {
-                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
                 "custom_state": {"value": 1},
             }
             if copy_checkpoint
@@ -17727,7 +17807,7 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
         assert after_failure.run_epoch > completed.run_epoch
         assert await store.load(child_id) is None
         assert await store.load_checkpoint(session_id) == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+            CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
             "custom_state": {"value": 1},
         }
 
@@ -17741,7 +17821,7 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
         )
         assert [event.type for event in retry_events] == [EventType.SESSION_FORKED]
         assert await store.load_checkpoint(child_id) == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+            CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
             "custom_state": {"value": 1},
         }
 
@@ -19466,7 +19546,7 @@ def test_background_interruption_reconciles_child_already_interrupting_elsewhere
     assert all(
         event.type != EventType.SESSION_INTERRUPTION_CASCADE_FAILED for event in parent_events
     )
-    assert parent_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert parent_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
 
 def test_background_interruption_cascade_isolates_child_completion_race(monkeypatch):
@@ -20861,7 +20941,7 @@ def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeyp
     assert first_event.type == EventType.SESSION_INTERRUPTED
     assert "pending_interruption_cascade" in checkpoint_before_terminal
     assert tasks_before_terminal == 0
-    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
 
 def test_pending_interruption_cascade_resumes_from_durable_checkpoint():
@@ -21380,7 +21460,7 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
     assert stale_completion == (False, False)
     assert failed_generation_completion == (False, False)
     assert current_completion == (True, True)
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
 
 def test_interruption_cascade_completion_publish_failure_keeps_retryable_marker(monkeypatch):
@@ -21593,6 +21673,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
     preserved, after_clear = asyncio.run(run())
 
     assert preserved == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "pending_session_interrupt": {
             "reason": "current reason",
             "interruption_type": "operator_requested",
@@ -21613,6 +21694,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         "replacement": True,
     }
     assert after_clear == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "prompt_anatomy_transition_intents": {
             "version": 1,
             "records": {"current-transition": {"status": "prepared"}},
@@ -24599,9 +24681,9 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
     session = asyncio.run(store.load("sess_broken_transcript"))
     assert session is not None
     assert session.status == SessionStatus.FAILED
-    assert asyncio.run(store.load_checkpoint("sess_broken_transcript")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2
-    }
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("sess_broken_transcript"))
+    ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
 
 def test_cayu_app_resume_uses_context_policy_and_preserves_full_transcript():
@@ -26220,6 +26302,7 @@ def test_cayu_app_recovers_pending_tool_round_with_unknown_tool_outcome():
 async def _seed_crashed_spawn_parent(
     store,
     *,
+    parent_identity: SessionIdentity,
     child_status,
     mode: str = "background",
     linkage: str = "correct",
@@ -26236,22 +26319,34 @@ async def _seed_crashed_spawn_parent(
     from cayu.runtime import _tool_execution as tool_execution
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
 
-    identity = SessionIdentity(provider_name="fake", model="fake-model")
+    child_identity = SessionIdentity(provider_name="fake", model="fake-model")
     parent_interaction_id = "interaction-parent-crashed-spawn"
     parent_messages = [Message.text("user", "spawn a reviewer")]
+
+    def freeze_parent_invocation_profile(current_session, current_checkpoint):
+        assert parent_identity.execution_profile is not None
+        return execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+            current_checkpoint,
+            session_id=current_session.id,
+            interaction_id=parent_interaction_id,
+            run_epoch=current_session.run_epoch,
+            profile=parent_identity.execution_profile,
+        )
+
     await store.create(
         RunRequest(
             agent_name="parent",
             session_id="parent",
             messages=parent_messages,
         ),
-        identity=identity,
+        identity=parent_identity,
         interaction_started_event=_interaction_started_event(
             "parent",
             interaction_id=parent_interaction_id,
             agent_name="parent",
         ),
         interaction_source_messages=parent_messages,
+        checkpoint_transform=freeze_parent_invocation_profile,
     )
     await store.replace_initial_transcript_messages(
         "parent",
@@ -26265,8 +26360,10 @@ async def _seed_crashed_spawn_parent(
         name="subagent",
         arguments={"agent": "reviewer", "task": "review"},
     )
+    active_checkpoint = await store.load_checkpoint("parent")
+    assert active_checkpoint is not None
     checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
-        None,
+        active_checkpoint,
         agent_name="parent",
         environment_name=None,
         task_id=None,
@@ -26327,7 +26424,7 @@ async def _seed_crashed_spawn_parent(
             ),
             source=SessionExecutionSource.SUBAGENT,
         ),
-        identity=identity,
+        identity=child_identity,
     )
     await store.append_transcript_messages(
         child_session_id,
@@ -26347,7 +26444,7 @@ async def _seed_crashed_spawn_parent(
                 ),
                 source=SessionExecutionSource.SUBAGENT,
             ),
-            identity=identity,
+            identity=child_identity,
         )
         await store.update_status("conflicting-child", child_status)
 
@@ -26418,8 +26515,23 @@ def _recover_parent(
         )
         app.register_agent(AgentSpec(name="parent", model="fake-model"), tools=[subagent_tool])
         app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        subagent_spec = subagent_tool.spec
+        parent_identity = profiled_session_identity(
+            provider_name="fake",
+            model="fake-model",
+            direct_tools=[
+                {
+                    "name": subagent_spec.name,
+                    "description": subagent_spec.description,
+                    "schema": subagent_spec.input_schema,
+                    "parallel_safe": subagent_spec.parallel_safe,
+                    "effect": subagent_spec.effect.value,
+                }
+            ],
+        )
         await _seed_crashed_spawn_parent(
             store,
+            parent_identity=parent_identity,
             child_status=child_status,
             mode=mode,
             linkage=linkage,
@@ -26971,6 +27083,52 @@ def _crashed_tool_round_app(
     return app, store, tool, checkpoint
 
 
+def test_tool_round_recovery_rejects_profile_drift_before_provider_preflight() -> None:
+    session_id = "sess_tool_round_profile_before_provider_preflight"
+    _, store, _, checkpoint = _crashed_tool_round_app(session_id)
+
+    class ChangedSideEffectTool(SideEffectTool):
+        spec = ToolSpec(
+            name="side_effect",
+            description="Changed tool declaration.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+    provider = RecordingNativeStructuredOutputProvider([])
+    replacement_app = CayuApp(session_store=store, enable_logging=False)
+    replacement_app.register_provider(provider, default=True)
+    replacement_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ChangedSideEffectTool()],
+    )
+
+    with pytest.raises(ExecutionProfileMismatchError):
+        asyncio.run(
+            collect_tool_round_recovery_events(
+                replacement_app,
+                ToolRoundRecoveryRequest(
+                    session_id=session_id,
+                    round_id=checkpoint["pending_tool_round"]["tool_round_id"],
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="verified externally",
+                    structured_output=StructuredOutputSpec(
+                        name="recovered_output",
+                        strategy="native",
+                        json_schema={
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"],
+                            "additionalProperties": False,
+                        },
+                    ),
+                ),
+            )
+        )
+
+    assert provider.preflight_schemas == []
+
+
 def test_command_policy_block_is_replayed_without_runner_execution_after_round_close_crash():
     session_id = "sess_command_policy_block_recovery"
     store = FailingOrdinaryToolResultCloseStore()
@@ -27338,19 +27496,32 @@ def test_manual_tool_round_recovery_rebases_stale_running_operation() -> None:
     operation_id = "stale-manual-recovery-operation"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
     round_id = checkpoint["pending_tool_round"]["tool_round_id"]
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
 
     async def simulate_crashed_continuation() -> None:
+        def claim_crashed_continuation(current_session, current_checkpoint):
+            claimed = _checkpoint_with_session_run_operation(
+                checkpoint=current_checkpoint,
+                current_session=current_session,
+                operation_id=operation_id,
+            )
+            return execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+                claimed,
+                session_id=current_session.id,
+                interaction_id=active_profile.interaction_id,
+                run_epoch=current_session.run_epoch + 1,
+                profile=active_profile.profile,
+                expected=active_profile,
+            )
+
         await store.transition_status_and_checkpoint(
             session_id,
             from_statuses={SessionStatus.FAILED},
             to_status=SessionStatus.RUNNING,
-            checkpoint_transform=lambda current_session, current_checkpoint: (
-                _checkpoint_with_session_run_operation(
-                    checkpoint=current_checkpoint,
-                    current_session=current_session,
-                    operation_id=operation_id,
-                )
-            ),
+            checkpoint_transform=claim_crashed_continuation,
         )
         await store.release_run_fence(session_id)
 
@@ -27623,7 +27794,24 @@ def test_tool_round_recovery_restores_status_when_append_did_not_commit() -> Non
     assert session is not None and session.status == SessionStatus.FAILED
     persisted = asyncio.run(store.load_events(session_id))
     assert not any(event.payload.get("manual_recovery") is True for event in persisted)
-    assert asyncio.run(store.load_checkpoint(session_id)) == checkpoint
+    restored_checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    original_profile = (
+        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
+    )
+    restored_profile = (
+        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+            restored_checkpoint
+        )
+    )
+    assert original_profile is not None
+    assert restored_profile is not None
+    assert restored_profile.session_id == original_profile.session_id
+    assert restored_profile.interaction_id == original_profile.interaction_id
+    assert restored_profile.profile == original_profile.profile
+    assert restored_profile.run_epoch > original_profile.run_epoch
+    assert checkpoint_without_active_invocation_profile(
+        restored_checkpoint
+    ) == checkpoint_without_active_invocation_profile(checkpoint)
     assert tool.calls == [{}]
 
 
@@ -28093,7 +28281,12 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             cleanup_order.append("heartbeat_lost")
             raise RuntimeError("manual recovery claim heartbeat lost")
 
-        async def record_environment_abort(*, session_id: str, original_error) -> None:
+        async def record_environment_abort(
+            *,
+            session_id: str,
+            original_error,
+            execution_profile=None,
+        ) -> None:
             assert isinstance(original_error, RuntimeError)
             checkpoint_during_abort = await store.load_checkpoint(session_id)
             assert checkpoint_during_abort is not None
@@ -28102,9 +28295,24 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
 
         original_finalize = app._recovery_coordinator.finalize_abandoned_session_by_id
 
-        async def record_abandoned_finalization(session_id: str) -> None:
+        async def record_abandoned_finalization(
+            session_id: str,
+            *,
+            propagate_interaction_publication_rejection: bool = False,
+            registered_agent=None,
+            registered_environment=None,
+            execution_profile=None,
+        ) -> None:
             cleanup_order.append("abandoned_finalization")
-            await original_finalize(session_id)
+            await original_finalize(
+                session_id,
+                propagate_interaction_publication_rejection=(
+                    propagate_interaction_publication_rejection
+                ),
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+            )
 
         monkeypatch.setattr(
             app._recovery_coordinator,
@@ -28197,7 +28405,12 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
             cleanup_order.append("heartbeat_lost")
             raise RuntimeError("manual recovery claim heartbeat lost while yielding")
 
-        async def record_environment_abort(*, session_id: str, original_error) -> None:
+        async def record_environment_abort(
+            *,
+            session_id: str,
+            original_error,
+            execution_profile=None,
+        ) -> None:
             assert isinstance(original_error, RuntimeError)
             checkpoint_during_abort = await store.load_checkpoint(session_id)
             assert checkpoint_during_abort is not None
@@ -28206,9 +28419,24 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
 
         original_finalize = app._recovery_coordinator.finalize_abandoned_session_by_id
 
-        async def record_abandoned_finalization(session_id: str) -> None:
+        async def record_abandoned_finalization(
+            session_id: str,
+            *,
+            propagate_interaction_publication_rejection: bool = False,
+            registered_agent=None,
+            registered_environment=None,
+            execution_profile=None,
+        ) -> None:
             cleanup_order.append("abandoned_finalization")
-            await original_finalize(session_id)
+            await original_finalize(
+                session_id,
+                propagate_interaction_publication_rejection=(
+                    propagate_interaction_publication_rejection
+                ),
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+            )
 
         monkeypatch.setattr(
             app._recovery_coordinator,
@@ -29324,11 +29552,31 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
     )
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
 
     async def run() -> None:
         # Model a live worker that crashed after its tool call became durable,
         # then pause recovery exactly before its atomic storage claim.
-        await store.update_status(session_id, SessionStatus.RUNNING)
+        current = await store.load(session_id)
+        assert current is not None
+        await store.transition_status_and_checkpoint(
+            session_id,
+            from_statuses={current.status},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda session, current_checkpoint: (
+                execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+                    current_checkpoint,
+                    session_id=session.id,
+                    interaction_id=active_profile.interaction_id,
+                    run_epoch=session.run_epoch + 1,
+                    profile=active_profile.profile,
+                    expected=active_profile,
+                )
+            ),
+        )
         await store.release_run_fence(session_id)
         store.pause_manual_claim = True
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
@@ -29448,11 +29696,31 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
         "interruption_type": "operator_requested",
         "interruption_request_id": interruption_request_id,
     }
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
 
     async def run() -> None:
         # Model an operator interruption that durably changed status and wrote
         # its checkpoint marker, but crashed before its terminal event append.
-        await store.update_status(session_id, SessionStatus.RUNNING)
+        current = await store.load(session_id)
+        assert current is not None
+        await store.transition_status_and_checkpoint(
+            session_id,
+            from_statuses={current.status},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda session, current_checkpoint: (
+                execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+                    current_checkpoint,
+                    session_id=session.id,
+                    interaction_id=active_profile.interaction_id,
+                    run_epoch=session.run_epoch + 1,
+                    profile=active_profile.profile,
+                    expected=active_profile,
+                )
+            ),
+        )
         await store.release_run_fence(session_id)
         await store.transition_status_and_checkpoint(
             session_id,
@@ -29686,10 +29954,23 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
         assert interaction_id is not None
 
         def install_expired_claim(
-            _session: Session,
+            current_session: Session,
             current_checkpoint: dict | None,
         ) -> dict:
-            updated = {} if current_checkpoint is None else dict(current_checkpoint)
+            current_profile = (
+                execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+                    current_checkpoint
+                )
+            )
+            assert current_profile is not None
+            updated = execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+                current_checkpoint,
+                session_id=current_session.id,
+                interaction_id=current_profile.interaction_id,
+                run_epoch=current_session.run_epoch + 1,
+                profile=current_profile.profile,
+                expected=current_profile,
+            )
             updated["incomplete_session_recovery_claim"] = {
                 "version": 1,
                 "claim_id": "crashed-manual-recovery",
@@ -31001,7 +31282,9 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
             str(UUID(terminal_records[-1].event.payload["session_run_operation_id"]))
             == terminal_records[-1].event.payload["session_run_operation_id"]
         )
-        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+        assert checkpoint_without_active_invocation_profile(
+            await store.load_checkpoint(session_id)
+        ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
     asyncio.run(scenario())
 
@@ -31274,7 +31557,7 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
             **pending_payload,
             "interruption_request_id": PRIVATE_EVENT_AUTHORITY,
         }
-        assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+        assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
         resumed = await collect_resume_events(
             app,
@@ -31353,7 +31636,7 @@ def test_cayu_app_recover_incomplete_session_finalizes_pending_interrupt():
 
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
     assert result.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
     assert result.events[0].payload["interruption_request_id"] == PRIVATE_EVENT_AUTHORITY
@@ -31446,7 +31729,27 @@ def test_cayu_app_recover_incomplete_session_gates_round_without_policy_outcome(
     checkpoint = asyncio.run(store.load_checkpoint("sess_recover_incomplete_tool_round"))
     assert checkpoint is not None
     assert "pending_tool_round" in checkpoint
-    asyncio.run(store.update_status("sess_recover_incomplete_tool_round", SessionStatus.RUNNING))
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
+    asyncio.run(
+        store.transition_status_and_checkpoint(
+            "sess_recover_incomplete_tool_round",
+            from_statuses={SessionStatus.FAILED},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda session, current_checkpoint: (
+                execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+                    current_checkpoint,
+                    session_id=session.id,
+                    interaction_id=active_profile.interaction_id,
+                    run_epoch=session.run_epoch + 1,
+                    profile=active_profile.profile,
+                    expected=active_profile,
+                )
+            ),
+        )
+    )
     provider_requests_before_recovery = len(provider.requests)
 
     result = asyncio.run(
@@ -31515,9 +31818,9 @@ def test_cayu_app_recover_incomplete_session_restores_required_approval_before_c
     assert checkpoint["pending_tool_round"]["policy_state"] == "unplanned"
     assert checkpoint["pending_tool_round"]["request_metadata"] == {"review_context": "durable"}
     asyncio.run(
-        store.update_status(
+        transition_runtime_session_to_running(
+            store,
             "sess_recover_required_approval_plan",
-            SessionStatus.RUNNING,
         )
     )
 
@@ -31619,7 +31922,7 @@ def test_legacy_ambiguous_policy_recovery_preserves_authoritative_denial():
         checkpoint = dict(checkpoint)
         checkpoint["pending_tool_round"] = legacy_round
         await store.checkpoint(session_id, checkpoint)
-        await store.update_status(session_id, SessionStatus.RUNNING)
+        await transition_runtime_session_to_running(store, session_id)
 
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
@@ -31723,7 +32026,7 @@ def test_legacy_mixed_policy_recovery_prefers_authoritative_approval_gate():
             session_id,
             {**checkpoint, "pending_tool_round": legacy_round},
         )
-        await store.update_status(session_id, SessionStatus.RUNNING)
+        await transition_runtime_session_to_running(store, session_id)
 
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
@@ -31820,7 +32123,7 @@ def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decisi
                 messages=[Message.text("user", "use tool")],
             ),
         )
-        await store.update_status(session_id, SessionStatus.RUNNING)
+        await transition_runtime_session_to_running(store, session_id)
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
@@ -31953,7 +32256,7 @@ def test_planned_policy_round_without_authoritative_decision_fails_closed(
         checkpoint = dict(checkpoint)
         checkpoint["pending_tool_round"] = malformed_round
         await store.checkpoint(session_id, checkpoint)
-        await store.update_status(session_id, SessionStatus.RUNNING)
+        await transition_runtime_session_to_running(store, session_id)
 
         with pytest.raises(
             ValueError,
@@ -31971,7 +32274,7 @@ def test_planned_policy_round_without_authoritative_decision_fails_closed(
     asyncio.run(run())
 
 
-def test_planned_unregistered_call_stays_nonexecuting_after_registration_drift():
+def test_planned_unregistered_call_rejects_registration_drift_before_recovery():
     async def run() -> None:
         session_id = "sess_planned_unregistered_registration_drift"
         store = FailingAfterPendingToolRoundCheckpointStore()
@@ -32013,7 +32316,7 @@ def test_planned_unregistered_call_stays_nonexecuting_after_registration_drift()
             session_id,
             {**checkpoint, "pending_tool_round": planned_round},
         )
-        await store.update_status(session_id, SessionStatus.RUNNING)
+        await transition_runtime_session_to_running(store, session_id)
 
         tool = SideEffectTool()
         recovery_app = CayuApp(session_store=store, enable_logging=False)
@@ -32022,16 +32325,23 @@ def test_planned_unregistered_call_stays_nonexecuting_after_registration_drift()
             AgentSpec(name="assistant", model="fake-model"),
             tools=[tool],
         )
-        result = await recovery_app.recover_incomplete_session(
-            IncompleteSessionRecoveryRequest(session_id=session_id)
-        )
+        before = await store.load(session_id)
+        assert before is not None
+        with pytest.raises(ExecutionProfileMismatchError) as raised:
+            await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
 
-        assert result.actions == (
-            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
-            IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+        assert raised.value.changed_component_classes == (
+            ExecutionProfileComponentClass.DIRECT_TOOLS,
         )
         assert tool.calls == []
+        after = await store.load(session_id)
+        assert after is not None
+        assert after.status is before.status
+        assert after.run_epoch == before.run_epoch
         events = await store.load_events(session_id)
+        assert events[-1].type is EventType.SESSION_EXECUTION_PROFILE_REJECTED
         assert not any(
             event.type is EventType.TOOL_CALL_STARTED
             and event.payload.get("tool_call_id") == "call_late"
@@ -32192,10 +32502,12 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
             self.block = False
             self.started = asyncio.Event()
             self.finish = asyncio.Event()
+            self.execution_profiles: list[Any] = []
 
-        async def after_tool_call(self, _context: ToolCallHookContext) -> None:
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
             if not self.block:
                 return
+            self.execution_profiles.append(context.execution_profile)
             self.started.set()
             await self.finish.wait()
 
@@ -32277,7 +32589,15 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
             IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
             IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
         )
-        assert_only_model_step_publication_checkpoint(await store.load_checkpoint(session_id))
+        checkpoint = await store.load_checkpoint(session_id)
+        assert_only_model_step_publication_checkpoint(checkpoint)
+        active_profile = (
+            execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+                checkpoint
+            )
+        )
+        assert active_profile is not None
+        assert hook.execution_profiles == [active_profile.profile]
 
     monkeypatch.setattr(
         recovery_coordinator_module,
@@ -32325,9 +32645,9 @@ def test_cayu_app_recover_incomplete_session_uses_recorded_tool_result():
     assert checkpoint is not None
     assert "pending_tool_round" in checkpoint
     asyncio.run(
-        store.update_status(
+        transition_runtime_session_to_running(
+            store,
             "sess_recover_incomplete_recorded_tool_result",
-            SessionStatus.RUNNING,
         )
     )
 
@@ -32389,9 +32709,9 @@ def test_cayu_app_recover_incomplete_session_preserves_pending_tool_approval():
         event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
     asyncio.run(
-        store.update_status(
+        transition_runtime_session_to_running(
+            store,
             "sess_recover_incomplete_pending_approval",
-            SessionStatus.RUNNING,
         )
     )
 
@@ -37654,7 +37974,12 @@ def test_cayu_app_recovery_does_not_append_terminal_event_without_session_claim(
     )
     approval_event = interrupt_events[4]
     approval_id = approval_event.payload["approval"]["approval_id"]
-    asyncio.run(store.update_status("sess_recovery_claim_required", SessionStatus.RUNNING))
+    asyncio.run(
+        transition_runtime_session_to_running(
+            store,
+            "sess_recovery_claim_required",
+        )
+    )
 
     with pytest.raises(ValueError, match="status transition not allowed"):
         asyncio.run(
@@ -40609,7 +40934,7 @@ def test_usage_triggered_context_policy_stays_triggered_after_previous_actual_us
     }
     checkpoint = asyncio.run(app.session_store.load_checkpoint("usage_triggered_policy"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "usage_triggered_context": {
             "version": 1,
             "min_input_tokens": 50,
@@ -40706,7 +41031,7 @@ def test_usage_triggered_context_policy_preserves_marker_with_checkpoint_policy(
         app.session_store.load_checkpoint("usage_triggered_policy_checkpoint_merge")
     )
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "triggered_policy": {"calls": 2},
         "usage_triggered_context": {
             "version": 1,
@@ -41104,7 +41429,7 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
         app.session_store.load_checkpoint("context_overflow_compaction_recovery")
     )
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "context_compaction": {
             "version": 2,
             "summary": "old request",
@@ -44672,7 +44997,9 @@ def test_automatic_compaction_internal_persistence_cancellation_is_not_caller_ca
             "Context outcome persistence was cancelled without caller cancellation."
         )
         assert task.exception() is None
-        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+        assert checkpoint_without_active_invocation_profile(
+            await store.load_checkpoint(session_id)
+        ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
     asyncio.run(run())
 
@@ -46463,7 +46790,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
     ]
     checkpoint = asyncio.run(store.load_checkpoint("sess_compaction"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "context_compaction": {
             "version": 2,
             "summary": "old one|old answer one|old two|old answer two",
@@ -46595,7 +46922,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         _private_events_for_public_events(store, "sess_model_compaction", [events[3]])
     )[0]
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "context_compaction": {
             "version": 2,
             "summary": "model summary",
@@ -49700,9 +50027,9 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             "error_type": expected_error_type,
         }
     assert runtime_provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2
-    }
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary"))
+    ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
     usage = asyncio.run(app.get_session_usage("sess_invalid_compaction_summary"))
     assert usage.model_steps == 1
@@ -49831,9 +50158,9 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
     assert events[5].payload["token_usage"]["total_tokens"] == 86
     assert events[6].payload["error"] == "Compaction model must not call tools."
     assert runtime_provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_rejected_compaction_tool_call")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2
-    }
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("sess_rejected_compaction_tool_call"))
+    ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
     usage = asyncio.run(app.get_session_usage("sess_rejected_compaction_tool_call"))
     assert usage.model_steps == 1
@@ -49957,9 +50284,9 @@ def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
     assert events[5].payload["step_count"] == 1
     assert events[6].payload["error"] == expected_error
     assert runtime_provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_unfinished_compaction")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2
-    }
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("sess_unfinished_compaction"))
+    ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
     usage = asyncio.run(app.get_session_usage("sess_unfinished_compaction"))
     assert usage.model_steps == 1
@@ -50171,7 +50498,9 @@ def test_automatic_compaction_real_cancellation_records_uncertain_dispatch() -> 
         assert completions[0].payload["compaction_outcome"] == "cancelled"
         assert completions[0].payload["usage_unavailable_reason"]
         assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events) == 1
-        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+        assert checkpoint_without_active_invocation_profile(
+            await store.load_checkpoint(session_id)
+        ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
         usage = await app.get_session_usage(session_id)
         assert usage.model_steps == 1
         assert usage.usage.total_tokens == 0
@@ -50354,9 +50683,9 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
         "error_type": "RuntimeError",
     }
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_compaction_failed")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2
-    }
+    assert checkpoint_without_active_invocation_profile(
+        asyncio.run(store.load_checkpoint("sess_compaction_failed"))
+    ) == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
 
 def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
@@ -55531,7 +55860,7 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
         ).event
         == stored_interrupt_events[0]
     )
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
 
 def test_new_interruption_does_not_reuse_terminal_event_from_before_resume():
@@ -56095,7 +56424,7 @@ def test_interrupt_session_clears_payload_before_yielding_direct_terminal_event(
     assert first_event.type == EventType.SESSION_INTERRUPTED
     assert first_event.payload["reason"] == "operator stop"
     assert "pending_session_interrupt" not in checkpoint_after_event
-    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
 
 
 def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
@@ -56159,7 +56488,9 @@ def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
     assert run_event.id == interrupt_events[0].id
     assert run_event.payload["reason"] == "operator stop"
     assert "pending_session_interrupt" not in checkpoint_after_event
-    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+    assert checkpoint_without_active_invocation_profile(final_checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
+    }
 
 
 def test_interrupt_session_persists_payload_atomically_with_interrupting_status():

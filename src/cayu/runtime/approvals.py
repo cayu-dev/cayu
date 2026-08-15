@@ -424,6 +424,12 @@ class PendingToolApproval(BaseModel):
     environment_name: str | None = None
     workspace_id: str | None = None
     task_id: str | None = None
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     # Required private checkpoint authority indicating whether any executable
     # argument or argument-derived policy output may be copied into the public
     # approval event. Checkpoints without positive two-state evidence are not
@@ -713,6 +719,7 @@ class PendingToolApprovalEventView(BaseModel):
         payload.pop("publish_arguments", None)
         payload.pop("secret_resolution_scope", None)
         payload.pop("run_limit_accounting", None)
+        payload.pop("execution_profile_fingerprint", None)
         payload["arguments_state"] = state
         payload["arguments"] = None if arguments_quarantined else pending.arguments
         payload["tool_calls"] = [
@@ -835,6 +842,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         environment_name=approval.environment_name,
         workspace_id=approval.workspace_id,
         task_id=approval.task_id,
+        execution_profile_fingerprint=approval.execution_profile_fingerprint,
         publish_arguments=approval.publish_arguments,
         secret_resolution_scope=approval.secret_resolution_scope,
         reason=approval.reason,

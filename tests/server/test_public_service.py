@@ -11,7 +11,11 @@ import pytest
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    checkpoint_with_rebound_test_invocation_profile,
+    profiled_session_identity,
+    runtime_interaction_started_event,
+)
 
 from cayu import (
     REDACTED_SECRET,
@@ -1426,13 +1430,25 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
                 model="scripted-model",
             ),
         )
-        await session_store.append_transcript_messages(
+        interaction_id = "interaction_abandoned_session"
+        await session_store.transition_status_and_checkpoint(
             reservation.operation.session_id,
-            [original_message],
-        )
-        await session_store.update_status(
-            reservation.operation.session_id,
-            SessionStatus.RUNNING,
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda session, checkpoint: (
+                checkpoint_with_rebound_test_invocation_profile(
+                    session,
+                    checkpoint,
+                    interaction_id=interaction_id,
+                )
+            ),
+            interaction_started_event=runtime_interaction_started_event(
+                service.cayu_app,
+                session_id=reservation.operation.session_id,
+                interaction_id=interaction_id,
+                agent_name=service.agent_name,
+            ),
+            interaction_source_messages=[original_message],
         )
 
         completed = await service.execute_work(reservation.operation.work_id)

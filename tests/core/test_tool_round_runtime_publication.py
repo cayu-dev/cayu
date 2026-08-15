@@ -6,6 +6,9 @@ from typing import Any
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
+from tests.core._execution_profile_fixtures import (
+    checkpoint_with_rebound_test_invocation_profile,
+)
 from tests.core._workload_secret_support import (
     FakeProvider,
     RequireApprovalPolicy,
@@ -34,8 +37,15 @@ from cayu.runtime._model_completion_publication import (
     model_step_publication_from_checkpoint,
 )
 from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
-from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
+from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
 from cayu.runtime.context import ContextPolicy, ContextRequest, validate_context_messages
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
@@ -92,10 +102,12 @@ def _assert_only_model_step_publication_checkpoint(
 ) -> None:
     assert checkpoint is not None
     assert set(checkpoint) == {
+        ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+    assert active_invocation_execution_profile_from_checkpoint(checkpoint) is not None
     assert model_step_publication_from_checkpoint(checkpoint) is not None
 
 
@@ -579,6 +591,12 @@ def test_model_boundary_rejects_corrupted_pending_tool_approval(
             return updated
 
         await store.transform_checkpoint(session_id, corrupt_checkpoint)
+        await store.transition_status_and_checkpoint(
+            session_id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=checkpoint_with_rebound_test_invocation_profile,
+        )
         checkpoint_before = await store.load_checkpoint(session_id)
         transcript_before = await store.load_transcript(session_id)
         events_before = await store.load_events(session_id)
@@ -588,8 +606,6 @@ def test_model_boundary_rejects_corrupted_pending_tool_approval(
             session_id,
             logical_step_id,
         )
-        await store.update_status(session_id, SessionStatus.RUNNING)
-
         with pytest.raises(
             ValueError,
             match="Pending tool approval checkpoint is invalid and cannot be executed",

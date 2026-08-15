@@ -19,8 +19,9 @@ from tests.core.checkpoint_schema_conformance import (
     assert_assistant_publication_checkpoint_conformance,
     assert_current_checkpoint_publication_upgrade_conformance,
     assert_future_checkpoint_rejection_conformance,
-    assert_versionless_checkpoint_resume_conformance,
+    assert_runtime_publication_rejects_invocation_authority_mutation,
     assert_versionless_noop_transform_stamps_conformance,
+    assert_versionless_pending_continuation_fails_closed_conformance,
 )
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
 from tests.core.session_topology_conformance import (
@@ -31,6 +32,7 @@ from tests.core.test_provider_operation_offline_recovery import (
     assert_offline_provider_operation_recovery,
     assert_offline_provider_operation_reuses_run_limit_accounting,
     assert_pending_provider_operation_later_completes,
+    assert_terminal_session_fails_closed_with_active_provider_operation,
 )
 from tests.core.tool_result_projection_conformance import (
     assert_tool_result_projection_recovery_conformance,
@@ -188,6 +190,12 @@ def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
 
 def test_postgres_offline_provider_operation_recovery(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_offline_provider_operation_recovery)
+
+
+def test_postgres_terminal_session_fails_closed_with_active_provider_operation(
+    postgres_dsn: str,
+) -> None:
+    _run(postgres_dsn, assert_terminal_session_fails_closed_with_active_provider_operation)
 
 
 def test_postgres_budgeted_offline_provider_operation_recovery(postgres_dsn: str) -> None:
@@ -693,7 +701,7 @@ def test_postgres_public_authority_alias_startup_backfills_every_identity_source
 
 def test_postgres_checkpoint_schema_runtime_conformance(postgres_dsn: str) -> None:
     async def exercise(store) -> None:
-        await assert_versionless_checkpoint_resume_conformance(
+        await assert_versionless_pending_continuation_fails_closed_conformance(
             store,
             session_id="sess-postgres-versionless-checkpoint",
         )
@@ -708,6 +716,10 @@ def test_postgres_checkpoint_schema_runtime_conformance(postgres_dsn: str) -> No
         await assert_current_checkpoint_publication_upgrade_conformance(
             store,
             session_id_prefix="sess-postgres-current-publication",
+        )
+        await assert_runtime_publication_rejects_invocation_authority_mutation(
+            store,
+            session_id_prefix="sess-postgres-invocation-authority-publication",
         )
         await assert_assistant_publication_checkpoint_conformance(
             store,

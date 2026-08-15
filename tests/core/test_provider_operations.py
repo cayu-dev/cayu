@@ -1159,7 +1159,11 @@ def test_synchronous_dispatch_is_unchanged() -> None:
 
     assert provider.stream_calls == 1
     assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in events}
-    assert "recovery_context" not in store.stage_requests[0].intent
+    recovery_context = ModelCompletionRecoveryContext.model_validate(
+        store.stage_requests[0].intent["recovery_context"]
+    )
+    assert recovery_context.execution_profile_fingerprint is not None
+    assert recovery_context.task_id is None
 
 
 def test_operator_inspection_distinguishes_sync_and_in_progress() -> None:

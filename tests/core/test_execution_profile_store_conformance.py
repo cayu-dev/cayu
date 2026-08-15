@@ -16,15 +16,19 @@ from cayu.runtime import (
     ResolutionActorSource,
     RunRequest,
     SessionIdentity,
+    SessionInvocationAdmission,
     SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
 )
 from cayu.runtime.execution_profiles import (
+    ActiveInvocationExecutionProfile,
     ExecutionProfileComponentClass,
     ExecutionProfileIdentity,
+    active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
+    checkpoint_with_active_invocation_execution_profile,
     execution_profile_decision_payload,
 )
 
@@ -180,6 +184,81 @@ async def _assert_execution_profile_store_conformance(
             ),
         )
     assert len(await store.load_events(session_id)) == 1
+
+    active_session_id = f"profile-store-active-{suffix}-{uuid4().hex}"
+    active_interaction_id = f"interaction-{uuid4().hex}"
+
+    def freeze_compatible_profile(current_session, checkpoint):
+        return checkpoint_with_active_invocation_execution_profile(
+            checkpoint,
+            session_id=current_session.id,
+            interaction_id=active_interaction_id,
+            run_epoch=current_session.run_epoch,
+            profile=candidate,
+        )
+
+    await store.create(
+        RunRequest(agent_name="assistant", session_id=active_session_id, messages=[]),
+        identity=SessionIdentity(
+            provider_name="fake",
+            model="fake-model",
+            execution_profile=expected,
+        ),
+        interaction_started_event=Event(
+            type=EventType.INTERACTION_STARTED,
+            session_id=active_session_id,
+            interaction_id=active_interaction_id,
+            agent_name="assistant",
+        ),
+        interaction_source_messages=[],
+        checkpoint_transform=freeze_compatible_profile,
+    )
+    await store.update_status(active_session_id, SessionStatus.INTERRUPTED)
+    await store.release_run_fence(active_session_id)
+    active_session = await store.load(active_session_id)
+    active_checkpoint = await store.load_checkpoint(active_session_id)
+    active_profile = active_invocation_execution_profile_from_checkpoint(active_checkpoint)
+    assert active_session is not None
+    assert active_profile is not None
+    replacement = _profile(tool_name="later_replacement_tool")
+    active_event = _rejection_event(
+        session_id=active_session_id,
+        expected=candidate,
+        candidate=replacement,
+    )
+    active_rejection = await store.reject_active_invocation_execution_profile(
+        active_session_id,
+        expected_statuses={SessionStatus.INTERRUPTED},
+        expected_run_epoch=active_session.run_epoch,
+        expected_active_invocation_profile=active_profile,
+        candidate_profile=replacement,
+        event=active_event,
+    )
+    assert active_rejection.replayed is False
+    assert [event.id for event in await store.load_events(active_session_id)].count(
+        active_event.id
+    ) == 1
+
+    continued = await store.admit_session_invocation(
+        active_session_id,
+        admission=SessionInvocationAdmission(
+            from_statuses=frozenset({SessionStatus.INTERRUPTED}),
+            checkpoint_transform=lambda _session, current: current,
+            execution_profile=candidate,
+            continued_interaction_id=active_interaction_id,
+            interaction_source_messages=(),
+            defer_interaction_source=True,
+            expected_active_invocation_profile=active_profile,
+        ),
+    )
+    continued_checkpoint = await store.load_checkpoint(active_session_id)
+    continued_profile = active_invocation_execution_profile_from_checkpoint(continued_checkpoint)
+    assert continued.status is SessionStatus.RUNNING
+    assert continued_profile is not None
+    assert continued_profile.profile == candidate
+    assert continued_profile.interaction_id == active_interaction_id
+    assert continued_profile.run_epoch == continued.run_epoch
+    await store.release_run_fence(active_session_id)
 
     transform_called = False
 
@@ -411,6 +490,77 @@ async def _close_store(store: SessionStore) -> None:
     close = getattr(store, "close", None)
     if close is not None:
         await close()
+
+
+class _LegacyExecutionProfileStore(InMemorySessionStore):
+    """Representative #903 custom store with the pre-#904 rejection signature."""
+
+    async def reject_execution_profile_resume(
+        self,
+        session_id,
+        *,
+        expected_statuses,
+        expected_run_epoch,
+        expected_profile,
+        candidate_profile,
+        event,
+        decision=None,
+    ):
+        return await super().reject_execution_profile_resume(
+            session_id,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_profile=expected_profile,
+            candidate_profile=candidate_profile,
+            event=event,
+            decision=decision,
+        )
+
+
+def test_legacy_custom_store_fails_closed_without_invocation_profile_capability() -> None:
+    async def run() -> None:
+        store = _LegacyExecutionProfileStore()
+        profile = _profile(tool_name="legacy_tool")
+        active = ActiveInvocationExecutionProfile(
+            session_id="legacy-session",
+            interaction_id="legacy-interaction",
+            run_epoch=1,
+            profile=profile,
+        )
+        event = _rejection_event(
+            session_id=active.session_id,
+            expected=profile,
+            candidate=profile,
+        )
+        try:
+            with pytest.raises(NotImplementedError, match="active-invocation"):
+                await store.reject_active_invocation_execution_profile(
+                    active.session_id,
+                    expected_statuses={SessionStatus.INTERRUPTED},
+                    expected_run_epoch=active.run_epoch,
+                    expected_active_invocation_profile=active,
+                    candidate_profile=profile,
+                    event=event,
+                )
+            with pytest.raises(NotImplementedError, match="active-invocation"):
+                await store.admit_session_invocation(
+                    active.session_id,
+                    admission=SessionInvocationAdmission(
+                        from_statuses=frozenset({SessionStatus.INTERRUPTED}),
+                        checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                        execution_profile=profile,
+                        continued_interaction_id=active.interaction_id,
+                        interaction_source_messages=(),
+                        defer_interaction_source=True,
+                        expected_active_invocation_profile=active,
+                    ),
+                )
+        finally:
+            close = getattr(store, "close", None)
+            if close is not None:
+                await close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
