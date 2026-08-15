@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.messages import ToolCallPart, ToolResultPart
@@ -18,8 +17,6 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
-    InteractionStatus,
-    InteractionSummaryEvidence,
     ResumeRequest,
     RunLimits,
     RunRequest,
@@ -32,9 +29,6 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime.execution_profiles import (
-    checkpoint_with_active_invocation_execution_profile,
-)
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.sessions import (
     ModelCompletionStageRequest,
@@ -180,22 +174,14 @@ async def _publish_structured_model_step(
 ) -> _PublishedStructuredStep:
     user_message = Message.text("user", "produce the final structured answer")
     interaction_id = f"interaction-{session_id}"
-    started_event_id = f"{session_id}:interaction-started"
-    started_at = datetime.now(UTC)
-    started_event = Event(
-        id=started_event_id,
-        type=EventType.INTERACTION_STARTED,
-        session_id=session_id,
-        interaction_id=interaction_id,
-        timestamp=started_at,
-        agent_name="assistant",
-        payload=InteractionSummaryEvidence(
-            status=InteractionStatus.ACTIVE,
-            start_event_id=started_event_id,
-            started_at=started_at,
-        ).model_dump(mode="json"),
-    )
-    session_identity = profiled_session_identity(
+    admitted = await create_admitted_session(
+        store,
+        request=RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[user_message],
+            structured_output=spec,
+        ),
         provider_name=provider_name,
         model="fake-model",
         direct_tools=(
@@ -208,35 +194,10 @@ async def _publish_structured_model_step(
             }
             for tool in tools
         ),
-    )
-    execution_profile = session_identity.execution_profile
-    assert execution_profile is not None
-    running = await store.create(
-        RunRequest(
-            agent_name="assistant",
-            session_id=session_id,
-            messages=[user_message],
-            structured_output=spec,
-        ),
-        identity=session_identity,
-        interaction_started_event=started_event,
-        interaction_source_messages=[user_message],
-        checkpoint_transform=lambda current_session, checkpoint: (
-            checkpoint_with_active_invocation_execution_profile(
-                checkpoint,
-                session_id=current_session.id,
-                interaction_id=interaction_id,
-                run_epoch=current_session.run_epoch,
-                profile=execution_profile,
-            )
-        ),
-    )
-    await store.replace_initial_transcript_messages(
-        session_id,
-        [user_message],
-        [user_message],
         interaction_id=interaction_id,
+        secret_redactor=redactor,
     )
+    running = admitted.session
 
     source_transcript_cursor = 1
     model_attempt_identity = ModelAttemptIdentity(

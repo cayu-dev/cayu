@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 import pytest
+from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu.core import AgentSpec, EventType, Message
 from cayu.core.messages import ProviderStatePart, ToolCallPart
@@ -28,10 +29,15 @@ from cayu.runtime.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     CheckpointCompatibilityError,
 )
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.sessions import SessionStore
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor
+
+_PRE_ACTIVE_INVOCATION_SCHEMA_VERSION = 2
 
 
 class _PauseForInputProvider(ModelProvider):
@@ -144,6 +150,47 @@ async def assert_current_checkpoint_publication_upgrade_conformance(
             CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
             "publication_phase": "published",
         }
+
+
+async def assert_reserved_checkpoint_key_migration_conformance(
+    store: SessionStore,
+    *,
+    session_id: str,
+) -> None:
+    """Legacy data under a newly reserved key never acquires runtime authority."""
+
+    admitted = await create_admitted_session(
+        store,
+        request=RunRequest(
+            agent_name="checkpoint-agent",
+            session_id=session_id,
+            messages=[Message.text("user", "preserve safe legacy checkpoint data")],
+        ),
+        provider_name="checkpoint-conformance",
+        model="checkpoint-model",
+    )
+    current = await store.load_checkpoint(session_id)
+    assert current is not None
+    active_collision = current[ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY]
+    legacy = {
+        **current,
+        CHECKPOINT_SCHEMA_VERSION_KEY: _PRE_ACTIVE_INVOCATION_SCHEMA_VERSION,
+        "future_additive_field": {"preserved": True},
+    }
+    await store.checkpoint(session_id, legacy)
+
+    migrated = await runtime_checkpoint_session_store(store).load_checkpoint(session_id)
+    assert migrated == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "future_additive_field": {"preserved": True},
+    }
+    assert active_invocation_execution_profile_from_checkpoint(migrated) is None
+
+    raw = await store.load_checkpoint(admitted.session.id)
+    assert raw is not None
+    assert raw[CHECKPOINT_SCHEMA_VERSION_KEY] == _PRE_ACTIVE_INVOCATION_SCHEMA_VERSION
+    assert raw[ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY] == active_collision
+    assert raw["future_additive_field"] == {"preserved": True}
 
 
 async def assert_runtime_publication_rejects_invocation_authority_mutation(

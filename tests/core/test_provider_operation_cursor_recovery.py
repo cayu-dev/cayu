@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message, ThinkingConfig, ThinkingPart
@@ -31,8 +31,6 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
-    InteractionStatus,
-    InteractionSummaryEvidence,
     ModelCompletionManualRecoveryRequired,
     RunRequest,
     Session,
@@ -42,9 +40,6 @@ from cayu.runtime import (
     session_usage_summary,
 )
 from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
-from cayu.runtime.execution_profiles import (
-    checkpoint_with_active_invocation_execution_profile,
-)
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
@@ -1671,9 +1666,13 @@ async def _stage_partial_operation(
         raise ValueError("advances must be 1 or 2")
     user_message = Message.text("user", "finish after reconnect")
     interaction_id = f"interaction-{session_id}"
-    started_event_id = f"{session_id}:interaction-started"
-    started_at = datetime.now(UTC)
-    session_identity = profiled_session_identity(
+    admitted = await create_admitted_session(
+        store,
+        request=RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[user_message],
+        ),
         provider_name=provider.name,
         model="fake-model",
         direct_tools=(
@@ -1686,46 +1685,10 @@ async def _stage_partial_operation(
             }
             for tool in tools
         ),
-    )
-    execution_profile = session_identity.execution_profile
-    assert execution_profile is not None
-    session = await store.create(
-        RunRequest(
-            agent_name="assistant",
-            session_id=session_id,
-            messages=[user_message],
-        ),
-        identity=session_identity,
-        interaction_started_event=Event(
-            id=started_event_id,
-            type=EventType.INTERACTION_STARTED,
-            session_id=session_id,
-            interaction_id=interaction_id,
-            timestamp=started_at,
-            agent_name="assistant",
-            payload=InteractionSummaryEvidence(
-                status=InteractionStatus.ACTIVE,
-                start_event_id=started_event_id,
-                started_at=started_at,
-            ).model_dump(mode="json"),
-        ),
-        interaction_source_messages=[user_message],
-        checkpoint_transform=lambda current_session, checkpoint: (
-            checkpoint_with_active_invocation_execution_profile(
-                checkpoint,
-                session_id=current_session.id,
-                interaction_id=interaction_id,
-                run_epoch=current_session.run_epoch,
-                profile=execution_profile,
-            )
-        ),
-    )
-    await store.replace_initial_transcript_messages(
-        session_id,
-        [user_message],
-        [user_message],
         interaction_id=interaction_id,
     )
+    session = admitted.session
+    execution_profile = admitted.active_invocation_profile.profile
     identity = ModelAttemptIdentity(
         model_step_id="mstep_" + "a" * 32,
         model_attempt_id="matt_" + "b" * 32,

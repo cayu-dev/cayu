@@ -9,6 +9,7 @@ from tests.core.checkpoint_schema_conformance import (
     assert_assistant_publication_checkpoint_conformance,
     assert_current_checkpoint_publication_upgrade_conformance,
     assert_future_checkpoint_rejection_conformance,
+    assert_reserved_checkpoint_key_migration_conformance,
     assert_runtime_publication_rejects_invocation_authority_mutation,
     assert_versionless_noop_transform_stamps_conformance,
     assert_versionless_pending_continuation_fails_closed_conformance,
@@ -557,6 +558,10 @@ def test_in_memory_checkpoint_schema_runtime_conformance() -> None:
             store,
             session_id="sess-memory-future-checkpoint",
         )
+        await assert_reserved_checkpoint_key_migration_conformance(
+            store,
+            session_id="sess-memory-reserved-key-migration",
+        )
         await assert_current_checkpoint_publication_upgrade_conformance(
             store,
             session_id_prefix="sess-memory-current-publication",
@@ -588,6 +593,10 @@ def test_sqlite_checkpoint_schema_runtime_conformance(tmp_path) -> None:
             await assert_future_checkpoint_rejection_conformance(
                 store,
                 session_id="sess-sqlite-future-checkpoint",
+            )
+            await assert_reserved_checkpoint_key_migration_conformance(
+                store,
+                session_id="sess-sqlite-reserved-key-migration",
             )
             await assert_current_checkpoint_publication_upgrade_conformance(
                 store,
