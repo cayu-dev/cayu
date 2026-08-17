@@ -13,6 +13,7 @@ from tests.core.task_invocation_fixtures import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
+import cayu.runtime.task_worker as task_worker_module
 from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
@@ -94,6 +95,44 @@ def test_run_task_worker_rejects_nan_poll_interval(tmp_path: Path) -> None:
             )
 
     asyncio.run(scenario())
+
+
+@pytest.mark.anyio
+async def test_one_second_task_lease_heartbeats_after_one_third(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    elapsed = 0.0
+    stop = asyncio.Event()
+    observed_heartbeats: list[tuple[str, str, int, float]] = []
+
+    class ExpiringLeaseStore:
+        async def heartbeat(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            extend_seconds: int,
+        ) -> None:
+            assert elapsed < 1.0
+            observed_heartbeats.append((task_id, worker_id, extend_seconds, elapsed))
+            stop.set()
+
+    async def advance_clock(seconds: float, wait_stop: asyncio.Event) -> bool:
+        nonlocal elapsed
+        elapsed += seconds
+        return wait_stop.is_set()
+
+    monkeypatch.setattr(task_worker_module, "_wait_or_stop", advance_clock)
+
+    await task_worker_module._heartbeat_until(
+        ExpiringLeaseStore(),  # type: ignore[arg-type]
+        "task-1",
+        "worker-a",
+        1,
+        stop,
+    )
+
+    assert observed_heartbeats == [("task-1", "worker-a", 1, pytest.approx(1 / 3))]
 
 
 async def _run_handler(app: CayuApp, task: Task, worker_id: str) -> None:

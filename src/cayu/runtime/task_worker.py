@@ -217,7 +217,7 @@ async def _heartbeat_until(
     lease_seconds: int,
     stop: asyncio.Event,
 ) -> None:
-    interval = max(1.0, lease_seconds / 3)
+    interval = lease_seconds / 3
     while not stop.is_set():
         if await _wait_or_stop(interval, stop):
             return
