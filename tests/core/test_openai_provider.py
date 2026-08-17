@@ -884,6 +884,32 @@ def test_openai_provider_rejects_nonfinite_timeout(timeout_s: float) -> None:
 
 
 @pytest.mark.anyio
+async def test_openai_stream_events_stops_at_first_completed_event() -> None:
+    yielded = 0
+
+    async def raw_events():
+        nonlocal yielded
+        yielded += 1
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "response-local",
+                "model": "model-local",
+                "status": "completed",
+                "output": [],
+                "usage": {},
+            },
+        }
+        yielded += 1
+        yield {"type": "response.output_text.delta", "delta": "late"}
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert yielded == 1
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("end_turn", ["false", 0, 1, [], {}])
 async def test_openai_stream_events_rejects_malformed_end_turn(end_turn: object) -> None:
     async def raw_events():

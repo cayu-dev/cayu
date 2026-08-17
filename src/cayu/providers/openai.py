@@ -997,6 +997,8 @@ async def openai_stream_events(
                 excluded_output_indexes=unfinished_output_indexes,
                 reasoning_state=reasoning_state,
             )
+            if event_type == "response.completed":
+                return
             completed = True
             continue
         if event_type in {"response.failed", "error"}:
