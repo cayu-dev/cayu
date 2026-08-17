@@ -23,6 +23,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from hashlib import sha256
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
@@ -83,8 +84,8 @@ async def run_task_worker(
     """
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive.")
-    if poll_interval_s <= 0:
-        raise ValueError("poll_interval_s must be positive.")
+    if not isfinite(poll_interval_s) or poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be finite and positive.")
     if max_tasks is not None and max_tasks < 0:
         raise ValueError("max_tasks must be non-negative.")
     worker_id = require_clean_nonblank(worker_id, "worker_id")

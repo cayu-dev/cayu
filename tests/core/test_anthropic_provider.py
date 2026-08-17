@@ -2351,6 +2351,12 @@ def test_anthropic_provider_rejects_invalid_stream_idle_timeout() -> None:
         AnthropicProvider(api_key="test-key", stream_idle_timeout_s="60")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf")])
+def test_anthropic_provider_rejects_nonfinite_timeout(timeout_s: float) -> None:
+    with pytest.raises(ValueError, match="timeout_s"):
+        AnthropicProvider(api_key="test-key", timeout_s=timeout_s)
+
+
 @pytest.mark.anyio
 async def test_anthropic_provider_resolves_api_key_ref_through_allowlist_proxy() -> None:
     transport = RecordingTransport(

@@ -877,6 +877,12 @@ async def test_openai_stream_events_preserves_end_turn(end_turn: bool) -> None:
     assert events[-1].completion.end_turn is end_turn
 
 
+@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf")])
+def test_openai_provider_rejects_nonfinite_timeout(timeout_s: float) -> None:
+    with pytest.raises(ValueError, match="timeout_s"):
+        OpenAIProvider(api_key="test-key", timeout_s=timeout_s)
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("end_turn", ["false", 0, 1, [], {}])
 async def test_openai_stream_events_rejects_malformed_end_turn(end_turn: object) -> None:

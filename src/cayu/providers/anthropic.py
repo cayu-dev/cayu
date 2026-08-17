@@ -491,10 +491,11 @@ class AnthropicProvider(ModelProvider):
             raise ValueError("max_tokens must be greater than zero.")
         if type(timeout_s) not in {int, float}:
             raise TypeError("timeout_s must be a number.")
+        timeout_s = require_finite(float(timeout_s), "timeout_s")
         if timeout_s <= 0:
             raise ValueError("timeout_s must be greater than zero.")
         self.max_tokens = max_tokens
-        self.timeout_s = float(timeout_s)
+        self.timeout_s = timeout_s
         if type(stream_idle_timeout_s) not in {int, float}:
             raise TypeError("stream_idle_timeout_s must be a number.")
         stream_idle_timeout_s = require_finite(

@@ -1249,3 +1249,31 @@ def test_bedrock_provider_reports_unfinished_tool_blocks() -> None:
     assert len(events) == 1
     assert events[0].type == ModelStreamEventType.ERROR
     assert events[0].payload["error"] == "Bedrock provider protocol failure"
+
+
+@pytest.mark.parametrize(
+    "stream_idle_timeout_s",
+    [float("nan"), float("inf"), float("-inf")],
+)
+def test_bedrock_provider_rejects_nonfinite_stream_idle_timeout(
+    stream_idle_timeout_s: float,
+) -> None:
+    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
+        BedrockProvider(
+            client=FakeBedrockClient([]),
+            stream_idle_timeout_s=stream_idle_timeout_s,
+        )
+
+
+@pytest.mark.parametrize(
+    "stream_close_timeout_s",
+    [float("nan"), float("inf"), float("-inf")],
+)
+def test_bedrock_provider_rejects_nonfinite_stream_close_timeout(
+    stream_close_timeout_s: float,
+) -> None:
+    with pytest.raises(ValueError, match="stream_close_timeout_s"):
+        BedrockProvider(
+            client=FakeBedrockClient([]),
+            stream_close_timeout_s=stream_close_timeout_s,
+        )

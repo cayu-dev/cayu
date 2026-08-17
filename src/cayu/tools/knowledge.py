@@ -15,6 +15,7 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
+    require_finite,
     require_nonblank,
     require_unicode_scalar_text,
 )
@@ -2111,7 +2112,7 @@ def _validate_optional_unit_float(value: float | None, key: str) -> float | None
         return None
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"`{key}` must be a number.")
-    value = float(value)
+    value = require_finite(float(value), key)
     if value < 0.0 or value > 1.0:
         raise ValueError(f"`{key}` must be between 0.0 and 1.0.")
     return value

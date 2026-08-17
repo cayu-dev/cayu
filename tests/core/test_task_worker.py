@@ -76,6 +76,26 @@ def _build(
     return app, store
 
 
+def test_run_task_worker_rejects_nan_poll_interval(tmp_path: Path) -> None:
+    app, store = _build(tmp_path)
+
+    async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        return None
+
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="poll_interval_s"):
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="worker-a",
+                poll_interval_s=float("nan"),
+                max_tasks=0,
+            )
+
+    asyncio.run(scenario())
+
+
 async def _run_handler(app: CayuApp, task: Task, worker_id: str) -> None:
     async for _event in app.run(
         RunRequest(

@@ -1688,6 +1688,11 @@ def test_search_knowledge_auto_min_score_zero_keeps_weak_semantic_neighbors() ->
     ]
 
 
+def test_search_knowledge_rejects_nan_auto_min_score() -> None:
+    with pytest.raises(ValueError, match="auto_min_score"):
+        SearchKnowledgeTool(auto_min_score=float("nan"))
+
+
 def test_search_knowledge_auto_min_score_preserves_unscored_keyword_hits() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(

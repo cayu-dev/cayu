@@ -13,7 +13,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_finite
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -1334,6 +1334,7 @@ def _optional_clean_string(value: str | None, field_name: str) -> str | None:
 def _positive_float(value: float, field_name: str) -> float:
     if type(value) not in {int, float}:
         raise TypeError(f"{field_name} must be a number.")
+    value = require_finite(float(value), field_name)
     if value <= 0:
         raise ValueError(f"{field_name} must be greater than zero.")
-    return float(value)
+    return value
