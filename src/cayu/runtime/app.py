@@ -68,6 +68,7 @@ from cayu.providers import (
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._environment_lifecycle import (
@@ -122,12 +123,17 @@ from cayu.runtime._session_engine import (
     _checkpoint_with_pending_session_interrupt,
     _environment_name,
     _replace_checkpoint_preserving_runtime_state,
+    _require_native_structured_output_support,
     _task_event,
     _validate_resume_request,
     _validate_run_request,
 )
 from cayu.runtime._session_queries import query_all_event_records, query_all_sessions
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
+from cayu.runtime._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    TERMINAL_EVENT_TYPES,
+)
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
@@ -169,7 +175,14 @@ from cayu.runtime.dispatch import (
     Dispatcher,
     DispatchHandle,
     DispatchRequest,
+    DispatchStatus,
     InlineDispatcher,
+    _copy_queued_dispatch_envelope,
+    _new_queued_dispatch_envelope,
+    _QueuedDispatchAuthorityRejected,
+    _QueuedDispatchEnvelope,
+    _QueuedDispatchSettlement,
+    _QueuedDispatchSettlementState,
     copy_dispatch_handle,
     copy_dispatch_request,
     redact_dispatch_request,
@@ -192,6 +205,10 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     ExecutionProfilePolicy,
     active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
+    execution_profile_from_session_metadata,
+    unavailable_execution_profile_components,
 )
 from cayu.runtime.hooks import (
     RuntimeHook,
@@ -246,13 +263,20 @@ from cayu.runtime.sessions import (
     ModelCompletionStage,
     PendingActionQuery,
     PendingActionResultTooLarge,
+    QueuedDispatchTerminalReceipt,
+    QueuedDispatchTerminalReceiptQuery,
     ResumeRequest,
     RunRequest,
     Session,
     SessionOrder,
     SessionQuery,
+    SessionRunFenced,
     SessionStatus,
     SessionStore,
+    _checkpoint_after_queued_dispatch_acknowledgement,
+    _queued_dispatch_session_instance_fingerprint,
+    _queued_dispatch_terminal_receipts_from_checkpoint,
+    _session_run_operation_from_checkpoint,
     _SessionRunFenceContext,
     copy_fork_session_request,
     copy_incomplete_session_recovery_request,
@@ -268,6 +292,7 @@ from cayu.runtime.stop_policy import (
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -2113,11 +2138,534 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    async def _load_queued_dispatch_session_snapshot(
+        self,
+        session_id: str,
+    ) -> tuple[Session, dict[str, Any] | None]:
+        """Load session and checkpoint authority under one store-owned boundary."""
+
+        snapshot: tuple[Session, dict[str, Any] | None] | None = None
+
+        def capture_snapshot(
+            session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> None:
+            nonlocal snapshot
+            snapshot = (
+                session.model_copy(deep=True),
+                None if checkpoint is None else deepcopy(checkpoint),
+            )
+            # ``None`` is the documented read-only result for this atomic
+            # checkpoint-transform boundary.
+            return None
+
+        await self.session_store.transform_checkpoint(session_id, capture_snapshot)
+        if snapshot is None:
+            raise RuntimeError("Queued dispatch session snapshot was not produced.")
+        return snapshot
+
+    async def _load_queued_dispatch_terminal_event(
+        self,
+        *,
+        private_session_id: str,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> Event | None:
+        """Load and validate the exact terminal event bound to an envelope."""
+
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=private_session_id,
+                event_id=envelope.terminal_event_id,
+                limit=2,
+            )
+        )
+        if not records:
+            return None
+        if len(records) != 1:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal evidence is duplicated."
+            )
+        terminal_event = records[0].event
+        if (
+            terminal_event.type not in TERMINAL_EVENT_TYPES
+            or terminal_event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+            != envelope.dispatch_operation_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal evidence conflicts with its envelope."
+            )
+        return terminal_event
+
+    async def _prepare_queued_dispatch(
+        self,
+        request: DispatchRequest,
+        *,
+        queue_task_id: str,
+    ) -> _QueuedDispatchEnvelope:
+        """Freeze runtime-owned profile authority before a queue task is published."""
+
+        if type(request) is not DispatchRequest:
+            raise TypeError("Queued dispatch preparation requires a DispatchRequest.")
+        request = copy_dispatch_request(request)
+        private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
+        session, checkpoint = await self._load_queued_dispatch_session_snapshot(private_session_id)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_model_completion = await self._recovery_coordinator.load_model_completion_boundary(
+            session
+        )
+        continues_active_invocation = (
+            pending_tool_round is not None or pending_model_completion is not None
+        )
+        if active_profile is not None:
+            if not active_invocation_execution_profile_matches_session_epoch(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            ):
+                raise RuntimeError(
+                    "Active invocation execution profile conflicts with the session epoch."
+                )
+            if (
+                active_invocation_execution_profile_is_released(
+                    active_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+                and not continues_active_invocation
+            ):
+                source_profile = execution_profile_from_session_metadata(session.metadata)
+            else:
+                source_profile = active_profile.profile
+        else:
+            if continues_active_invocation:
+                raise RuntimeError(
+                    "Queued dispatch recovery has no durable active invocation execution profile."
+                )
+            if session.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+                raise RuntimeError(
+                    "A live session has no durable active invocation execution profile."
+                )
+            source_profile = execution_profile_from_session_metadata(session.metadata)
+        required_profile = source_profile
+        target_changed = request.target is not None and (
+            request.target.provider_name != session.provider_name
+            or request.target.model != session.model
+        )
+        if target_changed:
+            if continues_active_invocation:
+                raise RuntimeError(
+                    "A queued dispatch model target cannot change while model or tool "
+                    "recovery is pending."
+                )
+            source_profile = execution_profile_from_session_metadata(session.metadata)
+            required_profile = self._session_engine._queued_dispatch_target_profile(
+                session=session,
+                source_profile=source_profile,
+                target=request.target,
+            )
+        unavailable = set(unavailable_execution_profile_components(source_profile))
+        unavailable.update(unavailable_execution_profile_components(required_profile))
+        if unavailable:
+            raise RuntimeError(
+                "Queued dispatch requires an execution profile with available components: "
+                + ", ".join(
+                    component.value
+                    for component in sorted(unavailable, key=lambda item: item.value)
+                )
+            )
+        if (
+            request.structured_output is not None
+            and request.structured_output.strategy is StructuredOutputStrategy.NATIVE
+        ):
+            registered_provider = self._get_registered_provider(
+                request.target.provider_name
+                if request.target is not None
+                else session.provider_name
+            )
+            _require_native_structured_output_support(
+                request.structured_output,
+                registered_provider=registered_provider,
+            )
+        durable_request = self.redact_dispatch_request(request)
+        return _new_queued_dispatch_envelope(
+            queue_task_id=queue_task_id,
+            request=durable_request,
+            session_instance_fingerprint=(_queued_dispatch_session_instance_fingerprint(session)),
+            source_profile=source_profile,
+            required_profile=required_profile,
+        )
+
+    async def _queued_dispatch_requests_match(
+        self,
+        existing: DispatchRequest,
+        candidate: DispatchRequest,
+    ) -> bool:
+        """Compare retries by private session authority, not rotating public aliases."""
+
+        existing = copy_dispatch_request(existing)
+        candidate = copy_dispatch_request(candidate)
+        existing_session_id, _ = await self._resolve_public_session_authority(existing.session_id)
+        candidate_session_id, _ = await self._resolve_public_session_authority(candidate.session_id)
+        if existing_session_id != candidate_session_id:
+            return False
+        comparison_session_id = "cayu-equivalent-session-authority"
+        return existing.model_copy(
+            update={"session_id": comparison_session_id},
+            deep=True,
+        ) == candidate.model_copy(
+            update={"session_id": comparison_session_id},
+            deep=True,
+        )
+
+    async def _acknowledge_queued_dispatch(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+        *,
+        dispatch_status: DispatchStatus,
+        receipt: QueuedDispatchTerminalReceipt | None = None,
+    ) -> None:
+        """Release exact terminal retention after the queue outcome is durable."""
+
+        envelope = _copy_queued_dispatch_envelope(envelope)
+        if type(dispatch_status) is not DispatchStatus:
+            raise TypeError("Queued dispatch acknowledgement status has an invalid type.")
+        settlement = await self._queued_dispatch_settlement_state(envelope)
+        if settlement.state is _QueuedDispatchSettlementState.NOT_ADMITTED:
+            return
+        if settlement.state is not _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_DURABLE:
+            raise RuntimeError(
+                "Queued dispatch terminal evidence is not durable enough to acknowledge."
+            )
+        if settlement.terminal_status is not dispatch_status:
+            raise RuntimeError(
+                "Queued dispatch task status conflicts with its exact terminal event."
+            )
+        private_session_id, _ = await self._resolve_public_session_authority(
+            envelope.request.session_id
+        )
+        if receipt is not None:
+            if type(receipt) is not QueuedDispatchTerminalReceipt:
+                raise TypeError("Queued dispatch acknowledgement receipt has an invalid type.")
+            receipt = QueuedDispatchTerminalReceipt(
+                session_id=receipt.session_id,
+                queue_task_id=receipt.queue_task_id,
+                operation_id=receipt.operation_id,
+                terminal_event_id=receipt.terminal_event_id,
+            )
+            if (
+                receipt.session_id != private_session_id
+                or receipt.queue_task_id != envelope.queue_task_id
+                or receipt.operation_id != envelope.dispatch_operation_id
+                or receipt.terminal_event_id != envelope.terminal_event_id
+            ):
+                raise RuntimeError(
+                    "Queued dispatch acknowledgement receipt conflicts with its envelope."
+                )
+
+        def acknowledge(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            return _checkpoint_after_queued_dispatch_acknowledgement(
+                checkpoint,
+                queue_task_id=envelope.queue_task_id,
+                operation_id=envelope.dispatch_operation_id,
+                terminal_event_id=envelope.terminal_event_id,
+            )
+
+        await self.session_store.transform_checkpoint(private_session_id, acknowledge)
+
+    async def _list_queued_dispatch_terminal_receipts(
+        self,
+        query: QueuedDispatchTerminalReceiptQuery,
+    ) -> list[QueuedDispatchTerminalReceipt]:
+        """Delegate bounded restart discovery to the durable session store."""
+
+        return await self.session_store.list_queued_dispatch_terminal_receipts(query)
+
+    @staticmethod
+    def _queued_dispatch_terminal_ownership_released(
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> bool:
+        """Validate and classify the exact invocation generation behind a terminal event."""
+
+        try:
+            run_operation = _session_run_operation_from_checkpoint(checkpoint)
+            receipt = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint).get(
+                envelope.dispatch_operation_id
+            )
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership evidence is malformed."
+            ) from exc
+        if receipt is not None and (
+            receipt.queue_task_id != envelope.queue_task_id
+            or receipt.terminal_event_id != envelope.terminal_event_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal receipt identity conflicts."
+            )
+        terminal_run_epoch = None if receipt is None else receipt.run_epoch
+        if run_operation is not None and run_operation.operation_id == (
+            envelope.dispatch_operation_id
+        ):
+            if (
+                run_operation.queue_task_id != envelope.queue_task_id
+                or run_operation.terminal_event_id != envelope.terminal_event_id
+            ):
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch run operation identity conflicts."
+                )
+            if terminal_run_epoch not in {None, run_operation.run_epoch}:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch terminal ownership epoch conflicts."
+                )
+            terminal_run_epoch = run_operation.run_epoch
+
+        # The exact terminal event is supplied by the caller of this helper. If
+        # neither live handoff representation remains, acknowledgement already
+        # completed: terminal publication first leaves either the run marker or
+        # its receipt in the checkpoint, and only an exact durable queue outcome
+        # removes the last one. A later invocation's active profile must not
+        # become ownership evidence for that already-settled operation.
+        if terminal_run_epoch is None:
+            return True
+
+        try:
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal invocation profile is malformed."
+            ) from exc
+        if active_profile is None:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal evidence has no durable invocation profile."
+            )
+        if not active_invocation_execution_profile_matches_session_epoch(
+            active_profile,
+            session_id=session.id,
+            run_epoch=session.run_epoch,
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership conflicts with the session epoch."
+            )
+        if session.run_epoch < terminal_run_epoch:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership belongs to a future session epoch."
+            )
+        if active_profile.run_epoch < terminal_run_epoch:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal profile predates its ownership epoch."
+            )
+        if (
+            active_profile.run_epoch == terminal_run_epoch
+            and active_profile.profile != envelope.required_profile
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal profile conflicts with its envelope."
+            )
+        return session.run_epoch > terminal_run_epoch
+
+    async def _queued_dispatch_settlement_state(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> _QueuedDispatchSettlement:
+        """Classify the exact event/ownership evidence for one queued operation."""
+
+        envelope = _copy_queued_dispatch_envelope(envelope)
+        private_session_id, _ = await self._resolve_public_session_authority(
+            envelope.request.session_id
+        )
+        terminal_event = await self._load_queued_dispatch_terminal_event(
+            private_session_id=private_session_id,
+            envelope=envelope,
+        )
+        terminal_event_durable = terminal_event is not None
+
+        try:
+            session, checkpoint = await self._load_queued_dispatch_session_snapshot(
+                private_session_id
+            )
+        except KeyError as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session no longer exists."
+            ) from exc
+        if (
+            _queued_dispatch_session_instance_fingerprint(session)
+            != envelope.session_instance_fingerprint
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session instance changed."
+            )
+        try:
+            run_operation = _session_run_operation_from_checkpoint(checkpoint)
+            receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership evidence is malformed."
+            ) from exc
+        receipt = receipts.get(envelope.dispatch_operation_id)
+        if receipt is not None and (
+            receipt.queue_task_id != envelope.queue_task_id
+            or receipt.terminal_event_id != envelope.terminal_event_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal receipt identity conflicts."
+            )
+        terminal_run_epoch = None if receipt is None else receipt.run_epoch
+        if run_operation is not None and run_operation.operation_id == (
+            envelope.dispatch_operation_id
+        ):
+            if (
+                run_operation.queue_task_id != envelope.queue_task_id
+                or run_operation.terminal_event_id != envelope.terminal_event_id
+            ):
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch run operation identity conflicts."
+                )
+            if terminal_run_epoch not in {None, run_operation.run_epoch}:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch terminal ownership epoch conflicts."
+                )
+            terminal_run_epoch = run_operation.run_epoch
+            if not terminal_event_durable:
+                return _QueuedDispatchSettlement(
+                    _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_PENDING
+                )
+        if receipt is not None and not terminal_event_durable:
+            # Publication and receipt transfer can commit after the first event
+            # query. The exact receipt pins the event, so one read after observing
+            # that receipt closes the cross-store classification race.
+            terminal_event = await self._load_queued_dispatch_terminal_event(
+                private_session_id=private_session_id,
+                envelope=envelope,
+            )
+            if terminal_event is None:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch receipt has no exact durable terminal event."
+                )
+            terminal_event_durable = True
+        if terminal_event_durable:
+            assert terminal_event is not None
+            if not self._queued_dispatch_terminal_ownership_released(
+                session=session,
+                checkpoint=checkpoint,
+                envelope=envelope,
+            ):
+                return _QueuedDispatchSettlement(
+                    _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_PENDING
+                )
+            terminal_status_by_type = {
+                str(EventType.SESSION_COMPLETED): DispatchStatus.COMPLETED,
+                str(EventType.SESSION_FAILED): DispatchStatus.FAILED,
+                str(EventType.SESSION_INTERRUPTED): DispatchStatus.INTERRUPTED,
+            }
+            try:
+                terminal_status = terminal_status_by_type[terminal_event.type]
+            except KeyError:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch terminal event has no dispatch status mapping."
+                ) from None
+            return _QueuedDispatchSettlement(
+                _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_DURABLE,
+                terminal_status=terminal_status,
+            )
+        return _QueuedDispatchSettlement(_QueuedDispatchSettlementState.NOT_ADMITTED)
+
+    async def _dispatch_queued(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> AsyncIterator[Event]:
+        """Run or replay one queue-owned dispatch under its frozen profile."""
+
+        envelope = _copy_queued_dispatch_envelope(envelope)
+        request = envelope.request
+        (
+            private_session_id,
+            store_resolved_session_id,
+        ) = await self._resolve_public_session_authority(request.session_id)
+        try:
+            session, checkpoint = await self._load_queued_dispatch_session_snapshot(
+                private_session_id
+            )
+        except KeyError as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session no longer exists."
+            ) from exc
+        if (
+            _queued_dispatch_session_instance_fingerprint(session)
+            != envelope.session_instance_fingerprint
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session instance changed."
+            )
+        replay_event = await self._load_queued_dispatch_terminal_event(
+            private_session_id=private_session_id,
+            envelope=envelope,
+        )
+        if replay_event is not None:
+            if not self._queued_dispatch_terminal_ownership_released(
+                session=session,
+                checkpoint=checkpoint,
+                envelope=envelope,
+            ):
+                raise SessionRunFenced(
+                    "Queued dispatch terminal hooks or trailing cleanup still own the "
+                    "session run fence."
+                )
+            yield await self._project_emitted_event_for_public_api(replay_event)
+            return
+
+        try:
+            self._get_registered_agent(session.agent_name)
+            self._get_registered_provider(
+                request.target.provider_name
+                if request.target is not None
+                else session.provider_name
+            )
+            self._get_registered_environment_for_session(session.environment_name)
+        except KeyError as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch required runtime component is unavailable."
+            ) from exc
+
+        private_request = request.model_copy(
+            update={"session_id": private_session_id},
+            deep=True,
+        )
+        stream = self._dispatch_inline_private(
+            private_request,
+            store_resolved_session_id=store_resolved_session_id,
+            source_execution_profile=envelope.source_profile,
+            required_execution_profile=envelope.required_profile,
+            required_session_instance_fingerprint=(envelope.session_instance_fingerprint),
+            dispatch_operation_id=envelope.dispatch_operation_id,
+            dispatch_terminal_event_id=envelope.terminal_event_id,
+            queue_task_id=envelope.queue_task_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
     async def _dispatch_inline_private(
         self,
         request: DispatchRequest,
         *,
         store_resolved_session_id: str | None = None,
+        source_execution_profile: ExecutionProfileIdentity | None = None,
+        required_execution_profile: ExecutionProfileIdentity | None = None,
+        required_session_instance_fingerprint: str | None = None,
+        dispatch_operation_id: str | None = None,
+        dispatch_terminal_event_id: str | None = None,
+        queue_task_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not DispatchRequest:
             raise TypeError("Inline dispatch requires a DispatchRequest.")
@@ -2142,14 +2690,37 @@ class CayuApp:
             redactor=self._secret_redactor,
             store_resolved_session_id=store_resolved_session_id,
         )
-        start_event_payload_extra = {"dispatch_id": request.dispatch_id}
+        start_event_payload_extra: dict[str, Any] = {"dispatch_id": request.dispatch_id}
         if request.task_id is not None:
             start_event_payload_extra["task_id"] = request.task_id
+        if dispatch_operation_id is not None:
+            start_event_payload_extra.update(
+                {
+                    "dispatch_operation_id": dispatch_operation_id,
+                    "queue_task_id": queue_task_id,
+                    "source_execution_profile_fingerprint": (
+                        None
+                        if source_execution_profile is None
+                        else source_execution_profile.fingerprint
+                    ),
+                    "required_execution_profile_fingerprint": (
+                        None
+                        if required_execution_profile is None
+                        else required_execution_profile.fingerprint
+                    ),
+                }
+            )
         session_stream = self._session_engine._resume_session(
             request=resume_request,
             task_id=request.task_id,
             start_event_payload_extra=start_event_payload_extra,
             start_task_on_enter=True,
+            source_execution_profile=source_execution_profile,
+            required_execution_profile=required_execution_profile,
+            required_session_instance_fingerprint=(required_session_instance_fingerprint),
+            run_operation_id=dispatch_operation_id,
+            terminal_event_id=dispatch_terminal_event_id,
+            queue_task_id=queue_task_id,
         )
         async with _close_delegated_event_stream(session_stream) as owned_stream:
             forwarded_stream = self._session_control.stream_with_out_of_band_events(

@@ -302,6 +302,20 @@ _BASELINE_DDL = """
         ON cayu_checkpoints(session_id)
         WHERE pending_action_flags <> 0;
 
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_queued_dispatch_run
+        ON cayu_checkpoints(session_id)
+        WHERE json_type(
+            state_json,
+            '$.session_run_operation.queue_task_id'
+        ) IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_queued_dispatch_receipts
+        ON cayu_checkpoints(session_id)
+        WHERE json_type(
+            state_json,
+            '$.queued_dispatch_terminal_receipts.receipts'
+        ) IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS cayu_transcript_messages (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
@@ -1482,6 +1496,21 @@ _MIGRATION_STEPS: dict[int, str] = {
             committed_at TEXT NOT NULL,
             PRIMARY KEY (task_id, idempotency_key)
         );
+    """,
+    40: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_queued_dispatch_run
+            ON cayu_checkpoints(session_id)
+            WHERE json_type(
+                state_json,
+                '$.session_run_operation.queue_task_id'
+            ) IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_queued_dispatch_receipts
+            ON cayu_checkpoints(session_id)
+            WHERE json_type(
+                state_json,
+                '$.queued_dispatch_terminal_receipts.receipts'
+            ) IS NOT NULL;
     """,
 }
 

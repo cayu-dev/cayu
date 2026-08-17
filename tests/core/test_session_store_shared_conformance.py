@@ -19,6 +19,7 @@ from tests.core._workload_secret_support import FakeProvider
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime.sessions as sessions_module
 from cayu import (
     SQLiteSessionStore,
     TerminalSessionEvidenceError,
@@ -176,6 +177,7 @@ from cayu.runtime.sessions import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     PersistedEventSideEffectDelivery,
+    QueuedDispatchTerminalReceiptQuery,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
     _mcp_authoritative_manifest_hash,
@@ -785,6 +787,195 @@ def conformance_postgres_dsn(postgres_dsn) -> Iterator[str]:
         yield postgres_dsn
     finally:
         asyncio.run(_reset_postgres_data(postgres_dsn))
+
+
+def test_session_store_conformance_lists_queued_dispatch_terminal_receipts(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            for session_id in (
+                "queued-receipt-a",
+                "queued-receipt-b",
+                "queued-receipt-unrelated",
+            ):
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[],
+                    ),
+                    identity=_identity(),
+                )
+            await store.append_event(
+                "queued-receipt-a",
+                Event(
+                    id="terminal-a",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="queued-receipt-a",
+                    payload={"session_run_operation_id": "operation-a"},
+                ),
+            )
+            await store.checkpoint(
+                "queued-receipt-a",
+                {
+                    "session_run_operation": {
+                        "version": 1,
+                        "operation_id": "operation-a",
+                        "run_epoch": 1,
+                        "terminal_event_id": "terminal-a",
+                        "queue_task_id": "queue-a",
+                    }
+                },
+            )
+            await store.checkpoint(
+                "queued-receipt-b",
+                {
+                    "queued_dispatch_terminal_receipts": {
+                        "version": 1,
+                        "receipts": {
+                            "operation-b-1": {
+                                "queue_task_id": "queue-b-1",
+                                "terminal_event_id": "terminal-b-1",
+                                "run_epoch": 1,
+                            },
+                            "operation-b-2": {
+                                "queue_task_id": "queue-b-2",
+                                "terminal_event_id": "terminal-b-2",
+                                "run_epoch": 1,
+                            },
+                        },
+                    }
+                },
+            )
+            await store.checkpoint(
+                "queued-receipt-unrelated",
+                {"unrelated": True},
+            )
+
+            first_page = await store.list_queued_dispatch_terminal_receipts(
+                QueuedDispatchTerminalReceiptQuery(limit=2)
+            )
+            assert [(receipt.session_id, receipt.operation_id) for receipt in first_page] == [
+                ("queued-receipt-a", "operation-a"),
+                ("queued-receipt-b", "operation-b-1"),
+            ]
+
+            store = await _reopen_store(session_store_case, store)
+            second_page = await store.list_queued_dispatch_terminal_receipts(
+                QueuedDispatchTerminalReceiptQuery(
+                    after_session_id=first_page[-1].session_id,
+                    after_operation_id=first_page[-1].operation_id,
+                    limit=2,
+                )
+            )
+            assert [receipt.model_dump(mode="json") for receipt in second_page] == [
+                {
+                    "session_id": "queued-receipt-b",
+                    "queue_task_id": "queue-b-2",
+                    "operation_id": "operation-b-2",
+                    "terminal_event_id": "terminal-b-2",
+                }
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_receipt_query_does_not_serialize_mutated_input(
+    session_store_case,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = "mutated-receipt-query-diagnostic-canary"
+
+    class Canary:
+        def __repr__(self) -> str:
+            return canary
+
+        def __str__(self) -> str:
+            return canary
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            query = QueuedDispatchTerminalReceiptQuery()
+            object.__setattr__(query, "limit", Canary())
+            with pytest.raises(ValueError):
+                await store.list_queued_dispatch_terminal_receipts(query)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+    captured = capsys.readouterr()
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert all(canary not in str(record.message) for record in recwarn)
+
+
+def test_in_memory_queued_dispatch_receipt_query_uses_live_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session_id = "queued-receipt-indexed"
+        await store.create(
+            RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+            identity=_identity(),
+        )
+        await store.checkpoint(
+            session_id,
+            {
+                "session_run_operation": {
+                    "version": 1,
+                    "operation_id": "operation-indexed",
+                    "run_epoch": 1,
+                    "terminal_event_id": "terminal-indexed",
+                    "queue_task_id": "queue-indexed",
+                }
+            },
+        )
+        assert await store.list_queued_dispatch_terminal_receipts() == []
+        await store.append_event(
+            session_id,
+            Event(
+                id="terminal-indexed",
+                type=EventType.SESSION_COMPLETED,
+                session_id=session_id,
+                payload={"session_run_operation_id": "operation-indexed"},
+            ),
+        )
+        with pytest.raises(ValueError, match="receipt checkpoint is invalid"):
+            await store.checkpoint(
+                session_id,
+                {
+                    "queued_dispatch_terminal_receipts": {
+                        "version": 2,
+                        "receipts": {},
+                    }
+                },
+            )
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["session_run_operation"]["operation_id"] == "operation-indexed"
+
+        def reject_history_projection(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("receipt query rescanned checkpoint/event history")
+
+        monkeypatch.setattr(
+            sessions_module,
+            "_queued_dispatch_terminal_receipts_for_session",
+            reject_history_projection,
+        )
+        receipts = await store.list_queued_dispatch_terminal_receipts()
+        assert [(receipt.session_id, receipt.operation_id) for receipt in receipts] == [
+            (session_id, "operation-indexed")
+        ]
+
+    asyncio.run(run())
 
 
 def test_in_memory_public_authority_aliases_reject_retired_keys() -> None:

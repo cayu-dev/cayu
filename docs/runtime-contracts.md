@@ -1382,6 +1382,84 @@ Fork authority is validated again after agent registration, model and environmen
 
 `DispatchRequest` asks a `Dispatcher` to submit work for an existing session and return a `DispatchHandle`. Dispatch is separate from fork: fork decides what state a branch starts from, while dispatch decides how a session run is placed. The default `InlineDispatcher` runs immediately in the current process by resuming the target session through the normal runtime loop, then returns a completed, failed, or interrupted handle based on the terminal session event. It is useful for tests, local execution, and proving orchestration logic, but it is not durable background execution. Production apps can provide another `Dispatcher` that submits work to an external queue or hosted runtime and returns a queued/submitted handle while events are observed through the session store. `CayuApp.dispatch_inline(...)` is the explicit local streaming API for callers that want to consume ordinary `session.resumed`, model, tool, task, interrupt, and terminal session events directly. `DispatchRequest.task_id` optionally links dispatched work to a task; using it with inline execution requires `CayuApp(task_store=...)`.
 
+`TaskStoreDispatcher` binds queued work to the target session's runtime-owned
+execution profile before its task becomes claimable. Its versioned durable
+envelope contains the redacted request, queue-task and dispatch-operation
+identities, a canonical request digest, the adoption-source and governed
+profile identities, a non-reversible session-instance fingerprint, and a
+runtime-authenticated public session authority;
+caller metadata cannot supply or replace those fields. The caller-selected
+`dispatch_id` is the stable queue
+idempotency key within a dispatcher task type. Reusing it with changed request
+material or a different private session fails closed, while retained aliases
+for the same private session remain an exact retry across key rotation. A
+queued task also fails closed if its terminal target session is deleted and the
+same reusable session ID is later assigned to another invocation, even when the
+replacement has an identical execution profile. A
+worker's queue lease permits it to validate that envelope, but is not
+session-execution authority. The worker must resolve the recorded application
+components and atomically compare and freeze the profile with the session run
+epoch before environment, provider, tool, verifier, or other effect work
+begins. Missing, unavailable, malformed, or changed authority fails closed and
+never reaches governed work. Missing or unavailable producer-side authority is
+rejected before queue publication. A parseable worker-side mismatch
+terminalizes the queue task with bounded fingerprint evidence; an unparseable
+legacy or corrupted envelope uses a generic safe diagnostic because its
+claimed profile fields are not authority.
+Legacy queue payloads without a profile envelope are rejected rather than run
+under the current process configuration. Model-target changes retain the
+explicit safe-boundary transition rules described above; queued dispatch does
+not create a separate implicit adoption path.
+
+Queue lease expiry and session ownership are independent. A reclaimed worker
+cannot bypass the session run fence, and recovery retains the envelope's
+profile requirement. Each envelope also preassigns a deterministic terminal
+event identity bound to the exact request/source-profile/governed-profile/task
+and session-instance tuple. Redelivery first
+reconciles that event, but does not complete the queue task while the prior
+invocation still owns terminal hooks or trailing cleanup; it requeues until
+that ownership is released or recovered. Loss of a task-terminalization
+acknowledgement or a worker restart can then replay the durable outcome without
+invoking the provider or tools again. Terminal evidence is retained from the
+session publication until the queue task's terminal write is positively
+acknowledged; event pruning cannot remove it during that ownership handoff.
+Acknowledgement requires both the exact operation-bound terminal session event
+and a completed or failed queue task whose immutable root invocation provenance,
+envelope, operation id, source and governed profile fingerprints, and dispatch
+status agree with the target session. If an
+operator cancellation wins the queue-task terminal race, the task remains
+cancelled; its exact immutable envelope plus the independently verified terminal
+session event can release the handoff without rewriting that cancellation into a
+different task outcome. An arbitrary terminal task or peer winner is not
+acknowledgement evidence. Built-in session stores expose
+only live run/receipt markers through bounded keyset pages, allowing a restarted
+worker to repair a committed task-to-session handoff without scanning terminal
+task history. The run marker carries the queue-task identity through recovery;
+it is transferred with the exact run epoch to an event-pinning receipt only
+after exact terminal event publication and is removed only after that run epoch
+has released its trailing ownership and the exact task outcome is durable. A
+newer invocation does not become the settlement gate for an older receipt or
+for an exact retry of an already acknowledged terminal dispatch.
+`DispatchHandle.metadata`, the durable queue envelope, and task terminal
+evidence expose `dispatch_operation_id`,
+`session_instance_fingerprint`,
+`source_execution_profile_fingerprint`, and
+`required_execution_profile_fingerprint`; execution-profile decision evidence
+records the profile actually admitted. These values are hashes and contain no
+raw private session identity, prompt, schema, tool, provider configuration, or
+secret material.
+
+Schema revision 40 is a breaking queued-dispatch deployment boundary. Before
+migrating a shared session/task store, stop every revision-39-or-older dispatch
+producer and worker and drain or explicitly settle every legacy task type
+configured on any `TaskStoreDispatcher`, including the default `cayu.dispatch`
+type and every application-defined custom task type. Migrate the stores only
+after those processes are quiescent, then deploy revision-40 producers and
+workers. The revision compatibility floor rejects an old process that starts
+after migration; it cannot revoke a worker that was already running with cached
+schema state, so mixed operation and application rollback across this boundary
+are unsupported.
+
 `SubagentTool` is model-facing delegation over the same session substrate, not a
 separate runtime. It creates a new child `RunRequest` with `parent_session_id`
 set to the calling session and `causal_budget_id` inherited from the caller,

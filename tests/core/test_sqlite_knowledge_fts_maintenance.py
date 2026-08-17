@@ -30,6 +30,18 @@ async def _close(store: object) -> None:
         await close()
 
 
+def _assert_peer_writer_can_begin(db_path: Path) -> None:
+    """Prove a failed migration released SQLite's writer lock at any schema revision."""
+
+    peer = sqlite_support.connect(db_path)
+    try:
+        peer.execute("PRAGMA busy_timeout = 100")
+        peer.execute("BEGIN IMMEDIATE")
+        peer.commit()
+    finally:
+        peer.close()
+
+
 def _chunks(entry_id: str, *texts: str) -> list[KnowledgeChunk]:
     return [
         KnowledgeChunk(
@@ -536,16 +548,7 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
         assert not connection.in_transaction
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 36
 
-        peer = SQLiteSessionStore(db_path)
-        try:
-            asyncio.run(
-                peer.create(
-                    RunRequest(agent_name="agent", session_id=f"peer-{failure}", messages=[]),
-                    identity=SessionIdentity(provider_name="fake", model="fake-model"),
-                )
-            )
-        finally:
-            asyncio.run(_close(peer))
+        _assert_peer_writer_can_begin(db_path)
 
         sqlite_support.reconcile_schema(
             boundary,  # type: ignore[arg-type]
@@ -672,17 +675,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
     finally:
         check.close()
 
-    peer = SQLiteSessionStore(db_path)
-    try:
-        peer._connection.execute("PRAGMA busy_timeout = 100")
-        asyncio.run(
-            peer.create(
-                RunRequest(agent_name="agent", session_id="peer-after-rollback", messages=[]),
-                identity=SessionIdentity(provider_name="fake", model="fake-model"),
-            )
-        )
-    finally:
-        asyncio.run(_close(peer))
+    _assert_peer_writer_can_begin(db_path)
 
     retry = sqlite_support.connect(db_path)
     try:

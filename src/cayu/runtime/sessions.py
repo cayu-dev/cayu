@@ -63,6 +63,7 @@ from cayu.core.events import (
     copy_event,
     event_payload_authority_is_runtime_generated,
     event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
 from cayu.core.messages import (
@@ -2018,6 +2019,30 @@ class Session(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+def _queued_dispatch_session_instance_fingerprint(session: Session) -> str:
+    """Identify one durable session creation without exposing invocation origin data."""
+
+    if type(session) is not Session:
+        raise TypeError("Queued dispatch session identity requires a Session.")
+    created_at = session.created_at
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("Queued dispatch session creation time must be timezone-aware.")
+    material = {
+        "record_type": "cayu.queued-dispatch-session-instance",
+        "schema_version": 1,
+        "session_id": session.id,
+        "parent_session_id": session.parent_session_id,
+        "causal_budget_id": session.causal_budget_id,
+        "created_at": created_at.astimezone(UTC).isoformat(),
+        "root_invocation_id": session.invocation.root_invocation_id,
+        "root_session_id": session.invocation.root_session_id,
+        "source": session.invocation.source.value,
+    }
+    return sha256(
+        canonical_durable_json_bytes(material, "queued_dispatch.session_instance")
+    ).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class _SessionCreateMaterial:
     agent_name: str
@@ -3947,6 +3972,53 @@ class SessionQuery(BaseModel):
     @classmethod
     def copy_query_label_selectors(cls, value) -> tuple[LabelSelectorRequirement, ...]:
         return copy_label_selector_requirements(value)
+
+
+class QueuedDispatchTerminalReceipt(BaseModel):
+    """Exact session-side handoff awaiting queue-task acknowledgement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: str
+    queue_task_id: str
+    operation_id: str
+    terminal_event_id: str
+
+    @field_validator(
+        "session_id",
+        "queue_task_id",
+        "operation_id",
+        "terminal_event_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if info.field_name == "terminal_event_id" and len(value) > EVENT_ID_MAX_CHARS:
+            raise ValueError("terminal_event_id is too long.")
+        return value
+
+
+class QueuedDispatchTerminalReceiptQuery(BaseModel):
+    """Bounded keyset query for live queued-dispatch handoffs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    after_session_id: str | None = None
+    after_operation_id: str | None = None
+    limit: StrictInt = Field(default=100, ge=1, le=1000)
+
+    @field_validator("after_session_id", "after_operation_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def require_complete_cursor(self) -> QueuedDispatchTerminalReceiptQuery:
+        if (self.after_session_id is None) != (self.after_operation_id is None):
+            raise ValueError("Queued dispatch receipt cursor fields must be supplied together.")
+        return self
 
 
 MAX_AGGREGATE_LABEL_FILTERS = 50
@@ -7344,6 +7416,16 @@ class SessionStore(ABC):
         their checkpoints individually is not an acceptable implementation.
         """
 
+    async def list_queued_dispatch_terminal_receipts(
+        self,
+        query: QueuedDispatchTerminalReceiptQuery | None = None,
+    ) -> list[QueuedDispatchTerminalReceipt]:
+        """List bounded live queue/session handoffs for restart reconciliation."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support queued dispatch receipt discovery."
+        )
+
     @abstractmethod
     async def query_pending_actions(
         self,
@@ -7714,6 +7796,16 @@ class InMemorySessionStore(SessionStore):
         self._transcript_indices_by_interaction: dict[str, dict[str | None, list[int]]] = {}
         self._deferred_interaction_inputs: dict[str, tuple[str, list[Message]]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
+        # Live queued-dispatch handoffs are indexed incrementally so restart
+        # reconciliation is bounded by the requested page, not by historical
+        # sessions or events.
+        self._queued_dispatch_terminal_receipts: dict[
+            tuple[str, str], QueuedDispatchTerminalReceipt
+        ] = {}
+        self._queued_dispatch_terminal_receipt_keys: list[tuple[str, str]] = []
+        self._queued_dispatch_terminal_receipt_keys_by_session: dict[
+            str, tuple[tuple[str, str], ...]
+        ] = {}
         self._session_operation_records: dict[str, dict[str, dict[str, Any]]] = {}
         self._mcp_manifest_baselines: dict[str, McpManifestBaseline] = {}
         self._pending_action_session_ids: set[str] = set()
@@ -7873,6 +7965,10 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         prepared: _PreparedInMemoryCheckpointStore,
     ) -> None:
+        self._refresh_queued_dispatch_terminal_receipts_unlocked(
+            session_id,
+            prepared.checkpoint,
+        )
         self._checkpoints[session_id] = prepared.checkpoint
         if prepared.has_pending_action:
             if prepared.rebuilt_records is not None:
@@ -7897,6 +7993,52 @@ class InMemorySessionStore(SessionStore):
                 None,
                 None,
             )
+
+    def _refresh_queued_dispatch_terminal_receipts_unlocked(
+        self,
+        session_id: str,
+        checkpoint: dict[str, Any] | None,
+    ) -> None:
+        previous_keys = self._queued_dispatch_terminal_receipt_keys_by_session.get(session_id, ())
+        previous_key_set = set(previous_keys)
+        receipts = _queued_dispatch_terminal_receipts_for_session(
+            session_id,
+            checkpoint,
+            durable_event_ids=self._event_ids.get(session_id, set()),
+        )
+        next_receipts: dict[tuple[str, str], QueuedDispatchTerminalReceipt] = {}
+        for receipt in receipts:
+            key = (receipt.session_id, receipt.operation_id)
+            if key in next_receipts:
+                raise RuntimeError("Duplicate in-memory queued dispatch receipt identity.")
+            if key in self._queued_dispatch_terminal_receipts and key not in previous_key_set:
+                raise RuntimeError("Duplicate in-memory queued dispatch receipt identity.")
+            next_receipts[key] = receipt.model_copy(deep=True)
+
+        previous_indices: list[tuple[int, tuple[str, str]]] = []
+        for key in previous_keys:
+            index = bisect_left(self._queued_dispatch_terminal_receipt_keys, key)
+            if (
+                index >= len(self._queued_dispatch_terminal_receipt_keys)
+                or self._queued_dispatch_terminal_receipt_keys[index] != key
+                or key not in self._queued_dispatch_terminal_receipts
+            ):
+                raise RuntimeError("In-memory queued dispatch receipt index is inconsistent.")
+            previous_indices.append((index, key))
+
+        self._queued_dispatch_terminal_receipt_keys_by_session.pop(session_id, None)
+        for index, key in reversed(previous_indices):
+            self._queued_dispatch_terminal_receipt_keys.pop(index)
+            del self._queued_dispatch_terminal_receipts[key]
+
+        next_keys: list[tuple[str, str]] = []
+        for key in sorted(next_receipts):
+            index = bisect_left(self._queued_dispatch_terminal_receipt_keys, key)
+            self._queued_dispatch_terminal_receipt_keys.insert(index, key)
+            self._queued_dispatch_terminal_receipts[key] = next_receipts[key]
+            next_keys.append(key)
+        if next_keys:
+            self._queued_dispatch_terminal_receipt_keys_by_session[session_id] = tuple(next_keys)
 
     def _store_checkpoint_unlocked(self, session_id: str, checkpoint: dict[str, Any]) -> None:
         prepared = self._prepare_checkpoint_store_unlocked(session_id, checkpoint)
@@ -8406,6 +8548,14 @@ class InMemorySessionStore(SessionStore):
                     "Cannot delete a session while terminal publication "
                     f"{run_operation.operation_id} is incomplete: {session_id}"
                 )
+            queued_terminal_receipts = _queued_dispatch_terminal_receipts_from_checkpoint(
+                checkpoint
+            )
+            if queued_terminal_receipts:
+                raise ValueError(
+                    "Cannot delete a session while queued dispatch terminal "
+                    f"acknowledgement is incomplete: {session_id}"
+                )
             evidence_events: list[Event] = []
             for record in reversed(self._session_event_records.get(session_id, [])):
                 if record.event.type not in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES:
@@ -8489,6 +8639,7 @@ class InMemorySessionStore(SessionStore):
             self._transcript_interaction_ids.pop(session_id, None)
             self._transcript_indices_by_interaction.pop(session_id, None)
             self._deferred_interaction_inputs.pop(session_id, None)
+            self._refresh_queued_dispatch_terminal_receipts_unlocked(session_id, None)
             self._checkpoints.pop(session_id, None)
             self._session_operation_records.pop(session_id, None)
             self._pending_action_session_ids.discard(session_id)
@@ -9399,6 +9550,10 @@ class InMemorySessionStore(SessionStore):
             }
         )
         self._next_event_sequence = prepared.next_sequence
+        self._refresh_queued_dispatch_terminal_receipts_unlocked(
+            session_id,
+            self._checkpoints.get(session_id),
+        )
         if not prepared.events:
             return session
         return session.model_copy(update={"last_activity_at": activity_at or datetime.now(UTC)})
@@ -11505,6 +11660,38 @@ class InMemorySessionStore(SessionStore):
     ) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=True)
 
+    async def list_queued_dispatch_terminal_receipts(
+        self,
+        query: QueuedDispatchTerminalReceiptQuery | None = None,
+    ) -> list[QueuedDispatchTerminalReceipt]:
+        if query is None:
+            query = QueuedDispatchTerminalReceiptQuery()
+        elif type(query) is not QueuedDispatchTerminalReceiptQuery:
+            raise TypeError(
+                "Queued dispatch receipt queries must be "
+                "QueuedDispatchTerminalReceiptQuery instances."
+            )
+        else:
+            query = QueuedDispatchTerminalReceiptQuery(
+                after_session_id=query.after_session_id,
+                after_operation_id=query.after_operation_id,
+                limit=query.limit,
+            )
+        cursor: tuple[str, str] | None = None
+        if query.after_session_id is not None:
+            assert query.after_operation_id is not None
+            cursor = (query.after_session_id, query.after_operation_id)
+        async with self._lock:
+            start = (
+                0
+                if cursor is None
+                else bisect_right(self._queued_dispatch_terminal_receipt_keys, cursor)
+            )
+            keys = self._queued_dispatch_terminal_receipt_keys[start : start + query.limit]
+            return [
+                self._queued_dispatch_terminal_receipts[key].model_copy(deep=True) for key in keys
+            ]
+
     async def query_pending_actions(
         self,
         query: PendingActionQuery | None = None,
@@ -11852,6 +12039,7 @@ class InMemorySessionStore(SessionStore):
             self._transcript_indices_by_interaction.pop(session_id, None)
             self._deferred_interaction_inputs.pop(session_id, None)
             if checkpoint is None:
+                self._refresh_queued_dispatch_terminal_receipts_unlocked(session_id, None)
                 self._checkpoints.pop(session_id, None)
             else:
                 self._store_checkpoint_unlocked(session_id, checkpoint)
@@ -18133,11 +18321,21 @@ def _checkpoint_after_initial_transcript_publication(
 
 _SESSION_RUN_OPERATION_CHECKPOINT_KEY = "session_run_operation"
 _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY = SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY = "queued_dispatch_terminal_receipts"
 
 
 @dataclass(frozen=True)
 class _SessionRunOperation:
     operation_id: str
+    run_epoch: int
+    terminal_event_id: str | None = None
+    queue_task_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _QueuedDispatchTerminalReceiptIdentity:
+    queue_task_id: str
+    terminal_event_id: str
     run_epoch: int
 
 
@@ -18157,10 +18355,205 @@ def _session_run_operation_from_checkpoint(
     run_epoch = marker.get("run_epoch")
     if type(run_epoch) is not int or run_epoch < 1 or run_epoch > MAX_DURABLE_JSON_INTEGER:
         raise ValueError("Session run operation checkpoint run_epoch is invalid.")
+    terminal_event_id = marker.get("terminal_event_id")
+    if terminal_event_id is not None:
+        terminal_event_id = require_clean_nonblank(
+            terminal_event_id,
+            "session_run_operation.terminal_event_id",
+        )
+        if len(terminal_event_id) > EVENT_ID_MAX_CHARS:
+            raise ValueError("Session run operation terminal_event_id is too long.")
+    queue_task_id = marker.get("queue_task_id")
+    if queue_task_id is not None:
+        queue_task_id = require_clean_nonblank(
+            queue_task_id,
+            "session_run_operation.queue_task_id",
+        )
+    if queue_task_id is not None and terminal_event_id is None:
+        raise ValueError("Session run operation queue_task_id requires a terminal_event_id.")
     return _SessionRunOperation(
         operation_id=operation_id,
         run_epoch=run_epoch,
+        terminal_event_id=terminal_event_id,
+        queue_task_id=queue_task_id,
     )
+
+
+def _queued_dispatch_terminal_receipts_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, _QueuedDispatchTerminalReceiptIdentity]:
+    """Parse terminal evidence retained until its queue task is acknowledged."""
+
+    if checkpoint is None or _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY not in checkpoint:
+        return {}
+    marker = checkpoint[_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY]
+    if type(marker) is not dict or set(marker) != {"version", "receipts"}:
+        raise ValueError("Queued dispatch terminal receipt checkpoint is invalid.")
+    if marker.get("version") != 1 or type(marker.get("receipts")) is not dict:
+        raise ValueError("Queued dispatch terminal receipt checkpoint is invalid.")
+    receipts: dict[str, _QueuedDispatchTerminalReceiptIdentity] = {}
+    for operation_id, receipt in marker["receipts"].items():
+        operation_id = require_clean_nonblank(
+            operation_id,
+            "queued_dispatch_terminal_receipt.operation_id",
+        )
+        if type(receipt) is not dict or set(receipt) != {
+            "queue_task_id",
+            "terminal_event_id",
+            "run_epoch",
+        }:
+            raise ValueError("Queued dispatch terminal receipt is invalid.")
+        queue_task_id = require_clean_nonblank(
+            receipt.get("queue_task_id"),
+            "queued_dispatch_terminal_receipt.queue_task_id",
+        )
+        terminal_event_id = require_clean_nonblank(
+            receipt.get("terminal_event_id"),
+            "queued_dispatch_terminal_receipt.terminal_event_id",
+        )
+        if len(terminal_event_id) > EVENT_ID_MAX_CHARS:
+            raise ValueError("Queued dispatch terminal receipt event identity is too long.")
+        run_epoch = receipt.get("run_epoch")
+        if type(run_epoch) is not int or run_epoch < 1 or run_epoch > MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("Queued dispatch terminal receipt run_epoch is invalid.")
+        receipts[operation_id] = _QueuedDispatchTerminalReceiptIdentity(
+            queue_task_id=queue_task_id,
+            terminal_event_id=terminal_event_id,
+            run_epoch=run_epoch,
+        )
+    return receipts
+
+
+def _queued_dispatch_terminal_receipts_for_session(
+    session_id: str,
+    checkpoint: dict[str, Any] | None,
+    *,
+    durable_event_ids: set[str],
+) -> list[QueuedDispatchTerminalReceipt]:
+    """Project all exact live queue/session handoffs from one checkpoint."""
+
+    session_id = require_clean_nonblank(session_id, "session_id")
+    projected: dict[str, QueuedDispatchTerminalReceipt] = {}
+    run_operation = _session_run_operation_from_checkpoint(checkpoint)
+    if (
+        run_operation is not None
+        and run_operation.queue_task_id is not None
+        and run_operation.terminal_event_id is not None
+        and run_operation.terminal_event_id in durable_event_ids
+    ):
+        projected[run_operation.operation_id] = QueuedDispatchTerminalReceipt(
+            session_id=session_id,
+            queue_task_id=run_operation.queue_task_id,
+            operation_id=run_operation.operation_id,
+            terminal_event_id=run_operation.terminal_event_id,
+        )
+    for operation_id, receipt in _queued_dispatch_terminal_receipts_from_checkpoint(
+        checkpoint
+    ).items():
+        candidate = QueuedDispatchTerminalReceipt(
+            session_id=session_id,
+            queue_task_id=receipt.queue_task_id,
+            operation_id=operation_id,
+            terminal_event_id=receipt.terminal_event_id,
+        )
+        existing = projected.get(operation_id)
+        if existing is not None and existing != candidate:
+            raise RuntimeError("Queued dispatch terminal handoff identity conflicts.")
+        projected[operation_id] = candidate
+    return list(projected.values())
+
+
+def _checkpoint_after_session_run_operation_cleanup(
+    checkpoint: dict[str, Any] | None,
+    *,
+    operation: _SessionRunOperation,
+    retain_terminal_receipt: bool,
+) -> dict[str, Any]:
+    """Clear run ownership and optionally transfer terminal retention to the queue."""
+
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
+    if not retain_terminal_receipt or operation.terminal_event_id is None:
+        return updated
+    receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+    if operation.queue_task_id is None:
+        return updated
+    receipt = _QueuedDispatchTerminalReceiptIdentity(
+        queue_task_id=operation.queue_task_id,
+        terminal_event_id=operation.terminal_event_id,
+        run_epoch=operation.run_epoch,
+    )
+    existing = receipts.get(operation.operation_id)
+    if existing not in {None, receipt}:
+        raise RuntimeError("Queued dispatch terminal receipt identity conflicts.")
+    receipts[operation.operation_id] = receipt
+    updated[_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY] = {
+        "version": 1,
+        "receipts": {
+            operation_id: {
+                "queue_task_id": stored_receipt.queue_task_id,
+                "terminal_event_id": stored_receipt.terminal_event_id,
+                "run_epoch": stored_receipt.run_epoch,
+            }
+            for operation_id, stored_receipt in receipts.items()
+        },
+    }
+    return updated
+
+
+def _checkpoint_after_queued_dispatch_acknowledgement(
+    checkpoint: dict[str, Any] | None,
+    *,
+    queue_task_id: str,
+    operation_id: str,
+    terminal_event_id: str,
+) -> dict[str, Any] | None:
+    """Release exact queue-owned terminal retention after task terminalization."""
+
+    queue_task_id = require_clean_nonblank(queue_task_id, "dispatch queue_task_id")
+    operation_id = require_clean_nonblank(operation_id, "dispatch operation_id")
+    terminal_event_id = require_clean_nonblank(
+        terminal_event_id,
+        "dispatch terminal_event_id",
+    )
+    current_operation = _session_run_operation_from_checkpoint(checkpoint)
+    receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+    receipt = receipts.get(operation_id)
+    if receipt is not None and (
+        receipt.queue_task_id != queue_task_id or receipt.terminal_event_id != terminal_event_id
+    ):
+        raise RuntimeError("Queued dispatch terminal receipt identity conflicts.")
+    if current_operation is not None and current_operation.operation_id == operation_id:
+        if (
+            current_operation.queue_task_id != queue_task_id
+            or current_operation.terminal_event_id != terminal_event_id
+        ):
+            raise RuntimeError("Queued dispatch run operation identity conflicts.")
+    elif receipt is None:
+        return None
+
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    if current_operation is not None and current_operation.operation_id == operation_id:
+        updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
+    if receipt is not None:
+        receipts.pop(operation_id)
+        if receipts:
+            updated[_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY] = {
+                "version": 1,
+                "receipts": {
+                    stored_operation_id: {
+                        "queue_task_id": stored_receipt.queue_task_id,
+                        "terminal_event_id": stored_receipt.terminal_event_id,
+                        "run_epoch": stored_receipt.run_epoch,
+                    }
+                    for stored_operation_id, stored_receipt in receipts.items()
+                },
+            }
+        else:
+            updated.pop(_QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY, None)
+    # ``transform_checkpoint`` reserves ``None`` for a read-only callback, so an
+    # empty object is the required mutation that clears the final receipt.
+    return updated
 
 
 def _checkpoint_with_session_run_operation(
@@ -18168,24 +18561,56 @@ def _checkpoint_with_session_run_operation(
     checkpoint: dict[str, Any] | None,
     current_session: Session,
     operation_id: str,
+    terminal_event_id: str | None = None,
+    queue_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Record the next running epoch in the same transaction as its status claim."""
     operation_id = require_clean_nonblank(operation_id, "session run operation_id")
+    if terminal_event_id is not None:
+        terminal_event_id = require_clean_nonblank(
+            terminal_event_id,
+            "session run terminal_event_id",
+        )
+        if len(terminal_event_id) > EVENT_ID_MAX_CHARS:
+            raise ValueError("Session run terminal_event_id is too long.")
+    if queue_task_id is not None:
+        queue_task_id = require_clean_nonblank(
+            queue_task_id,
+            "session run queue_task_id",
+        )
+        if terminal_event_id is None:
+            raise ValueError("Session run queue_task_id requires a terminal_event_id.")
     existing_operation = _session_run_operation_from_checkpoint(checkpoint)
     if existing_operation is not None:
         raise RuntimeError(
             "Session has incomplete terminal evidence for its previous run. "
             "Recover the session before starting another run."
         )
+    if queue_task_id is not None:
+        receipt = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint).get(operation_id)
+        if receipt is not None:
+            if (
+                receipt.queue_task_id != queue_task_id
+                or receipt.terminal_event_id != terminal_event_id
+            ):
+                raise RuntimeError("Queued dispatch terminal receipt identity conflicts.")
+            raise SessionRunFenced(
+                "Queued dispatch terminal evidence is awaiting queue acknowledgement."
+            )
     next_run_epoch = current_session.run_epoch + 1
     if next_run_epoch > MAX_DURABLE_JSON_INTEGER:
         raise ValueError("Session run operation run_epoch exceeds the durable integer limit.")
     updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    updated[_SESSION_RUN_OPERATION_CHECKPOINT_KEY] = {
+    marker: dict[str, Any] = {
         "version": 1,
         "operation_id": operation_id,
         "run_epoch": next_run_epoch,
     }
+    if terminal_event_id is not None:
+        marker["terminal_event_id"] = terminal_event_id
+    if queue_task_id is not None:
+        marker["queue_task_id"] = queue_task_id
+    updated[_SESSION_RUN_OPERATION_CHECKPOINT_KEY] = marker
     return updated
 
 
@@ -18773,7 +19198,12 @@ def _event_with_session_run_operation(
     if existing_operation_id not in {None, operation.operation_id}:
         raise ValueError("Terminal event carries a conflicting session run operation identity.")
     payload[_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = operation.operation_id
-    bound = event.model_copy(update={"payload": payload}, deep=True)
+    updates: dict[str, Any] = {"payload": payload}
+    if operation.terminal_event_id is not None:
+        updates["id"] = operation.terminal_event_id
+    bound = event.model_copy(update=updates, deep=True)
+    if operation.terminal_event_id is not None:
+        bound = event_with_runtime_generated_id(bound)
     return event_with_runtime_payload_authority(
         bound,
         _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,

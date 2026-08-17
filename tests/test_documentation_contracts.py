@@ -251,7 +251,22 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "revision 39" not in v0_2_1
 
     assert "Breaking schema revision 39" in unreleased
-    assert "confirm revision 39 before starting current workers" in unreleased
+    assert "Breaking schema revision 40" in unreleased
+    assert "confirm revision 40 before starting current workers" in unreleased
+    assert "through revision 40 before deploying them" in unreleased
+
+
+def test_queued_dispatch_revision_40_migration_covers_custom_task_types() -> None:
+    for document in ("release-notes.md", "runtime-contracts.md"):
+        migration_contract = " ".join(
+            (_REPO_ROOT / "docs" / document).read_text(encoding="utf-8").split()
+        )
+        for required in (
+            "every legacy task type configured on any `TaskStoreDispatcher`",
+            "the default `cayu.dispatch` type",
+            "every application-defined custom task type",
+        ):
+            assert required in migration_contract
 
 
 def test_project_server_command_is_release_visible_and_fail_closed() -> None:

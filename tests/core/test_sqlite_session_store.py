@@ -1905,7 +1905,10 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     with pytest.raises(
@@ -2036,6 +2039,27 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     assert retention_guard == ("cayu_protect_undelivered_event_side_effects",)
 
 
+def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -> None:
+    db_path = tmp_path / "pre-profiled-dispatch.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 40")
+        connection.execute("DROP INDEX idx_cayu_checkpoints_queued_dispatch_run")
+        connection.execute("DROP INDEX idx_cayu_checkpoints_queued_dispatch_receipts")
+        connection.execute("PRAGMA user_version = 39")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
 def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_path):
     # Revision 26 intentionally refuses to infer interaction attribution for
     # populated prerelease databases, including databases that start farther back.
@@ -2063,7 +2087,7 @@ def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2109,7 +2133,7 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2185,7 +2209,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 36"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2652,6 +2676,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (37, 37),
         (38, 37),
         (39, 39),
+        (40, 40),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

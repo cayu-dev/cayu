@@ -5,11 +5,12 @@ Usage:
     PYTHONPATH=src .venv/bin/python examples/dispatch_worker.py
 
 API-key-free. Shows the producer/consumer split of ``TaskStoreDispatcher``: ``app.dispatch()``
-ENQUEUES dispatched work as a claimable task instead of running it inline, and a separate
-worker claims it (atomically — ``PostgresTaskStore`` uses ``FOR UPDATE SKIP LOCKED``) and runs
-it through the resume path. Backed here by ``InMemoryTaskStore`` (single process); inject a
-``PostgresTaskStore`` for a distributed worker pool. ``dispatcher.run_worker(app, ...)`` is the
-long-running loop form of the single ``process_next`` call shown below.
+ENQUEUES dispatched work as a claimable, execution-profile-bound task instead of running it
+inline. A separately constructed worker application claims it (atomically —
+``PostgresTaskStore`` uses ``FOR UPDATE SKIP LOCKED``), resolves the recorded profile, and runs
+it through the resume path. Backed here by in-memory stores (single process); inject Postgres
+stores for a distributed worker pool. ``dispatcher.run_worker(app, ...)`` is the long-running
+loop form of the single ``process_next`` call shown below.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from cayu import (
     AgentSpec,
     CayuApp,
     DispatchRequest,
+    InMemorySessionStore,
     InMemoryTaskStore,
     Message,
     RunRequest,
@@ -38,18 +40,20 @@ class FakeProvider(ModelProvider):
 
 
 async def main() -> None:
+    sessions = InMemorySessionStore()
     tasks = InMemoryTaskStore()
     dispatcher = TaskStoreDispatcher(tasks)
-    app = CayuApp(
+    producer = CayuApp(
+        session_store=sessions,
         task_store=tasks,
         dispatcher=dispatcher,
         enable_logging=False,
     )
-    app.register_provider(FakeProvider(), default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    producer.register_provider(FakeProvider(), default=True)
+    producer.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     # A dispatch resumes an existing session, so create one first by running it once.
-    async for _ in app.run(
+    async for _ in producer.run(
         RunRequest(
             agent_name="assistant",
             session_id="sess_demo",
@@ -59,7 +63,7 @@ async def main() -> None:
         pass
 
     # PRODUCER: enqueue dispatched work — returns a handle immediately without running it.
-    handle = await app.dispatch(
+    handle = await producer.dispatch(
         DispatchRequest(
             session_id="sess_demo",
             messages=[Message.text("user", "do the queued follow-up")],
@@ -68,17 +72,33 @@ async def main() -> None:
     queue_task_id = handle.metadata["queue_task_id"]
     pending = await tasks.load_task(queue_task_id)
     assert pending is not None
-    print("submitted", handle.dispatch_id, handle.status, "queued_task=", pending.status)
+    print(
+        "submitted",
+        handle.dispatch_id,
+        handle.status,
+        "queued_task=",
+        pending.status,
+        "profile=",
+        handle.metadata["required_execution_profile_fingerprint"],
+    )
 
-    # CONSUMER: a worker claims the next queued dispatch and runs it to completion.
-    result = await dispatcher.process_next(app, worker_id="worker_a")
+    # CONSUMER: a separately constructed worker must declare the same executable profile.
+    worker = CayuApp(
+        session_store=sessions,
+        task_store=tasks,
+        dispatcher=dispatcher,
+        enable_logging=False,
+    )
+    worker.register_provider(FakeProvider(), default=True)
+    worker.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    result = await dispatcher.process_next(worker, worker_id="worker_a")
     assert result is not None
     done = await tasks.load_task(queue_task_id)
     assert done is not None
     print("processed", result.dispatch_id, result.status, "queued_task=", done.status)
 
     # The queue is now empty.
-    print("drained", await dispatcher.process_next(app, worker_id="worker_a"))
+    print("drained", await dispatcher.process_next(worker, worker_id="worker_a"))
 
 
 if __name__ == "__main__":

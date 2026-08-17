@@ -171,6 +171,16 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         WHERE pending_action_flags <> 0
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_queued_dispatch_run
+        ON cayu_checkpoints(session_id COLLATE "C")
+        WHERE state #> '{session_run_operation,queue_task_id}' IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_queued_dispatch_receipts
+        ON cayu_checkpoints(session_id COLLATE "C")
+        WHERE state #> '{queued_dispatch_terminal_receipts,receipts}' IS NOT NULL
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_transcript_messages (
         sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,

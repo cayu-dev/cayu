@@ -206,6 +206,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     _activate_session_interaction,
     _activate_session_run_fence,
+    _checkpoint_after_session_run_operation_cleanup,
     _checkpoint_with_session_run_operation,
     _current_session_run_epoch,
     _deactivate_session_interaction,
@@ -9189,6 +9190,7 @@ class RecoveryCoordinator:
                 await self._clear_session_run_operation(
                     session_id=finalized.id,
                     operation=run_operation,
+                    terminal_evidence_durable=True,
                 )
 
     async def recover_incomplete_session(
@@ -9993,6 +9995,7 @@ class RecoveryCoordinator:
                 session_id=session.id,
                 operation=inspection.run_operation,
                 required_claim_id=claim_id,
+                terminal_evidence_durable=True,
             )
 
         if terminal_event is not None:
@@ -10045,10 +10048,14 @@ class RecoveryCoordinator:
             operation_identity = run_operation.operation_id
         else:
             operation_identity = f"run_epoch:{terminal_run_epoch}"
-        event_id = str(
-            uuid5(
-                _TERMINAL_EVIDENCE_REPAIR_NAMESPACE,
-                f"{session.id}\0{operation_identity}\0{session.status.value}",
+        event_id = (
+            run_operation.terminal_event_id
+            if run_operation is not None and run_operation.terminal_event_id is not None
+            else str(
+                uuid5(
+                    _TERMINAL_EVIDENCE_REPAIR_NAMESPACE,
+                    f"{session.id}\0{operation_identity}\0{session.status.value}",
+                )
             )
         )
         if session.status == SessionStatus.COMPLETED:
@@ -10186,6 +10193,7 @@ class RecoveryCoordinator:
         session_id: str,
         operation: _SessionRunOperation,
         required_claim_id: str | None = None,
+        terminal_evidence_durable: bool = False,
     ) -> None:
         def clear_operation(
             _session: Session,
@@ -10204,9 +10212,11 @@ class RecoveryCoordinator:
                     raise _IncompleteRecoveryClaimLost(
                         "Terminal evidence recovery ownership changed before run cleanup."
                     )
-            updated = copy_json_value(checkpoint, "checkpoint")
-            updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY)
-            return updated
+            return _checkpoint_after_session_run_operation_cleanup(
+                checkpoint,
+                operation=operation,
+                retain_terminal_receipt=terminal_evidence_durable,
+            )
 
         await self._session_store.transform_checkpoint(session_id, clear_operation)
 
@@ -11478,11 +11488,16 @@ def _checkpoint_with_rebased_session_run_operation(
             "Session run operation belongs to a future run epoch and cannot be recovered."
         )
     updated = copy_json_value(checkpoint, "checkpoint")
-    updated[_SESSION_RUN_OPERATION_CHECKPOINT_KEY] = {
+    marker: dict[str, Any] = {
         "version": 1,
         "operation_id": operation.operation_id,
         "run_epoch": run_epoch,
     }
+    if operation.terminal_event_id is not None:
+        marker["terminal_event_id"] = operation.terminal_event_id
+    if operation.queue_task_id is not None:
+        marker["queue_task_id"] = operation.queue_task_id
+    updated[_SESSION_RUN_OPERATION_CHECKPOINT_KEY] = marker
     return updated
 
 

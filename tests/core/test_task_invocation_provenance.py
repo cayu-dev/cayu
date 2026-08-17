@@ -380,7 +380,7 @@ def test_sqlite_revision_thirty_nine_rejects_populated_task_database(tmp_path) -
     asyncio.run(create())
     connection = sqlite3.connect(database)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 39")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 39")
         connection.execute("PRAGMA user_version = 38")
         connection.commit()
     finally:

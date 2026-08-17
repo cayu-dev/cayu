@@ -148,6 +148,24 @@ def test_revision_thirty_eight_adds_idempotent_task_terminalization_receipts() -
         )
 
 
+def test_revision_forty_indexes_queued_dispatch_terminal_handoffs() -> None:
+    revision = m.revision(40)
+    state = m.SchemaState(
+        revision=revision.revision,
+        compatible_from=revision.compatible_from,
+    )
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 40"):
+        m.validate(state, app_latest=39, app_min_supported=39)
+    m.validate(state, app_latest=40, app_min_supported=40)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 40"):
+        m.validate(
+            m.SchemaState(revision=39, compatible_from=39),
+            app_latest=40,
+            app_min_supported=40,
+        )
+
+
 def test_revision_thirty_six_requires_session_invocation_provenance() -> None:
     revision = m.revision(36)
     state = m.SchemaState(

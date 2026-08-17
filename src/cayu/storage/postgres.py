@@ -164,6 +164,8 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    QueuedDispatchTerminalReceipt,
+    QueuedDispatchTerminalReceiptQuery,
     RunnerObservedEventIdentity,
     RunRequest,
     RuntimePublicationReceipt,
@@ -264,6 +266,7 @@ from cayu.runtime.sessions import (
     _PreparedRuntimePublication,
     _project_interruption_cascade_marker_fields,
     _public_authority_alias_store_key,
+    _queued_dispatch_terminal_receipts_from_checkpoint,
     _queued_session_message_event_payload,
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
@@ -443,7 +446,8 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 36
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 40
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 40
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -2156,6 +2160,43 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
                 "WHERE status = 'pending' AND session_id IS NULL"
             ),
             drop_statement=("DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_tasks_claim_availability"),
+        ),
+    ),
+    40: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_checkpoints_queued_dispatch_run",
+            table_name="cayu_checkpoints",
+            key_definitions=("session_id",),
+            predicate_definition=("state #> '{session_run_operation,queue_task_id}' IS NOT NULL"),
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_checkpoints_queued_dispatch_run "
+                'ON cayu_checkpoints(session_id COLLATE "C") '
+                "WHERE state #> '{session_run_operation,queue_task_id}' IS NOT NULL"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_checkpoints_queued_dispatch_run"
+            ),
+            required_key_collations=("C",),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_checkpoints_queued_dispatch_receipts",
+            table_name="cayu_checkpoints",
+            key_definitions=("session_id",),
+            predicate_definition=(
+                "state #> '{queued_dispatch_terminal_receipts,receipts}' IS NOT NULL"
+            ),
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_checkpoints_queued_dispatch_receipts "
+                'ON cayu_checkpoints(session_id COLLATE "C") '
+                "WHERE state #> "
+                "'{queued_dispatch_terminal_receipts,receipts}' IS NOT NULL"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_checkpoints_queued_dispatch_receipts"
+            ),
+            required_key_collations=("C",),
         ),
     ),
 }
@@ -7439,6 +7480,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise ValueError(
                             "Cannot delete a session while terminal publication "
                             f"{run_operation.operation_id} is incomplete: {session_id}"
+                        )
+                    if _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint):
+                        raise ValueError(
+                            "Cannot delete a session while queued dispatch terminal "
+                            f"acknowledgement is incomplete: {session_id}"
                         )
                     await cur.execute(
                         "SELECT event FROM cayu_events "
@@ -12850,6 +12896,105 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     ) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=True)
 
+    async def list_queued_dispatch_terminal_receipts(
+        self,
+        query: QueuedDispatchTerminalReceiptQuery | None = None,
+    ) -> list[QueuedDispatchTerminalReceipt]:
+        if query is None:
+            query = QueuedDispatchTerminalReceiptQuery()
+        elif type(query) is not QueuedDispatchTerminalReceiptQuery:
+            raise TypeError(
+                "Queued dispatch receipt queries must be "
+                "QueuedDispatchTerminalReceiptQuery instances."
+            )
+        else:
+            query = QueuedDispatchTerminalReceiptQuery(
+                after_session_id=query.after_session_id,
+                after_operation_id=query.after_operation_id,
+                limit=query.limit,
+            )
+        cursor_sql = ""
+        params: list[Any] = []
+        if query.after_session_id is not None:
+            assert query.after_operation_id is not None
+            cursor_sql = (
+                'WHERE session_id COLLATE "C" > %s OR '
+                '(session_id COLLATE "C" = %s '
+                'AND operation_id COLLATE "C" > %s)'
+            )
+            params.extend(
+                [
+                    query.after_session_id,
+                    query.after_session_id,
+                    query.after_operation_id,
+                ]
+            )
+        params.append(query.limit)
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                    WITH queued_dispatch_receipts AS (
+                        SELECT
+                            checkpoint.session_id,
+                            checkpoint.state
+                                #>> '{{session_run_operation,queue_task_id}}'
+                                AS queue_task_id,
+                            checkpoint.state
+                                #>> '{{session_run_operation,operation_id}}'
+                                AS operation_id,
+                            checkpoint.state
+                                #>> '{{session_run_operation,terminal_event_id}}'
+                                AS terminal_event_id
+                        FROM cayu_checkpoints AS checkpoint
+                        INNER JOIN cayu_events AS terminal_event
+                            ON terminal_event.session_id = checkpoint.session_id
+                           AND terminal_event.event_id = checkpoint.state
+                                #>> '{{session_run_operation,terminal_event_id}}'
+                        WHERE checkpoint.state
+                            #> '{{session_run_operation,queue_task_id}}'
+                            IS NOT NULL
+
+                        UNION
+
+                        SELECT
+                            checkpoint.session_id,
+                            receipt.value ->> 'queue_task_id' AS queue_task_id,
+                            receipt.key AS operation_id,
+                            receipt.value ->> 'terminal_event_id' AS terminal_event_id
+                        FROM cayu_checkpoints AS checkpoint
+                        CROSS JOIN LATERAL jsonb_each(
+                            COALESCE(
+                                checkpoint.state
+                                    #> '{{queued_dispatch_terminal_receipts,receipts}}',
+                                '{{}}'::jsonb
+                            )
+                        ) AS receipt(key, value)
+                        WHERE checkpoint.state
+                            #> '{{queued_dispatch_terminal_receipts,receipts}}'
+                            IS NOT NULL
+                    )
+                    SELECT session_id, queue_task_id, operation_id, terminal_event_id
+                    FROM queued_dispatch_receipts
+                    {cursor_sql}
+                    ORDER BY session_id COLLATE "C" ASC,
+                             operation_id COLLATE "C" ASC
+                    LIMIT %s
+                    """,
+                params,
+            )
+            rows = await cur.fetchall()
+        return [
+            QueuedDispatchTerminalReceipt(
+                session_id=row[0],
+                queue_task_id=row[1],
+                operation_id=row[2],
+                terminal_event_id=row[3],
+            )
+            for row in rows
+        ]
+
     async def query_pending_actions(
         self,
         query: PendingActionQuery | None = None,
@@ -14384,7 +14529,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
-    _min_required_revision = 39
+    _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
 
     def __init__(
         self,

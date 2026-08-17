@@ -460,6 +460,10 @@ class ActiveInvocationExecutionProfile(BaseModel):
         return ExecutionProfileIdentity.model_validate(value)
 
 
+class _ExecutionProfileAdmissionRequestRejected(RuntimeError):
+    """Private signal for deterministic request rejection before admission."""
+
+
 class ExecutionProfileMismatchError(RuntimeError):
     """Raised after durable evidence rejects a changed execution profile."""
 

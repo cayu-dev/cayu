@@ -89,6 +89,25 @@ guard.
 
 ## Unreleased
 
+### Queued dispatch is bound to durable execution profiles
+
+Queued tasks now retain the target session instance, source and required
+execution-profile fingerprints, and deterministic terminal handoff identity.
+Workers validate that authority before provider, tool, verifier, environment,
+or other governed work begins, and restart reconciliation settles the exact
+session/task outcome without redispatching completed work.
+
+Breaking schema revision 40 installs the queued-dispatch handoff indexes and
+marks the new profiled dispatch envelope as the only supported queued payload.
+Before migrating a shared session or task store, stop every revision-39-or-
+older dispatch producer and worker, take an application-consistent backup, and
+drain or explicitly settle every legacy task type configured on any
+`TaskStoreDispatcher`. This includes the default `cayu.dispatch` type and every
+application-defined custom task type. After all older processes are quiescent,
+run `cayu storage status` followed by `cayu storage migrate`, then confirm
+revision 40 before starting current workers. Mixed revision-39/revision-40
+operation and application-only rollback across this boundary are unsupported.
+
 ### Durable tasks retain immutable invocation provenance
 
 Tasks now carry a Cayu-minted invocation identity and their immediate execution
@@ -101,10 +120,12 @@ Breaking schema revision 39 applies this immutable origin contract to tasks and
 durable dispatch. Stop pre-39 workers and take an application-consistent backup
 before migrating. Populated prerelease task stores cannot be assigned truthful
 origins and must be recreated; empty task stores migrate normally. Run
-`cayu storage status` followed by `cayu storage migrate`, then confirm revision
-39 before starting current workers. Generated product-operation stores also add
-a required originating-subject column; recreate populated prerelease product
-databases rather than fabricating that authority.
+`cayu storage status` followed by `cayu storage migrate`; migration passes
+through revision 39 before the breaking revision-40 queued-dispatch boundary
+described above. Confirm revision 40 before starting current workers. Generated
+product-operation stores also add a required originating-subject column;
+recreate populated prerelease product databases rather than fabricating that
+authority.
 
 ### Worker task terminalization survives lost acknowledgements
 
@@ -122,8 +143,9 @@ state idempotency, not an exactly-once guarantee for external effects.
 Additive schema revision 38 installs the receipt table in SQLite and PostgreSQL.
 Revision-37 binaries remain compatible with the new table, but new built-in
 task stores require revision 38. Current workers also require the breaking
-revision-39 task-provenance boundary described above; migrate the shared database
-through revision 39 before deploying them.
+revision-39 task-provenance boundary and the breaking revision-40 queued-dispatch
+boundary described above; migrate the shared database through revision 40 before
+deploying them.
 
 ### SQLite knowledge updates no longer scan the global FTS corpus
 
@@ -134,15 +156,17 @@ Search behavior and BM25 ranking are unchanged.
 
 The knowledge migration advances the storage schema from revision 36 to
 breaking revision 37 before the additive revision-38 task receipt migration and
-breaking revision-39 task-provenance boundary. Stop older workers, take an
-application-consistent backup, run `cayu storage status` followed by
-`cayu storage migrate`, and confirm revision 39 before restarting current
-workers. The SQLite migration rebuilds legacy knowledge FTS rows in one
-transaction. After an ambiguous interruption, run `cayu storage status`: retry
-when revision 36 remains, or continue through the later migrations when the
-complete revision 37 commit is already visible. PostgreSQL records revision 37
-without changing its knowledge schema, then adds the shared terminalization
-receipt table at revision 38.
+breaking revision-39 task-provenance boundary, followed by the breaking
+revision-40 queued-dispatch boundary. Stop older workers, drain every configured
+legacy dispatcher task type as described above, take an application-consistent
+backup, run `cayu storage status` followed by `cayu storage migrate`, and confirm
+revision 40 before restarting current workers. The SQLite migration rebuilds
+legacy knowledge FTS rows in one transaction. After an ambiguous interruption,
+run `cayu storage status`: retry when revision 36 remains, or continue through
+the later migrations when the complete revision 37 commit is already visible.
+PostgreSQL records revision 37 without changing its knowledge schema, then adds
+the shared terminalization receipt table at revision 38 before continuing
+through revisions 39 and 40.
 
 ## v0.2.1
 

@@ -82,6 +82,7 @@ from cayu.environments import (
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
+    NativeStructuredOutputSchemaInvalid,
     ProviderOperationMode,
     UsageDialect,
     copy_usage_dialect,
@@ -282,6 +283,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyError,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
+    _ExecutionProfileAdmissionRequestRejected,
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
     active_invocation_execution_profile_matches_session_epoch,
@@ -351,6 +353,7 @@ from cayu.runtime.retry_policy import (
 )
 from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
@@ -395,6 +398,7 @@ from cayu.runtime.sessions import (
     TranscriptQuery,
     TranscriptSnapshot,
     _activate_session_interaction,
+    _checkpoint_after_session_run_operation_cleanup,
     _checkpoint_with_session_run_operation,
     _clear_session_interaction_recovered_active_through,
     _clear_session_interaction_settlement,
@@ -409,6 +413,7 @@ from cayu.runtime.sessions import (
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
+    _queued_dispatch_session_instance_fingerprint,
     _runtime_resume_transport_metadata,
     _session_metadata_with_model_projection,
     _session_run_operation_from_checkpoint,
@@ -443,6 +448,7 @@ from cayu.runtime.stop_policy import (
 )
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
+    NativeStructuredOutputUnsupported,
     StructuredOutputSpec,
     StructuredOutputStrategy,
     copy_structured_output_spec,
@@ -2930,6 +2936,10 @@ def _replace_checkpoint_preserving_runtime_state(
             (_SESSION_OPERATIONS_CHECKPOINT_KEY, "session_operations"),
             (_SESSION_RUN_OPERATION_CHECKPOINT_KEY, "session_run_operation"),
             (
+                _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
+                "queued_dispatch_terminal_receipts",
+            ),
+            (
                 _PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY,
                 "prompt_anatomy_transition_intents",
             ),
@@ -3277,6 +3287,34 @@ class SessionEngine:
         """Consume a live raw output without making it part of durable session state."""
 
         return self._workflow_structured_output_handoff.take(session_id)
+
+    def _queued_dispatch_target_profile(
+        self,
+        *,
+        session: Session,
+        source_profile: ExecutionProfileIdentity,
+        target: ModelTarget,
+    ) -> ExecutionProfileIdentity:
+        """Resolve the governed profile for one queued model-target transition."""
+
+        if type(session) is not Session:
+            raise TypeError("Queued dispatch profile resolution requires a Session.")
+        if type(source_profile) is not ExecutionProfileIdentity:
+            raise TypeError("Queued dispatch source profile has an invalid type.")
+        if type(target) is not ModelTarget:
+            raise TypeError("Queued dispatch target has an invalid type.")
+        registered_agent = self._get_registered_agent(session.agent_name)
+        registered_provider = self._get_registered_provider(target.provider_name)
+        candidate = _execution_profile_identity(
+            registered_agent=registered_agent,
+            provider_name=registered_provider.name,
+            model=target.model,
+            durable_system_prompt=None,
+        )
+        return execution_profile_with_component(
+            candidate,
+            source_profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
+        )
 
     async def validate_execution_profile_continuation(
         self,
@@ -9458,7 +9496,47 @@ class SessionEngine:
         task_id: str | None,
         start_event_payload_extra: dict[str, Any],
         start_task_on_enter: bool,
+        source_execution_profile: ExecutionProfileIdentity | None = None,
+        required_execution_profile: ExecutionProfileIdentity | None = None,
+        required_session_instance_fingerprint: str | None = None,
+        run_operation_id: str | None = None,
+        terminal_event_id: str | None = None,
+        queue_task_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if (source_execution_profile is None) != (required_execution_profile is None):
+            raise ValueError(
+                "Queued execution-profile authority requires both source and required profiles."
+            )
+        if (source_execution_profile is None) != (required_session_instance_fingerprint is None):
+            raise ValueError(
+                "Queued execution-profile authority requires a session-instance fingerprint."
+            )
+        if source_execution_profile is not None:
+            if type(source_execution_profile) is not ExecutionProfileIdentity:
+                raise TypeError("source_execution_profile must be an ExecutionProfileIdentity.")
+            source_execution_profile = ExecutionProfileIdentity.model_validate(
+                source_execution_profile.model_dump(mode="json")
+            )
+        if required_execution_profile is not None:
+            if type(required_execution_profile) is not ExecutionProfileIdentity:
+                raise TypeError("required_execution_profile must be an ExecutionProfileIdentity.")
+            required_execution_profile = ExecutionProfileIdentity.model_validate(
+                required_execution_profile.model_dump(mode="json")
+            )
+        if required_session_instance_fingerprint is not None and (
+            len(required_session_instance_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in required_session_instance_fingerprint
+            )
+        ):
+            raise ValueError(
+                "required_session_instance_fingerprint must be a lowercase SHA-256 digest."
+            )
+        if terminal_event_id is not None and run_operation_id is None:
+            raise ValueError("A terminal event identity requires a session run operation.")
+        if queue_task_id is not None and terminal_event_id is None:
+            raise ValueError("A queue task identity requires a terminal event identity.")
         require_secret_free_structured_output_spec(
             request.structured_output,
             redactor=self._secret_redactor,
@@ -9475,6 +9553,12 @@ class SessionEngine:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
+        if (
+            required_session_instance_fingerprint is not None
+            and _queued_dispatch_session_instance_fingerprint(loaded_session)
+            != required_session_instance_fingerprint
+        ):
+            raise RuntimeError("Queued dispatch target session instance changed.")
         for field_name in (
             "agent_name",
             "provider_name",
@@ -9496,15 +9580,22 @@ class SessionEngine:
         )
         request_projection = None
         if target_changed or loaded_projection_cursor:
-            request_projection = model_target.project_portable_transcript(request.messages)
-            if (
-                request_projection.provider_state_parts_dropped
-                or request_projection.thinking_parts_dropped
-            ):
-                raise ValueError(
-                    "New resume messages after model-target adoption cannot contain "
-                    "provider state or thinking parts."
-                )
+            try:
+                request_projection = model_target.project_portable_transcript(request.messages)
+                if (
+                    request_projection.provider_state_parts_dropped
+                    or request_projection.thinking_parts_dropped
+                ):
+                    raise ValueError(
+                        "New resume messages after model-target adoption cannot contain "
+                        "provider state or thinking parts."
+                    )
+            except ValueError as exc:
+                if queue_task_id is None:
+                    raise
+                raise _ExecutionProfileAdmissionRequestRejected(
+                    "Queued dispatch target request contains non-portable provider material."
+                ) from exc
         registered_provider = self._get_registered_provider(
             requested_target.provider_name
             if target_changed and requested_target is not None
@@ -9580,13 +9671,23 @@ class SessionEngine:
                 preflight_transcript.clear()
                 del preflight_snapshot
 
-        run_operation_id = str(uuid4())
+        run_operation_id = (
+            str(uuid4())
+            if run_operation_id is None
+            else require_clean_nonblank(run_operation_id, "run_operation_id")
+        )
         continuing_execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None
 
         def validate_resumable_checkpoint(
             current_session: Session,
             current_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
+            if (
+                required_session_instance_fingerprint is not None
+                and _queued_dispatch_session_instance_fingerprint(current_session)
+                != required_session_instance_fingerprint
+            ):
+                raise RuntimeError("Queued dispatch target session instance changed.")
             updated_checkpoint = (
                 None
                 if current_checkpoint is None
@@ -9677,6 +9778,8 @@ class SessionEngine:
                 checkpoint=updated_checkpoint,
                 current_session=current_session,
                 operation_id=run_operation_id,
+                terminal_event_id=terminal_event_id,
+                queue_task_id=queue_task_id,
             )
 
         # Report deterministic checkpoint conflicts before claiming the session,
@@ -9793,6 +9896,28 @@ class SessionEngine:
                         ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
                     ),
                 )
+                if required_execution_profile is not None:
+                    assert source_execution_profile is not None
+                    if target_changed and expected_execution_profile != source_execution_profile:
+                        raise ExecutionProfileMismatchError(
+                            session_id=loaded_session.id,
+                            expected_profile_fingerprint=(source_execution_profile.fingerprint),
+                            candidate_profile_fingerprint=(expected_execution_profile.fingerprint),
+                            changed_component_classes=changed_execution_profile_components(
+                                source_execution_profile,
+                                expected_execution_profile,
+                            ),
+                        )
+                    if candidate_execution_profile != required_execution_profile:
+                        raise ExecutionProfileMismatchError(
+                            session_id=loaded_session.id,
+                            expected_profile_fingerprint=(required_execution_profile.fingerprint),
+                            candidate_profile_fingerprint=(candidate_execution_profile.fingerprint),
+                            changed_component_classes=changed_execution_profile_components(
+                                required_execution_profile,
+                                candidate_execution_profile,
+                            ),
+                        )
             if not legacy_unprofiled_fork:
                 changed_profile_components = changed_execution_profile_components(
                     expected_execution_profile,
@@ -9853,12 +9978,37 @@ class SessionEngine:
                     registered_provider=registered_provider,
                 )
             )
+            if (
+                required_execution_profile is not None
+                and continuing_execution_profile_snapshot.profile != required_execution_profile
+            ):
+                raise ExecutionProfileMismatchError(
+                    session_id=loaded_session.id,
+                    expected_profile_fingerprint=required_execution_profile.fingerprint,
+                    candidate_profile_fingerprint=(
+                        continuing_execution_profile_snapshot.profile.fingerprint
+                    ),
+                    changed_component_classes=changed_execution_profile_components(
+                        required_execution_profile,
+                        continuing_execution_profile_snapshot.profile,
+                    ),
+                )
         # Provider-owned schema validation runs only after the current process's
         # execution profile has been frozen and any ordinary-resume drift has
         # been rejected. It remains before the durable status transition.
-        _require_native_structured_output_support(
-            request.structured_output, registered_provider=registered_provider
-        )
+        try:
+            _require_native_structured_output_support(
+                request.structured_output, registered_provider=registered_provider
+            )
+        except (
+            NativeStructuredOutputSchemaInvalid,
+            NativeStructuredOutputUnsupported,
+        ) as exc:
+            if queue_task_id is None:
+                raise
+            raise _ExecutionProfileAdmissionRequestRejected(
+                "Queued dispatch request failed deterministic provider preflight."
+            ) from exc
         existing_deferred_input = await self.session_store.load_deferred_interaction_input(
             loaded_session.id
         )
@@ -9926,6 +10076,12 @@ class SessionEngine:
                 finally:
                     hook_messages.clear()
                     hook_tools.clear()
+            except ValueError as exc:
+                if queue_task_id is None:
+                    raise
+                raise _ExecutionProfileAdmissionRequestRejected(
+                    "Queued dispatch target provider rejected its portable request material."
+                ) from exc
             finally:
                 source_transcript.clear()
                 portable_projection = None
@@ -10109,10 +10265,17 @@ class SessionEngine:
             ):
                 yield copy_event(model_boundary.completion_event)
             if model_boundary.state == "provider_operation_pending":
-                await self._clear_session_run_operation(
-                    session_id=session.id,
-                    operation_id=run_operation_id,
-                )
+                # A queued dispatch must retain its exact queue/session handoff
+                # until either provider reconciliation publishes the pinned
+                # terminal event or terminal-evidence recovery transfers it to
+                # a receipt. Clearing it before the following status write can
+                # make acknowledgement loss look like a never-admitted failure
+                # and terminally fail the queue task while provider work lives.
+                if queue_task_id is None:
+                    await self._clear_session_run_operation(
+                        session_id=session.id,
+                        operation_id=run_operation_id,
+                    )
                 await self.session_store.update_status(
                     session.id,
                     SessionStatus.INTERRUPTED,
@@ -10258,6 +10421,7 @@ class SessionEngine:
                     await self._clear_session_run_operation(
                         session_id=session.id,
                         operation_id=run_operation_id,
+                        terminal_evidence_durable=True,
                     )
                 except Exception as cleanup_failure:
                     logger.warning(
@@ -10687,6 +10851,10 @@ class SessionEngine:
             if fork_checkpoint is not None:
                 fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
                 fork_checkpoint.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
+                fork_checkpoint.pop(
+                    _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
+                    None,
+                )
                 # Active invocation authority is bound to the source session's
                 # interaction and run epoch, never to the derived child.
                 fork_checkpoint.pop(
@@ -14668,6 +14836,7 @@ class SessionEngine:
         *,
         session_id: str,
         operation_id: str,
+        terminal_evidence_durable: bool = False,
     ) -> None:
         def clear_operation(
             _session: Session,
@@ -14680,9 +14849,11 @@ class SessionEngine:
                 raise RuntimeError(
                     "Session run operation changed before terminal evidence cleanup."
                 )
-            updated = copy_json_value(checkpoint, "checkpoint")
-            updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY)
-            return updated
+            return _checkpoint_after_session_run_operation_cleanup(
+                checkpoint,
+                operation=run_operation,
+                retain_terminal_receipt=terminal_evidence_durable,
+            )
 
         await self.session_store.transform_checkpoint(
             session_id,
@@ -14771,6 +14942,7 @@ class SessionEngine:
                         run_operation_id,
                         "terminal event session_run_operation_id",
                     ),
+                    terminal_evidence_durable=True,
                 )
             except Exception as cleanup_failure:
                 logger.warning(

@@ -589,7 +589,7 @@ def test_revision_thirty_nine_rejects_populated_task_database(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 39")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 39")
             await conn.commit()
 
         migrator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
@@ -822,7 +822,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {postgres_storage.PostgresTaskStore._min_required_revision}",
+                match=rf"requires >= {postgres_storage._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
             ):
                 await task_validator.ensure_schema()
         finally:
@@ -945,12 +945,16 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 38"
             )
             assert await cur.fetchone() == ("additive", 37)
-            await cur.execute("SELECT to_regclass('cayu_task_terminalization_receipts')")
-            assert (await cur.fetchone())[0] == "cayu_task_terminalization_receipts"
             await cur.execute(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 39"
             )
             assert await cur.fetchone() == ("breaking", 39)
+            await cur.execute("SELECT to_regclass('cayu_task_terminalization_receipts')")
+            assert (await cur.fetchone())[0] == "cayu_task_terminalization_receipts"
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 40"
+            )
+            assert await cur.fetchone() == ("breaking", 40)
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

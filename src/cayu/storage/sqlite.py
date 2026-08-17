@@ -93,6 +93,8 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    QueuedDispatchTerminalReceipt,
+    QueuedDispatchTerminalReceiptQuery,
     RunnerObservedEventIdentity,
     RunRequest,
     RuntimePublicationReceipt,
@@ -194,6 +196,7 @@ from cayu.runtime.sessions import (
     _PreparedRuntimePublication,
     _project_interruption_cascade_marker_fields,
     _public_authority_alias_store_key,
+    _queued_dispatch_terminal_receipts_from_checkpoint,
     _queued_session_message_event_payload,
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
@@ -328,8 +331,8 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 36
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 39
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 40
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 40
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -2123,6 +2126,11 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(
                         "Cannot delete a session while terminal publication "
                         f"{run_operation.operation_id} is incomplete: {session_id}"
+                    )
+                if _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint):
+                    raise ValueError(
+                        "Cannot delete a session while queued dispatch terminal "
+                        f"acknowledgement is incomplete: {session_id}"
                     )
                 terminal_evidence_rows = self._connection.execute(
                     f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
@@ -6771,8 +6779,9 @@ class SQLiteSessionStore(SessionStore):
         The latest active or paused interaction lifecycle event is retained
         until a terminal event replaces it. Sessions with an active
         model-completion stage, pending tool round, or immutable
-        runtime-publication receipt are retained because deleting their
-        evidence would make exact recovery or receipt replay impossible.
+        runtime-publication receipt, or unacknowledged queued-dispatch terminal
+        receipt are retained because deleting their evidence would make exact
+        recovery or receipt replay impossible.
         Returns the number of events deleted.
         """
         if not isinstance(before, datetime):
@@ -6818,6 +6827,28 @@ class SQLiteSessionStore(SessionStore):
                                     checkpoint.state_json,
                                     '$.pending_tool_round'
                                 ) IS NOT NULL
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_checkpoints AS checkpoint
+                              WHERE checkpoint.session_id = cayu_events.session_id
+                                AND (
+                                    json_extract(
+                                        checkpoint.state_json,
+                                        '$.session_run_operation.terminal_event_id'
+                                    ) = cayu_events.event_id
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM json_each(
+                                            checkpoint.state_json,
+                                            '$.queued_dispatch_terminal_receipts.receipts'
+                                        ) AS receipt
+                                        WHERE json_extract(
+                                            receipt.value,
+                                            '$.terminal_event_id'
+                                        ) = cayu_events.event_id
+                                    )
+                                )
                           )
                           AND NOT EXISTS (
                               SELECT 1
@@ -6871,6 +6902,28 @@ class SQLiteSessionStore(SessionStore):
                                     checkpoint.state_json,
                                     '$.pending_tool_round'
                                 ) IS NOT NULL
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_checkpoints AS checkpoint
+                              WHERE checkpoint.session_id = cayu_events.session_id
+                                AND (
+                                    json_extract(
+                                        checkpoint.state_json,
+                                        '$.session_run_operation.terminal_event_id'
+                                    ) = cayu_events.event_id
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM json_each(
+                                            checkpoint.state_json,
+                                            '$.queued_dispatch_terminal_receipts.receipts'
+                                        ) AS receipt
+                                        WHERE json_extract(
+                                            receipt.value,
+                                            '$.terminal_event_id'
+                                        ) = cayu_events.event_id
+                                    )
+                                )
                           )
                           AND NOT EXISTS (
                               SELECT 1
@@ -7300,6 +7353,107 @@ class SQLiteSessionStore(SessionStore):
         query: SessionQuery | None = None,
     ) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=True)
+
+    async def list_queued_dispatch_terminal_receipts(
+        self,
+        query: QueuedDispatchTerminalReceiptQuery | None = None,
+    ) -> list[QueuedDispatchTerminalReceipt]:
+        if query is None:
+            query = QueuedDispatchTerminalReceiptQuery()
+        elif type(query) is not QueuedDispatchTerminalReceiptQuery:
+            raise TypeError(
+                "Queued dispatch receipt queries must be "
+                "QueuedDispatchTerminalReceiptQuery instances."
+            )
+        else:
+            query = QueuedDispatchTerminalReceiptQuery(
+                after_session_id=query.after_session_id,
+                after_operation_id=query.after_operation_id,
+                limit=query.limit,
+            )
+        cursor_sql = ""
+        params: list[Any] = []
+        if query.after_session_id is not None:
+            assert query.after_operation_id is not None
+            cursor_sql = "WHERE session_id > ? OR (session_id = ? AND operation_id > ?)"
+            params.extend(
+                [
+                    query.after_session_id,
+                    query.after_session_id,
+                    query.after_operation_id,
+                ]
+            )
+        params.append(query.limit)
+
+        def run_query(connection: sqlite3.Connection) -> list[QueuedDispatchTerminalReceipt]:
+            rows = connection.execute(
+                f"""
+                WITH queued_dispatch_receipts AS (
+                    SELECT
+                        checkpoint.session_id,
+                        json_extract(
+                            checkpoint.state_json,
+                            '$.session_run_operation.queue_task_id'
+                        ) AS queue_task_id,
+                        json_extract(
+                            checkpoint.state_json,
+                            '$.session_run_operation.operation_id'
+                        ) AS operation_id,
+                        json_extract(
+                            checkpoint.state_json,
+                            '$.session_run_operation.terminal_event_id'
+                        ) AS terminal_event_id
+                    FROM cayu_checkpoints AS checkpoint
+                    INNER JOIN cayu_events AS terminal_event
+                        ON terminal_event.session_id = checkpoint.session_id
+                       AND terminal_event.event_id = json_extract(
+                            checkpoint.state_json,
+                            '$.session_run_operation.terminal_event_id'
+                       )
+                    WHERE json_type(
+                        checkpoint.state_json,
+                        '$.session_run_operation.queue_task_id'
+                    ) IS NOT NULL
+
+                    UNION
+
+                    SELECT
+                        checkpoint.session_id,
+                        json_extract(receipt.value, '$.queue_task_id') AS queue_task_id,
+                        receipt.key AS operation_id,
+                        json_extract(
+                            receipt.value,
+                            '$.terminal_event_id'
+                        ) AS terminal_event_id
+                    FROM cayu_checkpoints AS checkpoint,
+                         json_each(
+                             checkpoint.state_json,
+                             '$.queued_dispatch_terminal_receipts.receipts'
+                         ) AS receipt
+                    WHERE json_type(
+                        checkpoint.state_json,
+                        '$.queued_dispatch_terminal_receipts.receipts'
+                    ) IS NOT NULL
+                )
+                SELECT session_id, queue_task_id, operation_id, terminal_event_id
+                FROM queued_dispatch_receipts
+                {cursor_sql}
+                ORDER BY session_id ASC, operation_id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [
+                QueuedDispatchTerminalReceipt(
+                    session_id=row["session_id"],
+                    queue_task_id=row["queue_task_id"],
+                    operation_id=row["operation_id"],
+                    terminal_event_id=row["terminal_event_id"],
+                )
+                for row in rows
+            ]
+
+        return await self._run_read(run_query)
 
     async def query_pending_actions(
         self,

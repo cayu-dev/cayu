@@ -230,6 +230,13 @@ REVISIONS: tuple[Revision, ...] = (
     # writers cannot populate the required value, so mixed-version task workers
     # are unsafe and populated historical task tables require a clean rebuild.
     Revision(revision=39, kind=RevisionKind.BREAKING, compatible_from=39),
+    # Index the two live checkpoint markers that own queued-dispatch terminal
+    # handoff reconciliation. Revision-40 workers also persist a new profiled
+    # queued-dispatch task payload that older workers cannot interpret. Operators
+    # must quiesce revision-39 and older producers/workers and settle their tasks
+    # before migration; the compatibility floor prevents later old-binary startup
+    # or rollback, but cannot revoke an already-running worker's cached schema.
+    Revision(revision=40, kind=RevisionKind.BREAKING, compatible_from=40),
 )
 
 #: The revision an empty database is initialized to.

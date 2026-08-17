@@ -510,6 +510,62 @@ def test_cayu_app_terminal_evidence_repair_fences_delayed_original_publisher() -
     asyncio.run(scenario())
 
 
+def test_terminal_evidence_repair_preserves_queued_dispatch_event_identity() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        session_id = "sess_queued_terminal_evidence_repair"
+        operation_id = "queued-terminal-evidence-repair"
+        terminal_event_id = "queued-terminal-event"
+        queue_task_id = "queued-terminal-task"
+        await store.create(
+            RunRequest(
+                agent_name="removed_agent",
+                session_id=session_id,
+                messages=[Message.text("user", "finish")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.transition_status_and_checkpoint(
+            session_id,
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda current_session, checkpoint: (
+                _checkpoint_with_session_run_operation(
+                    checkpoint=checkpoint,
+                    current_session=current_session,
+                    operation_id=operation_id,
+                    terminal_event_id=terminal_event_id,
+                    queue_task_id=queue_task_id,
+                )
+            ),
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        repaired = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+
+        assert repaired.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
+        records = await store.query_events(
+            EventQuery(session_id=session_id, event_id=terminal_event_id)
+        )
+        assert len(records) == 1
+        assert records[0].event.type is EventType.SESSION_INTERRUPTED
+        assert records[0].event.payload["session_run_operation_id"] == operation_id
+        receipts = await store.list_queued_dispatch_terminal_receipts()
+        assert [receipt.model_dump(mode="json") for receipt in receipts] == [
+            {
+                "session_id": session_id,
+                "queue_task_id": queue_task_id,
+                "operation_id": operation_id,
+                "terminal_event_id": terminal_event_id,
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_cayu_app_terminal_evidence_repair_rejects_future_run_operation() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
