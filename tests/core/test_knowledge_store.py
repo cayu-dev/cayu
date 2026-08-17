@@ -947,6 +947,83 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
     assert [hit.chunk.id for hit in third.hits if hit.chunk is not None] == ["custom-new"]
 
 
+def test_in_memory_embedding_store_rejects_cross_entry_chunk_id_collision_atomically() -> None:
+    async def run() -> tuple[
+        KnowledgeEntry | None,
+        list[KnowledgeChunk],
+        dict[str, object],
+        dict[str, object],
+    ]:
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+        )
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="alpha", text="GitHub auth policy."),
+            [
+                KnowledgeChunk(
+                    id="shared-chunk",
+                    entry_id="alpha",
+                    chunk_index=0,
+                    text="GitHub auth policy.",
+                )
+            ],
+        )
+        embeddings_before = dict(store._chunk_embeddings)
+
+        with pytest.raises(ValueError, match="globally unique"):
+            await store.put_entry_with_chunks(
+                KnowledgeEntry(id="beta", text="Invoice policy."),
+                [
+                    KnowledgeChunk(
+                        id="shared-chunk",
+                        entry_id="beta",
+                        chunk_index=0,
+                        text="Invoice policy.",
+                    )
+                ],
+            )
+
+        return (
+            await store.get_entry("beta"),
+            await store.read_chunks("alpha"),
+            embeddings_before,
+            dict(store._chunk_embeddings),
+        )
+
+    beta, alpha_chunks, embeddings_before, embeddings_after = asyncio.run(run())
+
+    assert beta is None
+    assert [(chunk.entry_id, chunk.id) for chunk in alpha_chunks] == [("alpha", "shared-chunk")]
+    assert embeddings_after == embeddings_before
+
+
+def test_in_memory_store_rejects_default_chunk_id_collision_atomically() -> None:
+    async def run() -> tuple[KnowledgeEntry | None, list[KnowledgeChunk]]:
+        store = InMemoryKnowledgeStore()
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="alpha", text="GitHub auth policy."),
+            [
+                KnowledgeChunk(
+                    id="beta:0",
+                    entry_id="alpha",
+                    chunk_index=0,
+                    text="GitHub auth policy.",
+                )
+            ],
+        )
+
+        with pytest.raises(ValueError, match="globally unique"):
+            await store.put_entry(KnowledgeEntry(id="beta", text="Invoice policy."))
+
+        return await store.get_entry("beta"), await store.read_chunks("alpha")
+
+    beta, alpha_chunks = asyncio.run(run())
+
+    assert beta is None
+    assert [(chunk.entry_id, chunk.id) for chunk in alpha_chunks] == [("alpha", "beta:0")]
+
+
 def test_in_memory_embedding_knowledge_store_honors_none_terms() -> None:
     async def run():
         provider = KeywordEmbeddingProvider()

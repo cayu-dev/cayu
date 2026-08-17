@@ -916,13 +916,17 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         entry = copy_knowledge_entry(entry)
         existing_entry = self._entries.get(entry.id)
         existing_chunks = self._chunks.get(entry.id)
-        self._entries[entry.id] = entry
+        replacement_chunks: list[KnowledgeChunk] | None = None
         if (
             existing_entry is None
             or existing_chunks is None
             or _has_only_default_chunk(existing_entry, existing_chunks)
         ):
-            self._chunks[entry.id] = [_default_chunk_for_entry(entry)]
+            replacement_chunks = [_default_chunk_for_entry(entry)]
+            self._ensure_globally_unique_chunk_ids(entry.id, replacement_chunks)
+        self._entries[entry.id] = entry
+        if replacement_chunks is not None:
+            self._chunks[entry.id] = replacement_chunks
         return copy_knowledge_entry(entry)
 
     async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
@@ -1021,6 +1025,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if clean_id not in self._entries:
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
         copied_chunks = _copy_entry_chunks(clean_id, chunks)
+        self._ensure_globally_unique_chunk_ids(clean_id, copied_chunks)
         self._chunks[clean_id] = copied_chunks
         return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
 
@@ -1031,6 +1036,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> KnowledgeEntry:
         copied_entry = copy_knowledge_entry(entry)
         copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
+        self._ensure_globally_unique_chunk_ids(copied_entry.id, copied_chunks)
         self._entries[copied_entry.id] = copied_entry
         self._chunks[copied_entry.id] = copied_chunks
         return copy_knowledge_entry(copied_entry)
@@ -1055,6 +1061,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return copy_knowledge_publication_receipt(existing_receipt, replayed=True)
         if copied_entry.id in self._entries:
             raise KnowledgePublicationConflict("entry_occupied")
+        self._ensure_globally_unique_chunk_ids(copied_entry.id, copied_chunks)
         receipt = KnowledgePublicationReceipt(
             operation_id=operation_id,
             entry_id=copied_entry.id,
@@ -1067,6 +1074,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._chunks[copied_entry.id] = copied_chunks
         self._publication_receipts[operation_id] = receipt
         return copy_knowledge_publication_receipt(receipt)
+
+    def _ensure_globally_unique_chunk_ids(
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        proposed_ids = {chunk.id for chunk in chunks}
+        for existing_entry_id, existing_chunks in self._chunks.items():
+            if existing_entry_id == entry_id:
+                continue
+            if any(chunk.id in proposed_ids for chunk in existing_chunks):
+                raise ValueError("Knowledge chunk ids must be globally unique across entries.")
 
     async def load_entry_publication_receipt(
         self,

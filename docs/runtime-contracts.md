@@ -5815,7 +5815,11 @@ Postgres embedding operational contract:
   importance/confidence hints, aspects, impact targets, and metadata.
 - `KnowledgeChunk`: bounded readable chunks for long entries. Stores may keep
   one default chunk for short entries, or replace the complete chunk set after
-  indexing a larger source.
+  indexing a larger source. A chunk ID identifies one chunk across the entire
+  store, not merely within an entry. A write that would reuse a chunk ID owned
+  by another entry fails atomically: the existing entry and chunks remain
+  unchanged, and the conflicting entry is not created. Built-in in-memory,
+  SQLite, and PostgreSQL stores enforce the same identity scope.
 - `KnowledgeQuery`: scoped retrieval request with simple query text, structured
   keyword fields (`any_terms`, `all_terms`, `none_terms`, `phrases`), namespace,
   labels, kinds, status/visibility filters, aspects, impact targets, source
