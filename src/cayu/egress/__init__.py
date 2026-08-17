@@ -49,6 +49,7 @@ from cayu.egress.grants import (
     VirtualCredentialRegistry,
 )
 from cayu.egress.policy import (
+    BrowserEgressPolicy,
     EgressPolicy,
     EgressRequest,
     HttpEgressPolicy,
@@ -58,6 +59,7 @@ from cayu.egress.proxy_exposure import VpcTaskProxyExposure
 __all__ = [
     "EGRESS_CAPABILITY_EVIDENCE_SCHEMA",
     "ApprovedEgressDestination",
+    "BrowserEgressPolicy",
     "CapturedRequest",
     "CapturedResponse",
     "CredentialKind",

@@ -19,6 +19,7 @@ from cayu.egress import (
     TransparentEgressBroker,
     VirtualCredentialRegistry,
 )
+from cayu.egress.broker import CAYU_EGRESS_ERROR_HEADER
 from cayu.vaults import StaticVault
 
 pytest.importorskip("cryptography")
@@ -29,9 +30,20 @@ from cayu.egress.proxy_server import (
     DualStackLoopbackEgressProxyServer,
     SessionCertificateAuthority,
     TransparentEgressProxyServer,
+    _serialize_response,
 )
 
 REAL_SECRET = "sk_test_51RealProxySwapSecret"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason"),
+    [(504, "Gateway Timeout"), (599, "Unknown Status")],
+)
+def test_response_serializer_uses_safe_http_reason(status_code: int, reason: str) -> None:
+    response = _serialize_response(CapturedResponse(status_code=status_code))
+
+    assert response.startswith(f"HTTP/1.1 {status_code} {reason}\r\n".encode())
 
 
 class _CapturingUpstream:
@@ -187,7 +199,8 @@ def test_plain_http_requests_are_rejected_without_broker_call() -> None:
 
     response, upstream = asyncio.run(run())
 
-    assert response.startswith(b"HTTP/1.1 405 Method Not Allowed")
+    assert response.startswith(b"HTTP/1.1 403 Forbidden")
+    assert f"{CAYU_EGRESS_ERROR_HEADER}: destination_denied".encode() in response
     assert upstream.sent is None
 
 
@@ -315,8 +328,11 @@ def test_dual_stack_loopback_proxy_serves_and_closes_both_address_families() -> 
 
     ipv4, ipv6, ipv4_closed, ipv6_closed = asyncio.run(run())
 
-    assert ipv4.startswith(b"HTTP/1.1 405 Method Not Allowed")
-    assert ipv6.startswith(b"HTTP/1.1 405 Method Not Allowed")
+    assert ipv4.startswith(b"HTTP/1.1 403 Forbidden")
+    assert ipv6.startswith(b"HTTP/1.1 403 Forbidden")
+    diagnostic = f"{CAYU_EGRESS_ERROR_HEADER}: destination_denied".encode()
+    assert diagnostic in ipv4
+    assert diagnostic in ipv6
     assert ipv4_closed is True
     assert ipv6_closed is True
 

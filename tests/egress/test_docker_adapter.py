@@ -146,6 +146,42 @@ def test_create_runner_forwards_explicit_docker_cli_grants(monkeypatch) -> None:
     assert observed["kwargs"]["docker_cli_env_allowlist"] == ("AWS_PROFILE",)
 
 
+def test_create_runner_forwards_explicit_seccomp_profile(monkeypatch, tmp_path) -> None:
+    observed: dict[str, object] = {}
+    expected_runner = object()
+    profile = tmp_path / "chromium-seccomp.json"
+    profile.write_text("{}")
+
+    class FakeDockerRunner:
+        @classmethod
+        async def create(cls, name: str, **kwargs):
+            observed.update(name=name, kwargs=kwargs)
+            return expected_runner
+
+    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", FakeDockerRunner)
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        proxy_host="127.0.0.1",
+        seccomp_profile=str(profile),
+    )
+    request = VirtualEgressRunnerRequest(
+        name="browser-worker",
+        runner_kind="docker",
+        image="cayu-browser-fetch:1",
+        binding=EgressBinding(runner_kind="docker", network="internal"),
+        env_overlay={},
+        ca_cert_host_path="/tmp/ca.pem",
+        guest_ca_path=GUEST_CA_PATH,
+        setup_commands=(),
+        egress_destinations=(),
+    )
+
+    runner = asyncio.run(adapter.create_runner(request))
+
+    assert runner is expected_runner
+    assert observed["kwargs"]["seccomp_profile"] == str(profile)
+
+
 class _FlakyCleanupDocker(_FakeDocker):
     def __init__(self) -> None:
         super().__init__()

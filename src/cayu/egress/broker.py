@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
@@ -12,6 +13,10 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import require_clean_nonblank
+from cayu.egress._resolution import (
+    InvalidResolvedAddressError,
+    ProhibitedResolvedAddressError,
+)
 from cayu.egress._resolution import (
     resolve_destination as _resolve_destination,
 )
@@ -31,8 +36,12 @@ from cayu.egress.destinations import (
 )
 from cayu.egress.errors import VirtualCredentialError
 from cayu.egress.grants import VirtualCredentialRegistry
-from cayu.egress.policy import EgressPolicy, EgressRequest
+from cayu.egress.policy import BrowserEgressPolicy, EgressPolicy, EgressRequest
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretResolver, validate_secret_resolver
+
+CAYU_EGRESS_ERROR_HEADER = "X-Cayu-Egress-Error"
+DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 # Headers that must not be forwarded verbatim between hops.
 _HOP_BY_HOP = frozenset(
@@ -48,6 +57,9 @@ _HOP_BY_HOP = frozenset(
         # Recomputed by the upstream client from the actual body/target.
         "content-length",
         "host",
+        # Cayu owns this response-only diagnostic namespace. Never allow an
+        # upstream origin or sandbox request to forge one of these values.
+        CAYU_EGRESS_ERROR_HEADER.lower(),
     }
 )
 
@@ -162,6 +174,27 @@ class _ForwardingAuthorization:
     policy_name: str
     authorization_kind: AuthorizationKind
     secrets: tuple[str, ...] = ()
+    require_identity_encoding: bool = False
+
+
+class _UpstreamDestinationDeniedError(ValueError):
+    pass
+
+
+class _UpstreamDnsError(ValueError):
+    pass
+
+
+class _UpstreamTimeoutError(RuntimeError):
+    pass
+
+
+class _UpstreamResponseTooLargeError(RuntimeError):
+    pass
+
+
+class _UpstreamUnsupportedEncodingError(RuntimeError):
+    pass
 
 
 class HttpxUpstream:
@@ -171,40 +204,79 @@ class HttpxUpstream:
         self,
         *,
         timeout_s: float = 30.0,
+        max_response_bytes: int = DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
         transport: httpx.AsyncBaseTransport | None = None,
         routes: Mapping[str, str] | None = None,
         destination_resolver: DestinationResolver | None = None,
     ) -> None:
-        self._timeout_s = timeout_s
+        self._timeout_s = _bounded_timeout(timeout_s)
+        self._max_response_bytes = _bounded_response_bytes(max_response_bytes)
         self._transport = transport
         self._routes = _validated_upstream_routes(routes or {})
         self._destination_resolver = destination_resolver or _resolve_destination
 
     async def send(self, request: CapturedRequest) -> CapturedResponse:
-        target = await self._target(request)
+        try:
+            target = await self._target(request)
+        except ProhibitedResolvedAddressError as exc:
+            raise _UpstreamDestinationDeniedError(
+                "Upstream destination resolved to a prohibited address."
+            ) from exc
+        except InvalidResolvedAddressError as exc:
+            raise _UpstreamDnsError("Upstream destination returned an invalid address.") from exc
         headers = _forwardable_headers(request.headers)
         headers["Host"] = target.host_header
         extensions = (
             {"sni_hostname": target.sni_hostname} if target.sni_hostname is not None else None
         )
-        async with httpx.AsyncClient(
-            timeout=self._timeout_s,
-            transport=self._transport,
-            trust_env=False,
-            follow_redirects=False,
-        ) as client:
-            response = await client.request(
-                request.method,
-                target.url,
-                headers=headers,
-                content=request.body or None,
-                extensions=extensions,
-            )
-        return CapturedResponse(
-            status_code=response.status_code,
-            headers=_decoded_response_headers(dict(response.headers)),
-            body=response.content,
-        )
+        try:
+            async with (
+                httpx.AsyncClient(
+                    timeout=self._timeout_s,
+                    transport=self._transport,
+                    trust_env=False,
+                    follow_redirects=False,
+                ) as client,
+                client.stream(
+                    request.method,
+                    target.url,
+                    headers=headers,
+                    content=request.body or None,
+                    extensions=extensions,
+                ) as response,
+            ):
+                content_encoding = response.headers.get("content-encoding")
+                requested_encoding = _header_get(request.headers, "Accept-Encoding")
+                if (
+                    requested_encoding is not None
+                    and requested_encoding.strip().lower() == "identity"
+                    and content_encoding is not None
+                    and content_encoding.strip().lower() != "identity"
+                ):
+                    raise _UpstreamUnsupportedEncodingError(
+                        "Upstream ignored the required identity content encoding."
+                    )
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    with contextlib.suppress(ValueError):
+                        if int(content_length) > self._max_response_bytes:
+                            raise _UpstreamResponseTooLargeError(
+                                "Upstream response exceeded the configured byte limit."
+                            )
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > self._max_response_bytes:
+                        raise _UpstreamResponseTooLargeError(
+                            "Upstream response exceeded the configured byte limit."
+                        )
+                    body.extend(chunk)
+                return CapturedResponse(
+                    status_code=response.status_code,
+                    headers=_decoded_response_headers(dict(response.headers)),
+                    body=bytes(body),
+                )
+        except httpx.TimeoutException as exc:
+            raise _UpstreamTimeoutError("Upstream request timed out.") from exc
 
     async def _target(self, request: CapturedRequest) -> _ResolvedUpstreamTarget:
         route = self._routes.get(request.host)
@@ -214,9 +286,12 @@ class HttpxUpstream:
         if host is None:  # pragma: no cover - constructors already validate origins
             raise ValueError("Upstream target has no hostname.")
         port = split.port or (443 if split.scheme == "https" else 80)
-        addresses = tuple(await self._destination_resolver(host, port))
+        try:
+            addresses = tuple(await self._destination_resolver(host, port))
+        except OSError as exc:
+            raise _UpstreamDnsError("Upstream destination resolution failed.") from exc
         if not addresses:
-            raise ValueError("Upstream destination did not resolve to an address.")
+            raise _UpstreamDnsError("Upstream destination did not resolve to an address.")
         allow_private = route is not None
         normalized = tuple(
             _validated_resolved_address(address, allow_private=allow_private)
@@ -231,6 +306,25 @@ class HttpxUpstream:
             host_header=host_header,
             sni_hostname=host if split.scheme == "https" else None,
         )
+
+
+def _bounded_timeout(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("timeout_s must be a finite positive number.")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError("timeout_s must be a finite positive number.")
+    return normalized
+
+
+def _bounded_response_bytes(value: int) -> int:
+    if type(value) is not int:
+        raise TypeError("max_response_bytes must be an integer.")
+    if value <= 0 or value > MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"max_response_bytes must be between 1 and {MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES}."
+        )
+    return value
 
 
 def _format_authority(host: str, port: int, scheme: str) -> str:
@@ -349,6 +443,7 @@ class TransparentEgressBroker:
                     grant.policy_name,
                     403,
                     "Destination not bound to grant.",
+                    error_code="destination_denied",
                 )
 
             policy = self._policies.get(grant.policy_name) if grant.policy_name else None
@@ -370,6 +465,7 @@ class TransparentEgressBroker:
                     policy.name,
                     403,
                     decision.reason or "Denied by policy.",
+                    error_code="destination_denied",
                 )
 
             credential_kind = supported_credential_kind_descriptor(grant.credential_kind)
@@ -437,6 +533,7 @@ class TransparentEgressBroker:
                     policy_name=policy.name,
                     authorization_kind="virtual_credential",
                     secrets=(real_secret,),
+                    require_identity_encoding=isinstance(policy, BrowserEgressPolicy),
                 ),
                 ensure_authority=lease.ensure_active,
             )
@@ -471,6 +568,7 @@ class TransparentEgressBroker:
                 403,
                 "Destination is not approved for credentialless egress.",
                 authorization_kind="credentialless",
+                error_code="destination_denied",
             )
         if not self._begin_credentialless_request():
             return self._deny(
@@ -501,6 +599,7 @@ class TransparentEgressBroker:
                     403,
                     decision.reason or "Denied by policy.",
                     authorization_kind="credentialless",
+                    error_code="destination_denied",
                 )
             return await self._forward_authorized(
                 request=request,
@@ -509,6 +608,7 @@ class TransparentEgressBroker:
                     grant_id=None,
                     policy_name=policy.name,
                     authorization_kind="credentialless",
+                    require_identity_encoding=isinstance(policy, BrowserEgressPolicy),
                 ),
                 ensure_authority=self._ensure_credentialless_authority,
             )
@@ -528,8 +628,71 @@ class TransparentEgressBroker:
                 ensure_authority()
             except VirtualCredentialError:
                 return self._authority_revoked(request, authorization)
+        if authorization.require_identity_encoding:
+            upstream_request = upstream_request.model_copy(
+                update={
+                    "headers": {
+                        **{
+                            key: value
+                            for key, value in upstream_request.headers.items()
+                            if key.lower() != "accept-encoding"
+                        },
+                        "Accept-Encoding": "identity",
+                    }
+                }
+            )
         try:
             response = await self._upstream.send(upstream_request)
+        except _UpstreamDestinationDeniedError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                403,
+                "Upstream destination is not publicly routable.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="destination_denied",
+            )
+        except _UpstreamDnsError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream destination resolution failed.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="dns_failure",
+            )
+        except _UpstreamTimeoutError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                504,
+                "Upstream request timed out.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="timeout",
+            )
+        except _UpstreamResponseTooLargeError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream response exceeded the configured byte limit.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="oversized_response",
+            )
+        except _UpstreamUnsupportedEncodingError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream ignored the required identity content encoding.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="unsupported_content",
+            )
         except Exception:
             return self._deny(
                 request,
@@ -538,12 +701,35 @@ class TransparentEgressBroker:
                 502,
                 "Upstream request failed.",
                 authorization_kind=authorization.authorization_kind,
+                error_code="fetch_failed",
             )
         if ensure_authority is not None:
             try:
                 ensure_authority()
             except VirtualCredentialError:
                 return self._authority_revoked(request, authorization)
+        if authorization.require_identity_encoding:
+            content_encoding = _header_get(response.headers, "content-encoding")
+            if content_encoding is not None and content_encoding.strip().lower() != "identity":
+                return self._deny(
+                    request,
+                    authorization.grant_id,
+                    authorization.policy_name,
+                    502,
+                    "Upstream ignored the required identity content encoding.",
+                    authorization_kind=authorization.authorization_kind,
+                    error_code="unsupported_content",
+                )
+            if len(response.body) > DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES:
+                return self._deny(
+                    request,
+                    authorization.grant_id,
+                    authorization.policy_name,
+                    502,
+                    "Upstream response exceeded the browser byte limit.",
+                    authorization_kind=authorization.authorization_kind,
+                    error_code="oversized_response",
+                )
         self._record(
             EgressDecision(
                 allowed=True,
@@ -605,6 +791,7 @@ class TransparentEgressBroker:
         authorization_kind: Literal["virtual_credential", "credentialless"] = (
             "virtual_credential"
         ),
+        error_code: str = "request_denied",
     ) -> CapturedResponse:
         self._record(
             EgressDecision(
@@ -622,7 +809,10 @@ class TransparentEgressBroker:
         body = json.dumps({"error": {"message": reason}}).encode()
         return CapturedResponse(
             status_code=status_code,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                CAYU_EGRESS_ERROR_HEADER: error_code,
+            },
             body=body,
         )
 

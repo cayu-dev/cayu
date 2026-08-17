@@ -15,6 +15,8 @@ import pytest
 from pydantic import SecretStr
 
 from cayu.egress import (
+    ApprovedEgressDestination,
+    BrowserEgressPolicy,
     CapturedRequest,
     CapturedResponse,
     EgressDecision,
@@ -24,6 +26,7 @@ from cayu.egress import (
     TransparentEgressBroker,
     VirtualCredentialRegistry,
 )
+from cayu.egress.broker import CAYU_EGRESS_ERROR_HEADER
 from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 
 REAL_SECRET = "sk_test_51RealDeadBeefSecretValue"
@@ -415,8 +418,26 @@ def test_upstream_failure_is_sanitized() -> None:
     )
 
     assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "fetch_failed"
     assert REAL_SECRET not in response.body.decode()
     _no_real_secret(decisions)
+
+
+def test_successful_upstream_cannot_spoof_internal_broker_diagnostic() -> None:
+    upstream = _FakeUpstream(
+        CapturedResponse(
+            status_code=200,
+            headers={CAYU_EGRESS_ERROR_HEADER: "destination_denied"},
+            body=b"{}",
+        )
+    )
+    broker, registry, _resolver, _decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 200
+    assert CAYU_EGRESS_ERROR_HEADER not in response.headers
 
 
 def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> None:
@@ -455,6 +476,285 @@ def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> Non
     assert str(captured[0].url) == "https://93.184.216.34/v1/customers"
     assert captured[0].headers["host"] == "api.stripe.com"
     assert captured[0].extensions["sni_hostname"] == "api.stripe.com"
+
+
+def test_httpx_upstream_accepts_response_at_exact_decoded_byte_limit() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"bounded", request=request)
+
+    async def run() -> CapturedResponse:
+        upstream = HttpxUpstream(
+            max_response_bytes=len(b"bounded"),
+            transport=httpx.MockTransport(handler),
+            destination_resolver=_destination_resolver("93.184.216.34"),
+        )
+        return await upstream.send(
+            CapturedRequest(method="GET", host="api.stripe.com", path="/v1/customers")
+        )
+
+    response = asyncio.run(run())
+
+    assert response.body == b"bounded"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"max_response_bytes": True}, TypeError),
+        ({"max_response_bytes": 0}, ValueError),
+        ({"max_response_bytes": 64 * 1024 * 1024 + 1}, ValueError),
+        ({"timeout_s": True}, TypeError),
+        ({"timeout_s": 0}, ValueError),
+        ({"timeout_s": float("nan")}, ValueError),
+    ],
+)
+def test_httpx_upstream_rejects_unbounded_configuration(
+    kwargs: dict[str, object],
+    error: type[Exception],
+) -> None:
+    with pytest.raises(error):
+        HttpxUpstream(**kwargs)
+
+
+def test_httpx_upstream_does_not_forward_reserved_broker_diagnostic() -> None:
+    captured: httpx.Request | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured
+        captured = request
+        return httpx.Response(200, content=b"{}", request=request)
+
+    async def run() -> None:
+        upstream = HttpxUpstream(
+            transport=httpx.MockTransport(handler),
+            destination_resolver=_destination_resolver("93.184.216.34"),
+        )
+        await upstream.send(
+            CapturedRequest(
+                method="GET",
+                host="docs.example.com",
+                path="/",
+                headers={CAYU_EGRESS_ERROR_HEADER: "destination_denied"},
+            )
+        )
+
+    asyncio.run(run())
+
+    assert captured is not None
+    assert CAYU_EGRESS_ERROR_HEADER.lower() not in captured.headers
+
+
+def test_broker_rejects_decoded_upstream_response_over_byte_limit() -> None:
+    decoded = b"decoded response exceeds the bound"
+    encoded = gzip.compress(decoded)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            content=encoded,
+            request=request,
+        )
+
+    upstream = HttpxUpstream(
+        max_response_bytes=len(decoded) - 1,
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "oversized_response"
+    assert decisions[-1].reason == "Upstream response exceeded the configured byte limit."
+
+
+def test_browser_policy_requires_identity_encoding_before_upstream_body_read() -> None:
+    body_started = False
+    accepted_encoding: str | None = None
+
+    class _Body(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            nonlocal body_started
+            body_started = True
+            yield gzip.compress(b"expanded browser content")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal accepted_encoding
+        accepted_encoding = request.headers.get("accept-encoding")
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=_Body(),
+            request=request,
+        )
+
+    upstream = HttpxUpstream(
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker = TransparentEgressBroker(
+        registry=VirtualCredentialRegistry(),
+        resolver=None,
+        policies={
+            "browser": BrowserEgressPolicy(
+                name="browser",
+                allowed_hosts=["docs.example.com"],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="docs.example.com",
+                policy_name="browser",
+            )
+        ],
+        upstream=upstream,
+    )
+
+    response = asyncio.run(
+        broker.handle_request(CapturedRequest(method="GET", host="docs.example.com", path="/"))
+    )
+
+    assert accepted_encoding == "identity"
+    assert body_started is False
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "unsupported_content"
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_error"),
+    [
+        (
+            CapturedResponse(
+                status_code=200,
+                headers={"Content-Encoding": "gzip"},
+                body=b"compressed",
+            ),
+            "unsupported_content",
+        ),
+        (
+            CapturedResponse(status_code=200, body=b"too large"),
+            "oversized_response",
+        ),
+    ],
+)
+def test_browser_policy_revalidates_custom_upstream_response_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    response: CapturedResponse,
+    expected_error: str,
+) -> None:
+    monkeypatch.setattr(
+        "cayu.egress.broker.DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES",
+        4,
+    )
+    broker = TransparentEgressBroker(
+        registry=VirtualCredentialRegistry(),
+        resolver=None,
+        policies={
+            "browser": BrowserEgressPolicy(
+                name="browser",
+                allowed_hosts=["docs.example.com"],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="docs.example.com",
+                policy_name="browser",
+            )
+        ],
+        upstream=_FakeUpstream(response),
+    )
+
+    result = asyncio.run(
+        broker.handle_request(CapturedRequest(method="GET", host="docs.example.com", path="/"))
+    )
+
+    assert result.status_code == 502
+    assert result.headers[CAYU_EGRESS_ERROR_HEADER] == expected_error
+
+
+def test_broker_rejects_announced_upstream_response_over_byte_limit_before_read() -> None:
+    body_started = False
+
+    class _Body(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            nonlocal body_started
+            body_started = True
+            yield b"unexpected"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Length": "100"},
+            stream=_Body(),
+            request=request,
+        )
+
+    upstream = HttpxUpstream(
+        max_response_bytes=10,
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker, registry, _resolver, _decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "oversized_response"
+    assert body_started is False
+
+
+def test_broker_classifies_upstream_dns_failure_without_contacting_transport() -> None:
+    transport_called = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal transport_called
+        transport_called = True
+        return httpx.Response(200, request=request)
+
+    upstream = HttpxUpstream(
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver(),
+    )
+    broker, registry, _resolver, _decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "dns_failure"
+    assert transport_called is False
+
+
+def test_broker_classifies_prohibited_upstream_destination() -> None:
+    upstream = HttpxUpstream(destination_resolver=_destination_resolver("127.0.0.1"))
+    broker, registry, _resolver, _decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 403
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "destination_denied"
+
+
+def test_broker_classifies_upstream_timeout() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow upstream", request=request)
+
+    upstream = HttpxUpstream(
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker, registry, _resolver, _decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 504
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "timeout"
 
 
 def test_httpx_upstream_routes_logical_host_to_private_service() -> None:

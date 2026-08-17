@@ -146,6 +146,22 @@ def _validate_ca_mount(ca_mount: tuple[str, str]) -> tuple[str, str]:
     return host_path, guest_path
 
 
+def validate_docker_seccomp_profile(path: str | None) -> str | None:
+    """Return an owned absolute Docker seccomp-profile path."""
+
+    if path is None:
+        return None
+    value = require_clean_nonblank(path, "seccomp_profile")
+    if not os.path.isabs(value):
+        raise ValueError("DockerRunner seccomp_profile must be an absolute host path.")
+    value = os.path.realpath(value)
+    if not os.path.isfile(value):
+        raise ValueError("DockerRunner seccomp_profile must be an existing regular file.")
+    if os.path.getsize(value) > 1024 * 1024:
+        raise ValueError("DockerRunner seccomp_profile must not exceed 1 MiB.")
+    return value
+
+
 def _build_docker_exec_argv(
     docker_path: str,
     name: str,
@@ -383,6 +399,7 @@ class DockerRunner(Runner):
         extra_hosts: Sequence[str] = (),
         env_overlay: Mapping[str, str] | None = None,
         ca_mount: tuple[str, str] | None = None,
+        seccomp_profile: str | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
@@ -400,7 +417,8 @@ class DockerRunner(Runner):
         ``(host_path, guest_path)`` CA read-only, and ``env_overlay`` is applied to
         every exec's environment (after model env, so it cannot be unset).
 
-        ``docker_cli_env_allowlist`` explicitly grants named host environment
+        ``seccomp_profile`` applies an explicit host-side Docker seccomp profile
+        to the container. ``docker_cli_env_allowlist`` explicitly grants named host environment
         variables to the trusted Docker CLI and its credential helpers. It is for
         registry or daemon authentication only and never enters the guest.
         """
@@ -417,6 +435,7 @@ class DockerRunner(Runner):
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         docker_cli_allowlist = normalize_docker_cli_env_allowlist(docker_cli_env_allowlist)
+        seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
         if default_cwd is None:
             default_cwd = mount_path if mount_path is not None else DEFAULT_DOCKER_CWD
         default_cwd = _validate_guest_cwd(default_cwd)
@@ -437,6 +456,8 @@ class DockerRunner(Runner):
             run_argv = ["run", "-d"]
             if runtime:
                 run_argv += ["--runtime", runtime]
+            if seccomp_profile is not None:
+                run_argv += ["--security-opt", f"seccomp={seccomp_profile}"]
             run_argv += ["--name", name]
             if network is not None:
                 run_argv += ["--network", require_clean_nonblank(network, "network")]

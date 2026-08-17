@@ -14,6 +14,7 @@ import tempfile
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
 from urllib.parse import urlsplit
 
 from cryptography import x509
@@ -21,7 +22,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from cayu.egress.broker import CapturedRequest, CapturedResponse, TransparentEgressBroker
+from cayu.egress.broker import (
+    CAYU_EGRESS_ERROR_HEADER,
+    CapturedRequest,
+    CapturedResponse,
+    TransparentEgressBroker,
+)
 from cayu.egress.destinations import normalize_egress_hostname
 
 _ONE_DAY = _dt.timedelta(days=1)
@@ -30,6 +36,13 @@ _LEAF_VALIDITY = _dt.timedelta(days=365)
 _MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _BROKER_TIMEOUT_S = 60.0
 _TRANSPORT_TUNNEL_TARGET = "cayu-transport.invalid:443"
+_PLAIN_HTTP_DENIAL_RESPONSE = (
+    "HTTP/1.1 403 Forbidden\r\n"
+    f"{CAYU_EGRESS_ERROR_HEADER}: destination_denied\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+).encode("ascii")
 _logger = logging.getLogger(__name__)
 
 
@@ -314,9 +327,7 @@ class TransparentEgressProxyServer:
         if method.upper() == "CONNECT":
             self._handle_connect(conn, target)
         else:
-            conn.sendall(
-                b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
+            conn.sendall(_PLAIN_HTTP_DENIAL_RESPONSE)
 
     def _transport_is_authenticated(
         self,
@@ -522,7 +533,10 @@ def _content_length(headers: dict[str, str]) -> int | None:
 
 
 def _serialize_response(response: CapturedResponse) -> bytes:
-    reason = _STATUS_REASON.get(response.status_code, "OK")
+    try:
+        reason = HTTPStatus(response.status_code).phrase
+    except ValueError:
+        reason = "Unknown Status"
     lines = [f"HTTP/1.1 {response.status_code} {reason}"]
     headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
     headers["Content-Length"] = str(len(response.body))
@@ -538,15 +552,3 @@ def _shutdown(sock: socket.socket) -> None:
         sock.shutdown(socket.SHUT_RDWR)
     with contextlib.suppress(OSError):
         sock.close()
-
-
-_STATUS_REASON = {
-    200: "OK",
-    201: "Created",
-    400: "Bad Request",
-    401: "Unauthorized",
-    403: "Forbidden",
-    404: "Not Found",
-    500: "Internal Server Error",
-    502: "Bad Gateway",
-}

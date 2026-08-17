@@ -628,6 +628,47 @@ def test_validate_mount_path_rejects_file(tmp_path):
         _validate_mount_path(str(target))
 
 
+def test_create_applies_explicit_seccomp_profile(monkeypatch, tmp_path):
+    issued = []
+    profile = tmp_path / "chromium-seccomp.json"
+    profile.write_text("{}")
+
+    async def fake_run_subprocess(command, **kwargs):
+        issued.append(command.argv)
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    asyncio.run(
+        DockerRunner.create(
+            "a1",
+            docker_path="/usr/bin/docker",
+            seccomp_profile=str(profile),
+        )
+    )
+
+    run = next(argv for argv in issued if argv[1] == "run")
+    assert run[2:4] == ["-d", "--security-opt"]
+    assert run[4] == f"seccomp={profile}"
+
+
+@pytest.mark.parametrize("profile", ["relative.json", "/missing/seccomp.json"])
+def test_create_rejects_invalid_seccomp_profile(monkeypatch, profile):
+    async def fake_run_subprocess(command, **kwargs):
+        raise AssertionError("docker should not run for an invalid seccomp profile")
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    with pytest.raises(ValueError, match="seccomp_profile"):
+        asyncio.run(
+            DockerRunner.create(
+                "a1",
+                docker_path="/usr/bin/docker",
+                seccomp_profile=profile,
+            )
+        )
+
+
 def test_create_rejects_bad_mount_path(monkeypatch, tmp_path):
     async def fake_run_subprocess(command, **kwargs):
         raise AssertionError("docker should not be invoked when mount_path is invalid")

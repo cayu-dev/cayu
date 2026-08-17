@@ -60,6 +60,7 @@ from cayu.core.tools import (
 from cayu.core.workflows import Workflow, WorkflowSpec
 from cayu.egress import (
     ApprovedEgressDestination,
+    BrowserEgressPolicy,
     CredentialMode,
     HttpEgressPolicy,
 )
@@ -1316,6 +1317,7 @@ __all__ = [
     "BillingIdentityState",
     "BoundWorkspace",
     "BoundedTarReader",
+    "BrowserEgressPolicy",
     "BudgetAction",
     "BudgetCheck",
     "BudgetLedger",

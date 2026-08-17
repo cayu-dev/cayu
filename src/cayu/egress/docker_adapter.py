@@ -34,7 +34,7 @@ from cayu.environments.admission import (
 )
 from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
 from cayu.runners.base import Runner
-from cayu.runners.docker import DockerRunner
+from cayu.runners.docker import DockerRunner, validate_docker_seccomp_profile
 
 _logger = logging.getLogger(__name__)
 
@@ -276,6 +276,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         sidecar_image: str = _DEFAULT_SIDECAR_IMAGE,
         proxy_host: str | None = None,
         proxy_bind_host_resolver: Callable[[], Awaitable[str]] | None = None,
+        seccomp_profile: str | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
     ) -> None:
         self._docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(
@@ -287,6 +288,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
         )
         self._sidecar_image = sidecar_image
+        self._seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
         # None => auto-resolve the narrowest reachable interface at prepare time
         # (loopback on Docker Desktop, bridge gateway on Linux). An explicit value
         # is used verbatim. The broker still requires a valid unguessable virtual
@@ -463,6 +465,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             network=network,
             env_overlay=dict(request.env_overlay),
             ca_mount=(request.ca_cert_host_path, request.guest_ca_path),
+            seccomp_profile=self._seccomp_profile,
             setup_commands=request.setup_commands,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
         )
