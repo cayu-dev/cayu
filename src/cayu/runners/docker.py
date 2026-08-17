@@ -421,6 +421,8 @@ class DockerRunner(Runner):
         to the container. ``docker_cli_env_allowlist`` explicitly grants named host environment
         variables to the trusted Docker CLI and its credential helpers. It is for
         registry or daemon authentication only and never enters the guest.
+        Managed containers always use Docker's minimal init as PID 1 so cleanup
+        descendants orphaned by a worker exit are reaped after they finish.
         """
         docker = _require_docker(docker_path)
         name = require_clean_nonblank(name, "name")
@@ -453,7 +455,11 @@ class DockerRunner(Runner):
                     ["rm", "-f", name],
                     docker_cli_env_allowlist=docker_cli_allowlist,
                 )
-            run_argv = ["run", "-d"]
+            # `docker exec` commands can intentionally delegate bounded cleanup
+            # to a descendant which outlives the command's process group. Keep
+            # Docker's minimal init as PID 1 so those orphaned owners are reaped
+            # after they finish; plain `sleep infinity` cannot reap zombies.
+            run_argv = ["run", "-d", "--init"]
             if runtime:
                 run_argv += ["--runtime", runtime]
             if seccomp_profile is not None:

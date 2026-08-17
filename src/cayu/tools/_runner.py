@@ -19,6 +19,7 @@ from cayu._exception_groups import (
 from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import require_durable_nonblank
 from cayu._workspace_mutation import detached_workspace_mutation_process_signal
+from cayu.environments.admission import ExecutionAdmissionCandidate
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -198,6 +199,21 @@ class InvocationRunnerHandle:
             published_failure = preflight_failure
             del preflight_failure, self
             raise published_failure from None
+
+    def execution_admission_candidate(self) -> ExecutionAdmissionCandidate | None:
+        """Return a detached capability snapshot without exposing runner ownership."""
+
+        candidate = self.__runner.execution_admission_candidate()
+        if candidate is None:
+            return None
+        if type(candidate) is not ExecutionAdmissionCandidate:
+            raise TypeError(
+                "Runner execution_admission_candidate() must return "
+                "ExecutionAdmissionCandidate or None."
+            )
+        return ExecutionAdmissionCandidate.model_validate(
+            candidate.model_dump(mode="python", warnings=False)
+        )
 
     async def exec(
         self,

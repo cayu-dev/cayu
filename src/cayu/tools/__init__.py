@@ -1,5 +1,14 @@
 """Native Python tools."""
 
+from cayu.tools.browser import (
+    BROWSER_FETCH_PLAYWRIGHT_VERSION,
+    BROWSER_FETCH_PROTOCOL_VERSION,
+    BROWSER_FETCH_WORKER_VERSION,
+    DEFAULT_BROWSER_FETCH_MAX_REQUESTS,
+    DEFAULT_BROWSER_FETCH_WORKER_COMMAND,
+    MAX_BROWSER_FETCH_MAX_REQUESTS,
+    BrowserWebFetchAdapter,
+)
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (
     CommandPolicy,
@@ -56,9 +65,16 @@ from cayu.tools.web import (
 )
 
 __all__ = [
+    "BROWSER_FETCH_PLAYWRIGHT_VERSION",
+    "BROWSER_FETCH_PROTOCOL_VERSION",
+    "BROWSER_FETCH_WORKER_VERSION",
+    "DEFAULT_BROWSER_FETCH_MAX_REQUESTS",
+    "DEFAULT_BROWSER_FETCH_WORKER_COMMAND",
+    "MAX_BROWSER_FETCH_MAX_REQUESTS",
     "ArtifactReadRequest",
     "ArtifactReader",
     "BackgroundSubagentTaskRegistry",
+    "BrowserWebFetchAdapter",
     "CommandPolicy",
     "CommandPolicyDecision",
     "CommandPolicyResult",

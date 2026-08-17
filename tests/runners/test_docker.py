@@ -532,6 +532,7 @@ def test_create_bind_mount_mode(monkeypatch, tmp_path):
         "/usr/bin/docker",
         "run",
         "-d",
+        "--init",
         "--name",
         "a1",
         "--mount",
@@ -648,8 +649,8 @@ def test_create_applies_explicit_seccomp_profile(monkeypatch, tmp_path):
     )
 
     run = next(argv for argv in issued if argv[1] == "run")
-    assert run[2:4] == ["-d", "--security-opt"]
-    assert run[4] == f"seccomp={profile}"
+    assert run[2:5] == ["-d", "--init", "--security-opt"]
+    assert run[5] == f"seccomp={profile}"
 
 
 @pytest.mark.parametrize("profile", ["relative.json", "/missing/seccomp.json"])
@@ -707,6 +708,7 @@ def test_create_isolated_mode_with_runtime(monkeypatch):
         "/usr/bin/docker",
         "run",
         "-d",
+        "--init",
         "--runtime",
         "runsc",
         "--name",

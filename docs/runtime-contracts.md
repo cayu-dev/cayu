@@ -4110,8 +4110,11 @@ is required, and return only safe results. Arbitrary values read directly from
 the host process environment do not automatically enter Cayu's workload-secret
 tracking or redaction boundary.
 
-`WebFetchTool` is the opt-in trusted-process adapter for bounded public page
-reads. Its model-facing `web_fetch` schema is closed and contains only `url`.
+`WebFetchTool` is the opt-in bounded public-page tool. Its model-facing
+`web_fetch` schema is closed and contains only `url`. Without an explicit
+adapter it uses trusted-process HTTP; applications can instead select
+`BrowserWebFetchAdapter` to dispatch the same contract through the session's
+admitted runner.
 The tool canonicalizes credentialless HTTPS URLs on port 443, rejects user
 information and IP literals, requires every DNS answer for each hop to be
 global, and pins the connection to one admitted address while retaining the
@@ -4141,12 +4144,13 @@ The public read is `ToolEffect.NONE`; applications can name `web_fetch` in
 `TaintAwareToolPolicy.taint_sources` when later tools require origin-based
 gating.
 
-This adapter performs direct network I/O from the trusted Cayu application
+The default adapter performs direct network I/O from the trusted Cayu application
 process. DNS admission and pinning constrain its destination, but do not provide
 process isolation, browser isolation, or a sandbox network boundary. It does
 not execute JavaScript, accept arbitrary request methods or headers, carry
-credentials, or invoke a secondary model. Register a separately governed
-sandbox or browser tool when those execution semantics are required. See
+credentials, or invoke a secondary model. `BrowserWebFetchAdapter` uses the
+admitted runner and virtual-egress boundary for JavaScript-rendered content; it
+does not fall back to this default path. See
 [`docs/web-fetch.md`](web-fetch.md) for registration and deployment guidance.
 
 A custom `Tool` uses environment services through `ctx`:
@@ -4552,6 +4556,13 @@ for Docker CLI operations, are never inferred from provider registration or
 model-controlled command input, and are never added to the guest environment.
 `DockerEgressAdapter` accepts the same argument and applies it to sidecar,
 network, and workload-runner Docker operations.
+
+`DockerRunner.create(seccomp_profile=...)` accepts an explicit absolute host
+path for a Docker seccomp profile; `DockerEgressAdapter` forwards the same
+setting to its workload container. Cayu resolves the path, requires an existing
+regular file no larger than 1 MiB, and passes it as one Docker CLI argument. A
+profile is trusted deployment configuration, not model input, and selecting one
+does not by itself promote Docker to an untrusted-code isolation boundary.
 
 `cayu.testing.verify_provider_credential_isolation(...)` is the deterministic
 deployment-readiness seam for this contract. It accepts trusted-only canaries,

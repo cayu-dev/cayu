@@ -305,12 +305,121 @@ the connection target and prevents DNS rebinding to private networks or cloud
 metadata. Application-owned `HttpxUpstream(routes=...)` mappings are an explicit
 trusted-control-plane override for private service origins; they still reject
 loopback, link-local/metadata, multicast, reserved, and unspecified addresses.
+The default upstream retains at most 8 MiB of decoded response data and rejects
+larger responses; applications that construct `HttpxUpstream` explicitly can
+select a lower limit or raise it as far as the hard 64 MiB ceiling. Browser
+policies additionally require identity encoding, so compressed expansion never
+crosses that browser-facing buffering boundary.
 
 Credentialed and credentialless declarations can be combined in one factory.
 The adapter receives the union of their hostnames for enforcement preflight,
 while only `VirtualCredentialSpec` entries create guest credential values. A
 factory with neither kind is rejected before adapter allocation, so an empty
 configuration opens no proxy or network capability.
+
+### JavaScript-rendered `web_fetch` in an admitted runner
+
+The stable `web_fetch` input and result contract can use a browser without
+starting Chromium in the Cayu server process. Build the versioned worker image
+in [`examples/browser_fetch`](../examples/browser_fetch/README.md), select it in
+a virtual-egress environment, and opt the tool into
+`BrowserWebFetchAdapter`. The adapter sends a bounded, versioned JSON request to
+the environment's admitted runner. Playwright, Chromium, its temporary profile,
+and its per-invocation trust database exist only inside that runner.
+
+```python
+from cayu import (
+    ApprovedEgressDestination,
+    AgentSpec,
+    BrowserEgressPolicy,
+    BrowserWebFetchAdapter,
+    CayuApp,
+    EnvironmentSpec,
+    ExecutionRequirements,
+    VirtualEgressEnvironmentFactory,
+    WebFetchTool,
+)
+from cayu.egress.docker_adapter import DockerEgressAdapter
+
+browser_hosts = ("docs.example.com", "static.example.com")
+factory = VirtualEgressEnvironmentFactory(
+    policies={
+        "product-docs": BrowserEgressPolicy(
+            name="product-docs",
+            allowed_hosts=browser_hosts,
+            allowed_path_prefixes=["/guides", "/assets"],
+            denied_prefixes=["/guides/internal"],
+        )
+    },
+    approved_destinations=[
+        ApprovedEgressDestination(
+            destination=host,
+            policy_name="product-docs",
+        )
+        for host in browser_hosts
+    ],
+    credentials=[],
+    adapter=DockerEgressAdapter(
+        seccomp_profile="/absolute/path/to/browser_fetch/seccomp_profile.json",
+    ),
+    image="cayu-browser-fetch:1-playwright-1.62.0",
+)
+
+app = CayuApp()
+app.register_environment_factory(
+    EnvironmentSpec(name="browser-docs"),
+    factory,
+    default=True,
+)
+app.register_agent(
+    AgentSpec(name="docs-agent", model="gpt-5.4-mini"),
+    tools=[WebFetchTool(adapter=BrowserWebFetchAdapter())],
+    execution_requirements=ExecutionRequirements.trusted(),
+)
+```
+
+`BrowserEgressPolicy` permits only body-free `GET` and `HEAD` requests. Denied
+prefixes take precedence over allowed prefixes, and prefix matching observes
+path-segment boundaries after one strict percent-decoding pass. Policy prefixes
+use decoded canonical paths; malformed escapes, residual escapes, repeated path
+separators, backslashes, semicolon path parameters, controls, and dot segments
+fail closed. Every document,
+redirect, script, stylesheet, image, and font host must be declared by the
+application; the browser never derives new authority from page content. Broker
+denials are returned through a
+reserved internal header which upstream responses cannot spoof. Browser-policy
+upstream requests require identity content encoding; an origin that ignores
+that requirement is rejected before its compressed body is read.
+
+The worker requires matching protocol, worker, and Playwright versions; a
+non-root guest; Chromium's sandbox; the managed HTTPS proxy and session CA; and
+current runner evidence for deny-by-default networking, brokered egress,
+confirmed cancellation, and confirmed cleanup. Missing or stale evidence fails
+before dispatch. There is no host-HTTP or host-Playwright fallback. Response
+bytes, extracted text, requests, redirects, command output, and elapsed time all
+have independent limits. The worker owns exactly one page; an unexpected popup
+or other secondary page fails the fetch instead of creating an unmetered
+network surface.
+
+Each temporary browser profile has a separate cleanup guardian before page
+execution begins. The guardian receives no application environment or
+credentials, waits on a parent-owned pipe, and deletes only the worker-owned
+profile when the invocation releases it or the worker exits. Normal completion
+waits for that deletion within a reserved part of the same request deadline. A
+blocked deletion has its own guardian deadline; the worker also sends the
+guardian `SIGKILL` and makes a bounded reap attempt without blocking the event
+loop. Any deletion or reap that cannot settle returns `cleanup_failed` instead
+of claiming that the temporary profile was removed. Managed Docker runners use
+Docker's minimal init as PID 1 so a guardian orphaned by a worker crash is
+reaped after cleanup instead of accumulating as a zombie. Other admitted
+runners that advertise confirmed cleanup must provide an equivalent reaper or
+supervisor contract.
+
+Docker is useful for the executable network-boundary proof and trusted
+development, but its adapter deliberately does not claim untrusted-code
+isolation. A production deployment that treats fetched pages as hostile should
+select an admitted sandbox runner which supplies the same image and worker
+protocol with the stronger isolation evidence its application requires.
 
 Credentialless authorization also requires a session-isolated broker transport.
 Docker provides this automatically: its dual-homed sidecar listens only on the

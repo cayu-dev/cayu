@@ -30,12 +30,13 @@ neutralized.
 
 ## Network boundary
 
-The built-in adapter accepts only credentialless HTTPS on port 443. It rejects
-URL user information and IP-literal destinations. Before every initial or
-redirected request, it resolves the hostname, requires every DNS answer to be a
-global address, and connects to one admitted address while preserving the
-original hostname for the HTTP `Host` header and TLS certificate validation.
-Redirects are followed manually and pass through the same validation again.
+The default trusted-process adapter accepts only credentialless HTTPS on port
+443. It rejects URL user information and IP-literal destinations. Before every
+initial or redirected request, it resolves the hostname, requires every DNS
+answer to be a global address, and connects to one admitted address while
+preserving the original hostname for the HTTP `Host` header and TLS certificate
+validation. Redirects are followed manually and pass through the same
+validation again.
 
 The transport requests identity content encoding and rejects compressed,
 missing-media-type, or unsupported-media-type successful responses before
@@ -53,14 +54,31 @@ These controls prevent the tool's URL input from becoming an unrestricted
 private-network fetch. They do **not** make the tool a process or network
 isolation boundary. `WebFetchTool.run()` executes as trusted Python code in the
 Cayu application process and the application process owns its outbound network
-access. Use a separately admitted sandbox/browser tool when page execution or
-workload isolation is required; do not describe this local adapter as running
-inside a configured sandbox merely because the agent also has a sandbox-backed
-environment.
+access. Select the runner-backed browser adapter described below when
+JavaScript page execution or a sandbox network boundary is required; do not
+describe the default adapter as running inside a configured sandbox merely
+because the agent also has a sandbox-backed environment.
 
 The tool has no authenticated-browsing surface. Do not place credentials in a
 URL. Authenticated APIs should use explicit Cayu credential and egress
 boundaries instead.
+
+## Runner-backed browser adapter
+
+`WebFetchTool(adapter=BrowserWebFetchAdapter())` preserves the same tool name,
+closed model input, output envelope, taint behavior, and limits while dispatching
+a versioned Playwright/Chromium worker through the current session runner. It
+never falls back to direct host HTTP. The selected environment must provide the
+compatible browser image plus current admission evidence for brokered,
+deny-by-default egress and deterministic command cancellation and cleanup.
+
+Browser destinations are still application configuration. Register every
+document and subresource host as an `ApprovedEgressDestination` under a
+`BrowserEgressPolicy`; redirects, frames, scripts, stylesheets, images, and
+fonts receive no transitive authority from the page. See
+[`virtual-egress.md`](virtual-egress.md#javascript-rendered-web_fetch-in-an-admitted-runner)
+and the [versioned image example](../examples/browser_fetch/README.md) for the
+complete environment and image configuration.
 
 ## Taint policy
 
