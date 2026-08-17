@@ -46,6 +46,8 @@ from cayu.tools.user_input import UserInputTool
 from cayu.tools.web import (
     HttpxWebFetchTransport,
     SystemWebFetchResolver,
+    WebFetchAdapter,
+    WebFetchAdapterRequest,
     WebFetchHttpRequest,
     WebFetchHttpResponse,
     WebFetchHttpTransport,
@@ -88,6 +90,8 @@ __all__ = [
     "SystemWebFetchResolver",
     "TextArtifactReader",
     "UserInputTool",
+    "WebFetchAdapter",
+    "WebFetchAdapterRequest",
     "WebFetchHttpRequest",
     "WebFetchHttpResponse",
     "WebFetchHttpTransport",

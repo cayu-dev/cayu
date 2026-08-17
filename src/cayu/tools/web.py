@@ -112,6 +112,28 @@ class WebFetchHttpResponse:
     body: bytes
 
 
+@dataclass(frozen=True)
+class WebFetchAdapterRequest:
+    """Canonical bounded request passed to a selected web-fetch adapter."""
+
+    requested_url: str
+    max_response_bytes: int
+    max_content_bytes: int
+    timeout_seconds: float
+    max_redirects: int
+
+
+@runtime_checkable
+class WebFetchAdapter(Protocol):
+    """High-level execution adapter for the stable ``web_fetch`` tool contract."""
+
+    async def fetch(
+        self,
+        ctx: ToolContext,
+        request: WebFetchAdapterRequest,
+    ) -> ToolResult: ...
+
+
 @runtime_checkable
 class WebFetchResolver(Protocol):
     """Resolves every destination immediately before its request hop."""
@@ -222,6 +244,7 @@ class WebFetchTool(Tool):
     def __init__(
         self,
         *,
+        adapter: WebFetchAdapter | None = None,
         resolver: WebFetchResolver | None = None,
         transport: WebFetchHttpTransport | None = None,
         max_response_bytes: int = DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES,
@@ -230,6 +253,11 @@ class WebFetchTool(Tool):
         max_redirects: int = DEFAULT_WEB_FETCH_MAX_REDIRECTS,
         spec: ToolSpec | None = None,
     ) -> None:
+        if adapter is not None and not isinstance(adapter, WebFetchAdapter):
+            raise TypeError("adapter must implement WebFetchAdapter.")
+        if adapter is not None and (resolver is not None or transport is not None):
+            raise ValueError("adapter cannot be combined with resolver or transport.")
+        self.adapter = adapter
         self.resolver = resolver if resolver is not None else SystemWebFetchResolver()
         self.transport = transport if transport is not None else HttpxWebFetchTransport()
         self.max_response_bytes = _configuration_int(
@@ -259,11 +287,31 @@ class WebFetchTool(Tool):
         super().__init__(spec)
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-        del ctx
         try:
             requested_url = _canonical_public_https_url(args)
         except (TypeError, ValueError):
             return _error_result("invalid_url", "A valid public HTTPS URL is required.")
+
+        if self.adapter is not None:
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    result = await self.adapter.fetch(
+                        ctx,
+                        WebFetchAdapterRequest(
+                            requested_url=requested_url,
+                            max_response_bytes=self.max_response_bytes,
+                            max_content_bytes=self.max_content_bytes,
+                            timeout_seconds=self.timeout_seconds,
+                            max_redirects=self.max_redirects,
+                        ),
+                    )
+            except TimeoutError:
+                return _error_result("timeout", "The web fetch timed out.")
+            if type(result) is not ToolResult:
+                raise TypeError("WebFetchAdapter.fetch() must return ToolResult.")
+            return result
+
+        del ctx
 
         extracted: tuple[str | None, str, tuple[str, ...]] | None = None
         try:
@@ -337,34 +385,13 @@ class WebFetchTool(Tool):
         if extracted is None:
             return _error_result("unsupported_content", "The response content type is unsupported.")
         title, content, truncation_reasons = extracted
-        structured = {
-            "requested_url": requested_url,
-            "final_url": request.url,
-            "title": title,
-            "representation": "text",
-            "content": content,
-            "redirects": redirects,
-            "truncated": bool(truncation_reasons),
-            "truncation_reasons": list(truncation_reasons),
-        }
-        projected_parts = [f"URL: {request.url}"]
-        if title is not None:
-            projected_parts.append(f"Title: {title}")
-        if content:
-            projected_parts.append(content)
-        projected_content = "\n\n".join(projected_parts)
-        delimited_content = projected_content.replace(
-            "</untrusted_web_content>",
-            "<\\/untrusted_web_content>",
-        )
-        return ToolResult(
-            content=(
-                "Fetched web content:\n\n"
-                "<untrusted_web_content>\n"
-                f"{delimited_content}\n"
-                "</untrusted_web_content>"
-            ),
-            structured=structured,
+        return _web_fetch_success_result(
+            requested_url=requested_url,
+            final_url=request.url,
+            title=title,
+            content=content,
+            redirects=redirects,
+            truncation_reasons=truncation_reasons,
         )
 
     async def _fetch_hop(
@@ -394,6 +421,46 @@ class WebFetchTool(Tool):
             timeout_seconds=self.timeout_seconds,
         )
         return await self.transport.fetch(request), request
+
+
+def _web_fetch_success_result(
+    *,
+    requested_url: str,
+    final_url: str,
+    title: str | None,
+    content: str,
+    redirects: Sequence[Mapping[str, Any]],
+    truncation_reasons: Sequence[str],
+) -> ToolResult:
+    structured = {
+        "requested_url": requested_url,
+        "final_url": final_url,
+        "title": title,
+        "representation": "text",
+        "content": content,
+        "redirects": [dict(redirect) for redirect in redirects],
+        "truncated": bool(truncation_reasons),
+        "truncation_reasons": list(truncation_reasons),
+    }
+    projected_parts = [f"URL: {final_url}"]
+    if title is not None:
+        projected_parts.append(f"Title: {title}")
+    if content:
+        projected_parts.append(content)
+    projected_content = "\n\n".join(projected_parts)
+    delimited_content = projected_content.replace(
+        "</untrusted_web_content>",
+        "<\\/untrusted_web_content>",
+    )
+    return ToolResult(
+        content=(
+            "Fetched web content:\n\n"
+            "<untrusted_web_content>\n"
+            f"{delimited_content}\n"
+            "</untrusted_web_content>"
+        ),
+        structured=structured,
+    )
 
 
 def _canonical_public_https_url(args: dict[str, Any]) -> str:
@@ -715,6 +782,8 @@ def _parse_content_type(value: str | None) -> tuple[str, str]:
 __all__ = [
     "HttpxWebFetchTransport",
     "SystemWebFetchResolver",
+    "WebFetchAdapter",
+    "WebFetchAdapterRequest",
     "WebFetchHttpRequest",
     "WebFetchHttpResponse",
     "WebFetchHttpTransport",

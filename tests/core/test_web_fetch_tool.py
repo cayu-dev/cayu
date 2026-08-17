@@ -24,6 +24,7 @@ from cayu import (
     ToolPolicyDecision,
     ToolResult,
     ToolSpec,
+    WebFetchAdapterRequest,
     WebFetchTool,
 )
 from cayu.tools import (
@@ -74,6 +75,96 @@ class _SequenceResolver:
     async def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
         self.calls.append((hostname, port))
         return self.answers[hostname].pop(0)
+
+
+class _FakeAdapter:
+    def __init__(self, result: ToolResult) -> None:
+        self.result = result
+        self.calls: list[tuple[ToolContext, WebFetchAdapterRequest]] = []
+
+    async def fetch(
+        self,
+        ctx: ToolContext,
+        request: WebFetchAdapterRequest,
+    ) -> ToolResult:
+        self.calls.append((ctx, request))
+        return self.result
+
+
+def test_web_fetch_explicit_adapter_receives_canonical_bounded_request() -> None:
+    expected = ToolResult(
+        content="adapter result",
+        structured={"requested_url": "https://example.com/"},
+    )
+    adapter = _FakeAdapter(expected)
+    context = ToolContext(session_id="sess_adapter")
+    tool = WebFetchTool(
+        adapter=adapter,
+        max_response_bytes=1234,
+        max_content_bytes=567,
+        timeout_seconds=9,
+        max_redirects=3,
+    )
+
+    result = asyncio.run(tool.run(context, {"url": "HTTPS://Example.COM"}))
+
+    assert result == expected
+    assert len(adapter.calls) == 1
+    received_context, request = adapter.calls[0]
+    assert received_context is context
+    assert request == WebFetchAdapterRequest(
+        requested_url="https://example.com/",
+        max_response_bytes=1234,
+        max_content_bytes=567,
+        timeout_seconds=9.0,
+        max_redirects=3,
+    )
+    assert tool.name == "web_fetch"
+    assert tool.schema["properties"]["url"]["maxLength"] == 8192
+
+
+def test_web_fetch_adapter_is_explicit_and_cannot_mix_with_local_transport() -> None:
+    adapter = _FakeAdapter(ToolResult(content="unused"))
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        WebFetchTool(adapter=adapter, resolver=_FakeResolver({}))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        WebFetchTool(adapter=adapter, transport=_FakeTransport([]))
+    with pytest.raises(TypeError, match="WebFetchAdapter"):
+        WebFetchTool(adapter=object())  # type: ignore[arg-type]
+
+
+def test_web_fetch_adapter_failure_does_not_fall_back_to_local_fetch() -> None:
+    expected = ToolResult(
+        content="The browser runner is unavailable.",
+        structured={"error": "browser_unavailable"},
+        is_error=True,
+    )
+    adapter = _FakeAdapter(expected)
+
+    result = asyncio.run(
+        WebFetchTool(adapter=adapter).run(
+            ToolContext(session_id="sess_adapter_failure"),
+            {"url": "https://example.com/"},
+        )
+    )
+
+    assert result == expected
+    assert len(adapter.calls) == 1
+
+
+def test_web_fetch_adapter_still_rejects_invalid_url_before_dispatch() -> None:
+    adapter = _FakeAdapter(ToolResult(content="must not run"))
+
+    result = asyncio.run(
+        WebFetchTool(adapter=adapter).run(
+            ToolContext(session_id="sess_adapter_invalid"),
+            {"url": "http://example.com/"},
+        )
+    )
+
+    assert result.structured == {"error": "invalid_url"}
+    assert adapter.calls == []
 
 
 def test_web_fetch_public_contract_and_successful_html_fetch() -> None:
