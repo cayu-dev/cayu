@@ -224,6 +224,36 @@ def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:
         )
 
 
+def test_application_anatomy_guide_tracks_shipped_process_roles() -> None:
+    process_roles = _heading_section(
+        _REPO_ROOT / "src" / "cayu" / "guides" / "application-anatomy.md",
+        heading="Process roles",
+    )
+
+    assert "`cayu serve` and `cayu worker` are shipped process-role adapters" in (process_roles)
+    assert "Cayu does not ship a `cayu script` command" in process_roles
+    assert "`cayu server`" not in process_roles
+    assert "`cayu worker` are not shipped commands" not in process_roles
+
+
+def test_release_notes_preserve_storage_revision_chronology() -> None:
+    release_notes = _REPO_ROOT / "docs" / "release-notes.md"
+    unreleased = _heading_section(release_notes, heading="Unreleased")
+    v0_2_1 = _heading_section(release_notes, heading="v0.2.1")
+    v0_2_0 = _heading_section(release_notes, heading="v0.2.0")
+
+    assert "advances from revision 29 to revision 34" in v0_2_0
+    assert "confirm revision 34 with no pending migrations" in v0_2_0
+    assert "revision 39" not in v0_2_0
+
+    assert "advances from revision 34 to revision 36" in v0_2_1
+    assert "confirm revision 36 with no pending migrations" in v0_2_1
+    assert "revision 39" not in v0_2_1
+
+    assert "Breaking schema revision 39" in unreleased
+    assert "confirm revision 39 before starting current workers" in unreleased
+
+
 def test_project_server_command_is_release_visible_and_fail_closed() -> None:
     guide = " ".join(
         (_REPO_ROOT / "docs" / "project-server.md").read_text(encoding="utf-8").split()

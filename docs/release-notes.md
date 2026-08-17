@@ -89,6 +89,23 @@ guard.
 
 ## Unreleased
 
+### Durable tasks retain immutable invocation provenance
+
+Tasks now carry a Cayu-minted invocation identity and their immediate execution
+source through claims, worker replacement, scheduling, session attachment, and
+terminal settlement. Server-created work also retains its verified product
+subject, so replacement workers can reconstruct the exact task provenance
+without trusting caller-authored identifiers.
+
+Breaking schema revision 39 applies this immutable origin contract to tasks and
+durable dispatch. Stop pre-39 workers and take an application-consistent backup
+before migrating. Populated prerelease task stores cannot be assigned truthful
+origins and must be recreated; empty task stores migrate normally. Run
+`cayu storage status` followed by `cayu storage migrate`, then confirm revision
+39 before starting current workers. Generated product-operation stores also add
+a required originating-subject column; recreate populated prerelease product
+databases rather than fabricating that authority.
+
 ### Worker task terminalization survives lost acknowledgements
 
 Worker-claimed task completion and failure now commit a deterministic terminal
@@ -104,8 +121,9 @@ state idempotency, not an exactly-once guarantee for external effects.
 
 Additive schema revision 38 installs the receipt table in SQLite and PostgreSQL.
 Revision-37 binaries remain compatible with the new table, but new built-in
-task stores require revision 38. Migrate the shared database before deploying
-workers that use replay-safe task terminalization.
+task stores require revision 38. Current workers also require the breaking
+revision-39 task-provenance boundary described above; migrate the shared database
+through revision 39 before deploying them.
 
 ### SQLite knowledge updates no longer scan the global FTS corpus
 
@@ -115,14 +133,16 @@ chunks, avoiding corpus-sized work while the shared SQLite writer lock is held.
 Search behavior and BM25 ranking are unchanged.
 
 The knowledge migration advances the storage schema from revision 36 to
-breaking revision 37 before the additive revision-38 task receipt migration. Stop older
-workers, take an application-consistent backup, run `cayu storage status` followed
-by `cayu storage migrate`, and confirm revision 38 before restarting workers. The
-SQLite migration rebuilds legacy knowledge FTS rows in one transaction. After an
-ambiguous interruption, run `cayu storage status`: retry when revision 36 remains,
-or proceed with the task receipt migration when the complete revision 37 commit
-is already visible. PostgreSQL records revision 37 without changing its knowledge
-schema, then adds the shared terminalization receipt table at revision 38.
+breaking revision 37 before the additive revision-38 task receipt migration and
+breaking revision-39 task-provenance boundary. Stop older workers, take an
+application-consistent backup, run `cayu storage status` followed by
+`cayu storage migrate`, and confirm revision 39 before restarting current
+workers. The SQLite migration rebuilds legacy knowledge FTS rows in one
+transaction. After an ambiguous interruption, run `cayu storage status`: retry
+when revision 36 remains, or continue through the later migrations when the
+complete revision 37 commit is already visible. PostgreSQL records revision 37
+without changing its knowledge schema, then adds the shared terminalization
+receipt table at revision 38.
 
 ## v0.2.1
 
@@ -242,36 +262,12 @@ application-consistent backup, and upgrade independently deployed Cayu servers,
 dashboards, generated clients, and workers together. Do not run mixed `v0.1.0`
 and `v0.2.0` processes against the same stores.
 
-The storage schema advances from revision 29 to revision 39. Run
+The storage schema advances from revision 29 to revision 34. Run
 `cayu storage status` followed by `cayu storage migrate` against every
 explicitly configured SQLite or PostgreSQL session store, budget ledger, eval
-store, task store, and knowledge store, then confirm revision 39 with no pending
-migrations before starting `v0.2.0` workers. Revisions 34–39 include the durable
-eval catalog, run lifecycle, delayed task availability contract, immutable
-knowledge-publication receipts, immutable root invocation provenance, stable
-SQLite knowledge FTS identities, and immutable task invocation provenance.
-Revision 35 is a breaking mixed-worker boundary: stop older workers before
-migrating because they do not honor operation-owned knowledge publication.
-Breaking revision 36 requires invocation provenance on every session, including
-a Cayu-minted root invocation ID that remains distinct when a deleted root's
-session ID is reused. Populated pre-36 prerelease session stores must be
-recreated rather than assigned guessed origins; empty stores migrate normally.
-Standalone trajectory documents advance from schema version 2 to version 3
-because session-backed trajectories now retain the same immutable invocation
-provenance. Version-2 exports must be regenerated rather than assigned an
-invented origin during loading.
-
-Breaking revision 37 gives SQLite knowledge chunks stable FTS identities;
-PostgreSQL records the shared compatibility boundary without knowledge DDL.
-
-Breaking revision 39 applies the same immutable origin contract to tasks and
-durable dispatch. Populated pre-39 prerelease task stores must be recreated;
-empty stores migrate normally. Task claims, worker replacement, scheduling,
-session attachment, and terminal settlement preserve the original task
-invocation record. Generated product-operation stores also add a required
-originating-subject column so replacement workers can reconstruct exact
-server-verified task provenance; recreate populated prerelease product
-databases rather than fabricating that authority.
+store, and task store, then confirm revision 34 with no pending migrations
+before starting `v0.2.0` workers. Revision 34 includes the durable eval catalog,
+run lifecycle, and delayed task availability contracts.
 
 ### Verification
 

@@ -125,9 +125,11 @@ startup and cleanup under the explicit host or process entrypoint that owns them
 | Worker integration | Calls the factory for the worker process. | Configured durable stores. | Only worker behavior explicitly started by that process. |
 | Test | Calls the factory for the test or fixture scope. | Test-selected stores. | None unless the test starts it. |
 
-`cayu console`, `cayu inspect`, and `cayu check` use the declared factory today.
-Server, script, and worker integrations should follow the same contract, but
-`cayu server`, `cayu script`, and `cayu worker` are not shipped commands.
+`cayu console`, `cayu inspect`, and `cayu check` use the declared factory for
+operator workflows. `cayu serve` and `cayu worker` are shipped process-role
+adapters that construct the same application through its declared factory.
+One-off scripts should call that factory directly and own the lifecycle of any
+active services they start; Cayu does not ship a `cayu script` command.
 
 ## Console contract
 
