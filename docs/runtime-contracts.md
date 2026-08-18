@@ -2617,6 +2617,12 @@ must be idempotent. Use a stable idempotency key such as
 `(watcher_name, context.record.event.id)` when calling external systems; that
 ID is the stable public global-sequence alias, not the private store identity.
 
+`EventWatcher.lease_seconds` and every built-in `EventWatcherStore.claim_event(...)`
+implementation accept only finite, positive seconds that remain a positive
+`datetime.timedelta` and produce a representable expiry relative to the claim clock.
+NaN, infinities, non-positive values, sub-microsecond durations that round to zero,
+and durations or expiries that overflow are rejected before a store mutation occurs.
+
 Changing a watcher filter while reusing the same watcher name changes the
 meaning of its cursor. Use a new watcher name when the event selection changes
 semantically.

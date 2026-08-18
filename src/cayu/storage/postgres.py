@@ -39,6 +39,7 @@ from cayu._validation import (
     copy_label_map,
     require_durable_nonblank,
     require_nonblank,
+    require_positive_timedelta_seconds,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -3262,9 +3263,13 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
     ) -> EventWatcherClaim | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
         record = copy_event_watcher_record(record)
-        lease_seconds = _validate_positive_float(lease_seconds, "lease_seconds")
-        await self._ensure_ready()
         now = datetime.now(UTC)
+        lease_seconds = require_positive_timedelta_seconds(
+            lease_seconds,
+            "lease_seconds",
+            relative_to=now,
+        )
+        await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             state = await self._load_watcher_state_for_update(cur, watcher_name, now=now)
             if state.cursor_sequence >= record.sequence:
@@ -16764,12 +16769,6 @@ def _event_watcher_delivery_from_claim(
         cursor_sequence=cursor_sequence,
         error=error,
     )
-
-
-def _validate_positive_float(value: float, field_name: str) -> float:
-    if type(value) not in {int, float} or value <= 0:
-        raise ValueError(f"{field_name} must be greater than 0.")
-    return float(value)
 
 
 def _clean_error(value: str) -> str:

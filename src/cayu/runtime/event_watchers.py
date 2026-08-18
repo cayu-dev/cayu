@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     require_durable_nonblank,
+    require_positive_timedelta_seconds,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -196,9 +197,11 @@ class EventWatcher:
             raise ValueError("max_attempts must be an integer greater than or equal to 1.")
         if type(self.batch_size) is not int or self.batch_size < 1:
             raise ValueError("batch_size must be an integer greater than or equal to 1.")
-        if type(self.lease_seconds) not in {int, float} or self.lease_seconds <= 0:
-            raise ValueError("lease_seconds must be greater than 0.")
-        object.__setattr__(self, "lease_seconds", float(self.lease_seconds))
+        object.__setattr__(
+            self,
+            "lease_seconds",
+            require_positive_timedelta_seconds(self.lease_seconds, "lease_seconds"),
+        )
 
 
 class EventWatcherRunResult(BaseModel):
@@ -320,8 +323,12 @@ class InMemoryEventWatcherStore(EventWatcherStore):
     ) -> EventWatcherClaim | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
         record = copy_event_watcher_record(record)
-        lease_seconds = _validate_lease_seconds(lease_seconds)
         now = self._clock()
+        lease_seconds = require_positive_timedelta_seconds(
+            lease_seconds,
+            "lease_seconds",
+            relative_to=now,
+        )
         async with self._lock:
             state = self._states.get(watcher_name)
             if state is None:
@@ -636,12 +643,6 @@ def _clock_or_utc_now(clock: Callable[[], datetime] | None) -> Callable[[], date
         return value.astimezone(UTC)
 
     return wrapped
-
-
-def _validate_lease_seconds(value: float) -> float:
-    if type(value) not in {int, float} or value <= 0:
-        raise ValueError("lease_seconds must be greater than 0.")
-    return float(value)
 
 
 def _validate_max_attempts(value: int) -> int:

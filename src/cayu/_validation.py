@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from math import isfinite
 from types import MappingProxyType
@@ -766,6 +766,35 @@ def require_finite(value: float, field_name: str) -> float:
     if not isfinite(value):
         raise ValueError(f"`{field_name}` must be finite.")
     return value
+
+
+def require_positive_timedelta_seconds(
+    value: Any,
+    field_name: str,
+    *,
+    relative_to: datetime | None = None,
+) -> float:
+    """Return positive seconds whose duration and resulting expiry are representable."""
+
+    if type(value) not in {int, float}:
+        raise ValueError(f"`{field_name}` must be a finite positive number of seconds.")
+    try:
+        validated = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"`{field_name}` must be representable as a timedelta.") from exc
+    if not isfinite(validated) or validated <= 0:
+        raise ValueError(f"`{field_name}` must be a finite positive number of seconds.")
+    try:
+        duration = timedelta(seconds=validated)
+    except OverflowError as exc:
+        raise ValueError(f"`{field_name}` must be representable as a timedelta.") from exc
+    if duration <= timedelta(0):
+        raise ValueError(f"`{field_name}` must produce a positive timedelta.")
+    try:
+        (relative_to or datetime.now(UTC)) + duration
+    except OverflowError as exc:
+        raise ValueError(f"`{field_name}` must produce a representable expiry datetime.") from exc
+    return validated
 
 
 def escape_json_pointer_segment(key: str) -> str:

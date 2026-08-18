@@ -251,6 +251,15 @@ async def _assert_portable_event_watcher_store_text(store: EventWatcherStore) ->
             session_id="sess_portable_watcher",
         ),
     )
+    for invalid_lease_seconds in (1e-12, 10**12):
+        with pytest.raises(ValueError, match="lease_seconds"):
+            await store.claim_event(
+                watcher_name="portable-watcher",
+                record=record,
+                lease_seconds=invalid_lease_seconds,
+            )
+        assert (await store.load_state("portable-watcher")).cursor_sequence == 0
+
     forged_record = record.model_copy(deep=True)
     forged_record.sequence = MAX_DURABLE_JSON_INTEGER + 1
     with pytest.raises(ValidationError):
@@ -1172,6 +1181,43 @@ def test_event_watcher_rejects_cursor_in_query() -> None:
             query=EventQuery(after_sequence=10),
             handler=lambda _context: None,
         )
+
+
+@pytest.mark.parametrize(
+    "lease_seconds",
+    [float("nan"), float("inf"), float("-inf"), 1e-12, 10**12, 1e308, 10**400],
+)
+def test_event_watcher_rejects_invalid_lease_seconds(lease_seconds: int | float) -> None:
+    with pytest.raises(ValueError, match="lease_seconds"):
+        EventWatcher(
+            name="invalid-lease",
+            query=EventQuery(),
+            handler=lambda _context: None,
+            lease_seconds=lease_seconds,
+        )
+
+
+def test_inmemory_event_watcher_store_rejects_zero_length_positive_lease() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    store = InMemoryEventWatcherStore(clock=lambda: now)
+    record = EventRecord(
+        sequence=1,
+        event=Event(
+            id="submicrosecond-lease-event",
+            type=EventType.SESSION_STARTED,
+            session_id="submicrosecond-lease-session",
+        ),
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="lease_seconds"):
+            await store.claim_event(
+                watcher_name="submicrosecond-lease-watcher",
+                record=record,
+                lease_seconds=1e-12,
+            )
+
+    asyncio.run(scenario())
 
 
 def test_event_watcher_cursor_reconstruction_revalidates_the_new_cursor() -> None:

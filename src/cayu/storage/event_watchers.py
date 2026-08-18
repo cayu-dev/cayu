@@ -12,6 +12,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_nonblank,
     require_nonblank,
+    require_positive_timedelta_seconds,
 )
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
@@ -83,8 +84,12 @@ class SQLiteEventWatcherStore(EventWatcherStore):
     ) -> EventWatcherClaim | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
         record = copy_event_watcher_record(record)
-        lease_seconds = _validate_positive_float(lease_seconds, "lease_seconds")
         now = self._clock()
+        lease_seconds = require_positive_timedelta_seconds(
+            lease_seconds,
+            "lease_seconds",
+            relative_to=now,
+        )
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -496,12 +501,6 @@ def _clock_or_utc_now(clock: Callable[[], datetime] | None) -> Callable[[], date
         return value.astimezone(UTC)
 
     return wrapped
-
-
-def _validate_positive_float(value: float, field_name: str) -> float:
-    if type(value) not in {int, float} or value <= 0:
-        raise ValueError(f"{field_name} must be greater than 0.")
-    return float(value)
 
 
 def _clean_error(value: str) -> str:
