@@ -604,9 +604,9 @@ def test_environment_failure_after_real_cancellation_is_detached_and_redacted() 
     assert isinstance(failure.exceptions[1], asyncio.CancelledError)
     assert failure.__cause__ is None
     assert failure.__context__ is None
-    # The session finalizer consumes the task's cancellation request after
-    # preserving it as an ordered leaf beside the extension failure.
-    assert cancelling == 0
+    # The session finalizer preserves both the ordered cancellation leaf and
+    # the task's authenticated cancellation request count.
+    assert cancelling == 1
     assert cancelled is False
     _assert_cayu_traceback_does_not_retain_text(failure, secret)
 

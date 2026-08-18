@@ -24,6 +24,10 @@ from cayu.runtime._binding_cleanup import (
     record_binding_finalize_failures,
 )
 from cayu.runtime._diagnostics import exception_diagnostic
+from cayu.runtime.workspace_observation_recovery import (
+    copy_workspace_observation_pending_cancellation_requests,
+    retain_workspace_observation_pending_cancellation_requests,
+)
 from cayu.vaults import SecretRedactor
 
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
@@ -154,6 +158,7 @@ def _detached_environment_cancellation(
     """Return a secret-safe cancellation without extension-owned attachments."""
 
     factory_cleanup_task = environment_factory_cleanup_settlement_task(cancellation)
+    authority_carrier = cancellation
     redactor = _environment_failure_redactor(cancellation, redactor=redactor)
     safe_args: tuple[Any, ...] = ("Environment operation cancelled",)
     try:
@@ -169,6 +174,11 @@ def _detached_environment_cancellation(
                 for value in raw_args
             )
         safe_cancellation = asyncio.CancelledError(*safe_args)
+        copy_workspace_observation_pending_cancellation_requests(
+            authority_carrier,
+            safe_cancellation,
+        )
+        authority_carrier = safe_cancellation
         _attach_detached_binding_statuses(
             cancellation,
             safe_cancellation,
@@ -186,6 +196,10 @@ def _detached_environment_cancellation(
             dict.clear(namespace)
         if type(cancellation) is asyncio.CancelledError:
             _BASE_EXCEPTION_ARGS_DESCRIPTOR.__set__(cancellation, safe_args)
+            copy_workspace_observation_pending_cancellation_requests(
+                authority_carrier,
+                cancellation,
+            )
             _attach_detached_binding_statuses(
                 safe_cancellation,
                 cancellation,
@@ -200,6 +214,10 @@ def _detached_environment_cancellation(
     except BaseException:
         safe_args = ("Environment operation cancelled",)
         safe_cancellation = asyncio.CancelledError(*safe_args)
+        copy_workspace_observation_pending_cancellation_requests(
+            authority_carrier,
+            safe_cancellation,
+        )
     if factory_cleanup_task is not None:
         attach_environment_factory_cleanup_settlement_task(
             safe_cancellation,
@@ -298,6 +316,7 @@ def _environment_operation_group(
             f"{operation} failed after caller cancellation.",
             [rebuilt, asyncio.CancelledError("Environment operation cancelled")],
         )
+    copy_workspace_observation_pending_cancellation_requests(error, rebuilt)
     _attach_detached_binding_statuses(
         error,
         rebuilt,
@@ -398,6 +417,19 @@ async def await_environment_operation(
     cancellation_pending_at_entry = bool(
         current_task is not None and getattr(current_task, "_must_cancel", False)
     )
+
+    def caller_cancellation_request_count() -> int:
+        current_count = 0 if current_task is None else current_task.cancelling()
+        return max(
+            current_count - cancellation_baseline,
+            int(cancellation_pending_at_entry),
+        )
+
+    def retain_caller_cancellation_authority(error: BaseException) -> None:
+        count = caller_cancellation_request_count()
+        if count:
+            retain_workspace_observation_pending_cancellation_requests(error, count)
+
     result: Any = None
     sanitized_failure: BaseException | None = None
     try:
@@ -413,6 +445,7 @@ async def await_environment_operation(
         del cancellation
         if caller_cancelled:
             sanitized_failure = safe_cancellation
+            retain_caller_cancellation_authority(sanitized_failure)
         else:
             child_cancellation_failure = RuntimeError(
                 f"{operation_name} was cancelled without caller cancellation."
@@ -449,6 +482,8 @@ async def await_environment_operation(
         )
         del error
         sanitized_failure = safe_group
+        if caller_cancelled:
+            retain_caller_cancellation_authority(sanitized_failure)
     except BaseException as error:
         caller_cancelled = (
             current_task is not None and current_task.cancelling() > cancellation_baseline
@@ -485,6 +520,7 @@ async def await_environment_operation(
                 factory_cleanup_task,
             )
         source_error = None
+        retain_caller_cancellation_authority(sanitized_failure)
     operation = _completed_environment_operation
     if sanitized_failure is not None:
         raise sanitized_failure from None
@@ -493,6 +529,7 @@ async def await_environment_operation(
             asyncio.CancelledError(getattr(current_task, "_cancel_message", None)),
             redactor=redactor,
         )
+        retain_caller_cancellation_authority(safe_cancellation)
         result = None
         raise safe_cancellation from None
     return result

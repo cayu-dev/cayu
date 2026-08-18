@@ -1520,9 +1520,9 @@ def test_grouped_factory_leaf_cleanups_retain_capacity_until_all_settle() -> Non
         first_task.cancel("cancel grouped factory")
         with pytest.raises(BaseExceptionGroup):
             await first_task
-        # The runtime owns and normalizes the delivered request before
-        # propagating the grouped failure to its stream consumer.
-        assert first_task.cancelling() == 0
+        # The grouped failure retains the delivered request as an explicit
+        # leaf without erasing the task's authenticated cancellation state.
+        assert first_task.cancelling() == 1
         assert not first_task.cancelled()
 
         blocked_before = await _collect_events(
@@ -2173,7 +2173,7 @@ def test_cancelled_sync_bind_reserves_target_until_factory_release_settles(
         else:
             with pytest.raises(asyncio.CancelledError, match="cancel sync bind"):
                 await cancelled_run
-        assert cancelled_run.cancelling() == (0 if provision_fails else 1)
+        assert cancelled_run.cancelling() == 1
         assert cancelled_run.cancelled() is (not provision_fails)
         rebound = await contender.bind(
             contender_source,

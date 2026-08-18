@@ -207,7 +207,10 @@ jobs:
               tests/core/test_sqlite_session_store.py::test_sqlite_off_thread_reader_retains_connection_ownership_during_cancellation \
               tests/core/test_sqlite_session_store.py::test_sqlite_off_thread_worker_failure_and_cancellation_remain_observable \
               tests/core/test_sqlite_session_store.py::test_sqlite_in_memory_read_cancellation_serializes_shared_writer_connection \
-              tests/core/test_runtime.py::test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation
+              tests/core/test_runtime.py::test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation \
+              tests/core/test_workspace_mutation_receipts.py::test_final_workspace_observer_restores_caller_cancellation_requests \
+              tests/core/test_workspace_mutation_receipts.py::test_delegated_stream_close_counts_checkpoint_cancellation_once \
+              tests/core/test_workspace_mutation_receipts.py::test_delegated_stream_close_distinguishes_restored_and_late_cancellation
           done
 
   package:

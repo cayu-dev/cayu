@@ -29,6 +29,9 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelRequest,
 )
+from cayu.runtime.workspace_observation_recovery import (
+    copy_workspace_observation_pending_cancellation_requests,
+)
 
 _PROVIDER_ERROR_PAYLOAD_KEYS = frozenset(
     {
@@ -84,7 +87,7 @@ def _contains_billing_identity_cancellation(exc: BaseException) -> bool:
 def _detach_billing_identity_cancellation_tree(
     exc: BaseExceptionGroup,
 ) -> BaseExceptionGroup:
-    return rebuild_exception_group(
+    detached = rebuild_exception_group(
         exc,
         group_message=(
             "Model provider billing identity resolution cancellation had concurrent failures"
@@ -94,13 +97,17 @@ def _detach_billing_identity_cancellation_tree(
             "Concurrent failure during model provider billing identity resolution"
         ),
     )
+    copy_workspace_observation_pending_cancellation_requests(exc, detached)
+    return detached
 
 
 def _detached_concurrent_billing_failure(exc: BaseException) -> BaseException:
     if isinstance(exc, asyncio.CancelledError):
-        return detach_billing_identity_cancellation(exc) or asyncio.CancelledError(
+        detached = detach_billing_identity_cancellation(exc) or asyncio.CancelledError(
             "Concurrent cancellation during model provider billing identity resolution"
         )
+        copy_workspace_observation_pending_cancellation_requests(exc, detached)
+        return detached
     if isinstance(exc, KeyboardInterrupt):
         return KeyboardInterrupt(
             "Concurrent keyboard interrupt during model provider billing identity resolution"

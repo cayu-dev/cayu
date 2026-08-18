@@ -40,6 +40,8 @@ from cayu._exception_state import pop_exception_state, set_exception_state
 from cayu._task_wait import (
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
+    capture_awaitable_outcome,
+    consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -405,6 +407,7 @@ from cayu.runtime.sessions import (
     _current_session_interaction_started_at,
     _current_session_invocation_interaction_ids,
     _deactivate_session_interaction,
+    _deactivate_session_run_fence,
     _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
@@ -485,6 +488,7 @@ from cayu.runtime.user_input import (
     public_pending_user_input_event_payload,
 )
 from cayu.runtime.workspace_observation_recovery import (
+    retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,
 )
 from cayu.vaults import (
@@ -3190,6 +3194,192 @@ def _raise_primary_with_secondary_failure(
     raise primary
 
 
+def _failure_without_existing_exception_identities(
+    error: BaseException,
+    existing_ids: set[int],
+) -> BaseException | None:
+    """Remove already-owned failures while retaining non-overlapping subgroups."""
+
+    pending: list[tuple[BaseException, bool]] = [(error, False)]
+    children_by_group: dict[int, tuple[BaseException, ...]] = {}
+    retained_by_identity: dict[int, BaseException | None] = {}
+    while pending:
+        candidate, expanded = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in retained_by_identity:
+            continue
+        if candidate_id in existing_ids:
+            retained_by_identity[candidate_id] = None
+            continue
+        if not isinstance(candidate, BaseExceptionGroup):
+            retained_by_identity[candidate_id] = candidate
+            continue
+        if expanded:
+            children = children_by_group.pop(candidate_id, ())
+            retained_children = [
+                retained
+                for child in children
+                if (retained := retained_by_identity.get(id(child))) is not None
+            ]
+            if not retained_children:
+                retained_by_identity[candidate_id] = None
+            elif len(retained_children) == len(children) and all(
+                retained is child
+                for retained, child in zip(retained_children, children, strict=True)
+            ):
+                retained_by_identity[candidate_id] = candidate
+            else:
+                retained_by_identity[candidate_id] = BaseExceptionGroup(
+                    "Session interruption additional non-duplicate failures.",
+                    retained_children,
+                )
+            continue
+        children = exception_group_children(candidate)
+        if children is None:
+            retained_by_identity[candidate_id] = RuntimeError(
+                "Session interruption received an unreadable exception group."
+            )
+            continue
+        children_by_group[candidate_id] = children
+        pending.append((candidate, True))
+        pending.extend((child, False) for child in reversed(children))
+
+    return retained_by_identity.get(id(error))
+
+
+def _session_interruption_failure_with_additional_control(
+    authoritative_failure: BaseException,
+    additional_failure: BaseException,
+    *,
+    group_message: str,
+    historical_cancellation_requests: int,
+) -> BaseException:
+    """Retain one later failure without losing interruption cancellation state."""
+
+    if type(historical_cancellation_requests) is not int or historical_cancellation_requests < 0:
+        raise ValueError("Historical cancellation requests must be a non-negative int.")
+    current_task = asyncio.current_task()
+    requests_before = 0 if current_task is None else current_task.cancelling()
+    delivered_cancellation: asyncio.CancelledError | None = None
+    if isinstance(additional_failure, asyncio.CancelledError):
+        delivered_cancellation = consume_pending_task_cancellation(
+            additional_failure,
+            preserve_requests=historical_cancellation_requests,
+        )
+    requests_after = 0 if current_task is None else current_task.cancelling()
+    requests_consumed = max(requests_before - requests_after, 0)
+
+    failures: list[BaseException] = [additional_failure]
+    if delivered_cancellation is not None and all(
+        delivered_cancellation is not failure for failure in failures
+    ):
+        failures.append(delivered_cancellation)
+
+    propagated_failure = authoritative_failure
+    for failure in failures:
+        existing_ids = {id(candidate) for candidate in iter_exception_tree(propagated_failure)}
+        retained_failure = _failure_without_existing_exception_identities(
+            failure,
+            existing_ids,
+        )
+        if retained_failure is None:
+            continue
+        propagated_failure = BaseExceptionGroup(
+            group_message,
+            [propagated_failure, retained_failure],
+        )
+
+    pending_request_count = (
+        workspace_observation_pending_cancellation_requests(authoritative_failure)
+        + requests_consumed
+    )
+    if pending_request_count:
+        retain_workspace_observation_pending_cancellation_requests(
+            propagated_failure,
+            pending_request_count,
+        )
+    return propagated_failure
+
+
+def _session_interruption_cleanup_child_error(
+    error: BaseException | None,
+    *,
+    operation: str,
+    preserved_failure: BaseException | None = None,
+) -> BaseException | None:
+    """Classify cleanup-owned cancellation as an operational failure."""
+
+    if error is None:
+        return None
+    if error is preserved_failure:
+        return error
+    if isinstance(error, asyncio.CancelledError):
+        return unexpected_child_cancellation_error(
+            error,
+            operation=operation,
+        )
+    if not isinstance(error, BaseExceptionGroup):
+        return error
+
+    pending: list[tuple[BaseException, bool]] = [(error, False)]
+    children_by_group: dict[int, tuple[BaseException, ...]] = {}
+    classified_by_identity: dict[int, tuple[BaseException, bool]] = {}
+    while pending:
+        candidate, expanded = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in classified_by_identity:
+            continue
+        if candidate is preserved_failure:
+            classified_by_identity[candidate_id] = (candidate, True)
+            continue
+        if isinstance(candidate, asyncio.CancelledError):
+            classified_by_identity[candidate_id] = (
+                unexpected_child_cancellation_error(
+                    candidate,
+                    operation=operation,
+                ),
+                False,
+            )
+            continue
+        if not isinstance(candidate, BaseExceptionGroup):
+            classified_by_identity[candidate_id] = (candidate, False)
+            continue
+        if expanded:
+            children = children_by_group.pop(candidate_id, ())
+            classified_children: list[BaseException] = []
+            contains_preserved_failure = False
+            changed = False
+            for child in children:
+                classified_child, child_contains_preserved = classified_by_identity[id(child)]
+                classified_children.append(classified_child)
+                contains_preserved_failure = contains_preserved_failure or child_contains_preserved
+                changed = changed or classified_child is not child
+            if contains_preserved_failure or changed:
+                classified_by_identity[candidate_id] = (
+                    BaseExceptionGroup(
+                        f"{operation} child failures.",
+                        classified_children,
+                    ),
+                    contains_preserved_failure,
+                )
+            else:
+                classified_by_identity[candidate_id] = (candidate, False)
+            continue
+        children = exception_group_children(candidate)
+        if children is None:
+            classified_by_identity[candidate_id] = (
+                RuntimeError(f"{operation} returned an unreadable exception group."),
+                False,
+            )
+            continue
+        children_by_group[candidate_id] = children
+        pending.append((candidate, True))
+        pending.extend((child, False) for child in reversed(children))
+
+    classified, _contains_preserved_failure = classified_by_identity[id(error)]
+    return classified
+
+
 def _failure_carries_interaction_publication_rejection(
     failure: Exception,
     *,
@@ -5254,23 +5444,27 @@ class SessionEngine:
                     yield queued_event
             return
         except BaseExceptionGroup as exc:
-            persisted_session = await self.session_store.load(session.id)
-            if (
-                binding_finalize_explicit_cancellation(exc) is not None
-                and persisted_session is not None
-                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
-            ):
-                if interaction_started:
-                    await self.session_store.materialize_deferred_interaction_input(session.id)
-                async for event in self._handle_session_interrupted(
-                    session=persisted_session,
+            if binding_finalize_explicit_cancellation(exc) is not None:
+
+                async def prepare_interruption() -> None:
+                    if interaction_started:
+                        await self.session_store.materialize_deferred_interaction_input(session.id)
+
+                (
+                    _interruption_events,
+                    propagated_failure,
+                ) = await self._handle_session_interrupted_preserving_failure(
+                    authoritative_failure=exc,
+                    session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
                     execution_profile=execution_profile,
-                ):
-                    yield event
-                raise exc
+                    prepare_interruption=prepare_interruption,
+                )
+                if propagated_failure is exc:
+                    raise
+                raise propagated_failure from None
             raise
         except GeneratorExit as abandonment:
             # This window is outside _run_session's own finalizer. Publish the
@@ -5298,32 +5492,78 @@ class SessionEngine:
                     )
             raise
         finally:
-            try:
+            finalizer_failure = sys.exception()
+            if (
+                finalizer_failure is not None
+                and workspace_observation_pending_cancellation_requests(finalizer_failure)
+            ):
+                finalizer_steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = ()
                 if release_before_run:
-                    await self._environment_lifecycle.abort_environment_setup(
-                        session_id=session.id,
-                        original_error=sys.exception(),
-                        execution_profile=execution_profile,
+                    finalizer_steps = (
+                        (
+                            "Pre-run environment setup abort",
+                            lambda: self._environment_lifecycle.abort_environment_setup(
+                                session_id=session.id,
+                                original_error=finalizer_failure,
+                                execution_profile=execution_profile,
+                            ),
+                        ),
+                        (
+                            "Pre-run environment run-fence release",
+                            lambda: (
+                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                    session_id=session.id,
+                                    execution_profile=execution_profile,
+                                )
+                            ),
+                        ),
                     )
-            finally:
+                propagated_finalizer_failure = (
+                    await self._settle_session_finalizer_preserving_interruption_failure(
+                        authoritative_failure=finalizer_failure,
+                        steps=finalizer_steps,
+                    )
+                )
+                if release_before_run:
+                    # The owned child receives a copied context. Retire the
+                    # caller's corresponding token after that child settles.
+                    _deactivate_session_run_fence(session.id)
+                try:
+                    if current_task is not None and active_factory_run is not None:
+                        self._session_control.unregister_active_task(
+                            session.id,
+                            current_task,
+                        )
+                finally:
+                    if release_before_run:
+                        _deactivate_session_interaction(session.id)
+                if propagated_finalizer_failure is not finalizer_failure:
+                    raise propagated_finalizer_failure from None
+            else:
                 try:
                     if release_before_run:
-                        await (
-                            self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                                session_id=session.id,
-                                execution_profile=execution_profile,
-                            )
+                        await self._environment_lifecycle.abort_environment_setup(
+                            session_id=session.id,
+                            original_error=finalizer_failure,
+                            execution_profile=execution_profile,
                         )
                 finally:
                     try:
-                        if current_task is not None and active_factory_run is not None:
-                            self._session_control.unregister_active_task(
-                                session.id,
-                                current_task,
+                        if release_before_run:
+                            await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                session_id=session.id,
+                                execution_profile=execution_profile,
                             )
                     finally:
-                        if release_before_run:
-                            _deactivate_session_interaction(session.id)
+                        try:
+                            if current_task is not None and active_factory_run is not None:
+                                self._session_control.unregister_active_task(
+                                    session.id,
+                                    current_task,
+                                )
+                        finally:
+                            if release_before_run:
+                                _deactivate_session_interaction(session.id)
 
         try:
             if messages is None:
@@ -5390,8 +5630,6 @@ class SessionEngine:
         billing_identity_cancellation_group: BaseExceptionGroup | None = None
         propagated_cancellation: asyncio.CancelledError | None = None
         propagated_cancellation_group: BaseExceptionGroup | None = None
-        group_has_explicit_cancellation = False
-        group_has_process_control = False
         try:
             async for event in forwarded_stream:
                 yield event
@@ -5400,16 +5638,6 @@ class SessionEngine:
             if billing_identity_cancellation is None:
                 propagated_cancellation = exc
         except BaseExceptionGroup as exc:
-            # Lifecycle cleanup can aggregate a cancellation with its cleanup
-            # failure. Preserve the grouped signal while applying the same
-            # durable session interruption transition as a plain cancellation.
-            group_has_explicit_cancellation = (
-                binding_finalize_explicit_cancellation(exc) is not None
-            )
-            group_has_process_control = any(
-                isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit))
-                for candidate in iter_exception_tree(exc)
-            )
             billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
             if billing_identity_cancellation_group is None:
                 propagated_cancellation_group = exc
@@ -5457,17 +5685,16 @@ class SessionEngine:
             raise billing_identity_cancellation
 
         if billing_identity_cancellation_group is not None:
-            persisted_session = None
-            if group_has_explicit_cancellation:
-                interruption_load_failed = False
-                try:
-                    persisted_session = await self.session_store.load(session.id)
-                except Exception:
-                    interruption_load_failed = True
-                if interruption_load_failed:
-                    raise RuntimeError(
-                        "Session interruption state load failed after provider billing cancellation"
-                    ) from None
+            interruption_load_failed = False
+            try:
+                persisted_session = await self.session_store.load(session.id)
+            except Exception:
+                interruption_load_failed = True
+                persisted_session = None
+            if interruption_load_failed:
+                raise RuntimeError(
+                    "Session interruption state load failed after provider billing cancellation"
+                ) from None
             if (
                 persisted_session is not None
                 and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
@@ -5506,33 +5733,6 @@ class SessionEngine:
             raise propagated_cancellation
 
         if propagated_cancellation_group is not None:
-            current_task = asyncio.current_task()
-            if (
-                group_has_process_control
-                and workspace_observation_pending_cancellation_requests(
-                    propagated_cancellation_group
-                )
-                and current_task is not None
-                and current_task.cancelling()
-            ):
-                # Do not introduce an await while a restored caller
-                # cancellation is pending: it would replace the concurrent
-                # process-control group before that exact evidence escapes.
-                raise propagated_cancellation_group
-            persisted_session = await self.session_store.load(session.id)
-            if (
-                group_has_explicit_cancellation
-                and persisted_session is not None
-                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
-            ):
-                async for event in self._handle_session_interrupted(
-                    session=persisted_session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                    execution_profile=execution_profile,
-                ):
-                    yield event
             raise propagated_cancellation_group
 
     async def resume(
@@ -10524,11 +10724,28 @@ class SessionEngine:
                 else reconciled_pending_round.source_transcript_cursor
             ),
         )
+        authoritative_failure: BaseExceptionGroup | None = None
         try:
-            if model_boundary.state == "promoted" and model_boundary.completion_event is not None:
-                yield copy_event(model_boundary.completion_event)
-            async for event in session_stream:
-                yield event
+            try:
+                if (
+                    model_boundary.state == "promoted"
+                    and model_boundary.completion_event is not None
+                ):
+                    yield copy_event(model_boundary.completion_event)
+                async for event in session_stream:
+                    yield event
+            except BaseExceptionGroup as exc:
+                detached_failure = detach_billing_identity_cancellation_group(exc)
+                authoritative_failure = exc if detached_failure is None else detached_failure
+            if authoritative_failure is None:
+                return
+            # A registered provider can retain live credentials in its repr.
+            # Drop the registration before the detached failure crosses the
+            # public resume boundary. Grouped interruption settlement already
+            # ran inside _run_session while its run-fence and interaction
+            # authority were still live.
+            del registered_provider
+            raise authoritative_failure from None
         except GeneratorExit:
             await session_stream.aclose()
             raise
@@ -13193,33 +13410,138 @@ class SessionEngine:
                 execution_profile=execution_profile,
             ):
                 yield event
+        except BaseExceptionGroup as failure:
+            # ``ExceptionGroup`` is also an ``Exception`` and is handled by
+            # the ordinary failure branch above. Only groups carrying a true
+            # ``BaseException`` control leaf reach this interruption path.
+            if binding_finalize_explicit_cancellation(failure) is None:
+                raise
+            if _latest_session_invocation_interaction_is_settled(session.id):
+                # A terminal interaction decision already committed. Preserve
+                # the grouped control outcome without rewriting that decision.
+                raise
+            if any(
+                _is_interaction_transition_run_fence(candidate)
+                for candidate in iter_exception_tree(failure)
+            ):
+                # This worker has positive evidence that its durable mutation
+                # authority was lost. Do not attempt a terminal write under a
+                # stale run epoch.
+                raise
+
+            async def prepare_group_interruption() -> list[Event]:
+                await materialize_deferred_messages_after_failure()
+                prepared_events: list[Event] = []
+                if close_new_pending_round_on_interrupt:
+                    async for event in self._close_durable_pending_tool_round_after_interrupt(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                    ):
+                        prepared_events.append(event)
+                return prepared_events
+
+            (
+                _interruption_events,
+                propagated_failure,
+            ) = await self._handle_session_interrupted_preserving_failure(
+                authoritative_failure=failure,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                execution_profile=execution_profile,
+                prepare_interruption=prepare_group_interruption,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
+            if propagated_failure is failure:
+                raise
+            raise propagated_failure from None
         finally:
-            try:
-                await self._environment_lifecycle.abort_environment_setup(
-                    session_id=session.id,
-                    original_error=sys.exception(),
-                    execution_profile=execution_profile,
+            finalizer_failure = sys.exception()
+            if (
+                finalizer_failure is not None
+                and workspace_observation_pending_cancellation_requests(finalizer_failure)
+            ):
+
+                async def discard_interrupt_signal() -> None:
+                    self._session_control.discard_interrupt_signal(session.id)
+
+                finalizer_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
+                    (
+                        "Session environment setup abort",
+                        lambda: self._environment_lifecycle.abort_environment_setup(
+                            session_id=session.id,
+                            original_error=finalizer_failure,
+                            execution_profile=execution_profile,
+                        ),
+                    ),
+                    (
+                        "Session interrupt-signal cleanup",
+                        discard_interrupt_signal,
+                    ),
+                ]
+                if release_run_fence_on_exit:
+                    finalizer_steps.append(
+                        (
+                            "Session environment run-fence release",
+                            lambda: (
+                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                    session_id=session.id,
+                                    execution_profile=execution_profile,
+                                )
+                            ),
+                        )
+                    )
+                propagated_finalizer_failure = (
+                    await self._settle_session_finalizer_preserving_interruption_failure(
+                        authoritative_failure=finalizer_failure,
+                        steps=tuple(finalizer_steps),
+                    )
                 )
-            finally:
-                self._session_control.discard_interrupt_signal(session.id)
+                if release_run_fence_on_exit:
+                    # The owned child receives a copied context. Retire the
+                    # caller's corresponding token after that child settles.
+                    _deactivate_session_run_fence(session.id)
                 try:
-                    if release_run_fence_on_exit:
-                        await (
-                            self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                    if current_task is not None:
+                        self._session_control.unregister_active_task(
+                            session.id,
+                            current_task,
+                        )
+                finally:
+                    _clear_session_interaction_settlement(session.id)
+                    _deactivate_session_interaction(session.id)
+                if propagated_finalizer_failure is not finalizer_failure:
+                    raise propagated_finalizer_failure from None
+            else:
+                try:
+                    await self._environment_lifecycle.abort_environment_setup(
+                        session_id=session.id,
+                        original_error=finalizer_failure,
+                        execution_profile=execution_profile,
+                    )
+                finally:
+                    self._session_control.discard_interrupt_signal(session.id)
+                    try:
+                        if release_run_fence_on_exit:
+                            await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                 session_id=session.id,
                                 execution_profile=execution_profile,
                             )
-                        )
-                finally:
-                    try:
-                        if current_task is not None:
-                            self._session_control.unregister_active_task(
-                                session.id,
-                                current_task,
-                            )
                     finally:
-                        _clear_session_interaction_settlement(session.id)
-                        _deactivate_session_interaction(session.id)
+                        try:
+                            if current_task is not None:
+                                self._session_control.unregister_active_task(
+                                    session.id,
+                                    current_task,
+                                )
+                        finally:
+                            _clear_session_interaction_settlement(session.id)
+                            _deactivate_session_interaction(session.id)
 
     async def _emit_turn_completed(
         self,
@@ -14656,6 +14978,227 @@ class SessionEngine:
         if loaded is None:
             raise KeyError(f"Session not found: {session_id}") from None
         return loaded
+
+    async def _handle_session_interrupted_preserving_failure(
+        self,
+        *,
+        authoritative_failure: BaseException,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        prepare_interruption: Callable[[], Awaitable[Iterable[Event] | None]] | None = None,
+        run_started_at: float | None = None,
+        turn_usage_tracker: SessionUsageTracker | None = None,
+        active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+    ) -> tuple[list[Event], BaseException]:
+        """Settle interruption durably without losing later caller control."""
+
+        current_task = asyncio.current_task()
+        retained_request_count = workspace_observation_pending_cancellation_requests(
+            authoritative_failure
+        )
+        current_request_count = 0 if current_task is None else current_task.cancelling()
+        historical_request_count = max(current_request_count - retained_request_count, 0)
+        entry_request_count = max(retained_request_count, current_request_count)
+        concurrent_controls: list[BaseException] = []
+        if current_task is not None and current_request_count > historical_request_count:
+            # Requests already represented by the authoritative failure were
+            # restored before it crossed this boundary. Consume only those
+            # owned requests; an older, previously handled cancellation count
+            # is task history, not a newly delivered control signal.
+            consume_pending_task_cancellation(
+                preserve_requests=historical_request_count,
+            )
+
+        events: list[Event] = []
+        owned_cleanup_failures: list[BaseException] = []
+
+        async def collect_events() -> None:
+            persisted_session = await self.session_store.load(session.id)
+            if (
+                persisted_session is None
+                or persisted_session.status not in _INTERRUPTIBLE_SESSION_STATUSES
+            ):
+                return
+            if prepare_interruption is not None:
+                try:
+                    prepared_events = await prepare_interruption()
+                except BaseException as preparation_failure:
+                    # Preparatory tool-round or deferred-input cleanup must not
+                    # prevent the authoritative session transition. Retain the
+                    # exact failure and continue to terminalize the session.
+                    owned_cleanup_failures.append(preparation_failure)
+                else:
+                    if prepared_events is not None:
+                        events.extend(prepared_events)
+            async for event in self._handle_session_interrupted(
+                session=persisted_session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                execution_profile=execution_profile,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            ):
+                events.append(event)
+
+        cleanup_task = asyncio.create_task(
+            capture_awaitable_outcome(collect_events),
+            name="cayu-session-interruption-cleanup",
+        )
+        cancellation_requests_consumed = 0
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as cancellation:
+                requests_before = 0 if current_task is None else current_task.cancelling()
+                retained_cancellation = consume_pending_task_cancellation(
+                    cancellation,
+                    preserve_requests=historical_request_count,
+                )
+                requests_after = 0 if current_task is None else current_task.cancelling()
+                cancellation_requests_consumed += max(
+                    requests_before - requests_after,
+                    0,
+                )
+                concurrent_controls.append(retained_cancellation or cancellation)
+            except BaseException as control:
+                # A supervisory exit cannot orphan the durable interruption
+                # mutation. Preserve it as data until the exact cleanup task
+                # reaches a terminal outcome.
+                concurrent_controls.append(control)
+
+        captured = cleanup_task.result()
+        classified_cleanup_failures: list[BaseException] = []
+        for cleanup_failure in (*owned_cleanup_failures, captured.error):
+            cleanup_error = _session_interruption_cleanup_child_error(
+                cleanup_failure,
+                operation="Session interruption cleanup",
+            )
+            if cleanup_error is not None and all(
+                cleanup_error is not retained for retained in classified_cleanup_failures
+            ):
+                classified_cleanup_failures.append(cleanup_error)
+
+        failures: list[BaseException] = [authoritative_failure]
+        for additional_failure in (*concurrent_controls, *classified_cleanup_failures):
+            existing_ids = {
+                id(candidate)
+                for retained_failure in failures
+                for candidate in iter_exception_tree(retained_failure)
+            }
+            retained_failure = _failure_without_existing_exception_identities(
+                additional_failure,
+                existing_ids,
+            )
+            if retained_failure is not None:
+                failures.append(retained_failure)
+        propagated_failure = (
+            authoritative_failure
+            if len(failures) == 1
+            else BaseExceptionGroup(
+                "Session interruption cleanup received additional failures.",
+                failures,
+            )
+        )
+        pending_request_count = entry_request_count + cancellation_requests_consumed
+        if pending_request_count:
+            retain_workspace_observation_pending_cancellation_requests(
+                propagated_failure,
+                pending_request_count,
+            )
+        return events, propagated_failure
+
+    async def _settle_session_finalizer_preserving_interruption_failure(
+        self,
+        *,
+        authoritative_failure: BaseException,
+        steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...],
+    ) -> BaseException:
+        """Settle finalizer awaits without replacing an interruption aggregate."""
+
+        propagated_failure = authoritative_failure
+        current_task = asyncio.current_task()
+        retained_request_count = workspace_observation_pending_cancellation_requests(
+            authoritative_failure
+        )
+        current_request_count = 0 if current_task is None else current_task.cancelling()
+        historical_request_count = max(current_request_count - retained_request_count, 0)
+        if current_task is not None and current_request_count > historical_request_count:
+            # Python 3.11 and 3.12 do not rescind an undelivered cancellation
+            # when ``uncancel()`` reaches zero. Observe the pending injection
+            # first, then normalize only requests already represented by the
+            # authoritative failure. Preserve and aggregate a genuinely new
+            # request that arrives during this checkpoint.
+            pending_control: asyncio.CancelledError | None = None
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError as control:
+                pending_control = control
+            if pending_control is not None:
+                request_count_after_checkpoint = current_task.cancelling()
+                new_request_count = max(
+                    request_count_after_checkpoint - current_request_count,
+                    0,
+                )
+                requests_to_preserve = historical_request_count + new_request_count
+                consume_pending_task_cancellation(
+                    pending_control,
+                    preserve_requests=requests_to_preserve,
+                )
+                if new_request_count:
+                    propagated_failure = _session_interruption_failure_with_additional_control(
+                        propagated_failure,
+                        pending_control,
+                        group_message=(
+                            "Session interruption finalization received additional control signals."
+                        ),
+                        historical_cancellation_requests=requests_to_preserve,
+                    )
+                    retain_workspace_observation_pending_cancellation_requests(
+                        propagated_failure,
+                        retained_request_count + new_request_count,
+                    )
+
+        for operation, step in steps:
+            current_task = asyncio.current_task()
+            historical_cancellation_requests = (
+                0 if current_task is None else current_task.cancelling()
+            )
+            cleanup_task = asyncio.create_task(
+                capture_awaitable_outcome(step),
+                name="cayu-session-interruption-finalizer",
+            )
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except BaseException as control:
+                    propagated_failure = _session_interruption_failure_with_additional_control(
+                        propagated_failure,
+                        control,
+                        group_message=(
+                            "Session interruption finalization received additional control signals."
+                        ),
+                        historical_cancellation_requests=(historical_cancellation_requests),
+                    )
+
+            captured = cleanup_task.result()
+            cleanup_error = _session_interruption_cleanup_child_error(
+                captured.error,
+                operation=operation,
+                preserved_failure=authoritative_failure,
+            )
+            if cleanup_error is not None:
+                propagated_failure = _session_interruption_failure_with_additional_control(
+                    propagated_failure,
+                    cleanup_error,
+                    group_message="Session interruption finalization failed.",
+                    historical_cancellation_requests=(historical_cancellation_requests),
+                )
+        return propagated_failure
 
     async def _handle_session_interrupted(
         self,

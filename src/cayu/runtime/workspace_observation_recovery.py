@@ -18,6 +18,7 @@ from cayu._exception_groups import (
     exception_tree_contains,
     iter_exception_tree,
 )
+from cayu._exception_state import exception_state, set_exception_state
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     ShieldedTaskOutcome,
@@ -73,6 +74,10 @@ WorkspaceObservationObserverAuthority = Literal["runtime_builtin", "configured"]
 _WORKSPACE_OBSERVATION_WORKSPACE_ALIAS_FIELD = "workspace_observation_workspace_id"
 _WORKSPACE_OBSERVATION_OBSERVER_ALIAS_FIELD = "workspace_observation_observer"
 _WORKSPACE_OBSERVATION_ARTIFACT_STORE_ALIAS_FIELD = "workspace_observation_artifact_store_id"
+_WORKSPACE_OBSERVATION_PENDING_CANCELLATION_ATTRIBUTE = (
+    "_cayu_workspace_observation_pending_cancellation"
+)
+_WORKSPACE_OBSERVATION_PENDING_CANCELLATION_AUTHORITY = object()
 
 
 def restore_workspace_observation_cancellation_requests(count: int) -> None:
@@ -211,12 +216,70 @@ def workspace_observation_pending_cancellation_requests(error: BaseException) ->
 
     return max(
         (
-            candidate.cancellation_requests_pending
+            max(
+                _workspace_observation_concurrent_cancellation_requests(candidate),
+                _workspace_observation_retained_cancellation_requests(candidate),
+            )
             for candidate in iter_exception_tree(error)
-            if isinstance(candidate, _WorkspaceObservationConcurrentControl)
         ),
         default=0,
     )
+
+
+def _workspace_observation_concurrent_cancellation_requests(error: BaseException) -> int:
+    if type(error) is not _WorkspaceObservationConcurrentControl:
+        return 0
+    count = exception_state(error, "cancellation_requests_pending")
+    return count if type(count) is int and count > 0 else 0
+
+
+def retain_workspace_observation_pending_cancellation_requests(
+    error: BaseException,
+    count: int,
+) -> None:
+    """Retain authenticated cancellation ownership across a runtime rebuild."""
+
+    if not isinstance(error, BaseException):
+        raise TypeError("error must be a BaseException.")
+    if type(count) is not int or count <= 0:
+        raise ValueError("Pending cancellation request count must be a positive int.")
+    retained = max(count, workspace_observation_pending_cancellation_requests(error))
+    if not set_exception_state(
+        error,
+        _WORKSPACE_OBSERVATION_PENDING_CANCELLATION_ATTRIBUTE,
+        (
+            _WORKSPACE_OBSERVATION_PENDING_CANCELLATION_AUTHORITY,
+            retained,
+        ),
+    ):
+        raise RuntimeError("Could not retain workspace observation cancellation authority.")
+
+
+def copy_workspace_observation_pending_cancellation_requests(
+    source: BaseException,
+    target: BaseException,
+) -> None:
+    """Copy authenticated cancellation ownership to a sanitized failure."""
+
+    count = workspace_observation_pending_cancellation_requests(source)
+    if count:
+        retain_workspace_observation_pending_cancellation_requests(target, count)
+
+
+def _workspace_observation_retained_cancellation_requests(error: BaseException) -> int:
+    authority = exception_state(
+        error,
+        _WORKSPACE_OBSERVATION_PENDING_CANCELLATION_ATTRIBUTE,
+    )
+    if (
+        type(authority) is tuple
+        and len(authority) == 2
+        and authority[0] is _WORKSPACE_OBSERVATION_PENDING_CANCELLATION_AUTHORITY
+        and type(authority[1]) is int
+        and authority[1] > 0
+    ):
+        return authority[1]
+    return 0
 
 
 def raise_workspace_observation_concurrent_control(

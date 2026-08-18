@@ -128,6 +128,7 @@ from cayu.runtime.workspace_observation_recovery import (
     _project_workspace_observation_authority,
     raise_workspace_observation_concurrent_control,
     restore_workspace_observation_cancellation_requests,
+    retain_workspace_observation_pending_cancellation_requests,
 )
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults import SecretRedactor
@@ -2051,12 +2052,19 @@ class EnvironmentLifecycle:
                 setup_owner.cleanup_release_safe = True
                 setup_owner.pending_finalize_failure_event = None
             if persist_cancellation is not None:
+                aggregate = append_binding_finalize_cancellation(
+                    exc,
+                    persist_cancellation,
+                )
+                if persistence.cancellation_requests_consumed:
+                    retain_workspace_observation_pending_cancellation_requests(
+                        aggregate,
+                        persistence.cancellation_requests_consumed,
+                    )
                 restore_workspace_observation_cancellation_requests(
                     persistence.cancellation_requests_consumed
                 )
-                raise append_binding_finalize_cancellation(
-                    exc, persist_cancellation
-                ) from persist_cancellation
+                raise aggregate from persist_cancellation
             try:
                 fanout_task = asyncio.create_task(
                     self._event_writer.fan_out_persisted([failure_event])

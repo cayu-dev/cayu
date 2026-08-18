@@ -217,6 +217,9 @@ def test_pull_request_scopes_expensive_verification_jobs() -> None:
 
     assert "needs: verification-scope" in sqlite
     assert "needs.verification-scope.outputs.sqlite_cancellation == 'true'" in sqlite
+    assert "test_final_workspace_observer_restores_caller_cancellation_requests" in sqlite
+    assert "test_delegated_stream_close_counts_checkpoint_cancellation_once" in sqlite
+    assert "test_delegated_stream_close_distinguishes_restored_and_late_cancellation" in sqlite
     assert "needs: verification-scope" in dashboard
     assert "needs.verification-scope.outputs.dashboard == 'true'" in dashboard
     assert "needs: verification-scope" in package

@@ -16,6 +16,7 @@ import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
+import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
@@ -54,6 +55,7 @@ from cayu.runtime import (
     InMemoryBudgetStore,
     InMemorySessionStore,
     InterruptSessionRequest,
+    ResumeRequest,
     RunRequest,
     RuntimePublicationRequest,
     RuntimePublicationResult,
@@ -63,15 +65,23 @@ from cayu.runtime import (
     ToolApprovalRequest,
     UserInputResponse,
 )
+from cayu.runtime._environment_operation_boundary import await_environment_operation
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._model_errors import (
+    _BillingIdentityResolutionCancelled,
+    detach_billing_identity_cancellation_group,
+)
+from cayu.runtime.app import _close_delegated_event_stream
 from cayu.runtime.sessions import runtime_publication_request_digest
 from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationLifecycle,
     _admit_workspace_observation_intent,
     _project_workspace_observation_authority,
     publish_workspace_observation_transition,
+    retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_event_digest,
     workspace_observation_observer_authority_matches,
+    workspace_observation_pending_cancellation_requests,
     workspace_observations_from_checkpoint,
 )
 from cayu.tools import ExecCommandTool, UserInputTool
@@ -206,6 +216,26 @@ class _SingleToolProvider(ModelProvider):
         self.seen_requests.append(request)
         self.requests += 1
         if self.requests == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call-workspace",
+                name=self.tool_name,
+                arguments=self.arguments,
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _CompletionThenSingleToolProvider(_SingleToolProvider):
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.seen_requests.append(request)
+        self.requests += 1
+        if self.requests == 1:
+            yield ModelStreamEvent.text_delta("ready")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
+        if self.requests == 2:
             yield ModelStreamEvent.tool_call(
                 id="call-workspace",
                 name=self.tool_name,
@@ -515,13 +545,16 @@ class _ConcurrentGeneratorExitObserverBinding(DeterministicWorkspaceBinding):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.cancel_target: asyncio.Task | None = None
+        self.cancellation_sent = False
 
     async def observe_revision(self, bound):
         del bound
         self.started.set()
         await self.release.wait()
         assert self.cancel_target is not None
-        self.cancel_target.cancel("observer caller cancellation")
+        if not self.cancellation_sent:
+            self.cancellation_sent = True
+            self.cancel_target.cancel("observer caller cancellation")
         raise GeneratorExit("observer concurrent supervisory exit")
 
 
@@ -812,6 +845,38 @@ class _BlockingTerminalAfterBlockingCaptureStore(_BlockingAfterObservationStore)
             self.terminal_started.set()
             await self.terminal_release.wait()
         await super().append_event(session_id, event)
+
+
+class _BlockingInterruptionCleanupStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_started = asyncio.Event()
+        self.cleanup_release = asyncio.Event()
+        self.cleanup_blocked = False
+        self.fail_next_run_fence_release = False
+
+    async def load(self, session_id):
+        task = asyncio.current_task()
+        if (
+            not self.cleanup_blocked
+            and task is not None
+            and task.get_name() == "cayu-session-interruption-cleanup"
+        ):
+            self.cleanup_blocked = True
+            self.cleanup_started.set()
+            await self.cleanup_release.wait()
+        else:
+            # A restored cancellation must be consumed before even a
+            # suspending persistence preflight. The old check-then-own path
+            # lost the authoritative failure at this checkpoint.
+            await asyncio.sleep(0)
+        return await super().load(session_id)
+
+    async def release_run_fence(self, session_id):
+        await super().release_run_fence(session_id)
+        if self.fail_next_run_fence_release:
+            self.fail_next_run_fence_release = False
+            raise RuntimeError("interruption run-fence release failed")
 
 
 class _WorkspaceObservationProcessLoss(BaseException):
@@ -2247,6 +2312,534 @@ def test_final_workspace_observer_restores_caller_cancellation_requests(
     assert consumer.cancelled() is True
     assert binding.observations == 3
     assert binding.finalize_calls == 0
+
+
+def test_workspace_cancellation_authority_survives_billing_detachment() -> None:
+    canary = "workspace-billing-cancellation-canary"
+    original = BaseExceptionGroup(
+        f"billing group {canary}",
+        [
+            _BillingIdentityResolutionCancelled(f"billing cancellation {canary}"),
+            GeneratorExit(f"observer exit {canary}"),
+        ],
+    )
+    retain_workspace_observation_pending_cancellation_requests(original, 2)
+
+    detached = detach_billing_identity_cancellation_group(original)
+
+    assert detached is not None
+    assert workspace_observation_pending_cancellation_requests(detached) == 2
+    assert canary not in repr(
+        [(type(error).__name__, error.args) for error in iter_exception_tree(detached)]
+    )
+
+
+def test_workspace_cancellation_authority_survives_environment_detachment() -> None:
+    canary = "workspace-environment-cancellation-canary"
+
+    async def run() -> BaseExceptionGroup:
+        original = BaseExceptionGroup(
+            f"environment group {canary}",
+            [
+                asyncio.CancelledError(f"environment cancellation {canary}"),
+                GeneratorExit(f"environment exit {canary}"),
+            ],
+        )
+        retain_workspace_observation_pending_cancellation_requests(original, 2)
+
+        async def fail() -> None:
+            raise original
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await await_environment_operation(
+                fail,
+                operation_name="Workspace observation environment operation",
+                redactor=SecretRedactor([canary]),
+            )
+        return exc_info.value
+
+    detached = asyncio.run(run())
+
+    assert workspace_observation_pending_cancellation_requests(detached) == 2
+    assert canary not in repr(
+        [(type(error).__name__, error.args) for error in iter_exception_tree(detached)]
+    )
+
+
+def test_delegated_stream_close_adds_late_cancellation_to_retained_requests() -> None:
+    async def run() -> tuple[asyncio.Task[None], BaseExceptionGroup]:
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+
+        async def stream() -> AsyncIterator[Event]:
+            try:
+                yield Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="session-delegated-close-cancellation",
+                )
+                await asyncio.Future()
+            finally:
+                close_started.set()
+                await close_release.wait()
+
+        authoritative_failure = BaseExceptionGroup(
+            "Workspace observation control.",
+            [
+                asyncio.CancelledError("original workspace cancellation"),
+                GeneratorExit("original workspace process control"),
+            ],
+        )
+        retain_workspace_observation_pending_cancellation_requests(
+            authoritative_failure,
+            2,
+        )
+
+        async def delegated_stream() -> AsyncIterator[Event]:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+                raise authoritative_failure
+                yield  # pragma: no cover - establishes the async-generator shape
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(delegated_stream()) as owned_stream:
+                await owned_stream.__anext__()
+
+        consumer = asyncio.create_task(consume())
+        await close_started.wait()
+        consumer.cancel("late delegated cleanup cancellation")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        close_release.set()
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await consumer
+        return consumer, exc_info.value
+
+    consumer, failure = asyncio.run(run())
+
+    assert consumer.cancelling() == 3
+    assert consumer.cancelled() is False
+    cancellations = [
+        error for error in iter_exception_tree(failure) if isinstance(error, asyncio.CancelledError)
+    ]
+    assert len(cancellations) == 2
+    assert (
+        sum(
+            cancellation.args == ("late delegated cleanup cancellation",)
+            for cancellation in cancellations
+        )
+        == 1
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 3
+
+
+def test_delegated_stream_close_preserves_late_cancellation_for_untagged_group() -> None:
+    async def run() -> tuple[asyncio.Task[None], BaseExceptionGroup]:
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+
+        async def stream() -> AsyncIterator[Event]:
+            try:
+                yield Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="session-delegated-untagged-cancellation",
+                )
+                await asyncio.Future()
+            finally:
+                close_started.set()
+                await close_release.wait()
+
+        authoritative_failure = BaseExceptionGroup(
+            "Untagged delegated stream control.",
+            [
+                asyncio.CancelledError("older untagged cancellation"),
+                GeneratorExit("older untagged supervisory exit"),
+            ],
+        )
+
+        async def delegated_stream() -> AsyncIterator[Event]:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+                raise authoritative_failure
+                yield  # pragma: no cover - establishes the async-generator shape
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(delegated_stream()) as owned_stream:
+                await owned_stream.__anext__()
+
+        consumer = asyncio.create_task(consume())
+        await close_started.wait()
+        consumer.cancel("late untagged cleanup cancellation")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        close_release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return consumer, raised.value
+
+    consumer, failure = asyncio.run(run())
+
+    cancellations = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if isinstance(candidate, asyncio.CancelledError)
+    ]
+    assert (
+        sum(candidate.args == ("older untagged cancellation",) for candidate in cancellations) == 1
+    )
+    assert (
+        sum(
+            candidate.args == ("late untagged cleanup cancellation",) for candidate in cancellations
+        )
+        == 1
+    )
+    assert (
+        sum(
+            type(candidate) is GeneratorExit
+            and candidate.args == ("older untagged supervisory exit",)
+            for candidate in iter_exception_tree(failure)
+        )
+        == 1
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 1
+    assert consumer.cancelling() == 1
+    assert consumer.cancelled() is False
+
+
+def test_delegated_stream_close_preserves_pending_entry_cancellation_for_untagged_group() -> None:
+    async def run() -> tuple[asyncio.Task[None], BaseExceptionGroup]:
+        authoritative_failure = BaseExceptionGroup(
+            "Untagged historical delegated stream control.",
+            [
+                asyncio.CancelledError("older untagged cancellation"),
+                GeneratorExit("older untagged supervisory exit"),
+            ],
+        )
+
+        async def stream() -> AsyncIterator[Event]:
+            yield Event(
+                type=EventType.SESSION_STARTED,
+                session_id="session-delegated-entry-cancellation",
+            )
+            await asyncio.Future()
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                current_task.cancel("pending cleanup-entry cancellation")
+                raise authoritative_failure
+
+        consumer = asyncio.create_task(consume())
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return consumer, raised.value
+
+    consumer, failure = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert (
+        sum(
+            isinstance(candidate, asyncio.CancelledError)
+            and candidate.args == ("older untagged cancellation",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(candidate, asyncio.CancelledError)
+            and candidate.args == ("pending cleanup-entry cancellation",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert (
+        sum(
+            type(candidate) is GeneratorExit
+            and candidate.args == ("older untagged supervisory exit",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 1
+    assert consumer.cancelling() == 1
+    assert consumer.cancelled() is False
+
+
+def test_delegated_stream_close_counts_checkpoint_cancellation_once() -> None:
+    async def run() -> tuple[asyncio.Task[None], BaseExceptionGroup]:
+        authoritative_failure = BaseExceptionGroup(
+            "Delegated stream process control.",
+            [GeneratorExit("delegated checkpoint supervisory exit")],
+        )
+
+        async def stream() -> AsyncIterator[Event]:
+            yield Event(
+                type=EventType.SESSION_STARTED,
+                session_id="session-delegated-checkpoint-cancellation",
+            )
+            await asyncio.Future()
+
+        async def delegated_stream() -> AsyncIterator[Event]:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                asyncio.get_running_loop().call_soon(
+                    current_task.cancel,
+                    "checkpoint cleanup cancellation",
+                )
+                raise authoritative_failure
+                yield  # pragma: no cover - establishes the async-generator shape
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(delegated_stream()) as owned_stream:
+                await owned_stream.__anext__()
+
+        consumer = asyncio.create_task(consume())
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return consumer, raised.value
+
+    consumer, failure = asyncio.run(run())
+
+    cancellations = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if isinstance(candidate, asyncio.CancelledError)
+    ]
+    assert len(cancellations) == 1
+    assert cancellations[0].args == ("checkpoint cleanup cancellation",)
+    assert workspace_observation_pending_cancellation_requests(failure) == 1
+    assert consumer.cancelling() == 1
+    assert consumer.cancelled() is False
+
+
+def test_delegated_stream_close_distinguishes_restored_and_late_cancellation() -> None:
+    async def run() -> tuple[asyncio.Task[None], BaseExceptionGroup]:
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+        authoritative_failure = BaseExceptionGroup(
+            "Delegated stream control with restored cancellation.",
+            [
+                asyncio.CancelledError("authoritative workspace cancellation"),
+                GeneratorExit("authoritative workspace supervisory exit"),
+            ],
+        )
+        retain_workspace_observation_pending_cancellation_requests(
+            authoritative_failure,
+            1,
+        )
+
+        async def stream() -> AsyncIterator[Event]:
+            try:
+                yield Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="session-delegated-restored-and-late-cancellation",
+                )
+                await asyncio.Future()
+            finally:
+                close_started.set()
+                await close_release.wait()
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                current_task.cancel("restored workspace cancellation")
+                raise authoritative_failure
+
+        consumer = asyncio.create_task(consume())
+        await close_started.wait()
+        consumer.cancel("late delegated cleanup cancellation")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        close_release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return consumer, raised.value
+
+    consumer, failure = asyncio.run(run())
+
+    cancellations = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if isinstance(candidate, asyncio.CancelledError)
+    ]
+    assert (
+        sum(
+            candidate.args == ("authoritative workspace cancellation",)
+            for candidate in cancellations
+        )
+        == 1
+    )
+    assert (
+        sum(candidate.args == ("restored workspace cancellation",) for candidate in cancellations)
+        == 0
+    )
+    assert (
+        sum(
+            candidate.args == ("late delegated cleanup cancellation",)
+            for candidate in cancellations
+        )
+        == 1
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 2
+    assert consumer.cancelling() == 2
+    assert consumer.cancelled() is False
+
+
+def test_delegated_stream_close_aggregates_process_control_only_failure_with_cancellation() -> None:
+    async def run() -> tuple[asyncio.Task[None], BaseExceptionGroup]:
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+
+        async def stream() -> AsyncIterator[Event]:
+            try:
+                yield Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="session-delegated-process-control-cancellation",
+                )
+                await asyncio.Future()
+            finally:
+                close_started.set()
+                await close_release.wait()
+
+        authoritative_failure = BaseExceptionGroup(
+            "Delegated stream process control.",
+            [
+                GeneratorExit("delegated supervisory exit"),
+                RuntimeError("delegated ordinary failure"),
+            ],
+        )
+
+        async def delegated_stream() -> AsyncIterator[Event]:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+                raise authoritative_failure
+                yield  # pragma: no cover - establishes the async-generator shape
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(delegated_stream()) as owned_stream:
+                await owned_stream.__anext__()
+
+        consumer = asyncio.create_task(consume())
+        await close_started.wait()
+        consumer.cancel("concurrent delegated cancellation")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        close_release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return consumer, raised.value
+
+    consumer, failure = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert (
+        sum(
+            type(candidate) is GeneratorExit and candidate.args == ("delegated supervisory exit",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(candidate, asyncio.CancelledError)
+            and candidate.args == ("concurrent delegated cancellation",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 1
+    assert consumer.cancelling() == 1
+    assert consumer.cancelled() is False
+
+
+def test_delegated_stream_close_aggregates_child_process_control_with_cancellation() -> None:
+    async def run() -> tuple[asyncio.Task[None], BaseExceptionGroup]:
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+
+        async def stream() -> AsyncIterator[Event]:
+            try:
+                yield Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="session-delegated-child-process-control",
+                )
+                await asyncio.Future()
+            finally:
+                close_started.set()
+                await close_release.wait()
+                raise SystemExit(17)
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+
+        consumer = asyncio.create_task(consume())
+        await close_started.wait()
+        consumer.cancel("concurrent child-cleanup cancellation")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        close_release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return consumer, raised.value
+
+    consumer, failure = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert (
+        sum(type(candidate) is SystemExit and candidate.args == (17,) for candidate in failures)
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(candidate, asyncio.CancelledError)
+            and candidate.args == ("concurrent child-cleanup cancellation",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 1
+    assert consumer.cancelling() == 1
+    assert consumer.cancelled() is False
+
+
+def test_delegated_stream_child_cancellation_is_an_operational_cleanup_failure() -> None:
+    async def run() -> tuple[asyncio.Task[None], RuntimeError]:
+        async def stream() -> AsyncIterator[Event]:
+            try:
+                yield Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="session-delegated-child-cancellation",
+                )
+                await asyncio.Future()
+            finally:
+                raise asyncio.CancelledError("child stream cleanup cancellation")
+
+        async def consume() -> None:
+            async with _close_delegated_event_stream(stream()) as owned_stream:
+                await owned_stream.__anext__()
+
+        consumer = asyncio.create_task(consume())
+        with pytest.raises(RuntimeError) as raised:
+            await consumer
+        return consumer, raised.value
+
+    consumer, failure = asyncio.run(run())
+
+    assert failure.args == (
+        "Delegated runtime stream cleanup was cancelled without caller cancellation.",
+    )
+    child_cancellation = exception_cause(failure)
+    assert isinstance(child_cancellation, asyncio.CancelledError)
+    assert child_cancellation.args == ("child stream cleanup cancellation",)
+    assert consumer.cancelling() == 0
+    assert consumer.cancelled() is False
 
 
 def test_thread_backed_before_observer_timeout_fences_tool_dispatch_and_reuse(
@@ -4662,11 +5255,159 @@ def test_artifact_store_process_control_is_not_lost_to_concurrent_cancellation(
         and candidate.args == ("artifact caller cancellation",)
         for candidate in failures
     )
-    assert consumer.cancelling() == 0
+    assert consumer.cancelling() == 1
     assert consumer.cancelled() is False
 
 
+@pytest.mark.parametrize("run_fence_release_failure", [False, True])
+@pytest.mark.parametrize("entrance", ["run", "resume"])
 def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
+    tmp_path,
+    monkeypatch,
+    entrance: str,
+    run_fence_release_failure: bool,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifact_root = tmp_path / "artifacts"
+    workspace_root.mkdir()
+    monkeypatch.setattr(
+        tool_round_executor_module,
+        "_WORKSPACE_RECEIPT_INLINE_PATH_LIMIT",
+        0,
+    )
+
+    async def run():
+        tool = _BlockingAfterWriteMutationTool()
+        store = _BlockingInterruptionCleanupStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        provider_type = (
+            _SingleToolProvider if entrance == "run" else _CompletionThenSingleToolProvider
+        )
+        app.register_provider(
+            provider_type(
+                tool_name=tool.spec.name,
+                arguments={},
+            ),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=_GeneratorExitArtifactStore(artifact_root),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="cancel-model"),
+            tools=[tool],
+        )
+        session_id = f"session-interrupted-artifact-generator-exit-{entrance}"
+        if entrance == "resume":
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "complete before resume")],
+                ),
+            )
+        store.fail_next_run_fence_release = run_fence_release_failure
+
+        async def consume() -> list[Event]:
+            if entrance == "run":
+                return await collect_events(
+                    app,
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "write then cancel")],
+                    ),
+                )
+            return [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "write then cancel")],
+                    )
+                )
+            ]
+
+        consumer = asyncio.create_task(consume())
+        await tool.started.wait()
+        consumer.cancel("caller cancellation during workspace mutation")
+        await store.cleanup_started.wait()
+        consumer.cancel("late cancellation during interruption cleanup")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        store.cleanup_release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        persisted = await store.load(session_id)
+        assert persisted is not None
+        return raised.value, consumer, persisted.status, [record.event for record in durable]
+
+    failure, consumer, status, durable_events = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert any(
+        type(candidate) is asyncio.CancelledError
+        and candidate.args == ("caller cancellation during workspace mutation",)
+        for candidate in failures
+    )
+    assert any(
+        type(candidate) is asyncio.CancelledError
+        and candidate.args == ("late cancellation during interruption cleanup",)
+        for candidate in failures
+    )
+    assert any(
+        type(candidate) is GeneratorExit and candidate.args == ("artifact-store supervisory exit",)
+        for candidate in failures
+    )
+    assert (
+        any(
+            type(candidate) is RuntimeError
+            and candidate.args == ("interruption run-fence release failed",)
+            for candidate in failures
+        )
+        is run_fence_release_failure
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 2
+    assert consumer.cancelling() == 2
+    assert consumer.cancelled() is False
+    assert status is SessionStatus.INTERRUPTED
+    assert (
+        sum(
+            type(candidate) is ValueError
+            and candidate.args
+            == (
+                "Tool-round publication requires exactly one terminal event for every "
+                "pending call; missing: call-workspace.",
+            )
+            for candidate in failures
+        )
+        == 1
+    )
+    paused_events = [
+        event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
+    ]
+    assert len(paused_events) == 1
+    assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
+    assert any(event.type is EventType.SESSION_INTERRUPTED for event in durable_events)
+    assert not any(
+        event.type
+        in {
+            EventType.WORKSPACE_MUTATION_RECORDED,
+            EventType.WORKSPACE_OBSERVATION_FINALIZED,
+        }
+        for event in durable_events
+    )
+
+
+def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -4681,7 +5422,7 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
 
     async def run():
         tool = _BlockingAfterWriteMutationTool()
-        store = InMemorySessionStore()
+        store = _BlockingInterruptionCleanupStore()
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(
             _SingleToolProvider(
@@ -4703,47 +5444,190 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
             AgentSpec(name="assistant", model="cancel-model"),
             tools=[tool],
         )
-        consumer = asyncio.create_task(
-            collect_events(
-                app,
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="session-interrupted-artifact-generator-exit",
-                    messages=[Message.text("user", "write then cancel")],
-                ),
+        session_id = "session-close-buffered-interruption-event"
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "write then close")],
             )
         )
-        await tool.started.wait()
-        consumer.cancel("caller cancellation during workspace mutation")
-        with pytest.raises(BaseExceptionGroup) as raised:
-            await consumer
-        durable = await store.query_events(
-            EventQuery(session_id="session-interrupted-artifact-generator-exit")
-        )
-        return raised.value, consumer, [record.event for record in durable]
 
-    failure, consumer, durable_events = asyncio.run(run())
+        async def consume_until_failure():
+            delivered_events: list[Event] = []
+            try:
+                async for event in stream:
+                    delivered_events.append(event)
+            except BaseException as failure:
+                task = asyncio.current_task()
+                assert task is not None
+                return delivered_events, failure, task.cancelling()
+            raise AssertionError("The authoritative interruption failure was not delivered.")
+
+        consumer = asyncio.create_task(consume_until_failure())
+        await tool.started.wait()
+        consumer.cancel("caller cancellation before buffered delivery")
+        await store.cleanup_started.wait()
+        store.cleanup_release.set()
+        delivered_events, failure, cancellation_requests = await consumer
+
+        async def close_stream() -> int:
+            await stream.aclose()
+            await asyncio.sleep(0)
+            task = asyncio.current_task()
+            assert task is not None
+            return task.cancelling()
+
+        closer = asyncio.create_task(close_stream())
+        closer_cancellation_requests = await closer
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return (
+            delivered_events,
+            failure,
+            cancellation_requests,
+            consumer,
+            closer_cancellation_requests,
+            closer,
+            [record.event for record in durable],
+        )
+
+    (
+        delivered_events,
+        failure,
+        cancellation_requests,
+        consumer,
+        closer_cancellation_requests,
+        closer,
+        durable_events,
+    ) = asyncio.run(run())
 
     failures = list(iter_exception_tree(failure))
     assert any(
         type(candidate) is asyncio.CancelledError
-        and candidate.args == ("caller cancellation during workspace mutation",)
+        and candidate.args == ("caller cancellation before buffered delivery",)
         for candidate in failures
     )
     assert any(
         type(candidate) is GeneratorExit and candidate.args == ("artifact-store supervisory exit",)
         for candidate in failures
     )
-    assert consumer.cancelling() == 0
-    assert consumer.cancelled() is False
+    assert workspace_observation_pending_cancellation_requests(failure) == 1
     assert not any(
-        event.type
-        in {
-            EventType.WORKSPACE_MUTATION_RECORDED,
-            EventType.WORKSPACE_OBSERVATION_FINALIZED,
-        }
-        for event in durable_events
+        event.type in {EventType.INTERACTION_INTERRUPTED, EventType.SESSION_INTERRUPTED}
+        for event in delivered_events
     )
+    assert cancellation_requests == 1
+    assert consumer.cancelled() is False
+    assert closer_cancellation_requests == 0
+    assert closer.cancelled() is False
+    paused_events = [
+        event for event in durable_events if event.type is EventType.INTERACTION_PAUSED
+    ]
+    assert len(paused_events) == 1
+    assert paused_events[0].payload["pending_action_kind"] == "tool_recovery"
+    assert any(event.type is EventType.SESSION_INTERRUPTED for event in durable_events)
+
+
+def test_interruption_failure_deduplication_handles_deep_groups_iteratively() -> None:
+    failure: BaseException = RuntimeError("deep cleanup failure")
+    for _ in range(2_000):
+        failure = BaseExceptionGroup("nested cleanup", [failure])
+
+    assert (
+        session_engine_module._failure_without_existing_exception_identities(
+            failure,
+            set(),
+        )
+        is failure
+    )
+
+
+def test_interruption_cleanup_does_not_invoke_failure_truthiness() -> None:
+    class HostileTruthinessFailure(RuntimeError):
+        def __bool__(self) -> bool:
+            raise AssertionError("failure truthiness must not run")
+
+    preserved = asyncio.CancelledError("authoritative cancellation")
+    hostile = HostileTruthinessFailure("private cleanup diagnostic")
+    failure = BaseExceptionGroup("cleanup failures", [preserved, hostile])
+
+    classified = session_engine_module._session_interruption_cleanup_child_error(
+        failure,
+        operation="Session interruption cleanup",
+        preserved_failure=preserved,
+    )
+
+    assert isinstance(classified, BaseExceptionGroup)
+    classified_failures = list(iter_exception_tree(classified))
+    assert any(candidate is preserved for candidate in classified_failures)
+    assert any(candidate is hostile for candidate in classified_failures)
+
+
+def test_interruption_cleanup_failure_preserves_historical_task_cancellation() -> None:
+    async def run() -> BaseException:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("handled historical cancellation")
+        with pytest.raises(asyncio.CancelledError, match="handled historical cancellation"):
+            await asyncio.sleep(0)
+        assert current.cancelling() == 1
+
+        authoritative = BaseExceptionGroup(
+            "Workspace observation control.",
+            [
+                asyncio.CancelledError("owned workspace cancellation"),
+                GeneratorExit("owned workspace supervisory exit"),
+            ],
+        )
+        retain_workspace_observation_pending_cancellation_requests(authoritative, 1)
+        propagated = session_engine_module._session_interruption_failure_with_additional_control(
+            authoritative,
+            RuntimeError("interruption cleanup failed"),
+            group_message="Session interruption finalization failed.",
+            historical_cancellation_requests=1,
+        )
+
+        assert current.cancelling() == 1
+        await asyncio.sleep(0)
+        assert current.cancelling() == 1
+        current.uncancel()
+        return propagated
+
+    failure = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert (
+        sum(
+            type(candidate) is asyncio.CancelledError
+            and candidate.args == ("owned workspace cancellation",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert (
+        sum(
+            type(candidate) is RuntimeError and candidate.args == ("interruption cleanup failed",)
+            for candidate in failures
+        )
+        == 1
+    )
+    assert workspace_observation_pending_cancellation_requests(failure) == 1
+
+
+def test_interruption_cleanup_handles_deep_preserved_failure_group_iteratively() -> None:
+    preserved = asyncio.CancelledError("authoritative cancellation")
+    failure: BaseException = preserved
+    for _ in range(2_000):
+        failure = BaseExceptionGroup("nested cleanup", [failure])
+
+    classified = session_engine_module._session_interruption_cleanup_child_error(
+        failure,
+        operation="Session interruption cleanup",
+        preserved_failure=preserved,
+    )
+
+    assert isinstance(classified, BaseExceptionGroup)
+    assert any(candidate is preserved for candidate in iter_exception_tree(classified))
 
 
 def test_stalled_receipt_artifact_write_is_bounded_without_replacing_tool_outcome(
@@ -5181,8 +6065,10 @@ def test_observer_owned_generator_exit_propagates_and_does_not_quarantine_reuse(
     assert provider.requests == 2
 
 
+@pytest.mark.parametrize("historical_cancellation", [False, True])
 def test_observer_process_control_is_not_lost_to_concurrent_cancellation(
     tmp_path,
+    historical_cancellation: bool,
 ) -> None:
     async def run():
         binding = _ConcurrentGeneratorExitObserverBinding()
@@ -5206,8 +6092,15 @@ def test_observer_process_control_is_not_lost_to_concurrent_cancellation(
             AgentSpec(name="assistant", model="scripted-model"),
             tools=[_NoopWorkspaceMutationTool()],
         )
-        consumer = asyncio.create_task(
-            collect_events(
+
+        async def consume() -> list[Event]:
+            if historical_cancellation:
+                current = asyncio.current_task()
+                assert current is not None
+                current.cancel("handled historical cancellation")
+                with pytest.raises(asyncio.CancelledError, match="handled historical cancellation"):
+                    await asyncio.sleep(0)
+            return await collect_events(
                 app,
                 RunRequest(
                     agent_name="assistant",
@@ -5215,7 +6108,8 @@ def test_observer_process_control_is_not_lost_to_concurrent_cancellation(
                     messages=[Message.text("user", "observe")],
                 ),
             )
-        )
+
+        consumer = asyncio.create_task(consume())
         binding.cancel_target = consumer
         await binding.started.wait()
         binding.release.set()
@@ -5231,12 +6125,20 @@ def test_observer_process_control_is_not_lost_to_concurrent_cancellation(
         and candidate.args == ("observer concurrent supervisory exit",)
         for candidate in failures
     )
-    assert any(
-        type(candidate) is asyncio.CancelledError
-        and candidate.args == ("observer caller cancellation",)
-        for candidate in failures
+    assert (
+        sum(
+            type(candidate) is asyncio.CancelledError
+            and candidate.args == ("observer caller cancellation",)
+            for candidate in failures
+        )
+        == 1
     )
-    assert consumer.cancelling() == 1
+    expected_cancellation_requests = 1 + int(historical_cancellation)
+    assert (
+        workspace_observation_pending_cancellation_requests(failure)
+        == expected_cancellation_requests
+    )
+    assert consumer.cancelling() == expected_cancellation_requests
     assert consumer.cancelled() is False
 
 

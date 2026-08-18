@@ -259,6 +259,7 @@ from cayu.runtime.workspace_observation_recovery import (
     await_workspace_observation_store_read,
     publish_workspace_observation_transition,
     raise_workspace_observation_concurrent_control,
+    restore_workspace_observation_cancellation_requests,
     workspace_observation_artifact_metadata_matches,
     workspace_observation_authority_matches,
     workspace_observation_event_digest,
@@ -11793,10 +11794,15 @@ class RecoveryCoordinator:
                         else:
                             read_result = captured.result
                             read_error = captured.error
+                    if outcome.cancellation is not None:
+                        restore_workspace_observation_cancellation_requests(
+                            outcome.cancellation_requests_consumed
+                        )
                     raise_workspace_observation_concurrent_control(
                         cancellation=outcome.cancellation,
                         error=read_error,
                         operation="Workspace observation artifact recovery",
+                        cancellation_requests_pending=(outcome.cancellation_requests_consumed),
                     )
                     if outcome.timed_out:
                         verification_failed = True
