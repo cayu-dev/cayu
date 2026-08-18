@@ -8403,7 +8403,7 @@ class SQLiteSessionStore(SessionStore):
                        invocation_json, metadata_json
                 FROM {session_source_sql}
                 {plan.page_where_sql}
-                ORDER BY {plan.order_sql}, id ASC
+                ORDER BY {plan.order_sql}
                 {plan.pagination_sql}
                 """,
                 plan.page_params,

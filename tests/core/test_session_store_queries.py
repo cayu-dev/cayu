@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -53,6 +54,7 @@ from cayu.runtime.sessions import (
     fork_session_invocation,
     session_outcome_from_records,
 )
+from cayu.storage import _session_store_sql as session_store_sql
 
 StoreFactory = Callable[[object], SessionStore]
 
@@ -3011,6 +3013,70 @@ def test_session_stores_cursor_pagination_is_stable_across_orders(store_factory,
         await _close_store(store)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("order", list(SessionOrder))
+def test_sql_session_order_includes_cursor_tie_breaker(order: SessionOrder) -> None:
+    direction = "DESC" if order.value.endswith("_desc") else "ASC"
+
+    assert session_store_sql.session_order_sql(order).endswith(f" {direction}, id ASC")
+
+
+def test_sqlite_session_cursor_paginates_equal_sort_values_without_gaps(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "equal-session-sort-values.sqlite")
+
+    async def run() -> list[str]:
+        session_ids = ["sess_c", "sess_a", "sess_e", "sess_b", "sess_d"]
+        for session_id in session_ids:
+            await store.create(_lifecycle_request(session_id), identity=_identity())
+
+        tied_at = datetime(2026, 1, 1, tzinfo=UTC).isoformat()
+        store._connection.execute(
+            """
+            UPDATE cayu_sessions
+            SET created_at = ?, updated_at = ?, last_activity_at = ?
+            """,
+            (tied_at, tied_at, tied_at),
+        )
+        store._connection.commit()
+        statements: list[str] = []
+        original_run_read = store._run_read
+
+        async def traced_run_read(query: Callable[..., object]) -> object:
+            def traced_query(connection: sqlite3.Connection) -> object:
+                connection.set_trace_callback(statements.append)
+                return query(connection)
+
+            return await original_run_read(traced_query)
+
+        monkeypatch.setattr(store, "_run_read", traced_run_read)
+
+        for order in SessionOrder:
+            collected: list[str] = []
+            cursor: str | None = None
+            while True:
+                page = await store.list_sessions(
+                    SessionQuery(order_by=order, limit=2, cursor=cursor)
+                )
+                collected.extend(session.id for session in page.sessions)
+                if page.next_cursor is None:
+                    break
+                cursor = page.next_cursor
+            assert collected == sorted(session_ids), order
+
+        await store.close()
+        return [
+            statement
+            for statement in statements
+            if "FROM cayu_sessions" in statement and "ORDER BY" in statement
+        ]
+
+    session_queries = asyncio.run(run())
+
+    assert session_queries
+    assert all(query.count("id ASC") == 1 for query in session_queries)
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])

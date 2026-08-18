@@ -96,7 +96,7 @@ def event_query_with_session_ids(
 
 def session_order_sql(order_by: SessionOrder) -> str:
     direction = "DESC" if session_order_is_descending(order_by) else "ASC"
-    return f"{session_sort_column(order_by)} {direction}"
+    return f"{session_sort_column(order_by)} {direction}, id ASC"
 
 
 def build_event_query_sql(

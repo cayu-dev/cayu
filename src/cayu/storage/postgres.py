@@ -13773,7 +13773,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     SELECT {pg_support.SESSION_COLUMNS}
                     FROM {session_source_sql}
                     {plan.page_where_sql}
-                    ORDER BY {plan.order_sql}, id ASC
+                    ORDER BY {plan.order_sql}
                     {plan.pagination_sql}
                     """,
                 ),
