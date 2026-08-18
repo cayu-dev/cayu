@@ -108,6 +108,31 @@ run `cayu storage status` followed by `cayu storage migrate`, then confirm
 revision 40 before starting current workers. Mixed revision-39/revision-40
 operation and application-only rollback across this boundary are unsupported.
 
+### Knowledge access is explicit and retrieval foundations are reproducible
+
+Every built-in knowledge store operation now requires a principal-derived
+`KnowledgeAccessScope`, supplied per operation or bound to the store. The scope
+is enforced inside memory, SQLite, and PostgreSQL reads, searches, mutations,
+chunk access, embedding paths, and publication-receipt replay. Runtime context
+injection, knowledge tools, indexing, and review carry the same scope; callers
+cannot widen a store-bound scope. Trusted maintenance must opt into the explicit
+privileged scope.
+
+Breaking schema revision 41 stores the immutable authorization projection beside
+each knowledge publication receipt so exact replay remains safe after an entry is
+hard-deleted. Stop pre-41 workers and take an application-consistent backup before
+migrating. Existing receipt authorization is deliberately not inferred or
+backfilled: databases with populated pre-41 knowledge publication receipts must be
+recreated. Empty receipt tables migrate normally. Run `cayu storage status`
+followed by `cayu storage migrate`, then confirm revision 41 before starting
+current workers. Mixed pre-41 and current knowledge writers are unsupported.
+
+The memory foundation also adds a deterministic weighted reciprocal-rank fusion
+primitive with bounded channel diagnostics, an explicit revision-reset/refusal
+contract, and a versioned hermetic retrieval corpus and baseline runner. These are
+foundation primitives; automatic curation and context placement remain separate
+future layers.
+
 ### Durable tasks retain immutable invocation provenance
 
 Tasks now carry a Cayu-minted invocation identity and their immediate execution

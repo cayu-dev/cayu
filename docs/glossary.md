@@ -49,6 +49,12 @@ disambiguates them so a name never sends you down the wrong path.
 
 ## A few load-bearing terms
 
+- **Knowledge vs memory.** Knowledge is durable canonical semantic material
+  (entries, chunks, source identity, lifecycle, and eventually immutable
+  revisions/evidence). Memory is the broader recall and context system that may
+  retrieve permitted knowledge, transcript episodes, and artifact-derived
+  documents. A `KnowledgeStore` is one memory source, not the whole memory
+  system. See [Memory foundation contracts](memory-foundation.md).
 - **Model-provider credential.** Host/control-process authority used by a
   `ModelProvider` or its refresh transport to make model requests. It is
   non-delegable by default; provider registration never makes it a runner,

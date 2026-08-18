@@ -254,6 +254,8 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "Breaking schema revision 40" in unreleased
     assert "confirm revision 40 before starting current workers" in unreleased
     assert "through revision 40 before deploying them" in unreleased
+    assert "Breaking schema revision 41" in unreleased
+    assert "confirm revision 41 before starting current workers" in unreleased
 
 
 def test_queued_dispatch_revision_40_migration_covers_custom_task_types() -> None:
