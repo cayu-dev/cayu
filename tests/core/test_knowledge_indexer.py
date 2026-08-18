@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from cayu.storage import (
     InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeIndexer,
@@ -16,6 +17,8 @@ from cayu.storage import (
     KnowledgeQuery,
     SQLiteKnowledgeStore,
 )
+
+_ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 
 
 def test_knowledge_indexer_builds_heading_aware_chunks() -> None:
@@ -76,7 +79,7 @@ def test_knowledge_indexer_overlaps_split_chunks() -> None:
 
 def test_knowledge_indexer_writes_to_store_and_searches_chunks() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         indexer = KnowledgeIndexer(store)
         result = await indexer.index_text(
             KnowledgeIndexRequest(
@@ -103,7 +106,7 @@ def test_knowledge_indexer_writes_to_store_and_searches_chunks() -> None:
 
 def test_knowledge_indexer_writes_to_sqlite_store(tmp_path) -> None:
     async def run():
-        store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+        store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
         try:
             indexer = KnowledgeIndexer(store)
             result = await indexer.index_text(
@@ -135,7 +138,7 @@ def test_knowledge_indexer_writes_to_sqlite_store(tmp_path) -> None:
 
 def test_knowledge_indexer_skips_unchanged_store_write() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         indexer = KnowledgeIndexer(store)
         request = KnowledgeIndexRequest(text="Stable policy text.", entry_id="stable")
         first = await indexer.index_text(request)
@@ -155,7 +158,7 @@ def test_knowledge_indexer_skips_unchanged_store_write() -> None:
 
 def test_knowledge_indexer_rewrites_when_metadata_changes_with_same_text() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         indexer = KnowledgeIndexer(store)
         first = await indexer.index_text(
             KnowledgeIndexRequest(
@@ -192,7 +195,7 @@ def test_knowledge_indexer_rewrites_when_metadata_changes_with_same_text() -> No
 
 def test_knowledge_indexer_rewrites_when_store_has_stale_extra_chunks() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         indexer = KnowledgeIndexer(store)
         request = KnowledgeIndexRequest(text="Same policy text.", entry_id="stale-extra")
         built = indexer.build(request)

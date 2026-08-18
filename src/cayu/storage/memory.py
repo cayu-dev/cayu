@@ -111,6 +111,128 @@ class KnowledgeListGroup(StrEnum):
     NAMESPACE = "namespace"
 
 
+class KnowledgeAccessDenied(PermissionError):
+    """Raised when a knowledge mutation falls outside its explicit access scope."""
+
+    def __init__(self, operation: str) -> None:
+        self.operation = require_clean_nonblank(operation, "operation")
+        super().__init__(f"Knowledge access denied for {self.operation}.")
+
+
+class KnowledgeAccessScope(BaseModel):
+    """Principal-derived constraints enforced inside every knowledge operation.
+
+    Cayu deliberately does not model tenants, organizations, users, or RBAC. The
+    hosting application maps those concepts into namespaces, labels, visibility,
+    source identity, lifecycle state, and expiration eligibility. Namespace-wide
+    access must be explicit; constructing a scope with no namespace is invalid.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    allowed_namespaces: list[str] = Field(default_factory=list)
+    allow_all_namespaces: bool = False
+    required_labels: dict[str, str] = Field(default_factory=dict)
+    allowed_visibilities: list[KnowledgeVisibility] = Field(
+        default_factory=lambda: [KnowledgeVisibility.GLOBAL]
+    )
+    allowed_source_types: list[str] | None = None
+    allowed_source_ids: list[str] | None = None
+    allowed_statuses: list[KnowledgeStatus] = Field(
+        default_factory=lambda: [KnowledgeStatus.ACTIVE]
+    )
+    include_expired: bool = False
+
+    @field_validator(
+        "allowed_namespaces", "allowed_source_types", "allowed_source_ids", mode="before"
+    )
+    @classmethod
+    def copy_string_lists(cls, value, info) -> list[str] | None:
+        if value is None and info.field_name in {"allowed_source_types", "allowed_source_ids"}:
+            return None
+        if value is None:
+            return []
+        copied = copy_json_value(value, info.field_name)
+        if type(copied) is not list:
+            raise ValueError(f"`{info.field_name}` must be a list.")
+        result: list[str] = []
+        for index, item in enumerate(copied):
+            if type(item) is not str:
+                raise ValueError(f"`{info.field_name}[{index}]` must be a string.")
+            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+        return sorted(_dedupe_strings(result))
+
+    @field_validator("required_labels", mode="before")
+    @classmethod
+    def copy_required_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "required_labels")
+
+    @field_validator("allowed_visibilities", "allowed_statuses")
+    @classmethod
+    def validate_nonempty_enum_lists(cls, value: list[Any], info) -> list[Any]:
+        if not value:
+            raise ValueError(f"`{info.field_name}` cannot be empty.")
+        return sorted(dict.fromkeys(value), key=str)
+
+    @field_validator("allow_all_namespaces", "include_expired", mode="before")
+    @classmethod
+    def validate_boolean_fields(cls, value, info) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"`{info.field_name}` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_namespace_boundary(self) -> KnowledgeAccessScope:
+        if self.allow_all_namespaces and self.allowed_namespaces:
+            raise ValueError(
+                "`allowed_namespaces` must be empty when `allow_all_namespaces` is true."
+            )
+        if not self.allow_all_namespaces and not self.allowed_namespaces:
+            raise ValueError(
+                "Knowledge access requires `allowed_namespaces` or explicit "
+                "`allow_all_namespaces=True`."
+            )
+        return self
+
+    @classmethod
+    def for_namespace(
+        cls,
+        namespace: str,
+        *,
+        required_labels: dict[str, str] | None = None,
+        allowed_visibilities: list[KnowledgeVisibility] | None = None,
+        allowed_source_types: list[str] | None = None,
+        allowed_source_ids: list[str] | None = None,
+        allowed_statuses: list[KnowledgeStatus] | None = None,
+        include_expired: bool = False,
+    ) -> KnowledgeAccessScope:
+        """Create an explicit single-namespace application scope."""
+
+        values: dict[str, Any] = {
+            "allowed_namespaces": [namespace],
+            "required_labels": required_labels or {},
+            "allowed_source_types": allowed_source_types,
+            "allowed_source_ids": allowed_source_ids,
+            "include_expired": include_expired,
+        }
+        if allowed_visibilities is not None:
+            values["allowed_visibilities"] = allowed_visibilities
+        if allowed_statuses is not None:
+            values["allowed_statuses"] = allowed_statuses
+        return cls(**values)
+
+    @classmethod
+    def privileged(cls) -> KnowledgeAccessScope:
+        """Create an explicit all-knowledge scope for trusted host maintenance."""
+
+        return cls(
+            allow_all_namespaces=True,
+            allowed_visibilities=list(KnowledgeVisibility),
+            allowed_statuses=list(KnowledgeStatus),
+            include_expired=True,
+        )
+
+
 class KnowledgeEntry(BaseModel):
     """Durable, source-attributed knowledge item."""
 
@@ -216,6 +338,37 @@ class KnowledgeEntry(BaseModel):
         if self.updated_at < self.created_at:
             raise ValueError("`updated_at` must be greater than or equal to `created_at`.")
         return self
+
+
+class _KnowledgeAccessSnapshot(BaseModel):
+    """Immutable authorization projection retained beside publication receipts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    namespace: str
+    labels: dict[str, str]
+    visibility: KnowledgeVisibility
+    source_type: str | None
+    source_id: str | None
+    status: KnowledgeStatus
+    expires_at: datetime | None
+
+    @field_validator("namespace")
+    @classmethod
+    def validate_namespace(cls, value: str) -> str:
+        return require_clean_nonblank(value, "namespace")
+
+    @field_validator("source_type", "source_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
 
 
 class KnowledgeChunk(BaseModel):
@@ -779,17 +932,50 @@ class KnowledgePublicationReceipt(BaseModel):
 class KnowledgeStore(ABC):
     """Searchable knowledge contract."""
 
+    _default_access_scope: KnowledgeAccessScope | None = None
+
+    def bound_access_scope(self) -> KnowledgeAccessScope | None:
+        """Return the explicitly bound single-principal scope, if configured."""
+
+        if self._default_access_scope is None:
+            return None
+        return copy_knowledge_access_scope(self._default_access_scope)
+
+    def _operation_access_scope(
+        self,
+        access_scope: KnowledgeAccessScope | None,
+    ) -> KnowledgeAccessScope:
+        default_scope = self._default_access_scope
+        if access_scope is None:
+            if default_scope is None:
+                raise TypeError("knowledge operation requires `access_scope`.")
+            return copy_knowledge_access_scope(default_scope)
+        explicit_scope = copy_knowledge_access_scope(access_scope)
+        if default_scope is not None and explicit_scope != default_scope:
+            raise KnowledgeAccessDenied("access_scope_override")
+        return explicit_scope
+
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
         """Return search modes this store can execute directly."""
 
         return (KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD)
 
     @abstractmethod
-    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+    async def put_entry(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
         """Insert or update one knowledge entry by id."""
 
     @abstractmethod
-    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
+    async def get_entry(
+        self,
+        entry_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry | None:
         """Load one entry by id."""
 
     @abstractmethod
@@ -797,6 +983,8 @@ class KnowledgeStore(ABC):
         self,
         entry_id: str,
         status: KnowledgeStatus,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         """Update one entry status and return the updated entry."""
 
@@ -805,6 +993,7 @@ class KnowledgeStore(ABC):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
         expected_namespace: str | None = None,
@@ -817,13 +1006,18 @@ class KnowledgeStore(ABC):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
         """Soft-delete one entry by default, or hard-delete when requested."""
 
     @abstractmethod
     async def replace_chunks(
-        self, entry_id: str, chunks: list[KnowledgeChunk]
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> list[KnowledgeChunk]:
         """Replace the complete chunk set for an existing entry."""
 
@@ -832,6 +1026,8 @@ class KnowledgeStore(ABC):
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         """Atomically write one entry and its complete chunk set."""
 
@@ -840,6 +1036,7 @@ class KnowledgeStore(ABC):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
     ) -> KnowledgePublicationReceipt:
         """Create one entry exactly once and retain immutable replay evidence.
@@ -858,6 +1055,8 @@ class KnowledgeStore(ABC):
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
         """Load immutable publication evidence for one operation id."""
 
@@ -870,6 +1069,7 @@ class KnowledgeStore(ABC):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         chunk_index: int | None = None,
         around: int = 0,
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
@@ -878,14 +1078,29 @@ class KnowledgeStore(ABC):
         """Read bounded chunks for one entry."""
 
     @abstractmethod
-    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+    async def search(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
         """Search knowledge and return a bounded result envelope."""
 
     @abstractmethod
-    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+    async def list_entries(
+        self,
+        query: KnowledgeListQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeListResult:
         """List entries/facets for discovery without requiring a lexical search term."""
 
-    async def prune_expired(self, *, now: datetime | None = None) -> int:
+    async def prune_expired(
+        self,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        now: datetime | None = None,
+    ) -> int:
         """Hard-delete entries whose ``expires_at`` is at or before ``now`` (default: current UTC).
 
         Returns the count removed. The read-time filter (:func:`_entry_is_expired`) only *hides*
@@ -900,10 +1115,19 @@ class KnowledgeStore(ABC):
 class InMemoryKnowledgeStore(KnowledgeStore):
     """In-memory knowledge store for tests, demos, and single-process apps."""
 
-    def __init__(self, entries: list[KnowledgeEntry] | None = None) -> None:
+    def __init__(
+        self,
+        entries: list[KnowledgeEntry] | None = None,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> None:
+        self._default_access_scope = (
+            None if access_scope is None else copy_knowledge_access_scope(access_scope)
+        )
         self._entries: dict[str, KnowledgeEntry] = {}
         self._chunks: dict[str, list[KnowledgeChunk]] = {}
         self._publication_receipts: dict[str, KnowledgePublicationReceipt] = {}
+        self._publication_access: dict[str, _KnowledgeAccessSnapshot] = {}
         if entries:
             for entry in entries:
                 copied = copy_knowledge_entry(entry)
@@ -912,9 +1136,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 self._entries[copied.id] = copied
                 self._chunks[copied.id] = [_default_chunk_for_entry(copied)]
 
-    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+    async def put_entry(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
+        _require_knowledge_entry_access(scope, entry, operation="put_entry")
         existing_entry = self._entries.get(entry.id)
+        if existing_entry is not None:
+            _require_knowledge_entry_access(scope, existing_entry, operation="put_entry")
         existing_chunks = self._chunks.get(entry.id)
         replacement_chunks: list[KnowledgeChunk] | None = None
         if (
@@ -929,10 +1162,16 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             self._chunks[entry.id] = replacement_chunks
         return copy_knowledge_entry(entry)
 
-    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
+    async def get_entry(
+        self,
+        entry_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry | None:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         entry = self._entries.get(clean_id)
-        if entry is None:
+        if entry is None or not _knowledge_scope_allows_entry(scope, entry):
             return None
         return copy_knowledge_entry(entry)
 
@@ -940,13 +1179,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self,
         entry_id: str,
         status: KnowledgeStatus,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         entry = self._entries.get(clean_id)
         if entry is None:
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+        _require_knowledge_entry_access(scope, entry, operation="update_entry_status")
         updated = entry.model_copy(update={"status": status, "updated_at": _next_updated_at(entry)})
         updated = copy_knowledge_entry(updated)
+        _require_knowledge_entry_access(scope, updated, operation="update_entry_status")
         self._entries[clean_id] = updated
         return copy_knowledge_entry(updated)
 
@@ -954,11 +1198,13 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
         expected_namespace: str | None = None,
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
@@ -973,6 +1219,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         entry = self._entries.get(clean_id)
         if entry is None:
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+        _require_knowledge_entry_access(scope, entry, operation="transition_entry_status")
         if entry.status is not from_status:
             raise ValueError(
                 f"Knowledge entry {clean_id!r} is {entry.status.value!r}, "
@@ -987,6 +1234,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             update={"status": to_status, "updated_at": _next_updated_at(entry)}
         )
         updated = copy_knowledge_entry(updated)
+        _require_knowledge_entry_access(scope, updated, operation="transition_entry_status")
         self._entries[clean_id] = updated
         return copy_knowledge_entry(updated)
 
@@ -994,24 +1242,39 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         entry = self._entries.get(clean_id)
         if entry is None:
             return None
+        _require_knowledge_entry_access(scope, entry, operation="delete_entry")
         if hard:
             self._entries.pop(clean_id, None)
             self._chunks.pop(clean_id, None)
             return copy_knowledge_entry(entry)
-        return await self.update_entry_status(clean_id, KnowledgeStatus.DELETED)
+        return await self.update_entry_status(
+            clean_id,
+            KnowledgeStatus.DELETED,
+            access_scope=scope,
+        )
 
-    async def prune_expired(self, *, now: datetime | None = None) -> int:
+    async def prune_expired(
+        self,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        scope = self._operation_access_scope(access_scope)
         cutoff = datetime.now(UTC) if now is None else now
         expired_ids = [
             entry_id
             for entry_id, entry in self._entries.items()
-            if entry.expires_at is not None and entry.expires_at <= cutoff
+            if entry.expires_at is not None
+            and entry.expires_at <= cutoff
+            and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
         ]
         for entry_id in expired_ids:
             self._entries.pop(entry_id, None)
@@ -1019,11 +1282,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         return len(expired_ids)
 
     async def replace_chunks(
-        self, entry_id: str, chunks: list[KnowledgeChunk]
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> list[KnowledgeChunk]:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
-        if clean_id not in self._entries:
+        entry = self._entries.get(clean_id)
+        if entry is None:
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+        _require_knowledge_entry_access(scope, entry, operation="replace_chunks")
         copied_chunks = _copy_entry_chunks(clean_id, chunks)
         self._ensure_globally_unique_chunk_ids(clean_id, copied_chunks)
         self._chunks[clean_id] = copied_chunks
@@ -1033,8 +1303,19 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         copied_entry = copy_knowledge_entry(entry)
+        _require_knowledge_entry_access(scope, copied_entry, operation="put_entry_with_chunks")
+        existing_entry = self._entries.get(copied_entry.id)
+        if existing_entry is not None:
+            _require_knowledge_entry_access(
+                scope,
+                existing_entry,
+                operation="put_entry_with_chunks",
+            )
         copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
         self._ensure_globally_unique_chunk_ids(copied_entry.id, copied_chunks)
         self._entries[copied_entry.id] = copied_entry
@@ -1046,11 +1327,14 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
     ) -> KnowledgePublicationReceipt:
+        scope = self._operation_access_scope(access_scope)
         operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
             entry, chunks, operation_id=operation_id
         )
+        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_with_chunks")
         existing_receipt = self._publication_receipts.get(operation_id)
         if existing_receipt is not None:
             _validate_knowledge_publication_replay(
@@ -1073,6 +1357,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._entries[copied_entry.id] = copied_entry
         self._chunks[copied_entry.id] = copied_chunks
         self._publication_receipts[operation_id] = receipt
+        self._publication_access[operation_id] = _knowledge_access_snapshot(copied_entry)
         return copy_knowledge_publication_receipt(receipt)
 
     def _ensure_globally_unique_chunk_ids(
@@ -1090,22 +1375,33 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         receipt = self._publication_receipts.get(operation_id)
-        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+        if receipt is None:
+            return None
+        snapshot = self._publication_access.get(operation_id)
+        if snapshot is None or not _knowledge_scope_allows_snapshot(scope, snapshot):
+            return None
+        return copy_knowledge_publication_receipt(receipt)
 
     async def read_chunks(
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         chunk_index: int | None = None,
         around: int = 0,
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
-        if clean_id not in self._entries:
+        entry = self._entries.get(clean_id)
+        if entry is None or not _knowledge_scope_allows_entry(scope, entry):
             return []
         if chunk_index is not None:
             _validate_nonnegative_int(chunk_index, "chunk_index")
@@ -1127,13 +1423,21 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             max_bytes=max_bytes,
         )
 
-    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+    async def search(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
         if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("InMemoryKnowledgeStore supports only auto and keyword search modes.")
         terms = _knowledge_query_terms(knowledge_query)
         scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str]] = []
         for entry in self._entries.values():
+            if not _knowledge_scope_allows_entry(scope, entry):
+                continue
             if not _entry_matches_query(entry, knowledge_query):
                 continue
             chunks = self._chunks.get(entry.id, [])
@@ -1190,11 +1494,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             total_hits_known=len(scored),
         )
 
-    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+    async def list_entries(
+        self,
+        query: KnowledgeListQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeListResult:
+        scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_list_query(query)
         entries = [
             entry
             for entry in self._entries.values()
+            if _knowledge_scope_allows_entry(scope, entry)
             if _entry_matches_list_query(entry, knowledge_query)
         ]
         entries.sort(
@@ -1260,6 +1571,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         embedding_model: str,
         embedding_dimensions: int | None = None,
         entries: list[KnowledgeEntry] | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
         hybrid_keyword_weight: float = 0.35,
         semantic_min_score: float = 0.55,
     ) -> None:
@@ -1279,7 +1591,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             "semantic_min_score",
         )
         self._chunk_embeddings: dict[str, _StoredChunkEmbedding] = {}
-        super().__init__(entries)
+        super().__init__(entries, access_scope=access_scope)
 
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
         return (
@@ -1289,8 +1601,13 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             KnowledgeSearchMode.HYBRID,
         )
 
-    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
-        stored = await super().put_entry(entry)
+    async def put_entry(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        stored = await super().put_entry(entry, access_scope=access_scope)
         await self._embed_entry_chunks(stored.id)
         return stored
 
@@ -1298,21 +1615,34 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
-        deleted = await super().delete_entry(entry_id, hard=hard)
+        deleted = await super().delete_entry(
+            entry_id,
+            access_scope=access_scope,
+            hard=hard,
+        )
         if hard and deleted is not None:
             self._drop_entry_embeddings(deleted.id)
         return deleted
 
-    async def prune_expired(self, *, now: datetime | None = None) -> int:
+    async def prune_expired(
+        self,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        scope = self._operation_access_scope(access_scope)
         cutoff = datetime.now(UTC) if now is None else now
         expired_ids = [
             entry_id
             for entry_id, entry in self._entries.items()
-            if entry.expires_at is not None and entry.expires_at <= cutoff
+            if entry.expires_at is not None
+            and entry.expires_at <= cutoff
+            and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
         ]
-        pruned = await super().prune_expired(now=cutoff)
+        pruned = await super().prune_expired(access_scope=scope, now=cutoff)
         for entry_id in expired_ids:
             self._drop_entry_embeddings(entry_id)
         return pruned
@@ -1321,8 +1651,14 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         self,
         entry_id: str,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> list[KnowledgeChunk]:
-        stored_chunks = await super().replace_chunks(entry_id, chunks)
+        stored_chunks = await super().replace_chunks(
+            entry_id,
+            chunks,
+            access_scope=access_scope,
+        )
         await self._embed_chunks(stored_chunks)
         self._drop_stale_entry_embeddings(entry_id)
         return stored_chunks
@@ -1331,8 +1667,14 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        stored = await super().put_entry_with_chunks(entry, chunks)
+        stored = await super().put_entry_with_chunks(
+            entry,
+            chunks,
+            access_scope=access_scope,
+        )
         stored_chunks = self._chunks.get(stored.id, [])
         await self._embed_chunks(stored_chunks)
         self._drop_stale_entry_embeddings(stored.id)
@@ -1343,11 +1685,13 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
     ) -> KnowledgePublicationReceipt:
         receipt = await super().publish_entry_with_chunks(
             entry,
             chunks,
+            access_scope=access_scope,
             operation_id=operation_id,
         )
         if receipt.replayed:
@@ -1357,10 +1701,16 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         self._drop_stale_entry_embeddings(receipt.entry_id)
         return receipt
 
-    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+    async def search(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
         if knowledge_query.mode is KnowledgeSearchMode.KEYWORD:
-            return await super().search(knowledge_query)
+            return await super().search(knowledge_query, access_scope=scope)
         if knowledge_query.mode not in {
             KnowledgeSearchMode.AUTO,
             KnowledgeSearchMode.SEMANTIC,
@@ -1374,6 +1724,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         candidates = [
             entry
             for entry in self._entries.values()
+            if _knowledge_scope_allows_entry(scope, entry)
             if _entry_matches_query(entry, knowledge_query)
             and not _entry_matches_none_terms(entry, self._chunks.get(entry.id, []), terms)
         ]
@@ -1558,6 +1909,101 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
 
     def _chunk_is_current(self, chunk: KnowledgeChunk) -> bool:
         return any(current == chunk for current in self._chunks.get(chunk.entry_id, []))
+
+
+def copy_knowledge_access_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessScope:
+    if type(scope) is not KnowledgeAccessScope:
+        raise TypeError("access_scope must be a KnowledgeAccessScope.")
+    return KnowledgeAccessScope(
+        allowed_namespaces=list(scope.allowed_namespaces),
+        allow_all_namespaces=scope.allow_all_namespaces,
+        required_labels=copy_label_map(scope.required_labels, "required_labels"),
+        allowed_visibilities=list(scope.allowed_visibilities),
+        allowed_source_types=(
+            None if scope.allowed_source_types is None else list(scope.allowed_source_types)
+        ),
+        allowed_source_ids=(
+            None if scope.allowed_source_ids is None else list(scope.allowed_source_ids)
+        ),
+        allowed_statuses=list(scope.allowed_statuses),
+        include_expired=scope.include_expired,
+    )
+
+
+def _knowledge_access_snapshot(entry: KnowledgeEntry) -> _KnowledgeAccessSnapshot:
+    return _KnowledgeAccessSnapshot(
+        namespace=entry.namespace,
+        labels=entry.labels,
+        visibility=entry.visibility,
+        source_type=entry.source_type,
+        source_id=entry.source_id,
+        status=entry.status,
+        expires_at=entry.expires_at,
+    )
+
+
+def _knowledge_access_snapshot_json(snapshot: _KnowledgeAccessSnapshot) -> str:
+    if type(snapshot) is not _KnowledgeAccessSnapshot:
+        raise TypeError("snapshot must be a _KnowledgeAccessSnapshot.")
+    return canonical_durable_json_bytes(
+        snapshot.model_dump(mode="json"),
+        "knowledge access snapshot",
+    ).decode("utf-8")
+
+
+def _parse_knowledge_access_snapshot_json(value: str) -> _KnowledgeAccessSnapshot:
+    if type(value) is not str:
+        raise TypeError("Knowledge access snapshot must be JSON text.")
+    return _KnowledgeAccessSnapshot.model_validate_json(value)
+
+
+def _knowledge_scope_allows_snapshot(
+    scope: KnowledgeAccessScope,
+    snapshot: _KnowledgeAccessSnapshot,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if not scope.allow_all_namespaces and snapshot.namespace not in scope.allowed_namespaces:
+        return False
+    for key, value in scope.required_labels.items():
+        if snapshot.labels.get(key) != value:
+            return False
+    if snapshot.visibility not in scope.allowed_visibilities:
+        return False
+    if (
+        scope.allowed_source_types is not None
+        and snapshot.source_type not in scope.allowed_source_types
+    ):
+        return False
+    if scope.allowed_source_ids is not None and snapshot.source_id not in scope.allowed_source_ids:
+        return False
+    if snapshot.status not in scope.allowed_statuses:
+        return False
+    cutoff = datetime.now(UTC) if now is None else now
+    return scope.include_expired or snapshot.expires_at is None or snapshot.expires_at > cutoff
+
+
+def _knowledge_scope_allows_entry(
+    scope: KnowledgeAccessScope,
+    entry: KnowledgeEntry,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    return _knowledge_scope_allows_snapshot(
+        scope,
+        _knowledge_access_snapshot(entry),
+        now=now,
+    )
+
+
+def _require_knowledge_entry_access(
+    scope: KnowledgeAccessScope,
+    entry: KnowledgeEntry,
+    *,
+    operation: str,
+) -> None:
+    if not _knowledge_scope_allows_entry(scope, entry):
+        raise KnowledgeAccessDenied(operation)
 
 
 def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:

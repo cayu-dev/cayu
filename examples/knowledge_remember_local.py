@@ -7,6 +7,7 @@ from typing import Any
 
 from cayu import (
     InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeReviewWorkflow,
     KnowledgeStatus,
     RememberKnowledgePolicy,
@@ -17,7 +18,13 @@ from cayu import (
 
 
 async def main() -> None:
-    store = InMemoryKnowledgeStore()
+    store = InMemoryKnowledgeStore(
+        access_scope=KnowledgeAccessScope.for_namespace(
+            "project:cayu",
+            required_labels={"project": "cayu", "tenant": "trusted"},
+            allowed_statuses=[KnowledgeStatus.PENDING, KnowledgeStatus.ACTIVE],
+        )
+    )
     ctx = ToolContext(
         session_id="remember-demo",
         agent_name="assistant",
@@ -80,7 +87,7 @@ async def main() -> None:
             default_status=KnowledgeStatus.ACTIVE,
             allow_active_writes=True,
             default_namespace="project:cayu",
-            require_labels={"project": "cayu"},
+            require_labels={"project": "cayu", "tenant": "trusted"},
         )
     ).run(
         ctx,

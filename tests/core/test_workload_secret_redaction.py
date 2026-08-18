@@ -23,6 +23,7 @@ import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.sessions as sessions_module
 from cayu import (
     InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
     ListKnowledgeTool,
@@ -80,6 +81,12 @@ from cayu.runtime.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
+
+
+class _TestKnowledgeStore(InMemoryKnowledgeStore):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("access_scope", KnowledgeAccessScope.privileged())
+        super().__init__(*args, **kwargs)
 
 
 def checkpoint_without_active_invocation_profile(
@@ -2194,7 +2201,7 @@ def test_runtime_knowledge_preview_redacts_before_bound_at_every_publication(
     secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
     session_id = "sess_knowledge_preview_secret"
     store = InMemorySessionStore()
-    knowledge_store = InMemoryKnowledgeStore()
+    knowledge_store = _TestKnowledgeStore()
     asyncio.run(
         KnowledgeIndexer(knowledge_store).index_text(
             KnowledgeIndexRequest(

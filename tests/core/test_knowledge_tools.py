@@ -13,6 +13,7 @@ from cayu import (
     EnvironmentSpec,
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeIndexer,
@@ -49,6 +50,14 @@ from cayu.storage.knowledge_indexer import (
 )
 from cayu.tools import knowledge as knowledge_module
 from cayu.vaults import ResolvedSecret
+
+_ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
+
+class _TestKnowledgeStore(InMemoryKnowledgeStore):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("access_scope", _ACCESS_SCOPE)
+        super().__init__(*args, **kwargs)
 
 
 class KeywordEmbeddingProvider(TextEmbeddingProvider):
@@ -97,7 +106,7 @@ class FailingEmbeddingProvider(TextEmbeddingProvider):
         raise RuntimeError("embedding service unavailable")
 
 
-class AcknowledgementLossKnowledgeStore(InMemoryKnowledgeStore):
+class AcknowledgementLossKnowledgeStore(_TestKnowledgeStore):
     async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
         await super().publish_entry_with_chunks(
             entry,
@@ -107,7 +116,7 @@ class AcknowledgementLossKnowledgeStore(InMemoryKnowledgeStore):
         raise RuntimeError("secret canary acknowledgement failure")
 
 
-class CompetingLegacyKnowledgeStore(InMemoryKnowledgeStore):
+class CompetingLegacyKnowledgeStore(_TestKnowledgeStore):
     def __init__(self) -> None:
         super().__init__()
         self.legacy_put_calls = 0
@@ -138,7 +147,7 @@ def _weighted_embedding_vector(text: str) -> list[float]:
 
 
 def test_environment_accepts_and_copies_knowledge_store() -> None:
-    store = InMemoryKnowledgeStore()
+    store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
     environment = Environment(
         EnvironmentSpec(name="local"),
         knowledge_store=store,
@@ -157,6 +166,16 @@ def test_environment_rejects_invalid_knowledge_store() -> None:
         )
 
 
+def test_environment_rejects_scope_that_differs_from_bound_store() -> None:
+    store = InMemoryKnowledgeStore(access_scope=KnowledgeAccessScope.for_namespace("project-a"))
+    with pytest.raises(ValueError, match="must match the scope bound"):
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=store,
+            knowledge_access_scope=KnowledgeAccessScope.for_namespace("project-b"),
+        )
+
+
 def test_search_knowledge_requires_configured_store() -> None:
     async def run():
         return await SearchKnowledgeTool().run(
@@ -172,7 +191,7 @@ def test_search_knowledge_requires_configured_store() -> None:
 
 def test_search_knowledge_returns_ranked_hits_with_filters() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="payments",
@@ -228,7 +247,7 @@ def test_search_knowledge_returns_ranked_hits_with_filters() -> None:
 
 def test_search_knowledge_accepts_structured_boolean_terms() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="github",
@@ -268,7 +287,7 @@ def test_search_knowledge_accepts_structured_boolean_terms() -> None:
 
 def test_search_knowledge_none_terms_exclude_sibling_chunks() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await store.put_entry_with_chunks(
             KnowledgeEntry(id="excluded", text="Integration summary."),
             [
@@ -390,7 +409,7 @@ def test_remember_knowledge_schema_does_not_mutate_custom_spec() -> None:
 
 def test_remember_knowledge_defaults_model_writes_to_pending() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         result = await RememberKnowledgeTool().run(
             ToolContext(
                 session_id="session_1",
@@ -454,7 +473,7 @@ def test_remember_knowledge_defaults_model_writes_to_pending() -> None:
 
 def test_remember_knowledge_status_is_policy_owned() -> None:
     async def run_default():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         result = await RememberKnowledgeTool().run(
             ToolContext(session_id="session_1", agent_name="assistant", knowledge_store=store),
             {
@@ -467,7 +486,7 @@ def test_remember_knowledge_status_is_policy_owned() -> None:
         return result, entry
 
     async def run_active():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         result = await RememberKnowledgeTool(
             policy=RememberKnowledgePolicy(
                 default_status=KnowledgeStatus.ACTIVE,
@@ -502,7 +521,7 @@ def test_remember_knowledge_status_is_policy_owned() -> None:
 
 def test_remember_knowledge_accepts_policy_dict() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         result = await RememberKnowledgeTool(
             policy={
                 "default_status": "active",
@@ -526,7 +545,7 @@ def test_remember_knowledge_accepts_policy_dict() -> None:
 
 def test_remember_knowledge_policy_owns_namespace_and_labels() -> None:
     async def run_policy_scope():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         result = await RememberKnowledgeTool(
             policy=RememberKnowledgePolicy(
                 default_namespace="project:cayu",
@@ -558,7 +577,7 @@ def test_remember_knowledge_policy_owns_namespace_and_labels() -> None:
 
 def test_remember_knowledge_policy_restricts_kinds() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         return await RememberKnowledgeTool(
             policy=RememberKnowledgePolicy(
                 allowed_kinds=("fact", "procedure"),
@@ -579,7 +598,10 @@ def test_remember_knowledge_policy_restricts_kinds() -> None:
 def test_remember_knowledge_rejects_oversized_text() -> None:
     async def run():
         return await RememberKnowledgeTool(max_text_bytes=5).run(
-            ToolContext(session_id="session_1", knowledge_store=InMemoryKnowledgeStore()),
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE),
+            ),
             {"text": "abcdef"},
         )
 
@@ -592,7 +614,7 @@ def test_remember_knowledge_rejects_oversized_text() -> None:
 
 def test_remember_knowledge_rejects_truncated_index_without_writing() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         result = await RememberKnowledgeTool(chunk_target_bytes=1_000, max_chunks=1).run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {"text": "alpha " * 1_000},
@@ -613,6 +635,7 @@ def test_remember_knowledge_rejects_truncated_index_without_writing() -> None:
 def test_remember_knowledge_preserves_entry_on_embedding_write_failure() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=FailingEmbeddingProvider(),
             embedding_model="test-embedding",
         )
@@ -720,7 +743,7 @@ def test_remember_knowledge_never_dispatches_legacy_upsert_over_competing_winner
 
 
 def test_remember_knowledge_rejects_store_with_only_receipt_lookup_support() -> None:
-    class ReceiptOnlyKnowledgeStore(InMemoryKnowledgeStore):
+    class ReceiptOnlyKnowledgeStore(_TestKnowledgeStore):
         publish_entry_with_chunks = KnowledgeStore.publish_entry_with_chunks
 
     async def run():
@@ -745,7 +768,7 @@ def test_remember_knowledge_rejects_store_with_only_receipt_lookup_support() -> 
 
 
 def test_remember_knowledge_rejects_invalid_operation_id_before_store_dispatch() -> None:
-    class TrackingKnowledgeStore(InMemoryKnowledgeStore):
+    class TrackingKnowledgeStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.receipt_reads = 0
@@ -783,7 +806,7 @@ def test_remember_knowledge_rejects_invalid_operation_id_before_store_dispatch()
 
 
 def test_remember_knowledge_bounds_store_internal_entry_read_cancellation() -> None:
-    class InternallyCancelledReadStore(InMemoryKnowledgeStore):
+    class InternallyCancelledReadStore(_TestKnowledgeStore):
         async def get_entry(self, entry_id):
             del entry_id
             raise asyncio.CancelledError("private store cancellation")
@@ -812,7 +835,7 @@ def test_remember_knowledge_bounds_store_internal_entry_read_cancellation() -> N
 
 
 def test_remember_knowledge_entry_read_preserves_real_caller_cancellation() -> None:
-    class BlockingReadStore(InMemoryKnowledgeStore):
+    class BlockingReadStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.read_started = asyncio.Event()
@@ -869,7 +892,7 @@ def test_remember_knowledge_entry_read_preserves_real_caller_cancellation() -> N
 
 
 def test_remember_knowledge_cancellation_during_post_commit_confirmation_reconciles() -> None:
-    class ConfirmationBarrierStore(InMemoryKnowledgeStore):
+    class ConfirmationBarrierStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.confirmation_started = asyncio.Event()
@@ -927,7 +950,7 @@ def test_remember_knowledge_cancellation_during_post_commit_confirmation_reconci
 def test_remember_knowledge_cancellation_retains_opaque_dispatch_and_preserves_retry(
     commit_before_release: bool,
 ) -> None:
-    class OpaquePublicationStore(InMemoryKnowledgeStore):
+    class OpaquePublicationStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.dispatched = threading.Event()
@@ -1012,7 +1035,7 @@ def test_remember_knowledge_cancellation_retains_opaque_dispatch_and_preserves_r
 
 
 def test_remember_knowledge_workspace_identity_is_consistent_across_commit() -> None:
-    class BarrierPublicationStore(InMemoryKnowledgeStore):
+    class BarrierPublicationStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.publish_started = asyncio.Event()
@@ -1068,7 +1091,7 @@ def test_remember_knowledge_workspace_identity_is_consistent_across_commit() -> 
 def test_remember_knowledge_capacity_allows_receipt_reconciliation_but_blocks_new_dispatch(
     monkeypatch,
 ) -> None:
-    class SelectiveBarrierStore(InMemoryKnowledgeStore):
+    class SelectiveBarrierStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.active_started = asyncio.Event()
@@ -1135,7 +1158,7 @@ def test_remember_knowledge_capacity_allows_receipt_reconciliation_but_blocks_ne
 
 
 def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -> None:
-    class ReconciliationBarrierStore(InMemoryKnowledgeStore):
+    class ReconciliationBarrierStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.publish_started = asyncio.Event()
@@ -1204,7 +1227,7 @@ def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -
 
 
 def test_remember_knowledge_reconciles_grouped_store_failure() -> None:
-    class GroupedFailureStore(InMemoryKnowledgeStore):
+    class GroupedFailureStore(_TestKnowledgeStore):
         async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
             await super().publish_entry_with_chunks(
                 entry,
@@ -1242,7 +1265,7 @@ def test_remember_knowledge_reconciles_grouped_store_failure() -> None:
 
 
 def test_remember_knowledge_keeps_caller_cancellation_authoritative_over_grouped_failure() -> None:
-    class GroupedFailureBarrierStore(InMemoryKnowledgeStore):
+    class GroupedFailureBarrierStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.committed = asyncio.Event()
@@ -1290,7 +1313,7 @@ def test_remember_knowledge_keeps_caller_cancellation_authoritative_over_grouped
 
 
 def test_remember_knowledge_bounds_grouped_receipt_lookup_failure() -> None:
-    class GroupedReceiptFailureStore(InMemoryKnowledgeStore):
+    class GroupedReceiptFailureStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.publish_calls = 0
@@ -1348,7 +1371,7 @@ def test_remember_knowledge_rejects_reused_operation_with_different_content(
     conflicting_arguments: dict[str, str],
 ) -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         ctx = ToolContext(
             session_id="session_1",
             idempotency_key="conflicting-remember-operation",
@@ -1370,7 +1393,7 @@ def test_remember_knowledge_rejects_reused_operation_with_different_content(
 
 
 def test_remember_knowledge_concurrent_exact_operation_reconciles_one_receipt() -> None:
-    class BarrierPublicationStore(InMemoryKnowledgeStore):
+    class BarrierPublicationStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.arrivals = 0
@@ -1413,7 +1436,7 @@ def test_remember_knowledge_concurrent_exact_operation_reconciles_one_receipt() 
 
 
 def test_remember_knowledge_concurrent_exact_operation_converges_after_id_collision() -> None:
-    class BarrierPublicationStore(InMemoryKnowledgeStore):
+    class BarrierPublicationStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.arrivals = 0
@@ -1489,7 +1512,7 @@ def test_remember_knowledge_exact_retry_reports_only_historical_commit(
     later_state: str,
 ) -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         ctx = ToolContext(
             session_id="session_1",
             idempotency_key="reviewed-remember-operation",
@@ -1560,6 +1583,7 @@ def test_remember_knowledge_runtime_requires_store() -> None:
 def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
         )
@@ -1604,6 +1628,7 @@ def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
 def test_search_knowledge_auto_filters_weak_semantic_neighbors_by_default() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
             semantic_min_score=0.0,
@@ -1648,6 +1673,7 @@ def test_search_knowledge_auto_filters_weak_semantic_neighbors_by_default() -> N
 def test_search_knowledge_auto_min_score_zero_keeps_weak_semantic_neighbors() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
             semantic_min_score=0.0,
@@ -1696,6 +1722,7 @@ def test_search_knowledge_rejects_nan_auto_min_score() -> None:
 def test_search_knowledge_auto_min_score_preserves_unscored_keyword_hits() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
             semantic_min_score=0.75,
@@ -1739,6 +1766,7 @@ def test_search_knowledge_auto_min_score_preserves_unscored_keyword_hits() -> No
 def test_search_knowledge_default_rejects_score_override_argument() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
             semantic_min_score=0.0,
@@ -1768,7 +1796,7 @@ def test_search_knowledge_default_rejects_score_override_argument() -> None:
 
 def test_search_knowledge_keyword_store_auto_does_not_apply_min_score() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="github",
@@ -1792,7 +1820,7 @@ def test_search_knowledge_keyword_store_auto_does_not_apply_min_score() -> None:
 
 def test_search_knowledge_runtime_requires_a_positive_search_field() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         return await SearchKnowledgeTool().run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {},
@@ -1806,7 +1834,7 @@ def test_search_knowledge_runtime_requires_a_positive_search_field() -> None:
 
 def test_search_knowledge_caps_model_facing_preview_per_hit() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="long",
@@ -1842,7 +1870,7 @@ def test_search_knowledge_redacts_preview_before_every_byte_bound(
     secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
 
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="secret",
@@ -1877,7 +1905,7 @@ def test_search_knowledge_retries_when_secret_resolves_during_store_read() -> No
         search_started = asyncio.Event()
         allow_search = asyncio.Event()
 
-        class BlockingSearchStore(InMemoryKnowledgeStore):
+        class BlockingSearchStore(_TestKnowledgeStore):
             search_calls = 0
 
             async def search(self, query: KnowledgeQuery):
@@ -1937,7 +1965,7 @@ def test_search_source_bounded_capture_fails_closed_when_secret_resolves_before_
     secret = "knowledge-search-late-secret-canary-ABCDEFGHIJKLMNOP"
 
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(entry_id="secret", text=secret)
         )
@@ -1992,7 +2020,7 @@ def test_search_preview_completeness_uses_the_selected_authoritative_field() -> 
     secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
 
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await store.put_entry_with_chunks(
             KnowledgeEntry(id="secret", text=secret[:16]),
             [
@@ -2027,7 +2055,7 @@ def test_search_preview_completeness_uses_the_selected_authoritative_field() -> 
 
 def test_search_result_limit_does_not_mark_complete_preview_as_truncated() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         indexer = KnowledgeIndexer(store)
         for entry_id in ("first", "second"):
             await indexer.index_text(
@@ -2060,7 +2088,7 @@ def test_search_result_limit_does_not_mark_complete_preview_as_truncated() -> No
 
 def test_list_knowledge_discovers_entries_and_facets() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="runbook",
@@ -2109,7 +2137,7 @@ def test_list_knowledge_discovers_entries_and_facets() -> None:
 
 def test_list_knowledge_can_include_entries_with_facets() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="runbook",
@@ -2139,6 +2167,7 @@ def test_list_knowledge_can_include_entries_with_facets() -> None:
 def test_list_knowledge_advertises_embedding_search_modes() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
         )
@@ -2168,7 +2197,7 @@ def test_list_knowledge_advertises_embedding_search_modes() -> None:
 
 def test_list_knowledge_can_return_multiple_facet_groups() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="runbook",
@@ -2234,7 +2263,7 @@ def test_list_knowledge_schema_advertises_group_by_as_portable_array() -> None:
 
 def test_list_knowledge_runtime_still_accepts_single_group_by_string() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="runbook",
@@ -2263,7 +2292,7 @@ def test_list_knowledge_runtime_still_accepts_single_group_by_string() -> None:
 
 def test_list_knowledge_returns_tool_error_for_invalid_arguments() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         return await ListKnowledgeTool().run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {"group_by": []},
@@ -2278,7 +2307,7 @@ def test_list_knowledge_returns_tool_error_for_invalid_arguments() -> None:
 
 def test_list_knowledge_reports_facet_truncation() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         for index in range(5):
             await KnowledgeIndexer(store).index_text(
                 KnowledgeIndexRequest(
@@ -2309,7 +2338,7 @@ def test_list_knowledge_reports_facet_truncation() -> None:
 
 def test_list_knowledge_reports_later_facet_truncation_with_entries() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="a",
@@ -2351,7 +2380,7 @@ def test_list_knowledge_reports_later_facet_truncation_with_entries() -> None:
 
 def test_list_knowledge_does_not_claim_no_entries_when_hidden_entries_match() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="runbook",
@@ -2380,7 +2409,7 @@ def test_list_knowledge_does_not_claim_no_entries_when_hidden_entries_match() ->
 
 def test_list_knowledge_includes_entries_by_default_without_group_by() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="runbook",
@@ -2404,7 +2433,7 @@ def test_list_knowledge_includes_entries_by_default_without_group_by() -> None:
 
 def test_list_knowledge_caps_model_facing_preview_per_entry() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="long",
@@ -2438,7 +2467,7 @@ def test_list_knowledge_redacts_preview_before_every_byte_bound(
     secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
 
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="secret",
@@ -2472,7 +2501,7 @@ def test_list_knowledge_retries_when_secret_resolves_during_store_read() -> None
         list_started = asyncio.Event()
         allow_list = asyncio.Event()
 
-        class BlockingListStore(InMemoryKnowledgeStore):
+        class BlockingListStore(_TestKnowledgeStore):
             list_calls = 0
 
             async def list_entries(self, query):
@@ -2529,7 +2558,7 @@ def test_list_source_bounded_capture_fails_closed_when_secret_resolves_before_pu
     secret = "knowledge-list-late-secret-canary-ABCDEFGHIJKLMNOP"
 
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(entry_id="secret", text=secret)
         )
@@ -2581,7 +2610,7 @@ def test_list_source_bounded_capture_fails_closed_when_secret_resolves_before_pu
 
 def test_list_result_limit_does_not_mark_complete_preview_as_truncated() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         indexer = KnowledgeIndexer(store)
         for entry_id in ("first", "second"):
             await indexer.index_text(
@@ -2614,7 +2643,10 @@ def test_list_result_limit_does_not_mark_complete_preview_as_truncated() -> None
 def test_search_knowledge_delegates_mode_support_to_store() -> None:
     async def run():
         return await SearchKnowledgeTool().run(
-            ToolContext(session_id="session_1", knowledge_store=InMemoryKnowledgeStore()),
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE),
+            ),
             {"query": "refund policy", "mode": "semantic"},
         )
 
@@ -2624,7 +2656,7 @@ def test_search_knowledge_delegates_mode_support_to_store() -> None:
 
 def test_read_knowledge_returns_bounded_chunks() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="doc",
@@ -2656,7 +2688,7 @@ def test_read_knowledge_returns_bounded_chunks() -> None:
 
 def test_read_knowledge_without_chunk_index_reads_from_start() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(entry_id="policy", text="Always verify bank details.")
         )
@@ -2687,7 +2719,10 @@ def test_read_knowledge_requires_configured_store() -> None:
 def test_read_knowledge_returns_tool_error_for_invalid_entry_id() -> None:
     async def run():
         return await ReadKnowledgeTool().run(
-            ToolContext(session_id="session_1", knowledge_store=InMemoryKnowledgeStore()),
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE),
+            ),
             {"entry_id": 123},
         )
 
@@ -2699,7 +2734,10 @@ def test_read_knowledge_returns_tool_error_for_invalid_entry_id() -> None:
 
     result = asyncio.run(
         ReadKnowledgeTool().run(
-            ToolContext(session_id="session_1", knowledge_store=InMemoryKnowledgeStore()),
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE),
+            ),
             {"entry_id": " policy "},
         )
     )
@@ -2710,7 +2748,7 @@ def test_read_knowledge_returns_tool_error_for_invalid_entry_id() -> None:
 
 def test_read_knowledge_returns_tool_error_for_invalid_window() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(entry_id="policy", text="Always verify bank details.")
         )
@@ -2727,7 +2765,7 @@ def test_read_knowledge_returns_tool_error_for_invalid_window() -> None:
 
 
 def test_read_knowledge_preserves_operational_value_error() -> None:
-    class FailingReadStore(InMemoryKnowledgeStore):
+    class FailingReadStore(_TestKnowledgeStore):
         async def read_chunks(self, entry_id: str, **kwargs):
             raise ValueError("knowledge backend state is invalid")
 
@@ -2745,19 +2783,23 @@ class ReadOnlyKnowledgeStore:
     """Minimal reader that only exposes the read-path store methods."""
 
     def __init__(self) -> None:
-        self._store = InMemoryKnowledgeStore()
+        self._store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
 
     async def index(self, request: KnowledgeIndexRequest) -> None:
         await KnowledgeIndexer(self._store).index_text(request)
 
-    async def search(self, query: KnowledgeQuery):
-        return await self._store.search(query)
+    async def search(self, query: KnowledgeQuery, *, access_scope=None):
+        return await self._store.search(query, access_scope=access_scope)
 
-    async def list_entries(self, query):
-        return await self._store.list_entries(query)
+    async def list_entries(self, query, *, access_scope=None):
+        return await self._store.list_entries(query, access_scope=access_scope)
 
-    async def read_chunks(self, entry_id: str, **kwargs):
-        return await self._store.read_chunks(entry_id, **kwargs)
+    async def read_chunks(self, entry_id: str, *, access_scope=None, **kwargs):
+        return await self._store.read_chunks(
+            entry_id,
+            access_scope=access_scope,
+            **kwargs,
+        )
 
 
 def test_read_tools_accept_read_only_knowledge_store() -> None:
@@ -2766,7 +2808,11 @@ def test_read_tools_accept_read_only_knowledge_store() -> None:
         await store.index(
             KnowledgeIndexRequest(entry_id="policy", text="Always verify bank details.")
         )
-        ctx = ToolContext(session_id="session_1", knowledge_store=store)
+        ctx = ToolContext(
+            session_id="session_1",
+            knowledge_store=store,
+            knowledge_access_scope=_ACCESS_SCOPE,
+        )
         search_result = await SearchKnowledgeTool().run(ctx, {"query": "bank details"})
         list_result = await ListKnowledgeTool().run(ctx, {})
         read_result = await ReadKnowledgeTool().run(ctx, {"entry_id": "policy"})
@@ -2823,6 +2869,7 @@ def test_search_knowledge_forwards_min_score_in_store_query() -> None:
 
     async def run():
         store = RecordingStore(
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
             semantic_min_score=0.0,
@@ -2851,7 +2898,7 @@ def test_search_knowledge_forwards_min_score_in_store_query() -> None:
 
 def test_search_knowledge_surfaces_threshold_not_applied() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="github",
@@ -2876,7 +2923,7 @@ def test_search_knowledge_surfaces_threshold_not_applied() -> None:
 
 def test_search_knowledge_keyword_auto_reports_no_threshold() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
                 entry_id="github",
@@ -2900,7 +2947,7 @@ def test_search_knowledge_keyword_auto_reports_no_threshold() -> None:
 
 def test_remember_knowledge_dedupes_identical_text() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         ctx = ToolContext(session_id="session_1", knowledge_store=store)
         args = {"text": "Always verify bank details before paying invoices."}
         first = await RememberKnowledgeTool().run(ctx, args)
@@ -2949,7 +2996,7 @@ def test_remember_knowledge_fails_closed_on_incompatible_existing_material_or_sc
             kind="fact",
             source_hash=source_hash,
         )
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         existing = KnowledgeEntry(
             id=entry_id,
             text=text,
@@ -2981,7 +3028,7 @@ def test_remember_knowledge_fails_closed_on_incompatible_existing_material_or_sc
 
 
 def test_remember_knowledge_rejects_incompatible_concurrent_winner() -> None:
-    class ConcurrentScopedWinnerStore(InMemoryKnowledgeStore):
+    class ConcurrentScopedWinnerStore(_TestKnowledgeStore):
         async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
             winner = KnowledgeEntry.model_validate(
                 entry.model_copy(update={"labels": {"tenant": "other"}}).model_dump()
@@ -3010,7 +3057,7 @@ def test_remember_knowledge_rejects_incompatible_concurrent_winner() -> None:
 
 
 def test_remember_knowledge_uses_one_policy_snapshot_across_publication() -> None:
-    class ConcurrentScopedWinnerStore(InMemoryKnowledgeStore):
+    class ConcurrentScopedWinnerStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.publish_started = asyncio.Event()
@@ -3062,7 +3109,7 @@ def test_remember_knowledge_revalidates_forged_policy_before_use() -> None:
 
 
 def test_custom_store_can_use_public_knowledge_publication_canonicalizer() -> None:
-    class PublicCanonicalizerStore(InMemoryKnowledgeStore):
+    class PublicCanonicalizerStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self._custom_publication_lock = asyncio.Lock()
@@ -3130,7 +3177,7 @@ def test_custom_store_can_use_public_knowledge_publication_canonicalizer() -> No
 
 
 def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() -> None:
-    class MutatingCanonicalizerStore(InMemoryKnowledgeStore):
+    class MutatingCanonicalizerStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self._custom_receipts: dict[str, KnowledgePublicationReceipt] = {}
@@ -3190,7 +3237,7 @@ def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() 
 
 def test_remember_knowledge_does_not_dedupe_archived_entry() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         ctx = ToolContext(session_id="session_1", knowledge_store=store)
         args = {"text": "Always verify bank details before paying invoices."}
         first = await RememberKnowledgeTool().run(ctx, args)
@@ -3252,7 +3299,7 @@ def test_remember_knowledge_does_not_dedupe_archived_entry() -> None:
 
 def test_remember_knowledge_distinct_kinds_are_not_deduped() -> None:
     async def run():
-        store = InMemoryKnowledgeStore()
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         ctx = ToolContext(session_id="session_1", knowledge_store=store)
         text = "Always verify bank details before paying invoices."
         first = await RememberKnowledgeTool().run(ctx, {"text": text, "kind": "fact"})

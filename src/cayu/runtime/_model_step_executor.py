@@ -2874,6 +2874,7 @@ class ModelStepExecutor:
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
         knowledge_store: Any,
+        knowledge_access_scope: Any,
         request_metadata: dict[str, Any],
         retry_policy: RetryPolicy,
         request_budget_limits: tuple[BudgetLimit, ...],
@@ -2899,6 +2900,7 @@ class ModelStepExecutor:
             structured_output=structured_output,
             thinking=thinking,
             knowledge_store=knowledge_store,
+            knowledge_access_scope=knowledge_access_scope,
             request_metadata=request_metadata,
             retry_policy=retry_policy,
             request_budget_limits=request_budget_limits,
@@ -4955,6 +4957,7 @@ class ModelStepRun:
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
         knowledge_store: Any,
+        knowledge_access_scope: Any,
         request_metadata: dict[str, Any],
         retry_policy: RetryPolicy,
         request_budget_limits: tuple[BudgetLimit, ...],
@@ -4977,6 +4980,7 @@ class ModelStepRun:
         self._structured_output = structured_output
         self._thinking = thinking
         self._knowledge_store = knowledge_store
+        self._knowledge_access_scope = knowledge_access_scope
         self._request_metadata = copy_json_value(request_metadata, "metadata")
         self._retry_policy = copy_retry_policy(retry_policy)
         self._request_budget_limits = copy_request_budget_limits(request_budget_limits)
@@ -5200,6 +5204,7 @@ class ModelStepRun:
                 step=step,
                 environment_name=self._environment_name,
                 knowledge_store=self._knowledge_store,
+                knowledge_access_scope=self._knowledge_access_scope,
                 request_metadata=self._request_metadata,
                 pressure_overhead=_context_pressure_overhead(
                     registered_provider=self._registered_provider,
@@ -6045,6 +6050,7 @@ class ModelStepRun:
                 step=step,
                 environment_name=self._environment_name,
                 knowledge_store=self._knowledge_store,
+                knowledge_access_scope=self._knowledge_access_scope,
                 request_metadata=self._request_metadata,
                 pressure_overhead=_context_pressure_overhead(
                     registered_provider=self._registered_provider,
@@ -7850,6 +7856,7 @@ async def _build_context(
     step: int,
     environment_name: str | None,
     knowledge_store: Any,
+    knowledge_access_scope: Any,
     request_metadata: dict[str, Any],
     pressure_overhead: ContextPressureOverhead,
     count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None,
@@ -7884,6 +7891,7 @@ async def _build_context(
         step=step,
         environment_name=environment_name,
         knowledge_store=knowledge_store,
+        knowledge_access_scope=knowledge_access_scope,
         metadata=copy_json_value(request_metadata, "metadata"),
         context_usage=context_usage,
         pressure_overhead=pressure_overhead,

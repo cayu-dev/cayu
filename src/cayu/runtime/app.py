@@ -326,7 +326,11 @@ from cayu.runtime.user_input import (
     copy_user_input_recovery_request,
     copy_user_input_response,
 )
-from cayu.storage.memory import KnowledgeStore
+from cayu.storage.memory import (
+    KnowledgeAccessScope,
+    KnowledgeStore,
+    copy_knowledge_access_scope,
+)
 from cayu.vaults import (
     SecretRedactionStream,
     SecretRedactor,
@@ -482,6 +486,7 @@ class CayuApp:
         session_store: SessionStore | None = None,
         task_store: TaskStore | None = None,
         knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
         knowledge_review_namespace: str | None = None,
         knowledge_review_labels: dict[str, str] | None = None,
         dispatcher: Dispatcher | None = None,
@@ -515,6 +520,23 @@ class CayuApp:
             raise TypeError("task_store must be a TaskStore.")
         if knowledge_store is not None and not isinstance(knowledge_store, KnowledgeStore):
             raise TypeError("knowledge_store must be a KnowledgeStore.")
+        bound_knowledge_access_scope = (
+            None if knowledge_store is None else knowledge_store.bound_access_scope()
+        )
+        if knowledge_store is not None and knowledge_access_scope is None:
+            knowledge_access_scope = bound_knowledge_access_scope
+        if (knowledge_store is None) != (knowledge_access_scope is None):
+            raise ValueError(
+                "knowledge_store and knowledge_access_scope must be configured together."
+            )
+        if (
+            knowledge_access_scope is not None
+            and bound_knowledge_access_scope is not None
+            and copy_knowledge_access_scope(knowledge_access_scope) != bound_knowledge_access_scope
+        ):
+            raise ValueError(
+                "knowledge_access_scope must match the scope bound to knowledge_store."
+            )
         if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
             raise TypeError("dispatcher must be a Dispatcher.")
         if budget_store is not None and not isinstance(budget_store, BudgetStore):
@@ -642,6 +664,11 @@ class CayuApp:
         self._runtime_session_store = runtime_checkpoint_session_store(self.session_store)
         self.task_store = task_store
         self.knowledge_store = knowledge_store
+        self.knowledge_access_scope = (
+            None
+            if knowledge_access_scope is None
+            else copy_knowledge_access_scope(knowledge_access_scope)
+        )
         self.knowledge_review_namespace = (
             require_clean_nonblank(knowledge_review_namespace, "knowledge_review_namespace")
             if knowledge_review_namespace is not None

@@ -15,6 +15,7 @@ import uvicorn
 
 from cayu import (
     CayuApp,
+    KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -142,7 +143,10 @@ def main() -> None:
         public_authority_alias_codec=public_authority_alias_codec_from_environment(),
     )
     task_store = SQLiteTaskStore(database)
-    knowledge_store = SQLiteKnowledgeStore(database)
+    knowledge_store = SQLiteKnowledgeStore(
+        database,
+        access_scope=KnowledgeAccessScope.privileged(),
+    )
     asyncio.run(seed_knowledge(knowledge_store))
 
     app = CayuApp(

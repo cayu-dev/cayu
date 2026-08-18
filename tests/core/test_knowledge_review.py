@@ -8,6 +8,7 @@ import pytest
 from cayu._validation import DurableValueError
 from cayu.storage import (
     InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeListQuery,
     KnowledgeQuery,
@@ -15,12 +16,17 @@ from cayu.storage import (
     KnowledgeStatus,
 )
 
+_ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
 
 class ScopeDriftKnowledgeStore(InMemoryKnowledgeStore):
-    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
-        entry = await super().get_entry(entry_id)
+    async def get_entry(self, entry_id: str, *, access_scope=None) -> KnowledgeEntry | None:
+        entry = await super().get_entry(entry_id, access_scope=access_scope)
         if entry is not None and entry.id == "pending_git":
-            await self.put_entry(entry.model_copy(update={"labels": {"project": "other"}}))
+            await self.put_entry(
+                entry.model_copy(update={"labels": {"project": "other"}}),
+                access_scope=access_scope,
+            )
         return entry
 
 
@@ -36,11 +42,13 @@ def test_review_workflow_rejects_nonportable_scope_and_entry_text(
     code: str,
 ) -> None:
     with pytest.raises(DurableValueError) as invalid_scope:
-        KnowledgeReviewWorkflow(InMemoryKnowledgeStore(), namespace=invalid_text)
+        KnowledgeReviewWorkflow(
+            InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE), namespace=invalid_text
+        )
     assert invalid_scope.value.code == code
     assert "workload-secret-value" not in str(invalid_scope.value)
 
-    workflow = KnowledgeReviewWorkflow(InMemoryKnowledgeStore())
+    workflow = KnowledgeReviewWorkflow(InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE))
     with pytest.raises(DurableValueError) as invalid_entry:
         asyncio.run(workflow.approve(invalid_text))
     assert invalid_entry.value.code == code
@@ -74,7 +82,8 @@ def test_review_workflow_lists_pending_entries_in_scope() -> None:
                     labels={"project": "cayu", "tenant": "trusted"},
                     status=KnowledgeStatus.ACTIVE,
                 ),
-            ]
+            ],
+            access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(
             store,
@@ -102,7 +111,8 @@ def test_review_workflow_approves_pending_entry() -> None:
                     labels={"project": "cayu"},
                     status=KnowledgeStatus.PENDING,
                 )
-            ]
+            ],
+            access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(store, namespace="project:cayu")
         approved = await workflow.approve("pending_git")
@@ -127,7 +137,8 @@ def test_review_workflow_rejects_pending_entry_as_archived() -> None:
                     namespace="project:cayu",
                     status=KnowledgeStatus.PENDING,
                 )
-            ]
+            ],
+            access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(store, namespace="project:cayu")
         rejected = await workflow.reject("pending_bad")
@@ -159,7 +170,8 @@ def test_review_workflow_refuses_non_pending_entries() -> None:
                     namespace="project:cayu",
                     status=KnowledgeStatus.ACTIVE,
                 )
-            ]
+            ],
+            access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(store, namespace="project:cayu")
         await workflow.approve("active_git")
@@ -179,7 +191,8 @@ def test_review_workflow_refuses_entries_outside_scope() -> None:
                     labels={"project": "other"},
                     status=KnowledgeStatus.PENDING,
                 )
-            ]
+            ],
+            access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(
             store,
@@ -203,7 +216,8 @@ def test_review_workflow_rechecks_scope_during_status_transition() -> None:
                     labels={"project": "cayu"},
                     status=KnowledgeStatus.PENDING,
                 )
-            ]
+            ],
+            access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(
             store,
@@ -218,7 +232,7 @@ def test_review_workflow_rechecks_scope_during_status_transition() -> None:
 
 def test_review_workflow_rejects_conflicting_query_scope() -> None:
     workflow = KnowledgeReviewWorkflow(
-        InMemoryKnowledgeStore(),
+        InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE),
         namespace="project:cayu",
         labels={"project": "cayu"},
     )

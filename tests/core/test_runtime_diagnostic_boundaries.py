@@ -21,6 +21,7 @@ from cayu import (
     InMemoryKnowledgeStore,
     InMemorySessionStore,
     InMemoryTaskStore,
+    KnowledgeAccessScope,
     KnowledgeInjectionPolicy,
     Message,
     ModelStreamEvent,
@@ -500,8 +501,8 @@ def test_knowledge_failure_redacts_secret_crossing_diagnostic_boundary() -> None
     prefix = "d" * (MAX_DIAGNOSTIC_UTF8_BYTES - len(secret.encode("utf-8")) // 2)
 
     class FailingKnowledgeStore(InMemoryKnowledgeStore):
-        async def search(self, query):
-            del query
+        async def search(self, query, *, access_scope=None):
+            del query, access_scope
             raise RuntimeError(prefix + secret)
 
     provider = FakeProvider(
@@ -518,7 +519,7 @@ def test_knowledge_failure_redacts_secret_crossing_diagnostic_boundary() -> None
     app.register_environment(
         Environment(
             EnvironmentSpec(name="local"),
-            knowledge_store=FailingKnowledgeStore(),
+            knowledge_store=FailingKnowledgeStore(access_scope=KnowledgeAccessScope.privileged()),
         ),
         default=True,
     )
@@ -1355,8 +1356,8 @@ def test_fail_open_knowledge_search_publishes_portable_failure_and_calls_provide
     error_code: str,
 ) -> None:
     class FailingKnowledgeStore(InMemoryKnowledgeStore):
-        async def search(self, query):
-            del query
+        async def search(self, query, *, access_scope=None):
+            del query, access_scope
             raise RuntimeError(rejected_text)
 
     store = InMemorySessionStore()
@@ -1373,7 +1374,7 @@ def test_fail_open_knowledge_search_publishes_portable_failure_and_calls_provide
     app.register_environment(
         Environment(
             EnvironmentSpec(name="local"),
-            knowledge_store=FailingKnowledgeStore(),
+            knowledge_store=FailingKnowledgeStore(access_scope=KnowledgeAccessScope.privileged()),
         ),
         default=True,
     )

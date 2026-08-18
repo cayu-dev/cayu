@@ -37,6 +37,7 @@ from cayu.runtime import (
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.storage import (
     InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
@@ -57,6 +58,13 @@ from cayu.tools.knowledge import (
     SearchKnowledgeTool,
 )
 from cayu.tools.subagents import SubagentResultTool, SubagentTool
+
+
+class _TestKnowledgeStore(InMemoryKnowledgeStore):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("access_scope", KnowledgeAccessScope.privileged())
+        super().__init__(*args, **kwargs)
+
 
 _TOOL_SCHEMA = {
     "type": "object",
@@ -99,7 +107,7 @@ class _Recorder:
         self.metadata_tool_effects: list[str | None] = []
 
 
-class _StalledKnowledgePublicationStore(InMemoryKnowledgeStore):
+class _StalledKnowledgePublicationStore(_TestKnowledgeStore):
     def __init__(self) -> None:
         super().__init__()
         self.dispatched = asyncio.Event()
@@ -122,7 +130,7 @@ class _StalledKnowledgePublicationStore(InMemoryKnowledgeStore):
         return receipt
 
 
-class _CancellationResistantKnowledgeReadStore(InMemoryKnowledgeStore):
+class _CancellationResistantKnowledgeReadStore(_TestKnowledgeStore):
     def __init__(self, *, phase: str) -> None:
         super().__init__()
         self.phase = phase
@@ -286,7 +294,7 @@ def test_remember_knowledge_ambiguous_failure_event_is_bounded_and_content_free(
     knowledge_canary = "private knowledge content must not enter failure evidence"
     exception_canary = "private store diagnostic must not enter failure evidence"
 
-    class AmbiguousKnowledgeStore(InMemoryKnowledgeStore):
+    class AmbiguousKnowledgeStore(_TestKnowledgeStore):
         async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
             raise RuntimeError(f"{exception_canary}: {knowledge_canary}")
 
@@ -670,7 +678,7 @@ def test_remember_knowledge_detaches_hostile_conflict_classification_at_runtime(
         failure = KnowledgePublicationConflict("entry_occupied")
         cast("Any", failure).reason = HostileReason()
 
-    class HostileConflictStore(InMemoryKnowledgeStore):
+    class HostileConflictStore(_TestKnowledgeStore):
         async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
             del entry, chunks, operation_id
             raise failure
@@ -730,7 +738,7 @@ def test_remember_knowledge_omits_unconfirmed_receipt_id_from_failure_evidence(
 ) -> None:
     canary = "private_receipt_entry_id_canary"
 
-    class ConflictingReceiptStore(InMemoryKnowledgeStore):
+    class ConflictingReceiptStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.receipts: dict[str, KnowledgePublicationReceipt] = {}
@@ -838,7 +846,7 @@ def test_remember_knowledge_success_withholds_arguments_from_events_and_transcri
 
     async def run():
         session_store = InMemorySessionStore()
-        knowledge_store = InMemoryKnowledgeStore()
+        knowledge_store = _TestKnowledgeStore()
         app = CayuApp(session_store=session_store, enable_logging=False)
         provider = _ScriptedProvider(
             [
@@ -1034,7 +1042,7 @@ def test_private_tool_arguments_cannot_reenter_terminal_output_through_extension
         app.register_environment(
             Environment(
                 EnvironmentSpec(name="knowledge-test"),
-                knowledge_store=InMemoryKnowledgeStore(),
+                knowledge_store=_TestKnowledgeStore(),
             ),
             default=True,
         )
@@ -1122,7 +1130,7 @@ def test_private_tool_policy_output_stays_quarantined_across_approval_resume(
         app.register_environment(
             Environment(
                 EnvironmentSpec(name="knowledge-test"),
-                knowledge_store=InMemoryKnowledgeStore(),
+                knowledge_store=_TestKnowledgeStore(),
             ),
             default=True,
         )
@@ -1256,7 +1264,7 @@ def test_remember_knowledge_contains_store_output_cancellation_during_validation
     def hostile_datetime() -> datetime:
         return datetime(2026, 8, 13, 12, 0, tzinfo=CancellingTimezone())
 
-    class ForgedOutputStore(InMemoryKnowledgeStore):
+    class ForgedOutputStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self.publish_calls = 0

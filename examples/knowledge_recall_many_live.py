@@ -17,6 +17,7 @@ from cayu import (
     Environment,
     EnvironmentSpec,
     InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
     ListKnowledgeTool,
@@ -38,7 +39,9 @@ async def main() -> None:
         print("Set ANTHROPIC_API_KEY or choose CAYU_PROVIDER=openai.")
         return
 
-    knowledge_store = InMemoryKnowledgeStore()
+    knowledge_store = InMemoryKnowledgeStore(
+        access_scope=KnowledgeAccessScope.for_namespace("project:cayu")
+    )
     seeded = await _seed_many_knowledge_entries(knowledge_store)
 
     app = CayuApp()

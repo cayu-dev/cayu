@@ -515,6 +515,7 @@ async def _create_model_run(
         structured_output=None,
         thinking=None,
         knowledge_store=None,
+        knowledge_access_scope=None,
         request_metadata={},
         retry_policy=retry_policy,
         request_budget_limits=(),

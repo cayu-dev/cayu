@@ -404,6 +404,7 @@ from cayu.storage import migrations as schema
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -421,8 +422,13 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _knowledge_access_snapshot,
+    _knowledge_access_snapshot_json,
     _knowledge_chunk_content_hash,
     _knowledge_publication_operation_id,
+    _knowledge_scope_allows_snapshot,
+    _parse_knowledge_access_snapshot_json,
+    _require_knowledge_entry_access,
     _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
@@ -430,6 +436,7 @@ from cayu.storage.memory import (
     _validate_nonnegative_float,
     _validate_positive_int,
     _validate_unit_float,
+    copy_knowledge_access_scope,
     copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_list_query,
@@ -1313,6 +1320,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         """,
     ),
     39: ("ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS invocation JSONB NOT NULL",),
+    41: (
+        "ALTER TABLE cayu_knowledge_publication_receipts "
+        "ADD COLUMN IF NOT EXISTS access_snapshot JSONB NOT NULL",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -2268,6 +2279,21 @@ async def _reject_populated_pre_task_invocation_database(cur: Any) -> None:
         )
 
 
+async def _reject_populated_pre_knowledge_access_snapshot_database(cur: Any) -> None:
+    await cur.execute("SELECT to_regclass('cayu_knowledge_publication_receipts')")
+    registered = await cur.fetchone()
+    if registered is None or registered[0] is None:
+        return
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_knowledge_publication_receipts)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 41 requires an authorization snapshot for every "
+            "knowledge publication receipt and cannot infer one for existing "
+            "receipts. Recreate the Cayu database before starting this build."
+        )
+
+
 async def _transcript_cursor(cur: Any, session_id: str) -> int:
     """Return the permanent next transcript position, independent of retention."""
 
@@ -2487,6 +2513,12 @@ class _PostgresStoreBase:
                         and any(revision.revision == 39 for revision in schema.pending(current))
                     ):
                         await _reject_populated_pre_task_invocation_database(cur)
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 41
+                        and any(revision.revision == 41 for revision in schema.pending(current))
+                    ):
+                        await _reject_populated_pre_knowledge_access_snapshot_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -2504,6 +2536,8 @@ class _PostgresStoreBase:
                             await self._validate_task_terminalization_receipt_table(cur)
                         if self._min_required_revision >= 39:
                             await self._validate_task_invocation_column(cur)
+                        if self._min_required_revision >= 41:
+                            await self._validate_knowledge_publication_access_snapshot_column(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -2716,6 +2750,29 @@ class _PostgresStoreBase:
             await self._validate_task_terminalization_receipt_table(cur)
         if revision.revision == 39:
             await self._validate_task_invocation_column(cur)
+        if revision.revision == 41:
+            await self._validate_knowledge_publication_access_snapshot_column(cur)
+
+    async def _validate_knowledge_publication_access_snapshot_column(
+        self,
+        cur: Any,
+    ) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_knowledge_publication_receipts'
+              AND column_name = 'access_snapshot'
+            """
+        )
+        if await cur.fetchone() != ("jsonb", "NO"):
+            raise RuntimeError(
+                "Postgres schema object "
+                "'cayu_knowledge_publication_receipts.access_snapshot' conflicts "
+                "with Cayu's knowledge authorization contract. Recreate the Cayu "
+                "database from a known-good revision-41 schema."
+            )
 
     async def _validate_task_terminalization_receipt_table(self, cur: Any) -> None:
         await cur.execute(
@@ -2995,6 +3052,12 @@ class _PostgresStoreBase:
             and any(revision.revision == 39 for revision in schema.pending(current))
         ):
             await _reject_populated_pre_task_invocation_database(cur)
+        if (
+            current != schema.UNINITIALIZED
+            and current < 41
+            and any(revision.revision == 41 for revision in schema.pending(current))
+        ):
+            await _reject_populated_pre_knowledge_access_snapshot_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -4513,18 +4576,70 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
 
+async def _lock_knowledge_entry(cur: Any, entry_id: str) -> None:
+    """Serialize every Cayu mutation of one knowledge identity."""
+
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"knowledge-entry:{entry_id}",),
+    )
+
+
+async def _begin_knowledge_read_snapshot(cur: Any) -> None:
+    """Keep access filtering and result hydration on one database snapshot."""
+
+    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
-    _min_required_revision = 35
+    _min_required_revision = 41
 
-    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+    def __init__(
+        self,
+        conninfo: str | None = None,
+        *,
+        pool: AsyncConnectionPool | None = None,
+        min_size: int = 1,
+        max_size: int = 8,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
+        read_only: bool = False,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> None:
+        self._default_access_scope = (
+            None if access_scope is None else copy_knowledge_access_scope(access_scope)
+        )
+        super().__init__(
+            conninfo,
+            pool=pool,
+            min_size=min_size,
+            max_size=max_size,
+            schema_mode=schema_mode,
+            read_only=read_only,
+        )
+
+    async def put_entry(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
+        _require_knowledge_entry_access(scope, entry, operation="put_entry")
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await _lock_knowledge_entry(cur, entry.id)
                     existing_entry = await self._load_entry(cur, entry.id)
+                    if existing_entry is not None:
+                        _require_knowledge_entry_access(
+                            scope,
+                            existing_entry,
+                            operation="put_entry",
+                        )
                     existing_chunks = await self._load_chunks(cur, entry.id)
                     await self._upsert_entry(cur, entry)
                     if (
@@ -4539,17 +4654,27 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise
         return copy_knowledge_entry(entry)
 
-    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
+    async def get_entry(
+        self,
+        entry_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry | None:
+        scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            return await self._load_entry(cur, entry_id)
+            await _begin_knowledge_read_snapshot(cur)
+            return await self._load_entry_in_scope(cur, entry_id, scope)
 
     async def update_entry_status(
         self,
         entry_id: str,
         status: KnowledgeStatus,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
         if not isinstance(status, KnowledgeStatus):
             raise ValueError("status must be a KnowledgeStatus.")
@@ -4557,9 +4682,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await _lock_knowledge_entry(cur, entry_id)
                     entry = await self._load_entry(cur, entry_id)
                     if entry is None:
                         raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+                    _require_knowledge_entry_access(scope, entry, operation="update_entry_status")
+                    target = entry.model_copy(update={"status": status})
+                    _require_knowledge_entry_access(scope, target, operation="update_entry_status")
                     updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
                     await cur.execute(
                         """
@@ -4582,11 +4711,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
         expected_namespace: str | None = None,
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
@@ -4598,10 +4729,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             else None
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(scope)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await _lock_knowledge_entry(cur, entry_id)
                     scope_clauses: list[str] = []
                     scope_params: list[object] = []
                     if expected_namespace is not None:
@@ -4628,16 +4761,28 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         SET status = %s, updated_at = GREATEST(NOW(), created_at, updated_at)
                         WHERE e.id = %s AND e.status = %s
                         {scope_sql}
+                        {access_sql}
                         """,
                     )
                     await cur.execute(
                         update_sql,
-                        (str(to_status), entry_id, str(from_status), *scope_params),
+                        (
+                            str(to_status),
+                            entry_id,
+                            str(from_status),
+                            *scope_params,
+                            *access_params,
+                        ),
                     )
                     if cur.rowcount != 1:
                         entry = await self._load_entry(cur, entry_id)
                         if entry is None:
                             raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+                        _require_knowledge_entry_access(
+                            scope,
+                            entry,
+                            operation="transition_entry_status",
+                        )
                         if expected_namespace is not None and entry.namespace != expected_namespace:
                             raise ValueError(
                                 f"Knowledge entry {entry_id!r} does not match expected namespace."
@@ -4652,6 +4797,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             f"not {from_status.value!r}."
                         )
                     loaded = await self._load_entry(cur, entry_id)
+                    if loaded is not None:
+                        _require_knowledge_entry_access(
+                            scope,
+                            loaded,
+                            operation="transition_entry_status",
+                        )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4664,17 +4815,21 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
+        scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await _lock_knowledge_entry(cur, entry_id)
                     entry = await self._load_entry(cur, entry_id)
                     if entry is None:
                         await conn.commit()
                         return None
+                    _require_knowledge_entry_access(scope, entry, operation="delete_entry")
                     if hard:
                         await cur.execute(
                             "DELETE FROM cayu_knowledge_entries WHERE id = %s",
@@ -4682,14 +4837,34 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         )
                         await conn.commit()
                         return copy_knowledge_entry(entry)
+                    target = entry.model_copy(update={"status": KnowledgeStatus.DELETED})
+                    _require_knowledge_entry_access(scope, target, operation="delete_entry")
+                    await cur.execute(
+                        """
+                        UPDATE cayu_knowledge_entries
+                        SET status = %s, updated_at = GREATEST(NOW(), created_at, updated_at)
+                        WHERE id = %s
+                        """,
+                        (str(KnowledgeStatus.DELETED), entry_id),
+                    )
+                    loaded = await self._load_entry(cur, entry_id)
                 await conn.commit()
             except Exception:
                 await conn.rollback()
                 raise
-        return await self.update_entry_status(entry_id, KnowledgeStatus.DELETED)
+        if loaded is None:
+            raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+        return loaded
 
-    async def prune_expired(self, *, now: datetime | None = None) -> int:
+    async def prune_expired(
+        self,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        scope = self._operation_access_scope(access_scope)
         cutoff = datetime.now(UTC) if now is None else now
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(scope)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -4697,9 +4872,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     # The entries DELETE cascades (ON DELETE CASCADE) to chunks, labels, aspects, and
                     # — for the embedding subclass — cayu_knowledge_embeddings, so no override is needed.
                     await cur.execute(
-                        "DELETE FROM cayu_knowledge_entries "
-                        "WHERE expires_at IS NOT NULL AND expires_at <= %s",
-                        (cutoff,),
+                        cast(
+                            "LiteralString",
+                            "DELETE FROM cayu_knowledge_entries AS e "
+                            "WHERE expires_at IS NOT NULL AND expires_at <= %s "
+                            f"{access_sql}",
+                        ),
+                        (cutoff, *access_params),
                     )
                     pruned = cur.rowcount
                 await conn.commit()
@@ -4712,15 +4891,21 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         entry_id: str,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> list[KnowledgeChunk]:
+        scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
         copied_chunks = _copy_knowledge_entry_chunks(entry_id, chunks)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    if await self._load_entry(cur, entry_id) is None:
+                    await _lock_knowledge_entry(cur, entry_id)
+                    entry = await self._load_entry(cur, entry_id)
+                    if entry is None:
                         raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+                    _require_knowledge_entry_access(scope, entry, operation="replace_chunks")
                     await self._replace_chunks(cur, entry_id, copied_chunks)
                 await conn.commit()
             except Exception:
@@ -4732,13 +4917,25 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
+        _require_knowledge_entry_access(scope, entry, operation="put_entry_with_chunks")
         copied_chunks = _copy_knowledge_entry_chunks(entry.id, chunks)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await _lock_knowledge_entry(cur, entry.id)
+                    existing_entry = await self._load_entry(cur, entry.id)
+                    if existing_entry is not None:
+                        _require_knowledge_entry_access(
+                            scope,
+                            existing_entry,
+                            operation="put_entry_with_chunks",
+                        )
                     await self._upsert_entry(cur, entry)
                     await self._replace_chunks(cur, entry.id, copied_chunks)
                 await conn.commit()
@@ -4752,11 +4949,14 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
     ) -> KnowledgePublicationReceipt:
+        scope = self._operation_access_scope(access_scope)
         operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
             entry, chunks, operation_id=operation_id
         )
+        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_with_chunks")
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -4798,7 +4998,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     )
                     await self._insert_entry(cur, copied_entry)
                     await self._replace_chunks(cur, copied_entry.id, copied_chunks)
-                    await self._insert_publication_receipt(cur, receipt)
+                    await self._insert_publication_receipt(cur, receipt, copied_entry)
                 await conn.commit()
                 return copy_knowledge_publication_receipt(receipt)
             except UniqueViolation:
@@ -4811,22 +5011,27 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            receipt = await self._load_publication_receipt(cur, operation_id)
+            receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     async def read_chunks(
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         chunk_index: int | None = None,
         around: int = 0,
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
+        scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
         if chunk_index is not None:
             _validate_knowledge_nonnegative_int(chunk_index, "chunk_index")
@@ -4837,7 +5042,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         _validate_knowledge_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            if await self._load_entry(cur, entry_id) is None:
+            await _begin_knowledge_read_snapshot(cur)
+            if await self._load_entry_in_scope(cur, entry_id, scope) is None:
                 return []
             chunks = await self._load_chunks(cur, entry_id)
         if chunk_index is not None:
@@ -4856,15 +5062,25 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             max_bytes=max_bytes,
         )
 
-    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+    async def search(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_query(query)
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
         ts_query, preview_terms = _postgres_knowledge_ts_query(query)
         search_filter_sql, search_filter_params = _postgres_knowledge_search_filter_sql(query)
         where_sql, params = _postgres_knowledge_filter_sql(query)
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(scope)
+        where_sql += access_sql
+        params.extend(access_params)
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
             total_hits_known = await self._count_search_hits(
                 cur,
                 search_filter_sql,
@@ -4894,11 +5110,21 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             total_hits_known=total_hits_known,
         )
 
-    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+    async def list_entries(
+        self,
+        query: KnowledgeListQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeListResult:
+        scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_list_query(query)
         where_sql, params = _postgres_knowledge_list_filter_sql(query)
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(scope)
+        where_sql += access_sql
+        params.extend(access_params)
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
             total_entries_known = await self._count_list_entries(cur, where_sql, params)
             await cur.execute(
                 cast(
@@ -5056,10 +5282,50 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         except Exception:
             raise KnowledgePublicationConflict("malformed_receipt") from None
 
+    async def _load_publication_receipt_in_scope(
+        self,
+        cur: Any,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgePublicationReceipt | None:
+        await cur.execute(
+            """
+            SELECT
+                operation_id,
+                entry_id,
+                request_sha256,
+                entry_created_at,
+                entry_updated_at,
+                committed_at,
+                access_snapshot::text
+            FROM cayu_knowledge_publication_receipts
+            WHERE operation_id = %s
+            """,
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            snapshot = _parse_knowledge_access_snapshot_json(row[6])
+            if not _knowledge_scope_allows_snapshot(access_scope, snapshot):
+                return None
+            return KnowledgePublicationReceipt(
+                operation_id=row[0],
+                entry_id=row[1],
+                request_sha256=row[2],
+                entry_created_at=row[3],
+                entry_updated_at=row[4],
+                committed_at=row[5],
+            )
+        except Exception:
+            raise KnowledgePublicationConflict("malformed_receipt") from None
+
     async def _insert_publication_receipt(
         self,
         cur: Any,
         receipt: KnowledgePublicationReceipt,
+        entry: KnowledgeEntry,
     ) -> None:
         await cur.execute(
             """
@@ -5069,9 +5335,10 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 request_sha256,
                 entry_created_at,
                 entry_updated_at,
-                committed_at
+                committed_at,
+                access_snapshot
             )
-            VALUES (%s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
             """,
             (
                 receipt.operation_id,
@@ -5080,6 +5347,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 receipt.entry_created_at,
                 receipt.entry_updated_at,
                 receipt.committed_at,
+                _knowledge_access_snapshot_json(_knowledge_access_snapshot(entry)),
             ),
         )
 
@@ -5167,6 +5435,56 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             WHERE id = %s
             """,
             (entry_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return _knowledge_entry_from_row(
+            row,
+            labels=await self._load_labels(cur, entry_id),
+            aspects=await self._load_aspects(cur, entry_id),
+            impact_targets=await self._load_impact_targets(cur, entry_id),
+        )
+
+    async def _load_entry_in_scope(
+        self,
+        cur: Any,
+        entry_id: str,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeEntry | None:
+        where_sql, params = _postgres_knowledge_access_scope_filter_sql(access_scope)
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT
+                    e.id,
+                    e.namespace,
+                    e.text,
+                    e.kind,
+                    e.visibility,
+                    e.status,
+                    e.created_by_type,
+                    e.created_by,
+                    e.created_at,
+                    e.updated_at,
+                    e.source_type,
+                    e.source_uri,
+                    e.source_id,
+                    e.source_hash,
+                    e.importance,
+                    e.importance_source,
+                    e.confidence,
+                    e.last_used_at,
+                    e.expires_at,
+                    e.title,
+                    e.metadata
+                FROM cayu_knowledge_entries AS e
+                WHERE e.id = %s
+                {where_sql}
+                """,
+            ),
+            (entry_id, *params),
         )
         row = await cur.fetchone()
         if row is None:
@@ -5624,6 +5942,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         embedding_provider: TextEmbeddingProvider,
         embedding_model: str,
         embedding_dimensions: int,
+        access_scope: KnowledgeAccessScope | None = None,
         hybrid_keyword_weight: float = 0.35,
         semantic_min_score: float = 0.55,
     ) -> None:
@@ -5649,6 +5968,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             min_size=min_size,
             max_size=max_size,
             schema_mode=schema_mode,
+            access_scope=access_scope,
         )
 
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
@@ -5669,9 +5989,15 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             await self._reconcile_embedding_schema()
             self._embedding_schema_ready = True
 
-    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
-        stored = await super().put_entry(entry)
-        await self._embed_entry_chunks_best_effort(stored.id)
+    async def put_entry(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
+        stored = await super().put_entry(entry, access_scope=scope)
+        await self._embed_entry_chunks_best_effort(stored.id, access_scope=scope)
         return stored
 
     async def publish_entry_with_chunks(
@@ -5679,11 +6005,14 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
     ) -> KnowledgePublicationReceipt:
+        scope = self._operation_access_scope(access_scope)
         receipt = await super().publish_entry_with_chunks(
             entry,
             chunks,
+            access_scope=scope,
             operation_id=operation_id,
         )
         if receipt.replayed:
@@ -5691,31 +6020,50 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         # Owned publication exposes a bounded post-commit warning through the
         # remember tool when derived work fails. Legacy writes retain their
         # established best-effort behavior below.
-        await self._embed_entry_chunks(receipt.entry_id)
+        await self._embed_entry_chunks(receipt.entry_id, access_scope=scope)
         return receipt
 
     async def replace_chunks(
         self,
         entry_id: str,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> list[KnowledgeChunk]:
-        stored_chunks = await super().replace_chunks(entry_id, chunks)
-        await self._embed_entry_chunks_best_effort(entry_id, chunks=stored_chunks)
+        scope = self._operation_access_scope(access_scope)
+        stored_chunks = await super().replace_chunks(
+            entry_id,
+            chunks,
+            access_scope=scope,
+        )
+        await self._embed_entry_chunks_best_effort(
+            entry_id,
+            access_scope=scope,
+            chunks=stored_chunks,
+        )
         return stored_chunks
 
     async def put_entry_with_chunks(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        stored = await super().put_entry_with_chunks(entry, chunks)
-        await self._embed_entry_chunks_best_effort(stored.id)
+        scope = self._operation_access_scope(access_scope)
+        stored = await super().put_entry_with_chunks(
+            entry,
+            chunks,
+            access_scope=scope,
+        )
+        await self._embed_entry_chunks_best_effort(stored.id, access_scope=scope)
         return stored
 
     async def backfill_embeddings(
         self,
         query: KnowledgeListQuery | None = None,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         limit: int = 500,
         refresh_existing: bool = False,
     ) -> PostgresEmbeddingBackfillResult:
@@ -5729,11 +6077,13 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         _validate_positive_int(limit, "limit")
         if type(refresh_existing) is not bool:
             raise ValueError("`refresh_existing` must be a boolean.")
+        scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_list_query(query or KnowledgeListQuery())
         await self._ensure_ready()
         chunks = await self._backfill_candidate_chunks(
             query,
             limit,
+            access_scope=scope,
             refresh_existing=refresh_existing,
         )
         embedded_chunks = await self._embed_chunks(
@@ -5748,10 +6098,16 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             refresh_existing=refresh_existing,
         )
 
-    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+    async def search(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_query(query)
         if query.mode is KnowledgeSearchMode.KEYWORD:
-            return await super().search(query)
+            return await super().search(query, access_scope=scope)
         if query.mode not in {
             KnowledgeSearchMode.AUTO,
             KnowledgeSearchMode.SEMANTIC,
@@ -5762,19 +6118,21 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 "and hybrid search modes."
             )
         await self._ensure_ready()
-        await self._lazy_backfill_search_scope(query)
+        await self._lazy_backfill_search_scope(query, access_scope=scope)
         semantic_query_text = _semantic_query_text(query)
         query_vector = await self._embed_query(query, semantic_query_text)
         (
             rows,
             candidate_limit_reached,
             semantic_total_hits_known_floor,
-        ) = await self._semantic_search_rows(query, query_vector)
+        ) = await self._semantic_search_rows(query, query_vector, access_scope=scope)
         async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
             scored, byte_truncated = await self._scored_semantic_rows(
                 cur,
                 rows,
                 query,
+                access_scope=scope,
             )
         total_hits_known_floor = len(scored)
         if query.mode is KnowledgeSearchMode.SEMANTIC:
@@ -5785,7 +6143,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
             keyword_query = query.model_copy(update={"mode": KnowledgeSearchMode.KEYWORD})
             try:
-                keyword_result = await super().search(keyword_query)
+                keyword_result = await super().search(keyword_query, access_scope=scope)
             except ValueError:
                 keyword_result = None
             if keyword_result is not None:
@@ -5942,8 +6300,13 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         self,
         query: KnowledgeQuery,
         query_vector: list[float],
+        *,
+        access_scope: KnowledgeAccessScope,
     ) -> tuple[list[tuple[str, str, float]], bool, int]:
         where_sql, params = _postgres_knowledge_filter_sql(query)
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(access_scope)
+        where_sql += access_sql
+        params.extend(access_params)
         none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
         vector_literal = _postgres_vector_literal(query_vector)
         candidate_limit = max(
@@ -6061,10 +6424,14 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         query: KnowledgeListQuery,
         limit: int,
         *,
+        access_scope: KnowledgeAccessScope,
         refresh_existing: bool,
         search_query: KnowledgeQuery | None = None,
     ) -> list[KnowledgeChunk]:
         where_sql, params = _postgres_knowledge_list_filter_sql(query)
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(access_scope)
+        where_sql += access_sql
+        params.extend(access_params)
         none_sql, none_params = (
             ("", []) if search_query is None else _postgres_knowledge_none_filter_sql(search_query)
         )
@@ -6116,6 +6483,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         cur: Any,
         rows: list[tuple[str, str, float]],
         query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
     ) -> tuple[
         list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]],
         bool,
@@ -6124,9 +6493,10 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]
         ] = []
         byte_truncated = False
+        scope = self._operation_access_scope(access_scope)
         semantic_min_score = self.semantic_min_score if query.min_score is None else query.min_score
         for entry_id, chunk_id, normalized_score in rows:
-            entry = await self._load_entry(cur, entry_id)
+            entry = await self._load_entry_in_scope(cur, entry_id, scope)
             chunk = await self._load_chunk(cur, chunk_id)
             if entry is None or chunk is None:
                 continue
@@ -6215,11 +6585,15 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope,
         chunks: list[KnowledgeChunk] | None = None,
     ) -> None:
+        scope = self._operation_access_scope(access_scope)
         await self._ensure_ready()
-        if chunks is None:
-            async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            if await self._load_entry_in_scope(cur, entry_id, scope) is None:
+                return
+            if chunks is None:
                 chunks = await self._load_chunks(cur, entry_id)
         await self._embed_chunks(chunks)
         await self._drop_stale_entry_embeddings(entry_id)
@@ -6228,6 +6602,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope,
         chunks: list[KnowledgeChunk] | None = None,
     ) -> None:
         """Embed an entry's chunks, flag-and-continuing on failure.
@@ -6239,7 +6614,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         ``search`` reads to lazily backfill the embeddings on the next query.
         """
         try:
-            await self._embed_entry_chunks(entry_id, chunks=chunks)
+            await self._embed_entry_chunks(
+                entry_id,
+                access_scope=access_scope,
+                chunks=chunks,
+            )
         except Exception:
             logger.warning(
                 "Deferred embedding for knowledge entry %r after a durable write; "
@@ -6248,7 +6627,12 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 exc_info=True,
             )
 
-    async def _lazy_backfill_search_scope(self, query: KnowledgeQuery) -> None:
+    async def _lazy_backfill_search_scope(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> None:
         """Backfill missing embeddings within the search's filter scope.
 
         Entries whose write-time embedding was deferred (provider outage) have no
@@ -6264,6 +6648,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             chunks = await self._backfill_candidate_chunks(
                 list_query,
                 _PGVECTOR_LAZY_BACKFILL_LIMIT,
+                access_scope=access_scope,
                 refresh_existing=False,
                 search_query=query,
             )
@@ -16134,6 +16519,42 @@ def _postgres_knowledge_list_filter_sql(
         source_id=query.source_id,
         include_expired=query.include_expired,
     )
+
+
+def _postgres_knowledge_access_scope_filter_sql(
+    scope: KnowledgeAccessScope,
+) -> tuple[str, list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if not scope.allow_all_namespaces:
+        clauses.append("e.namespace = ANY(%s)")
+        params.append(list(scope.allowed_namespaces))
+    for key, value in scope.required_labels.items():
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_labels AS access_label
+                WHERE access_label.entry_id = e.id
+                  AND access_label.key = %s
+                  AND access_label.value = %s
+            )
+            """
+        )
+        params.extend([key, value])
+    clauses.append("e.visibility = ANY(%s)")
+    params.append([str(visibility) for visibility in scope.allowed_visibilities])
+    clauses.append("e.status = ANY(%s)")
+    params.append([str(status) for status in scope.allowed_statuses])
+    if scope.allowed_source_types is not None:
+        clauses.append("e.source_type = ANY(%s)")
+        params.append(list(scope.allowed_source_types))
+    if scope.allowed_source_ids is not None:
+        clauses.append("e.source_id = ANY(%s)")
+        params.append(list(scope.allowed_source_ids))
+    if not scope.include_expired:
+        clauses.append("(e.expires_at IS NULL OR e.expires_at > NOW())")
+    return " AND " + " AND ".join(clauses), params
 
 
 def _postgres_knowledge_metadata_filter_sql(

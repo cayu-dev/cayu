@@ -32,6 +32,7 @@ from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -48,6 +49,7 @@ from cayu.storage.memory import (
     KnowledgeStore,
     KnowledgeVisibility,
     _knowledge_publication_operation_id,
+    copy_knowledge_access_scope,
     copy_knowledge_entry,
     copy_knowledge_publication_receipt,
     prepare_knowledge_publication,
@@ -976,6 +978,8 @@ async def _remember_load_entry(
 
 
 def _remember_store_supports_owned_publication(store: Any) -> bool:
+    if type(store) is _ScopedKnowledgeStoreHandle:
+        store = store._store
     store_type = type(store)
     return (
         getattr(store_type, "publish_entry_with_chunks", None)
@@ -1921,7 +1925,81 @@ def _require_knowledge_store(
             f"Tool context knowledge_store is missing methods required by "
             f"{tool_name}: {', '.join(missing)}."
         )
-    return ctx.knowledge_store
+    access_scope = ctx.knowledge_access_scope
+    if access_scope is None:
+        bound_scope = getattr(ctx.knowledge_store, "bound_access_scope", None)
+        if callable(bound_scope):
+            access_scope = bound_scope()
+    if access_scope is None:
+        raise PermissionError(
+            f"Tool context knowledge_store for {tool_name} is missing an access scope."
+        )
+    return _ScopedKnowledgeStoreHandle(
+        ctx.knowledge_store,
+        copy_knowledge_access_scope(access_scope),
+    )
+
+
+class _ScopedKnowledgeStoreHandle:
+    """Bind one trusted ToolContext scope without exposing it to model arguments."""
+
+    def __init__(self, store: Any, access_scope: KnowledgeAccessScope) -> None:
+        self._store = store
+        self._access_scope = copy_knowledge_access_scope(access_scope)
+        bound_scope = getattr(store, "bound_access_scope", None)
+        self._scope_is_store_bound = callable(bound_scope) and bound_scope() == self._access_scope
+
+    def supported_search_modes(self):
+        supported = getattr(self._store, "supported_search_modes", None)
+        if not callable(supported):
+            return (KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD)
+        return supported()
+
+    async def search(self, query):
+        if self._scope_is_store_bound:
+            return await self._store.search(query)
+        return await self._store.search(query, access_scope=self._access_scope)
+
+    async def list_entries(self, query):
+        if self._scope_is_store_bound:
+            return await self._store.list_entries(query)
+        return await self._store.list_entries(query, access_scope=self._access_scope)
+
+    async def read_chunks(self, entry_id, **kwargs):
+        if self._scope_is_store_bound:
+            return await self._store.read_chunks(entry_id, **kwargs)
+        return await self._store.read_chunks(
+            entry_id,
+            access_scope=self._access_scope,
+            **kwargs,
+        )
+
+    async def get_entry(self, entry_id):
+        if self._scope_is_store_bound:
+            return await self._store.get_entry(entry_id)
+        return await self._store.get_entry(entry_id, access_scope=self._access_scope)
+
+    async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+        if self._scope_is_store_bound:
+            return await self._store.publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+        return await self._store.publish_entry_with_chunks(
+            entry,
+            chunks,
+            access_scope=self._access_scope,
+            operation_id=operation_id,
+        )
+
+    async def load_entry_publication_receipt(self, operation_id):
+        if self._scope_is_store_bound:
+            return await self._store.load_entry_publication_receipt(operation_id)
+        return await self._store.load_entry_publication_receipt(
+            operation_id,
+            access_scope=self._access_scope,
+        )
 
 
 def _missing_knowledge_store_result() -> ToolResult:

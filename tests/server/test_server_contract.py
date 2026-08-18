@@ -21,6 +21,7 @@ from cayu import (
     EnvironmentSpec,
     InMemoryKnowledgeStore,
     InMemoryTaskStore,
+    KnowledgeAccessScope,
     LocalArtifactStore,
     default_price_book,
 )
@@ -46,6 +47,13 @@ from cayu.server.sse import (
     event_to_sse_message,
     parse_last_event_id,
 )
+
+
+class _TestKnowledgeStore(InMemoryKnowledgeStore):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("access_scope", KnowledgeAccessScope.privileged())
+        super().__init__(*args, **kwargs)
+
 
 _SNAPSHOT_PATH = Path(__file__).parent / "snapshots" / "openapi-contract-summary.json"
 _STREAMING_ROUTES = {
@@ -239,7 +247,7 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="contract-artifacts")
     app = CayuApp(
         task_store=InMemoryTaskStore(),
-        knowledge_store=InMemoryKnowledgeStore(),
+        knowledge_store=_TestKnowledgeStore(),
     )
     app.register_environment(
         Environment(
@@ -322,7 +330,7 @@ def test_system_diagnostics_reports_bounded_protected_runtime_state(tmp_path) ->
     )
     app = CayuApp(
         task_store=InMemoryTaskStore(),
-        knowledge_store=InMemoryKnowledgeStore(),
+        knowledge_store=_TestKnowledgeStore(),
     )
     app.register_environment(
         Environment(
@@ -517,7 +525,7 @@ def test_contract_keeps_optional_capability_combinations_independent(
     app = CayuApp(
         task_store=InMemoryTaskStore() if configured_feature == "tasks" else None,
         knowledge_store=(
-            InMemoryKnowledgeStore() if configured_feature == "reviewed_knowledge" else None
+            _TestKnowledgeStore() if configured_feature == "reviewed_knowledge" else None
         ),
     )
     if configured_feature == "artifacts":

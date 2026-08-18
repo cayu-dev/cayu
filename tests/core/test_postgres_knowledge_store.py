@@ -4,6 +4,9 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.core.knowledge_access_scope_conformance import (
+    assert_knowledge_access_scope_conformance,
+)
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
@@ -27,6 +30,7 @@ from cayu.embeddings import (
 )
 from cayu.storage import (
     MAX_KNOWLEDGE_CHUNK_INDEX,
+    KnowledgeAccessScope,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListGroup,
@@ -39,6 +43,8 @@ from cayu.storage import (
 from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, SchemaMode
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
+
+_ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 
 _TABLES = (
     "cayu_knowledge_embeddings",
@@ -115,7 +121,13 @@ async def _drop_all(dsn: str) -> None:
 def _new_store(dsn: str):
     from cayu import PostgresKnowledgeStore
 
-    return PostgresKnowledgeStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
+    return PostgresKnowledgeStore(
+        dsn,
+        access_scope=_ACCESS_SCOPE,
+        min_size=1,
+        max_size=4,
+        schema_mode=SchemaMode.CREATE,
+    )
 
 
 def _new_embedding_store(
@@ -128,6 +140,7 @@ def _new_embedding_store(
 
     return PostgresEmbeddingKnowledgeStore(
         dsn,
+        access_scope=_ACCESS_SCOPE,
         min_size=1,
         max_size=max_size,
         schema_mode=SchemaMode.CREATE,
@@ -149,6 +162,94 @@ def test_postgres_knowledge_store_owned_publication_conformance(postgres_dsn: st
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_knowledge_access_scope_conformance(postgres_dsn: str) -> None:
+    from cayu import PostgresKnowledgeStore
+
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await assert_knowledge_access_scope_conformance(store)
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_scoped_entry_hydration_uses_one_read_snapshot(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        privileged = _new_store(postgres_dsn)
+        try:
+            await privileged.put_entry(
+                KnowledgeEntry(
+                    id="entry",
+                    text="snapshot protected",
+                    labels={"project": "alpha"},
+                )
+            )
+        finally:
+            await privileged.close()
+
+        class RacingStore(PostgresKnowledgeStore):
+            changed = False
+
+            async def _load_labels(self, cur, entry_id: str) -> dict[str, str]:
+                if not self.changed:
+                    self.changed = True
+                    peer = _new_store(postgres_dsn)
+                    try:
+                        await peer.put_entry(
+                            KnowledgeEntry(
+                                id=entry_id,
+                                text="snapshot protected",
+                                labels={"project": "beta"},
+                            )
+                        )
+                    finally:
+                        await peer.close()
+                return await super()._load_labels(cur, entry_id)
+
+        scope = KnowledgeAccessScope.for_namespace(
+            "default",
+            required_labels={"project": "alpha"},
+        )
+        racing = RacingStore(
+            postgres_dsn,
+            access_scope=scope,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            loaded = await racing.get_entry("entry")
+        finally:
+            await racing.close()
+        assert loaded is not None
+        assert loaded.labels == {"project": "alpha"}
+
+        current = _new_store(postgres_dsn)
+        try:
+            updated = await current.get_entry("entry")
+        finally:
+            await current.close()
+            await _drop_all(postgres_dsn)
+        assert updated is not None
+        assert updated.labels == {"project": "beta"}
 
     asyncio.run(run())
 
@@ -268,6 +369,7 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
         await _skip_if_pgvector_unavailable(postgres_dsn)
         store = DelayedDeleteCleanupStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
             embedding_dimensions=3,
@@ -376,6 +478,7 @@ def test_postgres_remember_knowledge_reconciles_ack_loss_and_restart(
         }
         store = AcknowledgementLossPostgresStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
@@ -477,8 +580,8 @@ def test_postgres_knowledge_publication_rolls_back_each_material_write(
                 await super()._replace_chunks(cur, entry_id, chunks)
                 self._fail_after("chunks")
 
-            async def _insert_publication_receipt(self, cur, receipt) -> None:
-                await super()._insert_publication_receipt(cur, receipt)
+            async def _insert_publication_receipt(self, cur, receipt, entry) -> None:
+                await super()._insert_publication_receipt(cur, receipt, entry)
                 self._fail_after("receipt")
 
             def _fail_after(self, phase: str) -> None:
@@ -488,6 +591,7 @@ def test_postgres_knowledge_publication_rolls_back_each_material_write(
         await _drop_all(postgres_dsn)
         store = FailingPublicationStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
@@ -754,6 +858,7 @@ def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
         await _skip_if_pgvector_unavailable(postgres_dsn)
         store = PostgresEmbeddingKnowledgeStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
@@ -791,6 +896,7 @@ def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_in
         await _skip_if_pgvector_unavailable(postgres_dsn)
         first = PostgresEmbeddingKnowledgeStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
@@ -805,6 +911,7 @@ def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_in
 
         second = PostgresEmbeddingKnowledgeStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
@@ -960,6 +1067,7 @@ def test_postgres_embedding_store_flags_and_continues_then_lazily_backfills(
 
         store = PostgresEmbeddingKnowledgeStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
@@ -1800,6 +1908,7 @@ def test_postgres_knowledge_schema_migrates_and_coexists_with_session_store(
 
         knowledge_store = PostgresKnowledgeStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
@@ -2026,7 +2135,11 @@ def test_postgres_embedding_store_excludes_and_reembeds_other_space_versions(
 
             # (a1) semantic read filter excludes the v1 row (call the internal directly → no backfill).
             query_vector = await store._embed_query(query, _semantic_query_text(query))
-            raw_rows, _, _ = await store._semantic_search_rows(query, query_vector)
+            raw_rows, _, _ = await store._semantic_search_rows(
+                query,
+                query_vector,
+                access_scope=_ACCESS_SCOPE,
+            )
 
             # (a2) the missing-embedding check treats the v1 chunk as missing under v2.
             missing = await store._missing_embedding_chunks(await store.read_chunks("doc"))
@@ -2111,6 +2224,7 @@ def test_postgres_storage_migrate_adds_embedding_space_version_to_existing_table
         # And the embedding store now opens clean in the default VALIDATE mode.
         validate_store = PostgresEmbeddingKnowledgeStore(
             postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
             schema_mode=SchemaMode.VALIDATE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",

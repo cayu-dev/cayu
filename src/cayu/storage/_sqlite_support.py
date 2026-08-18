@@ -1570,6 +1570,13 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
     34: (("cayu_tasks", "available_at", "TEXT"),),
     36: (("cayu_sessions", "invocation_json", "TEXT NOT NULL"),),
     39: (("cayu_tasks", "invocation_json", "TEXT NOT NULL"),),
+    41: (
+        (
+            "cayu_knowledge_publication_receipts",
+            "access_snapshot_json",
+            "TEXT NOT NULL",
+        ),
+    ),
 }
 
 # Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD
@@ -1640,6 +1647,27 @@ def _reject_populated_pre_task_invocation_database(
             "Storage revision 39 requires invocation provenance for every task and "
             "cannot migrate a populated Cayu task database. Recreate the Cayu "
             "database before starting this build."
+        )
+
+
+def _reject_populated_pre_knowledge_access_snapshot_database(
+    connection: sqlite3.Connection,
+) -> None:
+    if (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_knowledge_publication_receipts'"
+        ).fetchone()
+        is None
+    ):
+        return
+    if connection.execute(
+        "SELECT EXISTS(SELECT 1 FROM cayu_knowledge_publication_receipts)"
+    ).fetchone()[0]:
+        raise schema.SchemaTooOld(
+            "Storage revision 41 requires an authorization snapshot for every "
+            "knowledge publication receipt and cannot infer one for existing "
+            "receipts. Recreate the Cayu database before starting this build."
         )
 
 
@@ -2500,6 +2528,8 @@ def reconcile_schema(
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
         _validate_task_invocation_column(connection)
+    if app_min_supported >= 41:
+        _validate_knowledge_publication_access_snapshot_column(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -2512,6 +2542,22 @@ def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
             "SQLite schema object 'cayu_sessions.invocation_json' conflicts with "
             "Cayu's required invocation-provenance contract. Recreate the Cayu "
             "database from a known-good revision-36 schema."
+        )
+
+
+def _validate_knowledge_publication_access_snapshot_column(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_knowledge_publication_receipts)")
+    }
+    if columns.get("access_snapshot_json") != ("TEXT", 1):
+        raise RuntimeError(
+            "SQLite schema object "
+            "'cayu_knowledge_publication_receipts.access_snapshot_json' conflicts "
+            "with Cayu's knowledge authorization contract. Recreate the Cayu "
+            "database from a known-good revision-41 schema."
         )
 
 
@@ -2588,19 +2634,41 @@ def _transaction(
     ``executescript`` cannot be used here: it force-commits any open transaction,
     so revision DDL is executed statement-by-statement.
 
-    ``begin_immediate=False`` preserves ``sqlite3``'s implicit writer admission
-    for knowledge operations that previously used the connection context manager.
+    ``begin_immediate=False`` starts a deferred transaction. Read paths use it
+    to hydrate one authorization-checked result from a stable WAL snapshot;
+    writes still take the immediate writer reservation before inspecting state.
     """
     failure: BaseException | None = None
     suppress_implicit_context = False
+    transaction_started = False
     try:
         if begin_immediate:
             connection.execute("BEGIN IMMEDIATE")
+        else:
+            connection.execute("BEGIN")
+        transaction_started = True
         yield
         connection.commit()
     except BaseException as primary:
-        failure = _settle_failed_transaction(connection, primary)
-        suppress_implicit_context = failure is not primary
+        if transaction_started:
+            failure = _settle_failed_transaction(connection, primary)
+            suppress_implicit_context = failure is not primary
+        else:
+            # A boundary wrapper can raise after SQLite accepted BEGIN. Probe
+            # conservatively so that owned work is rolled back, while a closed
+            # or otherwise unreadable connection preserves the original BEGIN
+            # failure instead of manufacturing a cleanup aggregate.
+            try:
+                began_despite_error = connection.in_transaction
+            except BaseException:
+                failure = primary
+            else:
+                failure = (
+                    _settle_failed_transaction(connection, primary)
+                    if began_despite_error
+                    else primary
+                )
+                suppress_implicit_context = failure is not primary
     if failure is not None:
         # A context-manager body exception remains Python's active implicit
         # context while __exit__ runs. Suppress that incidental chain because the
@@ -2716,6 +2784,12 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         and any(revision.revision == 39 for revision in schema.pending(current))
     ):
         _reject_populated_pre_task_invocation_database(connection)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 41
+        and any(revision.revision == 41 for revision in schema.pending(current))
+    ):
+        _reject_populated_pre_knowledge_access_snapshot_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -2774,6 +2848,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         hook = _MIGRATION_HOOKS.get(rev.revision)
         if hook is not None:
             hook(connection)
+        if rev.revision == 41:
+            _validate_knowledge_publication_access_snapshot_column(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

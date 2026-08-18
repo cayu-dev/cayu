@@ -11,6 +11,7 @@ from cayu.embeddings import TextEmbeddingProvider
 from cayu.providers import OpenAIProvider
 from cayu.storage import (
     InMemoryEmbeddingKnowledgeStore,
+    KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeHit,
     KnowledgeQuery,
@@ -55,6 +56,7 @@ async def _run_contract(
     dimensions: int | None,
 ) -> dict[str, object]:
     store = InMemoryEmbeddingKnowledgeStore(
+        access_scope=KnowledgeAccessScope.for_namespace("default"),
         embedding_provider=provider,
         embedding_model=embedding_model,
         embedding_dimensions=dimensions,

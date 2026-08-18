@@ -26,6 +26,7 @@ import os
 
 from cayu.providers import OpenAIProvider
 from cayu.storage import (
+    KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeListQuery,
     KnowledgeQuery,
@@ -37,6 +38,10 @@ from cayu.storage.migrations import SchemaMode
 
 NAMESPACE = "demo-postgres-embedding"
 PROJECT_LABEL = {"project": "cayu-demo"}
+ACCESS_SCOPE = KnowledgeAccessScope.for_namespace(
+    NAMESPACE,
+    required_labels=PROJECT_LABEL,
+)
 
 
 async def main() -> None:
@@ -59,6 +64,7 @@ async def main() -> None:
     provider = OpenAIProvider()
     store = PostgresEmbeddingKnowledgeStore(
         dsn,
+        access_scope=ACCESS_SCOPE,
         min_size=1,
         max_size=4,
         schema_mode=SchemaMode.CREATE,
@@ -122,6 +128,7 @@ async def main() -> None:
 async def _seed_keyword_knowledge(dsn: str) -> dict[str, int]:
     store = PostgresKnowledgeStore(
         dsn,
+        access_scope=ACCESS_SCOPE,
         min_size=1,
         max_size=4,
         schema_mode=SchemaMode.CREATE,

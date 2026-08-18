@@ -20,6 +20,7 @@ from cayu.storage import migrations as schema
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -37,8 +38,14 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _knowledge_access_snapshot,
+    _knowledge_access_snapshot_json,
     _knowledge_publication_operation_id,
+    _knowledge_scope_allows_snapshot,
+    _parse_knowledge_access_snapshot_json,
+    _require_knowledge_entry_access,
     _validate_knowledge_publication_replay,
+    copy_knowledge_access_scope,
     copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_list_query,
@@ -49,7 +56,7 @@ from cayu.storage.memory import (
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
-_SQLITE_MIN_REQUIRED_REVISION = 37
+_SQLITE_MIN_REQUIRED_REVISION = 41
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -60,6 +67,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         path: str | Path,
         *,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -70,6 +78,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
         self.path = db_path
+        self._default_access_scope = (
+            None if access_scope is None else copy_knowledge_access_scope(access_scope)
+        )
         self._schema_mode = schema_mode
         self._lock = asyncio.Lock()
         self._connection = sqlite_support.connect(db_path)
@@ -79,11 +90,20 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
         )
 
-    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+    async def put_entry(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
+        _require_knowledge_entry_access(scope, entry, operation="put_entry")
         async with self._lock:
             with sqlite_support._transaction(self._connection):
                 existing_entry = self._load_entry_unlocked(entry.id)
+                if existing_entry is not None:
+                    _require_knowledge_entry_access(scope, existing_entry, operation="put_entry")
                 existing_chunks = self._load_chunks_unlocked(entry.id)
                 self._upsert_entry_unlocked(entry)
                 if (
@@ -98,26 +118,42 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     self._refresh_entry_fts_unlocked(entry.id)
             return copy_knowledge_entry(entry)
 
-    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
+    async def get_entry(
+        self,
+        entry_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry | None:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         async with self._lock:
-            entry = self._load_entry_unlocked(clean_id)
-            return None if entry is None else copy_knowledge_entry(entry)
+            with sqlite_support._transaction(
+                self._connection,
+                begin_immediate=False,
+            ):
+                entry = self._load_entry_in_scope_unlocked(clean_id, scope)
+                return None if entry is None else copy_knowledge_entry(entry)
 
     async def update_entry_status(
         self,
         entry_id: str,
         status: KnowledgeStatus,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         if not isinstance(status, KnowledgeStatus):
             raise ValueError("status must be a KnowledgeStatus.")
         async with self._lock:
-            entry = self._load_entry_unlocked(clean_id)
-            if entry is None:
-                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-            updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_support._transaction(self._connection):
+                entry = self._load_entry_unlocked(clean_id)
+                if entry is None:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                _require_knowledge_entry_access(scope, entry, operation="update_entry_status")
+                updated = entry.model_copy(update={"status": status})
+                _require_knowledge_entry_access(scope, updated, operation="update_entry_status")
+                updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
                 cursor = self._connection.execute(
                     """
                     UPDATE cayu_knowledge_entries
@@ -130,25 +166,24 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         clean_id,
                     ),
                 )
-            # Guard the check-then-write: a concurrent hard delete between the load
-            # above and this UPDATE leaves nothing to update, so surface the removal
-            # instead of silently reloading a missing row.
-            if cursor.rowcount != 1:
-                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-            loaded = self._load_entry_unlocked(clean_id)
-            if loaded is None:
-                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-            return loaded
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                loaded = self._load_entry_unlocked(clean_id)
+                if loaded is None:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                return loaded
 
     async def transition_entry_status(
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
         expected_namespace: str | None = None,
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
@@ -161,30 +196,41 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
         async with self._lock:
-            entry = self._load_entry_unlocked(clean_id)
-            if entry is None:
-                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-            updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
-            scope_clauses: list[str] = []
-            scope_params: list[object] = []
-            if expected_namespace is not None:
-                scope_clauses.append("namespace = ?")
-                scope_params.append(expected_namespace)
-            for key, value in expected_labels.items():
-                scope_clauses.append(
-                    """
-                    EXISTS (
-                        SELECT 1
-                        FROM cayu_knowledge_labels AS label
-                        WHERE label.entry_id = cayu_knowledge_entries.id
-                          AND label.key = ?
-                          AND label.value = ?
-                    )
-                    """
+            with sqlite_support._transaction(self._connection):
+                entry = self._load_entry_unlocked(clean_id)
+                if entry is None:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                _require_knowledge_entry_access(
+                    scope,
+                    entry,
+                    operation="transition_entry_status",
                 )
-                scope_params.extend([key, value])
-            scope_sql = "".join(f" AND {clause}" for clause in scope_clauses)
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                target = entry.model_copy(update={"status": to_status})
+                _require_knowledge_entry_access(
+                    scope,
+                    target,
+                    operation="transition_entry_status",
+                )
+                updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
+                scope_clauses: list[str] = []
+                scope_params: list[object] = []
+                if expected_namespace is not None:
+                    scope_clauses.append("namespace = ?")
+                    scope_params.append(expected_namespace)
+                for key, value in expected_labels.items():
+                    scope_clauses.append(
+                        """
+                        EXISTS (
+                            SELECT 1
+                            FROM cayu_knowledge_labels AS label
+                            WHERE label.entry_id = cayu_knowledge_entries.id
+                              AND label.key = ?
+                              AND label.value = ?
+                        )
+                        """
+                    )
+                    scope_params.extend([key, value])
+                scope_sql = "".join(f" AND {clause}" for clause in scope_clauses)
                 cursor = self._connection.execute(
                     f"""
                     UPDATE cayu_knowledge_entries
@@ -200,61 +246,86 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         *scope_params,
                     ),
                 )
-            if cursor.rowcount != 1:
-                current = self._load_entry_unlocked(clean_id)
-                if current is None:
-                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-                if expected_namespace is not None and current.namespace != expected_namespace:
-                    raise ValueError(
-                        f"Knowledge entry {clean_id!r} does not match expected namespace."
-                    )
-                for key, value in expected_labels.items():
-                    if current.labels.get(key) != value:
+                if cursor.rowcount != 1:
+                    current = self._load_entry_unlocked(clean_id)
+                    if current is None:
+                        raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                    if expected_namespace is not None and current.namespace != expected_namespace:
                         raise ValueError(
-                            f"Knowledge entry {clean_id!r} does not match expected labels."
+                            f"Knowledge entry {clean_id!r} does not match expected namespace."
                         )
-                raise ValueError(
-                    f"Knowledge entry {clean_id!r} is {current.status.value!r}, "
-                    f"not {from_status.value!r}."
-                )
-            loaded = self._load_entry_unlocked(clean_id)
-            if loaded is None:
-                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-            return loaded
+                    for key, value in expected_labels.items():
+                        if current.labels.get(key) != value:
+                            raise ValueError(
+                                f"Knowledge entry {clean_id!r} does not match expected labels."
+                            )
+                    raise ValueError(
+                        f"Knowledge entry {clean_id!r} is {current.status.value!r}, "
+                        f"not {from_status.value!r}."
+                    )
+                loaded = self._load_entry_unlocked(clean_id)
+                if loaded is None:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                return loaded
 
     async def delete_entry(
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         async with self._lock:
-            entry = self._load_entry_unlocked(clean_id)
-            if entry is None:
-                return None
-            if hard:
-                with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_support._transaction(self._connection):
+                entry = self._load_entry_unlocked(clean_id)
+                if entry is None:
+                    return None
+                _require_knowledge_entry_access(scope, entry, operation="delete_entry")
+                if hard:
                     self._delete_chunks_unlocked(clean_id)
                     self._connection.execute(
                         "DELETE FROM cayu_knowledge_entries WHERE id = ?",
                         (clean_id,),
                     )
-                return copy_knowledge_entry(entry)
-        return await self.update_entry_status(clean_id, KnowledgeStatus.DELETED)
+                    return copy_knowledge_entry(entry)
+                target = entry.model_copy(update={"status": KnowledgeStatus.DELETED})
+                _require_knowledge_entry_access(scope, target, operation="delete_entry")
+                updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
+                self._connection.execute(
+                    "UPDATE cayu_knowledge_entries SET status = ?, updated_at = ? WHERE id = ?",
+                    (
+                        str(KnowledgeStatus.DELETED),
+                        sqlite_support.format_datetime(updated_at),
+                        clean_id,
+                    ),
+                )
+                loaded = self._load_entry_unlocked(clean_id)
+                if loaded is None:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                return loaded
 
-    async def prune_expired(self, *, now: datetime | None = None) -> int:
+    async def prune_expired(
+        self,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        scope = self._operation_access_scope(access_scope)
         cutoff = datetime.now(UTC) if now is None else now
+        access_sql, access_params = _knowledge_access_scope_filter_sql(scope)
         async with self._lock:
-            rows = self._connection.execute(
-                "SELECT id FROM cayu_knowledge_entries "
-                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
-                (sqlite_support.format_datetime(cutoff),),
-            ).fetchall()
-            expired_ids = [str(row["id"]) for row in rows]
-            if not expired_ids:
-                return 0
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_support._transaction(self._connection):
+                rows = self._connection.execute(
+                    "SELECT id FROM cayu_knowledge_entries "
+                    "AS e WHERE expires_at IS NOT NULL AND expires_at <= ? "
+                    f"{access_sql}",
+                    [sqlite_support.format_datetime(cutoff), *access_params],
+                ).fetchall()
+                expired_ids = [str(row["id"]) for row in rows]
+                if not expired_ids:
+                    return 0
                 # FTS is a virtual table (no FK cascade), so clear chunks/FTS explicitly; the
                 # entries DELETE then cascades to labels/aspects/impact_targets.
                 for entry_id in expired_ids:
@@ -269,13 +340,18 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         self,
         entry_id: str,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> list[KnowledgeChunk]:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         copied_chunks = _copy_entry_chunks(clean_id, chunks)
         async with self._lock:
-            if self._load_entry_unlocked(clean_id) is None:
-                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_support._transaction(self._connection):
+                entry = self._load_entry_unlocked(clean_id)
+                if entry is None:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                _require_knowledge_entry_access(scope, entry, operation="replace_chunks")
                 self._replace_chunks_unlocked(clean_id, copied_chunks)
             return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
 
@@ -283,11 +359,22 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
         copied_entry = copy_knowledge_entry(entry)
+        _require_knowledge_entry_access(scope, copied_entry, operation="put_entry_with_chunks")
         copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
         async with self._lock:
             with sqlite_support._transaction(self._connection):
+                existing_entry = self._load_entry_unlocked(copied_entry.id)
+                if existing_entry is not None:
+                    _require_knowledge_entry_access(
+                        scope,
+                        existing_entry,
+                        operation="put_entry_with_chunks",
+                    )
                 self._upsert_entry_unlocked(copied_entry)
                 self._replace_chunks_unlocked(copied_entry.id, copied_chunks)
             return copy_knowledge_entry(copied_entry)
@@ -297,11 +384,14 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
     ) -> KnowledgePublicationReceipt:
+        scope = self._operation_access_scope(access_scope)
         operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
             entry, chunks, operation_id=operation_id
         )
+        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_with_chunks")
         async with self._lock:
             with sqlite_support._transaction(self._connection):
                 existing_receipt = self._load_publication_receipt_unlocked(operation_id)
@@ -327,27 +417,32 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 self._insert_entry_unlocked(copied_entry)
                 self._insert_chunks_unlocked(copied_entry, copied_chunks)
-                self._insert_publication_receipt_unlocked(receipt)
+                self._insert_publication_receipt_unlocked(receipt, copied_entry)
             return copy_knowledge_publication_receipt(receipt)
 
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         async with self._lock:
-            receipt = self._load_publication_receipt_unlocked(operation_id)
+            receipt = self._load_publication_receipt_in_scope_unlocked(operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     async def read_chunks(
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         chunk_index: int | None = None,
         around: int = 0,
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
+        scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
         if chunk_index is not None:
             _validate_nonnegative_int(chunk_index, "chunk_index")
@@ -357,9 +452,13 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         _validate_positive_int(max_chunks, "max_chunks")
         _validate_positive_int(max_bytes, "max_bytes")
         async with self._lock:
-            if self._load_entry_unlocked(clean_id) is None:
-                return []
-            chunks = self._load_chunks_unlocked(clean_id)
+            with sqlite_support._transaction(
+                self._connection,
+                begin_immediate=False,
+            ):
+                if self._load_entry_in_scope_unlocked(clean_id, scope) is None:
+                    return []
+                chunks = self._load_chunks_unlocked(clean_id)
         if chunk_index is not None:
             chunks = _center_chunk_window(chunks, chunk_index=chunk_index, max_chunks=max_chunks)
         start_index = 0 if chunk_index is None else max(0, chunk_index - around)
@@ -372,32 +471,45 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             max_bytes=max_bytes,
         )
 
-    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+    async def search(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
         if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("SQLiteKnowledgeStore supports only auto and keyword search modes.")
         fts_query, preview_terms = _sqlite_knowledge_fts_query(knowledge_query)
         none_fts_query = _sqlite_knowledge_none_fts_query(knowledge_query)
         where_sql, params = _knowledge_filter_sql(knowledge_query)
+        access_sql, access_params = _knowledge_access_scope_filter_sql(scope)
+        where_sql += access_sql
+        params.extend(access_params)
         async with self._lock:
-            total_hits_known = self._count_search_hits_unlocked(
-                fts_query,
-                none_fts_query,
-                where_sql,
-                params,
-            )
-            unique_rows = self._search_unique_rows_unlocked(
-                fts_query=fts_query,
-                none_fts_query=none_fts_query,
-                where_sql=where_sql,
-                params=params,
-                limit=knowledge_query.limit,
-            )
-            hits, byte_truncated = self._hits_from_search_rows_unlocked(
-                unique_rows,
-                knowledge_query,
-                preview_terms,
-            )
+            with sqlite_support._transaction(
+                self._connection,
+                begin_immediate=False,
+            ):
+                total_hits_known = self._count_search_hits_unlocked(
+                    fts_query,
+                    none_fts_query,
+                    where_sql,
+                    params,
+                )
+                unique_rows = self._search_unique_rows_unlocked(
+                    fts_query=fts_query,
+                    none_fts_query=none_fts_query,
+                    where_sql=where_sql,
+                    params=params,
+                    limit=knowledge_query.limit,
+                )
+                hits, byte_truncated = self._hits_from_search_rows_unlocked(
+                    unique_rows,
+                    knowledge_query,
+                    preview_terms,
+                )
         return KnowledgeSearchResult(
             query=knowledge_query,
             hits=hits,
@@ -407,34 +519,47 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             total_hits_known=total_hits_known,
         )
 
-    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+    async def list_entries(
+        self,
+        query: KnowledgeListQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeListResult:
+        scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_list_query(query)
         where_sql, params = _knowledge_list_filter_sql(knowledge_query)
+        access_sql, access_params = _knowledge_access_scope_filter_sql(scope)
+        where_sql += access_sql
+        params.extend(access_params)
         async with self._lock:
-            total_entries_known = self._count_list_entries_unlocked(where_sql, params)
-            rows = self._connection.execute(
-                f"""
-                SELECT e.id
-                FROM cayu_knowledge_entries AS e
-                WHERE 1 = 1
-                {where_sql}
-                ORDER BY COALESCE(e.importance, 0.0) DESC,
-                         e.updated_at DESC,
-                         e.id ASC
-                LIMIT ?
-                """,
-                [*params, knowledge_query.limit],
-            ).fetchall()
-            entry_map = self._load_entries_unlocked([str(row["id"]) for row in rows])
-            entries = [
-                entry for row in rows if (entry := entry_map.get(str(row["id"]))) is not None
-            ]
-            facets, facets_truncated = self._list_facets_unlocked(
-                knowledge_query,
-                where_sql,
-                params,
-            )
-            items, byte_truncated = self._list_items_unlocked(entries, knowledge_query)
+            with sqlite_support._transaction(
+                self._connection,
+                begin_immediate=False,
+            ):
+                total_entries_known = self._count_list_entries_unlocked(where_sql, params)
+                rows = self._connection.execute(
+                    f"""
+                    SELECT e.id
+                    FROM cayu_knowledge_entries AS e
+                    WHERE 1 = 1
+                    {where_sql}
+                    ORDER BY COALESCE(e.importance, 0.0) DESC,
+                             e.updated_at DESC,
+                             e.id ASC
+                    LIMIT ?
+                    """,
+                    [*params, knowledge_query.limit],
+                ).fetchall()
+                entry_map = self._load_entries_unlocked([str(row["id"]) for row in rows])
+                entries = [
+                    entry for row in rows if (entry := entry_map.get(str(row["id"]))) is not None
+                ]
+                facets, facets_truncated = self._list_facets_unlocked(
+                    knowledge_query,
+                    where_sql,
+                    params,
+                )
+                items, byte_truncated = self._list_items_unlocked(entries, knowledge_query)
         return KnowledgeListResult(
             query=knowledge_query,
             entries=items,
@@ -833,9 +958,47 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         except Exception:
             raise KnowledgePublicationConflict("malformed_receipt") from None
 
+    def _load_publication_receipt_in_scope_unlocked(
+        self,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgePublicationReceipt | None:
+        row = self._connection.execute(
+            """
+            SELECT
+                receipt.operation_id,
+                receipt.entry_id,
+                receipt.request_sha256,
+                receipt.entry_created_at,
+                receipt.entry_updated_at,
+                receipt.committed_at,
+                receipt.access_snapshot_json
+            FROM cayu_knowledge_publication_receipts AS receipt
+            WHERE receipt.operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            snapshot = _parse_knowledge_access_snapshot_json(row["access_snapshot_json"])
+            if not _knowledge_scope_allows_snapshot(access_scope, snapshot):
+                return None
+            return KnowledgePublicationReceipt(
+                operation_id=row["operation_id"],
+                entry_id=row["entry_id"],
+                request_sha256=row["request_sha256"],
+                entry_created_at=sqlite_support.parse_datetime(row["entry_created_at"]),
+                entry_updated_at=sqlite_support.parse_datetime(row["entry_updated_at"]),
+                committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+            )
+        except Exception:
+            raise KnowledgePublicationConflict("malformed_receipt") from None
+
     def _insert_publication_receipt_unlocked(
         self,
         receipt: KnowledgePublicationReceipt,
+        entry: KnowledgeEntry,
     ) -> None:
         self._connection.execute(
             """
@@ -845,9 +1008,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 request_sha256,
                 entry_created_at,
                 entry_updated_at,
-                committed_at
+                committed_at,
+                access_snapshot_json
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 receipt.operation_id,
@@ -856,6 +1020,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 sqlite_support.format_datetime(receipt.entry_created_at),
                 sqlite_support.format_datetime(receipt.entry_updated_at),
                 sqlite_support.format_datetime(receipt.committed_at),
+                _knowledge_access_snapshot_json(_knowledge_access_snapshot(entry)),
             ),
         )
 
@@ -929,6 +1094,25 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         row = self._connection.execute(
             "SELECT * FROM cayu_knowledge_entries WHERE id = ?",
             (entry_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _entry_from_row(
+            row,
+            labels=self._load_labels_unlocked(entry_id),
+            aspects=self._load_aspects_unlocked(entry_id),
+            impact_targets=self._load_impact_targets_unlocked(entry_id),
+        )
+
+    def _load_entry_in_scope_unlocked(
+        self,
+        entry_id: str,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeEntry | None:
+        where_sql, params = _knowledge_access_scope_filter_sql(access_scope)
+        row = self._connection.execute(
+            f"SELECT e.* FROM cayu_knowledge_entries AS e WHERE e.id = ? {where_sql}",
+            [entry_id, *params],
         ).fetchone()
         if row is None:
             return None
@@ -1128,6 +1312,54 @@ def _knowledge_list_filter_sql(query: KnowledgeListQuery) -> tuple[str, list[obj
         source_id=query.source_id,
         include_expired=query.include_expired,
     )
+
+
+def _knowledge_access_scope_filter_sql(
+    scope: KnowledgeAccessScope,
+) -> tuple[str, list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if not scope.allow_all_namespaces:
+        placeholders = ", ".join("?" for _ in scope.allowed_namespaces)
+        clauses.append(f"e.namespace IN ({placeholders})")
+        params.extend(scope.allowed_namespaces)
+    for key, value in scope.required_labels.items():
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_labels AS access_label
+                WHERE access_label.entry_id = e.id
+                  AND access_label.key = ?
+                  AND access_label.value = ?
+            )
+            """
+        )
+        params.extend([key, value])
+    visibility_placeholders = ", ".join("?" for _ in scope.allowed_visibilities)
+    clauses.append(f"e.visibility IN ({visibility_placeholders})")
+    params.extend(str(visibility) for visibility in scope.allowed_visibilities)
+    status_placeholders = ", ".join("?" for _ in scope.allowed_statuses)
+    clauses.append(f"e.status IN ({status_placeholders})")
+    params.extend(str(status) for status in scope.allowed_statuses)
+    if scope.allowed_source_types is not None:
+        if scope.allowed_source_types:
+            placeholders = ", ".join("?" for _ in scope.allowed_source_types)
+            clauses.append(f"e.source_type IN ({placeholders})")
+            params.extend(scope.allowed_source_types)
+        else:
+            clauses.append("0")
+    if scope.allowed_source_ids is not None:
+        if scope.allowed_source_ids:
+            placeholders = ", ".join("?" for _ in scope.allowed_source_ids)
+            clauses.append(f"e.source_id IN ({placeholders})")
+            params.extend(scope.allowed_source_ids)
+        else:
+            clauses.append("0")
+    if not scope.include_expired:
+        clauses.append("(e.expires_at IS NULL OR e.expires_at > ?)")
+        params.append(sqlite_support.format_datetime(datetime.now(UTC)))
+    return " AND " + " AND ".join(clauses), params
 
 
 def _knowledge_metadata_filter_sql(

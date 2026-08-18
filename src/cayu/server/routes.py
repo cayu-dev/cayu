@@ -3291,6 +3291,7 @@ def create_router(
     session_store,
     task_store,
     knowledge_store=None,
+    knowledge_access_scope=None,
     knowledge_review_namespace: str | None = None,
     knowledge_review_labels: dict[str, str] | None = None,
     auth: AuthDependency | None = None,
@@ -7283,6 +7284,7 @@ def create_router(
             raise HTTPException(status_code=404, detail="Knowledge store is not configured.")
         return KnowledgeReviewWorkflow(
             knowledge_store,
+            access_scope=knowledge_access_scope,
             namespace=knowledge_review_namespace,
             labels=knowledge_review_labels,
             default_limit=50,

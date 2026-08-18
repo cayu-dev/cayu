@@ -523,6 +523,7 @@ class ToolContext(BaseModel):
     vault: VaultHandle | None = Field(default=None, exclude=True)
     proxy: CredentialProxyHandle | None = Field(default=None, exclude=True)
     knowledge_store: KnowledgeStoreHandle | None = Field(default=None, exclude=True)
+    knowledge_access_scope: Any = Field(default=None, exclude=True)
     mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
     _policy_denials: list[_PolicyDenialSignal] = PrivateAttr(default_factory=list)

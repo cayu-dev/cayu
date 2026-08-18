@@ -14,6 +14,7 @@ import pytest
 
 from cayu.runtime import RunRequest, SessionIdentity
 from cayu.storage import (
+    KnowledgeAccessScope,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeQuery,
@@ -22,6 +23,8 @@ from cayu.storage import (
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
+
+_ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 
 
 async def _close(store: object) -> None:
@@ -373,7 +376,7 @@ def test_revision_37_migrates_legacy_fts_and_preserves_ranking(tmp_path: Path) -
     db_path = tmp_path / "legacy-knowledge.sqlite"
 
     async def seed() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry_with_chunks(
                 KnowledgeEntry(id="alpha", title="Shared", text="shared summary"),
@@ -407,7 +410,9 @@ def test_revision_37_migrates_legacy_fts_and_preserves_ranking(tmp_path: Path) -
     finally:
         legacy.close()
 
-    migrated = SQLiteKnowledgeStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+    migrated = SQLiteKnowledgeStore(
+        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
+    )
     asyncio.run(_close(migrated))
     after = _raw_ranked_matches(db_path, "shared")
 
@@ -438,7 +443,9 @@ def test_revision_37_migrates_legacy_fts_and_preserves_ranking(tmp_path: Path) -
     finally:
         connection.close()
 
-    retried = SQLiteKnowledgeStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+    retried = SQLiteKnowledgeStore(
+        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
+    )
     asyncio.run(_close(retried))
 
 
@@ -449,7 +456,7 @@ def test_revision_37_failure_rolls_back_legacy_schema_and_search(
     db_path = tmp_path / "failed-migration.sqlite"
 
     async def seed() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry(KnowledgeEntry(id="legacy", text="searchable legacy"))
         finally:
@@ -502,7 +509,9 @@ def test_revision_37_failure_rolls_back_legacy_schema_and_search(
         "_validate_revision_37_knowledge_fts_data",
         original,
     )
-    repaired = SQLiteKnowledgeStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+    repaired = SQLiteKnowledgeStore(
+        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
+    )
     asyncio.run(_close(repaired))
 
 
@@ -521,7 +530,7 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
     db_path = tmp_path / f"migration-{failure}.sqlite"
 
     async def seed() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
         finally:
@@ -561,7 +570,7 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
     finally:
         connection.close()
 
-    migrated = SQLiteKnowledgeStore(db_path)
+    migrated = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
     try:
         result = asyncio.run(migrated.search(KnowledgeQuery(text="legacy searchable")))
         assert [hit.entry.id for hit in result.hits] == ["legacy"]
@@ -575,7 +584,7 @@ def test_revision_37_commit_acknowledgement_loss_preserves_committed_migration(
     db_path = tmp_path / "migration-commit-acknowledgement.sqlite"
 
     async def seed() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
         finally:
@@ -605,7 +614,7 @@ def test_revision_37_commit_acknowledgement_loss_preserves_committed_migration(
         connection.close()
 
     peer = SQLiteSessionStore(db_path)
-    migrated = SQLiteKnowledgeStore(db_path)
+    migrated = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
     try:
         asyncio.run(
             peer.create(
@@ -626,7 +635,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
     db_path = tmp_path / "migration-commit-rollback-failure.sqlite"
 
     async def seed() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
         finally:
@@ -686,7 +695,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
     finally:
         retry.close()
 
-    migrated = SQLiteKnowledgeStore(db_path)
+    migrated = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
     try:
         result = asyncio.run(migrated.search(KnowledgeQuery(text="legacy searchable")))
         assert [hit.entry.id for hit in result.hits] == ["legacy"]
@@ -712,7 +721,7 @@ def test_sqlite_knowledge_rollback_failure_preserves_primary_and_fences_store(
     db_path = tmp_path / f"knowledge-rollback-failure-{primary_kind}.sqlite"
 
     async def run() -> None:
-        store = FailingStore(db_path)
+        store = FailingStore(db_path, access_scope=_ACCESS_SCOPE)
         peer: SQLiteKnowledgeStore | None = None
         try:
             await store.put_entry(KnowledgeEntry(id="target", text="originaltoken"))
@@ -752,7 +761,7 @@ def test_sqlite_knowledge_rollback_failure_preserves_primary_and_fences_store(
             with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
                 await store.get_entry("target")
 
-            peer = SQLiteKnowledgeStore(db_path)
+            peer = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
             peer._connection.execute("PRAGMA busy_timeout = 100")
             loaded = await peer.get_entry("target")
             assert loaded is not None and loaded.text == "originaltoken"
@@ -774,7 +783,7 @@ def test_sqlite_knowledge_mutations_keep_exact_fts_rows(tmp_path: Path) -> None:
     db_path = tmp_path / "mutations.sqlite"
 
     async def run() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             entry = KnowledgeEntry(id="mutable", title="Original", text="old summary")
             await store.put_entry_with_chunks(
@@ -873,7 +882,10 @@ def test_sqlite_knowledge_refresh_failure_rolls_back_source_and_fts(
                 raise RuntimeError("injected after FTS insert")
 
     async def run() -> None:
-        store = FailingStore(tmp_path / f"rollback-{failure_phase}.sqlite")
+        store = FailingStore(
+            tmp_path / f"rollback-{failure_phase}.sqlite",
+            access_scope=_ACCESS_SCOPE,
+        )
         try:
             await store.put_entry(KnowledgeEntry(id="atomic", text="original body"))
             store.fail_at = failure_phase
@@ -902,7 +914,7 @@ def test_sqlite_knowledge_cancellation_before_writer_admission_is_atomic(
     tmp_path: Path,
 ) -> None:
     async def run() -> None:
-        store = SQLiteKnowledgeStore(tmp_path / "cancelled.sqlite")
+        store = SQLiteKnowledgeStore(tmp_path / "cancelled.sqlite", access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry(KnowledgeEntry(id="cancelled", text="original"))
             await store._lock.acquire()
@@ -950,16 +962,16 @@ def test_sqlite_knowledge_interruption_rolls_back_and_releases_writer(
             if self.interrupt_at == "fts":
                 signal.raise_signal(signal.SIGINT)
 
-        def _insert_publication_receipt_unlocked(self, receipt) -> None:
-            super()._insert_publication_receipt_unlocked(receipt)
+        def _insert_publication_receipt_unlocked(self, receipt, entry) -> None:
+            super()._insert_publication_receipt_unlocked(receipt, entry)
             if self.interrupt_at == "receipt":
                 signal.raise_signal(signal.SIGINT)
 
     db_path = tmp_path / f"interrupted-{entrance}.sqlite"
 
     async def run() -> None:
-        store = InterruptingStore(db_path)
-        peer = SQLiteKnowledgeStore(db_path)
+        store = InterruptingStore(db_path, access_scope=_ACCESS_SCOPE)
+        peer = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         peer._connection.execute("PRAGMA busy_timeout = 100")
         try:
             if entrance != "publish_entry_with_chunks":
@@ -1037,7 +1049,7 @@ def _measure_single_entry_refresh(
         list[tuple[object, ...]],
         str,
     ]:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry_with_chunks(
                 KnowledgeEntry(id="target", title="Before", text="target summary"),
@@ -1126,7 +1138,7 @@ def test_bounded_knowledge_refresh_does_not_starve_shared_checkpoint_write(
     db_path = tmp_path / "shared.sqlite"
 
     async def seed() -> None:
-        knowledge = SQLiteKnowledgeStore(db_path)
+        knowledge = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         session_store = SQLiteSessionStore(db_path)
         try:
             await knowledge.put_entry_with_chunks(
@@ -1143,7 +1155,7 @@ def test_bounded_knowledge_refresh_does_not_starve_shared_checkpoint_write(
             await _close(session_store)
 
     asyncio.run(seed())
-    knowledge = SQLiteKnowledgeStore(db_path)
+    knowledge = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
     checkpoint_store = SQLiteSessionStore(db_path)
     knowledge_paused = threading.Event()
     release_knowledge = threading.Event()
@@ -1231,7 +1243,7 @@ def test_sigkill_during_revision_37_migration_rolls_back_and_retries(
     marker = tmp_path / "migration-started"
 
     async def seed() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
             _seed_unrelated_corpus(store._connection, chunk_count=5000)
@@ -1297,7 +1309,9 @@ support.reconcile_schema(connection, migrations.SchemaMode.MIGRATE)
     finally:
         connection.close()
 
-    migrated = SQLiteKnowledgeStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+    migrated = SQLiteKnowledgeStore(
+        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
+    )
     try:
         result = asyncio.run(migrated.search(KnowledgeQuery(text="legacy searchable")))
         assert [hit.entry.id for hit in result.hits] == ["legacy"]
@@ -1311,7 +1325,7 @@ def test_sigkill_during_knowledge_refresh_cannot_publish_half_state(tmp_path: Pa
     marker = tmp_path / "refresh-paused"
 
     async def seed() -> None:
-        store = SQLiteKnowledgeStore(db_path)
+        store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             await store.put_entry(KnowledgeEntry(id="target", text="originaltoken"))
         finally:
@@ -1323,11 +1337,12 @@ import asyncio
 import pathlib
 import sys
 import time
-from cayu.storage import KnowledgeEntry, SQLiteKnowledgeStore
+from cayu.storage import KnowledgeAccessScope, KnowledgeEntry, SQLiteKnowledgeStore
 
 db_path = pathlib.Path(sys.argv[1])
 marker = pathlib.Path(sys.argv[2])
-store = SQLiteKnowledgeStore(db_path)
+_ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
 original = store._insert_entry_fts_unlocked
 
 def pause_before_fts(entry, chunks):
@@ -1352,7 +1367,7 @@ asyncio.run(store.put_entry(KnowledgeEntry(id='target', text='replacementtoken')
             process.kill()
             process.wait(timeout=5)
 
-    store = SQLiteKnowledgeStore(db_path)
+    store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
     try:
         loaded = asyncio.run(store.get_entry("target"))
         assert loaded is not None and loaded.text == "originaltoken"

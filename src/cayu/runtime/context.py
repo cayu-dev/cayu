@@ -764,6 +764,7 @@ class ContextRequest(BaseModel):
     step: StrictInt = Field(ge=1)
     environment_name: str | None = None
     knowledge_store: Any = Field(default=None, exclude=True)
+    knowledge_access_scope: Any = Field(default=None, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
     context_usage: ContextUsageState = Field(default_factory=ContextUsageState)
     pressure_overhead: ContextPressureOverhead = Field(default_factory=ContextPressureOverhead)
@@ -1829,7 +1830,23 @@ class KnowledgeInjectionPolicy(RuntimeManagedContextPolicy):
                 )
                 knowledge_search_observed = True
                 try:
-                    search_result = await request.knowledge_store.search(query)
+                    access_scope = request.knowledge_access_scope
+                    if access_scope is None:
+                        bound_scope = getattr(
+                            request.knowledge_store,
+                            "bound_access_scope",
+                            None,
+                        )
+                        if callable(bound_scope):
+                            access_scope = bound_scope()
+                    if access_scope is None:
+                        raise PermissionError(
+                            "ContextRequest knowledge search requires an access scope."
+                        )
+                    search_result = await request.knowledge_store.search(
+                        query,
+                        access_scope=access_scope,
+                    )
                 except Exception as exc:
                     diagnostic = exception_diagnostic(
                         exc,

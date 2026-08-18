@@ -2190,6 +2190,7 @@ class ToolRoundExecutor:
                 on_redactor_change=persist_resolved_secret_projection,
             ),
             knowledge_store=_knowledge_store(registered_environment),
+            knowledge_access_scope=_knowledge_access_scope(registered_environment),
             mcp_servers=_mcp_servers(registered_environment),
             metadata=ctx_metadata,
         )
@@ -6116,6 +6117,14 @@ def _knowledge_store(
     if registered_environment is None:
         return None
     return registered_environment.environment.knowledge_store
+
+
+def _knowledge_access_scope(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.knowledge_access_scope
 
 
 def _mcp_servers(

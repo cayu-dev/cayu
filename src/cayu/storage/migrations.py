@@ -237,6 +237,11 @@ REVISIONS: tuple[Revision, ...] = (
     # before migration; the compatibility floor prevents later old-binary startup
     # or rollback, but cannot revoke an already-running worker's cached schema.
     Revision(revision=40, kind=RevisionKind.BREAKING, compatible_from=40),
+    # Knowledge publication receipts now retain the immutable authorization
+    # projection of their entry. Without it, a receipt cannot be safely replayed
+    # after hard deletion. Existing receipts are deliberately not inferred or
+    # backfilled; populated receipt tables require an operator-approved rebuild.
+    Revision(revision=41, kind=RevisionKind.BREAKING, compatible_from=41),
 )
 
 #: The revision an empty database is initialized to.

@@ -3157,6 +3157,14 @@ def _knowledge_store(
     return registered_environment.environment.knowledge_store
 
 
+def _knowledge_access_scope(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.knowledge_access_scope
+
+
 def _user_tool_call_count(tool_calls: list[runtime_records.ToolCallRequest]) -> int:
     return sum(1 for tool_call in tool_calls if tool_call.name != STRUCTURED_OUTPUT_TOOL_NAME)
 
@@ -11885,6 +11893,7 @@ class SessionEngine:
                 structured_output=structured_output,
                 thinking=effective_thinking,
                 knowledge_store=_knowledge_store(registered_environment),
+                knowledge_access_scope=_knowledge_access_scope(registered_environment),
                 request_metadata=request_metadata,
                 retry_policy=retry_policy,
                 request_budget_limits=budget_limits,

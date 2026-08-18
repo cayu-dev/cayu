@@ -28,6 +28,7 @@ from cayu import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
+    KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeReviewWorkflow,
     KnowledgeStatus,
@@ -135,10 +136,15 @@ class _CountingScriptedModelProvider(ScriptedModelProvider):
 
 
 class _IsolatedLocalEnvironmentFactory(EnvironmentFactory):
-    def __init__(self, knowledge_store: InMemoryKnowledgeStore) -> None:
+    def __init__(
+        self,
+        knowledge_store: InMemoryKnowledgeStore,
+        knowledge_access_scope: KnowledgeAccessScope,
+    ) -> None:
         self._temporary_directory = TemporaryDirectory(prefix="cayu-runtime-acceptance-")
         self._root = Path(self._temporary_directory.name)
         self._knowledge_store = knowledge_store
+        self._knowledge_access_scope = knowledge_access_scope
         self._workspaces: dict[str, LocalWorkspace] = {}
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
@@ -157,6 +163,9 @@ class _IsolatedLocalEnvironmentFactory(EnvironmentFactory):
             workspace=workspace,
             knowledge_store=(
                 self._knowledge_store if request.agent_name == KNOWLEDGE_AGENT else None
+            ),
+            knowledge_access_scope=(
+                self._knowledge_access_scope if request.agent_name == KNOWLEDGE_AGENT else None
             ),
         )
         return EnvironmentFactoryResult(
@@ -181,8 +190,17 @@ async def build() -> EvalPlan:
             )
         ]
     )
+    knowledge_access_scope = KnowledgeAccessScope.for_namespace(
+        "cayu:runtime-acceptance",
+        allowed_statuses=[
+            KnowledgeStatus.ACTIVE,
+            KnowledgeStatus.PENDING,
+            KnowledgeStatus.ARCHIVED,
+        ],
+    )
     review = KnowledgeReviewWorkflow(
         knowledge_store,
+        access_scope=knowledge_access_scope,
         namespace="cayu:runtime-acceptance",
     )
     await review.approve(KNOWLEDGE_ENTRY_ID)
@@ -193,7 +211,7 @@ async def build() -> EvalPlan:
     )
     app.register_environment_factory(
         EnvironmentSpec(name=ENVIRONMENT_NAME),
-        _IsolatedLocalEnvironmentFactory(knowledge_store),
+        _IsolatedLocalEnvironmentFactory(knowledge_store, knowledge_access_scope),
         default=True,
     )
 

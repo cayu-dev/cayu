@@ -6016,7 +6016,8 @@ Apps can expose explicit agent recall by attaching a knowledge store to the
 environment and registering the built-in tools:
 
 ```python
-store = SQLiteKnowledgeStore("data/cayu.db")
+scope = KnowledgeAccessScope.for_namespace("default")
+store = SQLiteKnowledgeStore("data/cayu.db", access_scope=scope)
 environment = Environment(
     EnvironmentSpec(name="local"),
     knowledge_store=store,

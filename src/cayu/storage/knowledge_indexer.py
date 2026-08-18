@@ -21,12 +21,14 @@ from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_KIND,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    copy_knowledge_access_scope,
     copy_knowledge_chunk,
     copy_knowledge_entry,
 )
@@ -251,10 +253,24 @@ class KnowledgeIndexResult(BaseModel):
 class KnowledgeIndexer:
     """Deterministic text indexer for KnowledgeStore entries and chunks."""
 
-    def __init__(self, store: KnowledgeStore | None = None) -> None:
+    def __init__(
+        self,
+        store: KnowledgeStore | None = None,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> None:
         if store is not None and not isinstance(store, KnowledgeStore):
             raise TypeError("store must implement KnowledgeStore.")
+        if store is None and access_scope is not None:
+            raise ValueError("access_scope requires a store.")
+        if store is not None and access_scope is None:
+            access_scope = store.bound_access_scope()
+        if store is not None and access_scope is None:
+            raise ValueError("KnowledgeIndexer store requires an access scope.")
         self.store = store
+        self.access_scope = (
+            None if access_scope is None else copy_knowledge_access_scope(access_scope)
+        )
 
     def build(self, request: KnowledgeIndexRequest) -> KnowledgeIndexResult:
         request = copy_knowledge_index_request(request)
@@ -299,7 +315,12 @@ class KnowledgeIndexer:
         result = self.build(request)
         if self.store is None:
             return result
-        existing = await self.store.get_entry(result.entry.id)
+        if self.access_scope is None:  # pragma: no cover - constructor invariant
+            raise RuntimeError("KnowledgeIndexer store is missing an access scope.")
+        existing = await self.store.get_entry(
+            result.entry.id,
+            access_scope=self.access_scope,
+        )
         if (
             request.skip_unchanged
             and existing is not None
@@ -308,6 +329,7 @@ class KnowledgeIndexer:
             and _same_indexed_chunks(
                 await self.store.read_chunks(
                     result.entry.id,
+                    access_scope=self.access_scope,
                     max_chunks=len(result.chunks) + 1,
                     max_bytes=_chunk_comparison_max_bytes(result.chunks),
                 ),
@@ -315,7 +337,11 @@ class KnowledgeIndexer:
             )
         ):
             return result.model_copy(update={"unchanged": True})
-        await self.store.put_entry_with_chunks(result.entry, result.chunks)
+        await self.store.put_entry_with_chunks(
+            result.entry,
+            result.chunks,
+            access_scope=self.access_scope,
+        )
         return result.model_copy(update={"written": True})
 
 

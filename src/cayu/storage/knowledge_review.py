@@ -12,11 +12,13 @@ from cayu._validation import (
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeListQuery,
     KnowledgeListResult,
     KnowledgeStatus,
     KnowledgeVisibility,
+    copy_knowledge_access_scope,
 )
 
 _KNOWLEDGE_REVIEW_STORE_METHODS = (
@@ -27,19 +29,30 @@ _KNOWLEDGE_REVIEW_STORE_METHODS = (
 
 
 class _KnowledgeReviewStore(Protocol):
-    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None: ...
+    async def get_entry(
+        self,
+        entry_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeEntry | None: ...
 
     async def transition_entry_status(
         self,
         entry_id: str,
         *,
+        access_scope: KnowledgeAccessScope,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
         expected_namespace: str | None = None,
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry: ...
 
-    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult: ...
+    async def list_entries(
+        self,
+        query: KnowledgeListQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeListResult: ...
 
 
 class KnowledgeReviewWorkflow:
@@ -49,6 +62,7 @@ class KnowledgeReviewWorkflow:
         self,
         store: _KnowledgeReviewStore,
         *,
+        access_scope: KnowledgeAccessScope | None = None,
         namespace: str | None = None,
         labels: dict[str, str] | None = None,
         default_limit: int = DEFAULT_KNOWLEDGE_LIMIT,
@@ -56,6 +70,13 @@ class KnowledgeReviewWorkflow:
     ) -> None:
         _validate_review_store(store)
         self.store = store
+        if access_scope is None:
+            bound_scope = getattr(store, "bound_access_scope", None)
+            if callable(bound_scope):
+                access_scope = bound_scope()
+        if access_scope is None:
+            raise ValueError("KnowledgeReviewWorkflow requires an access scope.")
+        self.access_scope = copy_knowledge_access_scope(access_scope)
         self.namespace = (
             require_clean_nonblank(namespace, "namespace") if namespace is not None else None
         )
@@ -92,7 +113,7 @@ class KnowledgeReviewWorkflow:
             limit=self.default_limit if limit is None else limit,
             max_bytes=self.default_max_bytes if max_bytes is None else max_bytes,
         )
-        return await self.store.list_entries(query)
+        return await self.store.list_entries(query, access_scope=self.access_scope)
 
     async def get_pending(self, entry_id: str) -> KnowledgeEntry:
         """Load one pending entry after status and scope checks."""
@@ -105,6 +126,7 @@ class KnowledgeReviewWorkflow:
         entry = await self._require_pending_entry(entry_id)
         return await self.store.transition_entry_status(
             entry.id,
+            access_scope=self.access_scope,
             from_status=KnowledgeStatus.PENDING,
             to_status=KnowledgeStatus.ACTIVE,
             expected_namespace=self.namespace,
@@ -117,6 +139,7 @@ class KnowledgeReviewWorkflow:
         entry = await self._require_pending_entry(entry_id)
         return await self.store.transition_entry_status(
             entry.id,
+            access_scope=self.access_scope,
             from_status=KnowledgeStatus.PENDING,
             to_status=KnowledgeStatus.ARCHIVED,
             expected_namespace=self.namespace,
@@ -125,7 +148,7 @@ class KnowledgeReviewWorkflow:
 
     async def _require_pending_entry(self, entry_id: str) -> KnowledgeEntry:
         clean_id = require_clean_nonblank(entry_id, "entry_id")
-        entry = await self.store.get_entry(clean_id)
+        entry = await self.store.get_entry(clean_id, access_scope=self.access_scope)
         if entry is None:
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
         self._require_entry_in_scope(entry)

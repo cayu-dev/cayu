@@ -26,6 +26,7 @@ from cayu import (
     Environment,
     EnvironmentSpec,
     EventType,
+    KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -686,7 +687,10 @@ def build_app() -> CayuApp:
     shutil.rmtree(DATA_DIR / "artifacts", ignore_errors=True)
 
     database = DATA_DIR / "cayu.db"
-    knowledge_store = SQLiteKnowledgeStore(database)
+    knowledge_store = SQLiteKnowledgeStore(
+        database,
+        access_scope=KnowledgeAccessScope.privileged(),
+    )
     app = CayuApp(
         session_store=ManualRecoveryDemoSessionStore(database),
         task_store=SQLiteTaskStore(database),

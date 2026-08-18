@@ -39,6 +39,7 @@ from cayu import (
     EnvironmentSpec,
     InMemoryKnowledgeStore,
     InMemoryTaskStore,
+    KnowledgeAccessScope,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeStatus,
@@ -139,6 +140,13 @@ from cayu.server.sse import (
     SSE_SEND_TIMEOUT_SECONDS,
 )
 from cayu.tools import ExecCommandTool
+
+
+class _TestKnowledgeStore(InMemoryKnowledgeStore):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("access_scope", KnowledgeAccessScope.privileged())
+        super().__init__(*args, **kwargs)
+
 
 _LOCAL_SERVER_CONFIG = ServerConfig.local_development()
 _SHORT_REPLAY_SERVER_CONFIG = ServerConfig.local_development(
@@ -1589,7 +1597,7 @@ def test_server_artifact_inventory_does_not_advertise_unusable_next_offset() -> 
 
 
 def test_server_exposes_pending_knowledge_review_endpoints() -> None:
-    store = InMemoryKnowledgeStore(
+    store = _TestKnowledgeStore(
         [
             KnowledgeEntry(
                 id="pending_git",
@@ -1667,7 +1675,7 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
 
 
 def test_server_rejects_pending_knowledge_with_archived_status() -> None:
-    store = InMemoryKnowledgeStore(
+    store = _TestKnowledgeStore(
         [
             KnowledgeEntry(
                 id="pending_bad",
@@ -1692,7 +1700,7 @@ def test_server_knowledge_review_reports_missing_store_and_scope_errors() -> Non
     missing_store = TestClient(create_server(CayuApp(), config=_LOCAL_SERVER_CONFIG))
     assert missing_store.get("/api/knowledge/pending").status_code == 404
 
-    store = InMemoryKnowledgeStore(
+    store = _TestKnowledgeStore(
         [
             KnowledgeEntry(
                 id="pending_other",
@@ -1724,7 +1732,7 @@ def test_server_knowledge_review_reports_missing_store_and_scope_errors() -> Non
 
 
 def test_server_pending_knowledge_detail_validates_chunk_limits() -> None:
-    store = InMemoryKnowledgeStore(
+    store = _TestKnowledgeStore(
         [
             KnowledgeEntry(
                 id="pending_git",

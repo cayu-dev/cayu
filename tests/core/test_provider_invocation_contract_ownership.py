@@ -39,7 +39,11 @@ from cayu.runtime import (
     RunRequest,
     Session,
 )
-from cayu.storage import InMemoryEmbeddingKnowledgeStore, KnowledgeEntry
+from cayu.storage import (
+    InMemoryEmbeddingKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+)
 from cayu.tools import CommandRequest
 from cayu.vaults import SecretRef, StaticVault
 
@@ -138,6 +142,7 @@ class _UnvalidatedEmbeddingProvider(TextEmbeddingProvider):
 def test_embedding_store_revalidates_provider_results() -> None:
     provider = _UnvalidatedEmbeddingProvider()
     store = InMemoryEmbeddingKnowledgeStore(
+        access_scope=KnowledgeAccessScope.privileged(),
         embedding_provider=provider,
         embedding_model="embedding-model",
         embedding_dimensions=1,

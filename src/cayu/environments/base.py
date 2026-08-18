@@ -23,8 +23,9 @@ from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
 from cayu.workspaces import Workspace
 
 if TYPE_CHECKING:
-    from cayu.storage.memory import KnowledgeStore
+    from cayu.storage.memory import KnowledgeAccessScope, KnowledgeStore
 else:
+    KnowledgeAccessScope = Any
     KnowledgeStore = Any
 
 DEFAULT_WORKSPACE_INSTRUCTION_PATHS = ("AGENTS.md", ".cayu/AGENTS.md")
@@ -159,6 +160,7 @@ class Environment:
         vault: Vault | None = None,
         proxy: CredentialProxy | None = None,
         knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
         binding: WorkspaceBinding | None = None,
         mcp_servers: Iterable[McpServerSpec] | None = None,
         workspace_instructions: WorkspaceInstructionsInput | None = None,
@@ -185,6 +187,26 @@ class Environment:
             raise TypeError("proxy must be a CredentialProxy.")
         if knowledge_store is not None:
             _validate_knowledge_store(knowledge_store)
+        bound_knowledge_access_scope = None
+        if knowledge_store is not None:
+            bound_scope = getattr(knowledge_store, "bound_access_scope", None)
+            if callable(bound_scope):
+                bound_knowledge_access_scope = bound_scope()
+        if knowledge_store is not None and knowledge_access_scope is None:
+            knowledge_access_scope = bound_knowledge_access_scope
+        if (knowledge_store is None) != (knowledge_access_scope is None):
+            raise ValueError(
+                "knowledge_store and knowledge_access_scope must be configured together."
+            )
+        if (
+            knowledge_access_scope is not None
+            and bound_knowledge_access_scope is not None
+            and _copy_knowledge_access_scope(knowledge_access_scope)
+            != _copy_knowledge_access_scope(bound_knowledge_access_scope)
+        ):
+            raise ValueError(
+                "knowledge_access_scope must match the scope bound to knowledge_store."
+            )
         if binding is not None and not isinstance(binding, WorkspaceBinding):
             raise TypeError("binding must be a WorkspaceBinding.")
 
@@ -204,6 +226,11 @@ class Environment:
         self.vault = vault
         self.proxy = proxy
         self.knowledge_store = knowledge_store
+        self.knowledge_access_scope = (
+            None
+            if knowledge_access_scope is None
+            else _copy_knowledge_access_scope(knowledge_access_scope)
+        )
         self.binding = binding
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
         self.workspace_instructions = copy_workspace_instructions_input(
@@ -236,6 +263,7 @@ def copy_environment(environment: Environment) -> Environment:
         vault=environment.vault,
         proxy=environment.proxy,
         knowledge_store=environment.knowledge_store,
+        knowledge_access_scope=environment.knowledge_access_scope,
         binding=environment.binding,
         mcp_servers=environment.mcp_servers,
         workspace_instructions=environment.workspace_instructions,
@@ -246,6 +274,14 @@ def _validate_knowledge_store(value: Any) -> None:
     for method_name in _KNOWLEDGE_STORE_METHODS:
         if not callable(getattr(value, method_name, None)):
             raise TypeError("knowledge_store must implement KnowledgeStore.")
+
+
+def _copy_knowledge_access_scope(value: Any) -> Any:
+    # Local import avoids the storage package importing runtime/environment
+    # modules while cayu.environments itself is still initializing.
+    from cayu.storage.memory import copy_knowledge_access_scope
+
+    return copy_knowledge_access_scope(value)
 
 
 def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:

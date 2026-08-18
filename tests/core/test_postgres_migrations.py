@@ -612,6 +612,75 @@ def test_revision_thirty_nine_rejects_populated_task_database(
     asyncio.run(runner())
 
 
+def test_revision_forty_one_rejects_populated_knowledge_receipt_database(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_knowledge_publication_receipts (
+                        operation_id,
+                        entry_id,
+                        request_sha256,
+                        entry_created_at,
+                        entry_updated_at,
+                        committed_at,
+                        access_snapshot
+                    ) VALUES (
+                        'op_existing',
+                        'entry_existing',
+                        repeat('a', 64),
+                        NOW(),
+                        NOW(),
+                        NOW(),
+                        '{}'::jsonb
+                    )
+                    """
+                )
+                await cur.execute(
+                    "ALTER TABLE cayu_knowledge_publication_receipts DROP COLUMN access_snapshot"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 41")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match="cannot infer one for existing receipts",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (40,)
+            await cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_knowledge_publication_receipts' "
+                "AND column_name = 'access_snapshot'"
+            )
+            assert await cur.fetchone() is None
+
+    asyncio.run(runner())
+
+
 @pytest.mark.parametrize(
     ("column_ddl", "expected_shape"),
     [
@@ -955,6 +1024,17 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 40"
             )
             assert await cur.fetchone() == ("breaking", 40)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 41"
+            )
+            assert await cur.fetchone() == ("breaking", 41)
+            await cur.execute(
+                "SELECT data_type, is_nullable FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_knowledge_publication_receipts' "
+                "AND column_name = 'access_snapshot'"
+            )
+            assert await cur.fetchone() == ("jsonb", "NO")
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
