@@ -1,4 +1,4 @@
-# Local web fetch
+# Web fetch and hosted search
 
 `WebFetchTool` is Cayu's low-friction way for an agent running locally to read a
 public HTTPS page. It uses direct HTTP from the Cayu application process. It
@@ -175,3 +175,90 @@ budget, cancellation, and recovery paths, and declares `ToolEffect.NONE`.
 Applications can lower the trusted defaults with `max_response_bytes`,
 `max_content_bytes`, `timeout_seconds`, and `max_redirects`. Constructor limits
 have finite hard ceilings; none of these controls are exposed to the model.
+
+## Provider-neutral hosted search and fetch
+
+`WebSearchTool` adds the provider-neutral `web_search` contract. Its closed
+model input contains a required `query` and optional `num_results`; the
+application fixes the default and maximum result counts, per-snippet bytes,
+aggregate snippet bytes, and deadline. Results retain provider order as
+one-based `rank`, canonical HTTPS source URLs, bounded titles and snippets, and
+optional normalized publication dates or timestamps. A nullable provider title
+falls back to the bounded canonical URL rather than invalidating the complete
+result set. Provider scores remain under namespaced provider metadata and never
+replace the portable rank.
+
+The opt-in `ExaWebAdapter` implements both `WebSearchAdapter` and
+`WebFetchAdapter` without an Exa SDK dependency. Selecting it changes
+application wiring, not the model-facing `web_search` or `web_fetch` names and
+arguments:
+
+```python
+from cayu import (
+    AgentSpec,
+    AllowlistProxy,
+    Environment,
+    EnvironmentSpec,
+    ExaWebAdapter,
+    LocalEnvVault,
+    SecretRef,
+    WebFetchTool,
+    WebSearchTool,
+)
+
+vault = LocalEnvVault({"exa_api_key": "EXA_API_KEY"})
+proxy = AllowlistProxy(vault, allowed_destinations=["api.exa.ai"])
+exa = ExaWebAdapter(
+    api_key_ref=SecretRef(name="exa_api_key"),
+    search_type="auto",
+    search_max_age_hours=24,
+    fetch_max_age_hours=24,
+)
+
+app.register_environment(
+    Environment(EnvironmentSpec(name="research"), vault=vault, proxy=proxy),
+    default=True,
+)
+app.register_agent(
+    AgentSpec(name="researcher", model="your-model"),
+    tools=[
+        WebSearchTool(
+            adapter=exa,
+            default_results=5,
+            max_results=10,
+            max_snippet_bytes=2_048,
+            max_total_snippet_bytes=8_192,
+        ),
+        WebFetchTool(adapter=exa),
+    ],
+)
+```
+
+`LocalEnvVault` resolves the reference above from `EXA_API_KEY`; applications
+may use any `Vault` instead. The raw key
+is authorized and resolved through the active invocation credential proxy. It
+does not enter tool schemas, arguments, runner state, or result metadata. The
+adapter also rejects a request before dispatch if any non-header payload value
+collides with a currently protected secret.
+
+Exa mode, provider origin, authentication header, content-cache age, moderation,
+provider-response ceiling, and the two tool budgets are constructor settings.
+The adapter sends at most one provider request per tool call and performs no
+hidden retry. Rate limits retain a bounded `Retry-After` hint; successful calls
+retain bounded request IDs, warnings, and typed estimated-cost metadata under
+`provider_metadata.exa`. These provider values and all result content remain
+untrusted evidence.
+
+Hosted `web_fetch` preserves the established fetch result fields. Exa does not
+publish a redirect chain, so a response that changes the canonical URL fails
+with `unsupported_semantics` rather than inventing redirect evidence. Provider
+and per-URL failures have stable error codes and never include raw response
+bodies. Oversized, malformed, denied-credential, timeout, cancellation, and
+rate-limit paths remain distinct; cancellation is never converted into a tool
+error. Exa currently accepts at most 10,000 requested content characters; when
+returned text reaches that request ceiling, `provider_content_limit` makes the
+narrower provider boundary explicit in `truncation_reasons`.
+
+When search results can flow into sensitive tools, configure `web_search` as a
+taint source alongside `web_fetch`; neither tool silently changes an
+application's policy.

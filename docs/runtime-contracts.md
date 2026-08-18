@@ -4450,6 +4450,25 @@ The public read is `ToolEffect.NONE`; applications can name `web_fetch` in
 `TaintAwareToolPolicy.taint_sources` when later tools require origin-based
 gating.
 
+`WebSearchTool` exposes a provider-neutral `web_search` read through an explicit
+`WebSearchAdapter`. The model supplies only a bounded query and result count;
+the application owns provider selection, modes, credentials, cache policy,
+request limits, per-result snippet bytes, aggregate snippet bytes, and the
+deadline. Portable results use provider order as rank and retain canonical
+source URLs, titles, bounded snippets, and optional publication times. Provider
+request IDs, warnings, usage, retry hints, and scores remain bounded and
+namespaced rather than becoming portable ranking semantics.
+
+`ExaWebAdapter` is the first hosted implementation of both the search and fetch
+adapter seams. It resolves an application-owned `SecretRef` through the active
+credential proxy immediately before each request, sends one request without a
+hidden retry loop, and never hands the credential to a runner. Its combined
+search/content call remains governed by the independent aggregate snippet
+budget. Hosted fetch preserves the existing `web_fetch` fields and fails
+explicitly when Exa changes the final URL without supplying the redirect
+provenance required to represent that change. Exa is opt-in and uses Cayu's
+existing HTTP dependency rather than adding a provider SDK.
+
 The default adapter performs direct network I/O from the trusted Cayu application
 process. DNS admission and pinning constrain its destination, but do not provide
 process isolation, browser isolation, or a sandbox network boundary. It does

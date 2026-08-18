@@ -20,6 +20,7 @@ from cayu.tools.commands import (
     CommandRequest,
     ExecCommandTool,
 )
+from cayu.tools.exa import ExaWebAdapter
 from cayu.tools.files import (
     ArtifactReader,
     ArtifactReadRequest,
@@ -89,6 +90,7 @@ __all__ = [
     "CommandRequest",
     "DeleteFileTool",
     "EditFileTool",
+    "ExaWebAdapter",
     "ExecCommandTool",
     "GitChangesTool",
     "GitCommandPolicy",
