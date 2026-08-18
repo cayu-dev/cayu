@@ -1,0 +1,202 @@
+{
+  "schema_version": "cayu.memory_retrieval_corpus.v1",
+  "corpus_revision": "public-hermetic-v1",
+  "origin": "hermetic_public",
+  "entries": [
+    {
+      "id": "auth-current",
+      "text": "Rotate GitHub deployment credentials through the credential broker and record the acknowledged handoff.",
+      "namespace": "org-a",
+      "labels": {"project": "alpha"},
+      "visibility": "global",
+      "status": "active",
+      "source_type": "document",
+      "source_id": "runbook-auth-v2",
+      "language": "en"
+    },
+    {
+      "id": "refund-policy",
+      "text": "Refund requests above one hundred dollars require finance approval before payment reversal.",
+      "namespace": "org-a",
+      "labels": {"project": "alpha"},
+      "visibility": "global",
+      "status": "active",
+      "source_type": "document",
+      "source_id": "policy-refunds",
+      "language": "en"
+    },
+    {
+      "id": "deploy-es",
+      "text": "Antes del despliegue, ejecute las migraciones y verifique la salud del servicio.",
+      "namespace": "org-a",
+      "labels": {"project": "alpha"},
+      "visibility": "global",
+      "status": "active",
+      "source_type": "document",
+      "source_id": "runbook-deploy-es",
+      "language": "es"
+    },
+    {
+      "id": "incident-fr",
+      "text": "Pour un incident de paiement, vérifiez la facture puis contactez l'équipe financière.",
+      "namespace": "org-a",
+      "labels": {"project": "alpha"},
+      "visibility": "global",
+      "status": "active",
+      "source_type": "document",
+      "source_id": "runbook-incident-fr",
+      "language": "fr"
+    },
+    {
+      "id": "tenant-b-auth",
+      "text": "GitHub deployment credentials use the tenant B credential broker.",
+      "namespace": "org-b",
+      "labels": {"project": "alpha"},
+      "visibility": "global",
+      "status": "active",
+      "source_type": "document",
+      "source_id": "tenant-b-secret",
+      "language": "en"
+    },
+    {
+      "id": "legacy-auth",
+      "text": "Credential rotation uses the legacy password vault without a broker.",
+      "namespace": "org-a",
+      "labels": {"project": "alpha"},
+      "visibility": "global",
+      "status": "archived",
+      "source_type": "document",
+      "source_id": "runbook-auth-v1",
+      "language": "en"
+    },
+    {
+      "id": "private-auth",
+      "text": "GitHub credential broker emergency token for this private session.",
+      "namespace": "org-a",
+      "labels": {"project": "alpha"},
+      "visibility": "session",
+      "status": "active",
+      "source_type": "document",
+      "source_id": "session-secret",
+      "language": "en"
+    },
+    {
+      "id": "expired-auth",
+      "text": "Expired GitHub credential broker exception.",
+      "namespace": "org-a",
+      "labels": {"project": "alpha"},
+      "visibility": "global",
+      "status": "active",
+      "source_type": "document",
+      "source_id": "expired-exception",
+      "language": "en",
+      "expires_at": "2020-01-01T00:00:00Z"
+    }
+  ],
+  "cases": [
+    {
+      "id": "auth-isolation-and-freshness",
+      "trajectory_id": "public-ops-trajectory",
+      "turn_index": 120,
+      "language": "en",
+      "query": "GitHub credential broker rotation",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"},
+        "allowed_visibilities": ["global"],
+        "allowed_source_types": ["document"],
+        "allowed_statuses": ["active"],
+        "include_expired": false
+      },
+      "relevant_entry_ids": ["auth-current"],
+      "forbidden_entry_ids": [
+        "tenant-b-auth",
+        "legacy-auth",
+        "private-auth",
+        "expired-auth"
+      ],
+      "expected_source_ids": {"auth-current": "runbook-auth-v2"},
+      "cutoff": 5
+    },
+    {
+      "id": "refund-policy",
+      "trajectory_id": "public-support-trajectory",
+      "turn_index": 240,
+      "language": "en",
+      "query": "refund finance approval payment reversal",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"},
+        "allowed_visibilities": ["global"],
+        "allowed_source_types": ["document"],
+        "allowed_statuses": ["active"],
+        "include_expired": false
+      },
+      "relevant_entry_ids": ["refund-policy"],
+      "forbidden_entry_ids": ["tenant-b-auth"],
+      "expected_source_ids": {"refund-policy": "policy-refunds"},
+      "cutoff": 5
+    },
+    {
+      "id": "spanish-deployment",
+      "trajectory_id": "public-multilingual-trajectory",
+      "turn_index": 360,
+      "language": "es",
+      "query": "despliegue migraciones salud servicio",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"},
+        "allowed_visibilities": ["global"],
+        "allowed_source_types": ["document"],
+        "allowed_statuses": ["active"],
+        "include_expired": false
+      },
+      "relevant_entry_ids": ["deploy-es"],
+      "forbidden_entry_ids": ["tenant-b-auth"],
+      "expected_source_ids": {"deploy-es": "runbook-deploy-es"},
+      "cutoff": 5
+    },
+    {
+      "id": "french-payment-incident",
+      "trajectory_id": "public-multilingual-trajectory",
+      "turn_index": 480,
+      "language": "fr",
+      "query": "incident paiement facture équipe financière",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"},
+        "allowed_visibilities": ["global"],
+        "allowed_source_types": ["document"],
+        "allowed_statuses": ["active"],
+        "include_expired": false
+      },
+      "relevant_entry_ids": ["incident-fr"],
+      "forbidden_entry_ids": ["tenant-b-auth"],
+      "expected_source_ids": {"incident-fr": "runbook-incident-fr"},
+      "cutoff": 5
+    }
+  ],
+  "id_probes": [
+    {
+      "id": "typed-read-isolation",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"},
+        "allowed_visibilities": ["global"],
+        "allowed_source_types": ["document"],
+        "allowed_statuses": ["active"],
+        "include_expired": false
+      },
+      "forbidden_entry_ids": [
+        "tenant-b-auth",
+        "legacy-auth",
+        "private-auth",
+        "expired-auth"
+      ]
+    }
+  ]
+}

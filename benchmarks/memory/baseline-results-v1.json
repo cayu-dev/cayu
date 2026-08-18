@@ -1,0 +1,254 @@
+{
+  "corpus_revision": "public-hermetic-v1",
+  "results": [
+    {
+      "backend": "memory",
+      "cases": [
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "auth-isolation-and-freshness",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "en",
+          "latency_ms": 0.326417,
+          "model_facing_bytes": 208,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["auth-current"],
+          "stale_result_count": 0,
+          "truncated": false
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "refund-policy",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "en",
+          "latency_ms": 0.266875,
+          "model_facing_bytes": 196,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["refund-policy"],
+          "stale_result_count": 0,
+          "truncated": false
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "spanish-deployment",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "es",
+          "latency_ms": 0.2515,
+          "model_facing_bytes": 184,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["deploy-es"],
+          "stale_result_count": 0,
+          "truncated": false
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "french-payment-incident",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "fr",
+          "latency_ms": 0.256083,
+          "model_facing_bytes": 196,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["incident-fr"],
+          "stale_result_count": 0,
+          "truncated": false
+        }
+      ],
+      "configuration": {
+        "cutoffs": [5],
+        "source_set": ["knowledge"],
+        "token_estimator": "ceil(utf8_json_bytes/4)"
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "public-hermetic-v1",
+      "embedding_identity": null,
+      "language_slices": [
+        {
+          "case_count": 2,
+          "language": "en",
+          "mean_ndcg_at_k": 1.0,
+          "mean_reciprocal_rank": 1.0,
+          "recall_at_k": 1.0
+        },
+        {
+          "case_count": 1,
+          "language": "es",
+          "mean_ndcg_at_k": 1.0,
+          "mean_reciprocal_rank": 1.0,
+          "recall_at_k": 1.0
+        },
+        {
+          "case_count": 1,
+          "language": "fr",
+          "mean_ndcg_at_k": 1.0,
+          "mean_reciprocal_rank": 1.0,
+          "recall_at_k": 1.0
+        }
+      ],
+      "metrics": {
+        "authorization_leak_rate": 0.0,
+        "case_count": 4,
+        "citation_correctness": 1.0,
+        "estimated_model_facing_tokens": 196,
+        "false_injection_rate": 0.0,
+        "latency_p50_ms": 0.256083,
+        "latency_p95_ms": 0.326417,
+        "mean_candidate_count": 1.0,
+        "mean_ndcg_at_k": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "model_facing_bytes": 784,
+        "recall_at_k": 1.0,
+        "stale_result_rate": 0.0,
+        "total_candidate_count": 4,
+        "truncated_case_count": 0
+      },
+      "reranker_identity": null,
+      "schema_version": "cayu.memory_retrieval_baseline.v1",
+      "search_mode": "keyword"
+    },
+    {
+      "backend": "sqlite",
+      "cases": [
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "auth-isolation-and-freshness",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "en",
+          "latency_ms": 0.701125,
+          "model_facing_bytes": 208,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["auth-current"],
+          "stale_result_count": 0,
+          "truncated": false
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "refund-policy",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "en",
+          "latency_ms": 0.479125,
+          "model_facing_bytes": 196,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["refund-policy"],
+          "stale_result_count": 0,
+          "truncated": false
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "spanish-deployment",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "es",
+          "latency_ms": 0.42225,
+          "model_facing_bytes": 184,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["deploy-es"],
+          "stale_result_count": 0,
+          "truncated": false
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "french-payment-incident",
+          "citation_correct_count": 1,
+          "citation_evaluated_count": 1,
+          "false_injection_count": 0,
+          "language": "fr",
+          "latency_ms": 0.468834,
+          "model_facing_bytes": 196,
+          "ndcg_at_k": 1.0,
+          "recall_at_k": 1.0,
+          "reciprocal_rank": 1.0,
+          "selected_entry_ids": ["incident-fr"],
+          "stale_result_count": 0,
+          "truncated": false
+        }
+      ],
+      "configuration": {
+        "cutoffs": [5],
+        "source_set": ["knowledge"],
+        "token_estimator": "ceil(utf8_json_bytes/4)"
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "public-hermetic-v1",
+      "embedding_identity": null,
+      "language_slices": [
+        {
+          "case_count": 2,
+          "language": "en",
+          "mean_ndcg_at_k": 1.0,
+          "mean_reciprocal_rank": 1.0,
+          "recall_at_k": 1.0
+        },
+        {
+          "case_count": 1,
+          "language": "es",
+          "mean_ndcg_at_k": 1.0,
+          "mean_reciprocal_rank": 1.0,
+          "recall_at_k": 1.0
+        },
+        {
+          "case_count": 1,
+          "language": "fr",
+          "mean_ndcg_at_k": 1.0,
+          "mean_reciprocal_rank": 1.0,
+          "recall_at_k": 1.0
+        }
+      ],
+      "metrics": {
+        "authorization_leak_rate": 0.0,
+        "case_count": 4,
+        "citation_correctness": 1.0,
+        "estimated_model_facing_tokens": 196,
+        "false_injection_rate": 0.0,
+        "latency_p50_ms": 0.468834,
+        "latency_p95_ms": 0.701125,
+        "mean_candidate_count": 1.0,
+        "mean_ndcg_at_k": 1.0,
+        "mean_reciprocal_rank": 1.0,
+        "model_facing_bytes": 784,
+        "recall_at_k": 1.0,
+        "stale_result_rate": 0.0,
+        "total_candidate_count": 4,
+        "truncated_case_count": 0
+      },
+      "reranker_identity": null,
+      "schema_version": "cayu.memory_retrieval_baseline.v1",
+      "search_mode": "keyword"
+    }
+  ],
+  "schema_version": "cayu.memory_retrieval_baseline_matrix.v1"
+}

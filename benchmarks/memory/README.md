@@ -1,0 +1,35 @@
+# Memory retrieval baseline
+
+This directory freezes Cayu's pre-v5.1 retrieval behavior before revision-aware,
+cross-source recall changes land. The current runner measures the existing
+knowledge source only; it does not claim that knowledge and memory are the same
+thing. Memory is the future recall system, while knowledge is one durable,
+canonical source inside it.
+
+Run the public corpus from the repository root:
+
+```bash
+PYTHONPATH=src python scripts/run_memory_retrieval_baseline.py
+```
+
+Use `--output path.json` to retain a new report. The checked report records the
+observed in-memory and SQLite keyword baseline, including recall@5, MRR, nDCG@5,
+false injection, stale results, authorization leaks (search and typed ID/chunk
+reads), citation/source identity, candidate/truncation counts, model-facing byte
+and estimated-token overhead, multilingual slices, and p50/p95 search latency.
+Latency is environment-sensitive; correctness metrics and selected identities
+are the reproducible CI contract.
+
+## Private production-shaped imports
+
+The same bounded `cayu.memory_retrieval_corpus.v1` schema accepts an
+`origin` of `external_private`, trajectory identifiers, and turn indexes. Point
+`--corpus` at an external JSON file to evaluate long production-shaped
+trajectories. Do not copy private text or the resulting report into this public
+repository. Loading is local, bounded to 4 MiB and 10,000 entries/cases, and
+does not make provider or network calls.
+
+Every result records the corpus revision, backend, search mode, embedding and
+reranker identities, and configuration. Add those identities when evaluating a
+semantic or reranked implementation; `null` means the current keyword-only
+baseline did not use one.

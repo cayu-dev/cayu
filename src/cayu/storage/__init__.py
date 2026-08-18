@@ -12,6 +12,14 @@ from cayu.storage.knowledge_indexer import (
 )
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
+from cayu.storage.knowledge_transition import (
+    KNOWLEDGE_REVISION_RESET_POLICY_VERSION,
+    KnowledgeRevisionResetRequired,
+    KnowledgeRevisionTransitionAction,
+    KnowledgeRevisionTransitionAssessment,
+    assess_knowledge_revision_transition,
+    require_empty_knowledge_revision_transition,
+)
 from cayu.storage.memory import (
     BUILTIN_KNOWLEDGE_KINDS,
     DEFAULT_KNOWLEDGE_KIND,
@@ -53,6 +61,7 @@ __all__ = [
     "DEFAULT_KNOWLEDGE_LIMIT",
     "DEFAULT_KNOWLEDGE_MAX_BYTES",
     "DEFAULT_KNOWLEDGE_NAMESPACE",
+    "KNOWLEDGE_REVISION_RESET_POLICY_VERSION",
     "MAX_KNOWLEDGE_CHUNK_INDEX",
     "InMemoryEmbeddingKnowledgeStore",
     "InMemoryKnowledgeStore",
@@ -74,6 +83,9 @@ __all__ = [
     "KnowledgePublicationReceipt",
     "KnowledgeQuery",
     "KnowledgeReviewWorkflow",
+    "KnowledgeRevisionResetRequired",
+    "KnowledgeRevisionTransitionAction",
+    "KnowledgeRevisionTransitionAssessment",
     "KnowledgeSearchMode",
     "KnowledgeSearchResult",
     "KnowledgeStatus",
@@ -93,7 +105,9 @@ __all__ = [
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "assess_knowledge_revision_transition",
     "prepare_knowledge_publication",
+    "require_empty_knowledge_revision_transition",
 ]
 
 
