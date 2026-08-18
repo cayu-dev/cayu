@@ -9,9 +9,9 @@ from examples._advanced_support import (
     ScenarioResult,
     advanced_run_limits,
     collect_events,
-    count_model_completions,
+    completed_model_attempts,
     fork_session,
-    session_evidence,
+    runtime_evidence_for_roles,
 )
 
 from cayu import (
@@ -29,7 +29,6 @@ from cayu import (
     ToolPolicyDecision,
     ToolResult,
     ToolSpec,
-    taint_labels_from_metadata,
 )
 from cayu.providers import ModelProvider
 
@@ -171,7 +170,7 @@ async def run_scenario(
         )
     )
     quarantine_id = "incident-quarantine"
-    fork_event = await fork_session(
+    await fork_session(
         app,
         source_session_id=source_id,
         session_id=quarantine_id,
@@ -321,15 +320,28 @@ async def run_scenario(
     if not any(event.type == EventType.SESSION_COMPLETED for event in clean_events):
         raise RuntimeError("Clean response session did not complete.")
 
-    quarantine_session = await app.session_store.load(quarantine_id)
-    if quarantine_session is None:
-        raise RuntimeError("Quarantine session disappeared.")
-    inherited_labels = sorted(taint_labels_from_metadata(quarantine_session.metadata))
+    runtime_report, sessions = await runtime_evidence_for_roles(
+        app,
+        {
+            source_id: "source",
+            quarantine_id: "quarantine",
+            clean_id: "clean-responder",
+        },
+    )
+    quarantine_evidence = next(
+        session for session in runtime_report.sessions if session.session_id == quarantine_id
+    )
+    inherited_labels = list(quarantine_evidence.effective_taint_labels)
     quarantine_agent = app.get_agent("quarantine")
     registered_tools = set(quarantine_agent.tools)
+    blocked_policy_decisions = tuple(
+        decision
+        for decision in quarantine_evidence.policy_decisions
+        if decision.decision == "deny" and decision.tool_name == "rotate_credentials"
+    )
     blocked_labels = (
-        blocked_mutations[0].payload.get("metadata", {}).get("matched_taint_labels", [])
-        if len(blocked_mutations) == 1
+        list(blocked_policy_decisions[0].matched_taint_labels)
+        if len(blocked_policy_decisions) == 1
         else []
     )
     assertions = {
@@ -339,7 +351,7 @@ async def run_scenario(
         "fork_inherited_taint": inherited_labels == ["incident-untrusted"],
         "hostile_instruction_not_propagated": "IGNORE" not in state.sanitized_artifact,
         "protected_mutation_blocked_after_restart": (
-            len(blocked_mutations) == 1
+            len(blocked_policy_decisions) == 1
             and blocked_labels == ["incident-untrusted"]
             and state.protected_mutations == 0
         ),
@@ -348,20 +360,12 @@ async def run_scenario(
             and "send_notification" not in registered_tools
             and "raw_secret" not in registered_tools
             and "network_request" not in registered_tools
-            and fork_event.payload["inherited_taint_labels"] == ["incident-untrusted"]
+            and inherited_labels == ["incident-untrusted"]
         ),
         "sanitized_notification_sent_once": state.notifications == 1,
     }
-    sessions = await session_evidence(
-        app,
-        {
-            source_id: "source",
-            quarantine_id: "quarantine",
-            clean_id: "clean-responder",
-        },
-    )
-    model_requests = await count_model_completions(
-        app, [session.session_id for session in sessions]
+    model_requests = completed_model_attempts(
+        runtime_report, [session.session_id for session in sessions]
     )
     result = ScenarioResult(
         scenario="tainted-incident-response",
@@ -382,11 +386,11 @@ async def run_scenario(
             "sanitizer_receipt": sanitized[0].payload["result"]["structured"],
             "notification_artifact_id": state.sanitized_artifact_id,
             "protected_mutation_block_event": {
-                "event_type": str(blocked_mutations[0].type),
-                "tool_name": blocked_mutations[0].tool_name,
+                "event_id": blocked_policy_decisions[0].source_ref.event_id,
+                "tool_name": blocked_policy_decisions[0].tool_name,
                 "matched_taint_labels": blocked_labels,
             }
-            if len(blocked_mutations) == 1
+            if len(blocked_policy_decisions) == 1
             else None,
         },
     )

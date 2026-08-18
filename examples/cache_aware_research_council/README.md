@@ -18,6 +18,11 @@ prompts with the full transcript and with compacted context. The evidence
 envelope records total provider-reported input usage, including retries, and
 requires the compacted candidate to use fewer tokens than that paired baseline;
 it does not infer savings from character counts.
+The surrounding lineage, first/retry/operation usage, checkpoint identities,
+and causal-budget totals come from the public bounded
+`runtime_evidence(app, request)` projection rather than an example-owned raw
+event scan. The narrower paired dollar claim still uses the public v1
+cost-and-quality comparison contract.
 
 ```bash
 uv run python -m examples.cache_aware_research_council.app

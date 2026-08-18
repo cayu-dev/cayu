@@ -54,6 +54,11 @@ prove that:
 - the evaluator finds a weakness; and
 - the repair addresses the evaluator's critique.
 
+The scenario now obtains lineage, per-session and causal-budget accounting,
+first/retry/operation usage, compaction identities, recovery, and receipt
+summaries through the public v1 runtime-evidence projection. It no longer owns a
+parallel event scanner for those facts.
+
 This turns session forking into a cost and quality strategy rather than a copy
 of chat history. The matched branch-call denominator is serialized through the
 public v1 cost-and-quality report. Evaluator and repair sessions remain visible
@@ -115,6 +120,10 @@ executions. Only a sanitized, provenance-bearing artifact reaches the clean
 session, which performs one allowed notification.
 
 The claim is origin-based authority control, not prompt-injection detection.
+The durable taint and blocked-policy assertions are reconstructed through the
+same public v1 runtime-evidence projection used by the research council; the
+report exposes only the allowlisted policy outcome, matched taint labels, and
+source event identity, never the hostile ticket or tool payload.
 
 ## Observed live evidence
 

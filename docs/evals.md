@@ -569,6 +569,14 @@ control-plane route. Those product steps build on this storage guarantee. See
 [Runtime Contracts](runtime-contracts.md#sessionstore) for the snapshot and
 resource-limit contract.
 
+For payload-free operational/accounting evidence rather than a transcript-based
+eval trajectory, use `runtime_evidence(app, request)`. That public v1 projection
+accepts a bounded nonterminal or terminal lineage, preserves attempts, retries,
+operation-specific usage, tools, approvals, taint, recovery, receipts, and
+optional causal-budget totals, and excludes prompts, outputs, and tool payloads.
+It does not replace the coherent terminal snapshot required for trajectory
+promotion. See [Bounded runtime-evidence projection](runtime-contracts.md#bounded-runtime-evidence-projection).
+
 ## Promoting a durable session trajectory
 
 `trajectory_from_session(...)` turns one already-finished production session

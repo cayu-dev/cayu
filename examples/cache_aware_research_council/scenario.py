@@ -12,11 +12,11 @@ from examples._advanced_support import (
     ScenarioResult,
     advanced_run_limits,
     collect_events,
-    count_model_completions,
+    completed_model_attempts,
     first_model_input_tokens,
     fork_session,
     paired_cost_quality_report,
-    session_evidence,
+    runtime_evidence_for_roles,
     stable_output_spec,
     validated_output,
 )
@@ -298,7 +298,7 @@ async def run_scenario(
     )
     repair = validated_output(repair_events)
 
-    sessions = await session_evidence(
+    runtime_report, sessions = await runtime_evidence_for_roles(
         app,
         {
             source_id: "source",
@@ -314,10 +314,10 @@ async def run_scenario(
     sessions_by_role = {session.role: session for session in sessions}
     research_roles = ("primary-sources", "contrarian", "practitioner")
     baseline_first_attempt_input_tokens = sum(
-        [await first_model_input_tokens(app, baseline_ids[role]) for role in research_roles]
+        [first_model_input_tokens(runtime_report, baseline_ids[role]) for role in research_roles]
     )
     candidate_first_attempt_input_tokens = sum(
-        [await first_model_input_tokens(app, branch_ids[role]) for role in research_roles]
+        [first_model_input_tokens(runtime_report, branch_ids[role]) for role in research_roles]
     )
     baseline_total_input_tokens = sum(
         sessions_by_role[f"baseline-{role}"].usage["input_tokens"] for role in research_roles
@@ -384,8 +384,8 @@ async def run_scenario(
         ),
         "strategies_are_distinct": len(strategy_names) == 3,
     }
-    model_requests = await count_model_completions(
-        app, [session.session_id for session in sessions]
+    model_requests = completed_model_attempts(
+        runtime_report, [session.session_id for session in sessions]
     )
     result = ScenarioResult(
         scenario="cache-aware-research-council",

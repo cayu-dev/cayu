@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from examples._advanced_support.runtime import _runtime_failure_summary
+import pytest
+from examples._advanced_support.runtime import (
+    _runtime_failure_summary,
+    runtime_evidence_for_roles,
+)
 from examples.prompt_cache_compaction.deterministic import run
 from examples.prompt_cache_compaction.live import _thinking_for_model
 from examples.prompt_cache_compaction.scenario import (
@@ -14,7 +18,17 @@ from examples.prompt_cache_compaction.scenario import (
     _usage_snapshot_payload,
 )
 
-from cayu import Event, EventType, ToolEffect
+from cayu import (
+    CayuApp,
+    Event,
+    EventType,
+    InMemorySessionStore,
+    Message,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+    ToolEffect,
+)
 
 
 def test_stable_context_loader_declares_its_read_only_effect() -> None:
@@ -55,6 +69,44 @@ def test_runtime_failure_summary_keeps_provider_diagnostics_without_request_data
             "error": "invalid request",
         },
     ]
+
+
+def test_runtime_evidence_for_roles_includes_safe_failure_diagnostics() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        await store.create(
+            RunRequest(
+                agent_name="agent",
+                session_id="failed-session",
+                messages=[Message.text("user", "request body")],
+            ),
+            identity=SessionIdentity(provider_name="provider", model="model"),
+        )
+        await store.append_event(
+            "failed-session",
+            Event(
+                type=EventType.MODEL_ERROR,
+                session_id="failed-session",
+                payload={
+                    "error_type": "ProviderError",
+                    "error": "bad request",
+                    "request": {"secret": "must not be reported"},
+                },
+            ),
+        )
+        await store.update_status("failed-session", SessionStatus.FAILED)
+        with pytest.raises(RuntimeError) as caught:
+            await runtime_evidence_for_roles(
+                CayuApp(session_store=store, enable_logging=False),
+                {"failed-session": "test"},
+            )
+        assert str(caught.value) == (
+            "Session failed-session did not complete: failed; "
+            "failures=[{'type': 'model.error', 'error_type': 'ProviderError', "
+            "'error': 'bad request'}]"
+        )
+
+    asyncio.run(scenario())
 
 
 def test_live_thinking_configuration_matches_anthropic_model_capability() -> None:

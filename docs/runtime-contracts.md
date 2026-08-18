@@ -3130,6 +3130,113 @@ material. Catalog version/generated-at plus each price row's source, URL, and
 as-of provenance reproduce the estimate boundary. This is runtime accounting
 evidence, not a provider invoice.
 
+### Bounded runtime-evidence projection
+
+`runtime_evidence(app, request)` is the canonical public read model for
+reconstructing lineage, execution, safety, and accounting evidence from durable
+runtime state. `RuntimeEvidenceRequest` requires a `root_session_id` plus
+explicit `max_sessions` and `max_events` bounds. The default scope is the root
+and its durable descendants only. `include_causal_budget=True` opts into a
+separate `max_causal_budget_sessions` expansion; it never turns an omitted
+scope into a whole-store scan.
+
+```python
+from cayu import RuntimeEvidenceRequest, runtime_evidence
+
+report = await runtime_evidence(
+    app,
+    RuntimeEvidenceRequest(
+        root_session_id="research-source",
+        max_sessions=64,
+        max_events=20_000,
+        include_causal_budget=True,
+        max_causal_budget_sessions=64,
+        pricing=my_price_book,  # optional
+    ),
+)
+```
+
+`RuntimeEvidenceReport.schema_version` is
+`RUNTIME_EVIDENCE_SCHEMA_VERSION == 1`. Sessions are ordered parent before
+child, then by durable creation time and session id. The scope records the exact
+descendant ids and, when requested, causal-budget ids. Session records retain
+only structural identity, terminal state, last durable event cursor, origin
+event references, payload-free task links, checkpoint event identities,
+payload-free compaction identities with start/terminal source refs and count,
+model attempts, logical tool calls, approvals, effective taint labels, policy
+outcomes, interruption/recovery counts, and receipt identities. Recovery
+distinguishes interruptions that require manual recovery
+from trusted terminal tool events that record a completed manual
+reconciliation; arbitrary custom-event payload fields cannot increment either
+count. Every event-derived item carries its stable source event id and sequence.
+Task and session ids are themselves the owning durable-record identities.
+
+Attempts preserve their logical model-step and attempt ids, ordinal, terminal
+state, provider/model identity, usage availability, typed operation, source
+events, provider-reported token/cache counters, and optional pricing outcome.
+Operations are `agent_step`, `compaction`, `structured_output_repair`,
+`evaluation`, `repair`, `comparison_control`, or `unknown`. Explicit durable
+operation markers take precedence; compaction and structured-output repair are
+recognized from their runtime protocol evidence; a stable ordinary model step
+is `agent_step`. Unknown or legacy attribution produces a typed warning rather
+than being silently relabeled. Provider retry remains an ordinal of the same
+operation, not another operation kind.
+
+Session, direct-child branch, descendant-lineage, and optional causal-budget
+totals are recomputed from retained attempts. First-attempt, provider-retry,
+structured-output-repair, compaction, evaluation, repair, and
+comparison-control usage remain separate. `whole_workflow_totals` is populated
+only for the opt-in causal-budget scope; a descendant-only subtotal is never
+called whole-workflow usage. Missing or malformed provider usage remains a
+missing attempt plus a typed warning, never inferred from text and never
+converted into a successful zero-token attempt.
+
+Passing a `PriceBook` is optional. Without one, attempts report
+`cost.status="not_requested"`. With one, each usage-bearing attempt is either
+`priced` with one currency-local decimal value or `unpriced`; an attempt with no
+usable provider counters remains `missing_usage`. Totals keep currencies
+separate and count priced and unpriced attempts. Pricing cannot turn missing
+usage or an unknown model into zero-cost evidence. Cost arithmetic uses a fixed
+decimal context. The detached catalog is itself bounded to 512 combined price,
+contextual-requirement, and resource-mapping rows and 1 MiB of canonical JSON,
+with every text value capped at 1,024 characters, so per-attempt price
+resolution cannot import an unbounded application object or produce report
+identity that exceeds the report schema.
+The fixed decimal context is independent of the caller's ambient decimal
+precision.
+
+The default report is safe to serialize. Its models are frozen, bounded, and
+allowlist only control identities and numeric evidence. It never includes raw
+messages, prompts, model output, provider error bodies, tool arguments/results,
+approval reasons, receipt bodies, credentials, arbitrary metadata, task titles
+or descriptions, or compaction summaries. Custom checkpoint names collapse to
+the non-secret `custom` kind while retaining the checkpoint event id. Receipt
+extraction inspects only the documented receipt-identity locations and discards
+the surrounding result body.
+
+Missing roots, unsupported bounded reads, parent contradictions, cycles, and
+session/event/causal-budget exhaustion raise `RuntimeEvidenceError` with a
+stable `RuntimeEvidenceErrorCode`, configured limit, and observed count where
+applicable. Unknown events and optional task evidence instead produce typed
+warnings when core lineage remains valid. Built-in memory, SQLite, and
+PostgreSQL session stores already provide the bounded lineage and pre-hydration
+event reads used by the projection. A custom `SessionStore` must advertise and
+implement `supports_session_lineage`, `query_session_lineage(...)`, and
+`query_events_bounded(...)`; causal expansion additionally uses bounded,
+keyset-paged `list_sessions(...)`. Task evidence is optional and is read only
+when the configured `TaskStore` advertises `supports_task_topology`; otherwise
+the report says it is unavailable.
+
+The projection performs no provider, tool, environment, hook, approval, or
+recovery action and writes no report back to a store. It is computed on demand;
+sessions and events remain authoritative. Reopening a SQLite-backed application
+over the same durable snapshot produces the same report, and generation time is
+not part of equality. The reads are bounded but are not a cross-store database
+transaction: callers that require a process-death or one-instant snapshot proof
+must first establish that durable boundary. Reconstructing a `CayuApp` around a
+store proves application reconstruction, not that an arbitrary project boot is
+side-effect-free and not that a process died.
+
 The optional server also exposes
 `POST /api/causal-budgets/{causal_budget_id}/summary` for one-call work-item
 observability. It accepts the same pricing body as the causal cost endpoint and

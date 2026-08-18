@@ -13,6 +13,11 @@ exercise the runtime gate and assert its durable `tool.call.blocked` event. It
 does not register notification or other outbound tools. The application is
 reconstructed after the fork to prove the taint boundary survives `CayuApp`
 reconstruction around the same store.
+Its final safety assertions read the inherited taint, blocked policy decision,
+source event identity, recovery summary, and receipt identities from the public
+bounded `runtime_evidence(app, request)` projection. Raw events are retained
+only while driving the live retry/control flow, not as the scenario's evidence
+aggregation contract.
 
 ```bash
 uv run python -m examples.tainted_incident_response.app

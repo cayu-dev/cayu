@@ -15,10 +15,12 @@ from cayu import (
     ForkSessionRequest,
     OpenAIProvider,
     RunLimits,
+    RuntimeEvidenceAttemptStatus,
+    RuntimeEvidenceReport,
+    RuntimeEvidenceRequest,
     SessionStatus,
     StructuredOutputSpec,
-    session_usage_summary,
-    usage_metrics_from_event_payload,
+    runtime_evidence,
 )
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
@@ -135,75 +137,105 @@ async def session_evidence(
     app: CayuApp,
     roles: dict[str, str],
 ) -> list[SessionEvidence]:
-    evidence: list[SessionEvidence] = []
-    for session_id, role in roles.items():
-        session = await app.session_store.load(session_id)
-        if session is None:
-            raise RuntimeError(f"Session disappeared: {session_id}")
-        events = await app.session_store.load_events(session_id)
-        if session.status != SessionStatus.COMPLETED:
-            failures = _runtime_failure_summary(events)
-            raise RuntimeError(
-                f"Session {session_id} did not complete: {session.status}; failures={failures!r}"
-            )
-        usage = session_usage_summary(session_id, events)
-        manual_recovery = any(event.payload.get("manual_recovery") is True for event in events)
-        interrupted = any(event.type == EventType.SESSION_INTERRUPTED for event in events)
-        receipt_ids = sorted(
-            {
-                value
-                for event in events
-                if event.type == EventType.TOOL_CALL_COMPLETED
-                for value in [event.payload.get("idempotency_key")]
-                if isinstance(value, str) and value
-            }
-        )
-        taint_labels = session.metadata.get("taint_labels", [])
-        if not isinstance(taint_labels, list):
-            taint_labels = []
-        evidence.append(
-            SessionEvidence(
-                session_id=session.id,
-                role=role,
-                parent_session_id=session.parent_session_id,
-                causal_budget_id=session.causal_budget_id or session.id,
-                status=session.status.value,
-                usage={
-                    "input_tokens": usage.usage.input_tokens,
-                    "output_tokens": usage.usage.output_tokens,
-                    "total_tokens": usage.usage.total_tokens,
-                },
-                model_steps=usage.model_steps,
-                tool_calls=usage.tool_calls,
-                recovery_state=(
-                    "manually-reconciled"
-                    if manual_recovery
-                    else "resumed-after-interruption"
-                    if interrupted
-                    else "not-required"
-                ),
-                taint_labels=sorted(str(label) for label in taint_labels),
-                compaction_count=sum(
-                    event.type == EventType.CONTEXT_COMPACTION_COMPLETED for event in events
-                ),
-                receipt_ids=receipt_ids,
-            )
-        )
+    _, evidence = await runtime_evidence_for_roles(app, roles)
     return evidence
 
 
-async def first_model_input_tokens(app: CayuApp, session_id: str) -> int:
-    events = await app.session_store.load_events(session_id)
-    first_completion = next(
-        (event for event in events if event.type == EventType.MODEL_COMPLETED),
+async def runtime_evidence_for_roles(
+    app: CayuApp,
+    roles: dict[str, str],
+) -> tuple[RuntimeEvidenceReport, list[SessionEvidence]]:
+    if not roles:
+        raise ValueError("roles must select at least one session.")
+    root_session_id = next(iter(roles))
+    report = await runtime_evidence(
+        app,
+        RuntimeEvidenceRequest(
+            root_session_id=root_session_id,
+            max_sessions=min(500, max(32, len(roles) * 4)),
+            max_events=min(100_000, max(2_000, len(roles) * 2_000)),
+            include_causal_budget=True,
+            max_causal_budget_sessions=min(500, max(32, len(roles) * 4)),
+        ),
+    )
+    sessions_by_id = {session.session_id: session for session in report.sessions}
+    missing = sorted(set(roles) - sessions_by_id.keys())
+    if missing:
+        raise RuntimeError(f"Sessions disappeared from runtime evidence: {missing!r}")
+    evidence: list[SessionEvidence] = []
+    for session_id, role in roles.items():
+        session = sessions_by_id[session_id]
+        if session.status != SessionStatus.COMPLETED:
+            failures = _runtime_failure_summary(await app.session_store.load_events(session_id))
+            raise RuntimeError(
+                f"Session {session_id} did not complete: {session.status}; failures={failures!r}"
+            )
+        evidence.append(
+            SessionEvidence(
+                session_id=session.session_id,
+                role=role,
+                parent_session_id=session.parent_session_id,
+                causal_budget_id=session.causal_budget_id,
+                status=session.status.value,
+                usage={
+                    "input_tokens": session.totals.usage.input_tokens,
+                    "output_tokens": session.totals.usage.output_tokens,
+                    "total_tokens": session.totals.usage.total_tokens,
+                },
+                model_steps=sum(
+                    attempt.status is RuntimeEvidenceAttemptStatus.COMPLETED
+                    for attempt in session.attempts
+                ),
+                tool_calls=session.totals.tool_call_count,
+                recovery_state=(
+                    "manually-reconciled"
+                    if session.recovery.manual_reconciliation_count
+                    else "resumed-after-interruption"
+                    if session.recovery.interruption_count
+                    else "not-required"
+                ),
+                taint_labels=list(session.effective_taint_labels),
+                compaction_count=session.compaction_count,
+                receipt_ids=sorted(receipt.receipt_id for receipt in session.receipts),
+            )
+        )
+    return report, evidence
+
+
+def first_model_input_tokens(report: RuntimeEvidenceReport, session_id: str) -> int:
+    session = next(
+        (item for item in report.sessions if item.session_id == session_id),
         None,
     )
-    if first_completion is None:
+    if session is None:
+        raise RuntimeError(f"Session {session_id} is absent from runtime evidence.")
+    first_completion = next(
+        (
+            attempt
+            for attempt in session.attempts
+            if attempt.status is RuntimeEvidenceAttemptStatus.COMPLETED
+            and attempt.usage is not None
+        ),
+        None,
+    )
+    if first_completion is None or first_completion.usage is None:
         raise RuntimeError(f"Session {session_id} has no completed model attempt.")
-    usage = usage_metrics_from_event_payload(first_completion.payload)
-    if usage is None or usage.input_tokens <= 0:
+    if first_completion.usage.input_tokens <= 0:
         raise RuntimeError(f"Session {session_id} has no provider-reported input tokens.")
-    return usage.input_tokens
+    return first_completion.usage.input_tokens
+
+
+def completed_model_attempts(
+    report: RuntimeEvidenceReport,
+    session_ids: list[str],
+) -> int:
+    selected = set(session_ids)
+    return sum(
+        attempt.status is RuntimeEvidenceAttemptStatus.COMPLETED
+        for session in report.sessions
+        if session.session_id in selected
+        for attempt in session.attempts
+    )
 
 
 async def fork_session(

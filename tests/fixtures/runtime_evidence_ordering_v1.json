@@ -1,0 +1,39 @@
+{
+  "sessions": [
+    {
+      "session_id": "ordering-root",
+      "total_tokens": 0
+    },
+    {
+      "session_id": "branch-first",
+      "total_tokens": 2
+    },
+    {
+      "session_id": "branch-second",
+      "total_tokens": 5
+    },
+    {
+      "session_id": "grandchild",
+      "total_tokens": 3
+    }
+  ],
+  "branches": [
+    {
+      "branch_root_session_id": "branch-first",
+      "session_ids": [
+        "branch-first",
+        "grandchild"
+      ],
+      "session_count": 2,
+      "total_tokens": 5
+    },
+    {
+      "branch_root_session_id": "branch-second",
+      "session_ids": [
+        "branch-second"
+      ],
+      "session_count": 1,
+      "total_tokens": 5
+    }
+  ]
+}
