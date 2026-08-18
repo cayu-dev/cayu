@@ -284,6 +284,7 @@ from cayu.runtime.usage import (
     durable_model_completed_payload,
     is_conversational_model_completion_payload,
     normalize_usage_metrics,
+    normalize_usage_metrics_with_overflow_error,
     usage_metrics_from_event_payload,
     usage_metrics_payload,
 )
@@ -8320,7 +8321,7 @@ def _validate_stream_event(
         resolved_model = _payload_model(payload, fallback=requested_model)
         try:
             projected_metrics = usage_metrics_payload(
-                normalize_usage_metrics(
+                normalize_usage_metrics_with_overflow_error(
                     provider_name=provider_name,
                     model=resolved_model,
                     requested_model=requested_model,

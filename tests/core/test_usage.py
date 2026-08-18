@@ -3551,6 +3551,83 @@ def test_normalize_anthropic_usage_metrics() -> None:
     assert metrics.cache.uncached_input_tokens == 100
 
 
+@pytest.mark.parametrize(
+    ("provider_name", "raw_usage"),
+    [
+        pytest.param(
+            "openai",
+            {"input_tokens": MAX_DURABLE_JSON_INTEGER + 1, "output_tokens": 1},
+            id="top-level",
+        ),
+        pytest.param(
+            "openai",
+            {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "input_tokens_details": {"cached_tokens": MAX_DURABLE_JSON_INTEGER + 1},
+            },
+            id="nested-cache-read",
+        ),
+        pytest.param(
+            "openai",
+            {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "output_tokens_details": {"reasoning_tokens": MAX_DURABLE_JSON_INTEGER + 1},
+            },
+            id="nested-reasoning",
+        ),
+        pytest.param(
+            "anthropic",
+            {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_creation": {"ephemeral_5m_input_tokens": MAX_DURABLE_JSON_INTEGER + 1},
+            },
+            id="nested-cache-write",
+        ),
+        pytest.param(
+            "anthropic",
+            {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_details": [{"input_tokens": MAX_DURABLE_JSON_INTEGER + 1, "ttl": "5m"}],
+            },
+            id="nested-cache-detail",
+        ),
+        pytest.param(
+            "anthropic",
+            {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": MAX_DURABLE_JSON_INTEGER,
+                    "ephemeral_1h_input_tokens": 1,
+                },
+            },
+            id="derived-cache-write-total",
+        ),
+        pytest.param(
+            "openai",
+            {"input_tokens": MAX_DURABLE_JSON_INTEGER, "output_tokens": 1},
+            id="derived-primary-total",
+        ),
+    ],
+)
+def test_normalize_usage_metrics_rejects_counter_outside_durable_range(
+    provider_name: str,
+    raw_usage: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name=provider_name,
+            model="gpt-test",
+            raw_usage=raw_usage,
+        )
+        is None
+    )
+
+
 def test_normalize_vertex_usage_metrics_matches_anthropic() -> None:
     # Claude on Vertex returns the Anthropic-shaped usage payload, so the "vertex"
     # provider must fold cache tokens into input exactly like "anthropic".

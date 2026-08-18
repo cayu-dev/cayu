@@ -11,7 +11,7 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.runtime.execution_units import RUNTIME_OWNED_EXECUTION_IDENTITY_FIELDS
-from cayu.runtime.usage import normalize_usage_metrics
+from cayu.runtime.usage import normalize_usage_metrics_with_overflow_error
 
 _RUNTIME_OWNED_USAGE_FIELDS = frozenset(
     {
@@ -102,7 +102,7 @@ def _portable_overflow_usage_projection(
     except ValueError:
         model = requested_model
     try:
-        normalize_usage_metrics(
+        normalize_usage_metrics_with_overflow_error(
             provider_name=provider_name,
             model=model,
             requested_model=requested_model,

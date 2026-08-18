@@ -102,7 +102,7 @@ from cayu.runtime.usage import (
     ModelCompletionPurpose,
     UsageMetrics,
     durable_model_completed_payload,
-    normalize_usage_metrics,
+    normalize_usage_metrics_with_overflow_error,
     strip_provider_billing_identity,
     usage_metrics_from_event_payload,
     usage_metrics_payload,
@@ -7691,7 +7691,7 @@ def _compaction_model_completed_payload(
     )
     try:
         usage_metrics = usage_metrics_payload(
-            normalize_usage_metrics(
+            normalize_usage_metrics_with_overflow_error(
                 provider_name=provider_name,
                 model=resolved_model,
                 requested_model=fallback_model,

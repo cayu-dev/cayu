@@ -464,6 +464,10 @@ _KNOWN_DIALECTS = frozenset(
 _ANTHROPIC_SHAPED_PROVIDERS = frozenset({"anthropic", "vertex"})
 
 
+class _UsageCounterOverflowError(ValueError):
+    """A source or derived provider counter exceeds Cayu's durable int64 domain."""
+
+
 def normalize_usage_metrics(
     *,
     provider_name: str | None,
@@ -473,7 +477,31 @@ def normalize_usage_metrics(
     requested_model: str | None = None,
     billing_identity: BillingIdentity | None = None,
 ) -> UsageMetrics | None:
-    """Normalize provider usage payloads without hiding the original raw usage.
+    """Normalize provider usage, returning ``None`` for malformed or oversized counters."""
+
+    try:
+        return normalize_usage_metrics_with_overflow_error(
+            provider_name=provider_name,
+            model=model,
+            raw_usage=raw_usage,
+            usage_dialect=usage_dialect,
+            requested_model=requested_model,
+            billing_identity=billing_identity,
+        )
+    except _UsageCounterOverflowError:
+        return None
+
+
+def normalize_usage_metrics_with_overflow_error(
+    *,
+    provider_name: str | None,
+    model: str | None,
+    raw_usage: Any,
+    usage_dialect: str | None = None,
+    requested_model: str | None = None,
+    billing_identity: BillingIdentity | None = None,
+) -> UsageMetrics | None:
+    """Normalize usage while preserving durable-counter overflow classification.
 
     ``usage_dialect`` (a ``providers.base.UsageDialect`` value or its string) lets
     a provider declare how it encodes cache and reasoning tokens. When omitted or
@@ -481,6 +509,11 @@ def normalize_usage_metrics(
     shape, so Anthropic-shaped payloads (Claude via Bedrock/gateways/renamed
     adapters) fold cache read/write tokens back into ``input_tokens`` instead of
     undercounting.
+
+    Unlike :func:`normalize_usage_metrics`, this boundary raises ``ValueError``
+    when a source or derived counter exceeds Cayu's durable integer range. Runtime
+    completion publishers use that distinction to retain safe rejection evidence
+    without retrying a provider operation that already completed.
     """
 
     if type(raw_usage) is not dict:
@@ -676,6 +709,22 @@ def normalize_usage_metrics(
     uncached_input_tokens = max(input_tokens - cached_input_tokens, 0)
     if anthropic_shaped:
         uncached_input_tokens = _first_nonnegative_int(raw_usage, ("input_tokens",))
+
+    normalized_counters = (
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        cache_write_5m_tokens,
+        cache_write_1h_tokens,
+        cache_write_unknown_ttl_tokens,
+        cached_input_tokens,
+        uncached_input_tokens,
+    )
+    if any(_durable_nonnegative_int(value) is None for value in normalized_counters):
+        return None
 
     return UsageMetrics(
         provider_name=provider_name,
@@ -1042,13 +1091,23 @@ def _nonnegative_int(value: Any) -> int:
     return 0
 
 
+def _durable_nonnegative_int(value: Any) -> int | None:
+    """Return one counter only when it fits Cayu's durable integer boundary."""
+
+    if type(value) is not int or value < 0:
+        return None
+    if value > MAX_DURABLE_JSON_INTEGER:
+        raise _UsageCounterOverflowError
+    return value
+
+
 def _optional_nonnegative_int_field(values: dict[str, Any], key: str) -> tuple[int, bool] | None:
     """Return a present non-negative integer field, or ``None`` when malformed."""
 
     if key not in values:
         return 0, False
-    value = values[key]
-    if type(value) is not int or value < 0:
+    value = _durable_nonnegative_int(values[key])
+    if value is None:
         return None
     return value, True
 
@@ -1088,10 +1147,11 @@ def _nested_cached_input_tokens(raw_usage: dict[str, Any]) -> tuple[int, bool] |
             return None
         if "cached_tokens" not in details:
             continue
-        value = details["cached_tokens"]
-        if value is None:
+        raw_value = details["cached_tokens"]
+        if raw_value is None:
             continue
-        if type(value) is not int or value < 0:
+        value = _durable_nonnegative_int(raw_value)
+        if value is None:
             return None
         observed.append(value)
     if not observed:
@@ -1127,8 +1187,8 @@ def _nested_reasoning_output_tokens(
         for detail_key in ("reasoning_tokens", "thinking_tokens"):
             if detail_key not in details or details[detail_key] is None:
                 continue
-            value = details[detail_key]
-            if type(value) is not int or value < 0:
+            value = _durable_nonnegative_int(details[detail_key])
+            if value is None:
                 return None
             observed.append(value)
     if not observed:
@@ -1154,10 +1214,13 @@ def _strict_cache_write_tokens(raw_usage: dict[str, Any]) -> int | None:
         if type(cache_creation) is not dict:
             return None
         creation_total = 0
-        for value in cache_creation.values():
-            if type(value) is not int or value < 0:
+        for raw_value in cache_creation.values():
+            value = _durable_nonnegative_int(raw_value)
+            if value is None:
                 return None
             creation_total += value
+            if creation_total > MAX_DURABLE_JSON_INTEGER:
+                raise _UsageCounterOverflowError
         observed.append(creation_total)
 
     cache_details = raw_usage.get("cache_details")
@@ -1175,6 +1238,8 @@ def _strict_cache_write_tokens(raw_usage: dict[str, Any]) -> int | None:
             if not present:
                 return None
             details_total += value
+            if details_total > MAX_DURABLE_JSON_INTEGER:
+                raise _UsageCounterOverflowError
         observed.append(details_total)
     if not observed:
         return 0
