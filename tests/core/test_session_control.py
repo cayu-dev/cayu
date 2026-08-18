@@ -378,3 +378,54 @@ def test_out_of_band_events_are_copied_and_drained_after_stream_events() -> None
         "custom.workflow.progress",
     ]
     assert events[1].payload == {"progress": 1}
+
+
+class _UpstreamCloseAbort(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "close_failure",
+    [
+        pytest.param(RuntimeError("upstream close failed"), id="exception"),
+        pytest.param(_UpstreamCloseAbort("upstream close aborted"), id="base-exception"),
+    ],
+)
+def test_stream_cancellation_closes_upstream_iterator_once(
+    close_failure: BaseException,
+) -> None:
+    class BlockingIterator:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.never = asyncio.Event()
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> Event:
+            self.started.set()
+            await self.never.wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            raise close_failure
+
+    async def scenario() -> tuple[BaseException, int]:
+        upstream = BlockingIterator()
+        control = SessionControl[object](session_store=object())
+        wrapped = control.stream_with_out_of_band_events("session-cancel", upstream)
+        consumer = asyncio.create_task(anext(wrapped))
+        await asyncio.wait_for(upstream.started.wait(), timeout=1)
+        consumer.cancel()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(consumer, return_exceptions=True),
+            timeout=1,
+        )
+        return outcomes[0], upstream.close_calls
+
+    outcome, close_calls = asyncio.run(scenario())
+
+    assert isinstance(outcome, asyncio.CancelledError)
+    assert close_calls == 1

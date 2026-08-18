@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
@@ -322,6 +323,10 @@ class SessionControl(Generic[UsageTrackerT]):
                     yield queued_event
             async for queued_event in self.drain_out_of_band_events(session_id):
                 yield queued_event
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await _close_async_iterator(stream)
+            raise
         except GeneratorExit:
             await _close_async_iterator(stream)
             raise
