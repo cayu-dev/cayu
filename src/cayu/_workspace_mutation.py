@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from cayu._exception_groups import exception_tree_contains, rebuild_exception_group
+from cayu._task_wait import CapturedAwaitableOutcome
 
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
 _MAX_PROCESS_SIGNAL_ARGS = 4
@@ -14,6 +16,73 @@ _MAX_PROCESS_SIGNAL_ARGS = 4
 
 class WorkspaceMutationSettlementError(RuntimeError):
     """The runtime cannot prove that an invocation mutation has stopped."""
+
+
+def workspace_mutation_task_settlement_probe(
+    task: asyncio.Future[Any],
+) -> Callable[[], Awaitable[bool]]:
+    """Retain one exact task until shared-resource reuse can prove quiescence."""
+
+    if not isinstance(task, asyncio.Future):
+        raise TypeError("Workspace mutation settlement task must be an asyncio Future.")
+
+    process_signal_delivered = False
+
+    async def settle() -> bool:
+        nonlocal process_signal_delivered
+        current_task = asyncio.current_task()
+        cancellation_requests = 0 if current_task is None else current_task.cancelling()
+        if not task.done() and task.get_loop() is not asyncio.get_running_loop():
+            return False
+        if not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if current_task is not None and current_task.cancelling() > cancellation_requests:
+                    raise
+                if task.cancelled():
+                    # A cancelled coroutine is not positive evidence that an
+                    # opaque observer's thread, executor, subprocess, or remote
+                    # request stopped. Keep the environment quarantined.
+                    return False
+                raise
+            except BaseException as exc:
+                if not task.done():
+                    raise
+                process_signal = detached_workspace_mutation_process_signal(exc)
+                if process_signal is not None:
+                    if process_signal_delivered:
+                        return True
+                    process_signal_delivered = True
+                    raise process_signal from None
+        if not task.done() or task.cancelled():
+            return False
+        try:
+            result = task.result()
+        except BaseException as exc:
+            process_signal = detached_workspace_mutation_process_signal(exc)
+            if process_signal is not None:
+                if process_signal_delivered:
+                    return True
+                process_signal_delivered = True
+                raise process_signal from None
+            return not isinstance(exc, asyncio.CancelledError)
+        if type(result) is CapturedAwaitableOutcome:
+            captured_error = result.error
+            process_signal = detached_workspace_mutation_process_signal(captured_error)
+            if process_signal is not None:
+                if process_signal_delivered:
+                    return True
+                process_signal_delivered = True
+                raise process_signal from None
+            if captured_error is not None and exception_tree_contains(
+                captured_error,
+                asyncio.CancelledError,
+            ):
+                return False
+        return True
+
+    return settle
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +155,22 @@ class WorkspaceMutationProcessFence:
                 if task is not None and task.done():
                     outcome = _settlement_probe_task_outcome(task)
                     if self._accept_probe_outcome(owner, task, outcome):
+                        continue
+                    if outcome.process_signal is not None:
+                        if owner.process_signal_claimed:
+                            if owner.active_waiters > 0:
+                                # The waiter that claimed this generation still
+                                # owns delivery of its process-control outcome.
+                                blocked_by_owned_outcome = True
+                                continue
+                            self._retire_claimed_process_signal(owner, task)
+                            continue
+                        # A prior waiter can abandon before the retained probe
+                        # finishes. Join the completed generation so this next
+                        # waiter, rather than a replacement probe, receives the
+                        # late process-control outcome exactly once.
+                        owner.active_waiters += 1
+                        joined.append((owner, task))
                         continue
                     if owner.active_waiters > 0:
                         # Another waiter already owns delivery of this exact
@@ -169,6 +254,13 @@ class WorkspaceMutationProcessFence:
             if task is None or not task.done():
                 raise _workspace_mutation_quarantine_error() from None
             outcome = _settlement_probe_task_outcome(task)
+            if (
+                outcome.process_signal is not None
+                and owner.process_signal_claimed
+                and owner.active_waiters == 0
+            ):
+                self._retire_claimed_process_signal(owner, task)
+                continue
             if not self._accept_probe_outcome(owner, task, outcome):
                 raise _workspace_mutation_quarantine_error() from None
 
@@ -192,6 +284,24 @@ class WorkspaceMutationProcessFence:
         owners.remove(owner)
         owner.task = None
         return True
+
+    def _retire_claimed_process_signal(
+        self,
+        owner: _SettlementProbeOwner,
+        task: asyncio.Task[_SettlementProbeOutcome],
+    ) -> None:
+        """Retire one generation only after its signal was authoritatively delivered."""
+
+        owners = self._root._owners
+        if (
+            owner in owners
+            and owner.task is task
+            and task.done()
+            and owner.process_signal_claimed
+            and owner.active_waiters == 0
+        ):
+            owners.remove(owner)
+            owner.task = None
 
 
 async def _run_settlement_probe(
@@ -229,7 +339,7 @@ def detached_workspace_mutation_process_signal(
 ) -> BaseException | None:
     """Detach one extension-owned process signal from unsafe diagnostics."""
 
-    if not exception_tree_contains(error, (KeyboardInterrupt, SystemExit)):
+    if not exception_tree_contains(error, (GeneratorExit, KeyboardInterrupt, SystemExit)):
         return None
     if isinstance(error, BaseExceptionGroup):
         return rebuild_exception_group(
@@ -244,6 +354,8 @@ def detached_workspace_mutation_process_signal(
 
 
 def _detached_process_signal_leaf(error: BaseException) -> BaseException:
+    if isinstance(error, GeneratorExit):
+        return GeneratorExit(*(_safe_process_signal_args(error) or ()))
     if isinstance(error, KeyboardInterrupt):
         return KeyboardInterrupt(*(_safe_process_signal_args(error) or ()))
     if isinstance(error, SystemExit):
@@ -279,4 +391,5 @@ __all__ = [
     "WorkspaceMutationProcessFence",
     "WorkspaceMutationSettlementError",
     "detached_workspace_mutation_process_signal",
+    "workspace_mutation_task_settlement_probe",
 ]

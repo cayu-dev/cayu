@@ -84,6 +84,36 @@ class _RetainedInvocationOperationProbe:
         return outcome if type(outcome) is InvocationOperationOutcome else None
 
 
+def retained_invocation_operation_settlement_probe(
+    retained: _RetainedInvocationOperationProbe,
+) -> Callable[[], Awaitable[bool]]:
+    """Preserve one abandoned operation and any exact late process-control outcome."""
+
+    if type(retained) is not _RetainedInvocationOperationProbe:
+        raise TypeError("retained must be a runtime-owned invocation-operation probe.")
+
+    async def settle() -> bool:
+        outcome = await retained.outcome()
+        if outcome is None:
+            return False
+        error = outcome.error
+        if error is not None and exception_tree_contains(
+            error,
+            (KeyboardInterrupt, SystemExit, GeneratorExit),
+        ):
+            raise error
+        if error is not None and exception_tree_contains(  # noqa: SIM103
+            error,
+            asyncio.CancelledError,
+        ):
+            # Delivery to an extension-owned task is not positive evidence
+            # that executor, subprocess, SDK, or remote mutation work stopped.
+            return False
+        return True
+
+    return settle
+
+
 def _observe_retained_invocation_operation(
     child: asyncio.Future[InvocationOperationOutcome[Any]],
 ) -> None:
@@ -171,6 +201,9 @@ async def await_invocation_operation(
     on_unsettled_supervisory_exit: (
         Callable[[_RetainedInvocationOperationProbe], None] | None
     ) = None,
+    on_abandoned_caller_cancellation: (
+        Callable[[Callable[[], Awaitable[bool]]], None] | None
+    ) = None,
 ) -> InvocationOperationOutcome[_ResultT]:
     """Run an extension in an owned task without surrendering caller cancellation.
 
@@ -185,14 +218,14 @@ async def await_invocation_operation(
     A boundary that has already authenticated and retained caller cancellation
     may pass it back through ``cancellation`` to run required settlement work;
     later requests are observed without replacing the original signal.
-    Side-effect-free operations may opt into prompt abandonment after caller
-    cancellation by supplying ``abandon_on_caller_cancellation=True`` together
-    with a bounded ``operation_registry`` and
-    ``request_child_cancellation=False``. The child remains retained and
-    observed until it naturally settles; cancellation delivery alone cannot
-    prove that executor, subprocess, remote, or other opaque work stopped. This
-    mode must not be used for a mutation whose settlement owns retry or cleanup
-    authority.
+    Operations may opt into prompt abandonment after caller cancellation by
+    supplying ``abandon_on_caller_cancellation=True`` together with a bounded
+    ``operation_registry`` and ``request_child_cancellation=False``. The child
+    remains retained and observed until it naturally settles; cancellation
+    delivery alone cannot prove that executor, subprocess, remote, or other
+    opaque work stopped. A mutation whose settlement owns retry or cleanup
+    authority must additionally transfer the returned retained probe through
+    ``on_abandoned_caller_cancellation`` to a shared-resource fence.
     """
 
     if not callable(operation_factory):
@@ -205,6 +238,10 @@ async def await_invocation_operation(
         raise TypeError("cancellation must be a CancelledError or None.")
     if on_unsettled_supervisory_exit is not None and not callable(on_unsettled_supervisory_exit):
         raise TypeError("on_unsettled_supervisory_exit must be callable or None.")
+    if on_abandoned_caller_cancellation is not None and not callable(
+        on_abandoned_caller_cancellation
+    ):
+        raise TypeError("on_abandoned_caller_cancellation must be callable or None.")
     if abandon_on_caller_cancellation != (operation_registry is not None):
         raise ValueError(
             "abandon_on_caller_cancellation requires exactly one bounded operation registry."
@@ -285,6 +322,18 @@ async def await_invocation_operation(
                 if request_child_cancellation:
                     child.cancel(_CHILD_CANCELLATION_MESSAGE)
                 if abandon_on_caller_cancellation:
+                    # An outcome already terminal in this same loop turn must
+                    # surface now. In particular, a concurrent process-control
+                    # signal is aggregated with caller cancellation instead of
+                    # becoming a merely historical fence outcome.
+                    if child.done():
+                        break
+                    if on_abandoned_caller_cancellation is not None:
+                        on_abandoned_caller_cancellation(
+                            retained_invocation_operation_settlement_probe(
+                                _RetainedInvocationOperationProbe(child)
+                            )
+                        )
                     return InvocationOperationOutcome(
                         # The retained child can still begin after this caller
                         # stops waiting, so absence of an observed start is not

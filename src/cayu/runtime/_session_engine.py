@@ -129,10 +129,7 @@ from cayu.runtime._interruption_coordinator import (
     interruption_cascade_suppressed,
     suppress_interruption_cascade,
 )
-from cayu.runtime._message_redaction import (
-    redact_runtime_message_for_boundary,
-    redact_untrusted_message_for_boundary,
-)
+from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
@@ -486,6 +483,9 @@ from cayu.runtime.user_input import (
     event_with_pending_user_input_authority,
     pending_user_input_from_checkpoint,
     public_pending_user_input_event_payload,
+)
+from cayu.runtime.workspace_observation_recovery import (
+    workspace_observation_pending_cancellation_requests,
 )
 from cayu.vaults import (
     SecretRedactor,
@@ -5391,6 +5391,7 @@ class SessionEngine:
         propagated_cancellation: asyncio.CancelledError | None = None
         propagated_cancellation_group: BaseExceptionGroup | None = None
         group_has_explicit_cancellation = False
+        group_has_process_control = False
         try:
             async for event in forwarded_stream:
                 yield event
@@ -5404,6 +5405,10 @@ class SessionEngine:
             # durable session interruption transition as a plain cancellation.
             group_has_explicit_cancellation = (
                 binding_finalize_explicit_cancellation(exc) is not None
+            )
+            group_has_process_control = any(
+                isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit))
+                for candidate in iter_exception_tree(exc)
             )
             billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
             if billing_identity_cancellation_group is None:
@@ -5501,6 +5506,19 @@ class SessionEngine:
             raise propagated_cancellation
 
         if propagated_cancellation_group is not None:
+            current_task = asyncio.current_task()
+            if (
+                group_has_process_control
+                and workspace_observation_pending_cancellation_requests(
+                    propagated_cancellation_group
+                )
+                and current_task is not None
+                and current_task.cancelling()
+            ):
+                # Do not introduce an await while a restored caller
+                # cancellation is pending: it would replace the concurrent
+                # process-control group before that exact evidence escapes.
+                raise propagated_cancellation_group
             persisted_session = await self.session_store.load(session.id)
             if (
                 group_has_explicit_cancellation
@@ -12013,9 +12031,11 @@ class SessionEngine:
                     model_attempt_id=assistant_step_result.model_attempt_id,
                 )
                 raw_assistant_message = assistant_step_result.assistant_message
+                tool_round_identity = assistant_step_result.tool_round_identity
                 assistant_message = (
-                    redact_untrusted_message_for_boundary(
+                    transcript_helpers.redact_untrusted_assistant_message_for_boundary(
                         raw_assistant_message,
+                        tool_round_identity=tool_round_identity,
                         redactor=self._secret_redactor,
                         field_name="assistant_message",
                     )
@@ -12023,7 +12043,6 @@ class SessionEngine:
                     else None
                 )
                 tool_calls = assistant_step_result.tool_calls
-                tool_round_identity = assistant_step_result.tool_round_identity
                 tool_round_id = (
                     None if tool_round_identity is None else tool_round_identity.tool_round_id
                 )

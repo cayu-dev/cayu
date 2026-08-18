@@ -41,7 +41,19 @@ from cayu.runtime.tool_result_projection import (
     _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
     reestimate_tool_result_projection_tokens,
 )
+from cayu.runtime.workspace_observation_recovery import (
+    WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
+    WorkspaceObservationArtifactState,
+)
 from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.revisions import (
+    _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS,
+    _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS,
+    _WORKSPACE_PATH_REVISION_DELTA_FIELDS,
+    _WORKSPACE_PATH_REVISION_FIELDS,
+    WorkspaceRevisionDeltaStatus,
+    WorkspaceRevisionObservationStatus,
+)
 
 PUBLIC_EVENT_ID_PREFIX = "cayu_event_"
 PUBLIC_EVENT_LINKAGE_SEPARATOR = ":"
@@ -219,11 +231,33 @@ _TERMINAL_CONTROL_KEYS = frozenset(
 )
 _WORKSPACE_MUTATION_CAPTURE_CONTROLS = frozenset(
     {
+        ("pending", None),
         ("recorded", None),
         ("failed", "mutation_settlement_unproven"),
         ("failed", "receipt_publication_failed"),
+        ("failed", "worker_lost_before_workspace_observation_completed"),
+        ("failed", "worker_lost_before_tool_outcome_was_durable"),
+        ("failed", "durable_tool_outcome_evidence_missing"),
+        ("failed", "workspace_delta_evidence_missing"),
+        ("failed", "workspace_delta_evidence_conflict"),
+        ("failed", "referenced_workspace_artifact_missing"),
+        ("failed", "workspace_artifact_verification_failed"),
         ("interrupted", "receipt_publication_interrupted"),
     }
+)
+_WORKSPACE_OBSERVATION_PHASE_VALUES = frozenset({"before", "after"})
+_WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES = frozenset({"complete", "changed"})
+_WORKSPACE_OBSERVATION_STATUS_VALUES = frozenset(
+    item.value for item in WorkspaceRevisionObservationStatus
+)
+_WORKSPACE_MUTATION_STATUS_VALUES = frozenset(item.value for item in WorkspaceRevisionDeltaStatus)
+_WORKSPACE_OBSERVATION_ARTIFACT_STATE_VALUES = frozenset(
+    item.value for item in WorkspaceObservationArtifactState
+)
+_WORKSPACE_OBSERVATION_ARTIFACT_STATE_FIELDS = (
+    "revision_before_artifact_state",
+    "revision_after_artifact_state",
+    "revision_delta_artifact_state",
 )
 
 _SESSION_STATUS_VALUES = frozenset(
@@ -365,8 +399,20 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     EventType.SESSION_INTERRUPTED: {
         ("approval", "arguments_state"): frozenset({"quarantined"}),
         ("approval", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+        ("final_revision", "status"): _WORKSPACE_OBSERVATION_STATUS_VALUES,
+        ("final_revision", "path_scope"): _WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES,
         ("user_input", "arguments_state"): frozenset({"quarantined"}),
         ("user_input", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+    },
+    **{
+        event_type: {
+            ("final_revision", "status"): _WORKSPACE_OBSERVATION_STATUS_VALUES,
+            ("final_revision", "path_scope"): _WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES,
+        }
+        for event_type in {
+            EventType.SESSION_COMPLETED,
+            EventType.SESSION_FAILED,
+        }
     },
     **{
         event_type: {("arguments_state",): tool_argument_publication.TERMINAL_ARGUMENT_STATES}
@@ -456,6 +502,11 @@ _DECLARED_FIXED_CONTROLS: Mapping[
             ("outcome",): frozenset({"completed", "failed", "interrupted"}),
             ("terminal_outcome",): frozenset({"completed", "failed", "interrupted"}),
             ("factory_allocation_action",): frozenset({"preserve"}),
+            ("final_revision", "status"): _WORKSPACE_OBSERVATION_STATUS_VALUES,
+            (
+                "final_revision",
+                "path_scope",
+            ): _WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES,
         }
         for event_type in {
             EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
@@ -1741,39 +1792,122 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             },
         )
     workspace_observation_keys = (
-        "branch detail_code head_revision model_attempt_id model_step model_step_id observer "
+        "binding_generation_id branch detail_code head_revision model_attempt_id model_step model_step_id observer "
         "manifest_artifact_id manifest_artifact_sha256 manifest_artifact_size_bytes path_scope paths phase "
         "revision session_run_epoch status tool_call_id tool_round_id total_paths window_id "
-        "workspace_id"
+        "workspace_id artifact_store_id"
     )
+    workspace_path_owned_paths = {
+        ("paths", "*", field_name) for field_name in _WORKSPACE_PATH_REVISION_FIELDS
+    }
+    workspace_path_authority_paths = {
+        ("paths", "*", field_name) for field_name in _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS
+    }
+    workspace_delta_owned_paths = {
+        ("paths", "*", field_name) for field_name in _WORKSPACE_PATH_REVISION_DELTA_FIELDS
+    }
+    workspace_delta_authority_paths = {
+        ("paths", "*", field_name) for field_name in _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS
+    }
     policies[EventType.WORKSPACE_REVISION_OBSERVED] = _observed_policy(
         workspace_observation_keys,
+        owned_nested_paths=workspace_path_owned_paths,
+        authority_keys={"manifest_artifact_sha256", "observer"},
+        public_authority_keys={"manifest_artifact_sha256", "observer"},
         aliased_authority_keys={
             "model_attempt_id",
             "model_step_id",
+            "binding_generation_id",
             "manifest_artifact_id",
             "tool_call_id",
             "tool_round_id",
             "window_id",
             "workspace_id",
+            "artifact_store_id",
         },
+        nested_authority_paths=workspace_path_authority_paths,
         untrusted_container_keys={"paths"},
     )
     policies[EventType.WORKSPACE_MUTATION_RECORDED] = _observed_policy(
-        "after_observation_id after_revision before_observation_id before_revision "
+        "after_observation_id after_revision before_observation_id before_revision binding_generation_id "
         "branch_changed detail_code head_changed model_attempt_id model_step model_step_id "
         "manifest_artifact_id manifest_artifact_sha256 manifest_artifact_size_bytes observer paths "
-        "session_run_epoch status tool_call_id tool_round_id total_paths window_id workspace_id",
+        "recovery_run_epoch session_run_epoch status tool_call_id tool_outcome_event_digest tool_outcome_event_id "
+        "tool_round_id total_paths window_id workspace_id artifact_store_id",
+        owned_nested_paths=workspace_delta_owned_paths,
+        authority_keys={
+            "manifest_artifact_sha256",
+            "observer",
+            "tool_outcome_event_digest",
+        },
+        public_authority_keys={
+            "manifest_artifact_sha256",
+            "observer",
+            "tool_outcome_event_digest",
+        },
         aliased_authority_keys={
             "after_observation_id",
             "before_observation_id",
+            "binding_generation_id",
             "model_attempt_id",
             "model_step_id",
             "manifest_artifact_id",
             "tool_call_id",
+            "tool_outcome_event_id",
             "tool_round_id",
             "window_id",
             "workspace_id",
+            "artifact_store_id",
+        },
+        nested_authority_paths=workspace_delta_authority_paths,
+        untrusted_container_keys={"paths"},
+    )
+    policies[EventType.WORKSPACE_OBSERVATION_FINALIZED] = _observed_policy(
+        "after_observation_id before_observation_id binding_generation_id branch_changed detail_code "
+        "failed_artifact_count head_changed "
+        "model_attempt_id model_step model_step_id mutation_event_id paths recovery_run_epoch "
+        "referenced_artifact_count "
+        "revision_after_artifact_id revision_after_artifact_sha256 "
+        "revision_after_artifact_size_bytes revision_after_artifact_state "
+        "revision_before_artifact_id revision_before_artifact_sha256 "
+        "revision_before_artifact_size_bytes revision_before_artifact_state "
+        "revision_delta_artifact_id revision_delta_artifact_sha256 "
+        "revision_delta_artifact_size_bytes revision_delta_artifact_state "
+        "session_run_epoch status tool_call_id tool_outcome_event_digest tool_outcome_event_id "
+        "mutation_event_digest "
+        "tool_round_id total_paths window_id workspace_id observer artifact_store_id",
+        authority_keys={
+            "mutation_event_digest",
+            "observer",
+            "revision_after_artifact_sha256",
+            "revision_before_artifact_sha256",
+            "revision_delta_artifact_sha256",
+            "tool_outcome_event_digest",
+        },
+        public_authority_keys={
+            "mutation_event_digest",
+            "observer",
+            "revision_after_artifact_sha256",
+            "revision_before_artifact_sha256",
+            "revision_delta_artifact_sha256",
+            "tool_outcome_event_digest",
+        },
+        aliased_authority_keys={
+            "after_observation_id",
+            "before_observation_id",
+            "binding_generation_id",
+            "model_attempt_id",
+            "model_step_id",
+            "mutation_event_id",
+            "revision_after_artifact_id",
+            "revision_before_artifact_id",
+            "revision_delta_artifact_id",
+            "tool_call_id",
+            "tool_outcome_event_id",
+            "tool_round_id",
+            "window_id",
+            "workspace_id",
+            "artifact_store_id",
         },
         untrusted_container_keys={"paths"},
     )
@@ -1888,12 +2022,18 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys={"mutation_id"},
     )
     terminal_finalization_keys = (
-        "binding_finalize_error binding_finalize_publication_error environment_factory_release"
+        "binding_finalize_error binding_finalize_publication_error environment_factory_release "
+        "final_revision"
     )
     terminal_finalization_containers = {
         "binding_finalize_error",
         "binding_finalize_publication_error",
         "environment_factory_release",
+        "final_revision",
+    }
+    terminal_finalization_owned_paths = {
+        ("final_revision", "status"),
+        ("final_revision", "path_scope"),
     }
     policies[EventType.SESSION_STARTED] = _observed_policy(
         "agent_name input_contract parent_session_id prompt_contribution_manifest "
@@ -1910,6 +2050,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_COMPLETED] = _observed_policy(
         terminal_finalization_keys,
+        owned_nested_paths=terminal_finalization_owned_paths,
         authority_keys={"session_run_operation_id"},
         untrusted_container_keys=terminal_finalization_containers,
     )
@@ -1918,6 +2059,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "error error_type interaction_transition_failures interruption_type "
         "manual_recovery_required model_attempt_id model_step_id tool_call_id "
         f"tool_name tool_round_id {terminal_finalization_keys}",
+        owned_nested_paths=terminal_finalization_owned_paths,
         authority_keys={"session_run_operation_id"},
         aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
         untrusted_container_keys={"binding_cleanup", "interaction_transition_failures"}
@@ -1934,10 +2076,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "recovered requested_by resolved_by tool_call_id tool_call_metadata_truncated "
         "session_run_operation_id tool_evidence_conflict tool_name tool_round_id "
         "usage_summary user_input " + terminal_finalization_keys,
-        owned_nested_paths=_resolution_actor_nested_paths(
-            "requested_by",
-            "resolved_by",
-        )
+        owned_nested_paths=terminal_finalization_owned_paths
+        | _resolution_actor_nested_paths("requested_by", "resolved_by")
         | _APPROVAL_NESTED_SCHEMA_PATHS
         | _USER_INPUT_NESTED_SCHEMA_PATHS,
         aliased_authority_keys={
@@ -2251,15 +2391,20 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = knowledge_policy
 
     binding_policy = _observed_policy(
-        "binding_cleanup binding_type bound_metadata bound_path bound_snapshot "
+        "binding_cleanup binding_generation_id binding_type bound_metadata bound_path bound_snapshot "
         "bound_workspace_id configured_workspace_id environment_factory_release error "
-        "error_type factory_allocation_action failures final_snapshot has_bound_runner "
+        "error_type factory_allocation_action failures final_revision final_snapshot has_bound_runner "
         "has_configured_runner outcome source_workspace_id terminal_outcome",
+        owned_nested_paths={
+            ("final_revision", "status"),
+            ("final_revision", "path_scope"),
+        },
         untrusted_container_keys={
             "binding_cleanup",
             "bound_metadata",
             "environment_factory_release",
             "failures",
+            "final_revision",
         },
     )
     for event_type in (
@@ -3128,6 +3273,17 @@ def _reject_secret_authority_values(
                     "be used as durable event authority."
                 )
             continue
+        # Workspace-observer producers attest ``observer`` only when the
+        # lifecycle carries structural ``runtime_builtin`` provenance.  That
+        # positive evidence must win over an accidental exact collision with a
+        # workload secret; configured observers are deliberately not attested
+        # and continue through the ordinary secret-admission checks below.
+        if field_name == "observer" and event_payload_authority_is_runtime_generated(
+            event,
+            field_name=field_name,
+            value=value,
+        ):
+            continue
         if redactor.is_exact_secret(value):
             raise ValueError(
                 f"event.payload.{field_name} contains a workload secret and cannot "
@@ -3618,6 +3774,54 @@ def _recognized_controls(
             if reject_malformed:
                 raise
             return {}
+    if event.type == EventType.WORKSPACE_REVISION_OBSERVED:
+        phase = event.payload.get("phase")
+        status = event.payload.get("status")
+        path_scope = event.payload.get("path_scope")
+        if (
+            type(phase) is str
+            and phase in _WORKSPACE_OBSERVATION_PHASE_VALUES
+            and type(status) is str
+            and status in _WORKSPACE_OBSERVATION_STATUS_VALUES
+            and type(path_scope) is str
+            and path_scope in _WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES
+        ):
+            return {
+                "phase": phase,
+                "status": status,
+                "path_scope": path_scope,
+            }
+        if reject_malformed:
+            raise ValueError("Invalid workspace revision observation controls.")
+        return {}
+    if event.type == EventType.WORKSPACE_MUTATION_RECORDED:
+        status = event.payload.get("status")
+        if type(status) is str and status in _WORKSPACE_MUTATION_STATUS_VALUES:
+            return {"status": status}
+        if reject_malformed:
+            raise ValueError("Invalid workspace mutation status control.")
+        return {}
+    if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED:
+        status = event.payload.get("status")
+        detail_code = event.payload.get("detail_code")
+        if (
+            type(status) is not str
+            or (status, detail_code) not in WORKSPACE_OBSERVATION_TERMINAL_CONTROLS
+        ):
+            if reject_malformed:
+                raise ValueError("Invalid workspace observation terminal controls.")
+            return {}
+        controls = {"status": status, "detail_code": detail_code}
+        for field_name in _WORKSPACE_OBSERVATION_ARTIFACT_STATE_FIELDS:
+            if field_name not in event.payload:
+                continue
+            value = event.payload[field_name]
+            if type(value) is not str or value not in _WORKSPACE_OBSERVATION_ARTIFACT_STATE_VALUES:
+                if reject_malformed:
+                    raise ValueError("Invalid workspace observation artifact state control.")
+                return {}
+            controls[field_name] = value
+        return controls
     if event.type == EventType.MODEL_COMPLETED:
         controls: dict[str, Any] = {}
         classification = event.payload.get("step_classification")
@@ -3803,6 +4007,21 @@ def _remove_malformed_public_controls(
         and "interruption_type" not in controls
     ):
         redacted_payload.pop("interruption_type", None)
+
+    workspace_control_fields: tuple[str, ...] = ()
+    if event.type == EventType.WORKSPACE_REVISION_OBSERVED:
+        workspace_control_fields = ("phase", "status", "path_scope")
+    elif event.type == EventType.WORKSPACE_MUTATION_RECORDED:
+        workspace_control_fields = ("status",)
+    elif event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED:
+        workspace_control_fields = (
+            "status",
+            "detail_code",
+            *_WORKSPACE_OBSERVATION_ARTIFACT_STATE_FIELDS,
+        )
+    for field_name in workspace_control_fields:
+        if field_name in event.payload and field_name not in controls:
+            redacted_payload.pop(field_name, None)
 
     if event.type == EventType.TOOL_CALL_BLOCKED:
         for field_name in (

@@ -826,6 +826,54 @@ def test_finalize_started_publication_failure_does_not_skip_binding_cleanup(
     assert bound_runner.is_closed is True
 
 
+def test_finalize_completed_publication_failure_preserves_final_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> tuple[_SwitchingBinding, _EvidenceRunner, _EvidenceRunner]:
+        app, _factory, binding, source_runner, bound_runner, _lifecycle = _bound_factory_app()
+        original_emit = app._event_writer.emit
+
+        async def fail_finalize_completed(event: Event) -> Event:
+            if event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED:
+                raise ConnectionError("final revision publication acknowledgement lost")
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", fail_finalize_completed)
+        events = await _run(app, "sess_finalize_completion_publication_failed")
+        terminal = next(event for event in events if event.type is EventType.SESSION_COMPLETED)
+        assert terminal.payload["binding_finalize_publication_error"]["failures"] == [
+            {
+                "phase": "finalize_completed_event",
+                "error": "final revision publication acknowledgement lost",
+                "error_type": "ConnectionError",
+            }
+        ]
+        final_revision = terminal.payload["final_revision"]
+        assert final_revision == {
+            "workspace_id": final_revision["workspace_id"],
+            "observer": final_revision["observer"],
+            "status": "truncated",
+            "revision": None,
+            "head_revision": None,
+            "branch": None,
+            "path_scope": "complete",
+            "total_paths": 0,
+            "detail_code": "final_revision_secret_scope_unavailable",
+        }
+        assert final_revision["workspace_id"].startswith("cayu_authority_v1.")
+        assert final_revision["observer"].startswith("cayu_authority_v1.")
+        assert not any(
+            event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED for event in events
+        )
+        return binding, source_runner, bound_runner
+
+    binding, source_runner, bound_runner = asyncio.run(run())
+
+    assert binding.finalize_calls == 1
+    assert source_runner.is_closed is True
+    assert bound_runner.is_closed is True
+
+
 def test_binding_completion_publication_cancellation_finalizes_adopted_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

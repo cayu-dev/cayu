@@ -405,6 +405,7 @@ DISPATCH_CONFLICT_RECOVERY_REASON = "dispatch_conflict_worker_crash_recovery"
 _STALLED_RECOVERED_ACTIONS = {
     IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
     IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,
+    IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION,
     IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
     IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,
     IncompleteSessionRecoveryAction.PENDING_APPROVAL,

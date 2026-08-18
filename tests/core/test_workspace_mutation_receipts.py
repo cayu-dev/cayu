@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import warnings
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
+import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
 from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._exception_state import set_exception_state
-from cayu.artifacts import ArtifactMetadata, LocalArtifactStore
-from cayu.core import AgentSpec, EventType, Message, Tool, ToolContext, ToolResult, ToolSpec
+from cayu._validation import canonical_durable_json_bytes
+from cayu._workspace_mutation import WorkspaceMutationSettlementError
+from cayu.artifacts import ArtifactMetadata, ArtifactScope, LocalArtifactStore
+from cayu.core import AgentSpec, Event, EventType, Message, Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
     DeterministicWorkspaceBinding,
     Environment,
@@ -36,18 +42,37 @@ from cayu.runners import (
     ExecResult,
     LocalRunner,
     Runner,
+    RunnerExecutionError,
     attach_cancellation_artifacts,
 )
 from cayu.runtime import (
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     EventQuery,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InMemoryBudgetStore,
     InMemorySessionStore,
     InterruptSessionRequest,
     RunRequest,
+    RuntimePublicationRequest,
+    RuntimePublicationResult,
+    SessionIdentity,
+    SessionStatus,
     ToolApprovalDecision,
     ToolApprovalRequest,
     UserInputResponse,
+)
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime.sessions import runtime_publication_request_digest
+from cayu.runtime.workspace_observation_recovery import (
+    WorkspaceObservationLifecycle,
+    _admit_workspace_observation_intent,
+    _project_workspace_observation_authority,
+    publish_workspace_observation_transition,
+    workspace_observation_event_digest,
+    workspace_observation_observer_authority_matches,
+    workspace_observations_from_checkpoint,
 )
 from cayu.tools import ExecCommandTool, UserInputTool
 from cayu.vaults import SecretRedactor, SecretRef, StaticVault
@@ -55,14 +80,60 @@ from cayu.workspaces import (
     LocalWorkspace,
     WorkspaceIdentity,
     WorkspacePathRevision,
+    WorkspaceRevisionDelta,
+    WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
 )
 
 
+def _admit_test_workspace_observation_intent(
+    lifecycle: WorkspaceObservationLifecycle,
+) -> Any:
+    return _admit_workspace_observation_intent(
+        lifecycle,
+        redactor=SecretRedactor(),
+        configured_workspace_id=(
+            None if lifecycle.workspace_id == "workspace-unavailable" else lifecycle.workspace_id
+        ),
+        configured_artifact_store_id=lifecycle.artifact_store_id,
+    )
+
+
 async def collect_events(app: CayuApp, request: RunRequest):
     return [event async for event in app.run(request)]
+
+
+@pytest.mark.parametrize(
+    (
+        "durable_authority",
+        "configured_observer_is_runtime_owned",
+        "expected",
+    ),
+    [
+        ("runtime_builtin", True, True),
+        ("runtime_builtin", False, False),
+        ("configured", True, False),
+        ("configured", False, True),
+    ],
+)
+def test_workspace_observer_authority_matching_requires_equal_provenance(
+    durable_authority,
+    configured_observer_is_runtime_owned: bool,
+    expected: bool,
+) -> None:
+    assert (
+        workspace_observation_observer_authority_matches(
+            "DeterministicWorkspaceBinding",
+            durable_authority,
+            "DeterministicWorkspaceBinding",
+            configured_observer_is_runtime_owned=configured_observer_is_runtime_owned,
+            session_id="session-observer-authority-provenance",
+            public_authority_alias_codec=None,
+        )
+        is expected
+    )
 
 
 class _ScriptedProvider(ModelProvider):
@@ -426,6 +497,34 @@ class _ChildCancelledObserverBinding(NativeBinding):
         raise asyncio.CancelledError("observer-owned cancellation")
 
 
+class _OneShotGeneratorExitObserverBinding(DeterministicWorkspaceBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observations = 0
+
+    async def observe_revision(self, bound):
+        self.observations += 1
+        if self.observations == 1:
+            raise GeneratorExit("observer supervisory exit")
+        return await super().observe_revision(bound)
+
+
+class _ConcurrentGeneratorExitObserverBinding(DeterministicWorkspaceBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancel_target: asyncio.Task | None = None
+
+    async def observe_revision(self, bound):
+        del bound
+        self.started.set()
+        await self.release.wait()
+        assert self.cancel_target is not None
+        self.cancel_target.cancel("observer caller cancellation")
+        raise GeneratorExit("observer concurrent supervisory exit")
+
+
 class _StalledObserverBinding(DeterministicWorkspaceBinding):
     def __init__(self) -> None:
         super().__init__()
@@ -442,20 +541,39 @@ class _StalledObserverBinding(DeterministicWorkspaceBinding):
         return await super().observe_revision(bound)
 
 
+class _ThreadBackedBeforeObserverBinding(DeterministicWorkspaceBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observations = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    async def observe_revision(self, bound):
+        self.observations += 1
+        if self.observations == 1:
+            self.started.set()
+            await asyncio.to_thread(self.release.wait)
+        return await super().observe_revision(bound)
+
+
 class _FailAfterObservationStore(InMemorySessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.failed = False
 
-    async def append_event(self, session_id, event):
-        if (
-            not self.failed
-            and event.type == EventType.WORKSPACE_REVISION_OBSERVED
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        if not self.failed and any(
+            event.type == EventType.WORKSPACE_REVISION_OBSERVED
             and event.payload.get("phase") == "after"
+            for event in request.events
         ):
             self.failed = True
             raise ConnectionError("workspace receipt append failed")
-        await super().append_event(session_id, event)
+        return await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
 
 
 class _ChildCancelledAfterObservationStore(InMemorySessionStore):
@@ -463,15 +581,19 @@ class _ChildCancelledAfterObservationStore(InMemorySessionStore):
         super().__init__()
         self.failed = False
 
-    async def append_event(self, session_id, event):
-        if (
-            not self.failed
-            and event.type == EventType.WORKSPACE_REVISION_OBSERVED
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        if not self.failed and any(
+            event.type == EventType.WORKSPACE_REVISION_OBSERVED
             and event.payload.get("phase") == "after"
+            for event in request.events
         ):
             self.failed = True
             raise asyncio.CancelledError("event-store-owned cancellation")
-        await super().append_event(session_id, event)
+        return await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
 
 
 class _BlockingAfterObservationStore(InMemorySessionStore):
@@ -481,16 +603,193 @@ class _BlockingAfterObservationStore(InMemorySessionStore):
         self.release = asyncio.Event()
         self.blocked = False
 
-    async def append_event(self, session_id, event):
-        if (
-            not self.blocked
-            and event.type == EventType.WORKSPACE_REVISION_OBSERVED
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        if not self.blocked and any(
+            event.type == EventType.WORKSPACE_REVISION_OBSERVED
             and event.payload.get("phase") == "after"
+            for event in request.events
         ):
             self.blocked = True
             self.started.set()
             await self.release.wait()
-        await super().append_event(session_id, event)
+        return await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
+
+
+class _CancelledFailedWorkspacePublicationStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.publication_started = asyncio.Event()
+        self.release_publication = asyncio.Event()
+        self.publication_id: str | None = None
+        self.initial_failure = ConnectionError("initial workspace publication failed")
+        self.reconciliation_failure = TimeoutError("workspace receipt read failed")
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        if (
+            self.publication_id is None
+            and request.kind == "workspace-observation"
+            and request.intent.get("phase") == "before-evidence"
+        ):
+            self.publication_id = request.publication_id
+            self.publication_started.set()
+            await self.release_publication.wait()
+            raise self.initial_failure
+        return await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
+
+    async def load_runtime_publication_receipt(self, session_id, publication_id):
+        if publication_id == self.publication_id:
+            raise self.reconciliation_failure
+        return await super().load_runtime_publication_receipt(session_id, publication_id)
+
+
+_MALFORMED_WORKSPACE_ACK_CANARY = "f" * 64
+
+
+def _malformed_workspace_publication_result(
+    result: RuntimePublicationResult,
+    *,
+    request: RuntimePublicationRequest,
+    wrong_type_fields: bool,
+) -> RuntimePublicationResult:
+    receipt = result.receipt.model_copy(
+        update={
+            "publication_id": request.publication_id,
+            "kind": request.kind,
+            "interaction_id": request.interaction_id,
+            "intent": request.intent,
+            "request_digest": runtime_publication_request_digest(
+                result.session.id,
+                request,
+            ),
+            "publication_digest": _MALFORMED_WORKSPACE_ACK_CANARY,
+            "source_status": result.session.status,
+            "source_run_epoch": (True if wrong_type_fields else result.receipt.source_run_epoch),
+            "appended_event_ids": tuple(event.id for event in request.events),
+            "referenced_events": request.referenced_events,
+        }
+    )
+    return result.model_copy(
+        update={
+            "session": (
+                result.session.model_copy(update={"run_epoch": True})
+                if wrong_type_fields
+                else result.session
+            ),
+            "receipt": receipt,
+            "replayed": "not-a-boolean" if wrong_type_fields else False,
+        }
+    )
+
+
+class _CommittedMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.corrupted = False
+        self.before_evidence_attempts = 0
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        result = await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
+        if request.kind == "workspace-observation" and request.intent.get("phase") == (
+            "before-evidence"
+        ):
+            self.before_evidence_attempts += 1
+            if not self.corrupted:
+                self.corrupted = True
+                return _malformed_workspace_publication_result(
+                    result,
+                    request=request,
+                    wrong_type_fields=True,
+                )
+        return result
+
+
+class _UncommittedMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prior_result: RuntimePublicationResult | None = None
+        self.before_evidence_attempts = 0
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        if request.kind == "workspace-observation" and request.intent.get("phase") == (
+            "before-evidence"
+        ):
+            self.before_evidence_attempts += 1
+            assert self.prior_result is not None
+            return _malformed_workspace_publication_result(
+                self.prior_result,
+                request=request,
+                wrong_type_fields=False,
+            )
+        result = await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
+        self.prior_result = result
+        return result
+
+
+class _UncommittedConflictingWorkspaceAcknowledgementStore(
+    _UncommittedMalformedWorkspaceAcknowledgementStore
+):
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        if request.kind == "workspace-observation" and request.intent.get("phase") == (
+            "before-evidence"
+        ):
+            self.before_evidence_attempts += 1
+            assert self.prior_result is not None
+            result = _malformed_workspace_publication_result(
+                self.prior_result,
+                request=request,
+                wrong_type_fields=False,
+            )
+            receipt = result.receipt.model_copy(update={"publication_digest": "0" * 64})
+            publication_digest = hashlib.sha256(
+                canonical_durable_json_bytes(
+                    receipt.model_dump(mode="json", exclude={"publication_digest"}),
+                    "workspace_observation_publication_receipt",
+                )
+            ).hexdigest()
+            return result.model_copy(
+                update={
+                    "receipt": receipt.model_copy(update={"publication_digest": publication_digest})
+                }
+            )
+        result = await InMemorySessionStore.publish_runtime_publication(
+            self,
+            session_id,
+            request=request,
+            **kwargs,
+        )
+        self.prior_result = result
+        return result
+
+
+class _TracebackMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.returned_session = None
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        del session_id, request, kwargs
+        assert self.returned_session is not None
+        return RuntimePublicationResult.model_construct(
+            session=self.returned_session,
+            receipt=_MALFORMED_WORKSPACE_ACK_CANARY,
+            replayed=False,
+        )
 
 
 class _FailingTerminalAfterBlockingCaptureStore(_BlockingAfterObservationStore):
@@ -515,10 +814,146 @@ class _BlockingTerminalAfterBlockingCaptureStore(_BlockingAfterObservationStore)
         await super().append_event(session_id, event)
 
 
+class _WorkspaceObservationProcessLoss(BaseException):
+    pass
+
+
+class _WorkspaceObservationRecoveryFactory(EnvironmentFactory):
+    def __init__(self, root, *, workspace_id: str) -> None:
+        self.root = root
+        self.workspace_id = workspace_id
+        self.create_calls = 0
+
+    async def create(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> EnvironmentFactoryResult:
+        self.create_calls += 1
+        self.root.mkdir(parents=True, exist_ok=True)
+        return EnvironmentFactoryResult(
+            Environment(
+                EnvironmentSpec(name=request.environment_name),
+                workspace=LocalWorkspace(self.root, workspace_id=self.workspace_id),
+                runner=LocalRunner(self.root),
+                binding=DeterministicWorkspaceBinding(),
+            )
+        )
+
+
+class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
+    def __init__(self, *, phase: str) -> None:
+        super().__init__()
+        self.phase = phase
+        self.failed = False
+        self.cancel_workspace_observation_read = False
+        self.workspace_observation_read_cancelled = False
+        self.cancel_workspace_observation_mutation = False
+        self.workspace_observation_mutation_cancelled = False
+        self.hide_workspace_delta = False
+        self.workspace_delta_event_id = None
+
+    async def load_checkpoint(self, session_id):
+        task = asyncio.current_task()
+        if (
+            self.cancel_workspace_observation_read
+            and not self.workspace_observation_read_cancelled
+            and task is not None
+            and task.get_name() == "cayu-workspace-observation-store-read"
+        ):
+            self.workspace_observation_read_cancelled = True
+            raise asyncio.CancelledError("store-owned workspace observation cancellation")
+        return await super().load_checkpoint(session_id)
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        result = await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
+        if (
+            request.kind == "workspace-observation"
+            and request.intent.get("phase") == "delta-publication"
+            and result.receipt.appended_event_ids
+        ):
+            self.workspace_delta_event_id = result.receipt.appended_event_ids[0]
+        if (
+            not self.failed
+            and request.kind == "workspace-observation"
+            and request.intent.get("phase") == self.phase
+        ):
+            self.failed = True
+            raise _WorkspaceObservationProcessLoss(self.phase)
+        return result
+
+    async def transform_checkpoint(self, session_id, transform):
+        task = asyncio.current_task()
+        if (
+            self.cancel_workspace_observation_mutation
+            and not self.workspace_observation_mutation_cancelled
+            and task is not None
+            and task.get_name() == "cayu-workspace-observation-store-mutation"
+        ):
+            self.workspace_observation_mutation_cancelled = True
+            raise asyncio.CancelledError("store-owned workspace observation mutation cancellation")
+        result = await super().transform_checkpoint(session_id, transform)
+        if not self.failed and self.phase == "terminal-stage":
+            checkpoint = await self.load_checkpoint(session_id)
+            observations = None if checkpoint is None else checkpoint.get("workspace_observations")
+            pending_round = None if checkpoint is None else checkpoint.get("pending_tool_round")
+            if (
+                type(observations) is dict
+                and len(observations) == 1
+                and next(iter(observations.values())).get("phase") == "before_captured"
+                and type(pending_round) is dict
+                and pending_round.get("staged_terminals")
+            ):
+                self.failed = True
+                raise _WorkspaceObservationProcessLoss(self.phase)
+        return result
+
+    async def query_events(self, query):
+        records = await super().query_events(query)
+        if self.hide_workspace_delta and query.event_id == self.workspace_delta_event_id:
+            return [
+                record
+                for record in records
+                if record.event.type is not EventType.WORKSPACE_MUTATION_RECORDED
+            ]
+        return records
+
+
 class _ChildCancelledArtifactStore(LocalArtifactStore):
     async def put_bytes(self, *args, **kwargs):
         del args, kwargs
         raise asyncio.CancelledError("artifact-store-owned cancellation")
+
+
+class _GeneratorExitArtifactStore(LocalArtifactStore):
+    async def put_bytes(self, *args, **kwargs):
+        del args, kwargs
+        raise GeneratorExit("artifact-store supervisory exit")
+
+
+class _ConcurrentGeneratorExitArtifactStore(LocalArtifactStore):
+    def __init__(self, root) -> None:
+        super().__init__(root)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancel_target: asyncio.Task | None = None
+
+    async def put_bytes(self, *args, **kwargs):
+        del args, kwargs
+        self.started.set()
+        await self.release.wait()
+        assert self.cancel_target is not None
+        self.cancel_target.cancel("artifact caller cancellation")
+        raise GeneratorExit("artifact-store concurrent supervisory exit")
+
+
+class _CommitThenRaiseArtifactStore(LocalArtifactStore):
+    async def put_bytes(self, *args, **kwargs):
+        await super().put_bytes(*args, **kwargs)
+        raise ConnectionError("artifact acknowledgement lost")
 
 
 class _MalformedArtifactStore(LocalArtifactStore):
@@ -543,11 +978,46 @@ class _StalledArtifactStore(LocalArtifactStore):
         super().__init__(root)
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.finished = asyncio.Event()
 
     async def put_bytes(self, *args, **kwargs):
         self.started.set()
         await self.release.wait()
-        return await super().put_bytes(*args, **kwargs)
+        result = await super().put_bytes(*args, **kwargs)
+        self.finished.set()
+        return result
+
+
+class _ReadTrackingArtifactStore(LocalArtifactStore):
+    def __init__(self, root, *, store_id: str) -> None:
+        super().__init__(root, store_id=store_id)
+        self.reads = 0
+
+    async def read_bytes(self, *args, **kwargs):
+        self.reads += 1
+        return await super().read_bytes(*args, **kwargs)
+
+
+class _ConflictingReadArtifactStore(LocalArtifactStore):
+    def __init__(self, root, *, store_id: str, metadata_update: dict) -> None:
+        super().__init__(root, store_id=store_id)
+        self._metadata_update = metadata_update
+
+    async def read_bytes(self, *args, **kwargs):
+        result = await super().read_bytes(*args, **kwargs)
+        return result.model_copy(
+            update={
+                "metadata": result.metadata.model_copy(
+                    update=self._metadata_update,
+                )
+            }
+        )
+
+
+class _NoneReadArtifactStore(LocalArtifactStore):
+    async def read_bytes(self, *args, **kwargs):
+        del args, kwargs
+        return None
 
 
 class _CancellingMutationTool(Tool):
@@ -564,6 +1034,25 @@ class _CancellingMutationTool(Tool):
         raise asyncio.CancelledError("tool cancellation canary")
 
 
+class _BlockingAfterWriteMutationTool(Tool):
+    spec = ToolSpec(
+        name="blocking_after_write_mutation",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del args
+        assert ctx.workspace is not None
+        await ctx.workspace.create_bytes("cancelled-write.txt", b"written before cancellation")
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("Cancelled mutation tool unexpectedly resumed.")
+
+
 class _ResolveWorkspacePathSecretTool(Tool):
     spec = ToolSpec(
         name="resolve_workspace_path_secret",
@@ -575,6 +1064,29 @@ class _ResolveWorkspacePathSecretTool(Tool):
         del args
         assert ctx.vault is not None
         await ctx.vault.resolve(SecretRef(name="workspace_path"))
+        return ToolResult(content="resolved")
+
+
+class _ResolveWorkspaceBranchSecretTool(Tool):
+    spec = ToolSpec(
+        name="resolve_workspace_branch_secret",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del args
+        assert ctx.vault is not None
+        assert ctx.runner is not None
+        resolved = await ctx.vault.resolve(SecretRef(name="workspace_branch"))
+        await ctx.runner.exec(
+            ExecCommand.process(
+                "git",
+                "switch",
+                "-c",
+                resolved.value.get_secret_value(),
+            )
+        )
         return ToolResult(content="resolved")
 
 
@@ -698,6 +1210,12 @@ class _AsyncBlockingWorkspace(LocalWorkspace):
         self.started.set()
         await self.release.wait()
         return await super().create_bytes(path, content)
+
+
+class _GeneratorExitWorkspace(LocalWorkspace):
+    async def create_bytes(self, path: str, content: bytes):
+        del path, content
+        raise GeneratorExit("workspace mutation supervisory exit")
 
 
 class _DetachedThenBlockingWorkspaceMutationTool(Tool):
@@ -1036,6 +1554,82 @@ class _TrackingFinalizeBinding(DeterministicWorkspaceBinding):
         return super().abandon(bound)
 
 
+class _MutationQuiescenceTrackingFinalizeBinding(_TrackingFinalizeBinding):
+    def __init__(self, runner: _FailingDeferredBackgroundMutationRunner) -> None:
+        super().__init__()
+        self._runner = runner
+        self.observations_while_mutating = 0
+
+    async def observe_revision(self, bound):
+        if self._runner.started.is_set() and not self._runner.mutation_finished.is_set():
+            self.observations_while_mutating += 1
+        return await super().observe_revision(bound)
+
+
+class _CancellationResistantFinalObserverBinding(_TrackingFinalizeBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observations = 0
+        self.final_observation_started = asyncio.Event()
+        self.release_final_observation = asyncio.Event()
+        self.final_observation_finished = asyncio.Event()
+
+    async def observe_revision(self, bound):
+        self.observations += 1
+        if self.observations != 3:
+            return await super().observe_revision(bound)
+        self.final_observation_started.set()
+        try:
+            await self.release_final_observation.wait()
+        except asyncio.CancelledError:
+            # Model a custom observer whose underlying operation cannot be
+            # stopped by task cancellation after dispatch.
+            await self.release_final_observation.wait()
+        observation = await super().observe_revision(bound)
+        self.final_observation_finished.set()
+        return observation
+
+
+class _CallerCancellingFinalObserverBinding(_TrackingFinalizeBinding):
+    def __init__(self, cancellation_requests: int) -> None:
+        super().__init__()
+        self.cancellation_requests = cancellation_requests
+        self.observations = 0
+        self.cancel_target: asyncio.Task | None = None
+
+    async def observe_revision(self, bound):
+        self.observations += 1
+        if self.observations == 3:
+            assert self.cancel_target is not None
+            for request in range(self.cancellation_requests):
+                self.cancel_target.cancel(f"final observer cancellation {request + 1}")
+        return await super().observe_revision(bound)
+
+
+class _CancellationResistantAfterObserverBinding(_TrackingFinalizeBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observations = 0
+        self.after_observation_started = asyncio.Event()
+        self.release_after_observation = asyncio.Event()
+        self.after_observation_finished = asyncio.Event()
+
+    async def observe_revision(self, bound):
+        self.observations += 1
+        if self.observations != 2:
+            return await super().observe_revision(bound)
+        self.after_observation_started.set()
+        try:
+            await self.release_after_observation.wait()
+        except asyncio.CancelledError:
+            # Model an observer whose workspace access cannot be stopped once
+            # it has crossed the custom binding boundary.
+            await self.release_after_observation.wait()
+        observation = await super().observe_revision(bound)
+        self.after_observation_finished.set()
+        return observation
+
+
 class _AwaitedRunnerMutationTool(Tool):
     spec = ToolSpec(
         name="awaited_runner_mutation",
@@ -1108,6 +1702,69 @@ def test_workspace_mutation_classification_requires_exclusive_effectful_tool() -
         )
 
 
+def test_workspace_mutation_without_binding_records_unsupported_evidence(tmp_path) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _SingleToolProvider(
+                tool_name="noop_workspace_mutation",
+                arguments={},
+            ),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="unconfigured-binding-workspace"),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+
+        public_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-unconfigured-workspace-binding",
+                messages=[Message.text("user", "observe")],
+            ),
+        )
+        durable = await store.query_events(
+            EventQuery(session_id="session-unconfigured-workspace-binding")
+        )
+        return public_events, [record.event for record in durable]
+
+    public_events, durable_events = asyncio.run(run())
+
+    observations = [
+        event for event in durable_events if event.type is EventType.WORKSPACE_REVISION_OBSERVED
+    ]
+    assert len(observations) == 2
+    assert {event.payload["phase"] for event in observations} == {"before", "after"}
+    assert {event.payload["status"] for event in observations} == {"unsupported"}
+    assert {event.payload["observer"] for event in observations} == {"UnconfiguredWorkspaceBinding"}
+
+    receipt = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_MUTATION_RECORDED
+    )
+    assert receipt.payload["status"] == "unsupported"
+    assert receipt.payload["observer"] == "UnconfiguredWorkspaceBinding"
+
+    finalization = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalization.payload["status"] == "incomplete"
+    assert finalization.payload["detail_code"] == "workspace_revision_evidence_incomplete"
+    assert not any(
+        event.payload.get("workspace_mutation_capture_detail_code") == "receipt_publication_failed"
+        for event in public_events
+    )
+
+
 def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path) -> None:
     if shutil.which("git") is None:
         pytest.skip("git executable is required")
@@ -1130,7 +1787,14 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
 
     async def run():
         store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            # Exact built-in observer identities carry structural runtime
+            # provenance; a custom binding with the same name remains subject
+            # to configured-authority secret admission below.
+            secret_redactor=SecretRedactor(["before", "after", "changed", "GitRepositoryBinding"]),
+        )
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
@@ -1190,14 +1854,568 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
     assert receipt.payload["model_step"] == 1
     assert receipt.payload["tool_call_id"] == "call-shell"
     assert receipt.payload["workspace_id"] == "git-workspace"
+    assert {event.payload["observer"] for event in receipt_events} == {"GitRepositoryBinding"}
     assert receipt.payload["status"] == "changed"
     assert receipt.payload["paths"] == [
         {"path": "shell.txt", "change": "added", "renamed_from": None}
     ]
-    assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in public_events)
+    finalization = next(
+        event
+        for event in durable_events
+        if event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+    )
+    final_revision = dict(finalization.payload["final_revision"])
+    assert final_revision.pop("observer") != "GitRepositoryBinding"
+    assert "GitRepositoryBinding" not in finalization.model_dump_json()
+    assert final_revision == {
+        "workspace_id": "git-workspace",
+        "status": "supported",
+        "revision": after.payload["revision"],
+        "head_revision": after.payload["head_revision"],
+        "branch": after.payload["branch"],
+        "path_scope": "complete",
+        "total_paths": after.payload["total_paths"],
+        "detail_code": None,
+    }
+    assert "tool_call_id" not in finalization.payload["final_revision"]
+    assert "window_id" not in finalization.payload["final_revision"]
+    assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in public_events), [
+        str(event.type) for event in public_events[-20:]
+    ]
+    observation_terminal = next(
+        event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert observation_terminal.payload["status"] == "complete"
+    assert observation_terminal.payload["detail_code"] is None
+    assert observation_terminal.payload["observer"] == "GitRepositoryBinding"
+    public_observation_terminal = next(
+        event for event in public_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert public_observation_terminal.payload["status"] == "complete"
+    assert public_observation_terminal.payload["detail_code"] is None
+    assert public_observation_terminal.payload["observer"] != "GitRepositoryBinding"
+    assert "GitRepositoryBinding" not in public_observation_terminal.model_dump_json()
     assert "created" not in before.model_dump_json()
     assert "created" not in after.model_dump_json()
     assert "created" not in receipt.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "identity_source",
+    ["workspace", "artifact_store", "observer", "observer_builtin_name_spoof"],
+)
+def test_configured_observation_identity_is_admitted_before_durable_intent(
+    tmp_path,
+    caplog,
+    capsys,
+    identity_source,
+) -> None:
+    secret_identity = (
+        "GitRepositoryBinding"
+        if identity_source == "observer_builtin_name_spoof"
+        else f"PRIVATE_CONFIGURED_{identity_source.upper()}_ID_CANARY"
+    )
+
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            secret_redactor=SecretRedactor([secret_identity]),
+        )
+        app.register_provider(_ScriptedProvider(), default=True)
+        binding_type = type(secret_identity, (DeterministicWorkspaceBinding,), {})
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(
+                    tmp_path,
+                    workspace_id=(
+                        secret_identity if identity_source == "workspace" else "workspace"
+                    ),
+                ),
+                runner=LocalRunner(tmp_path),
+                binding=(
+                    binding_type()
+                    if identity_source in {"observer", "observer_builtin_name_spoof"}
+                    else DeterministicWorkspaceBinding()
+                ),
+                artifact_store=(
+                    LocalArtifactStore(tmp_path / "artifacts", store_id=secret_identity)
+                    if identity_source == "artifact_store"
+                    else None
+                ),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            public = await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-configured-workspace-secret",
+                    messages=[Message.text("user", "create a file")],
+                ),
+            )
+        durable = await store.query_events(
+            EventQuery(session_id="session-configured-workspace-secret")
+        )
+        checkpoint = await store.load_checkpoint("session-configured-workspace-secret")
+        transcript = await store.load_transcript("session-configured-workspace-secret")
+        return (
+            public,
+            [record.event for record in durable],
+            checkpoint,
+            transcript,
+            captured_warnings,
+        )
+
+    public_events, durable_events, checkpoint, transcript, captured_warnings = asyncio.run(run())
+    captured = capsys.readouterr()
+    assert not workspace_observations_from_checkpoint(checkpoint)
+    assert not any(
+        event.type
+        in {
+            EventType.WORKSPACE_REVISION_OBSERVED,
+            EventType.WORKSPACE_MUTATION_RECORDED,
+        }
+        for event in durable_events
+    )
+    assert any(event.type is EventType.SESSION_FAILED for event in public_events)
+    combined = repr(
+        (
+            [event.model_dump(mode="json") for event in public_events],
+            [event.model_dump(mode="json") for event in durable_events],
+            [message.model_dump(mode="json") for message in transcript],
+            captured_warnings,
+            [record.getMessage() for record in caplog.records],
+            captured.out,
+            captured.err,
+        )
+    )
+    assert secret_identity not in combined
+
+
+def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
+    tmp_path,
+    caplog,
+    capsys,
+) -> None:
+    secret_identity = "PRIVATE_DYNAMIC_WORKSPACE_ID_CANARY"
+
+    class AbortAfterIntentBinding(NativeBinding):
+        async def observe_revision(self, bound):
+            del bound
+            raise SystemExit(23)
+
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _SingleToolProvider(tool_name="noop_workspace_mutation", arguments={}),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id=secret_identity),
+                binding=AbortAfterIntentBinding(),
+                vault=StaticVault({"workspace_identity": secret_identity}),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+        with (
+            warnings.catch_warnings(record=True) as captured_warnings,
+            pytest.raises(SystemExit) as raised,
+        ):
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-dynamic-identity-intent",
+                    messages=[Message.text("user", "observe")],
+                ),
+            )
+        checkpoint = await store.load_checkpoint("session-dynamic-identity-intent")
+        durable_before_recovery = await store.query_events(
+            EventQuery(session_id="session-dynamic-identity-intent")
+        )
+        await store.release_run_fence("session-dynamic-identity-intent")
+        await store.update_status(
+            "session-dynamic-identity-intent",
+            SessionStatus.INTERRUPTED,
+        )
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_provider = _SingleToolProvider(
+            tool_name="noop_workspace_mutation",
+            arguments={},
+        )
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id=secret_identity),
+                binding=AbortAfterIntentBinding(),
+                vault=StaticVault({"workspace_identity": secret_identity}),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="cannot safely continue with opaque provider state",
+        ):
+            await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id="session-dynamic-identity-intent")
+            )
+        durable_after_recovery = await store.query_events(
+            EventQuery(session_id="session-dynamic-identity-intent")
+        )
+        return (
+            raised.value,
+            checkpoint,
+            durable_before_recovery,
+            recovery_provider.requests,
+            durable_after_recovery,
+            captured_warnings,
+        )
+
+    (
+        error,
+        checkpoint,
+        durable_before_recovery,
+        recovery_requests,
+        durable_after_recovery,
+        captured_warnings,
+    ) = asyncio.run(run())
+    captured = capsys.readouterr()
+    assert error.code == 23
+    observations = workspace_observations_from_checkpoint(checkpoint)
+    assert len(observations) == 1
+    (lifecycle,) = observations.values()
+    assert lifecycle.workspace_id != secret_identity
+    assert lifecycle.workspace_id.startswith("cayu_authority_")
+    assert recovery_requests == 0
+    assert any(
+        record.event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+        for record in durable_after_recovery
+    )
+    combined = repr(
+        (
+            checkpoint,
+            [record.event.model_dump(mode="json") for record in durable_before_recovery],
+            [record.event.model_dump(mode="json") for record in durable_after_recovery],
+            captured_warnings,
+            caplog.records,
+            captured.out,
+            captured.err,
+        )
+    )
+    assert secret_identity not in combined
+
+
+def test_cancellation_resistant_final_observer_fences_finalization_and_reuse(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        environment_lifecycle_module,
+        "_FINAL_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def run():
+        binding = _CancellationResistantFinalObserverBinding()
+        provider = _SingleToolProvider(
+            tool_name="noop_workspace_mutation",
+            arguments={},
+        )
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="final-observer-workspace"),
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+
+        first = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-final-observer-first",
+                messages=[Message.text("user", "observe")],
+            ),
+        )
+        assert binding.final_observation_started.is_set()
+        assert binding.final_observation_finished.is_set() is False
+        assert binding.finalize_calls == 0
+        assert any(event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED for event in first)
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-final-observer-second",
+                    messages=[Message.text("user", "reuse")],
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 2
+        assert binding.finalize_calls == 0
+        assert binding.abandon_calls == 0
+
+        binding.release_final_observation.set()
+        second = await contender
+        return first, second, binding, provider
+
+    first, second, binding, provider = asyncio.run(run())
+
+    assert binding.final_observation_finished.is_set()
+    assert provider.requests == 3
+    assert any(event.type is EventType.SESSION_COMPLETED for event in first)
+    assert any(event.type is EventType.SESSION_COMPLETED for event in second)
+    assert binding.abandon_calls >= 1
+
+
+@pytest.mark.parametrize("cancellation_requests", [1, 2])
+def test_final_workspace_observer_restores_caller_cancellation_requests(
+    tmp_path,
+    cancellation_requests: int,
+) -> None:
+    async def run() -> tuple[asyncio.Task[list[Event]], _CallerCancellingFinalObserverBinding]:
+        binding = _CallerCancellingFinalObserverBinding(cancellation_requests)
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(
+            _SingleToolProvider(
+                tool_name="noop_workspace_mutation",
+                arguments={},
+            ),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="final-cancel-workspace"),
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"session-final-observer-cancel-{cancellation_requests}",
+                    messages=[Message.text("user", "observe")],
+                ),
+            )
+        )
+        binding.cancel_target = consumer
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        return consumer, binding
+
+    consumer, binding = asyncio.run(run())
+
+    assert consumer.cancelling() == cancellation_requests
+    assert consumer.cancelled() is True
+    assert binding.observations == 3
+    assert binding.finalize_calls == 0
+
+
+def test_thread_backed_before_observer_timeout_fences_tool_dispatch_and_reuse(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        tool_round_executor_module,
+        "_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def run():
+        binding = _ThreadBackedBeforeObserverBinding()
+        provider = _SingleToolProvider(
+            tool_name="noop_workspace_mutation",
+            arguments={},
+        )
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="thread-observer-workspace"),
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+
+        first = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-thread-observer-first",
+                messages=[Message.text("user", "observe")],
+            ),
+        )
+        assert binding.started.is_set()
+        assert binding.release.is_set() is False
+        assert any(event.type is EventType.SESSION_FAILED for event in first)
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-thread-observer-second",
+                    messages=[Message.text("user", "reuse")],
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 1
+
+        binding.release.set()
+        second = await contender
+        return second, binding, provider
+
+    second, binding, provider = asyncio.run(run())
+
+    assert binding.observations >= 2
+    assert provider.requests == 2
+    assert any(event.type is EventType.SESSION_COMPLETED for event in second)
+
+
+def test_cancellation_resistant_after_observer_fences_finalization_and_reuse(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        tool_round_executor_module,
+        "_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def run():
+        binding = _CancellationResistantAfterObserverBinding()
+        provider = _SingleToolProvider(
+            tool_name="noop_workspace_mutation",
+            arguments={},
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="after-observer-workspace"),
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+
+        first = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-after-observer-first",
+                    messages=[Message.text("user", "observe")],
+                ),
+            )
+        )
+        await binding.after_observation_started.wait()
+        for _ in range(100):
+            durable = await store.query_events(
+                EventQuery(session_id="session-after-observer-first")
+            )
+            if any(record.event.type is EventType.SESSION_COMPLETED for record in durable):
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("First run did not publish its terminal event.")
+
+        assert first.done() is False
+        assert binding.after_observation_finished.is_set() is False
+        assert binding.finalize_calls == 0
+        assert not any(
+            record.event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+            for record in durable
+        )
+
+        contender = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-after-observer-second",
+                    messages=[Message.text("user", "reuse")],
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert contender.done() is False
+        assert provider.requests == 2
+        assert binding.finalize_calls == 0
+
+        binding.release_after_observation.set()
+        first_events, second_events = await asyncio.gather(first, contender)
+        first_durable = await store.query_events(
+            EventQuery(session_id="session-after-observer-first")
+        )
+        return first_events, second_events, first_durable, binding, provider
+
+    first, second, durable, binding, provider = asyncio.run(run())
+
+    assert binding.after_observation_finished.is_set()
+    assert provider.requests == 3
+    assert any(event.type is EventType.SESSION_COMPLETED for event in first)
+    assert any(event.type is EventType.SESSION_COMPLETED for event in second)
+    observations = [
+        record.event
+        for record in durable
+        if record.event.type is EventType.WORKSPACE_REVISION_OBSERVED
+    ]
+    assert [event.payload["status"] for event in observations] == ["supported", "failed"]
+    assert observations[-1].payload["detail_code"] == "revision_observer_timeout"
+    assert binding.finalize_calls == 1
 
 
 def test_detached_runner_mutation_settles_before_receipt_and_following_tool(
@@ -1361,6 +2579,63 @@ def test_supervisory_tool_exit_fences_environment_reuse_until_detached_mutation_
     assert any(event.type is EventType.SESSION_COMPLETED for event in contender_events)
     assert not any(event.type is EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
     assert (tmp_path / "settled-after-supervisory-exit.txt").read_bytes() == b"settled"
+
+
+def test_workspace_mutation_generator_exit_propagates_without_false_terminal_evidence(
+    tmp_path,
+) -> None:
+    async def run():
+        provider = _SingleToolProvider(
+            tool_name="blocking_workspace_mutation",
+            arguments={},
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=_GeneratorExitWorkspace(
+                    tmp_path,
+                    workspace_id="generator-exit-mutation-workspace",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BlockingWorkspaceMutationTool()],
+        )
+
+        with pytest.raises(GeneratorExit, match="workspace mutation supervisory exit"):
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-workspace-mutation-generator-exit",
+                    messages=[Message.text("user", "mutate")],
+                ),
+            )
+        durable = await store.query_events(
+            EventQuery(session_id="session-workspace-mutation-generator-exit")
+        )
+        return [record.event for record in durable], provider
+
+    durable_events, provider = asyncio.run(run())
+
+    assert provider.requests == 1
+    assert not any(
+        event.type
+        in {
+            EventType.WORKSPACE_MUTATION_RECORDED,
+            EventType.WORKSPACE_OBSERVATION_FINALIZED,
+            EventType.TOOL_CALL_COMPLETED,
+            EventType.TOOL_CALL_FAILED,
+            EventType.SESSION_FAILED,
+        }
+        for event in durable_events
+    )
 
 
 def test_cancelled_runner_mutation_returns_promptly_and_fences_reuse(tmp_path) -> None:
@@ -1877,7 +3152,7 @@ def test_unproven_runner_mutation_fences_environment_reuse_until_settled(
     async def run():
         workspace = LocalWorkspace(tmp_path, workspace_id="shared-runner-workspace")
         runner = _FailingDeferredBackgroundMutationRunner(tmp_path)
-        binding = _TrackingFinalizeBinding()
+        binding = _MutationQuiescenceTrackingFinalizeBinding(runner)
         following = _FollowingTool()
         provider = _AwaitedRunnerAndFollowingProvider()
         store = InMemorySessionStore()
@@ -1907,6 +3182,7 @@ def test_unproven_runner_mutation_fences_environment_reuse_until_settled(
         )
         assert any(event.type is EventType.SESSION_FAILED for event in first)
         assert runner.mutation_finished.is_set() is False
+        assert binding.observations_while_mutating == 0
         assert binding.finalize_calls == 0
 
         second = asyncio.create_task(
@@ -1938,6 +3214,7 @@ def test_unproven_runner_mutation_fences_environment_reuse_until_settled(
     assert not any(
         record.event.type is EventType.WORKSPACE_MUTATION_RECORDED for record in first_durable
     )
+    assert not any("final_revision" in record.event.payload for record in first_durable)
     assert any(event.type is EventType.SESSION_COMPLETED for event in second_events)
     assert runner.mutation_finished.is_set()
     assert provider.requests == 2
@@ -2675,6 +3952,116 @@ def test_workspace_receipt_waits_for_dynamic_secret_scope_before_publication(
 
     assert secret_path not in combined
     assert len(artifact_contents) == 2
+
+
+def test_terminal_workspace_revision_quarantines_dynamic_secret_scope(
+    tmp_path,
+    caplog,
+    capsys,
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git executable is required")
+    secret_branch = "PRIVATE_WORKSPACE_BRANCH_CANARY"
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init")
+    git("config", "user.email", "tester@example.com")
+    git("config", "user.name", "Test User")
+    (tmp_path / "README.md").write_text("baseline\n", encoding="utf-8")
+    git("add", "README.md")
+    git("commit", "-m", "baseline")
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    provider = _SingleToolProvider(
+        tool_name="resolve_workspace_branch_secret",
+        arguments={},
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="git-secret-workspace"),
+            runner=LocalRunner(tmp_path),
+            binding=GitRepositoryBinding(
+                repo_url="https://example.invalid/repository.git",
+                fetch=False,
+                require_clean=False,
+                verify_remote_url=False,
+            ),
+            vault=StaticVault({"workspace_branch": secret_branch}),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="scripted-model"),
+        tools=[_ResolveWorkspaceBranchSecretTool()],
+    )
+
+    async def run():
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            public = await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-dynamic-final-revision-secret",
+                    messages=[Message.text("user", "resolve")],
+                ),
+            )
+        durable = await store.query_events(
+            EventQuery(session_id="session-dynamic-final-revision-secret")
+        )
+        return public, durable, captured_warnings
+
+    public_events, durable, captured_warnings = asyncio.run(run())
+    captured = capsys.readouterr()
+    finalization = next(
+        record.event
+        for record in durable
+        if record.event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+    )
+    assert finalization.payload["final_snapshot"] is None
+    projected_authority = _project_workspace_observation_authority(
+        session_id="session-dynamic-final-revision-secret",
+        configured_workspace_id="git-secret-workspace",
+        configured_observer="GitRepositoryBinding",
+        configured_artifact_store_id=None,
+        observer_is_runtime_owned=True,
+        secret_resolution_scope="dynamic",
+        redactor=SecretRedactor(),
+        public_authority_alias_codec=store.public_authority_alias_codec,
+    )
+    assert finalization.payload["final_revision"] == {
+        "workspace_id": projected_authority.workspace_id,
+        "observer": "GitRepositoryBinding",
+        "status": "truncated",
+        "revision": None,
+        "head_revision": None,
+        "branch": None,
+        "path_scope": "complete",
+        "total_paths": 1,
+        "detail_code": "final_revision_secret_scope_unavailable",
+    }
+    combined = repr(
+        (
+            [event.model_dump(mode="json") for event in public_events],
+            [record.event.model_dump(mode="json") for record in durable],
+            provider.seen_requests,
+            captured_warnings,
+            caplog.records,
+            captured.out,
+            captured.err,
+        )
+    )
+    assert secret_branch not in combined
     receipt_events = [
         record.event
         for record in durable
@@ -3001,11 +4388,14 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
 
     async def run():
         store = InMemorySessionStore()
-        artifacts = LocalArtifactStore(artifact_root)
+        artifacts = LocalArtifactStore(artifact_root, store_id="artifact-store")
         app = CayuApp(
             session_store=store,
             enable_logging=False,
-            secret_redactor=SecretRedactor(["workspace-secret-value"]),
+            # Decimal digits collide with runtime-generated event, interaction,
+            # and commitment identities. Their structural provenance must keep
+            # those identities admissible without trusting configured input.
+            secret_redactor=SecretRedactor(["workspace-secret-value", *"0123456789"]),
         )
         app.register_provider(_BulkProvider(), default=True)
         app.register_environment(
@@ -3048,11 +4438,14 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
         receipt = next(
             event for event in events if event.type == EventType.WORKSPACE_MUTATION_RECORDED
         )
+        finalized = next(
+            event for event in events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+        )
         after_artifact = await artifacts.read_bytes(after.payload["manifest_artifact_id"])
         receipt_artifact = await artifacts.read_bytes(receipt.payload["manifest_artifact_id"])
-        return after, receipt, after_artifact, receipt_artifact
+        return after, receipt, finalized, after_artifact, receipt_artifact
 
-    after, receipt, after_artifact, receipt_artifact = asyncio.run(run())
+    after, receipt, finalized, after_artifact, receipt_artifact = asyncio.run(run())
 
     for event, artifact, expected_paths in (
         (after, after_artifact, 66),
@@ -3069,6 +4462,20 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
         assert b"workspace-secret-value" not in artifact.content
         assert len(event.model_dump_json().encode("utf-8")) < 16_000
 
+    assert (
+        finalized.payload["tool_outcome_event_digest"]
+        == receipt.payload["tool_outcome_event_digest"]
+    )
+    assert finalized.payload["mutation_event_digest"] == workspace_observation_event_digest(receipt)
+    assert (
+        finalized.payload["revision_after_artifact_sha256"]
+        == after.payload["manifest_artifact_sha256"]
+    )
+    assert (
+        finalized.payload["revision_delta_artifact_sha256"]
+        == receipt.payload["manifest_artifact_sha256"]
+    )
+
 
 @pytest.mark.parametrize(
     ("artifact_store_type", "expected_status", "expected_detail_code"),
@@ -3076,7 +4483,12 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
         (
             _ChildCancelledArtifactStore,
             "truncated",
-            "manifest_artifact_write_failed",
+            "manifest_artifact_write_unsettled",
+        ),
+        (
+            _CommitThenRaiseArtifactStore,
+            "truncated",
+            "manifest_artifact_write_unsettled",
         ),
         (
             _MalformedArtifactStore,
@@ -3134,7 +4546,204 @@ def test_artifact_store_failures_are_bounded_without_replacing_tool_outcome(
     )
     assert receipt.payload["status"] == expected_status
     assert receipt.payload["detail_code"] == expected_detail_code
+    finalized = next(
+        event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "incomplete"
+    assert finalized.payload["detail_code"] == "workspace_revision_evidence_incomplete"
+    artifact_states = {
+        value for key, value in finalized.payload.items() if key.endswith("_artifact_state")
+    }
+    assert artifact_states == {"intent"}
     assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in public_events)
+
+
+def test_artifact_store_generator_exit_propagates_without_false_terminal_evidence(
+    tmp_path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifact_root = tmp_path / "artifacts"
+    workspace_root.mkdir()
+
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_BulkProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=_GeneratorExitArtifactStore(artifact_root),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+
+        with pytest.raises(GeneratorExit, match="artifact-store supervisory exit"):
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-artifact-generator-exit",
+                    messages=[Message.text("user", "create files")],
+                ),
+            )
+        durable = await store.query_events(EventQuery(session_id="session-artifact-generator-exit"))
+        return [record.event for record in durable]
+
+    durable_events = asyncio.run(run())
+
+    assert not any(
+        event.type
+        in {
+            EventType.WORKSPACE_MUTATION_RECORDED,
+            EventType.WORKSPACE_OBSERVATION_FINALIZED,
+            EventType.SESSION_FAILED,
+        }
+        for event in durable_events
+    )
+
+
+def test_artifact_store_process_control_is_not_lost_to_concurrent_cancellation(
+    tmp_path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifact_root = tmp_path / "artifacts"
+    workspace_root.mkdir()
+
+    async def run():
+        artifact_store = _ConcurrentGeneratorExitArtifactStore(artifact_root)
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(_BulkProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=artifact_store,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-artifact-concurrent-control",
+                    messages=[Message.text("user", "create files")],
+                ),
+            )
+        )
+        artifact_store.cancel_target = consumer
+        await artifact_store.started.wait()
+        artifact_store.release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return raised.value, consumer
+
+    failure, consumer = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert any(
+        type(candidate) is GeneratorExit
+        and candidate.args == ("artifact-store concurrent supervisory exit",)
+        for candidate in failures
+    )
+    assert any(
+        type(candidate) is asyncio.CancelledError
+        and candidate.args == ("artifact caller cancellation",)
+        for candidate in failures
+    )
+    assert consumer.cancelling() == 0
+    assert consumer.cancelled() is False
+
+
+def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifact_root = tmp_path / "artifacts"
+    workspace_root.mkdir()
+    monkeypatch.setattr(
+        tool_round_executor_module,
+        "_WORKSPACE_RECEIPT_INLINE_PATH_LIMIT",
+        0,
+    )
+
+    async def run():
+        tool = _BlockingAfterWriteMutationTool()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _SingleToolProvider(
+                tool_name=tool.spec.name,
+                arguments={},
+            ),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=_GeneratorExitArtifactStore(artifact_root),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="cancel-model"),
+            tools=[tool],
+        )
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-interrupted-artifact-generator-exit",
+                    messages=[Message.text("user", "write then cancel")],
+                ),
+            )
+        )
+        await tool.started.wait()
+        consumer.cancel("caller cancellation during workspace mutation")
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        durable = await store.query_events(
+            EventQuery(session_id="session-interrupted-artifact-generator-exit")
+        )
+        return raised.value, consumer, [record.event for record in durable]
+
+    failure, consumer, durable_events = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert any(
+        type(candidate) is asyncio.CancelledError
+        and candidate.args == ("caller cancellation during workspace mutation",)
+        for candidate in failures
+    )
+    assert any(
+        type(candidate) is GeneratorExit and candidate.args == ("artifact-store supervisory exit",)
+        for candidate in failures
+    )
+    assert consumer.cancelling() == 0
+    assert consumer.cancelled() is False
+    assert not any(
+        event.type
+        in {
+            EventType.WORKSPACE_MUTATION_RECORDED,
+            EventType.WORKSPACE_OBSERVATION_FINALIZED,
+        }
+        for event in durable_events
+    )
 
 
 def test_stalled_receipt_artifact_write_is_bounded_without_replacing_tool_outcome(
@@ -3180,7 +4789,7 @@ def test_stalled_receipt_artifact_write_is_bounded_without_replacing_tool_outcom
         ]
         assert artifacts.started.is_set()
         artifacts.release.set()
-        await asyncio.sleep(0)
+        await artifacts.finished.wait()
         durable = await store.query_events(
             EventQuery(session_id="session-stalled-receipt-artifact")
         )
@@ -3194,7 +4803,13 @@ def test_stalled_receipt_artifact_write_is_bounded_without_replacing_tool_outcom
         if event.type == EventType.WORKSPACE_REVISION_OBSERVED and event.payload["phase"] == "after"
     )
     assert after.payload["status"] == "truncated"
-    assert after.payload["detail_code"] == "manifest_artifact_write_failed"
+    assert after.payload["detail_code"] == "manifest_artifact_write_unsettled"
+    finalized = next(
+        event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert {
+        value for key, value in finalized.payload.items() if key.endswith("_artifact_state")
+    } == {"intent"}
     assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in public_events)
 
 
@@ -3451,11 +5066,12 @@ def test_malformed_revision_observer_is_sanitized_before_serialization(
     assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in public_events)
 
 
-def test_observer_owned_cancellation_is_a_bounded_capture_failure(tmp_path) -> None:
+def test_observer_owned_cancellation_fails_closed_before_tool_dispatch(tmp_path) -> None:
     async def run():
         store = InMemorySessionStore()
+        provider = _ScriptedProvider()
         app = CayuApp(session_store=store, enable_logging=False)
-        app.register_provider(_ScriptedProvider(), default=True)
+        app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
                 EnvironmentSpec(name="local"),
@@ -3482,16 +5098,146 @@ def test_observer_owned_cancellation_is_a_bounded_capture_failure(tmp_path) -> N
         durable = await store.query_events(
             EventQuery(session_id="session-child-cancelled-observer")
         )
-        return public, [record.event for record in durable]
+        with pytest.raises(
+            WorkspaceMutationSettlementError,
+            match="settlement could not be proven",
+        ) as reuse_error:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-child-cancelled-observer-reuse",
+                    messages=[Message.text("user", "reuse")],
+                ),
+            )
+        return public, reuse_error.value, [record.event for record in durable], provider
 
-    public_events, durable_events = asyncio.run(run())
+    public_events, reuse_error, durable_events, provider = asyncio.run(run())
 
-    observations = [
-        event for event in durable_events if event.type == EventType.WORKSPACE_REVISION_OBSERVED
-    ]
-    assert [event.payload["status"] for event in observations] == ["failed", "failed"]
-    assert all(event.payload["detail_code"] == "revision_observer_failed" for event in observations)
-    assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in public_events)
+    assert provider.requests == 1
+    assert (tmp_path / "shell.txt").exists() is False
+    assert not any(
+        event.type
+        in {
+            EventType.WORKSPACE_REVISION_OBSERVED,
+            EventType.TOOL_CALL_COMPLETED,
+        }
+        for event in durable_events
+    )
+    assert any(event.type is EventType.SESSION_FAILED for event in public_events)
+    assert str(reuse_error) == "Workspace mutation settlement could not be proven."
+    assert any(
+        event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED for event in durable_events
+    )
+
+
+def test_observer_owned_generator_exit_propagates_and_does_not_quarantine_reuse(
+    tmp_path,
+) -> None:
+    async def run():
+        binding = _OneShotGeneratorExitObserverBinding()
+        provider = _SingleToolProvider(
+            tool_name="noop_workspace_mutation",
+            arguments={},
+        )
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="generator-exit-workspace"),
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+
+        with pytest.raises(GeneratorExit, match="observer supervisory exit"):
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-observer-generator-exit",
+                    messages=[Message.text("user", "observe")],
+                ),
+            )
+        second = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-observer-generator-exit-reuse",
+                messages=[Message.text("user", "reuse")],
+            ),
+        )
+        return second, binding, provider
+
+    second, binding, provider = asyncio.run(run())
+
+    assert any(event.type is EventType.SESSION_COMPLETED for event in second)
+    assert binding.observations >= 2
+    assert provider.requests == 2
+
+
+def test_observer_process_control_is_not_lost_to_concurrent_cancellation(
+    tmp_path,
+) -> None:
+    async def run():
+        binding = _ConcurrentGeneratorExitObserverBinding()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(
+            _SingleToolProvider(
+                tool_name="noop_workspace_mutation",
+                arguments={},
+            ),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="concurrent-control-workspace"),
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_NoopWorkspaceMutationTool()],
+        )
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-observer-concurrent-control",
+                    messages=[Message.text("user", "observe")],
+                ),
+            )
+        )
+        binding.cancel_target = consumer
+        await binding.started.wait()
+        binding.release.set()
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await consumer
+        return raised.value, consumer
+
+    failure, consumer = asyncio.run(run())
+
+    failures = list(iter_exception_tree(failure))
+    assert any(
+        type(candidate) is GeneratorExit
+        and candidate.args == ("observer concurrent supervisory exit",)
+        for candidate in failures
+    )
+    assert any(
+        type(candidate) is asyncio.CancelledError
+        and candidate.args == ("observer caller cancellation",)
+        for candidate in failures
+    )
+    assert consumer.cancelling() == 1
+    assert consumer.cancelled() is False
 
 
 def test_stalled_observer_is_bounded_without_replacing_tool_outcome(
@@ -3548,8 +5294,10 @@ def test_stalled_observer_is_bounded_without_replacing_tool_outcome(
     assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in public_events)
 
 
+@pytest.mark.parametrize("cancellation_requests", [1, 2])
 def test_caller_cancellation_during_after_observation_preserves_tool_terminal(
     tmp_path,
+    cancellation_requests: int,
 ) -> None:
     async def run():
         binding = _StalledObserverBinding()
@@ -3576,7 +5324,7 @@ def test_caller_cancellation_during_after_observation_preserves_tool_terminal(
                 async for event in app.run(
                     RunRequest(
                         agent_name="assistant",
-                        session_id="session-cancelled-after-observer",
+                        session_id=(f"session-cancelled-after-observer-{cancellation_requests}"),
                         messages=[Message.text("user", "create a file")],
                     )
                 )
@@ -3584,15 +5332,16 @@ def test_caller_cancellation_during_after_observation_preserves_tool_terminal(
 
         consumer = asyncio.create_task(consume())
         await binding.started.wait()
-        consumer.cancel("cancel while observing workspace")
+        for _request in range(cancellation_requests):
+            consumer.cancel("cancel while observing workspace")
         with pytest.raises(asyncio.CancelledError, match="cancel while observing workspace"):
             await consumer
-        assert consumer.cancelling() == 0
+        assert consumer.cancelling() == cancellation_requests
         assert consumer.cancelled() is True
         binding.release.set()
         await asyncio.sleep(0)
         durable = await store.query_events(
-            EventQuery(session_id="session-cancelled-after-observer")
+            EventQuery(session_id=f"session-cancelled-after-observer-{cancellation_requests}")
         )
         return [record.event for record in durable]
 
@@ -3720,11 +5469,19 @@ def test_terminal_failure_after_capture_cancellation_preserves_caller_cancellati
             asyncio.CancelledError, match="cancel during workspace capture"
         ) as raised:
             await consumer
-        assert consumer.cancelling() == 0
+        assert consumer.cancelling() == 1
         assert consumer.cancelled() is True
-        cause = exception_cause(raised.value)
-        assert isinstance(cause, RuntimeError)
-        assert "terminal publication failed" not in str(cause)
+        cleanup_group = exception_cause(raised.value)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        cleanup_failures = tuple(iter_exception_tree(cleanup_group))
+        assert any(isinstance(failure, ValueError) for failure in cleanup_failures)
+        closure_failure = exception_cause(cleanup_group)
+        assert isinstance(closure_failure, RuntimeError)
+        assert str(closure_failure) == "Interrupted tool-round closure failed."
+        assert all(
+            "terminal publication failed" not in str(failure)
+            for failure in (*cleanup_failures, closure_failure)
+        )
         durable = await store.query_events(
             EventQuery(session_id="session-cancelled-terminal-failure")
         )
@@ -3777,7 +5534,7 @@ def test_later_terminal_cancellation_does_not_replace_capture_cancellation(tmp_p
             await consumer
         assert raised.value.args == ("first cancellation during workspace capture",)
         assert exception_cause(raised.value) is not None
-        assert consumer.cancelling() == 0
+        assert consumer.cancelling() == 2
         assert consumer.cancelled() is True
         store.terminal_release.set()
 
@@ -3799,7 +5556,7 @@ def test_workspace_capture_publication_failure_preserves_tool_terminal(
         app = CayuApp(
             session_store=store,
             enable_logging=False,
-            secret_redactor=SecretRedactor(["failed", "receipt_publication_failed"]),
+            secret_redactor=SecretRedactor(["before", "failed", "receipt_publication_failed"]),
         )
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
@@ -3847,7 +5604,305 @@ def test_workspace_capture_publication_failure_preserves_tool_terminal(
         public_terminal.payload["workspace_mutation_capture_detail_code"]
         == "receipt_publication_failed"
     )
+    observation_terminal = next(
+        event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert observation_terminal.payload["status"] == "failed"
+    assert observation_terminal.payload["detail_code"] == "receipt_publication_failed"
+    public_observation_terminal = next(
+        event for event in public_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert public_observation_terminal.payload["status"] == "failed"
+    assert public_observation_terminal.payload["detail_code"] == "receipt_publication_failed"
     assert (tmp_path / "shell.txt").read_text(encoding="utf-8") == "created"
+
+
+def test_committed_malformed_workspace_acknowledgement_reconciles_exact_receipt(
+    tmp_path,
+) -> None:
+    async def run():
+        store = _CommittedMalformedWorkspaceAcknowledgementStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_ScriptedProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        public = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-malformed-committed-workspace-ack",
+                messages=[Message.text("user", "create a file")],
+            ),
+        )
+        durable = await store.query_events(
+            EventQuery(session_id="session-malformed-committed-workspace-ack")
+        )
+        return store, public, [record.event for record in durable]
+
+    store, public_events, durable_events = asyncio.run(run())
+
+    assert store.before_evidence_attempts == 2
+    assert (
+        sum(
+            event.type == EventType.WORKSPACE_REVISION_OBSERVED
+            and event.payload.get("phase") == "before"
+            for event in public_events
+        )
+        == 1
+    )
+    assert (
+        sum(
+            event.type == EventType.WORKSPACE_REVISION_OBSERVED
+            and event.payload.get("phase") == "before"
+            for event in durable_events
+        )
+        == 1
+    )
+    assert sum(event.type == EventType.TOOL_CALL_STARTED for event in durable_events) == 1
+    assert any(event.type == EventType.SESSION_COMPLETED for event in durable_events)
+    assert (tmp_path / "shell.txt").read_text(encoding="utf-8") == "created"
+
+
+def test_uncommitted_malformed_workspace_acknowledgement_is_not_fanned_out(
+    tmp_path,
+    caplog,
+    capsys,
+) -> None:
+    async def run():
+        store = _UncommittedMalformedWorkspaceAcknowledgementStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_ScriptedProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        public = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-malformed-uncommitted-workspace-ack",
+                messages=[Message.text("user", "create a file")],
+            ),
+        )
+        durable = await store.query_events(
+            EventQuery(session_id="session-malformed-uncommitted-workspace-ack")
+        )
+        return store, public, [record.event for record in durable]
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always")
+        store, public_events, durable_events = asyncio.run(run())
+    captured_output = capsys.readouterr()
+
+    assert store.before_evidence_attempts == 1
+    assert not any(
+        event.type == EventType.WORKSPACE_REVISION_OBSERVED
+        and event.payload.get("phase") == "before"
+        for event in public_events
+    )
+    assert not any(
+        event.type == EventType.WORKSPACE_REVISION_OBSERVED
+        and event.payload.get("phase") == "before"
+        for event in durable_events
+    )
+    finalized = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "failed"
+    assert finalized.payload["detail_code"] == "receipt_publication_failed"
+    assert any(event.type is EventType.SESSION_COMPLETED for event in durable_events)
+    assert _MALFORMED_WORKSPACE_ACK_CANARY not in repr(public_events)
+    assert _MALFORMED_WORKSPACE_ACK_CANARY not in repr(durable_events)
+    assert _MALFORMED_WORKSPACE_ACK_CANARY not in caplog.text
+    assert _MALFORMED_WORKSPACE_ACK_CANARY not in captured_output.out
+    assert _MALFORMED_WORKSPACE_ACK_CANARY not in captured_output.err
+    assert not any(
+        _MALFORMED_WORKSPACE_ACK_CANARY in str(warning.message) for warning in captured_warnings
+    )
+
+
+def test_cancelled_workspace_publication_preserves_initial_and_reconciliation_failures(
+    tmp_path,
+) -> None:
+    async def run():
+        store = _CancelledFailedWorkspacePublicationStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_ScriptedProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        consumer = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-workspace-publication-failure-cancelled",
+                    messages=[Message.text("user", "create a file")],
+                ),
+            )
+        )
+        await store.publication_started.wait()
+        consumer.cancel("workspace publication caller cancellation")
+        store.release_publication.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await consumer
+        return store, raised.value, consumer.cancelling(), consumer.cancelled()
+
+    store, cancellation, cancelling, cancelled = asyncio.run(run())
+    cause = exception_cause(cancellation)
+    assert cause is not None
+    failures = list(iter_exception_tree(cause))
+    bounded_failures = [
+        candidate for candidate in failures if type(candidate) is RunnerExecutionError
+    ]
+    assert [failure.diagnostic["error_type"] for failure in bounded_failures] == [
+        "ConnectionError",
+        "TimeoutError",
+    ]
+    assert all(candidate is not store.initial_failure for candidate in failures)
+    assert all(candidate is not store.reconciliation_failure for candidate in failures)
+    assert cancellation.args == ("workspace publication caller cancellation",)
+    assert cancelling == 1
+    assert cancelled is True
+
+
+def test_self_consistent_conflicting_workspace_acknowledgement_is_not_fanned_out(
+    tmp_path,
+) -> None:
+    async def run():
+        store = _UncommittedConflictingWorkspaceAcknowledgementStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_ScriptedProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        public = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-conflicting-uncommitted-workspace-ack",
+                messages=[Message.text("user", "create a file")],
+            ),
+        )
+        durable = await store.query_events(
+            EventQuery(session_id="session-conflicting-uncommitted-workspace-ack")
+        )
+        return store, public, [record.event for record in durable]
+
+    store, public_events, durable_events = asyncio.run(run())
+
+    assert store.before_evidence_attempts == 1
+    assert not any(
+        event.type is EventType.WORKSPACE_REVISION_OBSERVED
+        and event.payload.get("phase") == "before"
+        for event in (*public_events, *durable_events)
+    )
+    finalized = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "failed"
+    assert finalized.payload["detail_code"] == "receipt_publication_failed"
+    assert any(event.type is EventType.SESSION_COMPLETED for event in durable_events)
+
+
+def test_rejected_workspace_acknowledgement_is_absent_from_traceback_locals() -> None:
+    async def run() -> RuntimeError:
+        store = _TracebackMalformedWorkspaceAcknowledgementStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-malformed-workspace-ack-traceback",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="scripted", model="scripted-model"),
+        )
+        store.returned_session = session
+        event_writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=(),
+        )
+        lifecycle = WorkspaceObservationLifecycle(
+            session_id=session.id,
+            window_id="wmut-malformed-ack-traceback",
+            source_run_epoch=session.run_epoch,
+            binding_generation_id="wbind-malformed-ack-traceback",
+            workspace_id="workspace-malformed-ack-traceback",
+            observer="TracebackWorkspaceBinding",
+            observer_authority="configured",
+            artifact_store_id=None,
+            agent_name="assistant",
+            environment_name="local",
+            tool_name="mutate",
+            tool_call_id="call-malformed-ack-traceback",
+            model_step_id="mstep-malformed-ack-traceback",
+            model_attempt_id="matt-malformed-ack-traceback",
+            tool_round_id="tround-malformed-ack-traceback",
+            model_step=1,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="returned invalid acknowledgement",
+        ) as raised:
+            await publish_workspace_observation_transition(
+                session_store=store,
+                event_writer=event_writer,
+                session=session,
+                previous=None,
+                current=lifecycle,
+                phase="intent",
+                intent_admission=_admit_test_workspace_observation_intent(lifecycle),
+            )
+        return raised.value
+
+    error = asyncio.run(run())
+    captured = traceback.TracebackException.from_exception(error, capture_locals=True)
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    retained = repr([(frame.name, frame.locals) for frame in cayu_frames])
+
+    assert _MALFORMED_WORKSPACE_ACK_CANARY not in retained
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_abandoning_after_workspace_event_does_not_erase_tool_terminal(tmp_path) -> None:
@@ -3891,6 +5946,1381 @@ def test_abandoning_after_workspace_event_does_not_erase_tool_terminal(tmp_path)
 
     assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in durable_events)
     assert any(event.type == EventType.WORKSPACE_MUTATION_RECORDED for event in durable_events)
+
+
+@pytest.mark.parametrize(
+    (
+        "crash_phase",
+        "checkpoint_phase",
+        "terminal_status",
+        "tool_ran",
+        "hide_workspace_delta",
+    ),
+    [
+        ("intent", "intent", "ambiguous", False, False),
+        ("before-capture", "before_captured", "ambiguous", False, False),
+        ("terminal-stage", "before_captured", "incomplete", True, False),
+        ("tool-outcome", "tool_outcome_staged", "incomplete", True, False),
+        ("before-evidence", "tool_outcome_staged", "incomplete", True, False),
+        ("after-capture", "after_captured", "incomplete", True, False),
+        ("delta-publication", "delta_published", "complete", True, False),
+        ("delta-publication", "delta_published", "incomplete", True, True),
+        ("terminal", None, "complete", True, False),
+    ],
+)
+def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_redispatch(
+    tmp_path,
+    crash_phase: str,
+    checkpoint_phase: str | None,
+    terminal_status: str,
+    tool_ran: bool,
+    hide_workspace_delta: bool,
+) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase=crash_phase)
+        first_provider = _ScriptedProvider()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(first_provider, default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        session_id = (
+            f"session-workspace-observation-process-loss-{crash_phase}-{hide_workspace_delta}"
+        )
+        with pytest.raises(_WorkspaceObservationProcessLoss, match=crash_phase):
+            _ = [
+                event
+                async for event in first_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "create a file")],
+                    )
+                )
+            ]
+
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        observations = checkpoint.get("workspace_observations")
+        if checkpoint_phase is None:
+            assert observations is None
+        else:
+            assert type(observations) is dict and len(observations) == 1
+            assert next(iter(observations.values()))["phase"] == checkpoint_phase
+        assert first_provider.requests == 1
+        assert (tmp_path / "shell.txt").exists() is tool_ran
+
+        store.failed = True
+        store.hide_workspace_delta = hide_workspace_delta
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_provider = _ScriptedProvider()
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        competing_provider = _ScriptedProvider()
+        competing_app = CayuApp(session_store=store, enable_logging=False)
+        competing_app.register_provider(competing_provider, default=True)
+        competing_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        competing_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        recoveries = await asyncio.gather(
+            recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            ),
+            competing_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            ),
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return (
+            first_provider,
+            recovery_provider,
+            competing_provider,
+            recoveries,
+            [record.event for record in durable],
+            await store.load_checkpoint(session_id),
+        )
+
+    (
+        first_provider,
+        recovery_provider,
+        competing_provider,
+        recoveries,
+        durable_events,
+        checkpoint,
+    ) = asyncio.run(run())
+
+    assert first_provider.requests == 1
+    assert recovery_provider.requests == 0
+    assert competing_provider.requests == 0
+    assert sum(
+        IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
+        for recovery in recoveries
+    ) == (1 if checkpoint_phase is not None else 0)
+    assert (
+        sum(
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
+            for recovery in recoveries
+        )
+        == 1
+    )
+
+    finalized = [
+        event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    ]
+    assert len(finalized) == 1
+    assert finalized[0].payload["status"] == terminal_status
+    terminal_type = EventType.TOOL_CALL_COMPLETED if tool_ran else EventType.TOOL_CALL_FAILED
+    terminal = next(event for event in durable_events if event.type == terminal_type)
+    if (crash_phase == "delta-publication" and not hide_workspace_delta) or (
+        crash_phase == "terminal"
+    ):
+        assert terminal.payload["workspace_mutation_capture_status"] == "recorded"
+    elif hide_workspace_delta:
+        assert terminal.payload["workspace_mutation_capture_status"] == "failed"
+        assert (
+            terminal.payload["workspace_mutation_capture_detail_code"]
+            == "workspace_delta_evidence_missing"
+        )
+    elif tool_ran:
+        assert terminal.payload["workspace_mutation_capture_status"] == "failed"
+    assert checkpoint is not None
+    assert "workspace_observations" not in checkpoint
+
+
+@pytest.mark.parametrize(
+    ("crash_phase", "terminal_status", "detail_code"),
+    [
+        (
+            "intent",
+            "ambiguous",
+            "worker_lost_before_tool_outcome_was_durable",
+        ),
+        (
+            "after-capture",
+            "incomplete",
+            "worker_lost_before_workspace_observation_completed",
+        ),
+        (
+            "delta-publication",
+            "incomplete",
+            "workspace_revision_evidence_incomplete",
+        ),
+    ],
+)
+def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
+    tmp_path,
+    crash_phase: str,
+    terminal_status: str,
+    detail_code: str,
+) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase=crash_phase)
+        first_factory = _WorkspaceObservationRecoveryFactory(
+            tmp_path / "first-factory-workspace",
+            workspace_id="factory-workspace",
+        )
+        first_provider = _ScriptedProvider()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(first_provider, default=True)
+        first_app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            first_factory,
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        session_id = f"session-factory-observation-recovery-{crash_phase}"
+        with pytest.raises(_WorkspaceObservationProcessLoss, match=crash_phase):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create a file")],
+                ),
+            )
+
+        checkpoint_before = await store.load_checkpoint(session_id)
+        assert checkpoint_before is not None
+        assert workspace_observations_from_checkpoint(checkpoint_before)
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        # The replacement registration intentionally has no access to the
+        # historical concrete workspace. Recovery must not invoke it merely to
+        # collect evidence or compare identities.
+        recovery_factory = _WorkspaceObservationRecoveryFactory(
+            tmp_path / "replacement-factory-workspace",
+            workspace_id="replacement-workspace",
+        )
+        recovery_provider = _ScriptedProvider()
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            recovery_factory,
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        if crash_phase == "intent":
+            with pytest.raises(
+                RuntimeError,
+                match="cannot safely continue with opaque provider state",
+            ):
+                await recovery_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id)
+                )
+            recovery = None
+        else:
+            recovery = await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        checkpoint_after = await store.load_checkpoint(session_id)
+        return (
+            first_factory,
+            recovery_factory,
+            first_provider,
+            recovery_provider,
+            recovery,
+            [record.event for record in durable],
+            checkpoint_after,
+        )
+
+    (
+        first_factory,
+        recovery_factory,
+        first_provider,
+        recovery_provider,
+        recovery,
+        durable_events,
+        checkpoint,
+    ) = asyncio.run(run())
+
+    assert first_factory.create_calls == 1
+    assert recovery_factory.create_calls == 0
+    assert first_provider.requests == 1
+    assert recovery_provider.requests == 0
+    if recovery is not None:
+        assert IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
+    finalized = [
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    ]
+    assert len(finalized) == 1
+    assert finalized[0].payload["status"] == terminal_status
+    assert finalized[0].payload["detail_code"] == detail_code
+    assert checkpoint is not None
+    assert "workspace_observations" not in checkpoint
+
+
+@pytest.mark.parametrize(
+    ("crash_phase", "cancel_kind", "expected_operation"),
+    [
+        (
+            "after-capture",
+            "read",
+            "Workspace observation recovery checkpoint read",
+        ),
+        (
+            "terminal-stage",
+            "mutation",
+            "Workspace observation terminal-stage repair",
+        ),
+    ],
+)
+def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
+    tmp_path,
+    crash_phase,
+    cancel_kind,
+    expected_operation,
+) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase=crash_phase)
+        first_provider = _ScriptedProvider()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(first_provider, default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        session_id = f"session-workspace-observation-recovery-child-cancellation-{cancel_kind}"
+        with pytest.raises(_WorkspaceObservationProcessLoss, match=crash_phase):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create a file")],
+                ),
+            )
+
+        store.failed = True
+        if cancel_kind == "read":
+            store.cancel_workspace_observation_read = True
+        else:
+            store.cancel_workspace_observation_mutation = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_provider = _ScriptedProvider()
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        recovery_task = asyncio.create_task(
+            recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=f"{expected_operation} was cancelled without caller cancellation",
+        ):
+            await recovery_task
+        return recovery_task, first_provider, recovery_provider, store
+
+    recovery_task, first_provider, recovery_provider, store = asyncio.run(run())
+
+    if cancel_kind == "read":
+        assert store.workspace_observation_read_cancelled is True
+        assert store.workspace_observation_mutation_cancelled is False
+    else:
+        assert store.workspace_observation_read_cancelled is False
+        assert store.workspace_observation_mutation_cancelled is True
+    assert recovery_task.cancelling() == 0
+    assert recovery_task.cancelled() is False
+    assert first_provider.requests == 1
+    assert recovery_provider.requests == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "crash_phase",
+        "delete_before_recovery",
+        "recovery_store_id",
+        "metadata_update",
+        "artifact_state",
+        "commit_then_raise",
+        "malformed_read_result",
+    ),
+    [
+        (
+            "artifact-revision-after-intent",
+            False,
+            "artifact-store",
+            None,
+            "intent",
+            False,
+            False,
+        ),
+        (
+            "artifact-revision-after-published",
+            False,
+            "artifact-store",
+            None,
+            "orphaned",
+            False,
+            False,
+        ),
+        ("after-capture", False, "artifact-store", None, "referenced", False, False),
+        ("after-capture", True, "artifact-store", None, "missing", False, False),
+        ("delta-publication", True, "artifact-store", None, "missing", False, False),
+        ("delta-publication", False, "artifact-store", None, "failed", False, True),
+        ("after-capture", False, "artifact-store", None, "orphaned", True, False),
+        (
+            "after-capture",
+            False,
+            "artifact-store",
+            {"filename": "foreign.json"},
+            "failed",
+            False,
+            False,
+        ),
+        (
+            "after-capture",
+            False,
+            "artifact-store",
+            {"session_id": "foreign-session"},
+            "failed",
+            False,
+            False,
+        ),
+        (
+            "after-capture",
+            False,
+            "artifact-store",
+            {"scope": ArtifactScope.ENVIRONMENT},
+            "failed",
+            False,
+            False,
+        ),
+        (
+            "after-capture",
+            False,
+            "artifact-store",
+            {
+                "metadata": {
+                    "schema_version": 1,
+                    "kind": "revision-before",
+                    "sha256": "a" * 64,
+                    "window_id": "foreign-window",
+                }
+            },
+            "failed",
+            False,
+            False,
+        ),
+    ],
+)
+def test_workspace_observation_recovery_reports_partial_artifact_state(
+    tmp_path,
+    crash_phase: str,
+    delete_before_recovery: bool,
+    recovery_store_id: str,
+    metadata_update: dict | None,
+    artifact_state: str,
+    commit_then_raise: bool,
+    malformed_read_result: bool,
+) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase=crash_phase)
+        artifact_root = tmp_path / "artifacts"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        artifact_store = (
+            _CommitThenRaiseArtifactStore(artifact_root, store_id="artifact-store")
+            if commit_then_raise
+            else LocalArtifactStore(artifact_root, store_id="artifact-store")
+        )
+        first_provider = _BulkProvider()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(first_provider, default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=artifact_store,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BulkWriteTool()],
+        )
+        session_id = f"session-workspace-artifact-recovery-{crash_phase}-{delete_before_recovery}"
+        with pytest.raises(_WorkspaceObservationProcessLoss, match=crash_phase):
+            _ = [
+                event
+                async for event in first_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "write many files")],
+                    )
+                )
+            ]
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        observations = checkpoint["workspace_observations"]
+        lifecycle = next(iter(observations.values()))
+        artifact = next(
+            item for item in lifecycle["artifacts"] if item["evidence_kind"] == "revision-after"
+        )
+        if delete_before_recovery:
+            await artifact_store.delete(artifact["artifact_id"])
+
+        store.failed = True
+        store.hide_workspace_delta = crash_phase == "delta-publication"
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_provider = _BulkProvider()
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_artifact_store = (
+            _NoneReadArtifactStore(
+                artifact_root,
+                store_id=recovery_store_id,
+            )
+            if malformed_read_result
+            else LocalArtifactStore(
+                artifact_root,
+                store_id=recovery_store_id,
+            )
+            if metadata_update is None
+            else _ConflictingReadArtifactStore(
+                artifact_root,
+                store_id=recovery_store_id,
+                metadata_update=metadata_update,
+            )
+        )
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=recovery_artifact_store,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BulkWriteTool()],
+        )
+        recovery = await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return first_provider, recovery_provider, recovery, [record.event for record in durable]
+
+    first_provider, recovery_provider, recovery, durable_events = asyncio.run(run())
+
+    assert first_provider.requests == 1
+    assert recovery_provider.requests == 0
+    assert IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
+    finalized = next(
+        event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "incomplete"
+    assert finalized.payload["revision_after_artifact_state"] == artifact_state
+    assert finalized.payload["revision_after_artifact_id"].startswith("art_")
+    assert len(finalized.payload["revision_after_artifact_sha256"]) == 64
+    assert finalized.payload["revision_after_artifact_size_bytes"] > 0
+    if malformed_read_result:
+        assert finalized.payload["detail_code"] == "workspace_artifact_verification_failed"
+    if crash_phase == "delta-publication":
+        terminal = next(
+            event for event in durable_events if event.type is EventType.TOOL_CALL_COMPLETED
+        )
+        assert terminal.payload["workspace_mutation_capture_status"] == "failed"
+        assert terminal.payload["workspace_mutation_capture_detail_code"] == (
+            "workspace_artifact_verification_failed"
+            if malformed_read_result
+            else "referenced_workspace_artifact_missing"
+        )
+
+
+def test_recovery_does_not_downgrade_failed_delta_when_artifact_is_missing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    def failed_comparison(before, after):
+        return WorkspaceRevisionDelta(
+            identity=before.identity,
+            status=WorkspaceRevisionDeltaStatus.FAILED,
+            before_revision=before.revision,
+            after_revision=after.revision,
+            detail_code="revision_comparison_failed",
+        )
+
+    monkeypatch.setattr(
+        tool_round_executor_module,
+        "compare_workspace_revisions",
+        failed_comparison,
+    )
+
+    async def run():
+        workspace_root = tmp_path / "workspace"
+        artifact_root = tmp_path / "artifacts"
+        workspace_root.mkdir()
+        artifact_store = LocalArtifactStore(
+            artifact_root,
+            store_id="artifact-store",
+        )
+        store = _WorkspaceObservationProcessLossStore(phase="delta-publication")
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(_BulkProvider(), default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=artifact_store,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        session_id = "session-failed-workspace-delta-missing-artifact"
+        with pytest.raises(_WorkspaceObservationProcessLoss):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "write many files")],
+                ),
+            )
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        lifecycle = next(iter(checkpoint["workspace_observations"].values()))
+        after_artifact = next(
+            item for item in lifecycle["artifacts"] if item["evidence_kind"] == "revision-after"
+        )
+        await artifact_store.delete(after_artifact["artifact_id"])
+
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(_BulkProvider(), default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return [record.event for record in durable]
+
+    durable_events = asyncio.run(run())
+
+    finalized = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "failed"
+    assert finalized.payload["detail_code"] == "workspace_revision_comparison_failed"
+    assert finalized.payload["revision_after_artifact_state"] == "missing"
+
+
+def test_recovery_retains_late_artifact_intent_until_store_cleanup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifact_root = tmp_path / "artifacts"
+    workspace_root.mkdir()
+    monkeypatch.setattr(
+        tool_round_executor_module,
+        "_WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase="after-capture")
+        artifacts = _StalledArtifactStore(artifact_root)
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(_BulkProvider(), default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=artifacts,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        session_id = "session-late-workspace-artifact-recovery"
+        with pytest.raises(_WorkspaceObservationProcessLoss, match="after-capture"):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "write many files")],
+                ),
+            )
+        assert artifacts.started.is_set()
+        assert artifacts.finished.is_set() is False
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        lifecycle = next(iter(checkpoint["workspace_observations"].values()))
+        artifact = next(
+            item for item in lifecycle["artifacts"] if item["evidence_kind"] == "revision-after"
+        )
+        assert artifact["state"] == "intent"
+
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(_BulkProvider(), default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=artifacts,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        finalized = next(
+            record.event
+            for record in durable
+            if record.event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+        )
+        assert finalized.payload["revision_after_artifact_state"] == "intent"
+        assert finalized.payload["revision_after_artifact_id"] == artifact["artifact_id"]
+        assert finalized.payload["revision_after_artifact_sha256"] == artifact["sha256"]
+        assert finalized.payload["revision_after_artifact_size_bytes"] == artifact["size_bytes"]
+
+        artifacts.release.set()
+        await artifacts.finished.wait()
+        result = await artifacts.read_bytes(
+            artifact["artifact_id"],
+            max_bytes=artifact["size_bytes"],
+        )
+        return result.content, artifact["sha256"]
+
+    content, expected_digest = asyncio.run(run())
+
+    assert hashlib.sha256(content).hexdigest() == expected_digest
+
+
+@pytest.mark.parametrize(
+    ("authority_update", "expected_error"),
+    [
+        ({}, "duplicate active lifecycles"),
+        ({"session_id": "foreign-session"}, "belongs to a different session"),
+        ({"agent_name": "foreign-agent"}, "conflicts with its invocation scope"),
+        (
+            {"environment_name": "foreign-environment"},
+            "conflicts with its invocation scope",
+        ),
+        ({"source_run_epoch": 999}, "belongs to a future run epoch"),
+        (
+            {"source_run_epoch": 0},
+            "conflicts with its active invocation profile",
+        ),
+        (
+            {"interaction_id": "foreign-interaction"},
+            "conflicts with its active invocation profile",
+        ),
+        ({"model_step_id": "model-step-foreign"}, "conflicts with its pending tool round"),
+        (
+            {"model_attempt_id": "model-attempt-foreign"},
+            "conflicts with its pending tool round",
+        ),
+        ({"tool_round_id": "tool-round-foreign"}, "conflicts with its pending tool round"),
+        ({"model_step": 999}, "conflicts with its pending tool round"),
+        ({"tool_call_id": "call-foreign"}, "conflicts with its pending tool call"),
+        ({"tool_name": "foreign-tool"}, "conflicts with its pending tool call"),
+        (
+            {"artifact_store_id": "replacement-artifact-store"},
+            "conflicts with its registered environment authority",
+        ),
+    ],
+)
+def test_workspace_observation_recovery_rejects_foreign_authority_before_artifact_read(
+    tmp_path,
+    authority_update: dict[str, object],
+    expected_error: str,
+) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase="artifact-revision-after-published")
+        artifact_root = tmp_path / "artifacts"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(_BulkProvider(), default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BulkWriteTool()],
+        )
+        session_id = "session-cross-session-workspace-observation"
+        with pytest.raises(_WorkspaceObservationProcessLoss):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "write many files")],
+                ),
+            )
+
+        def forge_cross_session_lifecycle(_session, checkpoint):
+            assert checkpoint is not None
+            copied = copy.deepcopy(checkpoint)
+            observations = copied["workspace_observations"]
+            original_window_id, lifecycle = next(iter(observations.items()))
+            foreign = copy.deepcopy(lifecycle)
+            foreign.update(authority_update)
+            if authority_update:
+                # Exercise each conflicting authority independently.  Adding a
+                # second lifecycle here would make the duplicate-owner defect
+                # authoritative before environment-backed fields (such as the
+                # artifact-store identity) can be checked.
+                observations[original_window_id] = foreign
+            else:
+                foreign["window_id"] = "zz-foreign-workspace-observation"
+                observations[foreign["window_id"]] = foreign
+            return copied
+
+        await store.transform_checkpoint(session_id, forge_cross_session_lifecycle)
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        forged_checkpoint = await store.load_checkpoint(session_id)
+        tracking_store = _ReadTrackingArtifactStore(
+            artifact_root,
+            store_id="artifact-store",
+        )
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(_BulkProvider(), default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=tracking_store,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BulkWriteTool()],
+        )
+        with pytest.raises(RuntimeError, match=expected_error):
+            await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        checkpoint = await store.load_checkpoint(session_id)
+        return (
+            tracking_store,
+            [record.event for record in durable],
+            forged_checkpoint,
+            checkpoint,
+        )
+
+    tracking_store, durable_events, forged_checkpoint, checkpoint = asyncio.run(run())
+
+    assert tracking_store.reads == 0
+    assert not any(
+        event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED for event in durable_events
+    )
+    assert checkpoint is not None
+    assert len(checkpoint["workspace_observations"]) == (1 if authority_update else 2)
+    assert forged_checkpoint is not None
+    assert checkpoint == forged_checkpoint
+
+
+@pytest.mark.parametrize("original_is_runtime_builtin", [True, False])
+def test_workspace_observation_recovery_rejects_same_name_observer_authority_change(
+    tmp_path,
+    original_is_runtime_builtin: bool,
+) -> None:
+    impostor_binding_type = type(
+        "DeterministicWorkspaceBinding",
+        (DeterministicWorkspaceBinding,),
+        {},
+    )
+
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase="intent")
+        first_binding = (
+            DeterministicWorkspaceBinding()
+            if original_is_runtime_builtin
+            else impostor_binding_type()
+        )
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(_ScriptedProvider(), default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=first_binding,
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        session_id = (
+            "session-workspace-observer-authority-runtime-to-configured"
+            if original_is_runtime_builtin
+            else "session-workspace-observer-authority-configured-to-runtime"
+        )
+        with pytest.raises(_WorkspaceObservationProcessLoss, match="intent"):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create a file")],
+                ),
+            )
+
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        lifecycle = next(iter(checkpoint["workspace_observations"].values()))
+        assert lifecycle["observer"] == "DeterministicWorkspaceBinding"
+        assert lifecycle["observer_authority"] == (
+            "runtime_builtin" if original_is_runtime_builtin else "configured"
+        )
+
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_binding = (
+            impostor_binding_type()
+            if original_is_runtime_builtin
+            else DeterministicWorkspaceBinding()
+        )
+        recovery_provider = _ScriptedProvider()
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=recovery_binding,
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="conflicts with its registered environment authority",
+        ):
+            await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return recovery_provider, [record.event for record in durable]
+
+    recovery_provider, durable_events = asyncio.run(run())
+
+    assert recovery_provider.requests == 0
+    assert not any(
+        event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED for event in durable_events
+    )
+
+
+def test_workspace_observation_recovery_rejects_foreign_durable_tool_outcome(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace_root = tmp_path / "workspace"
+        artifact_root = tmp_path / "artifacts"
+        workspace_root.mkdir()
+        store = _WorkspaceObservationProcessLossStore(phase="after-capture")
+        first_provider = _BulkProvider()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(first_provider, default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BulkWriteTool()],
+        )
+        session_id = "session-foreign-workspace-tool-outcome"
+        with pytest.raises(_WorkspaceObservationProcessLoss):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create a file")],
+                ),
+            )
+
+        foreign_event: Event | None = None
+
+        def forge_tool_outcome(_session, checkpoint):
+            nonlocal foreign_event
+            assert checkpoint is not None
+            copied = copy.deepcopy(checkpoint)
+            pending_round = copied["pending_tool_round"]
+            staged_event = Event.model_validate(pending_round["staged_terminals"][0]["event"])
+            foreign_event = staged_event.model_copy(
+                update={
+                    "id": "foreign-workspace-tool-outcome",
+                    "agent_name": "foreign-agent",
+                },
+                deep=True,
+            )
+            pending_round["staged_terminals"] = []
+            lifecycle = next(iter(copied["workspace_observations"].values()))
+            lifecycle["tool_outcome_event_id"] = foreign_event.id
+            lifecycle["tool_outcome_event_digest"] = workspace_observation_event_digest(
+                foreign_event
+            )
+            return copied
+
+        await store.transform_checkpoint(session_id, forge_tool_outcome)
+        assert foreign_event is not None
+        await store.append_event(session_id, foreign_event)
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        recovery_provider = _BulkProvider()
+        tracking_store = _ReadTrackingArtifactStore(
+            artifact_root,
+            store_id="artifact-store",
+        )
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=tracking_store,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BulkWriteTool()],
+        )
+        with pytest.raises(
+            ValueError,
+            match="Tool-round durable event has a conflicting agent identity",
+        ):
+            await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return (
+            recovery_provider,
+            tracking_store,
+            [record.event for record in durable],
+        )
+
+    recovery_provider, tracking_store, durable_events = asyncio.run(run())
+
+    assert recovery_provider.requests == 0
+    assert tracking_store.reads == 0
+    finalized = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "ambiguous"
+    assert finalized.payload["detail_code"] == "durable_tool_outcome_evidence_missing"
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "interaction_id",
+        "agent_name",
+        "window_id",
+        "tool_outcome_event_id",
+        "manifest_artifact",
+    ],
+)
+def test_workspace_observation_recovery_rejects_foreign_delta_event(
+    tmp_path,
+    conflict: str,
+) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase="delta-publication")
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(_ScriptedProvider(), default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        session_id = f"session-foreign-workspace-delta-{conflict}"
+        with pytest.raises(_WorkspaceObservationProcessLoss):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create a file")],
+                ),
+            )
+        assert store.workspace_delta_event_id is not None
+        records = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_id=store.workspace_delta_event_id,
+            )
+        )
+        assert len(records) == 1
+        delta_event = records[0].event
+        event_update: dict[str, object] = {
+            "id": f"foreign-delta-{conflict}",
+        }
+        payload = dict(delta_event.payload)
+        if conflict == "interaction_id":
+            event_update["interaction_id"] = "foreign-interaction"
+        elif conflict == "agent_name":
+            event_update["agent_name"] = "foreign-agent"
+        elif conflict == "window_id":
+            payload["window_id"] = "foreign-window"
+        elif conflict == "tool_outcome_event_id":
+            payload["tool_outcome_event_id"] = "foreign-tool-outcome"
+        else:
+            payload.update(
+                {
+                    "manifest_artifact_id": "foreign-artifact",
+                    "manifest_artifact_sha256": "a" * 64,
+                    "manifest_artifact_size_bytes": 1,
+                }
+            )
+        event_update["payload"] = payload
+        foreign_delta = delta_event.model_copy(update=event_update, deep=True)
+        await store.append_event(session_id, foreign_delta)
+
+        def point_lifecycle_to_foreign_delta(_session, checkpoint):
+            assert checkpoint is not None
+            copied = copy.deepcopy(checkpoint)
+            lifecycle = next(iter(copied["workspace_observations"].values()))
+            lifecycle["mutation_event_id"] = foreign_delta.id
+            lifecycle["mutation_event_digest"] = workspace_observation_event_digest(foreign_delta)
+            return copied
+
+        await store.transform_checkpoint(session_id, point_lifecycle_to_foreign_delta)
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_provider = _ScriptedProvider()
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+                runner=LocalRunner(tmp_path),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ExecCommandTool()],
+        )
+        recovery = await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return recovery_provider, recovery, [record.event for record in durable]
+
+    recovery_provider, recovery, durable_events = asyncio.run(run())
+
+    assert recovery_provider.requests == 0
+    assert IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
+    finalized = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "ambiguous"
+    assert finalized.payload["detail_code"] == "workspace_delta_evidence_conflict"
+
+
+def test_workspace_observation_recovery_validates_delta_before_artifact_read(
+    tmp_path,
+) -> None:
+    async def run():
+        workspace_root = tmp_path / "workspace"
+        artifact_root = tmp_path / "artifacts"
+        workspace_root.mkdir()
+        store = _WorkspaceObservationProcessLossStore(phase="delta-publication")
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(_BulkProvider(), default=True)
+        first_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        session_id = "session-foreign-bulk-workspace-delta"
+        with pytest.raises(_WorkspaceObservationProcessLoss):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "write many files")],
+                ),
+            )
+        assert store.workspace_delta_event_id is not None
+        records = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_id=store.workspace_delta_event_id,
+            )
+        )
+        assert len(records) == 1
+        payload = dict(records[0].event.payload)
+        payload["window_id"] = "foreign-window"
+        foreign_delta = records[0].event.model_copy(
+            update={"id": "foreign-bulk-delta", "payload": payload},
+            deep=True,
+        )
+        await store.append_event(session_id, foreign_delta)
+
+        def point_lifecycle_to_foreign_delta(_session, checkpoint):
+            assert checkpoint is not None
+            copied = copy.deepcopy(checkpoint)
+            lifecycle = next(iter(copied["workspace_observations"].values()))
+            lifecycle["mutation_event_id"] = foreign_delta.id
+            lifecycle["mutation_event_digest"] = workspace_observation_event_digest(foreign_delta)
+            return copied
+
+        await store.transform_checkpoint(session_id, point_lifecycle_to_foreign_delta)
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        tracking_store = _ReadTrackingArtifactStore(
+            artifact_root,
+            store_id="artifact-store",
+        )
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(_BulkProvider(), default=True)
+        recovery_app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=tracking_store,
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        recovery = await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return tracking_store, recovery, [record.event for record in durable]
+
+    tracking_store, recovery, durable_events = asyncio.run(run())
+
+    assert tracking_store.reads == 0
+    assert IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
+    finalized = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert finalized.payload["status"] == "ambiguous"
+    assert finalized.payload["detail_code"] == "workspace_delta_evidence_conflict"
 
 
 def test_workspace_receipt_closes_before_tool_cancellation_propagates(tmp_path) -> None:

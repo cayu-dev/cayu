@@ -104,7 +104,7 @@ class InvocationWorkspaceMutationOwner:
         mutation_error = outcome.error
         if mutation_error is not None and exception_tree_contains(
             mutation_error,
-            (KeyboardInterrupt, SystemExit),
+            (GeneratorExit, KeyboardInterrupt, SystemExit),
         ):
             raise mutation_error
         if mutation_error is not None:
@@ -180,7 +180,10 @@ class InvocationWorkspaceMutationOwner:
         process_failures = [
             failure
             for failure in failures
-            if exception_tree_contains(failure, (KeyboardInterrupt, SystemExit))
+            if exception_tree_contains(
+                failure,
+                (GeneratorExit, KeyboardInterrupt, SystemExit),
+            )
         ]
         if len(process_failures) == 1:
             raise process_failures[0]

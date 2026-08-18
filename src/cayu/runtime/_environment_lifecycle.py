@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from typing import Any
@@ -21,15 +21,21 @@ from cayu._exception_groups import (
     iter_exception_tree,
 )
 from cayu._task_wait import (
+    CapturedAwaitableOutcome,
     await_shielded_task_outcome,
+    capture_awaitable_outcome,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
     copy_label_map,
+    require_clean_nonblank,
 )
-from cayu._workspace_mutation import WorkspaceMutationSettlementError
+from cayu._workspace_mutation import (
+    WorkspaceMutationSettlementError,
+    workspace_mutation_task_settlement_probe,
+)
 from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
 from cayu.environments import (
     BoundWorkspace,
@@ -51,7 +57,10 @@ from cayu.environments import (
     evaluate_execution_admission,
     load_workspace_instructions,
 )
-from cayu.environments.bindings import _EnvironmentLifecycleBindAttempt
+from cayu.environments.bindings import (
+    _EnvironmentLifecycleBindAttempt,
+    _runtime_owned_workspace_observer_name,
+)
 from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
     combine_environment_factory_cleanup_settlement_tasks,
@@ -63,6 +72,7 @@ from cayu.environments.factory import (
 )
 from cayu.runners import Runner
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
+from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._binding_cleanup import (
     append_binding_finalize_cancellation,
@@ -103,6 +113,7 @@ from cayu.runtime._environment_allocation import (
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.sessions import (
     CheckpointTransform,
     Session,
@@ -111,13 +122,33 @@ from cayu.runtime.sessions import (
     _deactivate_session_run_fence,
     session_user_metadata,
 )
+from cayu.runtime.workspace_observation_recovery import (
+    _WORKSPACE_OBSERVATION_OBSERVER_ALIAS_FIELD,
+    _WORKSPACE_OBSERVATION_WORKSPACE_ALIAS_FIELD,
+    _project_workspace_observation_authority,
+    raise_workspace_observation_concurrent_control,
+    restore_workspace_observation_cancellation_requests,
+)
+from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults import SecretRedactor
+from cayu.workspaces import (
+    WorkspaceIdentity,
+    WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimits,
+    WorkspaceRevisionObservationStatus,
+)
+from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservationLimitExceeded,
+    copy_bounded_workspace_revision_observation,
+)
 
 FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES = 4096
 _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_release"
 _MAX_LAZY_ENVIRONMENT_CLEANUP_SETTLEMENTS = 16
 _LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
 DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS = 256
+_FINAL_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS = 30.0
+_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS = 64
 
 _RunFenceReleaseKey = tuple[str, int]
 
@@ -229,6 +260,9 @@ class EnvironmentLifecycle:
         self._deferred_factory_cleanup_profiles: dict[str, ExecutionProfileIdentity] = {}
         self._deferred_run_fence_release_events: dict[_RunFenceReleaseKey, asyncio.Event] = {}
         self._deferred_run_fence_release_tasks: dict[_RunFenceReleaseKey, asyncio.Task[None]] = {}
+        self._final_workspace_observation_operations = BoundedInvocationOperationRegistry(
+            max_operations=_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS
+        )
 
     def _retain_deferred_factory_cleanup_execution_profile(
         self,
@@ -1204,12 +1238,21 @@ class EnvironmentLifecycle:
         environment_name = _environment_name(registered_environment)
         try:
             return await self._event_writer.emit(
-                Event(
-                    type=EventType.ENVIRONMENT_BINDING_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=_binding_base_payload(registered_environment),
+                _event_with_binding_generation_authority(
+                    Event(
+                        type=EventType.ENVIRONMENT_BINDING_STARTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=_binding_base_payload(
+                            registered_environment,
+                            session_id=session.id,
+                            public_authority_alias_codec=(
+                                self._session_store.public_authority_alias_codec
+                            ),
+                            redactor=self._secret_redactor,
+                        ),
+                    )
                 )
             )
         except BaseException:
@@ -1391,7 +1434,12 @@ class EnvironmentLifecycle:
 
         environment_name = _environment_name(registered_environment)
         events: list[Event] = []
-        base_payload = _binding_base_payload(registered_environment)
+        base_payload = _binding_base_payload(
+            registered_environment,
+            session_id=session.id,
+            public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
+            redactor=self._secret_redactor,
+        )
         setup_owner = self._active_environment_setups.get(session.id)
         if setup_owner is None:
             setup_owner = _ActiveEnvironmentSetup(
@@ -1521,12 +1569,14 @@ class EnvironmentLifecycle:
                 try:
                     events.append(
                         await self._event_writer.emit(
-                            Event(
-                                type=EventType.ENVIRONMENT_BINDING_FAILED,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                payload=failure_payload,
+                            _event_with_binding_generation_authority(
+                                Event(
+                                    type=EventType.ENVIRONMENT_BINDING_FAILED,
+                                    session_id=session.id,
+                                    agent_name=registered_agent.spec.name,
+                                    environment_name=environment_name,
+                                    payload=failure_payload,
+                                )
                             )
                         )
                     )
@@ -1568,6 +1618,7 @@ class EnvironmentLifecycle:
             preserve_factory_allocation=(
                 registered_environment.unclaimed_factory_result is not None
             ),
+            binding_generation_id=registered_environment.binding_generation_id,
             workspace_mutation_fence=(registered_environment.workspace_mutation_fence),
         )
         # Binding owns the live handles from this point. Record that transfer
@@ -1577,15 +1628,24 @@ class EnvironmentLifecycle:
         setup_owner.registered_environment = bound_registered_environment
         events.append(
             await self._event_writer.emit(
-                Event(
-                    type=EventType.ENVIRONMENT_BINDING_COMPLETED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        **base_payload,
-                        **_bound_workspace_payload(bound),
-                    },
+                _event_with_binding_generation_authority(
+                    Event(
+                        type=EventType.ENVIRONMENT_BINDING_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            **base_payload,
+                            **_bound_workspace_payload(
+                                bound,
+                                registered_environment=registered_environment,
+                                session_id=session.id,
+                                public_authority_alias_codec=(
+                                    self._session_store.public_authority_alias_codec
+                                ),
+                            ),
+                        },
+                    )
                 )
             )
         )
@@ -1839,8 +1899,18 @@ class EnvironmentLifecycle:
                 "binding finalize metadata",
             )
         base_payload = {
-            **_binding_base_payload(registered_environment),
-            **_bound_workspace_payload(bound_workspace),
+            **_binding_base_payload(
+                registered_environment,
+                session_id=session.id,
+                public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
+                redactor=self._secret_redactor,
+            ),
+            **_bound_workspace_payload(
+                bound_workspace,
+                registered_environment=registered_environment,
+                session_id=session.id,
+                public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
+            ),
             "outcome": outcome,
         }
         if preserve_factory_allocation:
@@ -1851,20 +1921,33 @@ class EnvironmentLifecycle:
         try:
             events.append(
                 await self._event_writer.emit(
-                    Event(
-                        type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
-                        session_id=session.id,
-                        agent_name=event.agent_name,
-                        environment_name=environment_name,
-                        payload=base_payload,
+                    _event_with_binding_generation_authority(
+                        Event(
+                            type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+                            session_id=session.id,
+                            agent_name=event.agent_name,
+                            environment_name=environment_name,
+                            payload=base_payload,
+                        )
                     )
                 )
             )
         except BaseException as exc:
             start_publication_error = exc
 
+        final_revision: WorkspaceRevisionObservation | None = None
         try:
-            final_snapshot = await environment_operation_boundary.await_environment_operation(
+            final_revision = await environment_operation_boundary.await_environment_operation(
+                lambda: _observe_final_workspace_revision(
+                    registered_environment,
+                    binding,
+                    bound_workspace,
+                    operation_registry=self._final_workspace_observation_operations,
+                ),
+                operation_name="Final workspace revision observation",
+                redactor=self._secret_redactor,
+            )
+            final_snapshot_value = await environment_operation_boundary.await_environment_operation(
                 lambda: _finalize_binding_after_mutation_quiescence(
                     registered_environment,
                     binding,
@@ -1880,7 +1963,7 @@ class EnvironmentLifecycle:
                 # exact-owner retry state is now safe to discard even if
                 # validating or publishing the resulting snapshot later fails.
                 setup_owner.cleanup_release_safe = True
-            final_snapshot = copy_workspace_snapshot(final_snapshot)
+            final_snapshot = copy_workspace_snapshot(final_snapshot_value)
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
             if start_publication_error is not None:
                 exc = BaseExceptionGroup(
@@ -1894,16 +1977,31 @@ class EnvironmentLifecycle:
                 outcome=outcome,
                 redactor=self._secret_redactor,
             )
+            final_revision_payload = (
+                None
+                if final_revision is None
+                else _final_workspace_revision_payload(
+                    final_revision,
+                    registered_environment=registered_environment,
+                    session_id=session.id,
+                    redactor=self._secret_redactor,
+                    public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
+                )
+            )
             error_payload = {
                 **base_payload,
                 **finalize_error_payload,
             }
-            pending_failure_event = Event(
-                type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
-                session_id=session.id,
-                agent_name=event.agent_name,
-                environment_name=environment_name,
-                payload=error_payload,
+            if final_revision_payload is not None:
+                error_payload["final_revision"] = final_revision_payload
+            pending_failure_event = _event_with_binding_generation_authority(
+                Event(
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+                    session_id=session.id,
+                    agent_name=event.agent_name,
+                    environment_name=environment_name,
+                    payload=error_payload,
+                )
             )
             if setup_owner is not None:
                 # Retain the stable event identity until persistence or
@@ -1912,10 +2010,12 @@ class EnvironmentLifecycle:
                 # failed finalization attempt.
                 setup_owner.pending_finalize_failure_event = pending_failure_event
             try:
-                failure_event, persist_cancellation = await _persist_binding_finalize_failure_event(
+                persistence = await _persist_binding_finalize_failure_event(
                     self._event_writer,
                     pending_failure_event,
                 )
+                failure_event = persistence.event
+                persist_cancellation = persistence.cancellation
             except BaseException as diagnostic_error:
                 attach_binding_finalize_safe_payload(exc, finalize_error_payload)
                 diagnostic = exception_diagnostic(
@@ -1951,6 +2051,9 @@ class EnvironmentLifecycle:
                 setup_owner.cleanup_release_safe = True
                 setup_owner.pending_finalize_failure_event = None
             if persist_cancellation is not None:
+                restore_workspace_observation_cancellation_requests(
+                    persistence.cancellation_requests_consumed
+                )
                 raise append_binding_finalize_cancellation(
                     exc, persist_cancellation
                 ) from persist_cancellation
@@ -1994,6 +2097,8 @@ class EnvironmentLifecycle:
                 raise
             terminal_payload = copy_json_value(event.payload, "payload")
             terminal_payload["binding_finalize_error"] = finalize_error_payload
+            if final_revision_payload is not None:
+                terminal_payload["final_revision"] = final_revision_payload
             return EnvironmentBindingFinalizeResult(
                 event=copy_event(event).model_copy(
                     update={"payload": terminal_payload},
@@ -2006,15 +2111,29 @@ class EnvironmentLifecycle:
         try:
             events.append(
                 await self._event_writer.emit(
-                    Event(
-                        type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
-                        session_id=session.id,
-                        agent_name=event.agent_name,
-                        environment_name=environment_name,
-                        payload={
-                            **base_payload,
-                            "final_snapshot": _workspace_snapshot_payload(final_snapshot),
-                        },
+                    _event_with_binding_generation_authority(
+                        Event(
+                            type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                            session_id=session.id,
+                            agent_name=event.agent_name,
+                            environment_name=environment_name,
+                            payload={
+                                **base_payload,
+                                "final_snapshot": _final_workspace_snapshot_payload(
+                                    final_snapshot,
+                                    registered_environment=registered_environment,
+                                ),
+                                "final_revision": _final_workspace_revision_payload(
+                                    final_revision,
+                                    registered_environment=registered_environment,
+                                    session_id=session.id,
+                                    redactor=self._secret_redactor,
+                                    public_authority_alias_codec=(
+                                        self._session_store.public_authority_alias_codec
+                                    ),
+                                ),
+                            },
+                        )
                     )
                 )
             )
@@ -2036,6 +2155,13 @@ class EnvironmentLifecycle:
                     outcome=outcome,
                     redactor=self._secret_redactor,
                 )
+            )
+            terminal_payload["final_revision"] = _final_workspace_revision_payload(
+                final_revision,
+                registered_environment=registered_environment,
+                session_id=session.id,
+                redactor=self._secret_redactor,
+                public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
             )
             event = _copy_event_with_payload(event, terminal_payload)
         return EnvironmentBindingFinalizeResult(event=event, events=events)
@@ -2174,19 +2300,23 @@ class EnvironmentLifecycle:
                     ) from retry_error
             if not setup_owner.cleanup_release_safe and pending_failure_event is not None:
                 try:
-                    (
-                        failure_event,
-                        persist_cancellation,
-                    ) = await _persist_binding_finalize_failure_event(
+                    persistence = await _persist_binding_finalize_failure_event(
                         self._event_writer,
                         pending_failure_event,
                     )
+                    failure_event = persistence.event
+                    persist_cancellation = persistence.cancellation
                     setup_owner.cleanup_release_safe = True
                     setup_owner.pending_finalize_failure_event = None
                     fanout_outcome = await await_shielded_task_outcome(
                         asyncio.create_task(self._event_writer.fan_out_persisted([failure_event])),
                         cancellation=persist_cancellation,
                     )
+                    if fanout_outcome.cancellation is not None:
+                        restore_workspace_observation_cancellation_requests(
+                            persistence.cancellation_requests_consumed
+                            + fanout_outcome.cancellation_requests_consumed
+                        )
                     settlement_error = _environment_cleanup_settlement_error(
                         fanout_error=fanout_outcome.error,
                         cancellation=fanout_outcome.cancellation,
@@ -2704,14 +2834,18 @@ async def _reconcile_binding_finalize_failure_event(
     *,
     persistence_error: BaseException,
     cancellation: asyncio.CancelledError | None,
-) -> tuple[bool, asyncio.CancelledError | None]:
+) -> tuple[bool, asyncio.CancelledError | None, int]:
     outcome = await await_shielded_task_outcome(
         asyncio.create_task(writer.is_persisted(event)),
         cancellation=cancellation,
     )
     cancellation = outcome.cancellation
     if outcome.error is None:
-        return bool(outcome.result), cancellation
+        return (
+            bool(outcome.result),
+            cancellation,
+            outcome.cancellation_requests_consumed,
+        )
     fatal_signal = binding_finalize_fatal_signal(outcome.error)
     if fatal_signal is not None:
         raise fatal_signal
@@ -2727,26 +2861,56 @@ async def _reconcile_binding_finalize_failure_event(
     raise persistence_error from outcome.error
 
 
+@dataclass(frozen=True, slots=True)
+class _BindingFinalizeFailurePersistence:
+    """Durable failure event plus cancellation consumed while proving it."""
+
+    event: Event
+    cancellation: asyncio.CancelledError | None
+    cancellation_requests_consumed: int
+
+    def __iter__(self) -> Iterator[Event | asyncio.CancelledError | None]:
+        # Preserve the established private two-value unpacking contract while
+        # runtime callers consume the exact cancellation count by name.
+        yield self.event
+        yield self.cancellation
+
+
 async def _persist_binding_finalize_failure_event(
     writer: RuntimeEventWriter,
     event: Event,
-) -> tuple[Event, asyncio.CancelledError | None]:
+) -> _BindingFinalizeFailurePersistence:
     outcome = await await_shielded_task_outcome(asyncio.create_task(writer.persist(event)))
     persistence_error = outcome.error
     cancellation = outcome.cancellation
     if persistence_error is None:
-        return event, cancellation
+        return _BindingFinalizeFailurePersistence(
+            event=event,
+            cancellation=cancellation,
+            cancellation_requests_consumed=outcome.cancellation_requests_consumed,
+        )
     fatal_signal = binding_finalize_fatal_signal(persistence_error)
     if fatal_signal is not None:
         raise fatal_signal
-    persisted, cancellation = await _reconcile_binding_finalize_failure_event(
+    (
+        persisted,
+        cancellation,
+        reconciliation_cancellation_requests_consumed,
+    ) = await _reconcile_binding_finalize_failure_event(
         writer,
         event,
         persistence_error=persistence_error,
         cancellation=cancellation,
     )
     if persisted:
-        return event, cancellation
+        return _BindingFinalizeFailurePersistence(
+            event=event,
+            cancellation=cancellation,
+            cancellation_requests_consumed=(
+                outcome.cancellation_requests_consumed
+                + reconciliation_cancellation_requests_consumed
+            ),
+        )
     if cancellation is not None:
         raise BaseExceptionGroup(
             "Binding finalization failure publication failed after caller cancellation.",
@@ -2786,6 +2950,227 @@ async def _finalize_binding_after_mutation_quiescence(
         outcome=outcome,
         metadata=metadata,
     )
+
+
+async def _observe_final_workspace_revision(
+    registered_environment: runtime_records.RegisteredEnvironment,
+    binding: WorkspaceBinding,
+    bound_workspace: BoundWorkspace,
+    *,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> WorkspaceRevisionObservation:
+    # A terminal revision is authoritative only after every earlier workspace
+    # mutation has positively settled.  Check before dispatching the observer;
+    # the binding-finalization boundary repeats this guard before its own
+    # potentially mutating synchronization step.
+    registered_environment.workspace_mutation_fence.require_available_nowait()
+    workspace = bound_workspace.workspace or bound_workspace.source_workspace
+    workspace_id = (
+        "workspace-unavailable"
+        if workspace is None
+        else require_clean_nonblank(workspace.id, "workspace.id")
+    )
+    expected_identity = WorkspaceIdentity(
+        workspace_id=workspace_id,
+        observer=type(binding).__name__,
+    )
+
+    def failed(detail_code: str) -> WorkspaceRevisionObservation:
+        return WorkspaceRevisionObservation(
+            identity=expected_identity,
+            status=WorkspaceRevisionObservationStatus.FAILED,
+            detail_code=detail_code,
+        )
+
+    if not operation_registry.reserve():
+        return failed("final_revision_observer_capacity_exhausted")
+    try:
+        observation_task = asyncio.create_task(
+            capture_awaitable_outcome(lambda: binding.observe_revision(bound_workspace))
+        )
+    except BaseException:
+        operation_registry.release_reservation()
+        raise
+    operation_registry.track(observation_task)
+    try:
+        observation_outcome = await await_shielded_task_outcome(
+            observation_task,
+            timeout_s=_FINAL_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS,
+            timeout_after_cancellation_s=0.0,
+        )
+    except BaseException:
+        if not observation_task.done():
+            registered_environment.workspace_mutation_fence.fail_closed(
+                workspace_mutation_task_settlement_probe(observation_task)
+            )
+        raise
+    if observation_task.done():
+        operation_registry.release(observation_task)
+    observed: object = None
+    observer_error = observation_outcome.error
+    if observer_error is None:
+        captured = observation_outcome.result
+        if type(captured) is not CapturedAwaitableOutcome:
+            observer_error = RuntimeError(
+                "Final workspace revision observer returned an invalid owned outcome."
+            )
+        else:
+            observed = captured.result
+            observer_error = captured.error
+    observer_settlement_unproven = observer_error is not None and (
+        exception_tree_contains(
+            observer_error,
+            asyncio.CancelledError,
+        )
+    )
+    if observer_settlement_unproven:
+        # A terminal observer coroutine may still have cancellation-opaque
+        # work in a thread, executor, subprocess, SDK, or remote service. A
+        # cancelled task is therefore retained as fail-closed evidence even
+        # when caller cancellation arrived in the same scheduling turn.
+        registered_environment.workspace_mutation_fence.fail_closed(
+            workspace_mutation_task_settlement_probe(observation_task)
+        )
+    if observation_outcome.cancellation is not None and not observation_task.done():
+        registered_environment.workspace_mutation_fence.fail_closed(
+            workspace_mutation_task_settlement_probe(observation_task)
+        )
+    if observation_outcome.cancellation is not None:
+        restore_workspace_observation_cancellation_requests(
+            observation_outcome.cancellation_requests_consumed
+        )
+    raise_workspace_observation_concurrent_control(
+        cancellation=observation_outcome.cancellation,
+        error=observer_error,
+        operation="Final workspace revision observation",
+        cancellation_requests_pending=(observation_outcome.cancellation_requests_consumed),
+    )
+    if observation_outcome.timed_out:
+        if observation_task.done():
+            operation_registry.release(observation_task)
+            return failed("final_revision_observer_timeout")
+        # Do not cancel an opaque observer: cancellation of its coroutine does
+        # not stop a thread, executor job, subprocess, or remote request. Keep
+        # the exact task behind the environment fence until it really settles.
+        registered_environment.workspace_mutation_fence.fail_closed(
+            workspace_mutation_task_settlement_probe(observation_task)
+        )
+        raise WorkspaceMutationSettlementError(
+            "Final workspace revision observation did not settle after its deadline."
+        ) from None
+    if observer_error is not None:
+        if exception_tree_contains(
+            observer_error,
+            (GeneratorExit, KeyboardInterrupt, SystemExit),
+        ):
+            raise observer_error
+        if observer_settlement_unproven:
+            raise WorkspaceMutationSettlementError(
+                "Final workspace revision observation did not prove mutation quiescence."
+            ) from None
+        return failed("final_revision_observer_failed")
+    try:
+        return copy_bounded_workspace_revision_observation(
+            observed,
+            expected_identity=expected_identity,
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+    except WorkspaceRevisionObservationLimitExceeded:
+        return WorkspaceRevisionObservation(
+            identity=expected_identity,
+            status=WorkspaceRevisionObservationStatus.TRUNCATED,
+            detail_code="final_revision_observer_limit_exceeded",
+        )
+    except Exception:
+        return failed("final_revision_observer_failed")
+
+
+def _final_workspace_revision_payload(
+    observation: WorkspaceRevisionObservation,
+    *,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    session_id: str,
+    redactor: SecretRedactor,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+) -> dict[str, Any]:
+    if (
+        invocation_secrets.registered_environment_secret_resolution_scope(registered_environment)
+        != "static"
+    ):
+        # Invocation-resolved secret registries deliberately remain in-process
+        # and invocation-scoped. Terminal finalization can run after that scope
+        # has been discarded or in a fresh recovery process, so arbitrary
+        # observer text cannot be proven safe for a dynamic environment. Keep a
+        # fixed, content-free view instead of allowing branch/revision fields to
+        # bypass the tool-round publication quarantine.
+        binding = (
+            None if registered_environment is None else registered_environment.environment.binding
+        )
+        runtime_owned_observer = (
+            None if binding is None else _runtime_owned_workspace_observer_name(binding)
+        )
+        try:
+            projected_authority = _project_workspace_observation_authority(
+                session_id=session_id,
+                configured_workspace_id=observation.identity.workspace_id,
+                configured_observer=observation.identity.observer,
+                configured_artifact_store_id=None,
+                observer_is_runtime_owned=(runtime_owned_observer == observation.identity.observer),
+                secret_resolution_scope="dynamic",
+                redactor=redactor,
+                public_authority_alias_codec=public_authority_alias_codec,
+            )
+            workspace_id = projected_authority.workspace_id
+            observer = projected_authority.observer
+        except (RuntimeError, ValueError):
+            # A store without a durable alias keyring cannot authenticate raw
+            # dynamic identities after the invocation secret scope is gone.
+            # Finalization remains available, but publishes fixed evidence.
+            workspace_id = "workspace-authority-unavailable"
+            observer = (
+                observation.identity.observer
+                if runtime_owned_observer == observation.identity.observer
+                else "workspace-observer-unavailable"
+            )
+        return {
+            "workspace_id": workspace_id,
+            "observer": observer,
+            "status": WorkspaceRevisionObservationStatus.TRUNCATED.value,
+            "revision": None,
+            "head_revision": None,
+            "branch": None,
+            "path_scope": observation.path_scope,
+            "total_paths": observation.total_paths,
+            "detail_code": "final_revision_secret_scope_unavailable",
+        }
+    return {
+        "workspace_id": observation.identity.workspace_id,
+        "observer": observation.identity.observer,
+        "status": observation.status.value,
+        "revision": observation.revision,
+        "head_revision": observation.head_revision,
+        "branch": observation.branch,
+        "path_scope": observation.path_scope,
+        "total_paths": observation.total_paths,
+        "detail_code": observation.detail_code,
+    }
+
+
+def _final_workspace_snapshot_payload(
+    snapshot: WorkspaceSnapshot | None,
+    *,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> dict[str, Any] | None:
+    if (
+        invocation_secrets.registered_environment_secret_resolution_scope(registered_environment)
+        != "static"
+    ):
+        # Binding snapshots may repeat observer-derived branch, revision, path,
+        # or extension metadata. They share the terminal workspace-evidence
+        # boundary and therefore require the same positive static-scope proof as
+        # the final revision projection.
+        return None
+    return _workspace_snapshot_payload(snapshot)
 
 
 class _BindingAbandonBlockedByMutationFence:
@@ -2875,26 +3260,76 @@ def _environment_factory_base_payload(
 
 def _binding_base_payload(
     registered_environment: runtime_records.RegisteredEnvironment,
+    *,
+    session_id: str,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+    redactor: SecretRedactor,
 ) -> dict[str, Any]:
     if registered_environment.binding_payload is not None:
-        return copy_json_value(registered_environment.binding_payload, "binding_payload")
+        payload = copy_json_value(registered_environment.binding_payload, "binding_payload")
+        payload["binding_generation_id"] = registered_environment.binding_generation_id
+        return payload
     binding = registered_environment.environment.binding
     return {
-        "binding_type": type(binding).__name__ if binding is not None else None,
-        "configured_workspace_id": _workspace_object_id(
-            registered_environment.environment.workspace
+        "binding_type": _durable_environment_binding_type(
+            binding,
+            registered_environment=registered_environment,
+            session_id=session_id,
+            public_authority_alias_codec=public_authority_alias_codec,
+            redactor=redactor,
+        ),
+        "binding_generation_id": registered_environment.binding_generation_id,
+        "configured_workspace_id": _durable_environment_workspace_id(
+            _workspace_object_id(registered_environment.environment.workspace),
+            registered_environment=registered_environment,
+            session_id=session_id,
+            public_authority_alias_codec=public_authority_alias_codec,
         ),
         "has_configured_runner": registered_environment.environment.runner is not None,
     }
 
 
-def _bound_workspace_payload(bound: BoundWorkspace) -> dict[str, Any]:
+def _event_with_binding_generation_authority(event: Event) -> Event:
+    """Mark one generated binding owner as structural runtime authority."""
+
+    if "binding_generation_id" not in event.payload:
+        raise ValueError("Binding lifecycle event is missing its generation authority.")
+    return event_with_runtime_payload_authority(event, "binding_generation_id")
+
+
+def _bound_workspace_payload(
+    bound: BoundWorkspace,
+    *,
+    registered_environment: runtime_records.RegisteredEnvironment,
+    session_id: str,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+) -> dict[str, Any]:
+    snapshot = bound.snapshot
+    bound_snapshot = _workspace_snapshot_payload(snapshot)
+    if bound_snapshot is not None:
+        assert snapshot is not None
+        bound_snapshot["workspace_id"] = _durable_environment_workspace_id(
+            snapshot.workspace_id,
+            registered_environment=registered_environment,
+            session_id=session_id,
+            public_authority_alias_codec=public_authority_alias_codec,
+        )
     return {
-        "source_workspace_id": _workspace_object_id(bound.source_workspace),
-        "bound_workspace_id": _workspace_object_id(bound.workspace),
+        "source_workspace_id": _durable_environment_workspace_id(
+            _workspace_object_id(bound.source_workspace),
+            registered_environment=registered_environment,
+            session_id=session_id,
+            public_authority_alias_codec=public_authority_alias_codec,
+        ),
+        "bound_workspace_id": _durable_environment_workspace_id(
+            _workspace_object_id(bound.workspace),
+            registered_environment=registered_environment,
+            session_id=session_id,
+            public_authority_alias_codec=public_authority_alias_codec,
+        ),
         "bound_path": bound.path,
         "bound_metadata": copy_json_value(bound.metadata, "bound_metadata"),
-        "bound_snapshot": _workspace_snapshot_payload(bound.snapshot),
+        "bound_snapshot": bound_snapshot,
         "has_bound_runner": bound.runner is not None,
     }
 
@@ -2916,6 +3351,58 @@ def _workspace_object_id(workspace: Any) -> str | None:
         return None
     workspace_id = getattr(workspace, "id", None)
     return workspace_id if isinstance(workspace_id, str) else None
+
+
+def _durable_environment_workspace_id(
+    workspace_id: str | None,
+    *,
+    registered_environment: runtime_records.RegisteredEnvironment,
+    session_id: str,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+) -> str | None:
+    if workspace_id is None:
+        return None
+    workspace_id = require_clean_nonblank(workspace_id, "workspace_id")
+    if (
+        invocation_secrets.registered_environment_secret_resolution_scope(registered_environment)
+        == "static"
+    ):
+        return workspace_id
+    if not isinstance(public_authority_alias_codec, PublicAuthorityAliasCodec):
+        return "workspace-authority-unavailable"
+    return public_authority_alias_codec.encode(
+        workspace_id,
+        field_name=_WORKSPACE_OBSERVATION_WORKSPACE_ALIAS_FIELD,
+        session_id=session_id,
+    )
+
+
+def _durable_environment_binding_type(
+    binding: WorkspaceBinding | None,
+    *,
+    registered_environment: runtime_records.RegisteredEnvironment,
+    session_id: str,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+    redactor: SecretRedactor,
+) -> str | None:
+    if binding is None:
+        return None
+    binding_type = type(binding).__name__
+    if _runtime_owned_workspace_observer_name(binding) == binding_type:
+        return binding_type
+    dynamic = (
+        invocation_secrets.registered_environment_secret_resolution_scope(registered_environment)
+        != "static"
+    )
+    if not dynamic and redactor.redact_text(binding_type) == binding_type:
+        return binding_type
+    if not isinstance(public_authority_alias_codec, PublicAuthorityAliasCodec):
+        return "workspace-observer-unavailable"
+    return public_authority_alias_codec.encode(
+        binding_type,
+        field_name=_WORKSPACE_OBSERVATION_OBSERVER_ALIAS_FIELD,
+        session_id=session_id,
+    )
 
 
 def _binding_outcome_for_terminal_event(event_type: EventType | str) -> str:

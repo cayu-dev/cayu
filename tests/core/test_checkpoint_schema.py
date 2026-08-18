@@ -36,6 +36,14 @@ from cayu.runtime.checkpoints import (
 )
 from cayu.runtime.context import _compaction_checkpoint
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
+from cayu.runtime.workspace_observation_recovery import (
+    WorkspaceObservationArtifact,
+    WorkspaceObservationArtifactState,
+    WorkspaceObservationEvidenceState,
+    WorkspaceObservationLifecycle,
+    WorkspaceObservationPhase,
+    workspace_observations_from_checkpoint,
+)
 
 _FROZEN_VERSIONLESS_ROOT_CHECKPOINTS = {
     "approval": {
@@ -269,6 +277,251 @@ def test_v2_root_checkpoint_discards_reserved_invocation_authority_collision() -
     }
     assert ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY in source
     assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+
+
+def test_v3_root_checkpoint_discards_reserved_workspace_observation_collision() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 3,
+        "workspace_observations": {
+            "caller-controlled-window": {
+                "record_type": "cayu.workspace-observation",
+                "schema_version": 1,
+            }
+        },
+        "future_additive_field": {"kept": True},
+    }
+
+    decoded = decode_runtime_checkpoint(source, session_id="sess-v3-workspace-collision")
+
+    assert decoded == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "future_additive_field": {"kept": True},
+    }
+    assert "workspace_observations" in source
+    assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == 3
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("schema_version", True),
+        ("schema_version", 1.0),
+        ("source_run_epoch", True),
+        ("source_run_epoch", 1.0),
+        ("model_step", True),
+        ("model_step", 1.0),
+    ],
+)
+def test_workspace_observation_authority_rejects_non_exact_integer_fields(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    record = {
+        "record_type": "cayu.workspace-observation",
+        "schema_version": 1,
+        "session_id": "sess-workspace-exact-integers",
+        "interaction_id": None,
+        "window_id": "wmut-workspace-exact-integers",
+        "source_run_epoch": 1,
+        "binding_generation_id": "wbind-workspace-exact-integers",
+        "workspace_id": "workspace-exact-integers",
+        "observer": "ExactIntegerBinding",
+        "observer_authority": "configured",
+        "artifact_store_id": None,
+        "agent_name": "assistant",
+        "environment_name": "local",
+        "tool_name": "mutate",
+        "tool_call_id": "call-workspace-exact-integers",
+        "model_step_id": "mstep-workspace-exact-integers",
+        "model_attempt_id": "matt-workspace-exact-integers",
+        "tool_round_id": "tround-workspace-exact-integers",
+        "model_step": 1,
+        "phase": "intent",
+        "before_state": "pending",
+        "before_observation_id": None,
+        "tool_outcome_event_id": None,
+        "tool_outcome_event_digest": None,
+        "after_state": "pending",
+        "after_observation_id": None,
+        "delta_state": "pending",
+        "mutation_event_id": None,
+        "mutation_event_digest": None,
+        "artifacts": [],
+    }
+    record[field_name] = invalid_value
+
+    with pytest.raises(ValueError):
+        workspace_observations_from_checkpoint(
+            {"workspace_observations": {record["window_id"]: record}}
+        )
+
+
+@pytest.mark.parametrize("invalid_authority", [None, True, "future"])
+def test_workspace_observation_checkpoint_rejects_invalid_observer_authority(
+    invalid_authority: object,
+) -> None:
+    lifecycle = WorkspaceObservationLifecycle(
+        session_id="sess-invalid-observer-authority",
+        window_id="wmut-invalid-observer-authority",
+        source_run_epoch=1,
+        binding_generation_id="wbind-invalid-observer-authority",
+        workspace_id="workspace-invalid-observer-authority",
+        observer="ConfiguredWorkspaceBinding",
+        observer_authority="configured",
+        agent_name="assistant",
+        tool_name="mutate",
+        tool_call_id="call-invalid-observer-authority",
+        model_step_id="mstep-invalid-observer-authority",
+        model_attempt_id="matt-invalid-observer-authority",
+        tool_round_id="tround-invalid-observer-authority",
+    )
+    record: dict[str, Any] = lifecycle.model_dump(mode="json")
+    record["observer_authority"] = invalid_authority
+
+    with pytest.raises(ValueError):
+        workspace_observations_from_checkpoint(
+            {"workspace_observations": {lifecycle.window_id: record}}
+        )
+
+
+def test_workspace_observation_checkpoint_requires_observer_authority() -> None:
+    lifecycle = WorkspaceObservationLifecycle(
+        session_id="sess-missing-observer-authority",
+        window_id="wmut-missing-observer-authority",
+        source_run_epoch=1,
+        binding_generation_id="wbind-missing-observer-authority",
+        workspace_id="workspace-missing-observer-authority",
+        observer="ConfiguredWorkspaceBinding",
+        observer_authority="configured",
+        agent_name="assistant",
+        tool_name="mutate",
+        tool_call_id="call-missing-observer-authority",
+        model_step_id="mstep-missing-observer-authority",
+        model_attempt_id="matt-missing-observer-authority",
+        tool_round_id="tround-missing-observer-authority",
+    )
+    record = lifecycle.model_dump(mode="json")
+    del record["observer_authority"]
+
+    with pytest.raises(ValueError):
+        workspace_observations_from_checkpoint(
+            {"workspace_observations": {lifecycle.window_id: record}}
+        )
+
+
+@pytest.mark.parametrize("invalid_value", [True, 1.0])
+def test_workspace_observation_artifact_size_requires_exact_integer(
+    invalid_value: object,
+) -> None:
+    with pytest.raises(ValueError):
+        WorkspaceObservationArtifact(
+            evidence_kind="revision-before",
+            artifact_id="artifact-workspace-exact-integers",
+            sha256="a" * 64,
+            size_bytes=invalid_value,
+            state="intent",
+        )
+
+
+def test_workspace_observation_checkpoint_revalidates_forged_nested_artifact() -> None:
+    forged = WorkspaceObservationArtifact.model_construct(
+        evidence_kind="revision-before",
+        artifact_id="artifact-forged-workspace-observation",
+        sha256="a" * 64,
+        size_bytes=True,
+        state="intent",
+    )
+    record = WorkspaceObservationLifecycle(
+        session_id="sess-forged-workspace-artifact",
+        window_id="wmut-forged-workspace-artifact",
+        source_run_epoch=1,
+        binding_generation_id="wbind-forged-workspace-artifact",
+        workspace_id="workspace-forged-workspace-artifact",
+        observer="ForgedArtifactBinding",
+        observer_authority="configured",
+        artifact_store_id="artifact-forged-workspace-artifact",
+        agent_name="assistant",
+        environment_name="local",
+        tool_name="mutate",
+        tool_call_id="call-forged-workspace-artifact",
+        model_step_id="mstep-forged-workspace-artifact",
+        model_attempt_id="matt-forged-workspace-artifact",
+        tool_round_id="tround-forged-workspace-artifact",
+        model_step=1,
+        phase=WorkspaceObservationPhase.TOOL_OUTCOME_STAGED,
+        before_state=WorkspaceObservationEvidenceState.CAPTURED_PRIVATE,
+        tool_outcome_event_id="evt-forged-workspace-artifact",
+        tool_outcome_event_digest="b" * 64,
+    ).model_dump(mode="json")
+    record["artifacts"] = [forged]
+
+    with pytest.raises(ValueError):
+        workspace_observations_from_checkpoint(
+            {"workspace_observations": {record["window_id"]: record}}
+        )
+
+
+@pytest.mark.parametrize("terminal_state", ["orphaned", "missing"])
+def test_active_workspace_observation_rejects_terminal_only_artifact_state(
+    terminal_state: str,
+) -> None:
+    lifecycle = WorkspaceObservationLifecycle(
+        session_id="sess-active-artifact-state",
+        window_id="wmut-active-artifact-state",
+        source_run_epoch=1,
+        binding_generation_id="wbind-active-artifact-state",
+        workspace_id="workspace-active-artifact-state",
+        observer="ActiveArtifactStateBinding",
+        observer_authority="configured",
+        artifact_store_id="artifact-active-artifact-state",
+        agent_name="assistant",
+        environment_name="local",
+        tool_name="mutate",
+        tool_call_id="call-active-artifact-state",
+        model_step_id="mstep-active-artifact-state",
+        model_attempt_id="matt-active-artifact-state",
+        tool_round_id="tround-active-artifact-state",
+        model_step=1,
+        phase=WorkspaceObservationPhase.TOOL_OUTCOME_STAGED,
+        before_state=WorkspaceObservationEvidenceState.CAPTURED_PRIVATE,
+        tool_outcome_event_id="evt-active-artifact-state",
+        tool_outcome_event_digest="a" * 64,
+        artifacts=(
+            WorkspaceObservationArtifact(
+                evidence_kind="revision-before",
+                artifact_id="artifact-active-artifact-state",
+                sha256="b" * 64,
+                size_bytes=1,
+                state=WorkspaceObservationArtifactState(terminal_state),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="terminal-only artifact state"):
+        workspace_observations_from_checkpoint(
+            {"workspace_observations": {lifecycle.window_id: lifecycle.model_dump(mode="json")}}
+        )
+
+
+@pytest.mark.parametrize("writer_version", [1, 2, 3])
+def test_older_writer_view_rejects_active_workspace_observation_authority(
+    writer_version: int,
+) -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "workspace_observations": {
+            "wmut-writer-view": {
+                "record_type": "cayu.workspace-observation",
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        runtime_checkpoint_writer_view(
+            source,
+            writer_version=writer_version,
+            session_id="sess-active-workspace-observation-writer-view",
+        )
 
 
 @pytest.mark.parametrize("writer_version", [1, 2])

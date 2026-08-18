@@ -127,6 +127,19 @@ class WorkspacePathRevision(BaseModel):
         return text
 
 
+_WORKSPACE_PATH_REVISION_FIELDS = frozenset(WorkspacePathRevision.model_fields)
+_WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS = frozenset(
+    {
+        "content_sha256",
+        "index_mode",
+        "index_object_id",
+        "kind",
+        "staged",
+        "working_tree",
+    }
+)
+
+
 class WorkspaceRevisionObservation(BaseModel):
     """Bounded evidence for one observed workspace state.
 
@@ -169,6 +182,154 @@ class WorkspaceRevisionObservation(BaseModel):
         return self
 
 
+class WorkspaceRevisionObservationLimitExceeded(ValueError):
+    """A detached observation exceeds the runtime's bounded evidence contract."""
+
+
+def copy_bounded_workspace_revision_observation(
+    observed: object,
+    *,
+    expected_identity: WorkspaceIdentity,
+    limits: WorkspaceRevisionObservationLimits,
+    max_total_paths: int = (1 << 63) - 1,
+) -> WorkspaceRevisionObservation:
+    """Detach extension-owned revision evidence without invoking its serializers."""
+
+    if type(observed) is not WorkspaceRevisionObservation:
+        raise TypeError("Workspace observer must return WorkspaceRevisionObservation.")
+    if type(expected_identity) is not WorkspaceIdentity:
+        raise TypeError("expected_identity must be a WorkspaceIdentity.")
+    if type(limits) is not WorkspaceRevisionObservationLimits:
+        raise TypeError("limits must be WorkspaceRevisionObservationLimits.")
+    if type(max_total_paths) is not int or max_total_paths < 0:
+        raise ValueError("max_total_paths must be a non-negative integer.")
+    if type(observed.identity) is not WorkspaceIdentity:
+        raise TypeError("Workspace observer returned an invalid identity.")
+    if (
+        type(observed.identity.workspace_id) is not str
+        or type(observed.identity.observer) is not str
+        or observed.identity.workspace_id != expected_identity.workspace_id
+        or observed.identity.observer != expected_identity.observer
+    ):
+        raise ValueError("Workspace observer returned an unexpected identity.")
+    if type(observed.status) is not WorkspaceRevisionObservationStatus:
+        raise TypeError("Workspace observation status is invalid.")
+    if type(observed.path_scope) is not str or observed.path_scope not in {
+        "complete",
+        "changed",
+    }:
+        raise TypeError("Workspace observation path scope is invalid.")
+    if type(observed.paths) is not tuple:
+        raise TypeError("Workspace observation paths must be a tuple.")
+    if len(observed.paths) > limits.max_paths:
+        raise WorkspaceRevisionObservationLimitExceeded
+    if (
+        type(observed.total_paths) is not int
+        or observed.total_paths < 0
+        or observed.total_paths > max_total_paths
+    ):
+        raise WorkspaceRevisionObservationLimitExceeded
+
+    serialized_size = 256
+    for value in (
+        observed.identity.workspace_id,
+        observed.identity.observer,
+        observed.revision,
+        observed.head_revision,
+        observed.branch,
+        observed.detail_code,
+    ):
+        serialized_size += _bounded_observation_text_size(
+            value,
+            max_bytes=limits.max_path_bytes,
+        )
+    detached_paths: list[WorkspacePathRevision] = []
+    detached_path_names: set[str] = set()
+    for path in observed.paths:
+        if type(path) is not WorkspacePathRevision:
+            raise TypeError("Workspace observation contains an invalid path entry.")
+        if type(path.path) is not str or path.path in detached_path_names:
+            raise ValueError("Workspace observation paths must be unique strings.")
+        detached_path_names.add(path.path)
+        for value in (path.untracked, path.ignored):
+            if type(value) is not bool:
+                raise TypeError("Workspace observation path flags must be booleans.")
+        for value in (path.present, path.tracked):
+            if value is not None and type(value) is not bool:
+                raise TypeError("Workspace observation path flags must be booleans or None.")
+        if type(path.kind) is not str or path.kind not in {
+            "file",
+            "symlink",
+            "submodule",
+            "unknown",
+        }:
+            raise TypeError("Workspace observation path kind is invalid.")
+        for value in (
+            path.path,
+            path.staged,
+            path.working_tree,
+            path.content_sha256,
+            path.index_object_id,
+            path.index_mode,
+            path.renamed_from,
+        ):
+            serialized_size += _bounded_observation_text_size(
+                value,
+                max_bytes=limits.max_path_bytes,
+            )
+        serialized_size += 192
+        if serialized_size > limits.max_manifest_bytes:
+            raise WorkspaceRevisionObservationLimitExceeded
+        detached_paths.append(
+            WorkspacePathRevision(
+                path=path.path,
+                staged=path.staged,
+                working_tree=path.working_tree,
+                untracked=path.untracked,
+                ignored=path.ignored,
+                present=path.present,
+                tracked=path.tracked,
+                kind=path.kind,
+                content_sha256=path.content_sha256,
+                index_object_id=path.index_object_id,
+                index_mode=path.index_mode,
+                renamed_from=path.renamed_from,
+            )
+        )
+
+    detached = WorkspaceRevisionObservation(
+        identity=WorkspaceIdentity(
+            workspace_id=observed.identity.workspace_id,
+            observer=observed.identity.observer,
+        ),
+        status=observed.status,
+        revision=observed.revision,
+        head_revision=observed.head_revision,
+        branch=observed.branch,
+        path_scope=observed.path_scope,
+        paths=tuple(detached_paths),
+        total_paths=observed.total_paths,
+        detail_code=observed.detail_code,
+    )
+    encoded = detached.model_dump_json().encode("utf-8")
+    if len(encoded) > limits.max_manifest_bytes:
+        raise WorkspaceRevisionObservationLimitExceeded
+    return WorkspaceRevisionObservation.model_validate_json(encoded)
+
+
+def _bounded_observation_text_size(value: str | None, *, max_bytes: int) -> int:
+    if value is None:
+        return 0
+    if type(value) is not str:
+        raise TypeError("Workspace observation text fields must be strings.")
+    if len(value) > max_bytes:
+        raise WorkspaceRevisionObservationLimitExceeded
+    encoded = value.encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise WorkspaceRevisionObservationLimitExceeded
+    return len(encoded)
+
+
 class WorkspacePathRevisionDelta(BaseModel):
     """One content-free path change between two observations."""
 
@@ -187,6 +348,10 @@ class WorkspacePathRevisionDelta(BaseModel):
         if not _safe_relative_path(path):
             raise ValueError("Workspace revision delta path must be traversal-free.")
         return path
+
+
+_WORKSPACE_PATH_REVISION_DELTA_FIELDS = frozenset(WorkspacePathRevisionDelta.model_fields)
+_WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS = frozenset({"change"})
 
 
 class WorkspaceRevisionDelta(BaseModel):

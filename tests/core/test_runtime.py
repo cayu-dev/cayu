@@ -9129,6 +9129,8 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         return events, private_events, binding, configured_workspace, bound_workspace
 
     events, private_events, binding, configured_workspace, bound_workspace = asyncio.run(run())
+    binding_generation_id = private_events[0].payload["binding_generation_id"]
+    assert binding_generation_id.startswith("wbind_")
 
     assert [event.type for event in events[:3]] == [
         EventType.ENVIRONMENT_BINDING_STARTED,
@@ -9137,11 +9139,13 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
     ]
     assert private_events[0].payload == {
         "binding_type": "RecordingWorkspaceBinding",
+        "binding_generation_id": binding_generation_id,
         "configured_workspace_id": configured_workspace.id,
         "has_configured_runner": False,
     }
     assert private_events[1].payload == {
         "binding_type": "RecordingWorkspaceBinding",
+        "binding_generation_id": binding_generation_id,
         "configured_workspace_id": configured_workspace.id,
         "has_configured_runner": False,
         "source_workspace_id": configured_workspace.id,
@@ -9157,11 +9161,13 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         EventType.SESSION_COMPLETED,
     ]
     assert private_events[-3].payload["configured_workspace_id"] == configured_workspace.id
+    assert private_events[-3].payload["binding_generation_id"] == binding_generation_id
     assert private_events[-3].payload["source_workspace_id"] == configured_workspace.id
     assert private_events[-3].payload["bound_workspace_id"] == bound_workspace.id
     assert private_events[-3].payload["outcome"] == "completed"
     assert private_events[-3].payload["bound_snapshot"] is None
     assert private_events[-2].payload["outcome"] == "completed"
+    assert private_events[-2].payload["binding_generation_id"] == binding_generation_id
     assert private_events[-2].payload["final_snapshot"] is None
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.bind_calls) == 1
@@ -9868,6 +9874,17 @@ def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
     assert len(persisted_error.encode("utf-8")) <= BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES
     assert events[-2].payload["error_type"] == "RuntimeError"
     assert events[-2].payload["outcome"] == "completed"
+    assert events[-2].payload["final_revision"] == {
+        "workspace_id": "workspace-unavailable",
+        "observer": "RecordingWorkspaceBinding",
+        "status": "unsupported",
+        "revision": None,
+        "head_revision": None,
+        "branch": None,
+        "path_scope": "complete",
+        "total_paths": 0,
+        "detail_code": "revision_observation_unsupported",
+    }
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.finalize_calls) == 1
     assert events[-1].payload["binding_finalize_error"] == {
@@ -9883,6 +9900,7 @@ def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
         ],
     }
     assert secret not in str(events[-1].payload["binding_finalize_error"])
+    assert events[-1].payload["final_revision"] == events[-2].payload["final_revision"]
     assert str(finalize_error) == raw_message
 
 
@@ -9925,6 +9943,7 @@ def test_cayu_app_invalid_binding_finalize_snapshot_is_reported_on_terminal_even
         "Workspace snapshot copies require a WorkspaceSnapshot or None."
     )
     assert events[-2].payload["error_type"] == "TypeError"
+    assert events[-2].payload["final_revision"]["status"] == "unsupported"
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert events[-1].payload["binding_finalize_error"] == {
         "error": "Workspace snapshot copies require a WorkspaceSnapshot or None.",
@@ -9938,6 +9957,7 @@ def test_cayu_app_invalid_binding_finalize_snapshot_is_reported_on_terminal_even
             }
         ],
     }
+    assert events[-1].payload["final_revision"] == events[-2].payload["final_revision"]
 
 
 def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):

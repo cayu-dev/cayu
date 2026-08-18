@@ -16,7 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from cayu._exception_groups import exception_cause, set_exception_cause
+from cayu._exception_groups import exception_cause, exception_tree_contains, set_exception_cause
 from cayu._validation import (
     copy_json_value,
     copy_label_map,
@@ -445,22 +445,42 @@ async def _close_delegated_event_stream(
             owned_stream
         )
         if cancellation is not None:
-            if authoritative_failure is not None and authoritative_failure is not cancellation:
-                cancellation.add_note(
-                    "Delegated runtime stream cleanup was cancelled after an earlier "
-                    f"{type(authoritative_failure).__name__}."
+            authoritative_cancellation_group = isinstance(
+                authoritative_failure, BaseExceptionGroup
+            ) and exception_tree_contains(authoritative_failure, asyncio.CancelledError)
+            if authoritative_cancellation_group:
+                process_control = exception_tree_contains(
+                    authoritative_failure,
+                    (GeneratorExit, KeyboardInterrupt, SystemExit),
                 )
-            if cleanup_failure is not None and cleanup_failure is not cancellation:
-                cancellation.add_note(
-                    "Delegated runtime stream cleanup also failed: "
-                    f"{type(cleanup_failure).__name__}."
+                authoritative_failure.add_note(
+                    "Delegated runtime stream cleanup observed the already-grouped "
+                    "caller cancellation. The authoritative failure group remains "
+                    + ("intact with concurrent process control." if process_control else "intact.")
                 )
-            _attach_delegated_failure_causes(
-                cancellation,
-                (authoritative_failure, cleanup_failure),
-                message="Delegated runtime stream cancellation evidence",
-            )
-            raise cancellation
+                _attach_delegated_failure_causes(
+                    authoritative_failure,
+                    (cleanup_failure,),
+                    message="Delegated runtime stream cleanup and concurrent control causes",
+                )
+                cancellation = None
+            if cancellation is not None:
+                if authoritative_failure is not None and authoritative_failure is not cancellation:
+                    cancellation.add_note(
+                        "Delegated runtime stream cleanup was cancelled after an earlier "
+                        f"{type(authoritative_failure).__name__}."
+                    )
+                if cleanup_failure is not None and cleanup_failure is not cancellation:
+                    cancellation.add_note(
+                        "Delegated runtime stream cleanup also failed: "
+                        f"{type(cleanup_failure).__name__}."
+                    )
+                _attach_delegated_failure_causes(
+                    cancellation,
+                    (authoritative_failure, cleanup_failure),
+                    message="Delegated runtime stream cancellation evidence",
+                )
+                raise cancellation
         if cleanup_failure is not None:
             if authoritative_failure is None or isinstance(authoritative_failure, GeneratorExit):
                 raise cleanup_failure
@@ -1630,6 +1650,7 @@ class CayuApp:
                     else None,
                     registration_source=registered_environment.registration_source,
                     registration_symbol=registered_environment.registration_symbol,
+                    binding_generation_id=registered_environment.binding_generation_id,
                 )
             )
         return tuple(registrations)
@@ -1656,6 +1677,7 @@ class CayuApp:
         return runtime_records.RegisteredEnvironment(
             spec=registered_environment.spec.model_copy(deep=True),
             environment=copy_environment(registered_environment.environment),
+            binding_generation_id=registered_environment.binding_generation_id,
         )
 
     def get_environment_factory(self, name: str | None = None) -> EnvironmentFactory:

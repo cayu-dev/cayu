@@ -13,11 +13,23 @@ from cayu.vaults import SecretRedactor
 _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
     {
         "agent_name",
+        "after_observation_id",
         "approval_id",
+        "artifact_id",
         "assistant_message_state",
+        "before_observation_id",
+        "before_state",
+        "binding_generation_id",
+        "workspace_id",
+        "observer",
+        "observer_authority",
+        "artifact_store_id",
         "covered_tool_call_ids",
         "decision",
         "environment_name",
+        "evidence_kind",
+        "after_state",
+        "delta_state",
         "event_id",
         "expires_at",
         "hooks_state",
@@ -26,9 +38,11 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "interaction_id",
         "model_attempt_id",
         "model_step_id",
+        "mutation_event_id",
         "name",
         "policy_decision",
         "policy_evidence",
+        "phase",
         "role",
         "round_id",
         "secret_resolution_scope",
@@ -39,10 +53,11 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "timestamp",
         "tool_call_id",
         "tool_name",
+        "tool_outcome_event_id",
         "tool_round_id",
         "type",
         "workflow_name",
-        "workspace_id",
+        "window_id",
         "record_type",
         "component_class",
         "strength",
@@ -64,6 +79,11 @@ _DURABLE_ENUM_STRING_FIELDS = frozenset(
         "strategy",
         "type",
         "hooks_state",
+        "phase",
+        "before_state",
+        "after_state",
+        "delta_state",
+        "observer_authority",
     }
 )
 _DURABLE_SHA256_STRING_FIELDS = frozenset(
@@ -72,6 +92,9 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
         "user_message_sha256",
         "fingerprint",
         "execution_profile_fingerprint",
+        "sha256",
+        "mutation_event_digest",
+        "tool_outcome_event_digest",
     }
 )
 _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
@@ -89,6 +112,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "aliases",
     "allow_unpriced",
     "arguments",
+    "artifacts",
     "anchor_transcript_index",
     "as_of",
     "backoff_multiplier",
@@ -192,6 +216,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "score",
     "score_kind",
     "score_normalized",
+    "size_bytes",
     "schedules",
     "session_operations",
     "session_id",
@@ -277,7 +302,7 @@ _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
 # record. Its dynamic key is untrusted, but the record below it resumes the
 # runtime schema. Other dynamic maps, notably environment reconnect metadata,
 # contain arbitrary extension data and must remain untrusted at every depth.
-_DURABLE_SINGLE_LEVEL_TYPED_MAPS = frozenset({"records"})
+_DURABLE_SINGLE_LEVEL_TYPED_MAPS = frozenset({"records", "workspace_observations"})
 _QUARANTINED_ASSISTANT_MESSAGE_KEYS = frozenset({"role", "content"})
 _QUARANTINED_ASSISTANT_MESSAGE_PART_KEYS = frozenset(
     {
@@ -315,6 +340,7 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
         "pending_user_input",
         "session_operations",
         "usage_triggered_context",
+        "workspace_observations",
     }
 )
 _ACTIVE_INVOCATION_PROFILE_ROOT_IDENTITY_PATHS = frozenset(
@@ -329,6 +355,37 @@ _ACTIVE_INVOCATION_PROFILE_COMPONENT_IDENTITY_FIELDS = frozenset(
         "component_class",
         "strength",
         "availability",
+    }
+)
+_WORKSPACE_OBSERVATION_IDENTITY_FIELDS = frozenset(
+    {
+        "record_type",
+        "session_id",
+        "interaction_id",
+        "window_id",
+        "binding_generation_id",
+        "workspace_id",
+        "observer",
+        "artifact_store_id",
+        "agent_name",
+        "environment_name",
+        "tool_name",
+        "tool_call_id",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "before_observation_id",
+        "tool_outcome_event_id",
+        "after_observation_id",
+        "mutation_event_id",
+    }
+)
+_PENDING_TOOL_ROUND_EXECUTION_IDENTITY_FIELDS = frozenset(
+    {
+        "model_attempt_id",
+        "model_step_id",
+        "source_model_step_id",
+        "tool_round_id",
     }
 )
 
@@ -369,10 +426,17 @@ def durable_value_contains_secret(
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
     if type(value) is str:
-        if _is_active_invocation_profile_identity_path(path):
-            # The active profile is runtime-owned authority reconstructed
-            # through its frozen typed model. These identities were already
-            # admitted before the checkpoint record was created.
+        if (
+            _is_active_invocation_profile_identity_path(path)
+            or _is_workspace_observation_identity_path(path)
+            or _is_pending_tool_round_execution_identity_path(path)
+        ):
+            # Both checkpoint roots are runtime-owned typed authority. Active
+            # profiles cross their dedicated admission boundary; workspace
+            # observation roots can be created only with a matching private
+            # intent admission. Configured dynamic identities are already
+            # field-scoped keyed aliases; static identities were checked, and
+            # exact runtime observer identities retain structural provenance.
             return False
         if path and path[-1] in _DURABLE_ENUM_STRING_FIELDS and _path_has_typed_schema(path[:-1]):
             # Typed model validation owns these finite protocol values. A
@@ -445,6 +509,30 @@ def _is_active_invocation_profile_identity_path(path: tuple[str, ...]) -> bool:
             "components",
         )
         and path[-1] in _ACTIVE_INVOCATION_PROFILE_COMPONENT_IDENTITY_FIELDS
+    )
+
+
+def _is_workspace_observation_identity_path(path: tuple[str, ...]) -> bool:
+    return (
+        len(path) == 3
+        and path[0] == "workspace_observations"
+        and path[2] in _WORKSPACE_OBSERVATION_IDENTITY_FIELDS
+    ) or (
+        len(path) == 4
+        and path[0] == "workspace_observations"
+        and path[2] == "artifacts"
+        and path[3] == "artifact_id"
+    )
+
+
+def _is_pending_tool_round_execution_identity_path(path: tuple[str, ...]) -> bool:
+    """Return whether a typed pending round owns this runtime execution ID."""
+
+    return (
+        len(path) >= 2
+        and path[0] == "pending_tool_round"
+        and path[-1] in _PENDING_TOOL_ROUND_EXECUTION_IDENTITY_FIELDS
+        and _path_has_typed_schema(path[:-1])
     )
 
 

@@ -106,6 +106,13 @@ _MESSAGE_AUTHORITY_STRING_FIELDS = frozenset(
         "tool_round_id",
     }
 )
+_MESSAGE_RUNTIME_EXECUTION_AUTHORITY_FIELDS = frozenset(
+    {
+        "model_attempt_id",
+        "model_step_id",
+        "tool_round_id",
+    }
+)
 _MESSAGE_PRESERVED_STRING_FIELDS = _MESSAGE_AUTHORITY_STRING_FIELDS | {
     "type",
 }
@@ -194,6 +201,14 @@ def _redact_message_for_boundary(
         # must fail closed instead of being rewritten into a different value.
         for authority_field in _MESSAGE_AUTHORITY_STRING_FIELDS:
             value = part.get(authority_field)
+            if (
+                trust_runtime_tool_result_projection
+                and authority_field in _MESSAGE_RUNTIME_EXECUTION_AUTHORITY_FIELDS
+            ):
+                # Runtime transcript admission already authenticated this
+                # complete tool-round lineage. A coincidental workload-secret
+                # substring must not rewrite or reject runtime-generated IDs.
+                continue
             if type(value) is str and redactor.redact_text(value) != value:
                 raise ValueError(
                     f"{field_name}.content[{index}].{authority_field} contains a "

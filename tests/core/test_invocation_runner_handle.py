@@ -21,7 +21,11 @@ import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._resources as resources_module
 import cayu.tools._runner as runner_module
 from cayu._exception_groups import iter_exception_tree
-from cayu._workspace_mutation import WorkspaceMutationProcessFence
+from cayu._task_wait import capture_awaitable_outcome
+from cayu._workspace_mutation import (
+    WorkspaceMutationProcessFence,
+    workspace_mutation_task_settlement_probe,
+)
 from cayu.core import AgentSpec, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
@@ -3801,7 +3805,91 @@ def test_workspace_mutation_fence_preserves_active_system_exit_code() -> None:
         fence.require_available_nowait()
         return calls
 
-    assert asyncio.run(scenario()) == 2
+    assert asyncio.run(scenario()) == 1
+
+
+def test_workspace_mutation_task_probe_rejects_terminal_child_cancellation() -> None:
+    async def scenario() -> None:
+        fence = WorkspaceMutationProcessFence()
+        observer_started = asyncio.Event()
+        cancellation_delivered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def observer() -> None:
+            observer_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_delivered.set()
+                await release.wait()
+                raise
+
+        observation_task = asyncio.create_task(observer())
+        await observer_started.wait()
+        observation_task.cancel("observer deadline")
+        await cancellation_delivered.wait()
+        fence.fail_closed(workspace_mutation_task_settlement_probe(observation_task))
+        waiter = asyncio.create_task(fence.wait_until_available())
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+        release.set()
+        with pytest.raises(
+            WorkspaceMutationSettlementError,
+            match="settlement could not be proven",
+        ):
+            await waiter
+        assert observation_task.cancelled() is True
+        with pytest.raises(
+            WorkspaceMutationSettlementError,
+            match="settlement could not be proven",
+        ):
+            fence.require_available_nowait()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_mutation_task_probe_preserves_late_process_signal_once() -> None:
+    async def scenario() -> int:
+        fence = WorkspaceMutationProcessFence()
+        release = asyncio.Event()
+
+        async def observer() -> None:
+            await release.wait()
+            raise SystemExit(17)
+
+        observation_task = asyncio.create_task(capture_awaitable_outcome(observer))
+        fence.fail_closed(workspace_mutation_task_settlement_probe(observation_task))
+        release.set()
+        with pytest.raises(SystemExit) as raised:
+            await fence.wait_until_available()
+        assert raised.value.code == 17
+        await fence.wait_until_available()
+        fence.require_available_nowait()
+        return 1
+
+    assert asyncio.run(scenario()) == 1
+
+
+def test_workspace_mutation_task_probe_preserves_late_generator_exit_once() -> None:
+    async def scenario() -> int:
+        fence = WorkspaceMutationProcessFence()
+        release = asyncio.Event()
+
+        async def observer() -> None:
+            await release.wait()
+            raise GeneratorExit("PRIVATE_LATE_OBSERVER_SIGNAL_CANARY")
+
+        observation_task = asyncio.create_task(capture_awaitable_outcome(observer))
+        fence.fail_closed(workspace_mutation_task_settlement_probe(observation_task))
+        release.set()
+        with pytest.raises(GeneratorExit) as raised:
+            await fence.wait_until_available()
+        assert raised.value.args == ()
+        await fence.wait_until_available()
+        fence.require_available_nowait()
+        return 1
+
+    assert asyncio.run(scenario()) == 1
 
 
 def test_workspace_mutation_fence_delivers_active_signal_group_once() -> None:
@@ -3858,7 +3946,7 @@ def test_workspace_mutation_fence_delivers_active_signal_group_once() -> None:
     assert len(signals) == 1
     assert signals[0].code == 17
     assert "PRIVATE_SETTLEMENT" not in repr(failures)
-    assert calls == 2
+    assert calls == 1
 
 
 def test_workspace_mutation_fence_preserves_signal_and_sibling_failure() -> None:
@@ -3896,8 +3984,19 @@ def test_workspace_mutation_fence_preserves_signal_and_sibling_failure() -> None
     assert sum(isinstance(candidate, RuntimeError) for candidate in leaves) == 1
 
 
-def test_workspace_mutation_fence_does_not_replay_historical_process_signal() -> None:
-    async def scenario() -> tuple[asyncio.Task[None], int]:
+@pytest.mark.parametrize(
+    ("signal_type", "signal_arg", "expected_args"),
+    [
+        (SystemExit, 17, (17,)),
+        (GeneratorExit, "PRIVATE_LATE_SETTLEMENT_SIGNAL", ()),
+    ],
+)
+def test_workspace_mutation_fence_delivers_late_process_signal_once_after_waiter_cancel(
+    signal_type: type[BaseException],
+    signal_arg: object,
+    expected_args: tuple[object, ...],
+) -> None:
+    async def scenario() -> tuple[asyncio.Task[None], BaseException, int]:
         fence = WorkspaceMutationProcessFence()
         started = asyncio.Event()
         release = asyncio.Event()
@@ -3911,7 +4010,7 @@ def test_workspace_mutation_fence_does_not_replay_historical_process_signal() ->
                 started.set()
                 await release.wait()
                 first_finished.set()
-                raise SystemExit("historical settlement signal")
+                raise signal_type(signal_arg)
             return True
 
         fence.fail_closed(probe)
@@ -3923,14 +4022,23 @@ def test_workspace_mutation_fence_does_not_replay_historical_process_signal() ->
         release.set()
         await first_finished.wait()
         await asyncio.sleep(0)
+        try:
+            await fence.wait_until_available()
+        except BaseException as signal:
+            delivered = signal
+        else:  # pragma: no cover - paired invariant
+            raise AssertionError("Late settlement signal was discarded.")
         await fence.wait_until_available()
-        return cancelled_waiter, calls
+        fence.require_available_nowait()
+        return cancelled_waiter, delivered, calls
 
-    cancelled_waiter, calls = asyncio.run(scenario())
+    cancelled_waiter, delivered, calls = asyncio.run(scenario())
 
     assert cancelled_waiter.cancelling() == 1
     assert cancelled_waiter.cancelled()
-    assert calls == 2
+    assert type(delivered) is signal_type
+    assert delivered.args == expected_args
+    assert calls == 1
 
 
 def test_concurrent_invocation_runner_handles_keep_secret_scopes_separate() -> None:

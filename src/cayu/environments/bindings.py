@@ -3159,3 +3159,23 @@ def _git_command_label(args: tuple[str, ...]) -> str:
 def _reject_reserved_metadata(metadata: dict[str, Any], key: str) -> None:
     if key in metadata:
         raise ValueError(f"GitRepositoryBinding metadata key {key!r} is reserved.")
+
+
+def _runtime_owned_workspace_observer_name(binding: object) -> str | None:
+    """Return an observer name only for exact built-in binding implementations.
+
+    Extension subclasses deliberately do not inherit this authority: equality
+    with a built-in class name is not evidence that the runtime produced it.
+    Private runtime wrappers are likewise treated as extension-shaped unless
+    their observation identity is projected through a separate owned boundary.
+    """
+
+    if type(binding) not in {
+        NativeBinding,
+        DeterministicWorkspaceBinding,
+        NoWorkspaceBinding,
+        GitRepositoryBinding,
+        SyncBinding,
+    }:
+        return None
+    return type(binding).__name__

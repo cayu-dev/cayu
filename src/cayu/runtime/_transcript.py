@@ -330,6 +330,61 @@ def assistant_message_with_tool_round(
     )
 
 
+def assistant_message_without_tool_round(
+    message: Message,
+    identity: ToolRoundIdentity,
+) -> Message:
+    """Remove one exact runtime-owned lineage before redacting provider content."""
+
+    if type(message) is not Message:
+        raise TypeError("Assistant tool-round projection requires a Message.")
+    identity = copy_tool_round_identity(identity)
+    tool_call_seen = False
+    content: list[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+    ] = []
+    for part in message.content:
+        if type(part) is not ToolCallPart:
+            content.append(copy_message_part(part))
+            continue
+        if not _part_matches_tool_round_identity(part, identity):
+            raise ValueError("Assistant message carries conflicting runtime tool-round authority.")
+        tool_call_seen = True
+        content.append(
+            ToolCallPart(
+                tool_call_id=part.tool_call_id,
+                tool_name=part.tool_name,
+                arguments=deepcopy(part.arguments),
+            )
+        )
+    if not tool_call_seen:
+        raise ValueError("Assistant tool-round projection requires at least one tool call.")
+    return Message(role=message.role, content=tuple(content))
+
+
+def redact_untrusted_assistant_message_for_boundary(
+    message: Message,
+    *,
+    tool_round_identity: ToolRoundIdentity | None,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> Message:
+    """Redact provider content without treating runtime lineage as workload data."""
+
+    identity = (
+        None if tool_round_identity is None else copy_tool_round_identity(tool_round_identity)
+    )
+    untrusted_message = (
+        message if identity is None else assistant_message_without_tool_round(message, identity)
+    )
+    redacted = message_redaction.redact_untrusted_message_for_boundary(
+        untrusted_message,
+        redactor=redactor,
+        field_name=field_name,
+    )
+    return redacted if identity is None else assistant_message_with_tool_round(redacted, identity)
+
+
 def assistant_message_with_projected_tool_arguments(
     message: Message,
     outcomes: list[ToolCallOutcome] | tuple[ToolCallOutcome, ...],

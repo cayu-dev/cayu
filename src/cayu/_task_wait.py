@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -16,6 +17,27 @@ class ShieldedTaskOutcome(Generic[_ResultT]):
     cancellation: asyncio.CancelledError | None = None
     cancellation_requests_consumed: int = 0
     timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class CapturedAwaitableOutcome(Generic[_ResultT]):
+    """One extension outcome captured before it can escape through task machinery."""
+
+    result: _ResultT | None = None
+    error: BaseException | None = None
+
+
+async def capture_awaitable_outcome(
+    operation_factory: Callable[[], Awaitable[_ResultT]],
+) -> CapturedAwaitableOutcome[_ResultT]:
+    """Return every extension outcome as data, including process-control signals."""
+
+    if not callable(operation_factory):
+        raise TypeError("operation_factory must be callable.")
+    try:
+        return CapturedAwaitableOutcome(result=await operation_factory())
+    except BaseException as error:
+        return CapturedAwaitableOutcome(error=error)
 
 
 def unexpected_child_cancellation_error(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from cayu._validation import require_durable_clean_nonblank
 from cayu._workspace_mutation import WorkspaceMutationProcessFence
@@ -102,6 +103,14 @@ class RegisteredEnvironment:
     preserve_factory_allocation: bool = False
     registration_source: str | None = None
     registration_symbol: str | None = None
+    # Runtime-owned authority for one concrete environment/binding generation.
+    # Factory materialization receives a fresh value; copies and the subsequent
+    # binding transfer retain it. A fresh process therefore cannot accidentally
+    # claim attribution for a prior process's live workspace handle.
+    binding_generation_id: str = field(
+        default_factory=lambda: f"wbind_{uuid4().hex}",
+        compare=False,
+    )
     workspace_mutation_fence: WorkspaceMutationProcessFence = field(
         default_factory=WorkspaceMutationProcessFence,
         compare=False,

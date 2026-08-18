@@ -152,6 +152,7 @@ class EventType(StrEnum):
 
     WORKSPACE_REVISION_OBSERVED = "workspace.revision.observed"
     WORKSPACE_MUTATION_RECORDED = "workspace.mutation.recorded"
+    WORKSPACE_OBSERVATION_FINALIZED = "workspace.observation.finalized"
 
     HOOK_STARTED = "hook.started"
     HOOK_COMPLETED = "hook.completed"
@@ -379,6 +380,11 @@ def event_with_runtime_nested_payload_authority(
 
     def collect(value: Any, path: tuple[str, ...], offset: int) -> None:
         if offset == len(path):
+            if value is None:
+                # Typed lists may contain optional authority fields. Absence
+                # needs no attestation; present siblings still retain their
+                # exact runtime provenance through the wildcard path.
+                return
             if type(value) is not str or not value.strip():
                 raise ValueError(
                     f"event.payload.{'.'.join(path)} must contain non-empty strings "

@@ -120,7 +120,6 @@ from cayu.runtime._completion_projection import portable_model_completion_projec
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
-    redact_untrusted_message_for_boundary,
 )
 from cayu.runtime._model_errors import (
     copy_provider_exception_control,
@@ -717,8 +716,11 @@ def _durable_assistant_step_result(
         if copied.tool_calls:
             raise ValueError("Assistant tool calls require an assistant message.")
         return copied
-    assistant_message = redact_untrusted_message_for_boundary(
+    # The model never owned tool-round identifiers. Evaluate only its content
+    # against workload secrets, then restore the exact runtime lineage.
+    assistant_message = transcript_helpers.redact_untrusted_assistant_message_for_boundary(
         copied.assistant_message,
+        tool_round_identity=copied.tool_round_identity,
         redactor=redactor,
         field_name="assistant_message",
     )

@@ -14,7 +14,11 @@ from cayu.egress import (
     HttpEgressPolicy,
     SandboxEgressAdapter,
 )
-from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
+from cayu.environments import (
+    DeterministicWorkspaceBinding,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryRequest,
+)
 from cayu.runners import (
     E2BRunner,
     E2BWorkspaceCapability,
@@ -33,6 +37,7 @@ from cayu.workspaces import (
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
+    WorkspaceRevisionObservationStatus,
 )
 
 pytest.importorskip("cryptography")
@@ -229,6 +234,8 @@ class _MismatchedIdentityWorkspace(RunnerWorkspace):
 def _factory(
     adapter: SandboxEgressAdapter,
     workspace_factory: Any,
+    *,
+    inner_binding: DeterministicWorkspaceBinding | None = None,
 ) -> VirtualEgressEnvironmentFactory:
     return VirtualEgressEnvironmentFactory(
         resolver=StaticVault({"provider_key": "sk_test_workspace_composition"}),
@@ -249,6 +256,7 @@ def _factory(
         ],
         adapter=adapter,
         workspace_factory=workspace_factory,
+        inner_binding=inner_binding,
     )
 
 
@@ -266,9 +274,11 @@ def _local_exec(root: Path) -> Any:
 
 
 @pytest.mark.parametrize("provider", ["microsandbox", "e2b"])
+@pytest.mark.parametrize("observation_mode", ["default", "deterministic"])
 def test_factory_composes_provider_workspace_without_unwrapping(
     tmp_path: Path,
     provider: str,
+    observation_mode: str,
 ) -> None:
     order: list[str] = []
     if provider == "microsandbox":
@@ -299,6 +309,9 @@ def test_factory_composes_provider_workspace_without_unwrapping(
         result = await _factory(
             adapter,
             lambda runner: workspace_type(runner, root=str(tmp_path)),
+            inner_binding=(
+                DeterministicWorkspaceBinding() if observation_mode == "deterministic" else None
+            ),
         ).create(
             EnvironmentFactoryRequest(
                 session_id=f"sess_{provider}",
@@ -342,6 +355,14 @@ def test_factory_composes_provider_workspace_without_unwrapping(
         )
         assert bound.workspace is workspace
         assert bound.runner is managed
+        observation = await binding.observe_revision(bound)
+        assert observation.status is (
+            WorkspaceRevisionObservationStatus.SUPPORTED
+            if observation_mode == "deterministic"
+            else WorkspaceRevisionObservationStatus.UNSUPPORTED
+        )
+        assert observation.identity.workspace_id == workspace.id
+        assert observation.identity.observer == type(binding).__name__
         await binding.finalize(bound, outcome="completed")
         await binding.finalize(bound, outcome="completed")
         return managed, workspace, inner

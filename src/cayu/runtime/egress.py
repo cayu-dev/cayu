@@ -120,6 +120,12 @@ from cayu.runtime._binding_cleanup import (
 )
 from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
 from cayu.workspaces import RunnerBoundWorkspace, Workspace
+from cayu.workspaces.revisions import (
+    WorkspaceIdentity,
+    WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimits,
+    copy_bounded_workspace_revision_observation,
+)
 
 EventEmitter = Callable[[Event], Awaitable[Event]]
 VirtualEgressWorkspaceFactory = Callable[[Runner], Workspace | Awaitable[Workspace]]
@@ -2521,6 +2527,36 @@ class _EgressTeardownBinding(WorkspaceBinding):
             agent_name=agent_name,
             environment_name=environment_name,
             metadata=metadata,
+        )
+
+    async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:
+        """Delegate observation while retaining this wrapper's public identity."""
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("Workspace revision observation requires a BoundWorkspace.")
+        workspace = bound.workspace or bound.source_workspace
+        workspace_id = (
+            "workspace-unavailable"
+            if workspace is None
+            else require_clean_nonblank(workspace.id, "workspace.id")
+        )
+        inner_identity = WorkspaceIdentity(
+            workspace_id=workspace_id,
+            observer=type(self._inner).__name__,
+        )
+        observed = copy_bounded_workspace_revision_observation(
+            await self._inner.observe_revision(bound),
+            expected_identity=inner_identity,
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+        return WorkspaceRevisionObservation.model_validate(
+            {
+                **observed.model_dump(mode="json"),
+                "identity": {
+                    "workspace_id": workspace_id,
+                    "observer": type(self).__name__,
+                },
+            }
         )
 
     async def _bind_for_environment_lifecycle(
