@@ -332,7 +332,7 @@ def test_browser_adapter_sanitizes_unexpected_runner_failure() -> None:
             ),
             "incompatible_browser",
         ),
-        (_success_payload(worker_version="3"), "incompatible_browser"),
+        (_success_payload(worker_version="4"), "incompatible_browser"),
         (_success_payload(playwright_version="1.63.0"), "incompatible_browser"),
         (_success_payload(requested_url="https://other.example/"), "malformed_browser_result"),
         (_success_payload(response_bytes=2049), "malformed_browser_result"),

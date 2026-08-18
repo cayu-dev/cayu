@@ -102,6 +102,51 @@ fonts receive no transitive authority from the page. See
 and the [versioned image example](../examples/browser_fetch/README.md) for the
 complete environment and image configuration.
 
+## Sandboxed screenshot artifacts
+
+`ScreenshotPageTool` uses the same versioned browser worker, admitted runner,
+virtual-egress policy, redirect checks, request/response ceilings, ephemeral
+context, and bounded cleanup path. It has no trusted-process fallback. The
+model-facing `screenshot_page` schema is closed:
+
+```json
+{"url": "https://example.com/reference", "full_page": false}
+```
+
+`full_page` is the only model-selected presentation option. PNG format,
+viewport, maximum page width and height, maximum pixels, screenshot bytes,
+redirects, requests, response bytes, and elapsed time remain application-owned
+constructor limits. The worker checks layout bounds before a full-page capture;
+the host then validates the bounded base64 transport as a complete PNG,
+including dimensions, chunk order, and checksums.
+
+The tool requires both an admitted browser runner and an `ArtifactStore` on the
+active environment. It stores the PNG as a session-scoped artifact and returns
+one provider-neutral `image` file attachment. Its text and structured results
+contain only canonical page evidence, capture dimensions, and the artifact
+reference—never PNG bytes or base64. Provider translation resolves the artifact
+only at the subsequent model-request boundary. Missing artifact storage,
+unsupported capture, oversized layout, oversized PNG, timeout, browser crash,
+and artifact publication failure remain distinct bounded errors without worker
+stderr or exception text.
+
+```python
+from cayu import BrowserWebFetchAdapter, ScreenshotPageTool, WebFetchTool
+
+tools = [
+    WebFetchTool(adapter=BrowserWebFetchAdapter()),
+    ScreenshotPageTool(),
+]
+```
+
+Artifact creation is a durable mutation, so `screenshot_page` declares
+`ToolEffect.EXTERNAL`. Runtime tool calls receive a stable idempotency identity;
+the built-in hashes it into an opaque deterministic artifact ID and reconciles
+an acknowledgement-lost write against exact bytes and metadata. Direct calls
+without that runtime identity remain conservatively external. Add
+`screenshot_page` to the same web taint-source policy as `web_fetch` when later
+tools can publish or act on page-derived evidence.
+
 ## Taint policy
 
 Fetched text is untrusted input. Mark `web_fetch` as a taint source when later

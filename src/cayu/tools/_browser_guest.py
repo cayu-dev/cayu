@@ -1,4 +1,4 @@
-"""Narrow JSON browser-fetch worker executed inside a Cayu runner.
+"""Narrow JSON browser-inspection worker executed inside a Cayu runner.
 
 This module is intentionally not imported by :mod:`cayu.tools.browser`. The
 versioned browser image copies it to ``/opt/cayu-browser/worker.py`` and invokes
@@ -9,6 +9,7 @@ Cayu host process.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import importlib.metadata
 import json
@@ -24,11 +25,11 @@ import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Never
+from typing import Any, Literal, Never
 from urllib.parse import urljoin, urlsplit
 
-PROTOCOL_VERSION = "cayu.browser-fetch.v2"
-WORKER_VERSION = "2"
+PROTOCOL_VERSION = "cayu.browser-fetch.v3"
+WORKER_VERSION = "3"
 PLAYWRIGHT_VERSION = "1.62.0"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -37,6 +38,9 @@ _MAX_CONTENT_BYTES = 256 * 1024
 _MAX_REDIRECTS = 10
 _MAX_REQUESTS = 512
 _MAX_DOM_NODES = 100_000
+_MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
+_MAX_SCREENSHOT_DIMENSION = 16_384
+_MAX_SCREENSHOT_PAGE_PIXELS = 32_000_000
 _MAX_TIMEOUT_SECONDS = 120.0
 _MAX_TITLE_BYTES = 512
 _ACCESSIBILITY_SNAPSHOT_DEPTH = 32
@@ -66,19 +70,35 @@ class _GuestFailure(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _Limits:
+class _BrowserLimits:
     max_response_bytes: int
-    max_content_bytes: int
     timeout_seconds: float
     max_redirects: int
     max_requests: int
+
+
+@dataclass(frozen=True)
+class _Limits(_BrowserLimits):
+    max_content_bytes: int
     max_dom_nodes: int
+
+
+@dataclass(frozen=True)
+class _ScreenshotLimits(_BrowserLimits):
+    max_screenshot_bytes: int
+    viewport_width: int
+    viewport_height: int
+    max_page_width: int
+    max_page_height: int
+    max_page_pixels: int
 
 
 @dataclass(frozen=True)
 class _Request:
     url: str
-    limits: _Limits
+    limits: _Limits | _ScreenshotLimits
+    operation: Literal["fetch", "screenshot"] = "fetch"
+    full_page: bool = False
 
 
 @dataclass
@@ -91,6 +111,7 @@ class _PageState:
     limit_exceeded: bool = False
     denied_code: str | None = None
     response_inspection_failed: bool = False
+    browser_crashed: bool = False
     cleanup_failed: bool = False
     redirects: list[dict[str, Any]] = field(default_factory=list)
 
@@ -108,6 +129,13 @@ class _FrameIdentity:
     url: str
     mime_type: str
     parent_index: int | None
+
+
+@dataclass(frozen=True)
+class _ScreenshotDocumentIdentity:
+    frame_id: str
+    loader_id: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -150,28 +178,45 @@ def _bounded_int(value: Any, *, minimum: int, maximum: int) -> int:
 def _bounded_float(value: Any, *, minimum: float, maximum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _GuestFailure("incompatible_browser")
-    normalized = float(value)
+    try:
+        normalized = float(value)
+    except OverflowError as exc:
+        raise _GuestFailure("incompatible_browser") from exc
     if not math.isfinite(normalized) or normalized < minimum or normalized > maximum:
         raise _GuestFailure("incompatible_browser")
     return normalized
 
 
 def _request_from_json(raw: Any) -> _Request:
-    if type(raw) is not dict or set(raw) != {
+    if type(raw) is not dict or not {
         "expected_playwright_version",
         "limits",
         "operation",
         "protocol_version",
         "url",
         "worker_version",
-    }:
+    }.issubset(raw):
         raise _GuestFailure("incompatible_browser")
+    operation = raw["operation"]
     if (
         raw["protocol_version"] != PROTOCOL_VERSION
         or raw["worker_version"] != WORKER_VERSION
         or raw["expected_playwright_version"] != PLAYWRIGHT_VERSION
-        or raw["operation"] != "fetch"
+        or type(operation) is not str
+        or operation not in {"fetch", "screenshot"}
     ):
+        raise _GuestFailure("incompatible_browser")
+    expected_keys = {
+        "expected_playwright_version",
+        "limits",
+        "operation",
+        "protocol_version",
+        "url",
+        "worker_version",
+    }
+    if operation == "screenshot":
+        expected_keys.add("full_page")
+    if set(raw) != expected_keys:
         raise _GuestFailure("incompatible_browser")
     url = raw["url"]
     if type(url) is not str or not 0 < len(url) <= _MAX_URL_LENGTH:
@@ -190,51 +235,132 @@ def _request_from_json(raw: Any) -> _Request:
         or split.fragment
     ):
         raise _GuestFailure("destination_denied")
-    limits = raw["limits"]
-    if type(limits) is not dict or set(limits) != {
+    raw_limits = raw["limits"]
+    fetch_limit_keys = {
         "max_content_bytes",
         "max_dom_nodes",
         "max_redirects",
         "max_requests",
         "max_response_bytes",
         "timeout_seconds",
-    }:
+    }
+    screenshot_limit_keys = {
+        "max_page_height",
+        "max_page_pixels",
+        "max_page_width",
+        "max_redirects",
+        "max_requests",
+        "max_response_bytes",
+        "max_screenshot_bytes",
+        "timeout_seconds",
+        "viewport_height",
+        "viewport_width",
+    }
+    expected_limit_keys = fetch_limit_keys if operation == "fetch" else screenshot_limit_keys
+    if type(raw_limits) is not dict or set(raw_limits) != expected_limit_keys:
         raise _GuestFailure("incompatible_browser")
-    return _Request(
-        url=url,
-        limits=_Limits(
-            max_response_bytes=_bounded_int(
-                limits["max_response_bytes"],
-                minimum=1,
-                maximum=_MAX_RESPONSE_BYTES,
-            ),
+    max_response_bytes = _bounded_int(
+        raw_limits["max_response_bytes"],
+        minimum=1,
+        maximum=_MAX_RESPONSE_BYTES,
+    )
+    timeout_seconds = _bounded_float(
+        raw_limits["timeout_seconds"],
+        minimum=0.001,
+        maximum=_MAX_TIMEOUT_SECONDS,
+    )
+    max_redirects = _bounded_int(
+        raw_limits["max_redirects"],
+        minimum=0,
+        maximum=_MAX_REDIRECTS,
+    )
+    max_requests = _bounded_int(
+        raw_limits["max_requests"],
+        minimum=1,
+        maximum=_MAX_REQUESTS,
+    )
+    if operation == "fetch":
+        limits: _Limits | _ScreenshotLimits = _Limits(
+            max_response_bytes=max_response_bytes,
+            timeout_seconds=timeout_seconds,
+            max_redirects=max_redirects,
+            max_requests=max_requests,
             max_content_bytes=_bounded_int(
-                limits["max_content_bytes"],
+                raw_limits["max_content_bytes"],
                 minimum=1,
                 maximum=_MAX_CONTENT_BYTES,
             ),
-            timeout_seconds=_bounded_float(
-                limits["timeout_seconds"],
-                minimum=0.001,
-                maximum=_MAX_TIMEOUT_SECONDS,
-            ),
-            max_redirects=_bounded_int(
-                limits["max_redirects"],
-                minimum=0,
-                maximum=_MAX_REDIRECTS,
-            ),
-            max_requests=_bounded_int(
-                limits["max_requests"],
-                minimum=1,
-                maximum=_MAX_REQUESTS,
-            ),
             max_dom_nodes=_bounded_int(
-                limits["max_dom_nodes"],
+                raw_limits["max_dom_nodes"],
                 minimum=1,
                 maximum=_MAX_DOM_NODES,
             ),
-        ),
+        )
+        full_page = False
+    else:
+        limits = _ScreenshotLimits(
+            max_response_bytes=max_response_bytes,
+            timeout_seconds=timeout_seconds,
+            max_redirects=max_redirects,
+            max_requests=max_requests,
+            max_screenshot_bytes=_bounded_int(
+                raw_limits["max_screenshot_bytes"],
+                minimum=1,
+                maximum=_MAX_SCREENSHOT_BYTES,
+            ),
+            viewport_width=_bounded_int(
+                raw_limits["viewport_width"],
+                minimum=1,
+                maximum=_MAX_SCREENSHOT_DIMENSION,
+            ),
+            viewport_height=_bounded_int(
+                raw_limits["viewport_height"],
+                minimum=1,
+                maximum=_MAX_SCREENSHOT_DIMENSION,
+            ),
+            max_page_width=_bounded_int(
+                raw_limits["max_page_width"],
+                minimum=1,
+                maximum=_MAX_SCREENSHOT_DIMENSION,
+            ),
+            max_page_height=_bounded_int(
+                raw_limits["max_page_height"],
+                minimum=1,
+                maximum=_MAX_SCREENSHOT_DIMENSION,
+            ),
+            max_page_pixels=_bounded_int(
+                raw_limits["max_page_pixels"],
+                minimum=1,
+                maximum=_MAX_SCREENSHOT_PAGE_PIXELS,
+            ),
+        )
+        full_page = raw["full_page"]
+        if type(full_page) is not bool:
+            raise _GuestFailure("incompatible_browser")
+        if (
+            limits.viewport_width > limits.max_page_width
+            or limits.viewport_height > limits.max_page_height
+            or limits.viewport_width * limits.viewport_height > limits.max_page_pixels
+        ):
+            raise _GuestFailure("incompatible_browser")
+    return _Request(
+        operation=operation,
+        url=url,
+        limits=limits,
+        full_page=full_page,
     )
+
+
+def _fetch_limits(request: _Request) -> _Limits:
+    if request.operation != "fetch" or not isinstance(request.limits, _Limits):
+        raise _GuestFailure("incompatible_browser")
+    return request.limits
+
+
+def _screenshot_limits(request: _Request) -> _ScreenshotLimits:
+    if request.operation != "screenshot" or not isinstance(request.limits, _ScreenshotLimits):
+        raise _GuestFailure("incompatible_browser")
+    return request.limits
 
 
 def _proxy_and_ca() -> tuple[str, Path]:
@@ -671,16 +797,17 @@ async def _extract_page_representation(
 ) -> tuple[str | None, str, str, tuple[str, ...]]:
     """Select and bound the canonical model-facing page representation."""
 
+    limits = _fetch_limits(request)
     frame_identities = await _frame_identities(cdp)
     frames = _playwright_frames_for_identities(page, frame_identities)
     evidence_membership = await _frame_evidence_membership(cdp, frame_identities)
-    remaining_nodes = request.limits.max_dom_nodes
+    remaining_nodes = limits.max_dom_nodes
     projections: list[_FrameProjection] = []
     for identity in frame_identities:
         projection = await _isolated_frame_projection(
             cdp,
             identity,
-            request,
+            limits,
             max_dom_nodes=remaining_nodes,
         )
         remaining_nodes -= projection.node_count
@@ -717,7 +844,7 @@ async def _extract_page_representation(
                 raise _GuestFailure("browser_crash")
             normalized, normalized_truncated = _normalized_accessibility_text(
                 accessibility_content,
-                request.limits.max_content_bytes,
+                limits.max_content_bytes,
             )
             frame_contents.append(normalized)
             content_truncated = (
@@ -734,7 +861,7 @@ async def _extract_page_representation(
         included_indexes,
         included_projections,
         frame_contents,
-        max_bytes=request.limits.max_content_bytes,
+        max_bytes=limits.max_content_bytes,
     )
     content_truncated = content_truncated or aggregate_truncated
     stable_identities = await _frame_identities(cdp)
@@ -760,27 +887,14 @@ async def _extract_page_representation(
 async def _isolated_frame_projection(
     cdp: Any,
     identity: _FrameIdentity,
-    request: _Request,
+    limits: _Limits,
     *,
     max_dom_nodes: int,
 ) -> _FrameProjection:
-    isolated_world = await cdp.send(
-        "Page.createIsolatedWorld",
+    execution_context_id = await _create_isolated_world(cdp, identity.frame_id)
+    encoded_limits = json.dumps(
         {
-            "frameId": identity.frame_id,
-            "worldName": _BROWSER_INSPECTION_WORLD,
-            "grantUniveralAccess": False,
-        },
-    )
-    if (
-        type(isolated_world) is not dict
-        or type(isolated_world.get("executionContextId")) is not int
-        or isolated_world["executionContextId"] <= 0
-    ):
-        raise _GuestFailure("browser_crash")
-    limits = json.dumps(
-        {
-            "content": request.limits.max_content_bytes,
+            "content": limits.max_content_bytes,
             "nodes": max_dom_nodes,
             "title": _MAX_TITLE_BYTES,
         },
@@ -790,7 +904,7 @@ async def _isolated_frame_projection(
     projection = await cdp.send(
         "Runtime.evaluate",
         {
-            "contextId": isolated_world["executionContextId"],
+            "contextId": execution_context_id,
             "expression": """(() => {
             const limits = __CAYU_INSPECTION_LIMITS__;
             const body = document.body;
@@ -841,7 +955,7 @@ async def _isolated_frame_projection(
                 node_limit_exceeded: nodeCount > limits.nodes,
                 semantic_structure: semanticStructure,
             };
-        })()""".replace("__CAYU_INSPECTION_LIMITS__", limits),
+        })()""".replace("__CAYU_INSPECTION_LIMITS__", encoded_limits),
             "returnByValue": True,
             "awaitPromise": False,
             "userGesture": False,
@@ -884,7 +998,7 @@ async def _isolated_frame_projection(
 
     text, text_truncated = _normalized_text(
         extracted["text"],
-        request.limits.max_content_bytes,
+        limits.max_content_bytes,
         preserve_lines=True,
     )
     text_truncated = text_truncated or extracted["truncated"]
@@ -903,6 +1017,66 @@ async def _isolated_frame_projection(
         semantic_structure=extracted["semantic_structure"],
         node_count=extracted["node_count"],
     )
+
+
+async def _create_isolated_world(cdp: Any, frame_id: str) -> int:
+    isolated_world = await cdp.send(
+        "Page.createIsolatedWorld",
+        {
+            "frameId": frame_id,
+            "worldName": _BROWSER_INSPECTION_WORLD,
+            "grantUniveralAccess": False,
+        },
+    )
+    if (
+        type(isolated_world) is not dict
+        or type(isolated_world.get("executionContextId")) is not int
+        or isolated_world["executionContextId"] <= 0
+    ):
+        raise _GuestFailure("browser_crash")
+    return isolated_world["executionContextId"]
+
+
+async def _isolated_page_title(cdp: Any, frame_id: str) -> tuple[str | None, bool]:
+    execution_context_id = await _create_isolated_world(cdp, frame_id)
+    projection = await cdp.send(
+        "Runtime.evaluate",
+        {
+            "contextId": execution_context_id,
+            "expression": """(() => {
+            const title = document.title;
+            return {
+                title: title.slice(0, __CAYU_TITLE_LIMIT__ + 1),
+                title_truncated: title.length > __CAYU_TITLE_LIMIT__,
+            };
+        })()""".replace("__CAYU_TITLE_LIMIT__", str(_MAX_TITLE_BYTES)),
+            "returnByValue": True,
+            "awaitPromise": False,
+            "userGesture": False,
+        },
+    )
+    if (
+        type(projection) is not dict
+        or projection.get("exceptionDetails") is not None
+        or type(projection.get("result")) is not dict
+        or projection["result"].get("type") != "object"
+        or type(projection["result"].get("value")) is not dict
+    ):
+        raise _GuestFailure("browser_crash")
+    extracted = projection["result"]["value"]
+    if (
+        set(extracted) != {"title", "title_truncated"}
+        or type(extracted.get("title")) is not str
+        or type(extracted.get("title_truncated")) is not bool
+    ):
+        raise _GuestFailure("browser_crash")
+    title, title_truncated = _normalized_text(
+        extracted["title"],
+        _MAX_TITLE_BYTES,
+        preserve_lines=False,
+    )
+    title_truncated = title_truncated or extracted["title_truncated"]
+    return title or None, title_truncated
 
 
 async def _frame_identities(cdp: Any) -> tuple[_FrameIdentity, ...]:
@@ -1112,6 +1286,170 @@ def _browser_request_is_admissible(url: Any) -> bool:
     )
 
 
+async def _capture_page_screenshot(
+    page: Any,
+    cdp: Any,
+    request: _Request,
+    *,
+    main_frame_id: str,
+) -> tuple[str, str | None, bool, int, int, bytes]:
+    limits = _screenshot_limits(request)
+    # Keep the document timeline fixed across the trusted measurement and the
+    # later Playwright capture. Page-authored JavaScript is already disabled.
+    freeze_result = await cdp.send("Animation.setPlaybackRate", {"playbackRate": 0})
+    if type(freeze_result) is not dict:
+        raise _GuestFailure("screenshot_failed")
+    document_identity = await _screenshot_document_identity(
+        cdp,
+        expected_frame_id=main_frame_id,
+    )
+    title, title_truncated = await _isolated_page_title(cdp, main_frame_id)
+    if request.full_page:
+        expected_width, expected_height = _screenshot_layout_dimensions(
+            await cdp.send("Page.getLayoutMetrics")
+        )
+    else:
+        expected_width = limits.viewport_width
+        expected_height = limits.viewport_height
+    if (
+        expected_width <= 0
+        or expected_height <= 0
+        or expected_width > limits.max_page_width
+        or expected_height > limits.max_page_height
+        or expected_width * expected_height > limits.max_page_pixels
+    ):
+        raise _GuestFailure("oversized_page")
+    screenshot_options: dict[str, Any] = {
+        "type": "png",
+        "full_page": request.full_page,
+        # Avoid Playwright's temporary inline caret styling. Page CSS can react
+        # to that DOM mutation and change layout after the validated measurement.
+        "caret": "initial",
+    }
+    if request.full_page:
+        # Playwright recomputes full-page dimensions immediately before capture.
+        # Supplying the already-validated rectangle makes that later measurement
+        # unable to expand the bitmap if CSS layout moves between the two steps.
+        screenshot_options["clip"] = {
+            "x": 0,
+            "y": 0,
+            "width": expected_width,
+            "height": expected_height,
+        }
+    screenshot = await page.screenshot(**screenshot_options)
+    if type(screenshot) is not bytes:
+        raise _GuestFailure("screenshot_failed")
+    if len(screenshot) > limits.max_screenshot_bytes:
+        raise _GuestFailure("oversized_screenshot")
+    width, height = _png_header_dimensions(screenshot)
+    if (
+        width > limits.max_page_width
+        or height > limits.max_page_height
+        or width * height > limits.max_page_pixels
+    ):
+        raise _GuestFailure("oversized_page")
+    if (width, height) != (expected_width, expected_height):
+        raise _GuestFailure("screenshot_failed")
+    if request.full_page:
+        stable_width, stable_height = _screenshot_layout_dimensions(
+            await cdp.send("Page.getLayoutMetrics")
+        )
+        if (stable_width, stable_height) != (expected_width, expected_height):
+            if (
+                stable_width > limits.max_page_width
+                or stable_height > limits.max_page_height
+                or stable_width * stable_height > limits.max_page_pixels
+            ):
+                raise _GuestFailure("oversized_page")
+            raise _GuestFailure("screenshot_failed")
+    stable_document_identity = await _screenshot_document_identity(
+        cdp,
+        expected_frame_id=main_frame_id,
+    )
+    if stable_document_identity != document_identity:
+        raise _GuestFailure("screenshot_failed")
+    return document_identity.url, title, title_truncated, width, height, screenshot
+
+
+async def _screenshot_document_identity(
+    cdp: Any,
+    *,
+    expected_frame_id: str,
+) -> _ScreenshotDocumentIdentity:
+    frame_tree = await cdp.send("Page.getFrameTree")
+    if type(frame_tree) is not dict or type(frame_tree.get("frameTree")) is not dict:
+        raise _GuestFailure("screenshot_failed")
+    root = frame_tree["frameTree"]
+    if type(root.get("frame")) is not dict:
+        raise _GuestFailure("screenshot_failed")
+    frame = root["frame"]
+    frame_id = frame.get("id")
+    loader_id = frame.get("loaderId")
+    url = frame.get("url")
+    if (
+        type(expected_frame_id) is not str
+        or not 0 < len(expected_frame_id) <= 256
+        or type(frame_id) is not str
+        or frame_id != expected_frame_id
+        or type(loader_id) is not str
+        or not 0 < len(loader_id) <= 256
+        or type(url) is not str
+        or not 0 < len(url) <= _MAX_URL_LENGTH
+    ):
+        raise _GuestFailure("screenshot_failed")
+    return _ScreenshotDocumentIdentity(
+        frame_id=frame_id,
+        loader_id=loader_id,
+        url=url,
+    )
+
+
+def _screenshot_layout_dimensions(metrics: Any) -> tuple[int, int]:
+    if type(metrics) is not dict or type(metrics.get("cssContentSize")) is not dict:
+        raise _GuestFailure("screenshot_failed")
+    css_content_size = metrics["cssContentSize"]
+    raw_width = css_content_size.get("width")
+    raw_height = css_content_size.get("height")
+    if (
+        isinstance(raw_width, bool)
+        or not isinstance(raw_width, (int, float))
+        or not math.isfinite(raw_width)
+        or isinstance(raw_height, bool)
+        or not isinstance(raw_height, (int, float))
+        or not math.isfinite(raw_height)
+    ):
+        raise _GuestFailure("screenshot_failed")
+    return math.ceil(raw_width), math.ceil(raw_height)
+
+
+def _screenshot_playwright_failure(
+    *,
+    state: _PageState,
+    browser: Any,
+    page: Any,
+) -> _GuestFailure:
+    if state.browser_crashed:
+        return _GuestFailure("browser_crash")
+    try:
+        if not browser.is_connected() or page.is_closed():
+            return _GuestFailure("browser_crash")
+    except Exception:
+        # Failure to inspect ownership after a Playwright transport error is
+        # itself evidence that the browser boundary is no longer trustworthy.
+        return _GuestFailure("browser_crash")
+    return _GuestFailure("screenshot_failed")
+
+
+def _png_header_dimensions(content: bytes) -> tuple[int, int]:
+    if len(content) < 24 or content[:8] != b"\x89PNG\r\n\x1a\n" or content[12:16] != b"IHDR":
+        raise _GuestFailure("screenshot_failed")
+    width = int.from_bytes(content[16:20], "big")
+    height = int.from_bytes(content[20:24], "big")
+    if width <= 0 or height <= 0:
+        raise _GuestFailure("screenshot_failed")
+    return width, height
+
+
 async def _fetch_with_browser(
     request: _Request,
     proxy: str,
@@ -1150,6 +1488,7 @@ async def _fetch_with_browser(
         ]
         | None
     ) = None
+    screenshot_projection: tuple[str, str | None, bool, int, int, bytes] | None = None
     try:
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(
@@ -1175,15 +1514,33 @@ async def _fetch_with_browser(
             timeout=operation_timeout_ms,
         )
         launched = True
+        context_options: dict[str, Any] = {
+            "accept_downloads": False,
+            "ignore_https_errors": False,
+            "java_script_enabled": True,
+            "service_workers": "block",
+        }
+        if request.operation == "screenshot":
+            screenshot_limits = _screenshot_limits(request)
+            context_options.update(
+                viewport={
+                    "width": screenshot_limits.viewport_width,
+                    "height": screenshot_limits.viewport_height,
+                },
+                device_scale_factor=1,
+            )
         context = await browser.new_context(
-            accept_downloads=False,
-            ignore_https_errors=False,
-            java_script_enabled=True,
-            service_workers="block",
+            **context_options,
         )
         page = await context.new_page()
         page.set_default_timeout(operation_timeout_ms)
         page.set_default_navigation_timeout(operation_timeout_ms)
+
+        def browser_crashed(*_args: Any) -> None:
+            state.browser_crashed = True
+
+        browser.on("disconnected", browser_crashed)
+        page.on("crash", browser_crashed)
 
         def abort_page() -> None:
             violation_observed.set()
@@ -1379,22 +1736,42 @@ async def _fetch_with_browser(
         state_failure = _page_state_failure(state, redirects=redirects)
         if state_failure is not None:
             raise state_failure
-        title, representation, content, truncation_reasons = await _extract_page_representation(
-            page,
-            cdp,
-            request,
-            operation_timeout_ms=operation_timeout_ms,
-        )
+        if request.operation == "fetch":
+            title, representation, content, truncation_reasons = await _extract_page_representation(
+                page,
+                cdp,
+                request,
+                operation_timeout_ms=operation_timeout_ms,
+            )
+        else:
+            try:
+                if main_frame_id is None:
+                    raise _GuestFailure("browser_crash")
+                screenshot_projection = await _capture_page_screenshot(
+                    page,
+                    cdp,
+                    request,
+                    main_frame_id=main_frame_id,
+                )
+            except PlaywrightTimeoutError:
+                raise
+            except PlaywrightError as exc:
+                raise _screenshot_playwright_failure(
+                    state=state,
+                    browser=browser,
+                    page=page,
+                ) from exc
         state_failure = _page_state_failure(state, redirects=redirects)
         if state_failure is not None:
             raise state_failure
-        success_projection = (
-            page.url,
-            title,
-            representation,
-            content,
-            truncation_reasons,
-        )
+        if request.operation == "fetch":
+            success_projection = (
+                page.url,
+                title,
+                representation,
+                content,
+                truncation_reasons,
+            )
     except asyncio.CancelledError as exc:
         primary = exc
         raise
@@ -1450,11 +1827,32 @@ async def _fetch_with_browser(
             if cause is None:
                 raise cleanup
             raise cleanup from cause
-    if success_projection is None:  # pragma: no cover - success construction invariant
-        raise _GuestFailure("browser_crash")
     state_failure = _page_state_failure(state, redirects=redirects)
     if state_failure is not None:
         raise state_failure
+    if request.operation == "screenshot":
+        if screenshot_projection is None:  # pragma: no cover - success construction invariant
+            raise _GuestFailure("browser_crash")
+        final_url, title, title_truncated, width, height, screenshot = screenshot_projection
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "worker_version": WORKER_VERSION,
+            "playwright_version": PLAYWRIGHT_VERSION,
+            "kind": "screenshot",
+            "requested_url": request.url,
+            "final_url": final_url,
+            "title": title,
+            "title_truncated": title_truncated,
+            "redirects": list(redirects),
+            "response_bytes": state.response_bytes,
+            "request_count": state.request_count,
+            "full_page": request.full_page,
+            "width": width,
+            "height": height,
+            "data_base64": base64.b64encode(screenshot).decode("ascii"),
+        }
+    if success_projection is None:  # pragma: no cover - success construction invariant
+        raise _GuestFailure("browser_crash")
     final_url, title, representation, content, final_truncation_reasons = success_projection
     return {
         "protocol_version": PROTOCOL_VERSION,

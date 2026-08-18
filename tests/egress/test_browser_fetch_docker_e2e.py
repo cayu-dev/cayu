@@ -9,6 +9,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from cayu import (
     BrowserEgressPolicy,
     BrowserWebFetchAdapter,
     ExecCommand,
+    LocalArtifactStore,
+    ScreenshotPageTool,
     ToolContext,
     WebFetchTool,
 )
@@ -34,7 +37,7 @@ from cayu.vaults import SecretRedactor
 
 _BROWSER_IMAGE = os.environ.get(
     "CAYU_BROWSER_FETCH_IMAGE",
-    "cayu-browser-fetch:2-playwright-1.62.0-test",
+    "cayu-browser-fetch:3-playwright-1.62.0-test",
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SECCOMP_PROFILE = _REPOSITORY_ROOT / "examples" / "browser_fetch" / "seccomp_profile.json"
@@ -288,6 +291,11 @@ class _RecordingUpstream:
 
 
 async def _drive_browser_fetch() -> dict[str, Any]:
+    artifact_temp = tempfile.TemporaryDirectory(prefix="cayu-browser-screenshots-")
+    artifact_store = LocalArtifactStore(
+        Path(artifact_temp.name) / "artifacts",
+        store_id="browser-screenshot-e2e",
+    )
     endpoint = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _BrowserFixtureHandler)
     endpoint_thread = threading.Thread(target=endpoint.serve_forever, daemon=True)
     endpoint_thread.start()
@@ -317,6 +325,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
         credentials=[],
         adapter=DockerEgressAdapter(seccomp_profile=str(_SECCOMP_PROFILE)),
         image=_BROWSER_IMAGE,
+        artifact_store=artifact_store,
         upstream=upstream,
     )
     result = None
@@ -330,8 +339,10 @@ async def _drive_browser_fetch() -> dict[str, Any]:
         )
         runner = result.environment.runner
         binding = result.environment.binding
+        environment_artifact_store = result.environment.artifact_store
         assert runner is not None
         assert binding is not None
+        assert environment_artifact_store is artifact_store
         handle = InvocationRunnerHandle(
             runner,
             redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
@@ -345,6 +356,45 @@ async def _drive_browser_fetch() -> dict[str, Any]:
             max_content_bytes=16 * 1024,
             timeout_seconds=30,
             max_redirects=3,
+        )
+        screenshot_tool = ScreenshotPageTool(
+            max_response_bytes=1024 * 1024,
+            timeout_seconds=30,
+            max_redirects=3,
+            viewport_width=800,
+            viewport_height=600,
+            max_page_width=1600,
+            max_page_height=2400,
+            max_page_pixels=3_840_000,
+        )
+        screenshot = await screenshot_tool.run(
+            ToolContext(
+                session_id="browser-fetch-e2e",
+                agent_name="agent",
+                environment_name="browser",
+                idempotency_key="browser-screenshot-e2e-call",
+                runner=handle,
+                artifact_store=environment_artifact_store,
+            ),
+            {"url": "https://docs.browser.test/structured"},
+        )
+        assert screenshot.is_error is False
+        assert screenshot.structured is not None
+        screenshot_artifact_id = screenshot.structured["artifact_id"]
+        assert type(screenshot_artifact_id) is str
+        screenshot_read = await artifact_store.read_bytes(
+            screenshot_artifact_id,
+        )
+        screenshot_denied = await screenshot_tool.run(
+            ToolContext(
+                session_id="browser-fetch-e2e",
+                agent_name="agent",
+                environment_name="browser",
+                idempotency_key="browser-screenshot-e2e-denied-call",
+                runner=handle,
+                artifact_store=environment_artifact_store,
+            ),
+            {"url": "https://docs.browser.test/redirect-then-denied"},
         )
         success = await tool.run(
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
@@ -473,8 +523,151 @@ async def _drive_browser_fetch() -> dict[str, Any]:
             ),
             timeout_s=10,
         )
+        screenshot_stability_probe = await handle.exec(
+            ExecCommand.process(
+                "python",
+                "-c",
+                r'''
+import asyncio
+import importlib.util
+import json
+import math
+import sys
+
+from playwright.async_api import async_playwright
+
+spec = importlib.util.spec_from_file_location(
+    "cayu_browser_worker_screenshot_stability_probe",
+    "/opt/cayu-browser/worker.py",
+)
+if spec is None or spec.loader is None:
+    raise RuntimeError("browser worker module is unavailable")
+worker = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = worker
+spec.loader.exec_module(worker)
+
+HTML = """<!doctype html><style>
+html,body{margin:0;width:64px;height:48px}
+@keyframes grow{from{height:48px}to{height:96px}}
+body{animation:grow 2s linear infinite alternate;background:red}
+</style><title>stable</title><div>x</div>"""
+
+async def dimensions(cdp):
+    metrics = await cdp.send("Page.getLayoutMetrics")
+    size = metrics["cssContentSize"]
+    return [math.ceil(size["width"]), math.ceil(size["height"])]
+
+class NavigatingScreenshotPage:
+    def __init__(self, page):
+        self.page = page
+
+    async def screenshot(self, **kwargs):
+        await self.page.goto("https://docs.test/next", wait_until="load")
+        return await self.page.screenshot(**kwargs)
+
+async def main():
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            chromium_sandbox=True,
+        )
+        try:
+            context = await browser.new_context(
+                viewport={"width": 64, "height": 48},
+                device_scale_factor=1,
+            )
+            page = await context.new_page()
+            await page.set_content(HTML)
+            cdp = await context.new_cdp_session(page)
+            frame_tree = await cdp.send("Page.getFrameTree")
+            frame_id = frame_tree["frameTree"]["frame"]["id"]
+            await cdp.send("Emulation.setScriptExecutionDisabled", {"value": True})
+            request = worker._Request(
+                url="https://example.com/",
+                operation="screenshot",
+                full_page=True,
+                limits=worker._ScreenshotLimits(
+                    max_response_bytes=1024,
+                    timeout_seconds=5,
+                    max_redirects=2,
+                    max_requests=10,
+                    max_screenshot_bytes=1024 * 1024,
+                    viewport_width=64,
+                    viewport_height=48,
+                    max_page_width=256,
+                    max_page_height=256,
+                    max_page_pixels=65_536,
+                ),
+            )
+            _, _, _, width, height, _ = await worker._capture_page_screenshot(
+                page,
+                cdp,
+                request,
+                main_frame_id=frame_id,
+            )
+            playback_rate = await cdp.send("Animation.getPlaybackRate")
+            post_capture_layouts = []
+            for _ in range(8):
+                await asyncio.sleep(0.1)
+                post_capture_layouts.append(await dimensions(cdp))
+
+            async def fulfill_document(route):
+                title = "replacement" if route.request.url.endswith("/next") else "initial"
+                color = "blue" if title == "replacement" else "red"
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=(
+                        f"<!doctype html><title>{title}</title>"
+                        f'<body style="margin:0;width:64px;height:48px;background:{color}">'
+                        f"{title}</body>"
+                    ),
+                )
+
+            await context.route("https://docs.test/**", fulfill_document)
+            navigation_page = await context.new_page()
+            await navigation_page.goto("https://docs.test/start", wait_until="load")
+            navigation_cdp = await context.new_cdp_session(navigation_page)
+            navigation_frame_tree = await navigation_cdp.send("Page.getFrameTree")
+            navigation_frame_id = navigation_frame_tree["frameTree"]["frame"]["id"]
+            await navigation_cdp.send(
+                "Emulation.setScriptExecutionDisabled",
+                {"value": True},
+            )
+            document_change_error = None
+            try:
+                await worker._capture_page_screenshot(
+                    NavigatingScreenshotPage(navigation_page),
+                    navigation_cdp,
+                    request,
+                    main_frame_id=navigation_frame_id,
+                )
+            except worker._GuestFailure as exc:
+                document_change_error = exc.code
+            print(
+                json.dumps(
+                    {
+                        "animation_playback_rate": playback_rate["playbackRate"],
+                        "captured": [width, height],
+                        "document_change_error": document_change_error,
+                        "post_capture_layouts": post_capture_layouts,
+                    },
+                    sort_keys=True,
+                )
+            )
+        finally:
+            await browser.close()
+
+asyncio.run(main())
+''',
+            ),
+            timeout_s=15,
+        )
         return {
             "success": success,
+            "screenshot": screenshot,
+            "screenshot_bytes": screenshot_read.content,
+            "screenshot_denied": screenshot_denied,
             "structured": structured,
             "navigation": navigation,
             "shadow_controls": shadow_controls,
@@ -491,6 +684,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
             "denied_subresource": denied_subresource,
             "worker_integrity_probe": worker_integrity_probe,
             "network_probe": network_probe,
+            "screenshot_stability_probe": screenshot_stability_probe,
             "requests": tuple((request.host, request.path) for request in upstream.requests),
         }
     finally:
@@ -503,6 +697,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
         endpoint.shutdown()
         endpoint.server_close()
         endpoint_thread.join(timeout=5)
+        artifact_temp.cleanup()
 
 
 @pytest.fixture(scope="module")
@@ -535,6 +730,56 @@ def test_browser_fetch_renders_javascript_through_managed_virtual_egress(
     assert ("docs.browser.test", "/start") in browser_fetch_results["requests"]
     assert ("docs.browser.test", "/guide") in browser_fetch_results["requests"]
     assert ("static.browser.test", "/render.js") in browser_fetch_results["requests"]
+
+
+def test_screenshot_page_returns_an_artifact_backed_model_image_without_bypassing_egress(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["screenshot"]
+
+    assert result.is_error is False
+    assert result.structured["requested_url"] == "https://docs.browser.test/structured"
+    assert result.structured["final_url"] == "https://docs.browser.test/structured"
+    assert result.structured["title"] == "Deployment console"
+    assert result.structured["full_page"] is False
+    assert result.structured["width"] == 800
+    assert result.structured["height"] == 600
+    assert len(result.artifacts) == 1
+    attachment = result.artifacts[0]
+    assert attachment["type"] == "cayu.file_attachment.v1"
+    assert attachment["kind"] == "image"
+    assert attachment["content_type"] == "image/png"
+    assert attachment["artifact_id"] == result.structured["artifact_id"]
+    screenshot = browser_fetch_results["screenshot_bytes"]
+    assert type(screenshot) is bytes
+    assert screenshot.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(screenshot) == attachment["size_bytes"]
+    assert "data_base64" not in json.dumps(result.model_dump(mode="json"))
+    assert ("docs.browser.test", "/structured") in browser_fetch_results["requests"]
+    # Exercise the screenshot operation itself against a page that requests a
+    # prohibited subresource; the worker must fail before publishing an image.
+    denied = browser_fetch_results["screenshot_denied"]
+    assert denied.structured == {"error": "destination_denied"}
+    assert denied.artifacts == []
+    assert ("static.browser.test", "/private/subresource.js") not in browser_fetch_results[
+        "requests"
+    ]
+
+
+def test_full_page_screenshot_freezes_layout_and_rejects_document_replacement(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    probe = browser_fetch_results["screenshot_stability_probe"]
+
+    assert probe.exit_code == 0
+    assert probe.timed_out is False
+    evidence = json.loads(probe.stdout)
+    assert evidence["animation_playback_rate"] == 0
+    captured = evidence["captured"]
+    assert captured[0] == 64
+    assert 48 <= captured[1] <= 96
+    assert evidence["document_change_error"] == "screenshot_failed"
+    assert evidence["post_capture_layouts"] == [captured] * 8
 
 
 def test_browser_fetch_preserves_structured_page_relationships_as_accessibility_evidence(

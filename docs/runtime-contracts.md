@@ -4477,6 +4477,19 @@ and `aria-hidden` subtrees—remain inside the safety accounting but cannot
 select or contribute model-facing evidence. See
 [`docs/web-fetch.md`](web-fetch.md) for registration and deployment guidance.
 
+`ScreenshotPageTool` exposes the separate closed `screenshot_page` schema with
+`url` and optional `full_page`. It has no direct-host implementation: capture
+uses the same versioned, admitted browser worker and virtual-egress path. The
+worker bounds layout dimensions, pixels, PNG bytes, requests, response bytes,
+redirects, and elapsed time before returning a bounded internal base64
+transport. The host validates the PNG container and declared dimensions, stores
+the raw bytes through the environment's `ArtifactStore`, and returns only a
+session-scoped artifact reference plus a provider-neutral image attachment.
+Raw image bytes/base64 never enter model-facing text or structured output.
+Because artifact creation is durable, the tool declares `ToolEffect.EXTERNAL`;
+runtime-provided idempotency identity is used for deterministic artifact
+publication and exact acknowledgement-loss reconciliation.
+
 A custom `Tool` uses environment services through `ctx`:
 `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the
 environment's runner, while `ctx.workspace.read_bytes(path, offset=...,

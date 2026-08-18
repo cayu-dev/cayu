@@ -10,6 +10,7 @@ from cayu.tools.browser import (
     MAX_BROWSER_FETCH_MAX_DOM_NODES,
     MAX_BROWSER_FETCH_MAX_REQUESTS,
     BrowserWebFetchAdapter,
+    ScreenshotPageTool,
 )
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (
@@ -100,6 +101,7 @@ __all__ = [
     "ReadKnowledgeTool",
     "RememberKnowledgePolicy",
     "RememberKnowledgeTool",
+    "ScreenshotPageTool",
     "SearchKnowledgeTool",
     "SearchTextTool",
     "SubagentContextMode",

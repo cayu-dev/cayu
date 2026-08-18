@@ -1,8 +1,9 @@
-# Sandboxed browser fetch image
+# Sandboxed browser inspection image
 
-This image is the versioned guest half of `BrowserWebFetchAdapter`. It contains
+This image is the versioned guest half of `BrowserWebFetchAdapter` and
+`ScreenshotPageTool`. It contains
 Playwright 1.62.0, its matching Chromium build, NSS tooling for the per-session
-Cayu CA, and the closed `cayu.browser-fetch.v2` worker. The image runs as the
+Cayu CA, and the closed `cayu.browser-fetch.v3` worker. The image runs as the
 non-root `pwuser`; the root-owned, read-only worker refuses root execution and
 launches Chromium with its browser sandbox enabled. Other commands running as
 the guest user cannot replace the versioned worker between invocations.
@@ -18,7 +19,7 @@ Build from the repository root:
 ```bash
 docker build \
   --file examples/browser_fetch/Dockerfile \
-  --tag cayu-browser-fetch:2-playwright-1.62.0 \
+  --tag cayu-browser-fetch:3-playwright-1.62.0 \
   .
 ```
 
@@ -40,6 +41,7 @@ from cayu import (
     ApprovedEgressDestination,
     BrowserEgressPolicy,
     BrowserWebFetchAdapter,
+    ScreenshotPageTool,
     WebFetchTool,
 )
 
@@ -58,13 +60,14 @@ approved_destinations = [
     for host in ("docs.example.com", "static.example.com")
 ]
 web_fetch = WebFetchTool(adapter=BrowserWebFetchAdapter())
+screenshot_page = ScreenshotPageTool()
 ```
 
 Pass `policies={"product-docs": browser_policy}`,
 `approved_destinations=approved_destinations`, `credentials=[]`, an adapter
 constructed with
 `DockerEgressAdapter(seccomp_profile="/absolute/path/to/examples/browser_fetch/seccomp_profile.json")`,
-and `image="cayu-browser-fetch:2-playwright-1.62.0"` to
+and `image="cayu-browser-fetch:3-playwright-1.62.0"` to
 `VirtualEgressEnvironmentFactory`. Plain Docker proves the enforced networking
 path for trusted development and CI; it is not Cayu's untrusted-code isolation
 boundary. Applications that require a stronger boundary use the same adapter
@@ -93,6 +96,14 @@ shares the configured DOM/content limits across the complete page rather than
 granting each frame a separate allowance. Frame subtrees ignored by Chromium's
 accessibility tree remain counted for safety but are excluded from model-facing
 evidence.
+
+`ScreenshotPageTool` uses the same worker and egress boundary. Its only model
+presentation option is `full_page`; PNG format, viewport, dimensions, pixels,
+bytes, and all navigation/network limits are host configuration. The active
+environment must include an artifact store. Successful captures are stored as
+session-scoped PNG artifacts and returned as provider-neutral image attachments;
+worker base64 is bounded internal transport and never appears in model-facing
+text or structured output.
 
 The checked-in seccomp profile is Playwright 1.62.0's
 [published Docker profile](https://github.com/microsoft/playwright/blob/v1.62.0/utils/docker/seccomp_profile.json):

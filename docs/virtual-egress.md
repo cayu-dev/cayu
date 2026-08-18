@@ -350,6 +350,8 @@ from cayu import (
     CayuApp,
     EnvironmentSpec,
     ExecutionRequirements,
+    S3ArtifactStore,
+    ScreenshotPageTool,
     VirtualEgressEnvironmentFactory,
     WebFetchTool,
 )
@@ -376,7 +378,8 @@ factory = VirtualEgressEnvironmentFactory(
     adapter=DockerEgressAdapter(
         seccomp_profile="/absolute/path/to/browser_fetch/seccomp_profile.json",
     ),
-    image="cayu-browser-fetch:2-playwright-1.62.0",
+    image="cayu-browser-fetch:3-playwright-1.62.0",
+    artifact_store=S3ArtifactStore("production-artifacts"),
 )
 
 app = CayuApp()
@@ -387,7 +390,10 @@ app.register_environment_factory(
 )
 app.register_agent(
     AgentSpec(name="docs-agent", model="gpt-5.4-mini"),
-    tools=[WebFetchTool(adapter=BrowserWebFetchAdapter())],
+    tools=[
+        WebFetchTool(adapter=BrowserWebFetchAdapter()),
+        ScreenshotPageTool(),
+    ],
     execution_requirements=ExecutionRequirements.trusted(),
 )
 ```
@@ -413,8 +419,12 @@ before dispatch. There is no host-HTTP or host-Playwright fallback. Response
 bytes, selected content, frame documents, aggregate composed-DOM nodes,
 accessibility-tree depth, requests, redirects, command output, and elapsed time
 all have independent limits. The worker owns exactly one page; an unexpected
-popup or other secondary page fails the fetch instead of creating an unmetered
-network surface.
+popup or other secondary page fails the operation instead of creating an
+unmetered network surface. `ScreenshotPageTool` adds application-owned viewport,
+full-page dimension, pixel, and PNG-byte ceilings on the same path. It requires
+the factory's `artifact_store`, stores only a session-scoped PNG, and returns a
+provider-neutral image attachment without placing worker base64 in model-facing
+text or structured output.
 
 Each temporary browser profile has a separate cleanup guardian before page
 execution begins. The guardian receives no application environment or
