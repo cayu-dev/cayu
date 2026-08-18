@@ -65,6 +65,9 @@ from cayu.tools.web import (
     WebFetchHttpTransport,
     WebFetchResolver,
     WebFetchTool,
+    WebSearchAdapter,
+    WebSearchAdapterRequest,
+    WebSearchTool,
 )
 
 __all__ = [
@@ -119,6 +122,9 @@ __all__ = [
     "WebFetchHttpTransport",
     "WebFetchResolver",
     "WebFetchTool",
+    "WebSearchAdapter",
+    "WebSearchAdapterRequest",
+    "WebSearchTool",
     "WriteFileTool",
     "default_artifact_readers",
     "default_background_subagent_registry",
