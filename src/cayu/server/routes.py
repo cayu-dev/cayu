@@ -7369,6 +7369,7 @@ def create_router(
         try:
             chunks = await knowledge_store.read_chunks(
                 entry.id,
+                access_scope=knowledge_access_scope,
                 max_chunks=max_chunks,
                 max_bytes=max_bytes,
             )

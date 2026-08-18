@@ -38,6 +38,7 @@ from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
+    KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgeFacet,
     KnowledgeHit,
@@ -620,6 +621,95 @@ def test_in_memory_embedding_store_prune_expired_drops_embeddings() -> None:
     assert entry is None
 
 
+def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider_awaits() -> None:
+    class QueryBlockingEmbeddingProvider(TextEmbeddingProvider):
+        name = "query-blocking-keyword-test"
+
+        def __init__(self) -> None:
+            self.query_started = asyncio.Event()
+            self.release_query = asyncio.Event()
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            if self.call_count == 2:
+                self.query_started.set()
+                await self.release_query.wait()
+            return TextEmbeddingResult(
+                model=request.model,
+                embeddings=[
+                    TextEmbedding(index=index, vector=_test_embedding_vector(text))
+                    for index, text in enumerate(request.texts)
+                ],
+            )
+
+    async def run() -> tuple[KnowledgeEntry, KnowledgeChunk]:
+        provider = QueryBlockingEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        privileged = KnowledgeAccessScope.privileged()
+        tenant_scope = KnowledgeAccessScope.for_namespace("tenant-a")
+        original = KnowledgeEntry(
+            id="shared-entry",
+            namespace="tenant-a",
+            text="Tenant A credential policy.",
+        )
+        original_chunk = KnowledgeChunk(
+            id="shared-entry:0",
+            entry_id=original.id,
+            chunk_index=0,
+            text=original.text,
+        )
+        await store.put_entry_with_chunks(
+            original,
+            [original_chunk],
+            access_scope=privileged,
+        )
+
+        search_task = asyncio.create_task(
+            store.search(
+                KnowledgeQuery(
+                    text="credential",
+                    namespace="tenant-a",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                ),
+                access_scope=tenant_scope,
+            )
+        )
+        await asyncio.wait_for(provider.query_started.wait(), timeout=2)
+        replacement = KnowledgeEntry(
+            id=original.id,
+            namespace="tenant-b",
+            text="Tenant B secret credential policy.",
+        )
+        replacement_chunk = KnowledgeChunk(
+            id=original_chunk.id,
+            entry_id=replacement.id,
+            chunk_index=0,
+            text=replacement.text,
+        )
+        await store.put_entry_with_chunks(
+            replacement,
+            [replacement_chunk],
+            access_scope=privileged,
+        )
+        provider.release_query.set()
+        result = await search_task
+
+        assert await store.get_entry(original.id, access_scope=tenant_scope) is None
+        assert result.hits
+        returned_chunk = result.hits[0].chunk
+        assert returned_chunk is not None
+        return result.hits[0].entry, returned_chunk
+
+    entry, chunk = asyncio.run(run())
+
+    assert entry.namespace == "tenant-a"
+    assert chunk.text == "Tenant A credential policy."
+
+
 def test_in_memory_owned_publication_does_not_apply_stale_derived_embeddings() -> None:
     class FirstCallBlockingEmbeddingProvider(TextEmbeddingProvider):
         name = "blocking-keyword-test"
@@ -1035,7 +1125,7 @@ def test_in_memory_embedding_store_rejects_cross_entry_chunk_id_collision_atomic
         )
         embeddings_before = dict(store._chunk_embeddings)
 
-        with pytest.raises(ValueError, match="globally unique"):
+        with pytest.raises(KnowledgeChunkConflict):
             await store.put_entry_with_chunks(
                 KnowledgeEntry(id="beta", text="Invoice policy."),
                 [
@@ -1077,7 +1167,7 @@ def test_in_memory_store_rejects_default_chunk_id_collision_atomically() -> None
             ],
         )
 
-        with pytest.raises(ValueError, match="globally unique"):
+        with pytest.raises(KnowledgeChunkConflict):
             await store.put_entry(KnowledgeEntry(id="beta", text="Invoice policy."))
 
         return await store.get_entry("beta"), await store.read_chunks("alpha")

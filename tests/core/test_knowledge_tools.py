@@ -13,8 +13,10 @@ from cayu import (
     EnvironmentSpec,
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
+    KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeChunk,
+    KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
@@ -1358,6 +1360,64 @@ def test_remember_knowledge_bounds_grouped_receipt_lookup_failure() -> None:
     assert "canary" not in result.content
     assert "canary" not in repr(result.structured)
     assert publish_calls == 0
+
+
+@pytest.mark.parametrize("confirmation_failure", ["unavailable", "absent"])
+def test_remember_knowledge_does_not_report_unverified_replay_as_receipt_conflict(
+    confirmation_failure: str,
+) -> None:
+    class UnverifiedReplayStore(_TestKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.confirmation_failure: str | None = None
+            self.replay_receipt_reads = 0
+            self.publish_calls = 0
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publish_calls += 1
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+        async def load_entry_publication_receipt(self, operation_id):
+            if self.confirmation_failure is not None:
+                self.replay_receipt_reads += 1
+                if self.replay_receipt_reads == 2:
+                    if self.confirmation_failure == "unavailable":
+                        raise RuntimeError("receipt confirmation unavailable")
+                    return None
+            return await super().load_entry_publication_receipt(operation_id)
+
+    async def run():
+        store = UnverifiedReplayStore()
+        context = ToolContext(
+            session_id="session_1",
+            idempotency_key="unverified-replay-operation",
+            knowledge_store=store,
+        )
+        arguments = {"text": "A transient confirmation failure is not a conflict."}
+        written = await RememberKnowledgeTool().run(context, arguments)
+        store.confirmation_failure = confirmation_failure
+        replay = await RememberKnowledgeTool().run(context, arguments)
+        replay_receipt_reads = store.replay_receipt_reads
+        store.confirmation_failure = None
+        receipt = await store.load_entry_publication_receipt("unverified-replay-operation")
+        return written, replay, receipt, replay_receipt_reads, store.publish_calls
+
+    written, replay, receipt, replay_receipt_reads, publish_calls = asyncio.run(run())
+
+    assert written.is_error is False
+    assert replay.is_error is True
+    assert replay.structured == {
+        "error": "knowledge_write_failed",
+        "outcome": "receipt_read_failed",
+        "cleanup": "not_attempted_unowned",
+    }
+    assert receipt is not None
+    assert replay_receipt_reads == 2
+    assert publish_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -3025,6 +3085,301 @@ def test_remember_knowledge_fails_closed_on_incompatible_existing_material_or_sc
         "entry_id": existing.id,
     }
     assert stored == existing
+
+
+def test_remember_knowledge_reports_global_chunk_collision_as_deterministic_conflict() -> None:
+    async def run():
+        text = "A deterministic chunk collision must not be reported as ambiguous."
+        target_entry_id = content_knowledge_entry_id(
+            namespace="default",
+            kind="fact",
+            source_hash=knowledge_source_hash(text),
+        )
+        operation_id = "global-chunk-collision"
+        store = _TestKnowledgeStore()
+        owner = KnowledgeEntry(
+            id="chunk-owner",
+            text="Unrelated durable material.",
+        )
+        owner_chunk = KnowledgeChunk(
+            id=f"{target_entry_id}:0",
+            entry_id=owner.id,
+            chunk_index=0,
+            text=owner.text,
+        )
+        await store.put_entry_with_chunks(owner, [owner_chunk])
+
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key=operation_id,
+                knowledge_store=store,
+            ),
+            {"text": text},
+        )
+        return (
+            result,
+            target_entry_id,
+            await store.get_entry(target_entry_id),
+            await store.read_chunks(owner.id),
+            await store.load_entry_publication_receipt(operation_id),
+        )
+
+    result, target_entry_id, target, owner_chunks, receipt = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "knowledge_write_failed",
+        "outcome": "publication_conflict",
+        "cleanup": "not_attempted_unowned",
+        "entry_id": target_entry_id,
+    }
+    assert target is None
+    assert len(owner_chunks) == 1
+    assert owner_chunks[0].id == f"{target_entry_id}:0"
+    assert receipt is None
+
+
+def test_remember_knowledge_reports_scoped_publication_denial_without_ambiguity() -> None:
+    async def run():
+        text = "A foreign publication occupant must remain outside the caller scope."
+        target_entry_id = content_knowledge_entry_id(
+            namespace="default",
+            kind="fact",
+            source_hash=knowledge_source_hash(text),
+        )
+        operation_id = "scoped-publication-denial"
+        store = InMemoryKnowledgeStore()
+        privileged = KnowledgeAccessScope.privileged()
+        foreign = KnowledgeEntry(
+            id=target_entry_id,
+            namespace="foreign",
+            text="Foreign durable material.",
+        )
+        await store.put_entry(foreign, access_scope=privileged)
+        caller_scope = KnowledgeAccessScope.for_namespace(
+            "default",
+            allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+        )
+
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key=operation_id,
+                knowledge_store=store,
+                knowledge_access_scope=caller_scope,
+            ),
+            {"text": text},
+        )
+        return (
+            result,
+            target_entry_id,
+            await store.get_entry(target_entry_id, access_scope=privileged),
+            await store.load_entry_publication_receipt(
+                operation_id,
+                access_scope=privileged,
+            ),
+        )
+
+    result, target_entry_id, stored, receipt = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "knowledge_write_failed",
+        "outcome": "access_denied",
+        "cleanup": "not_attempted_unowned",
+        "entry_id": target_entry_id,
+    }
+    assert stored is not None
+    assert stored.namespace == "foreign"
+    assert stored.text == "Foreign durable material."
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "visible_receipt_read"),
+    [
+        pytest.param(KnowledgeAccessDenied, None, id="access-denied-unavailable"),
+        pytest.param(KnowledgeChunkConflict, None, id="chunk-conflict-unavailable"),
+        pytest.param(KnowledgePublicationConflict, None, id="operation-conflict-unavailable"),
+        pytest.param(KnowledgePublicationConflict, 3, id="operation-conflict-partial"),
+    ],
+)
+def test_remember_knowledge_preserves_ambiguity_when_receipt_reconciliation_fails(
+    failure_type: type[Exception],
+    visible_receipt_read: int | None,
+) -> None:
+    class PostCommitFailureStore(_TestKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_reads = 0
+            self.committed_receipt: KnowledgePublicationReceipt | None = None
+
+        async def load_entry_publication_receipt(
+            self,
+            operation_id,
+            *,
+            access_scope=None,
+        ):
+            self.receipt_reads += 1
+            if self.receipt_reads == 1 or self.receipt_reads == visible_receipt_read:
+                return await super().load_entry_publication_receipt(
+                    operation_id,
+                    access_scope=access_scope,
+                )
+            raise RuntimeError("receipt reconciliation unavailable")
+
+        async def publish_entry_with_chunks(
+            self,
+            entry,
+            chunks,
+            *,
+            access_scope=None,
+            operation_id,
+        ):
+            self.committed_receipt = await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                access_scope=access_scope,
+                operation_id=operation_id,
+            )
+            reason = (
+                "operation_mismatch"
+                if failure_type is KnowledgePublicationConflict
+                else "publish_entry_with_chunks"
+            )
+            raise failure_type(reason)
+
+    async def run():
+        store = PostCommitFailureStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="post-commit-reconciliation-failure",
+                knowledge_store=store,
+            ),
+            {"text": "Unavailable reconciliation cannot prove publication did not commit."},
+        )
+        assert result.structured is not None
+        return result, store, await store.get_entry(result.structured["entry_id"])
+
+    result, store, stored = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == "ambiguous_publication"
+    assert stored is not None
+    assert store.committed_receipt is not None
+    assert store.committed_receipt.entry_id == stored.id
+    assert store.receipt_reads == (3 if visible_receipt_read is None else 4)
+
+
+@pytest.mark.parametrize(
+    ("receipt_readback", "expected_outcome"),
+    [
+        pytest.param("unavailable", "ambiguous_publication", id="unavailable"),
+        pytest.param("absent", "invalid_publication_result", id="confirmed-absent"),
+    ],
+)
+def test_remember_knowledge_requires_receipt_evidence_to_reject_success_acknowledgement(
+    receipt_readback: str,
+    expected_outcome: str,
+) -> None:
+    class SuccessAcknowledgementStore(_TestKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_reads = 0
+            self.publish_calls = 0
+            self.committed_receipt: KnowledgePublicationReceipt | None = None
+
+        async def load_entry_publication_receipt(
+            self,
+            operation_id,
+            *,
+            access_scope=None,
+        ):
+            self.receipt_reads += 1
+            if self.receipt_reads == 1:
+                return await super().load_entry_publication_receipt(
+                    operation_id,
+                    access_scope=access_scope,
+                )
+            if receipt_readback == "unavailable":
+                raise RuntimeError("receipt readback unavailable")
+            return None
+
+        async def publish_entry_with_chunks(
+            self,
+            entry,
+            chunks,
+            *,
+            access_scope=None,
+            operation_id,
+        ):
+            self.publish_calls += 1
+            self.committed_receipt = await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                access_scope=access_scope,
+                operation_id=operation_id,
+            )
+            return self.committed_receipt
+
+    async def run():
+        store = SuccessAcknowledgementStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="success-acknowledgement-readback",
+                knowledge_store=store,
+            ),
+            {"text": "A successful acknowledgement still requires durable readback."},
+        )
+        assert result.structured is not None
+        return result, store, await store.get_entry(result.structured["entry_id"])
+
+    result, store, stored = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == expected_outcome
+    assert stored is not None
+    assert store.committed_receipt is not None
+    assert store.committed_receipt.entry_id == stored.id
+    assert store.receipt_reads == 3
+    assert store.publish_calls == 1
+
+
+def test_remember_knowledge_reports_only_proven_receipt_incompatibility_as_conflict() -> None:
+    class IncompatibleReceiptStore(_TestKnowledgeStore):
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            receipt = await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+            self._publication_receipts[operation_id] = receipt.model_copy(
+                update={"request_sha256": "0" * 64}
+            )
+            raise KnowledgePublicationConflict("operation_mismatch")
+
+    async def run():
+        store = IncompatibleReceiptStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="incompatible-publication-receipt",
+                knowledge_store=store,
+            ),
+            {"text": "Only authenticated receipt incompatibility is a conflict."},
+        )
+        receipt = await store.load_entry_publication_receipt("incompatible-publication-receipt")
+        return result, receipt
+
+    result, receipt = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == "operation_conflict"
+    assert receipt is not None
+    assert receipt.request_sha256 == "0" * 64
 
 
 def test_remember_knowledge_rejects_incompatible_concurrent_winner() -> None:

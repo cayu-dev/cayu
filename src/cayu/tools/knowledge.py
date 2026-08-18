@@ -32,9 +32,11 @@ from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
+    KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgeFacet,
     KnowledgeHit,
@@ -748,21 +750,27 @@ class RememberKnowledgeTool(Tool):
                 raise ValueError("`text` exceeds the configured remember_knowledge chunk capacity.")
         if prior_receipt is not None:
             result = _remember_result_with_receipt_identity(result, prior_receipt)
-            if not await _remember_confirm_owned_publication(
+            observation = await _remember_observe_owned_publication(
                 store,
                 result=result,
                 operation_id=operation_id,
                 receipt=prior_receipt,
                 operation_registry=self._read_operations,
-            ):
-                return _knowledge_write_failed_result(
-                    # The receipt is extension-owned and has not authenticated
-                    # its identity against the requested publication. Keep its
-                    # entry id out of model-visible failure evidence.
-                    entry_id=None,
-                    outcome="receipt_conflict",
-                )
-            return _remember_knowledge_replayed_result(result)
+            )
+            if observation.confirmed:
+                return _remember_knowledge_replayed_result(result)
+            return _knowledge_write_failed_result(
+                # The receipt is extension-owned and has not authenticated its
+                # identity against the requested publication. Keep its entry id
+                # out of model-visible failure evidence, but do not turn an
+                # unavailable confirmation read into an identity conflict.
+                entry_id=None,
+                outcome=(
+                    "receipt_conflict"
+                    if observation.receipt_incompatible
+                    else "receipt_read_failed"
+                ),
+            )
 
         return await self._await_owned_publication(
             store=store,
@@ -857,6 +865,14 @@ class RememberKnowledgeTool(Tool):
 class _OwnedKnowledgePublication:
     intent_sha256: str
     task: asyncio.Task[ToolResult]
+
+
+@dataclass(frozen=True)
+class _RememberPublicationObservation:
+    confirmed: bool = False
+    receipt_present: bool = False
+    receipt_absent: bool = False
+    receipt_incompatible: bool = False
 
 
 def _remember_request_intent_sha256(
@@ -1015,6 +1031,21 @@ def _remember_publication_conflict(
     return True, reason
 
 
+def _remember_deterministic_publication_failure(
+    failure: BaseException | None,
+) -> str | None:
+    """Classify exact built-in failures that prove publication did not commit."""
+
+    # Keep this exact-type boundary aligned with `_remember_publication_conflict`.
+    # An extension-owned subclass can redefine exception behavior and does not
+    # carry the built-in store's atomic no-commit guarantee.
+    if type(failure) is KnowledgeAccessDenied:
+        return "access_denied"
+    if type(failure) is KnowledgeChunkConflict:
+        return "publication_conflict"
+    return None
+
+
 async def _remember_publish_owned(
     store: Any,
     *,
@@ -1079,6 +1110,7 @@ async def _remember_publish_owned(
         else outcome.error
     )
     failure_is_conflict, conflict_reason = _remember_publication_conflict(failure)
+    deterministic_failure_outcome = _remember_deterministic_publication_failure(failure)
     returned_receipt: KnowledgePublicationReceipt | None = None
     if failure is None:
         try:
@@ -1087,15 +1119,21 @@ async def _remember_publish_owned(
             returned_receipt = copy_knowledge_publication_receipt(outcome.result)
         except (TypeError, ValueError):
             failure = RuntimeError("Knowledge store returned an invalid publication receipt.")
+    confirmed = False
     operation_receipt_present = False
+    operation_receipt_absent = False
+    operation_receipt_conflict = False
     try:
-        confirmed = await _remember_confirm_owned_publication(
+        observation = await _remember_observe_owned_publication(
             store,
             result=result,
             operation_id=operation_id,
             receipt=returned_receipt,
             operation_registry=operation_registry,
         )
+        confirmed = observation.confirmed
+        operation_receipt_present = observation.receipt_present
+        operation_receipt_absent = observation.receipt_absent
         if not confirmed:
             try:
                 durable_receipt = await _remember_load_publication_receipt(
@@ -1107,19 +1145,30 @@ async def _remember_publish_owned(
                 raise
             except Exception:
                 durable_receipt = None
+            else:
+                if durable_receipt is None:
+                    operation_receipt_absent = True
+                else:
+                    operation_receipt_present = True
             if durable_receipt is not None:
-                operation_receipt_present = True
                 reconciled_result = _remember_result_with_receipt_identity(
                     result,
                     durable_receipt,
                 )
-                confirmed = await _remember_confirm_owned_publication(
+                observation = await _remember_observe_owned_publication(
                     store,
                     result=reconciled_result,
                     operation_id=operation_id,
                     receipt=durable_receipt,
                     operation_registry=operation_registry,
                 )
+                confirmed = observation.confirmed
+                operation_receipt_present |= observation.receipt_present
+                operation_receipt_absent |= observation.receipt_absent
+                # The first pass may differ only because a concurrent exact
+                # publication supplied the durable entry identity. Only this
+                # receipt-reconstructed pass can prove an operation conflict.
+                operation_receipt_conflict = observation.receipt_incompatible
                 if confirmed:
                     result = reconciled_result
     except asyncio.CancelledError as cancellation:
@@ -1149,7 +1198,8 @@ async def _remember_publish_owned(
                 else "publication_acknowledgement_lost"
             ),
         )
-    if failure_is_conflict and operation_receipt_present:
+    publication_absence_confirmed = operation_receipt_absent and not operation_receipt_present
+    if failure_is_conflict and operation_receipt_conflict:
         outcome_code = "operation_conflict"
     elif failure_is_conflict and conflict_reason in {
         "entry_occupied",
@@ -1168,12 +1218,18 @@ async def _remember_publish_owned(
         )
         if winner is not None:
             return _remember_knowledge_already_known_result(winner)
+        outcome_code = (
+            "publication_conflict" if publication_absence_confirmed else "ambiguous_publication"
+        )
+    elif failure_is_conflict and publication_absence_confirmed:
         outcome_code = "publication_conflict"
     elif failure_is_conflict:
-        outcome_code = "publication_conflict"
+        outcome_code = "ambiguous_publication"
+    elif deterministic_failure_outcome is not None and publication_absence_confirmed:
+        outcome_code = deterministic_failure_outcome
     elif isinstance(failure, asyncio.CancelledError):
         outcome_code = "store_cancelled"
-    elif failure is None:
+    elif failure is None and (operation_receipt_conflict or publication_absence_confirmed):
         outcome_code = "invalid_publication_result"
     else:
         outcome_code = "ambiguous_publication"
@@ -1191,34 +1247,65 @@ async def _remember_confirm_owned_publication(
     receipt: KnowledgePublicationReceipt | None = None,
     operation_registry: BoundedInvocationOperationRegistry,
 ) -> bool:
+    observation = await _remember_observe_owned_publication(
+        store,
+        result=result,
+        operation_id=operation_id,
+        receipt=receipt,
+        operation_registry=operation_registry,
+    )
+    return observation.confirmed
+
+
+async def _remember_observe_owned_publication(
+    store: Any,
+    *,
+    result: Any,
+    operation_id: str,
+    receipt: KnowledgePublicationReceipt | None = None,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> _RememberPublicationObservation:
     try:
         durable_receipt = await _remember_load_publication_receipt(
             store,
             operation_id,
             operation_registry=operation_registry,
         )
-        if durable_receipt is None:
-            return False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return _RememberPublicationObservation()
+    if durable_receipt is None:
+        return _RememberPublicationObservation(receipt_absent=True)
+    try:
         if receipt is not None and _remember_receipt_identity(
             receipt
         ) != _remember_receipt_identity(durable_receipt):
-            return False
+            return _RememberPublicationObservation(
+                receipt_present=True,
+                receipt_incompatible=True,
+            )
         _, expected_entry, _, request_sha256 = prepare_knowledge_publication(
             result.entry,
             result.chunks,
             operation_id=operation_id,
         )
-        return (
+        confirmed = (
             durable_receipt.operation_id == operation_id
             and durable_receipt.entry_id == expected_entry.id
             and durable_receipt.request_sha256 == request_sha256
             and durable_receipt.entry_created_at == expected_entry.created_at
             and durable_receipt.entry_updated_at == expected_entry.updated_at
         )
+        return _RememberPublicationObservation(
+            confirmed=confirmed,
+            receipt_present=True,
+            receipt_incompatible=not confirmed,
+        )
     except asyncio.CancelledError:
         raise
     except Exception:
-        return False
+        return _RememberPublicationObservation(receipt_present=True)
 
 
 async def _remember_confirm_owned_publication_after_cancellation(

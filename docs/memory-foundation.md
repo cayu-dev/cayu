@@ -38,7 +38,11 @@ the scope in typed ID reads, chunk reads, list/search candidate selection,
 writes, lifecycle changes, deletion, publication receipts, review/indexing, and
 embedding jobs. Inaccessible ID reads return no entry/chunks so they do not
 become an existence oracle; an attempted inaccessible mutation raises
-`KnowledgeAccessDenied`.
+`KnowledgeAccessDenied`. Chunk identities are global storage identities: every
+chunk-writing path authorizes an existing chunk's owning entry before reporting
+occupancy. A foreign-scope collision therefore raises `KnowledgeAccessDenied`,
+while an authorized collision raises the backend-independent
+`KnowledgeChunkConflict` without leaving a partial entry, chunk set, or receipt.
 
 ```python
 from cayu import (
@@ -108,10 +112,15 @@ then `(record_type, record_id, revision)`.
 
 The configuration records a caller-owned version, strategy version, weights,
 `rrf_k`, feature adjustments, per-channel candidate ceiling, fused-head limit,
-and a canonical SHA-256 fingerprint. The result records channel/index coverage,
-candidate/omission counts, truncation reasons, and continuation availability.
-Inputs that omit a configured channel, add an unconfigured channel, exceed a
-budget, duplicate a rank, or disagree on canonical feature values fail closed.
+and a canonical SHA-256 fingerprint. Construction rejects numeric values that
+cannot enter that canonical durable representation, so every accepted
+configuration is immediately fingerprintable. Weight maps remain deeply
+immutable after construction, and updated model copies pass through the same
+validation before receiving a new fingerprint. The result records channel/index
+coverage, candidate/omission counts, truncation reasons, and continuation
+availability. Inputs that omit a configured channel, add an unconfigured channel,
+exceed a budget, duplicate a rank, or disagree on canonical feature values fail
+closed.
 
 A replacement `RetrievalFusionStrategy` must preserve these invariants even if
 its ranking method differs: hard filtering occurs before its inputs, all work is

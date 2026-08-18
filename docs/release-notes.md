@@ -116,7 +116,14 @@ is enforced inside memory, SQLite, and PostgreSQL reads, searches, mutations,
 chunk access, embedding paths, and publication-receipt replay. Runtime context
 injection, knowledge tools, indexing, and review carry the same scope; callers
 cannot widen a store-bound scope. Trusted maintenance must opt into the explicit
-privileged scope.
+privileged scope. Global chunk-identity occupancy is authorized before it is
+reported: foreign-scope collisions fail with `KnowledgeAccessDenied`, authorized
+collisions use `KnowledgeChunkConflict`, and PostgreSQL serializes entry, chunk,
+and publication identities in one server-side ordered lock batch. The remember
+tool preserves those deterministic outcomes as access denial or publication
+conflict instead of misreporting them as an outcome-ambiguous write, but only
+after an authoritative receipt lookup proves publication absent. An unavailable
+receipt lookup preserves the ambiguous outcome of post-commit extension work.
 
 Breaking schema revision 41 stores the immutable authorization projection beside
 each knowledge publication receipt so exact replay remains safe after an entry is
@@ -131,7 +138,11 @@ The memory foundation also adds a deterministic weighted reciprocal-rank fusion
 primitive with bounded channel diagnostics, an explicit revision-reset/refusal
 contract, and a versioned hermetic retrieval corpus and baseline runner. These are
 foundation primitives; automatic curation and context placement remain separate
-future layers.
+future layers. WRRF configuration construction now rejects values outside its
+canonical durable fingerprint domain rather than accepting a configuration that
+can fail only after fusion work. Its weight maps are deeply immutable, and
+`model_copy(update=...)` revalidates updated values before returning a new
+configuration.
 
 ### Durable tasks retain immutable invocation provenance
 

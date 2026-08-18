@@ -287,3 +287,65 @@ def test_weighted_rrf_configuration_is_defensively_copied_and_versioned() -> Non
             channel_weights={"lexical": 1.0},
             strategy_version="unknown",
         )
+
+
+def test_weighted_rrf_configuration_is_deeply_immutable_and_copies_revalidate() -> None:
+    config = WeightedReciprocalRankFusionConfig(
+        configuration_version="immutable-v1",
+        channel_weights={"lexical": 1.0},
+        feature_weights={"exact": 0.25},
+    )
+    fingerprint = config.fingerprint()
+
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        config.channel_weights["lexical"] = 2.0
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        config.feature_weights.clear()
+
+    assert config.fingerprint() == fingerprint
+    assert config.model_dump(mode="json")["channel_weights"] == {"lexical": 1.0}
+
+    copied = config.model_copy(update={"channel_weights": {"semantic": 2.0}})
+    assert copied.channel_weights == {"semantic": 2.0}
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        copied.channel_weights["semantic"] = 3.0
+    with pytest.raises(ValidationError, match="enable at least one channel"):
+        config.model_copy(update={"channel_weights": {}})
+    with pytest.raises(ValidationError):
+        config.model_copy(update={"feature_weights": {"exact": 1e20}})
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"channel_weights": {"lexical": 1e20}},
+        {"feature_weights": {"exact": -1e20}},
+        {"rrf_k": 1e20},
+        {"max_candidates_per_channel": 2**63},
+        {"fused_head_limit": 2**63},
+    ],
+)
+def test_weighted_rrf_rejects_configurations_that_cannot_be_fingerprinted(
+    updates: dict[str, object],
+) -> None:
+    values = {
+        "configuration_version": "portable-v1",
+        "channel_weights": {"lexical": 1.0},
+    }
+    values.update(updates)
+
+    with pytest.raises(ValidationError):
+        WeightedReciprocalRankFusionConfig(**values)
+
+
+def test_weighted_rrf_every_accepted_configuration_is_immediately_fingerprintable() -> None:
+    config = WeightedReciprocalRankFusionConfig(
+        configuration_version="portable-boundary-v1",
+        channel_weights={"lexical": float(2**62)},
+        rrf_k=0.5,
+        feature_weights={"exact": -1.25},
+        max_candidates_per_channel=2**63 - 1,
+        fused_head_limit=2**63 - 1,
+    )
+
+    assert len(config.fingerprint()) == 64

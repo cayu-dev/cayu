@@ -1597,7 +1597,7 @@ def test_server_artifact_inventory_does_not_advertise_unusable_next_offset() -> 
 
 
 def test_server_exposes_pending_knowledge_review_endpoints() -> None:
-    store = _TestKnowledgeStore(
+    store = InMemoryKnowledgeStore(
         [
             KnowledgeEntry(
                 id="pending_git",
@@ -1619,8 +1619,10 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
             ),
         ]
     )
+    access_scope = KnowledgeAccessScope.privileged()
     app = CayuApp(
         knowledge_store=store,
+        knowledge_access_scope=access_scope,
         knowledge_review_namespace="project:cayu",
         knowledge_review_labels={"project": "cayu", "tenant": "trusted"},
     )
@@ -1635,6 +1637,7 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
                     text="Remote sandbox Git pushes should use a brokered credential proxy.",
                 )
             ],
+            access_scope=access_scope,
         )
     )
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))

@@ -119,6 +119,14 @@ class KnowledgeAccessDenied(PermissionError):
         super().__init__(f"Knowledge access denied for {self.operation}.")
 
 
+class KnowledgeChunkConflict(RuntimeError):
+    """A knowledge write conflicts with an occupied global chunk identity."""
+
+    def __init__(self, operation: str) -> None:
+        self.operation = require_clean_nonblank(operation, "operation")
+        super().__init__("Knowledge chunk identity conflicts with durable state.")
+
+
 class KnowledgeAccessScope(BaseModel):
     """Principal-derived constraints enforced inside every knowledge operation.
 
@@ -1156,7 +1164,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             or _has_only_default_chunk(existing_entry, existing_chunks)
         ):
             replacement_chunks = [_default_chunk_for_entry(entry)]
-            self._ensure_globally_unique_chunk_ids(entry.id, replacement_chunks)
+            self._require_chunk_ids_available(
+                entry.id,
+                replacement_chunks,
+                access_scope=scope,
+                operation="put_entry",
+            )
         self._entries[entry.id] = entry
         if replacement_chunks is not None:
             self._chunks[entry.id] = replacement_chunks
@@ -1295,7 +1308,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
         _require_knowledge_entry_access(scope, entry, operation="replace_chunks")
         copied_chunks = _copy_entry_chunks(clean_id, chunks)
-        self._ensure_globally_unique_chunk_ids(clean_id, copied_chunks)
+        self._require_chunk_ids_available(
+            clean_id,
+            copied_chunks,
+            access_scope=scope,
+            operation="replace_chunks",
+        )
         self._chunks[clean_id] = copied_chunks
         return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
 
@@ -1317,7 +1335,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 operation="put_entry_with_chunks",
             )
         copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
-        self._ensure_globally_unique_chunk_ids(copied_entry.id, copied_chunks)
+        self._require_chunk_ids_available(
+            copied_entry.id,
+            copied_chunks,
+            access_scope=scope,
+            operation="put_entry_with_chunks",
+        )
         self._entries[copied_entry.id] = copied_entry
         self._chunks[copied_entry.id] = copied_chunks
         return copy_knowledge_entry(copied_entry)
@@ -1337,15 +1360,31 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_with_chunks")
         existing_receipt = self._publication_receipts.get(operation_id)
         if existing_receipt is not None:
+            receipt_access = self._publication_access.get(operation_id)
+            if receipt_access is None:
+                raise KnowledgePublicationConflict("malformed_receipt")
+            if not _knowledge_scope_allows_snapshot(scope, receipt_access):
+                raise KnowledgeAccessDenied("publish_entry_with_chunks")
             _validate_knowledge_publication_replay(
                 existing_receipt,
                 entry=copied_entry,
                 request_sha256=request_sha256,
             )
             return copy_knowledge_publication_receipt(existing_receipt, replayed=True)
-        if copied_entry.id in self._entries:
+        existing_entry = self._entries.get(copied_entry.id)
+        if existing_entry is not None:
+            _require_knowledge_entry_access(
+                scope,
+                existing_entry,
+                operation="publish_entry_with_chunks",
+            )
             raise KnowledgePublicationConflict("entry_occupied")
-        self._ensure_globally_unique_chunk_ids(copied_entry.id, copied_chunks)
+        self._require_chunk_ids_available(
+            copied_entry.id,
+            copied_chunks,
+            access_scope=scope,
+            operation="publish_entry_with_chunks",
+        )
         receipt = KnowledgePublicationReceipt(
             operation_id=operation_id,
             entry_id=copied_entry.id,
@@ -1360,17 +1399,32 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._publication_access[operation_id] = _knowledge_access_snapshot(copied_entry)
         return copy_knowledge_publication_receipt(receipt)
 
-    def _ensure_globally_unique_chunk_ids(
+    def _require_chunk_ids_available(
         self,
         entry_id: str,
         chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope,
+        operation: str,
     ) -> None:
         proposed_ids = {chunk.id for chunk in chunks}
+        occupied_entry_ids: set[str] = set()
         for existing_entry_id, existing_chunks in self._chunks.items():
             if existing_entry_id == entry_id:
                 continue
             if any(chunk.id in proposed_ids for chunk in existing_chunks):
-                raise ValueError("Knowledge chunk ids must be globally unique across entries.")
+                occupied_entry_ids.add(existing_entry_id)
+        for occupied_entry_id in sorted(occupied_entry_ids):
+            owner = self._entries.get(occupied_entry_id)
+            if owner is None:
+                raise KnowledgeChunkConflict(operation)
+            _require_knowledge_entry_access(
+                access_scope,
+                owner,
+                operation=operation,
+            )
+        if occupied_entry_ids:
+            raise KnowledgeChunkConflict(operation)
 
     async def load_entry_publication_receipt(
         self,
@@ -1721,13 +1775,21 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 "hybrid search modes."
             )
         terms = _knowledge_query_terms(knowledge_query)
-        candidates = [
-            entry
-            for entry in self._entries.values()
-            if _knowledge_scope_allows_entry(scope, entry)
-            if _entry_matches_query(entry, knowledge_query)
-            and not _entry_matches_none_terms(entry, self._chunks.get(entry.id, []), terms)
-        ]
+        candidates: list[tuple[KnowledgeEntry, list[KnowledgeChunk]]] = []
+        for entry in self._entries.values():
+            chunks = self._chunks.get(entry.id, [])
+            if not _knowledge_scope_allows_entry(scope, entry):
+                continue
+            if not _entry_matches_query(entry, knowledge_query):
+                continue
+            if _entry_matches_none_terms(entry, chunks, terms):
+                continue
+            candidates.append(
+                (
+                    copy_knowledge_entry(entry),
+                    [copy_knowledge_chunk(chunk) for chunk in chunks],
+                )
+            )
         if not candidates:
             return KnowledgeSearchResult(
                 query=knowledge_query,
@@ -1738,7 +1800,9 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 total_hits_known=0,
             )
         semantic_query_text = _semantic_query_text(knowledge_query)
-        await self._embed_entries(candidates)
+        candidate_embeddings = await self._embed_chunks(
+            [chunk for _, chunks in candidates for chunk in chunks]
+        )
         query_vector = await self._embed_query(knowledge_query, semantic_query_text)
         semantic_min_score = (
             self.semantic_min_score
@@ -1748,8 +1812,12 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         scored: list[
             tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]
         ] = []
-        for entry in candidates:
-            semantic_score, chunk = self._best_semantic_score(entry, query_vector)
+        for entry, chunks in candidates:
+            semantic_score, chunk = self._best_semantic_score(
+                chunks,
+                candidate_embeddings,
+                query_vector,
+            )
             if semantic_score is None:
                 continue
             normalized_semantic = _normalize_cosine_similarity(semantic_score)
@@ -1764,7 +1832,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             if knowledge_query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
                 keyword_score, keyword_chunk, keyword_reason, keyword_preview = _score_entry(
                     entry,
-                    self._chunks.get(entry.id, []),
+                    chunks,
                     knowledge_query,
                 )
                 if keyword_score > 0:
@@ -1798,19 +1866,18 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         )
         return _search_result_from_scored_embeddings(scored, knowledge_query, score_kind=score_kind)
 
-    async def _embed_entries(self, entries: list[KnowledgeEntry]) -> None:
-        chunks: list[KnowledgeChunk] = []
-        for entry in entries:
-            chunks.extend(self._chunks.get(entry.id, []))
-        await self._embed_chunks(chunks)
-
     async def _embed_entry_chunks(self, entry_id: str) -> None:
         await self._embed_chunks(self._chunks.get(entry_id, []))
 
-    async def _embed_chunks(self, chunks: list[KnowledgeChunk]) -> None:
+    async def _embed_chunks(self, chunks: list[KnowledgeChunk]) -> dict[str, list[float]]:
+        vectors = {
+            chunk.id: list(self._chunk_embeddings[chunk.id]["vector"])
+            for chunk in chunks
+            if self._has_current_embedding(chunk)
+        }
         missing = [chunk for chunk in chunks if not self._has_current_embedding(chunk)]
         if not missing:
-            return
+            return vectors
         result = copy_text_embedding_result(
             await self.embedding_provider.embed_texts(
                 TextEmbeddingRequest(
@@ -1828,6 +1895,8 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             if embedding is None:
                 raise ValueError("Embedding provider did not return every requested index.")
             self._validate_embedding_dimension(embedding.vector)
+            vector = list(embedding.vector)
+            vectors[chunk.id] = vector
             if not self._chunk_is_current(chunk):
                 continue
             self._chunk_embeddings[chunk.id] = {
@@ -1835,8 +1904,9 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 "content_hash": _knowledge_chunk_content_hash(chunk),
                 "model": self.embedding_model,
                 "dimensions": self.embedding_dimensions,
-                "vector": list(embedding.vector),
+                "vector": vector,
             }
+        return vectors
 
     async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
         result = copy_text_embedding_result(
@@ -1860,16 +1930,17 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
 
     def _best_semantic_score(
         self,
-        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        embeddings: dict[str, list[float]],
         query_vector: list[float],
     ) -> tuple[float | None, KnowledgeChunk | None]:
         best_score: float | None = None
         best_chunk: KnowledgeChunk | None = None
-        for chunk in self._chunks.get(entry.id, []):
-            stored = self._chunk_embeddings.get(chunk.id)
-            if stored is None or stored["content_hash"] != _knowledge_chunk_content_hash(chunk):
+        for chunk in chunks:
+            vector = embeddings.get(chunk.id)
+            if vector is None:
                 continue
-            score = _cosine_similarity(query_vector, stored["vector"])
+            score = _cosine_similarity(query_vector, vector)
             if best_score is None or score > best_score:
                 best_score = score
                 best_chunk = chunk

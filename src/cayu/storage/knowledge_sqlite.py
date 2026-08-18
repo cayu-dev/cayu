@@ -20,9 +20,11 @@ from cayu.storage import migrations as schema
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeActorType,
     KnowledgeChunk,
+    KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgeFacet,
     KnowledgeHit,
@@ -56,6 +58,7 @@ from cayu.storage.memory import (
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
+_CHUNK_ID_LOOKUP_BATCH_SIZE = 400
 _SQLITE_MIN_REQUIRED_REVISION = 41
 
 
@@ -105,15 +108,25 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 if existing_entry is not None:
                     _require_knowledge_entry_access(scope, existing_entry, operation="put_entry")
                 existing_chunks = self._load_chunks_unlocked(entry.id)
-                self._upsert_entry_unlocked(entry)
                 if (
                     existing_entry is None
                     or not existing_chunks
                     or _has_only_default_chunk(existing_entry, existing_chunks)
                 ):
+                    replacement_chunks = [_default_chunk_for_entry(entry)]
+                    self._require_chunk_ids_available_unlocked(
+                        entry.id,
+                        replacement_chunks,
+                        access_scope=scope,
+                        operation="put_entry",
+                    )
+                else:
+                    replacement_chunks = None
+                self._upsert_entry_unlocked(entry)
+                if replacement_chunks is not None:
                     # `_replace_chunks_unlocked` rebuilds the FTS rows itself, so the
                     # single rebuild below covers the untouched-chunks branch only.
-                    self._replace_chunks_unlocked(entry.id, [_default_chunk_for_entry(entry)])
+                    self._replace_chunks_unlocked(entry.id, replacement_chunks)
                 else:
                     self._refresh_entry_fts_unlocked(entry.id)
             return copy_knowledge_entry(entry)
@@ -314,7 +327,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
     ) -> int:
         scope = self._operation_access_scope(access_scope)
         cutoff = datetime.now(UTC) if now is None else now
-        access_sql, access_params = _knowledge_access_scope_filter_sql(scope)
+        access_sql, access_params = _knowledge_access_scope_filter_sql(
+            scope,
+            now=cutoff,
+        )
         async with self._lock:
             with sqlite_support._transaction(self._connection):
                 rows = self._connection.execute(
@@ -352,6 +368,12 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 if entry is None:
                     raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
                 _require_knowledge_entry_access(scope, entry, operation="replace_chunks")
+                self._require_chunk_ids_available_unlocked(
+                    clean_id,
+                    copied_chunks,
+                    access_scope=scope,
+                    operation="replace_chunks",
+                )
                 self._replace_chunks_unlocked(clean_id, copied_chunks)
             return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
 
@@ -375,6 +397,12 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         existing_entry,
                         operation="put_entry_with_chunks",
                     )
+                self._require_chunk_ids_available_unlocked(
+                    copied_entry.id,
+                    copied_chunks,
+                    access_scope=scope,
+                    operation="put_entry_with_chunks",
+                )
                 self._upsert_entry_unlocked(copied_entry)
                 self._replace_chunks_unlocked(copied_entry.id, copied_chunks)
             return copy_knowledge_entry(copied_entry)
@@ -394,7 +422,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_with_chunks")
         async with self._lock:
             with sqlite_support._transaction(self._connection):
-                existing_receipt = self._load_publication_receipt_unlocked(operation_id)
+                existing_receipt = self._load_publication_receipt_unlocked(
+                    operation_id,
+                    access_scope=scope,
+                )
                 if existing_receipt is not None:
                     _validate_knowledge_publication_replay(
                         existing_receipt,
@@ -405,8 +436,20 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         existing_receipt,
                         replayed=True,
                     )
-                if self._load_entry_unlocked(copied_entry.id) is not None:
+                existing_entry = self._load_entry_unlocked(copied_entry.id)
+                if existing_entry is not None:
+                    _require_knowledge_entry_access(
+                        scope,
+                        existing_entry,
+                        operation="publish_entry_with_chunks",
+                    )
                     raise KnowledgePublicationConflict("entry_occupied")
+                self._require_chunk_ids_available_unlocked(
+                    copied_entry.id,
+                    copied_chunks,
+                    access_scope=scope,
+                    operation="publish_entry_with_chunks",
+                )
                 receipt = KnowledgePublicationReceipt(
                     operation_id=operation_id,
                     entry_id=copied_entry.id,
@@ -926,9 +969,46 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         self._insert_entry_fts_unlocked(entry, chunks)
 
+    def _require_chunk_ids_available_unlocked(
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope,
+        operation: str,
+    ) -> None:
+        proposed_ids = sorted({chunk.id for chunk in chunks})
+        occupied_entry_ids: set[str] = set()
+        for offset in range(0, len(proposed_ids), _CHUNK_ID_LOOKUP_BATCH_SIZE):
+            batch = proposed_ids[offset : offset + _CHUNK_ID_LOOKUP_BATCH_SIZE]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = self._connection.execute(
+                f"""
+                SELECT DISTINCT entry_id
+                FROM cayu_knowledge_chunks
+                WHERE id IN ({placeholders}) AND entry_id <> ?
+                ORDER BY entry_id
+                """,
+                [*batch, entry_id],
+            ).fetchall()
+            occupied_entry_ids.update(str(row["entry_id"]) for row in rows)
+        for occupied_entry_id in sorted(occupied_entry_ids):
+            owner = self._load_entry_unlocked(occupied_entry_id)
+            if owner is None:
+                raise KnowledgeChunkConflict(operation)
+            _require_knowledge_entry_access(
+                access_scope,
+                owner,
+                operation=operation,
+            )
+        if occupied_entry_ids:
+            raise KnowledgeChunkConflict(operation)
+
     def _load_publication_receipt_unlocked(
         self,
         operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
     ) -> KnowledgePublicationReceipt | None:
         row = self._connection.execute(
             """
@@ -938,7 +1018,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 request_sha256,
                 entry_created_at,
                 entry_updated_at,
-                committed_at
+                committed_at,
+                access_snapshot_json
             FROM cayu_knowledge_publication_receipts
             WHERE operation_id = ?
             """,
@@ -947,7 +1028,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         if row is None:
             return None
         try:
-            return KnowledgePublicationReceipt(
+            snapshot = _parse_knowledge_access_snapshot_json(row["access_snapshot_json"])
+            receipt = KnowledgePublicationReceipt(
                 operation_id=row["operation_id"],
                 entry_id=row["entry_id"],
                 request_sha256=row["request_sha256"],
@@ -957,6 +1039,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         except Exception:
             raise KnowledgePublicationConflict("malformed_receipt") from None
+        if not _knowledge_scope_allows_snapshot(access_scope, snapshot):
+            raise KnowledgeAccessDenied("publish_entry_with_chunks")
+        return receipt
 
     def _load_publication_receipt_in_scope_unlocked(
         self,
@@ -1316,6 +1401,8 @@ def _knowledge_list_filter_sql(query: KnowledgeListQuery) -> tuple[str, list[obj
 
 def _knowledge_access_scope_filter_sql(
     scope: KnowledgeAccessScope,
+    *,
+    now: datetime | None = None,
 ) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
@@ -1358,7 +1445,7 @@ def _knowledge_access_scope_filter_sql(
             clauses.append("0")
     if not scope.include_expired:
         clauses.append("(e.expires_at IS NULL OR e.expires_at > ?)")
-        params.append(sqlite_support.format_datetime(datetime.now(UTC)))
+        params.append(sqlite_support.format_datetime(datetime.now(UTC) if now is None else now))
     return " AND " + " AND ".join(clauses), params
 
 

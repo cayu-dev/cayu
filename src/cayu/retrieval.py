@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from hashlib import sha256
 from math import fsum
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
+    FrozenJsonDict,
     canonical_durable_json_bytes,
     copy_json_value,
     require_finite,
@@ -166,9 +175,9 @@ class WeightedReciprocalRankFusionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     configuration_version: str
-    channel_weights: dict[str, float]
+    channel_weights: Mapping[str, float]
     rrf_k: float = 60.0
-    feature_weights: dict[str, float] = Field(default_factory=dict)
+    feature_weights: Mapping[str, float] = Field(default_factory=dict)
     max_candidates_per_channel: int = 100
     fused_head_limit: int = 50
     strategy_version: str = WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION
@@ -197,6 +206,15 @@ class WeightedReciprocalRankFusionConfig(BaseModel):
     def validate_feature_weights(cls, value) -> dict[str, float]:
         return _copy_weight_map(value, "feature_weights", strictly_positive=False)
 
+    @field_validator("channel_weights", "feature_weights")
+    @classmethod
+    def freeze_weight_maps(cls, value: Mapping[str, float]) -> Mapping[str, float]:
+        return FrozenJsonDict(value)
+
+    @field_serializer("channel_weights", "feature_weights")
+    def serialize_weight_maps(self, value: Mapping[str, float]) -> dict[str, float]:
+        return dict(value)
+
     @field_validator("rrf_k", mode="before")
     @classmethod
     def validate_rrf_k(cls, value) -> float:
@@ -218,7 +236,29 @@ class WeightedReciprocalRankFusionConfig(BaseModel):
     def validate_enabled_channels(self) -> WeightedReciprocalRankFusionConfig:
         if not self.channel_weights:
             raise ValueError("`channel_weights` must enable at least one channel.")
+        canonical_durable_json_bytes(
+            self.model_dump(mode="json"),
+            "weighted reciprocal-rank fusion configuration",
+        )
         return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Return an independently validated immutable configuration."""
+
+        payload = self.model_dump(mode="python", round_trip=True)
+        if update is not None:
+            payload.update(update)
+        copied = type(self).model_validate(payload)
+        fields_set = set(self.model_fields_set)
+        if update is not None:
+            fields_set.update(update)
+        object.__setattr__(copied, "__pydantic_fields_set__", fields_set)
+        return copied
 
     def fingerprint(self) -> str:
         payload = canonical_durable_json_bytes(

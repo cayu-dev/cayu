@@ -78,6 +78,58 @@ _TABLES = (
 )
 
 
+def test_postgres_knowledge_write_locks_are_batched_in_global_order(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage.postgres import _lock_knowledge_write_identities
+
+    class RecordingCursor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        async def execute(self, query: str, params: tuple[object, ...]) -> None:
+            self.calls.append((query, params))
+
+    async def run() -> tuple[
+        list[tuple[str, tuple[object, ...]]],
+        list[tuple[str, tuple[object, ...]]],
+    ]:
+        cursor = RecordingCursor()
+        await _lock_knowledge_write_identities(cursor)
+        await _lock_knowledge_write_identities(
+            cursor,
+            entry_ids=("entry-b", "entry-a"),
+            chunk_ids=("chunk-b", "chunk-a", "chunk-b"),
+            operation_ids=("operation-b", "operation-a"),
+        )
+        bulk_cursor = RecordingCursor()
+        await _lock_knowledge_write_identities(
+            bulk_cursor,
+            chunk_ids=tuple(f"chunk-{index:04d}" for index in range(1_000)),
+        )
+        return cursor.calls, bulk_cursor.calls
+
+    calls, bulk_calls = asyncio.run(run())
+
+    assert len(calls) == 1
+    query, params = calls[0]
+    assert "unnest(%s::text[])" in query
+    assert "SELECT DISTINCT hashtextextended" in query
+    assert "ORDER BY lock_key" in query
+    assert params == (
+        [
+            "knowledge-chunk:chunk-a",
+            "knowledge-chunk:chunk-b",
+            "knowledge-entry:entry-a",
+            "knowledge-entry:entry-b",
+            "knowledge-operation:operation-a",
+            "knowledge-operation:operation-b",
+        ],
+    )
+    assert len(bulk_calls) == 1
+    assert bulk_calls[0][1] == ([f"knowledge-chunk:chunk-{index:04d}" for index in range(1_000)],)
+
+
 class KeywordEmbeddingProvider(TextEmbeddingProvider):
     name = "keyword-test"
 
@@ -250,6 +302,211 @@ def test_postgres_scoped_entry_hydration_uses_one_read_snapshot(
             await _drop_all(postgres_dsn)
         assert updated is not None
         assert updated.labels == {"project": "beta"}
+
+    asyncio.run(run())
+
+
+def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        original = KnowledgeEntry(
+            id="tenant-a-entry",
+            namespace="tenant-a",
+            text="Tenant A credential policy.",
+        )
+        original_chunk = KnowledgeChunk(
+            id="reusable-chunk",
+            entry_id=original.id,
+            chunk_index=0,
+            text=original.text,
+        )
+        privileged = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await privileged.put_entry_with_chunks(original, [original_chunk])
+        finally:
+            await privileged.close()
+
+        class RacingStore(PostgresEmbeddingKnowledgeStore):
+            changed = False
+
+            async def _load_entry_in_scope(self, cur, entry_id, access_scope):
+                if not self.changed:
+                    self.changed = True
+                    peer = _new_store(postgres_dsn)
+                    try:
+                        await peer.replace_chunks(
+                            original.id,
+                            [
+                                KnowledgeChunk(
+                                    id="tenant-a-replacement",
+                                    entry_id=original.id,
+                                    chunk_index=0,
+                                    text="Tenant A replacement policy.",
+                                )
+                            ],
+                        )
+                        tenant_b = KnowledgeEntry(
+                            id="tenant-b-entry",
+                            namespace="tenant-b",
+                            text="Tenant B secret credential policy.",
+                        )
+                        await peer.put_entry_with_chunks(
+                            tenant_b,
+                            [
+                                KnowledgeChunk(
+                                    id=original_chunk.id,
+                                    entry_id=tenant_b.id,
+                                    chunk_index=0,
+                                    text=tenant_b.text,
+                                )
+                            ],
+                        )
+                    finally:
+                        await peer.close()
+                return await super()._load_entry_in_scope(cur, entry_id, access_scope)
+
+        scope = KnowledgeAccessScope.for_namespace("tenant-a")
+        racing = RacingStore(
+            postgres_dsn,
+            access_scope=scope,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+            semantic_min_score=0.70,
+        )
+        try:
+            result = await racing.search(
+                KnowledgeQuery(
+                    text="credential",
+                    namespace="tenant-a",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+        finally:
+            await racing.close()
+
+        assert racing.changed is True
+        assert [hit.entry.id for hit in result.hits] == [original.id]
+        assert result.hits[0].chunk == original_chunk
+
+        current = _new_store(postgres_dsn)
+        try:
+            assert [chunk.id for chunk in await current.read_chunks(original.id)] == [
+                "tenant-a-replacement"
+            ]
+            reused = await current.read_chunks("tenant-b-entry")
+            assert reused[0].id == original_chunk.id
+            assert reused[0].text == "Tenant B secret credential policy."
+        finally:
+            await current.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_hybrid_lanes_share_one_read_snapshot(postgres_dsn: str) -> None:
+    async def run() -> None:
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        original = KnowledgeEntry(
+            id="hybrid-original",
+            namespace="tenant-a",
+            text="Original credential policy.",
+        )
+        original_chunk = KnowledgeChunk(
+            id="hybrid-original-chunk",
+            entry_id=original.id,
+            chunk_index=0,
+            text=original.text,
+        )
+        later = KnowledgeEntry(
+            id="hybrid-later",
+            namespace="tenant-a",
+            text="Later credential policy.",
+        )
+        later_chunk = KnowledgeChunk(
+            id="hybrid-later-chunk",
+            entry_id=later.id,
+            chunk_index=0,
+            text=later.text,
+        )
+        privileged = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await privileged.put_entry_with_chunks(original, [original_chunk])
+        finally:
+            await privileged.close()
+
+        class RacingStore(PostgresEmbeddingKnowledgeStore):
+            changed = False
+
+            async def _scored_semantic_rows(
+                self,
+                cur,
+                rows,
+                query,
+                *,
+                access_scope,
+            ):
+                scored = await super()._scored_semantic_rows(
+                    cur,
+                    rows,
+                    query,
+                    access_scope=access_scope,
+                )
+                if not self.changed:
+                    self.changed = True
+                    peer = _new_store(postgres_dsn)
+                    try:
+                        await peer.delete_entry(original.id, hard=True)
+                        await peer.put_entry_with_chunks(later, [later_chunk])
+                    finally:
+                        await peer.close()
+                return scored
+
+        scope = KnowledgeAccessScope.for_namespace("tenant-a")
+        racing = RacingStore(
+            postgres_dsn,
+            access_scope=scope,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+            semantic_min_score=0.70,
+        )
+        try:
+            result = await racing.search(
+                KnowledgeQuery(
+                    text="credential",
+                    namespace="tenant-a",
+                    mode=KnowledgeSearchMode.HYBRID,
+                )
+            )
+        finally:
+            await racing.close()
+
+        assert racing.changed is True
+        assert [hit.entry.id for hit in result.hits] == [original.id]
+        assert result.hits[0].chunk == original_chunk
+
+        current = _new_store(postgres_dsn)
+        try:
+            assert await current.get_entry(original.id) is None
+            assert await current.get_entry(later.id) == later
+        finally:
+            await current.close()
+            await _drop_all(postgres_dsn)
 
     asyncio.run(run())
 

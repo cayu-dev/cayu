@@ -6,6 +6,7 @@ from typing import Any
 
 from cayu.storage import (
     KnowledgeChunk,
+    KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
@@ -175,6 +176,59 @@ async def assert_concurrent_publication_conformance(store: Any) -> None:
     )
     assert await store.get_entry(expected_entry.id) == expected_entry
     assert await store.read_chunks(expected_entry.id) == expected_chunks
+
+    chunk_entry_a, chunk_material_a = publication_material(
+        entry_id="concurrent_chunk_publication_a",
+        text="First owner of a concurrently proposed chunk identity.",
+        timestamp_offset=3,
+    )
+    chunk_entry_b, chunk_material_b = publication_material(
+        entry_id="concurrent_chunk_publication_b",
+        text="Second owner of a concurrently proposed chunk identity.",
+        timestamp_offset=4,
+    )
+    shared_chunk_id = "concurrent-global-chunk"
+    chunk_material_a = [chunk_material_a[0].model_copy(update={"id": shared_chunk_id})]
+    chunk_material_b = [chunk_material_b[0].model_copy(update={"id": shared_chunk_id})]
+
+    async def publish_shared_chunk(
+        operation_id: str,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> tuple[str, KnowledgePublicationReceipt | KnowledgeChunkConflict]:
+        try:
+            return (
+                operation_id,
+                await store.publish_entry_with_chunks(
+                    entry,
+                    chunks,
+                    operation_id=operation_id,
+                ),
+            )
+        except KnowledgeChunkConflict as exc:
+            return operation_id, exc
+
+    chunk_outcomes = await asyncio.gather(
+        publish_shared_chunk("concurrent-chunk-a", chunk_entry_a, chunk_material_a),
+        publish_shared_chunk("concurrent-chunk-b", chunk_entry_b, chunk_material_b),
+    )
+    chunk_receipts = [
+        item for item in chunk_outcomes if isinstance(item[1], KnowledgePublicationReceipt)
+    ]
+    chunk_conflicts = [
+        item for item in chunk_outcomes if isinstance(item[1], KnowledgeChunkConflict)
+    ]
+    assert len(chunk_receipts) == 1
+    assert len(chunk_conflicts) == 1
+    winning_entry, winning_chunks, losing_entry, losing_operation_id = (
+        (chunk_entry_a, chunk_material_a, chunk_entry_b, "concurrent-chunk-b")
+        if chunk_receipts[0][0] == "concurrent-chunk-a"
+        else (chunk_entry_b, chunk_material_b, chunk_entry_a, "concurrent-chunk-a")
+    )
+    assert await store.get_entry(winning_entry.id) == winning_entry
+    assert await store.read_chunks(winning_entry.id) == winning_chunks
+    assert await store.get_entry(losing_entry.id) is None
+    assert await store.load_entry_publication_receipt(losing_operation_id) is None
 
 
 async def assert_stale_operation_cannot_replace_newer_publication(store: Any) -> None:
