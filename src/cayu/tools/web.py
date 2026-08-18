@@ -8,7 +8,7 @@ import socket
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -389,6 +389,7 @@ class WebFetchTool(Tool):
             requested_url=requested_url,
             final_url=request.url,
             title=title,
+            representation="text",
             content=content,
             redirects=redirects,
             truncation_reasons=truncation_reasons,
@@ -428,18 +429,20 @@ def _web_fetch_success_result(
     requested_url: str,
     final_url: str,
     title: str | None,
+    representation: Literal["text", "accessibility"],
     content: str,
     redirects: Sequence[Mapping[str, Any]],
     truncation_reasons: Sequence[str],
 ) -> ToolResult:
+    truncated = bool(truncation_reasons)
     structured = {
         "requested_url": requested_url,
         "final_url": final_url,
         "title": title,
-        "representation": "text",
+        "representation": representation,
         "content": content,
         "redirects": [dict(redirect) for redirect in redirects],
-        "truncated": bool(truncation_reasons),
+        "truncated": truncated,
         "truncation_reasons": list(truncation_reasons),
     }
     projected_parts = [f"URL: {final_url}"]
@@ -452,9 +455,16 @@ def _web_fetch_success_result(
         "</untrusted_web_content>",
         "<\\/untrusted_web_content>",
     )
+    trusted_metadata = (
+        "Fetched web content:\n"
+        f"Representation: {representation}\n"
+        f"Truncated: {'true' if truncated else 'false'}"
+    )
+    if truncation_reasons:
+        trusted_metadata += f"\nTruncation reasons: {', '.join(truncation_reasons)}"
     return ToolResult(
         content=(
-            "Fetched web content:\n\n"
+            f"{trusted_metadata}\n\n"
             "<untrusted_web_content>\n"
             f"{delimited_content}\n"
             "</untrusted_web_content>"

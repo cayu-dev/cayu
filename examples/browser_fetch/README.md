@@ -2,7 +2,7 @@
 
 This image is the versioned guest half of `BrowserWebFetchAdapter`. It contains
 Playwright 1.62.0, its matching Chromium build, NSS tooling for the per-session
-Cayu CA, and the closed `cayu.browser-fetch.v1` worker. The image runs as the
+Cayu CA, and the closed `cayu.browser-fetch.v2` worker. The image runs as the
 non-root `pwuser`; the root-owned, read-only worker refuses root execution and
 launches Chromium with its browser sandbox enabled. Other commands running as
 the guest user cannot replace the versioned worker between invocations.
@@ -18,7 +18,7 @@ Build from the repository root:
 ```bash
 docker build \
   --file examples/browser_fetch/Dockerfile \
-  --tag cayu-browser-fetch:1-playwright-1.62.0 \
+  --tag cayu-browser-fetch:2-playwright-1.62.0 \
   .
 ```
 
@@ -64,7 +64,7 @@ Pass `policies={"product-docs": browser_policy}`,
 `approved_destinations=approved_destinations`, `credentials=[]`, an adapter
 constructed with
 `DockerEgressAdapter(seccomp_profile="/absolute/path/to/examples/browser_fetch/seccomp_profile.json")`,
-and `image="cayu-browser-fetch:1-playwright-1.62.0"` to
+and `image="cayu-browser-fetch:2-playwright-1.62.0"` to
 `VirtualEgressEnvironmentFactory`. Plain Docker proves the enforced networking
 path for trusted development and CI; it is not Cayu's untrusted-code isolation
 boundary. Applications that require a stronger boundary use the same adapter
@@ -75,6 +75,24 @@ evidence for deny-by-default networking, brokered egress, confirmed
 cancellation, or confirmed cleanup. It never falls back to host-process HTTP.
 All browser destinations remain application-owned: redirects and subresource
 hosts are not inferred or auto-approved.
+
+Rendered pages without meaningful interactive or relational structure retain
+the compact `text` result. Links, tables, forms, navigation landmarks, and
+interactive labels—including controls in open shadow roots—deterministically
+select an accessibility-tree-depth-, aggregate-composed-DOM-node-, and
+byte-bounded `accessibility` representation. Trusted metadata identifies the
+representation and truncation state before the untrusted model-facing page
+envelope. Applications can lower the DOM-node ceiling with
+`BrowserWebFetchAdapter(max_dom_nodes=...)`; it is host configuration and is
+never exposed to the model. The worker freezes page-authored JavaScript after
+the render-settle period and performs node accounting from a browser-owned
+isolated world, keeping page-defined getters and prototype overrides outside
+the inspection boundary. It aggregates up to 32 admitted main/child frame
+documents in stable tree order, labels each frame section with its URL, and
+shares the configured DOM/content limits across the complete page rather than
+granting each frame a separate allowance. Frame subtrees ignored by Chromium's
+accessibility tree remain counted for safety but are excluded from model-facing
+evidence.
 
 The checked-in seccomp profile is Playwright 1.62.0's
 [published Docker profile](https://github.com/microsoft/playwright/blob/v1.62.0/utils/docker/seccomp_profile.json):

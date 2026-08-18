@@ -26,8 +26,8 @@ from cayu.tools.web import (
     _web_fetch_success_result,
 )
 
-BROWSER_FETCH_PROTOCOL_VERSION = "cayu.browser-fetch.v1"
-BROWSER_FETCH_WORKER_VERSION = "1"
+BROWSER_FETCH_PROTOCOL_VERSION = "cayu.browser-fetch.v2"
+BROWSER_FETCH_WORKER_VERSION = "2"
 BROWSER_FETCH_PLAYWRIGHT_VERSION = "1.62.0"
 DEFAULT_BROWSER_FETCH_WORKER_COMMAND = (
     "/usr/local/bin/python",
@@ -36,6 +36,8 @@ DEFAULT_BROWSER_FETCH_WORKER_COMMAND = (
 )
 DEFAULT_BROWSER_FETCH_MAX_REQUESTS = 128
 MAX_BROWSER_FETCH_MAX_REQUESTS = 512
+DEFAULT_BROWSER_FETCH_MAX_DOM_NODES = 10_000
+MAX_BROWSER_FETCH_MAX_DOM_NODES = 100_000
 _BROWSER_FETCH_JSON_OVERHEAD_BYTES = 64 * 1024
 _BROWSER_FETCH_ERROR_CODES = frozenset(
     {
@@ -86,13 +88,14 @@ class _BrowserRedirect(BaseModel):
 class _BrowserSuccess(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    protocol_version: Literal["cayu.browser-fetch.v1"]
-    worker_version: Literal["1"]
+    protocol_version: Literal["cayu.browser-fetch.v2"]
+    worker_version: Literal["2"]
     playwright_version: Literal["1.62.0"]
     kind: Literal["success"]
     requested_url: str = Field(min_length=1, max_length=8192)
     final_url: str = Field(min_length=1, max_length=8192)
     title: str | None = None
+    representation: Literal["text", "accessibility"]
     content: str
     redirects: tuple[_BrowserRedirect, ...] = Field(max_length=10)
     truncation_reasons: tuple[Literal["title", "content"], ...] = Field(max_length=2)
@@ -109,8 +112,8 @@ class _BrowserSuccess(BaseModel):
 class _BrowserFailure(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    protocol_version: Literal["cayu.browser-fetch.v1"]
-    worker_version: Literal["1"]
+    protocol_version: Literal["cayu.browser-fetch.v2"]
+    worker_version: Literal["2"]
     playwright_version: str = Field(min_length=1, max_length=32)
     kind: Literal["error"]
     error: str = Field(min_length=1, max_length=64)
@@ -138,9 +141,11 @@ class BrowserWebFetchAdapter:
         *,
         worker_command: Sequence[str] = DEFAULT_BROWSER_FETCH_WORKER_COMMAND,
         max_requests: int = DEFAULT_BROWSER_FETCH_MAX_REQUESTS,
+        max_dom_nodes: int = DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
     ) -> None:
         self._worker_command = _browser_worker_command(worker_command)
         self.max_requests = _bounded_max_requests(max_requests)
+        self.max_dom_nodes = _bounded_max_dom_nodes(max_dom_nodes)
 
     async def fetch(
         self,
@@ -184,6 +189,7 @@ class BrowserWebFetchAdapter:
                     "timeout_seconds": request.timeout_seconds,
                     "max_redirects": request.max_redirects,
                     "max_requests": self.max_requests,
+                    "max_dom_nodes": self.max_dom_nodes,
                 },
             },
             ensure_ascii=False,
@@ -273,6 +279,14 @@ def _bounded_max_requests(value: int) -> int:
         raise TypeError("max_requests must be an integer.")
     if value <= 0 or value > MAX_BROWSER_FETCH_MAX_REQUESTS:
         raise ValueError(f"max_requests must be between 1 and {MAX_BROWSER_FETCH_MAX_REQUESTS}.")
+    return value
+
+
+def _bounded_max_dom_nodes(value: int) -> int:
+    if type(value) is not int:
+        raise TypeError("max_dom_nodes must be an integer.")
+    if value <= 0 or value > MAX_BROWSER_FETCH_MAX_DOM_NODES:
+        raise ValueError(f"max_dom_nodes must be between 1 and {MAX_BROWSER_FETCH_MAX_DOM_NODES}.")
     return value
 
 
@@ -391,6 +405,7 @@ def _browser_worker_result(
         requested_url=requested_url,
         final_url=final_url,
         title=title,
+        representation=success.representation,
         content=content,
         redirects=redirects,
         truncation_reasons=success.truncation_reasons,
@@ -401,8 +416,10 @@ __all__ = [
     "BROWSER_FETCH_PLAYWRIGHT_VERSION",
     "BROWSER_FETCH_PROTOCOL_VERSION",
     "BROWSER_FETCH_WORKER_VERSION",
+    "DEFAULT_BROWSER_FETCH_MAX_DOM_NODES",
     "DEFAULT_BROWSER_FETCH_MAX_REQUESTS",
     "DEFAULT_BROWSER_FETCH_WORKER_COMMAND",
+    "MAX_BROWSER_FETCH_MAX_DOM_NODES",
     "MAX_BROWSER_FETCH_MAX_REQUESTS",
     "BrowserWebFetchAdapter",
 ]

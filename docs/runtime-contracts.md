@@ -4234,7 +4234,25 @@ process isolation, browser isolation, or a sandbox network boundary. It does
 not execute JavaScript, accept arbitrary request methods or headers, carry
 credentials, or invoke a secondary model. `BrowserWebFetchAdapter` uses the
 admitted runner and virtual-egress boundary for JavaScript-rendered content; it
-does not fall back to this default path. See
+does not fall back to this default path. Its versioned worker retains `text` for
+ordinary pages and selects a bounded `accessibility` representation for tables,
+forms, native navigation links, navigation landmarks, and interactive labels,
+including controls in open shadow roots. Trusted model-facing metadata declares
+the selected representation and truncation state outside the untrusted page
+envelope; the structured result retains the same fields. Final URL and redirect
+evidence retain the same contract. Accessibility snapshots have hard aggregate
+composed-DOM-node, accessibility-tree-depth, and content-byte ceilings. The
+worker freezes page-authored JavaScript and uses a browser-owned isolated world
+so node accounting and accessibility evidence describe one stable document;
+page-world property and prototype overrides are not inspection authority. Up
+to 32 admitted main/child frame documents are aggregated in stable tree order
+with explicit source URLs under page-wide node and content budgets, the same
+accessibility-depth ceiling, and the existing request, response-byte, and
+elapsed-time limits. A changing frame topology or document identity fails
+closed rather than publishing partial evidence. Frame documents whose owning
+element is ignored by Chromium's accessibility tree—including hidden, inert,
+and `aria-hidden` subtrees—remain inside the safety accounting but cannot
+select or contribute model-facing evidence. See
 [`docs/web-fetch.md`](web-fetch.md) for registration and deployment guidance.
 
 A custom `Tool` uses environment services through `ctx`:

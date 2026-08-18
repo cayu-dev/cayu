@@ -167,7 +167,7 @@ def test_create_runner_forwards_explicit_seccomp_profile(monkeypatch, tmp_path) 
     request = VirtualEgressRunnerRequest(
         name="browser-worker",
         runner_kind="docker",
-        image="cayu-browser-fetch:1",
+        image="cayu-browser-fetch:2",
         binding=EgressBinding(runner_kind="docker", network="internal"),
         env_overlay={},
         ca_cert_host_path="/tmp/ca.pem",

@@ -326,6 +326,20 @@ a virtual-egress environment, and opt the tool into
 `BrowserWebFetchAdapter`. The adapter sends a bounded, versioned JSON request to
 the environment's admitted runner. Playwright, Chromium, its temporary profile,
 and its per-invocation trust database exist only inside that runner.
+Ordinary pages return compact readable text. Links, tables, forms, navigation
+landmarks, and interactive labels—including controls in open shadow
+roots—select a bounded accessibility snapshot so their relationships are not
+flattened away. Trusted model-facing metadata and the structured result both
+identify the selected representation and truncation state.
+Before extraction, the worker freezes page-authored JavaScript and reads the
+stable document through a browser-owned isolated world, so page-defined getters
+and prototype overrides cannot bypass the node ceiling or change the evidence
+while it is being captured. The worker aggregates at most 32 admitted frame
+documents in stable tree order, labels every frame section with its URL, and
+applies the configured DOM/content limits as page-wide totals rather than
+per-frame allowances. Frame topology or navigation changing during inspection
+fails closed. Chromium-ignored frame subtrees remain inside frame, network, and
+DOM-node limits but are excluded from representation selection and output.
 
 ```python
 from cayu import (
@@ -362,7 +376,7 @@ factory = VirtualEgressEnvironmentFactory(
     adapter=DockerEgressAdapter(
         seccomp_profile="/absolute/path/to/browser_fetch/seccomp_profile.json",
     ),
-    image="cayu-browser-fetch:1-playwright-1.62.0",
+    image="cayu-browser-fetch:2-playwright-1.62.0",
 )
 
 app = CayuApp()
@@ -396,9 +410,10 @@ non-root guest; Chromium's sandbox; the managed HTTPS proxy and session CA; and
 current runner evidence for deny-by-default networking, brokered egress,
 confirmed cancellation, and confirmed cleanup. Missing or stale evidence fails
 before dispatch. There is no host-HTTP or host-Playwright fallback. Response
-bytes, extracted text, requests, redirects, command output, and elapsed time all
-have independent limits. The worker owns exactly one page; an unexpected popup
-or other secondary page fails the fetch instead of creating an unmetered
+bytes, selected content, frame documents, aggregate composed-DOM nodes,
+accessibility-tree depth, requests, redirects, command output, and elapsed time
+all have independent limits. The worker owns exactly one page; an unexpected
+popup or other secondary page fails the fetch instead of creating an unmetered
 network surface.
 
 Each temporary browser profile has a separate cleanup guardian before page

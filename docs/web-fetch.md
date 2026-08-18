@@ -72,6 +72,28 @@ never falls back to direct host HTTP. The selected environment must provide the
 compatible browser image plus current admission evidence for brokered,
 deny-by-default egress and deterministic command cancellation and cleanup.
 
+The browser worker returns compact readable `text` for ordinary pages. It
+deterministically selects `accessibility` when links, tables, forms, navigation
+landmarks, or interactive labels would otherwise lose page relationships,
+including controls in open shadow roots. Trusted metadata before the untrusted
+page envelope tells the model which representation was selected and whether it
+was truncated; the structured result retains the same fields for application
+consumers. Both forms share the configured content-byte limit; accessibility
+inspection also has hard accessibility-depth and aggregate composed-DOM-node
+ceilings. Applications can lower the node ceiling with
+`BrowserWebFetchAdapter(max_dom_nodes=...)`; the model-facing input remains only
+`url`. After the render-settle period, the worker freezes page-authored
+JavaScript and inspects the stable document from a browser-owned isolated
+world. Page-defined getters or prototype overrides therefore cannot mutate the
+document between node accounting and accessibility capture. Up to 32 admitted
+main/child frame documents are inspected in stable tree order. Their text or
+accessibility sections carry explicit frame URLs, share page-wide node and
+content budgets, and retain the existing depth, request, response-byte, and
+elapsed-time ceilings; frame attachment, detachment, navigation, unsupported
+media, or excess frame count fails closed. Hidden, inert, and `aria-hidden`
+frame subtrees still consume those safety limits but cannot select the
+representation or contribute model-facing content.
+
 Browser destinations are still application configuration. Register every
 document and subresource host as an `ApprovedEgressDestination` under a
 `BrowserEgressPolicy`; redirects, frames, scripts, stylesheets, images, and

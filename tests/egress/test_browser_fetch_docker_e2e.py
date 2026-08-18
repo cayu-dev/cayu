@@ -34,7 +34,7 @@ from cayu.vaults import SecretRedactor
 
 _BROWSER_IMAGE = os.environ.get(
     "CAYU_BROWSER_FETCH_IMAGE",
-    "cayu-browser-fetch:1-playwright-1.62.0-test",
+    "cayu-browser-fetch:2-playwright-1.62.0-test",
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SECCOMP_PROFILE = _REPOSITORY_ROOT / "examples" / "browser_fetch" / "seccomp_profile.json"
@@ -121,6 +121,57 @@ class _BrowserFixtureHandler(http.server.BaseHTTPRequestHandler):
             )
             self._send(200, "text/javascript; charset=utf-8", body)
             return
+        if self.path == "/structured":
+            body = b"""<!doctype html>
+<html><head><title>Deployment console</title></head>
+<body><main>
+<h1>Deployment overview</h1>
+<table aria-label="Release status">
+<thead><tr><th>Environment</th><th>Status</th></tr></thead>
+<tbody><tr><td>Production</td><td>Ready</td></tr></tbody>
+</table>
+<form aria-label="Deployment controls">
+<label for="target">Target</label>
+<select id="target"><option>Production</option></select>
+<button type="button">Deploy</button>
+</form>
+</main></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/navigation":
+            body = b"""<!doctype html>
+<html><head><title>Navigation</title></head>
+<body><a href="/structured">Open deployment console</a></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/shadow-controls":
+            body = b"""<!doctype html>
+<html><head><title>Shadow controls</title></head>
+<body><div id="controls"></div><script>
+const root = document.querySelector('#controls').attachShadow({mode: 'open'});
+for (let index = 0; index < 8; index += 1) {
+  const button = document.createElement('button');
+  button.setAttribute('aria-label', `Deploy environment ${index}`);
+  root.append(button);
+}
+</script></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/deep-accessibility":
+            groups = "".join(
+                (
+                    f'<div id="level-{index}" role="group" '
+                    f'aria-label="Level {index}"'
+                    + (f' aria-owns="level-{index + 1}"></div>' if index < 39 else "></div>")
+                )
+                for index in range(40)
+            )
+            body = (
+                "<!doctype html><html><head><title>Deep relationships</title></head>"
+                f"<body>{groups}</body></html>"
+            ).encode()
+            self._send(200, "text/html; charset=utf-8", body)
+            return
         if self.path == "/redirect-out":
             self.send_response(302)
             self.send_header("Location", "https://blocked.browser.test/private")
@@ -138,18 +189,64 @@ window.open('https://docs.browser.test/popup-target');
 </script><main>primary page</main></body></html>"""
             self._send(200, "text/html; charset=utf-8", body)
             return
-        if self.path == "/late-denied":
-            body = b"""<!doctype html>
-<html><head><title>Late request probe</title></head>
-<body><main>initial content</main><script>
+        if self.path == "/mutating-extraction":
+            body = b"""<!doctype html><html><head><title>Stable inspection</title></head>
+<body><button>initial control</button><script>
 Object.defineProperty(document.body, 'innerText', {
   configurable: true,
   get() {
     fetch('https://static.browser.test/private/late');
-    return 'late request triggered during extraction';
+    for (let index = 0; index < 100; index += 1) {
+      const button = document.createElement('button');
+      button.textContent = `page-controlled ${index}`;
+      document.body.append(button);
+    }
+    return 'page-controlled replacement';
+  }
+});
+setTimeout(() => {
+  for (let index = 0; index < 100; index += 1) {
+    const button = document.createElement('button');
+    button.textContent = `frame-timer ${index}`;
+    document.body.append(button);
+  }
+}, 500);
+</script></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/framed":
+            body = b"""<!doctype html><html><head><title>Framed application</title></head>
+<body><main>Parent overview</main><iframe src="https://static.browser.test/framed-controls"></iframe></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/framed-controls":
+            body = b"""<!doctype html><html><head><title>Frame controls</title></head>
+<body><form><input aria-label="Target"><button>Deploy</button></form><script>
+Object.defineProperty(document.body, 'innerText', {
+  configurable: true,
+  get() {
+    fetch('https://static.browser.test/private/frame-late');
+    for (let index = 0; index < 100; index += 1) {
+      const button = document.createElement('button');
+      button.textContent = `frame-controlled ${index}`;
+      document.body.append(button);
+    }
+    return 'frame-controlled replacement';
   }
 });
 </script></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/mixed-frames":
+            body = b"""<!doctype html><html><head><title>Mixed frames</title></head><body><main>Parent frame shell</main><iframe hidden src="https://static.browser.test/hidden-controls"></iframe><iframe src="https://static.browser.test/visible-article"></iframe></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/hidden-controls":
+            body = b"""<!doctype html><html><head><title>Hidden controls</title></head><body><form><input aria-label="Hidden target"><button>Hidden deploy</button></form></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/visible-article":
+            body = b"""<!doctype html><html><head><title>Visible article</title></head><body><article>Visible frame article</article></body></html>"""
             self._send(200, "text/html; charset=utf-8", body)
             return
         if self.path == "/redirect-then-denied":
@@ -253,6 +350,32 @@ async def _drive_browser_fetch() -> dict[str, Any]:
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
             {"url": "https://docs.browser.test/start"},
         )
+        structured = await tool.run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/structured"},
+        )
+        navigation = await tool.run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/navigation"},
+        )
+        shadow_controls = await tool.run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/shadow-controls"},
+        )
+        deep_accessibility = await tool.run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/deep-accessibility"},
+        )
+        oversized_dom = await WebFetchTool(
+            adapter=BrowserWebFetchAdapter(max_dom_nodes=5),
+            max_response_bytes=1024 * 1024,
+            max_content_bytes=16 * 1024,
+            timeout_seconds=30,
+            max_redirects=3,
+        ).run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/shadow-controls"},
+        )
         denied = await tool.run(
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
             {"url": "https://docs.browser.test/redirect-out"},
@@ -265,9 +388,55 @@ async def _drive_browser_fetch() -> dict[str, Any]:
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
             {"url": "https://docs.browser.test/popup"},
         )
-        late_denied = await tool.run(
+        stable_extraction = await WebFetchTool(
+            adapter=BrowserWebFetchAdapter(max_dom_nodes=5),
+            max_response_bytes=1024 * 1024,
+            max_content_bytes=16 * 1024,
+            timeout_seconds=30,
+            max_redirects=3,
+        ).run(
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
-            {"url": "https://docs.browser.test/late-denied"},
+            {"url": "https://docs.browser.test/mutating-extraction"},
+        )
+        framed = await WebFetchTool(
+            adapter=BrowserWebFetchAdapter(max_dom_nodes=11),
+            max_response_bytes=1024 * 1024,
+            max_content_bytes=16 * 1024,
+            timeout_seconds=30,
+            max_redirects=3,
+        ).run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/framed"},
+        )
+        framed_oversized = await WebFetchTool(
+            adapter=BrowserWebFetchAdapter(max_dom_nodes=10),
+            max_response_bytes=1024 * 1024,
+            max_content_bytes=16 * 1024,
+            timeout_seconds=30,
+            max_redirects=3,
+        ).run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/framed"},
+        )
+        mixed_frames = await WebFetchTool(
+            adapter=BrowserWebFetchAdapter(max_dom_nodes=13),
+            max_response_bytes=1024 * 1024,
+            max_content_bytes=16 * 1024,
+            timeout_seconds=30,
+            max_redirects=3,
+        ).run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/mixed-frames"},
+        )
+        mixed_frames_oversized = await WebFetchTool(
+            adapter=BrowserWebFetchAdapter(max_dom_nodes=12),
+            max_response_bytes=1024 * 1024,
+            max_content_bytes=16 * 1024,
+            timeout_seconds=30,
+            max_redirects=3,
+        ).run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/mixed-frames"},
         )
         denied_subresource = await tool.run(
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
@@ -306,10 +475,19 @@ async def _drive_browser_fetch() -> dict[str, Any]:
         )
         return {
             "success": success,
+            "structured": structured,
+            "navigation": navigation,
+            "shadow_controls": shadow_controls,
+            "deep_accessibility": deep_accessibility,
+            "oversized_dom": oversized_dom,
             "denied": denied,
             "locally_denied_redirect": locally_denied_redirect,
             "popup": popup,
-            "late_denied": late_denied,
+            "stable_extraction": stable_extraction,
+            "framed": framed,
+            "framed_oversized": framed_oversized,
+            "mixed_frames": mixed_frames,
+            "mixed_frames_oversized": mixed_frames_oversized,
             "denied_subresource": denied_subresource,
             "worker_integrity_probe": worker_integrity_probe,
             "network_probe": network_probe,
@@ -359,6 +537,81 @@ def test_browser_fetch_renders_javascript_through_managed_virtual_egress(
     assert ("static.browser.test", "/render.js") in browser_fetch_results["requests"]
 
 
+def test_browser_fetch_preserves_structured_page_relationships_as_accessibility_evidence(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["structured"]
+
+    assert result.is_error is False
+    assert result.structured["requested_url"] == "https://docs.browser.test/structured"
+    assert result.structured["final_url"] == "https://docs.browser.test/structured"
+    assert result.structured["title"] == "Deployment console"
+    assert result.structured["representation"] == "accessibility"
+    assert result.structured["truncated"] is False
+    assert result.structured["truncation_reasons"] == []
+    accessibility = result.structured["content"]
+    assert type(accessibility) is str
+    assert "Release status" in accessibility
+    assert "Production" in accessibility
+    assert "Ready" in accessibility
+    assert "Deployment controls" in accessibility
+    assert "Deploy" in accessibility
+    assert ("docs.browser.test", "/structured") in browser_fetch_results["requests"]
+
+
+def test_browser_fetch_preserves_native_navigation_roles_and_destinations(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["navigation"]
+
+    assert result.is_error is False
+    assert result.structured["representation"] == "accessibility"
+    accessibility = result.structured["content"]
+    assert type(accessibility) is str
+    assert 'link "Open deployment console"' in accessibility
+    assert "/url:" in accessibility
+    assert "/structured" in accessibility
+
+
+def test_browser_fetch_discovers_and_bounds_open_shadow_dom_controls(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["shadow_controls"]
+
+    assert result.is_error is False
+    assert result.structured["representation"] == "accessibility"
+    accessibility = result.structured["content"]
+    assert type(accessibility) is str
+    assert 'button "Deploy environment 0"' in accessibility
+    assert 'button "Deploy environment 7"' in accessibility
+
+
+def test_browser_fetch_reports_accessibility_tree_depth_truncation(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["deep_accessibility"]
+
+    assert result.is_error is False
+    assert result.structured["representation"] == "accessibility"
+    assert result.structured["truncated"] is True
+    assert result.structured["truncation_reasons"] == ["content"]
+    assert "Truncated: true" in result.content
+    assert "Truncation reasons: content" in result.content
+    accessibility = result.structured["content"]
+    assert type(accessibility) is str
+    assert 'group "Level 32"' in accessibility
+    assert 'group "Level 33"' not in accessibility
+
+
+def test_browser_fetch_rejects_pages_above_the_configured_dom_node_ceiling(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["oversized_dom"]
+
+    assert result.is_error is True
+    assert result.structured == {"error": "oversized_response"}
+
+
 def test_browser_fetch_denies_unapproved_redirect_and_direct_network(
     browser_fetch_results: dict[str, Any],
 ) -> None:
@@ -383,13 +636,69 @@ def test_browser_fetch_rejects_untracked_secondary_pages(
     assert popup.structured == {"error": "fetch_failed"}
 
 
-def test_browser_fetch_cannot_publish_success_before_late_denial_settles(
+def test_browser_fetch_freezes_and_isolates_page_controlled_extraction(
     browser_fetch_results: dict[str, Any],
 ) -> None:
-    late_denied = browser_fetch_results["late_denied"]
-    assert late_denied.is_error is True
-    assert late_denied.structured == {"error": "destination_denied"}
+    result = browser_fetch_results["stable_extraction"]
+
+    assert result.is_error is False
+    assert result.structured["representation"] == "accessibility"
+    assert result.structured["truncated"] is False
+    assert result.structured["content"] == '- button "initial control"'
+    assert "page-controlled" not in result.content
     assert ("static.browser.test", "/private/late") not in browser_fetch_results["requests"]
+
+
+def test_browser_fetch_aggregates_admitted_frames_under_shared_limits(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["framed"]
+
+    assert result.is_error is False
+    assert result.structured["representation"] == "accessibility"
+    assert result.structured["truncated"] is False
+    content = result.structured["content"]
+    assert type(content) is str
+    assert "[Main frame]" in content
+    assert "URL: https://docs.browser.test/framed" in content
+    assert "Parent overview" in content
+    assert "[Frame 1]" in content
+    assert "URL: https://static.browser.test/framed-controls" in content
+    assert "Parent frame: 0" in content
+    assert 'textbox "Target"' in content
+    assert 'button "Deploy"' in content
+    assert "frame-controlled" not in content
+    assert "frame-timer" not in content
+    assert ("static.browser.test", "/private/frame-late") not in browser_fetch_results["requests"]
+
+    oversized = browser_fetch_results["framed_oversized"]
+    assert oversized.is_error is True
+    assert oversized.structured == {"error": "oversized_response"}
+
+
+def test_browser_fetch_excludes_hidden_frames_but_counts_their_nodes(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["mixed_frames"]
+
+    assert result.is_error is False
+    assert result.structured["representation"] == "text"
+    assert result.structured["truncated"] is False
+    content = result.structured["content"]
+    assert type(content) is str
+    assert "Parent frame shell" in content
+    assert "[Frame 1]" in content
+    assert "[Frame 2]" not in content
+    assert "URL: https://static.browser.test/visible-article" in content
+    assert "Visible frame article" in content
+    assert "hidden-controls" not in content
+    assert "Hidden controls" not in content
+    assert "Hidden target" not in content
+    assert "Hidden deploy" not in content
+
+    oversized = browser_fetch_results["mixed_frames_oversized"]
+    assert oversized.is_error is True
+    assert oversized.structured == {"error": "oversized_response"}
 
 
 def test_browser_fetch_does_not_misclassify_denied_subresource_after_redirect(

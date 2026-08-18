@@ -12,7 +12,7 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
@@ -20,6 +20,7 @@ from cayu import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     BROWSER_FETCH_PROTOCOL_VERSION,
     BROWSER_FETCH_WORKER_VERSION,
+    DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
     BrowserWebFetchAdapter,
     ExecCommand,
     ExecutionCapabilityClaim,
@@ -29,7 +30,7 @@ from cayu import (
 )
 from cayu.environments.admission import ExecutionAdmissionCandidate
 from cayu.runners import ExecResult, RunnerExecutionError, RunnerUnavailableError
-from cayu.tools import MAX_BROWSER_FETCH_MAX_REQUESTS
+from cayu.tools import MAX_BROWSER_FETCH_MAX_DOM_NODES, MAX_BROWSER_FETCH_MAX_REQUESTS
 from cayu.tools import _browser_guest as guest
 
 
@@ -79,6 +80,7 @@ def _success_payload(**overrides: Any) -> str:
         "requested_url": "https://example.com/",
         "final_url": "https://example.com/guide",
         "title": "Rendered guide",
+        "representation": "text",
         "content": "JavaScript-rendered content",
         "redirects": [
             {
@@ -133,10 +135,14 @@ def _run(
     timeout_seconds: float = 2.1,
     max_redirects: int = 2,
     max_requests: int = 128,
+    max_dom_nodes: int = DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
 ):
     return asyncio.run(
         WebFetchTool(
-            adapter=BrowserWebFetchAdapter(max_requests=max_requests),
+            adapter=BrowserWebFetchAdapter(
+                max_requests=max_requests,
+                max_dom_nodes=max_dom_nodes,
+            ),
             max_response_bytes=max_response_bytes,
             max_content_bytes=max_content_bytes,
             timeout_seconds=timeout_seconds,
@@ -183,6 +189,7 @@ def test_browser_adapter_preserves_web_fetch_contract_and_dispatches_closed_requ
         "expected_playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
         "limits": {
             "max_content_bytes": 1024,
+            "max_dom_nodes": DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
             "max_redirects": 2,
             "max_requests": 128,
             "max_response_bytes": 2048,
@@ -195,6 +202,28 @@ def test_browser_adapter_preserves_web_fetch_contract_and_dispatches_closed_requ
     }
     assert kwargs["timeout_s"] == 3
     assert kwargs["output_limit_bytes"] == (2 * (1024 + 512 + 4 * (2 + 2 * 2) * 8192) + 64 * 1024)
+
+
+def test_browser_adapter_projects_accessibility_evidence_without_changing_url_evidence() -> None:
+    runner = _FakeRunner(
+        ExecResult(
+            stdout=_success_payload(
+                representation="accessibility",
+                content='- navigation "Primary"\n  - link "Guide"',
+            )
+        )
+    )
+
+    result = _run(runner)
+
+    assert result.is_error is False
+    assert result.structured["representation"] == "accessibility"
+    assert result.structured["content"] == '- navigation "Primary"\n  - link "Guide"'
+    assert result.structured["requested_url"] == "https://example.com/"
+    assert result.structured["final_url"] == "https://example.com/guide"
+    assert result.content.startswith(
+        "Fetched web content:\nRepresentation: accessibility\nTruncated: false\n\n"
+    )
 
 
 def test_browser_adapter_bounds_non_ascii_request_and_result_framing() -> None:
@@ -296,11 +325,19 @@ def test_browser_adapter_sanitizes_unexpected_runner_failure() -> None:
         ("not-json", "malformed_browser_result"),
         (json.dumps([]), "malformed_browser_result"),
         (_success_payload(protocol_version="future"), "incompatible_browser"),
-        (_success_payload(worker_version="2"), "incompatible_browser"),
+        (
+            _success_payload(
+                protocol_version="cayu.browser-fetch.v1",
+                worker_version="1",
+            ),
+            "incompatible_browser",
+        ),
+        (_success_payload(worker_version="3"), "incompatible_browser"),
         (_success_payload(playwright_version="1.63.0"), "incompatible_browser"),
         (_success_payload(requested_url="https://other.example/"), "malformed_browser_result"),
         (_success_payload(response_bytes=2049), "malformed_browser_result"),
         (_success_payload(request_count=129), "malformed_browser_result"),
+        (_success_payload(representation="dom"), "malformed_browser_result"),
         (_success_payload(content="x" * 1025), "malformed_browser_result"),
         (_success_payload(content="unsafe\x00content"), "malformed_browser_result"),
         (_success_payload(content="unsafe\ud800content"), "malformed_browser_result"),
@@ -316,6 +353,15 @@ def test_browser_adapter_rejects_malformed_or_incompatible_worker_result(
     result = _run(_FakeRunner(ExecResult(stdout=stdout)))
 
     assert result.structured == {"error": error}
+
+
+def test_browser_adapter_requires_the_worker_to_declare_its_representation() -> None:
+    payload = json.loads(_success_payload())
+    del payload["representation"]
+
+    result = _run(_FakeRunner(ExecResult(stdout=json.dumps(payload))))
+
+    assert result.structured == {"error": "malformed_browser_result"}
 
 
 def test_browser_adapter_rejects_result_above_configured_request_limit() -> None:
@@ -361,6 +407,12 @@ def test_browser_adapter_configuration_is_bounded() -> None:
         BrowserWebFetchAdapter(max_requests=0)
     with pytest.raises(ValueError, match="max_requests"):
         BrowserWebFetchAdapter(max_requests=MAX_BROWSER_FETCH_MAX_REQUESTS + 1)
+    with pytest.raises(ValueError, match="max_dom_nodes"):
+        BrowserWebFetchAdapter(max_dom_nodes=0)
+    with pytest.raises(TypeError, match="max_dom_nodes"):
+        BrowserWebFetchAdapter(max_dom_nodes=True)
+    with pytest.raises(ValueError, match="max_dom_nodes"):
+        BrowserWebFetchAdapter(max_dom_nodes=MAX_BROWSER_FETCH_MAX_DOM_NODES + 1)
     with pytest.raises(TypeError, match="worker_command"):
         BrowserWebFetchAdapter(worker_command="python")
     with pytest.raises(ValueError, match="worker_command"):
@@ -410,6 +462,7 @@ def test_guest_request_framing_and_text_bounds_are_closed() -> None:
                 "timeout_seconds": 1.5,
                 "max_redirects": 1,
                 "max_requests": 4,
+                "max_dom_nodes": 100,
             },
         }
     )
@@ -429,6 +482,18 @@ def test_guest_request_framing_and_text_bounds_are_closed() -> None:
     )
     assert lines == "first\nsecond\ufffd line"
     assert lines_truncated is False
+    accessibility, accessibility_truncated = guest._normalized_accessibility_text(
+        "- navigation\n\t- link  Guide\x00\n" + (" " * 80) + "- button Save",
+        256,
+    )
+    assert accessibility == "- navigation\n - link Guide\n" + (" " * 64) + "- button Save"
+    assert accessibility_truncated is False
+    bounded_accessibility, bounded_accessibility_truncated = guest._normalized_accessibility_text(
+        "\u00e9" * 8, 7
+    )
+    assert bounded_accessibility == "\u00e9\u00e9\u00e9"
+    assert len(bounded_accessibility.encode("utf-8")) <= 7
+    assert bounded_accessibility_truncated is True
     with pytest.raises(guest._GuestFailure):
         guest._request_from_json(
             {
@@ -441,6 +506,476 @@ def test_guest_request_framing_and_text_bounds_are_closed() -> None:
                 "arbitrary_browser_command": "evaluate",
             }
         )
+
+
+def _projection_cdp(
+    extracted: dict[str, object],
+    *,
+    final_loader_id: str = "loader-1",
+) -> Mock:
+    def frame_tree(loader_id: str) -> dict[str, object]:
+        return {
+            "frameTree": {
+                "frame": {
+                    "id": "frame-1",
+                    "loaderId": loader_id,
+                    "url": "https://example.com/",
+                    "mimeType": "text/html",
+                }
+            }
+        }
+
+    projected = {"node_count": 1, **extracted}
+    cdp = Mock()
+    cdp.send = AsyncMock(
+        side_effect=[
+            frame_tree("loader-1"),
+            {"executionContextId": 7},
+            {"result": {"type": "object", "value": projected}},
+            frame_tree(final_loader_id),
+        ]
+    )
+    return cdp
+
+
+def test_guest_keeps_readable_text_for_pages_without_semantic_structure() -> None:
+    async def exercise() -> None:
+        page = Mock()
+        page.main_frame = page
+        page.url = "https://example.com/"
+        page.child_frames = []
+        cdp = _projection_cdp(
+            {
+                "text": "Rendered article body",
+                "truncated": False,
+                "title": "Article",
+                "title_truncated": False,
+                "node_limit_exceeded": False,
+                "semantic_structure": False,
+            }
+        )
+        page.locator = Mock()
+        request = guest._Request(
+            url="https://example.com/",
+            limits=guest._Limits(
+                max_response_bytes=1024,
+                max_content_bytes=128,
+                timeout_seconds=1.0,
+                max_redirects=1,
+                max_requests=4,
+                max_dom_nodes=100,
+            ),
+        )
+
+        result = await guest._extract_page_representation(
+            page,
+            cdp,
+            request,
+            operation_timeout_ms=500,
+        )
+
+        assert result == ("Article", "text", "Rendered article body", ())
+        page.locator.assert_not_called()
+        assert cdp.send.await_args_list[0] == call("Page.getFrameTree")
+        assert cdp.send.await_args_list[1] == call(
+            "Page.createIsolatedWorld",
+            {
+                "frameId": "frame-1",
+                "worldName": guest._BROWSER_INSPECTION_WORLD,
+                "grantUniveralAccess": False,
+            },
+        )
+        runtime_call = cdp.send.await_args_list[2]
+        assert runtime_call.args[0] == "Runtime.evaluate"
+        assert runtime_call.args[1]["contextId"] == 7
+        assert (
+            'const limits = {"content":128,"nodes":100,"title":512};'
+            in (runtime_call.args[1]["expression"])
+        )
+        assert cdp.send.await_args_list[3] == call("Page.getFrameTree")
+
+    asyncio.run(exercise())
+
+
+def test_guest_escalates_semantic_pages_to_bounded_accessibility_evidence() -> None:
+    async def exercise() -> None:
+        locator = Mock()
+        bounded_snapshot = '- navigation "Primary"\n  - link   "Guide"\n  - button "Save"'
+        locator.aria_snapshot = AsyncMock(
+            side_effect=[
+                bounded_snapshot,
+                bounded_snapshot + '\n    - text "deeper evidence"',
+            ]
+        )
+        page = Mock()
+        page.main_frame = page
+        page.url = "https://example.com/"
+        page.child_frames = []
+        cdp = _projection_cdp(
+            {
+                "text": "Guide Save",
+                "truncated": False,
+                "title": "Controls",
+                "title_truncated": False,
+                "node_limit_exceeded": False,
+                "semantic_structure": True,
+            }
+        )
+        page.locator.return_value = locator
+        request = guest._Request(
+            url="https://example.com/",
+            limits=guest._Limits(
+                max_response_bytes=1024,
+                max_content_bytes=128,
+                timeout_seconds=1.0,
+                max_redirects=1,
+                max_requests=4,
+                max_dom_nodes=100,
+            ),
+        )
+
+        result = await guest._extract_page_representation(
+            page,
+            cdp,
+            request,
+            operation_timeout_ms=500,
+        )
+
+        assert result == (
+            "Controls",
+            "accessibility",
+            '- navigation "Primary"\n  - link "Guide"\n  - button "Save"',
+            ("content",),
+        )
+        page.locator.assert_called_once_with("body")
+        assert locator.aria_snapshot.await_args_list == [
+            call(
+                timeout=500,
+                depth=guest._ACCESSIBILITY_SNAPSHOT_DEPTH,
+                mode="default",
+                boxes=False,
+            ),
+            call(
+                timeout=500,
+                depth=guest._ACCESSIBILITY_SNAPSHOT_DEPTH + 1,
+                mode="default",
+                boxes=False,
+            ),
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_guest_rejects_page_above_the_dom_node_ceiling_before_snapshot() -> None:
+    async def exercise() -> None:
+        page = Mock()
+        page.main_frame = page
+        page.url = "https://example.com/"
+        page.child_frames = []
+        cdp = _projection_cdp(
+            {
+                "text": "",
+                "truncated": False,
+                "title": "Too large",
+                "title_truncated": False,
+                "node_limit_exceeded": True,
+                "semantic_structure": True,
+            }
+        )
+        page.locator = Mock()
+        request = guest._Request(
+            url="https://example.com/",
+            limits=guest._Limits(
+                max_response_bytes=1024,
+                max_content_bytes=128,
+                timeout_seconds=1.0,
+                max_redirects=1,
+                max_requests=4,
+                max_dom_nodes=100,
+            ),
+        )
+
+        with pytest.raises(guest._GuestFailure) as captured:
+            await guest._extract_page_representation(
+                page,
+                cdp,
+                request,
+                operation_timeout_ms=500,
+            )
+
+        assert captured.value.code == "oversized_response"
+        page.locator.assert_not_called()
+
+    asyncio.run(exercise())
+
+
+def test_guest_rejects_a_document_replaced_during_accessibility_extraction() -> None:
+    async def exercise() -> None:
+        locator = Mock()
+        locator.aria_snapshot = AsyncMock(return_value='- button "Save"')
+        page = Mock()
+        page.main_frame = page
+        page.url = "https://example.com/"
+        page.child_frames = []
+        page.locator.return_value = locator
+        cdp = _projection_cdp(
+            {
+                "text": "Save",
+                "truncated": False,
+                "title": "Controls",
+                "title_truncated": False,
+                "node_limit_exceeded": False,
+                "semantic_structure": True,
+            },
+            final_loader_id="loader-2",
+        )
+        request = guest._Request(
+            url="https://example.com/",
+            limits=guest._Limits(
+                max_response_bytes=1024,
+                max_content_bytes=128,
+                timeout_seconds=1.0,
+                max_redirects=1,
+                max_requests=4,
+                max_dom_nodes=100,
+            ),
+        )
+
+        with pytest.raises(guest._GuestFailure) as captured:
+            await guest._extract_page_representation(
+                page,
+                cdp,
+                request,
+                operation_timeout_ms=500,
+            )
+
+        assert captured.value.code == "fetch_failed"
+
+    asyncio.run(exercise())
+
+
+def test_guest_aggregates_child_frames_under_one_node_and_content_budget() -> None:
+    async def exercise() -> None:
+        frame_tree = {
+            "frameTree": {
+                "frame": {
+                    "id": "main-frame",
+                    "loaderId": "main-loader",
+                    "url": "https://example.com/",
+                    "mimeType": "text/html",
+                },
+                "childFrames": [
+                    {
+                        "frame": {
+                            "id": "child-frame",
+                            "parentId": "main-frame",
+                            "loaderId": "child-loader",
+                            "url": "https://static.example.com/controls",
+                            "mimeType": "text/html",
+                        }
+                    }
+                ],
+            }
+        }
+        main_projection = {
+            "node_count": 4,
+            "node_limit_exceeded": False,
+            "semantic_structure": False,
+            "text": "Parent overview",
+            "title": "Parent",
+            "title_truncated": False,
+            "truncated": False,
+        }
+        child_projection = {
+            "node_count": 7,
+            "node_limit_exceeded": False,
+            "semantic_structure": True,
+            "text": "Deploy",
+            "title": "Controls",
+            "title_truncated": False,
+            "truncated": False,
+        }
+        cdp = Mock()
+        cdp.send = AsyncMock(
+            side_effect=[
+                frame_tree,
+                {"backendNodeId": 42},
+                {
+                    "nodes": [
+                        {
+                            "backendDOMNodeId": 42,
+                            "ignored": False,
+                        }
+                    ]
+                },
+                {"executionContextId": 7},
+                {"result": {"type": "object", "value": main_projection}},
+                {"executionContextId": 8},
+                {"result": {"type": "object", "value": child_projection}},
+                frame_tree,
+                {"backendNodeId": 42},
+                {
+                    "nodes": [
+                        {
+                            "backendDOMNodeId": 42,
+                            "ignored": False,
+                        }
+                    ]
+                },
+            ]
+        )
+        main_locator = Mock()
+        main_locator.aria_snapshot = AsyncMock(return_value="- text: Parent overview\n- iframe")
+        child_locator = Mock()
+        child_locator.aria_snapshot = AsyncMock(
+            return_value='- textbox "Target"\n- button "Deploy"'
+        )
+        child_frame = Mock()
+        child_frame.url = "https://static.example.com/controls"
+        child_frame.child_frames = []
+        child_frame.locator.return_value = child_locator
+        main_frame = Mock()
+        main_frame.url = "https://example.com/"
+        main_frame.child_frames = [child_frame]
+        main_frame.locator.return_value = main_locator
+        page = Mock()
+        page.main_frame = main_frame
+        request = guest._Request(
+            url="https://example.com/",
+            limits=guest._Limits(
+                max_response_bytes=1024,
+                max_content_bytes=1024,
+                timeout_seconds=1.0,
+                max_redirects=1,
+                max_requests=4,
+                max_dom_nodes=11,
+            ),
+        )
+
+        result = await guest._extract_page_representation(
+            page,
+            cdp,
+            request,
+            operation_timeout_ms=500,
+        )
+
+        assert result == (
+            "Parent",
+            "accessibility",
+            "[Main frame]\n"
+            "URL: https://example.com/\n"
+            "Title: Parent\n"
+            "- text: Parent overview\n"
+            "- iframe\n\n"
+            "[Frame 1]\n"
+            "URL: https://static.example.com/controls\n"
+            "Parent frame: 0\n"
+            "Title: Controls\n"
+            '- textbox "Target"\n'
+            '- button "Deploy"',
+            (),
+        )
+        runtime_calls = [
+            observed
+            for observed in cdp.send.await_args_list
+            if observed.args[0] == "Runtime.evaluate"
+        ]
+        assert '"nodes":11' in runtime_calls[0].args[1]["expression"]
+        assert '"nodes":7' in runtime_calls[1].args[1]["expression"]
+
+    asyncio.run(exercise())
+
+
+def test_guest_excludes_ignored_frame_subtrees_from_evidence_membership() -> None:
+    async def exercise() -> None:
+        identities = (
+            guest._FrameIdentity(
+                frame_id="main",
+                loader_id="main-loader",
+                url="https://example.com/",
+                mime_type="text/html",
+                parent_index=None,
+            ),
+            guest._FrameIdentity(
+                frame_id="hidden",
+                loader_id="hidden-loader",
+                url="https://static.example.com/hidden",
+                mime_type="text/html",
+                parent_index=0,
+            ),
+            guest._FrameIdentity(
+                frame_id="hidden-descendant",
+                loader_id="hidden-descendant-loader",
+                url="https://static.example.com/hidden-child",
+                mime_type="text/html",
+                parent_index=1,
+            ),
+            guest._FrameIdentity(
+                frame_id="visible",
+                loader_id="visible-loader",
+                url="https://static.example.com/visible",
+                mime_type="text/html",
+                parent_index=0,
+            ),
+        )
+        cdp = Mock()
+        cdp.send = AsyncMock(
+            side_effect=[
+                {"backendNodeId": 10},
+                {"nodes": [{"backendDOMNodeId": 10, "ignored": True}]},
+                {"backendNodeId": 11},
+                {"nodes": [{"backendDOMNodeId": 11, "ignored": False}]},
+                {"backendNodeId": 12},
+                {"nodes": [{"backendDOMNodeId": 12, "ignored": False}]},
+            ]
+        )
+
+        assert await guest._frame_evidence_membership(cdp, identities) == (
+            True,
+            False,
+            False,
+            True,
+        )
+
+    asyncio.run(exercise())
+
+
+def test_guest_rejects_more_than_the_hard_frame_document_limit() -> None:
+    async def exercise() -> None:
+        main_frame = {
+            "id": "main-frame",
+            "loaderId": "main-loader",
+            "url": "https://example.com/",
+            "mimeType": "text/html",
+        }
+        child_frames = [
+            {
+                "frame": {
+                    "id": f"child-{index}",
+                    "parentId": "main-frame",
+                    "loaderId": f"loader-{index}",
+                    "url": "about:blank",
+                    "mimeType": "text/html",
+                }
+            }
+            for index in range(guest._MAX_FRAME_DOCUMENTS)
+        ]
+        cdp = Mock()
+        cdp.send = AsyncMock(
+            return_value={
+                "frameTree": {
+                    "frame": main_frame,
+                    "childFrames": child_frames,
+                }
+            }
+        )
+
+        with pytest.raises(guest._GuestFailure) as captured:
+            await guest._frame_identities(cdp)
+
+        assert captured.value.code == "oversized_response"
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize(
@@ -607,6 +1142,7 @@ def test_guest_browser_cleanup_uses_the_deadline_remaining_after_ca_setup() -> N
                 timeout_seconds=0.5,
                 max_redirects=1,
                 max_requests=4,
+                max_dom_nodes=100,
             ),
         )
         cleanup_calls: list[str] = []
@@ -725,6 +1261,7 @@ def test_guest_browser_cleanup_never_expands_beyond_its_configured_reserve() -> 
                 timeout_seconds=120.0,
                 max_redirects=1,
                 max_requests=4,
+                max_dom_nodes=100,
             ),
         )
         observed_budgets: list[float] = []
@@ -835,6 +1372,7 @@ def test_guest_classifies_temporary_profile_cleanup_failure(
                 "timeout_seconds": 1.0,
                 "max_redirects": 1,
                 "max_requests": 4,
+                "max_dom_nodes": 100,
             },
         }
     )
@@ -1070,6 +1608,7 @@ def test_guest_profile_owner_start_preserves_caller_cancellation() -> None:
             timeout_seconds=1.0,
             max_redirects=1,
             max_requests=4,
+            max_dom_nodes=100,
         ),
     )
 
@@ -1145,6 +1684,7 @@ def test_guest_profile_owner_start_timeout_reports_unproven_cleanup() -> None:
             timeout_seconds=0.05,
             max_redirects=1,
             max_requests=4,
+            max_dom_nodes=100,
         ),
     )
 
@@ -1190,6 +1730,7 @@ def test_guest_blocking_profile_cleanup_returns_bounded_failure(tmp_path: Path) 
                 "timeout_seconds": 0.1,
                 "max_redirects": 1,
                 "max_requests": 4,
+                "max_dom_nodes": 100,
             },
         }
     )
@@ -1273,6 +1814,7 @@ def test_guest_operation_deadline_preserves_observed_denial() -> None:
                 "timeout_seconds": 0.1,
                 "max_redirects": 1,
                 "max_requests": 4,
+                "max_dom_nodes": 100,
             },
         }
     )

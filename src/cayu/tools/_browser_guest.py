@@ -27,8 +27,8 @@ from pathlib import Path
 from typing import Any, Never
 from urllib.parse import urljoin, urlsplit
 
-PROTOCOL_VERSION = "cayu.browser-fetch.v1"
-WORKER_VERSION = "1"
+PROTOCOL_VERSION = "cayu.browser-fetch.v2"
+WORKER_VERSION = "2"
 PLAYWRIGHT_VERSION = "1.62.0"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -36,8 +36,13 @@ _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_CONTENT_BYTES = 256 * 1024
 _MAX_REDIRECTS = 10
 _MAX_REQUESTS = 512
+_MAX_DOM_NODES = 100_000
 _MAX_TIMEOUT_SECONDS = 120.0
 _MAX_TITLE_BYTES = 512
+_ACCESSIBILITY_SNAPSHOT_DEPTH = 32
+_MAX_ACCESSIBILITY_INDENT = 64
+_MAX_FRAME_DOCUMENTS = 32
+_BROWSER_INSPECTION_WORLD = "cayu-browser-inspection"
 _RENDER_SETTLE_MILLISECONDS = 250
 _FINAL_NETWORK_SETTLE_SECONDS = 0.25
 _PLAYWRIGHT_BROWSERS_PATH = "/ms-playwright"
@@ -67,6 +72,7 @@ class _Limits:
     timeout_seconds: float
     max_redirects: int
     max_requests: int
+    max_dom_nodes: int
 
 
 @dataclass(frozen=True)
@@ -93,6 +99,26 @@ class _PageState:
 class _BrowserCleanupOutcome:
     errors: tuple[BaseException, ...] = ()
     cancellation: asyncio.CancelledError | None = None
+
+
+@dataclass(frozen=True)
+class _FrameIdentity:
+    frame_id: str
+    loader_id: str
+    url: str
+    mime_type: str
+    parent_index: int | None
+
+
+@dataclass(frozen=True)
+class _FrameProjection:
+    identity: _FrameIdentity
+    title: str | None
+    text: str
+    title_truncated: bool
+    text_truncated: bool
+    semantic_structure: bool
+    node_count: int
 
 
 @dataclass(frozen=True)
@@ -167,6 +193,7 @@ def _request_from_json(raw: Any) -> _Request:
     limits = raw["limits"]
     if type(limits) is not dict or set(limits) != {
         "max_content_bytes",
+        "max_dom_nodes",
         "max_redirects",
         "max_requests",
         "max_response_bytes",
@@ -200,6 +227,11 @@ def _request_from_json(raw: Any) -> _Request:
                 limits["max_requests"],
                 minimum=1,
                 maximum=_MAX_REQUESTS,
+            ),
+            max_dom_nodes=_bounded_int(
+                limits["max_dom_nodes"],
+                minimum=1,
+                maximum=_MAX_DOM_NODES,
             ),
         ),
     )
@@ -602,6 +634,461 @@ def _normalized_text(value: str, max_bytes: int, *, preserve_lines: bool) -> tup
     return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
 
 
+def _normalized_accessibility_text(value: str, max_bytes: int) -> tuple[str, bool]:
+    """Bound an ARIA snapshot while preserving its structural indentation."""
+
+    safe_parts: list[str] = []
+    for character in value:
+        category = unicodedata.category(character)
+        if category == "Cs":
+            safe_parts.append("\ufffd")
+        elif character in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029":
+            safe_parts.append("\n")
+        elif category == "Cc":
+            safe_parts.append(" ")
+        else:
+            safe_parts.append(character)
+    lines: list[str] = []
+    for raw_line in "".join(safe_parts).splitlines():
+        stripped = raw_line.lstrip(" ")
+        if not stripped:
+            continue
+        indent = min(len(raw_line) - len(stripped), _MAX_ACCESSIBILITY_INDENT)
+        lines.append((" " * indent) + " ".join(stripped.split()))
+    normalized = "\n".join(lines)
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return normalized, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+async def _extract_page_representation(
+    page: Any,
+    cdp: Any,
+    request: _Request,
+    *,
+    operation_timeout_ms: int,
+) -> tuple[str | None, str, str, tuple[str, ...]]:
+    """Select and bound the canonical model-facing page representation."""
+
+    frame_identities = await _frame_identities(cdp)
+    frames = _playwright_frames_for_identities(page, frame_identities)
+    evidence_membership = await _frame_evidence_membership(cdp, frame_identities)
+    remaining_nodes = request.limits.max_dom_nodes
+    projections: list[_FrameProjection] = []
+    for identity in frame_identities:
+        projection = await _isolated_frame_projection(
+            cdp,
+            identity,
+            request,
+            max_dom_nodes=remaining_nodes,
+        )
+        remaining_nodes -= projection.node_count
+        projections.append(projection)
+
+    included_indexes = [index for index, included in enumerate(evidence_membership) if included]
+    included_projections = [projections[index] for index in included_indexes]
+    representation = (
+        "accessibility"
+        if any(projection.semantic_structure for projection in included_projections)
+        else "text"
+    )
+    frame_contents: list[str] = []
+    content_truncated = False
+    if representation == "accessibility":
+        for index in included_indexes:
+            frame = frames[index]
+            body = frame.locator("body")
+            accessibility_content = await body.aria_snapshot(
+                timeout=operation_timeout_ms,
+                depth=_ACCESSIBILITY_SNAPSHOT_DEPTH,
+                mode="default",
+                boxes=False,
+            )
+            accessibility_depth_probe = await body.aria_snapshot(
+                timeout=operation_timeout_ms,
+                depth=_ACCESSIBILITY_SNAPSHOT_DEPTH + 1,
+                mode="default",
+                boxes=False,
+            )
+            if type(accessibility_content) is not str:
+                raise _GuestFailure("browser_crash")
+            if type(accessibility_depth_probe) is not str:
+                raise _GuestFailure("browser_crash")
+            normalized, normalized_truncated = _normalized_accessibility_text(
+                accessibility_content,
+                request.limits.max_content_bytes,
+            )
+            frame_contents.append(normalized)
+            content_truncated = (
+                content_truncated
+                or normalized_truncated
+                or accessibility_depth_probe != accessibility_content
+            )
+    else:
+        for projection in included_projections:
+            frame_contents.append(projection.text)
+            content_truncated = content_truncated or projection.text_truncated
+
+    content, aggregate_truncated = _aggregate_frame_content(
+        included_indexes,
+        included_projections,
+        frame_contents,
+        max_bytes=request.limits.max_content_bytes,
+    )
+    content_truncated = content_truncated or aggregate_truncated
+    stable_identities = await _frame_identities(cdp)
+    if stable_identities != frame_identities:
+        raise _GuestFailure("fetch_failed")
+    stable_frames = _playwright_frames_for_identities(page, stable_identities)
+    if (
+        any(stable is not original for stable, original in zip(stable_frames, frames, strict=True))
+        or await _frame_evidence_membership(cdp, stable_identities) != evidence_membership
+    ):
+        raise _GuestFailure("fetch_failed")
+
+    title = projections[0].title
+    title_truncated = any(projection.title_truncated for projection in included_projections)
+    truncation_reasons: list[str] = []
+    if title_truncated:
+        truncation_reasons.append("title")
+    if content_truncated:
+        truncation_reasons.append("content")
+    return title, representation, content, tuple(truncation_reasons)
+
+
+async def _isolated_frame_projection(
+    cdp: Any,
+    identity: _FrameIdentity,
+    request: _Request,
+    *,
+    max_dom_nodes: int,
+) -> _FrameProjection:
+    isolated_world = await cdp.send(
+        "Page.createIsolatedWorld",
+        {
+            "frameId": identity.frame_id,
+            "worldName": _BROWSER_INSPECTION_WORLD,
+            "grantUniveralAccess": False,
+        },
+    )
+    if (
+        type(isolated_world) is not dict
+        or type(isolated_world.get("executionContextId")) is not int
+        or isolated_world["executionContextId"] <= 0
+    ):
+        raise _GuestFailure("browser_crash")
+    limits = json.dumps(
+        {
+            "content": request.limits.max_content_bytes,
+            "nodes": max_dom_nodes,
+            "title": _MAX_TITLE_BYTES,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    projection = await cdp.send(
+        "Runtime.evaluate",
+        {
+            "contextId": isolated_world["executionContextId"],
+            "expression": """(() => {
+            const limits = __CAYU_INSPECTION_LIMITS__;
+            const body = document.body;
+            const semanticTags = new Set([
+                "a", "area", "button", "details", "dl", "form", "input",
+                "nav", "select", "summary", "table", "textarea",
+            ]);
+            let nodeCount = body ? 1 : 0;
+            let semanticStructure = false;
+            if (body) {
+                const pending = [body];
+                scan: while (pending.length > 0) {
+                    const node = pending.pop();
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        const element = node;
+                        const tag = element.localName;
+                        semanticStructure = semanticStructure
+                            || semanticTags.has(tag)
+                            || element.hasAttribute("role")
+                            || element.hasAttribute("aria-label")
+                            || element.hasAttribute("aria-labelledby")
+                            || element.hasAttribute("aria-describedby");
+                        if (element.shadowRoot) {
+                            nodeCount += 1;
+                            if (nodeCount > limits.nodes) {
+                                break scan;
+                            }
+                            pending.push(element.shadowRoot);
+                        }
+                    }
+                    for (let child = node.lastChild; child; child = child.previousSibling) {
+                        nodeCount += 1;
+                        if (nodeCount > limits.nodes) {
+                            break scan;
+                        }
+                        pending.push(child);
+                    }
+                }
+            }
+            const value = body ? body.innerText : "";
+            const title = document.title;
+            return {
+                text: value.slice(0, limits.content + 1),
+                truncated: value.length > limits.content,
+                title: title.slice(0, limits.title + 1),
+                title_truncated: title.length > limits.title,
+                node_count: nodeCount,
+                node_limit_exceeded: nodeCount > limits.nodes,
+                semantic_structure: semanticStructure,
+            };
+        })()""".replace("__CAYU_INSPECTION_LIMITS__", limits),
+            "returnByValue": True,
+            "awaitPromise": False,
+            "userGesture": False,
+        },
+    )
+    if (
+        type(projection) is not dict
+        or projection.get("exceptionDetails") is not None
+        or type(projection.get("result")) is not dict
+        or projection["result"].get("type") != "object"
+        or type(projection["result"].get("value")) is not dict
+    ):
+        raise _GuestFailure("browser_crash")
+    extracted = projection["result"]["value"]
+    if (
+        set(extracted)
+        != {
+            "node_limit_exceeded",
+            "node_count",
+            "semantic_structure",
+            "text",
+            "title",
+            "title_truncated",
+            "truncated",
+        }
+        or type(extracted.get("text")) is not str
+        or type(extracted.get("truncated")) is not bool
+        or type(extracted.get("title")) is not str
+        or type(extracted.get("title_truncated")) is not bool
+        or type(extracted.get("node_count")) is not int
+        or extracted["node_count"] < 0
+        or type(extracted.get("node_limit_exceeded")) is not bool
+        or type(extracted.get("semantic_structure")) is not bool
+    ):
+        raise _GuestFailure("browser_crash")
+    if extracted["node_limit_exceeded"]:
+        raise _GuestFailure("oversized_response")
+    if extracted["node_count"] > max_dom_nodes:
+        raise _GuestFailure("browser_crash")
+
+    text, text_truncated = _normalized_text(
+        extracted["text"],
+        request.limits.max_content_bytes,
+        preserve_lines=True,
+    )
+    text_truncated = text_truncated or extracted["truncated"]
+    title, title_truncated = _normalized_text(
+        extracted["title"],
+        _MAX_TITLE_BYTES,
+        preserve_lines=False,
+    )
+    title_truncated = title_truncated or extracted["title_truncated"]
+    return _FrameProjection(
+        identity=identity,
+        title=title or None,
+        text=text,
+        title_truncated=title_truncated,
+        text_truncated=text_truncated,
+        semantic_structure=extracted["semantic_structure"],
+        node_count=extracted["node_count"],
+    )
+
+
+async def _frame_identities(cdp: Any) -> tuple[_FrameIdentity, ...]:
+    frame_tree = await cdp.send("Page.getFrameTree")
+    if type(frame_tree) is not dict or type(frame_tree.get("frameTree")) is not dict:
+        raise _GuestFailure("browser_crash")
+    pending: list[tuple[dict[str, Any], int | None]] = [(frame_tree["frameTree"], None)]
+    identities: list[_FrameIdentity] = []
+    seen_ids: set[str] = set()
+    while pending:
+        tree, parent_index = pending.pop()
+        if type(tree.get("frame")) is not dict:
+            raise _GuestFailure("browser_crash")
+        frame = tree["frame"]
+        frame_id = frame.get("id")
+        loader_id = frame.get("loaderId")
+        url = frame.get("url")
+        mime_type = frame.get("mimeType")
+        if (
+            type(frame_id) is not str
+            or not 0 < len(frame_id) <= 256
+            or frame_id in seen_ids
+            or type(loader_id) is not str
+            or not 0 < len(loader_id) <= 256
+            or type(url) is not str
+            or not 0 < len(url) <= _MAX_URL_LENGTH
+            or type(mime_type) is not str
+        ):
+            raise _GuestFailure("browser_crash")
+        if not _browser_request_is_admissible(url):
+            raise _GuestFailure("destination_denied")
+        if mime_type not in _HTML_CONTENT_TYPES | _TEXT_CONTENT_TYPES:
+            raise _GuestFailure("unsupported_content")
+        if parent_index is not None:
+            parent_id = frame.get("parentId")
+            if parent_id != identities[parent_index].frame_id:
+                raise _GuestFailure("browser_crash")
+        seen_ids.add(frame_id)
+        current_index = len(identities)
+        identities.append(
+            _FrameIdentity(
+                frame_id=frame_id,
+                loader_id=loader_id,
+                url=url,
+                mime_type=mime_type,
+                parent_index=parent_index,
+            )
+        )
+        if len(identities) > _MAX_FRAME_DOCUMENTS:
+            raise _GuestFailure("oversized_response")
+        raw_children = tree.get("childFrames", [])
+        if type(raw_children) is not list:
+            raise _GuestFailure("browser_crash")
+        children: list[dict[str, Any]] = []
+        for child in raw_children:
+            if type(child) is not dict:
+                raise _GuestFailure("browser_crash")
+            children.append(child)
+        pending.extend((child, current_index) for child in reversed(children))
+    return tuple(identities)
+
+
+async def _frame_evidence_membership(
+    cdp: Any,
+    identities: tuple[_FrameIdentity, ...],
+) -> tuple[bool, ...]:
+    """Return frame documents represented by their owner in Chromium's AX tree."""
+
+    if not identities or identities[0].parent_index is not None:
+        raise _GuestFailure("browser_crash")
+    included = [True]
+    for index, identity in enumerate(identities[1:], start=1):
+        parent_index = identity.parent_index
+        if parent_index is None or parent_index >= index:
+            raise _GuestFailure("browser_crash")
+        owner = await cdp.send("DOM.getFrameOwner", {"frameId": identity.frame_id})
+        if (
+            type(owner) is not dict
+            or type(owner.get("backendNodeId")) is not int
+            or owner["backendNodeId"] <= 0
+        ):
+            raise _GuestFailure("browser_crash")
+        backend_node_id = owner["backendNodeId"]
+        accessibility = await cdp.send(
+            "Accessibility.getPartialAXTree",
+            {
+                "backendNodeId": backend_node_id,
+                "fetchRelatives": False,
+            },
+        )
+        if type(accessibility) is not dict or type(accessibility.get("nodes")) is not list:
+            raise _GuestFailure("browser_crash")
+        matching_nodes = [
+            node
+            for node in accessibility["nodes"]
+            if type(node) is dict and node.get("backendDOMNodeId") == backend_node_id
+        ]
+        if len(matching_nodes) != 1 or type(matching_nodes[0].get("ignored")) is not bool:
+            raise _GuestFailure("browser_crash")
+        included.append(included[parent_index] and not matching_nodes[0]["ignored"])
+    return tuple(included)
+
+
+def _playwright_frames_for_identities(
+    page: Any,
+    identities: tuple[_FrameIdentity, ...],
+) -> tuple[Any, ...]:
+    pending: list[tuple[Any, int | None]] = [(page.main_frame, None)]
+    frames: list[Any] = []
+    seen: set[int] = set()
+    while pending:
+        frame, parent_index = pending.pop()
+        if id(frame) in seen or len(frames) >= _MAX_FRAME_DOCUMENTS:
+            raise _GuestFailure("fetch_failed")
+        seen.add(id(frame))
+        current_index = len(frames)
+        if current_index >= len(identities):
+            raise _GuestFailure("fetch_failed")
+        identity = identities[current_index]
+        if frame.url != identity.url or parent_index != identity.parent_index:
+            raise _GuestFailure("fetch_failed")
+        frames.append(frame)
+        children = frame.child_frames
+        if type(children) is not list:
+            raise _GuestFailure("browser_crash")
+        pending.extend((child, current_index) for child in reversed(children))
+    if len(frames) != len(identities):
+        raise _GuestFailure("fetch_failed")
+    return tuple(frames)
+
+
+def _aggregate_frame_content(
+    frame_indexes: list[int],
+    projections: list[_FrameProjection],
+    contents: list[str],
+    *,
+    max_bytes: int,
+) -> tuple[str, bool]:
+    if (
+        len(frame_indexes) != len(projections)
+        or len(projections) != len(contents)
+        or not projections
+        or frame_indexes[0] != 0
+        or any(index < 0 for index in frame_indexes)
+        or frame_indexes != sorted(set(frame_indexes))
+    ):
+        raise _GuestFailure("browser_crash")
+    if len(projections) == 1:
+        return contents[0], False
+    sections: list[str] = []
+    output_indexes = {
+        source_index: output_index for output_index, source_index in enumerate(frame_indexes)
+    }
+    for source_index, projection, content in zip(
+        frame_indexes,
+        projections,
+        contents,
+        strict=True,
+    ):
+        output_index = output_indexes[source_index]
+        url, _ = _normalized_text(
+            projection.identity.url,
+            4 * _MAX_URL_LENGTH,
+            preserve_lines=False,
+        )
+        lines = [
+            f"[{'Main frame' if output_index == 0 else f'Frame {output_index}'}]",
+            f"URL: {url}",
+        ]
+        if projection.identity.parent_index is not None:
+            parent_output_index = output_indexes.get(projection.identity.parent_index)
+            if parent_output_index is None:
+                raise _GuestFailure("browser_crash")
+            lines.append(f"Parent frame: {parent_output_index}")
+        if projection.title is not None:
+            lines.append(f"Title: {projection.title}")
+        if content:
+            lines.append(content)
+        sections.append("\n".join(lines))
+    joined = "\n\n".join(sections)
+    encoded = joined.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return joined, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
 def _browser_request_is_admissible(url: Any) -> bool:
     if type(url) is not str or not 0 < len(url) <= _MAX_URL_LENGTH:
         return False
@@ -653,7 +1140,16 @@ async def _fetch_with_browser(
     redirects = state.redirects
     launched = False
     primary: BaseException | None = None
-    success_projection: tuple[str, str | None, str, tuple[str, ...]] | None = None
+    success_projection: (
+        tuple[
+            str,
+            str | None,
+            str,
+            str,
+            tuple[str, ...],
+        ]
+        | None
+    ) = None
     try:
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(
@@ -873,65 +1369,31 @@ async def _fetch_with_browser(
         content_type = final_headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type not in _HTML_CONTENT_TYPES | _TEXT_CONTENT_TYPES:
             raise _GuestFailure("unsupported_content")
-        extracted = await page.evaluate(
-            """limits => {
-                const value = document.body ? document.body.innerText : "";
-                const title = document.title;
-                return {
-                    text: value.slice(0, limits.content + 1),
-                    truncated: value.length > limits.content,
-                    title: title.slice(0, limits.title + 1),
-                    title_truncated: title.length > limits.title,
-                };
-            }""",
-            {
-                "content": request.limits.max_content_bytes,
-                "title": _MAX_TITLE_BYTES,
-            },
-        )
-        if (
-            type(extracted) is not dict
-            or type(extracted.get("text")) is not str
-            or type(extracted.get("truncated")) is not bool
-            or type(extracted.get("title")) is not str
-            or type(extracted.get("title_truncated")) is not bool
-        ):
-            raise _GuestFailure("browser_crash")
-        content, content_truncated = _normalized_text(
-            extracted["text"],
-            request.limits.max_content_bytes,
-            preserve_lines=True,
-        )
-        content_truncated = content_truncated or extracted["truncated"]
-        title, title_truncated = _normalized_text(
-            extracted["title"],
-            _MAX_TITLE_BYTES,
-            preserve_lines=False,
-        )
-        title_truncated = title_truncated or extracted["title_truncated"]
-        truncation_reasons: list[str] = []
-        if title_truncated:
-            truncation_reasons.append("title")
-        if content_truncated:
-            truncation_reasons.append("content")
-        # Let work synchronously initiated by extraction reach the broker before
-        # freezing page-authored JavaScript. Keep the response listeners active
-        # while already-dispatched requests settle, then close the context before
-        # publishing success so no later page activity can race the final check.
-        await _wait_for_browser_violation(violation_observed)
-        state_failure = _page_state_failure(state, redirects=redirects)
-        if state_failure is not None:
-            raise state_failure
+        # Freeze page-authored JavaScript before inspecting the document. The
+        # isolated world below retains Playwright/CDP inspection capability but
+        # cannot observe page-world prototype or own-property overrides. This
+        # makes the node ceiling and accessibility evidence describe one stable
+        # document rather than two page-controlled moments in time.
         await cdp.send("Emulation.setScriptExecutionDisabled", {"value": True})
         await _wait_for_browser_violation(violation_observed)
         state_failure = _page_state_failure(state, redirects=redirects)
         if state_failure is not None:
             raise state_failure
+        title, representation, content, truncation_reasons = await _extract_page_representation(
+            page,
+            cdp,
+            request,
+            operation_timeout_ms=operation_timeout_ms,
+        )
+        state_failure = _page_state_failure(state, redirects=redirects)
+        if state_failure is not None:
+            raise state_failure
         success_projection = (
             page.url,
-            title or None,
+            title,
+            representation,
             content,
-            tuple(truncation_reasons),
+            truncation_reasons,
         )
     except asyncio.CancelledError as exc:
         primary = exc
@@ -993,7 +1455,7 @@ async def _fetch_with_browser(
     state_failure = _page_state_failure(state, redirects=redirects)
     if state_failure is not None:
         raise state_failure
-    final_url, title, content, final_truncation_reasons = success_projection
+    final_url, title, representation, content, final_truncation_reasons = success_projection
     return {
         "protocol_version": PROTOCOL_VERSION,
         "worker_version": WORKER_VERSION,
@@ -1002,6 +1464,7 @@ async def _fetch_with_browser(
         "requested_url": request.url,
         "final_url": final_url,
         "title": title,
+        "representation": representation,
         "content": content,
         "redirects": list(redirects),
         "truncation_reasons": list(final_truncation_reasons),
