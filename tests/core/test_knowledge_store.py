@@ -9,6 +9,9 @@ from pydantic import ValidationError
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
 )
+from tests.core.knowledge_phrase_conformance import (
+    assert_token_exact_phrase_search_conformance,
+)
 from tests.core.knowledge_publication_conformance import (
     assert_concurrent_publication_conformance,
     assert_owned_publication_conformance,
@@ -1224,6 +1227,10 @@ def test_in_memory_knowledge_store_structured_keyword_search() -> None:
     result = asyncio.run(run())
 
     assert [hit.entry.id for hit in result.hits] == ["github_secret"]
+
+
+def test_in_memory_knowledge_store_phrase_search_conformance() -> None:
+    asyncio.run(assert_token_exact_phrase_search_conformance(InMemoryKnowledgeStore()))
 
 
 @pytest.mark.parametrize(

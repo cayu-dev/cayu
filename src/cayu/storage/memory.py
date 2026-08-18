@@ -58,7 +58,7 @@ class _SearchTerms(TypedDict):
     any: list[str]
     all: list[list[str]]
     none: list[str]
-    phrases: list[str]
+    phrases: list[list[str]]
 
 
 class _StoredChunkEmbedding(TypedDict):
@@ -1925,8 +1925,12 @@ def _score_entry(
             best_reason = "title match"
             best_preview_text = entry.title
     for chunk in chunks:
-        chunk_search_text = _entry_chunk_searchable_text(entry, chunk)
-        chunk_score = _score_candidate(chunk_search_text, terms)
+        chunk_search_fields = _entry_chunk_searchable_fields(entry, chunk)
+        chunk_score = _score_candidate(
+            "\n".join(chunk_search_fields),
+            terms,
+            phrase_fields=chunk_search_fields,
+        )
         if chunk_score > best_score:
             best_score = chunk_score
             best_chunk = chunk
@@ -1935,40 +1939,71 @@ def _score_entry(
     return best_score, best_chunk, best_reason, best_preview_text
 
 
-def _score_candidate(text: str, terms: _SearchTerms) -> float:
-    if not _text_matches_structured_terms(text, terms):
+def _score_candidate(
+    text: str,
+    terms: _SearchTerms,
+    *,
+    phrase_fields: list[str] | None = None,
+) -> float:
+    tokens = _tokenize_search_text(text)
+    phrase_token_fields = (
+        [tokens]
+        if phrase_fields is None
+        else [_tokenize_search_text(field) for field in phrase_fields]
+    )
+    if not _tokens_match_structured_terms(tokens, terms, phrase_token_fields):
         return 0.0
-    token_counts = Counter(_tokenize_search_text(text))
+    token_counts = Counter(tokens)
     score = float(sum(token_counts[term] for term in terms["any"]))
     score += float(sum(max(token_counts[term] for term in group) for group in terms["all"]))
-    folded = text.casefold()
-    score += float(sum(2 for phrase in terms["phrases"] if phrase in folded))
+    score += float(
+        sum(
+            2
+            for phrase in terms["phrases"]
+            if any(_tokens_contain_phrase(field, phrase) for field in phrase_token_fields)
+        )
+    )
     return score
 
 
-def _text_matches_structured_terms(text: str, terms: _SearchTerms) -> bool:
-    tokens = set(_tokenize_search_text(text))
-    folded = text.casefold()
-    if any(term in tokens for term in terms["none"]):
+def _tokens_match_structured_terms(
+    tokens: list[str],
+    terms: _SearchTerms,
+    phrase_token_fields: list[list[str]],
+) -> bool:
+    token_set = set(tokens)
+    if any(term in token_set for term in terms["none"]):
         return False
-    if not all(any(term in tokens for term in group) for group in terms["all"]):
+    if not all(any(term in token_set for term in group) for group in terms["all"]):
         return False
     positives = terms["any"] or terms["phrases"]
     return not positives or (
-        any(term in tokens for term in terms["any"])
-        or any(phrase in folded for phrase in terms["phrases"])
+        any(term in token_set for term in terms["any"])
+        or any(
+            _tokens_contain_phrase(field, phrase)
+            for phrase in terms["phrases"]
+            for field in phrase_token_fields
+        )
     )
 
 
-def _entry_chunk_searchable_text(entry: KnowledgeEntry, chunk: KnowledgeChunk) -> str:
+def _tokens_contain_phrase(tokens: list[str], phrase: list[str]) -> bool:
+    phrase_length = len(phrase)
+    return any(
+        tokens[index : index + phrase_length] == phrase
+        for index in range(len(tokens) - phrase_length + 1)
+    )
+
+
+def _entry_chunk_searchable_fields(entry: KnowledgeEntry, chunk: KnowledgeChunk) -> list[str]:
     parts: list[str] = []
     if entry.title is not None:
         parts.append(entry.title)
     parts.append(entry.text)
     if chunk.text == entry.text:
-        return "\n".join(parts)
+        return parts
     parts.append(chunk.text)
-    return "\n".join(parts)
+    return parts
 
 
 def _entry_matches_none_terms(
@@ -2100,7 +2135,9 @@ def _knowledge_query_terms(query: KnowledgeQuery) -> _SearchTerms:
                 for token in group
             ]
         ),
-        "phrases": _dedupe_strings([_normalize_search_phrase(phrase) for phrase in query.phrases]),
+        "phrases": _dedupe_search_term_groups(
+            [_normalize_search_phrase(phrase) for phrase in query.phrases]
+        ),
     }
 
 
@@ -2132,8 +2169,11 @@ def _dedupe_search_term_groups(groups: list[list[str]]) -> list[list[str]]:
     return result
 
 
-def _normalize_search_phrase(value: str) -> str:
-    return require_nonblank(value, "phrase").casefold()
+def _normalize_search_phrase(value: str) -> list[str]:
+    tokens = _tokenize_search_text(require_nonblank(value, "phrase"))
+    if not tokens:
+        raise ValueError("Structured knowledge search phrases must contain at least one token.")
+    return tokens
 
 
 def _knowledge_facets(

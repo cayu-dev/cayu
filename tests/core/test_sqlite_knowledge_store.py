@@ -10,6 +10,9 @@ from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
 )
+from tests.core.knowledge_phrase_conformance import (
+    assert_token_exact_phrase_search_conformance,
+)
 from tests.core.knowledge_publication_conformance import (
     assert_concurrent_publication_conformance,
     assert_failed_publication_left_no_state,
@@ -658,6 +661,17 @@ def test_sqlite_knowledge_store_structured_keyword_search(tmp_path) -> None:
     result = asyncio.run(run())
 
     assert [hit.entry.id for hit in result.hits] == ["github_secret"]
+
+
+def test_sqlite_knowledge_store_phrase_search_conformance(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(tmp_path / "phrase-conformance.sqlite")
+        try:
+            await assert_token_exact_phrase_search_conformance(store)
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
 
 
 def test_sqlite_knowledge_store_applies_none_terms_to_the_complete_entry(tmp_path) -> None:

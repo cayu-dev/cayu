@@ -5908,6 +5908,10 @@ Postgres embedding operational contract:
   keyword fields (`any_terms`, `all_terms`, `none_terms`, `phrases`), namespace,
   labels, kinds, status/visibility filters, aspects, impact targets, source
   filters, mode, result limit, and preview byte cap.
+  Phrase terms match ordered consecutive complete search tokens within one
+  searchable field (title, entry text, or chunk text). Phrase and candidate
+  text use the same case-folding and punctuation tokenization, so
+  `Cat, DOG!` matches `cat dog`, while `copycat dogma` and `dog cat` do not.
   `none_terms` exclude an entire entry when any forbidden term appears in the
   entry title, entry text, or any of its chunks. Stores apply that exclusion
   before ranking candidates, counting results, or enforcing result and semantic
