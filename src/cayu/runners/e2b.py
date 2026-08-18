@@ -8,13 +8,16 @@ import shlex
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from math import isfinite
 from types import ModuleType
 from typing import Any, Literal, cast
 from uuid import uuid4
 
 from cayu._exception_groups import add_exception_note_safely, exception_tree_contains
-from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
+from cayu._validation import (
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_positive_finite_seconds,
+)
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -1655,11 +1658,7 @@ def _validate_hardened_guest_user(user: str) -> str:
 
 
 def _validate_handoff_timeout(value: float, field_name: str) -> float:
-    if type(value) not in {int, float}:
-        raise TypeError(f"E2B {field_name} must be numeric.")
-    if not isfinite(value) or value <= 0:
-        raise ValueError(f"E2B {field_name} must be finite and greater than zero.")
-    return float(value)
+    return require_positive_finite_seconds(value, f"E2B {field_name}")
 
 
 def _validate_max_protected_file_bytes(value: int) -> int:

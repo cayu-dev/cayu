@@ -4,7 +4,7 @@ import math
 import posixpath
 from typing import Any
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import require_clean_nonblank, require_positive_finite_seconds
 from cayu.runners import DEFAULT_E2B_CWD, E2BWorkspaceCapability, Runner
 from cayu.workspaces._guest_guard import (
     guard_create,
@@ -64,6 +64,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
     ) -> None:
         if not isinstance(runner, Runner):
             raise TypeError("E2BWorkspace runner must be a Runner.")
+        request_timeout_s = _validate_optional_timeout(request_timeout_s)
         capability = runner.workspace_capability(E2BWorkspaceCapability)
         if capability is None:
             raise TypeError("E2BWorkspace runner does not expose E2BWorkspaceCapability.")
@@ -77,7 +78,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
         self.default_list_limit = _validate_required_limit(default_list_limit, "default_list_limit")
         self.default_list_depth = _validate_required_limit(default_list_depth, "default_list_depth")
         self.user = _validate_optional_user(user)
-        self.request_timeout_s = _validate_optional_timeout(request_timeout_s)
+        self.request_timeout_s = request_timeout_s
         if workspace_id is None:
             self.id = f"e2b:{capability.sandbox_id}:{self.root}"
         else:
@@ -352,11 +353,7 @@ def _validate_optional_user(user: str | None) -> str | None:
 def _validate_optional_timeout(timeout_s: float | None) -> float | None:
     if timeout_s is None:
         return None
-    if type(timeout_s) not in {int, float}:
-        raise TypeError("E2BWorkspace request_timeout_s must be numeric.")
-    if timeout_s <= 0:
-        raise ValueError("E2BWorkspace request_timeout_s must be greater than zero.")
-    return float(timeout_s)
+    return require_positive_finite_seconds(timeout_s, "E2BWorkspace request_timeout_s")
 
 
 def _is_same_or_child(path: str, root: str) -> bool:

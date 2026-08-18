@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from math import isfinite
 from types import MappingProxyType
-from typing import Any, Never
+from typing import Any, Never, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -795,6 +795,17 @@ def require_positive_timedelta_seconds(
     except OverflowError as exc:
         raise ValueError(f"`{field_name}` must produce a representable expiry datetime.") from exc
     return validated
+
+
+def require_positive_finite_seconds(value: object, field_name: str) -> float:
+    """Return one numeric seconds value after exact finite/positive validation."""
+
+    if type(value) not in {int, float}:
+        raise TypeError(f"{field_name} must be numeric.")
+    normalized = float(cast("int | float", value))
+    if not isfinite(normalized) or normalized <= 0:
+        raise ValueError(f"{field_name} must be finite and greater than zero.")
+    return normalized
 
 
 def escape_json_pointer_segment(key: str) -> str:

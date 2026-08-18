@@ -115,6 +115,66 @@ def _workspace(root: str | None = None) -> tuple[E2BWorkspace, FakeE2BFs]:
     )
 
 
+def _runner_with_capability_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[E2BRunner, list[type[Any]]]:
+    runner = E2BRunner(FakeSandbox(FakeE2BFs()), e2b_module=object())
+    capability_calls: list[type[Any]] = []
+    original = runner.workspace_capability
+
+    def tracked_workspace_capability(capability_type: type[Any]) -> Any:
+        capability_calls.append(capability_type)
+        return original(capability_type)
+
+    monkeypatch.setattr(runner, "workspace_capability", tracked_workspace_capability)
+    return runner, capability_calls
+
+
+@pytest.mark.parametrize("request_timeout_s", [float("nan"), float("inf"), float("-inf")])
+def test_e2b_workspace_rejects_nonfinite_timeout_before_capability_lookup(
+    request_timeout_s: float,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, capability_calls = _runner_with_capability_probe(monkeypatch)
+
+    with pytest.raises(ValueError, match="request_timeout_s"):
+        E2BWorkspace(runner, request_timeout_s=request_timeout_s)
+
+    assert capability_calls == []
+
+
+@pytest.mark.parametrize(
+    ("request_timeout_s", "expected"),
+    [(None, None), (1, 1.0), (1.25, 1.25)],
+)
+def test_e2b_workspace_accepts_optional_finite_positive_timeout(
+    request_timeout_s: float | None,
+    expected: float | None,
+) -> None:
+    runner = E2BRunner(FakeSandbox(FakeE2BFs()), e2b_module=object())
+
+    workspace = E2BWorkspace(runner, request_timeout_s=request_timeout_s)
+
+    assert workspace.request_timeout_s == expected
+
+
+@pytest.mark.parametrize(
+    ("request_timeout_s", "error_type"),
+    [(0, ValueError), (-1, ValueError), (True, TypeError), ("1", TypeError), (object(), TypeError)],
+)
+def test_e2b_workspace_retains_fail_closed_timeout_types(
+    request_timeout_s: object,
+    error_type: type[Exception],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, capability_calls = _runner_with_capability_probe(monkeypatch)
+
+    with pytest.raises(error_type, match="request_timeout_s"):
+        E2BWorkspace(runner, request_timeout_s=cast("Any", request_timeout_s))
+
+    assert capability_calls == []
+
+
 def _replace_runner_exec(workspace: E2BWorkspace, func: Any) -> None:
     runner = cast("Any", workspace._control_plane_runner())
     runner.exec = func
