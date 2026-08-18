@@ -39,7 +39,11 @@ from cayu.evals.corpus import (
     pricing_profile_identity,
 )
 from cayu.evals.models import EvalRun, EvalRunContractV1, _model_instance_python_input
-from cayu.evals.portable_assertions import _compile_corpus_assertion_specs
+from cayu.evals.portable_assertions import (
+    _compile_corpus_assertion_specs,
+    _model_judge_implementation_revision,
+    _trusted_model_judge_binding,
+)
 from cayu.evals.published import PublishedEvalRun, _publish_eval_run_with_trial_public_data
 from cayu.evals.result_contract import (
     EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
@@ -60,6 +64,7 @@ CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES = 1 << 20
 CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES = 64 << 10
 CORPUS_EXECUTION_RESULT_MAX_BYTES = 40 << 20
 CORPUS_EXECUTION_RESULT_SCHEMA_VERSION = 1
+CORPUS_EXECUTION_MAX_MODEL_JUDGES = 32
 
 
 def _bootstrap_message_text(message: Message) -> str:
@@ -203,6 +208,76 @@ class EvaluationTargetIdentity(BaseModel):
         return self.app_manifest.fingerprint
 
 
+class ModelJudgeTarget(BaseModel):
+    """Trusted local execution authority for one portable evaluator key."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    key: StrictStr
+    app: CayuApp
+    agent_name: StrictStr
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        return _portable_id(value, "key")
+
+    @field_validator("app")
+    @classmethod
+    def validate_app(cls, value: CayuApp) -> CayuApp:
+        if not isinstance(value, CayuApp):
+            raise TypeError("ModelJudgeTarget app must be a CayuApp.")
+        return value
+
+    @field_validator("agent_name")
+    @classmethod
+    def validate_agent_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @model_validator(mode="after")
+    def validate_authority_boundary(self) -> ModelJudgeTarget:
+        _require_public_target_text(self.app, self.key, "model_judges.key")
+        _trusted_model_judge_binding(
+            key=self.key,
+            app=self.app,
+            agent_name=self.agent_name,
+        )
+        return self
+
+
+def _copy_model_judge_target(target: ModelJudgeTarget) -> ModelJudgeTarget:
+    if type(target) is not ModelJudgeTarget:
+        raise TypeError("target must be an exact ModelJudgeTarget.")
+    return ModelJudgeTarget(
+        key=target.key,
+        app=target.app,
+        agent_name=target.agent_name,
+    )
+
+
+def model_judge_implementation_revision(target: ModelJudgeTarget) -> str:
+    """Return the implementation identity a trusted target will publish."""
+
+    validated = _copy_model_judge_target(target)
+    return _model_judge_implementation_revision(
+        key=validated.key,
+        app=validated.app,
+        agent_name=validated.agent_name,
+    )
+
+
 class CorpusTarget(BaseModel):
     """Trusted local execution authority selected by an eval project target."""
 
@@ -223,6 +298,10 @@ class CorpusTarget(BaseModel):
         default_factory=EvaluationEvidencePolicySpec.standard
     )
     price_book: PriceBook | None = None
+    model_judges: tuple[ModelJudgeTarget, ...] = Field(
+        default=(),
+        max_length=CORPUS_EXECUTION_MAX_MODEL_JUDGES,
+    )
     limits: CorpusExecutionLimits = Field(default_factory=CorpusExecutionLimits)
 
     @field_validator("key")
@@ -311,6 +390,23 @@ class CorpusTarget(BaseModel):
             raise TypeError("CorpusTarget price_book must be an exact PriceBook or None.")
         return copy_price_book(value)
 
+    @field_validator("model_judges", mode="before")
+    @classmethod
+    def copy_model_judges(cls, value: object) -> tuple[ModelJudgeTarget, ...]:
+        if not isinstance(value, list | tuple):
+            raise TypeError("CorpusTarget model_judges must be an ordered list or tuple.")
+        copied: list[ModelJudgeTarget] = []
+        for item in value:
+            if type(item) is not ModelJudgeTarget:
+                raise TypeError(
+                    "CorpusTarget model_judges must contain exact ModelJudgeTarget values."
+                )
+            copied.append(_copy_model_judge_target(item))
+        keys = tuple(item.key for item in copied)
+        if len(keys) != len(set(keys)):
+            raise ValueError("CorpusTarget model judge keys must be unique.")
+        return tuple(copied)
+
     @field_validator("limits", mode="before")
     @classmethod
     def copy_limits(cls, value: object) -> CorpusExecutionLimits:
@@ -398,6 +494,7 @@ def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
         application_release_id=target.application_release_id,
         evidence_policy=target.evidence_policy,
         price_book=target.price_book,
+        model_judges=target.model_judges,
         limits=target.limits,
     )
 
@@ -487,6 +584,14 @@ def _compile_prepared_corpus_suite(
             trusted_pricing=validated_target.price_book,
             expected_pricing_profile=validated_corpus.pricing_profile,
             trusted_pricing_identity=trusted_pricing_identity,
+            trusted_model_judges=tuple(
+                _trusted_model_judge_binding(
+                    key=judge.key,
+                    app=judge.app,
+                    agent_name=judge.agent_name,
+                )
+                for judge in validated_target.model_judges
+            ),
         )
     )
     compiled_input_chars = 0

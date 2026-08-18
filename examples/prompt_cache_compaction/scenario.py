@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import hashlib
+from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from examples._advanced_support import (
+    ComparisonSessionEvidence,
     ScenarioResult,
     collect_events,
-    paired_cost_evidence,
+    paired_cost_quality_report,
     session_evidence,
 )
 
@@ -19,12 +22,18 @@ from cayu import (
     CheckpointCompactionContextPolicy,
     CompactionRequest,
     CompactionResult,
+    ComparableGenerationSettings,
+    ComparableOutputBudget,
+    CostQualityAttemptOperation,
     Event,
     EventType,
     Message,
     ModelCompactor,
+    PairedQualityEvidence,
     PriceBook,
     PromptCacheCompactor,
+    QualityEvidenceReference,
+    QualityEvidenceStatus,
     RequestFootprintConfig,
     ResumeRequest,
     RunRequest,
@@ -126,11 +135,16 @@ class PairedPromptCacheCompactor(PromptCacheCompactor):
             compaction_instruction=_CACHE_COMPACTION_INSTRUCTION,
         )
         self.paired_request: CompactionRequest | None = None
+        self.paired_result: CompactionResult | None = None
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
-        if request.existing_summary is None and self.paired_request is None:
+        is_paired_attempt = request.existing_summary is None and self.paired_request is None
+        if is_paired_attempt:
             self.paired_request = request
-        return await super().compact(request)
+        result = await super().compact(request)
+        if is_paired_attempt:
+            self.paired_result = result
+        return result
 
 
 class LoadStableContextTool(Tool):
@@ -174,6 +188,81 @@ def _compaction_model_events(events: list[Event]) -> list[Event]:
         if event.type == EventType.MODEL_COMPLETED
         and event.payload.get("purpose") == "context_compaction"
     ]
+
+
+def _model_step_attempt_events(events: Sequence[Event], completion: Event) -> tuple[Event, ...]:
+    completion_index = next(
+        (index for index, event in enumerate(events) if event.id == completion.id),
+        None,
+    )
+    purpose = completion.payload.get("purpose")
+    attempt_event_types = {
+        EventType.MODEL_STARTED,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
+        EventType.MODEL_COMPLETED,
+    }
+    if completion_index is not None and type(purpose) is str and purpose:
+        operation_start_index: int | None = None
+        for start_index in range(completion_index, -1, -1):
+            event = events[start_index]
+            if start_index != completion_index and event.type == EventType.MODEL_COMPLETED:
+                break
+            if event.type == EventType.MODEL_STARTED and event.payload.get("purpose") == purpose:
+                operation_start_index = start_index
+        if operation_start_index is not None:
+            return tuple(
+                candidate
+                for candidate in events[operation_start_index : completion_index + 1]
+                if candidate.type in attempt_event_types
+            )
+    model_step_id = completion.payload.get("model_step_id")
+    if type(model_step_id) is not str or not model_step_id:
+        return (completion,)
+    return tuple(
+        event
+        for event in events
+        if event.type in attempt_event_types and event.payload.get("model_step_id") == model_step_id
+    )
+
+
+def _comparison_control_events(
+    *,
+    requests: Sequence[ModelRequest],
+    completed_payloads: Sequence[dict[str, Any]],
+    session_id: str,
+    provider_name: str,
+) -> tuple[Event, ...]:
+    events: list[Event] = []
+    completion_offset = max(0, len(requests) - len(completed_payloads))
+    for index, request in enumerate(requests, start=1):
+        shared = {
+            "provider": provider_name,
+            "model": request.model,
+            "step": 1,
+            "attempt": index,
+            "max_attempts": len(requests),
+        }
+        events.append(Event(type=EventType.MODEL_STARTED, session_id=session_id, payload=shared))
+        completion_index = index - 1 - completion_offset
+        if 0 <= completion_index < len(completed_payloads):
+            events.append(
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={**completed_payloads[completion_index], **shared},
+                )
+            )
+    if not requests:
+        events.extend(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id=session_id,
+                payload=payload,
+            )
+            for payload in completed_payloads
+        )
+    return tuple(events)
 
 
 def _cache_read_tokens(event: Event) -> int:
@@ -251,47 +340,84 @@ def _usage_snapshot(event: Event) -> dict[str, int | bool | None]:
     return _usage_snapshot_payload(event.payload)
 
 
-def _paired_cost_evidence(
+def _paired_cost_quality_report(
     *,
-    candidate_event: Event | None,
-    baseline_payload: dict[str, Any] | None,
+    candidate_events: Sequence[Event] | None,
+    baseline_events: Sequence[Event] | None,
+    source_checkpoint_id: str,
+    baseline_quality: PairedQualityEvidence,
+    candidate_quality: PairedQualityEvidence,
     price_book: PriceBook | None,
 ) -> dict[str, Any]:
-    if candidate_event is None or baseline_payload is None:
-        return paired_cost_evidence(
-            candidate=None,
+    if not candidate_events or not baseline_events:
+        return paired_cost_quality_report(
+            pair_id="first-prompt-cache-compaction",
+            workload_id="prompt-cache-compaction",
+            task_id="retention-summary",
+            source_id=source_checkpoint_id,
+            role="retained-summary",
+            output_budget=ComparableOutputBudget(max_output_tokens=2_048),
+            generation_settings=ComparableGenerationSettings(revision="sha256:" + "7" * 64),
+            baseline_strategy_id="uncached-bounded-control",
+            candidate_strategy_id="cache-aware-compaction",
             baseline=None,
+            candidate=None,
+            baseline_quality=baseline_quality,
+            candidate_quality=candidate_quality,
             price_book=price_book,
-            baseline_cost_field="bounded_baseline_cost",
-        )
-    if price_book is None:
-        return paired_cost_evidence(
-            candidate=(),
-            baseline=(),
-            price_book=None,
-            baseline_cost_field="bounded_baseline_cost",
         )
 
-    baseline_event = Event(
-        type=EventType.MODEL_COMPLETED,
-        session_id="prompt-cache-bounded-baseline",
-        payload=baseline_payload,
-    )
-    candidate_cost = estimate_session_cost(
-        session_id=candidate_event.session_id,
-        events=[candidate_event],
-        pricing=price_book,
-    )
-    baseline_cost = estimate_session_cost(
-        session_id=baseline_event.session_id,
-        events=[baseline_event],
-        pricing=price_book,
-    )
-    return paired_cost_evidence(
-        candidate=(candidate_cost,),
-        baseline=(baseline_cost,),
+    baseline_session_id = baseline_events[0].session_id
+    candidate_session_id = candidate_events[0].session_id
+    return paired_cost_quality_report(
+        pair_id="first-prompt-cache-compaction",
+        workload_id="prompt-cache-compaction",
+        task_id="retention-summary",
+        source_id=source_checkpoint_id,
+        role="retained-summary",
+        output_budget=ComparableOutputBudget(max_output_tokens=2_048),
+        generation_settings=ComparableGenerationSettings(revision="sha256:" + "7" * 64),
+        baseline_strategy_id="uncached-bounded-control",
+        candidate_strategy_id="cache-aware-compaction",
+        baseline=(
+            ComparisonSessionEvidence(
+                session_id=baseline_session_id,
+                events=tuple(baseline_events),
+                operation=CostQualityAttemptOperation.COMPARISON_CONTROL,
+                role="bounded-control",
+                source_checkpoint_id=source_checkpoint_id,
+            ),
+        ),
+        candidate=(
+            ComparisonSessionEvidence(
+                session_id=candidate_session_id,
+                events=tuple(candidate_events),
+                operation=CostQualityAttemptOperation.COMPACTION,
+                role="cache-aware-compactor",
+                branch_id=candidate_session_id,
+                source_checkpoint_id=source_checkpoint_id,
+            ),
+        ),
+        baseline_quality=baseline_quality,
+        candidate_quality=candidate_quality,
         price_book=price_book,
-        baseline_cost_field="bounded_baseline_cost",
+    )
+
+
+def _retention_quality(*, passed: bool, reference: str) -> PairedQualityEvidence:
+    return PairedQualityEvidence(
+        contract_name="mandatory-retention-token",
+        contract_version="v1",
+        threshold=Decimal("1"),
+        role="retained-summary",
+        status=QualityEvidenceStatus.PASSED if passed else QualityEvidenceStatus.FAILED,
+        score=Decimal("1") if passed else Decimal("0"),
+        references=(
+            QualityEvidenceReference(
+                kind="session",
+                reference="sha256:" + hashlib.sha256(reference.encode("utf-8")).hexdigest(),
+            ),
+        ),
     )
 
 
@@ -561,18 +687,45 @@ async def run_scenario(
         and len(baseline_requests) == 1
         and baseline_requests[0].options.get("thinking") == requests[3].options.get("thinking")
     )
-    paired_cost = _paired_cost_evidence(
-        candidate_event=compaction_events[0] if compaction_events else None,
-        baseline_payload=baseline_payload,
+    paired_cost = _paired_cost_quality_report(
+        candidate_events=(
+            _model_step_attempt_events(events, compaction_events[0]) if compaction_events else None
+        ),
+        baseline_events=(
+            _comparison_control_events(
+                requests=baseline_requests,
+                completed_payloads=(
+                    baseline_result.model_completed_payloads if baseline_result is not None else ()
+                ),
+                session_id="prompt-cache-bounded-baseline",
+                provider_name=baseline_recorder.name,
+            )
+            if baseline_result is not None
+            else None
+        ),
+        source_checkpoint_id=f"{session_id}:paired-compaction-source",
+        baseline_quality=_retention_quality(
+            passed=baseline_result is not None and RETENTION_TOKEN in baseline_result.summary,
+            reference="session://prompt-cache-bounded-baseline/summary",
+        ),
+        candidate_quality=_retention_quality(
+            passed=(
+                paired_compactor.paired_result is not None
+                and RETENTION_TOKEN in paired_compactor.paired_result.summary
+            ),
+            reference=f"session://{session_id}/first-compaction-summary",
+        ),
         price_book=price_book,
     )
+    paired_result = paired_cost["pairs"][0]
     provenance_gated = (
         paired_cost.get("status") == "unpriced"
-        and paired_cost.get("candidate_cost") is None
-        and paired_cost.get("bounded_baseline_cost") is None
+        and paired_result.get("candidate_cost") is None
+        and paired_result.get("baseline_cost") is None
     ) or (
-        paired_cost.get("status") == "priced"
-        and isinstance(paired_cost.get("pricing_provenance"), dict)
+        paired_cost.get("status") == "verified"
+        and bool(paired_result["candidate"]["pricing_provenance"])
+        and bool(paired_result["baseline"]["pricing_provenance"])
     )
     assertions = {
         "tool_session_exercised": tool.calls == 1 and session.tool_calls == 1,

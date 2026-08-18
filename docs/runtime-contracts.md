@@ -1057,11 +1057,27 @@ nested contract values into detached snapshots, including already-validated
 Pydantic instances; later mutation of caller-owned requests, transcripts,
 metadata, comparisons, structured-output errors, or trajectories cannot rewrite
 retained evaluation evidence. `EvalPlan.app` is intentionally the exception: it
-remains the same live `CayuApp` reference and is never deep-copied.
+remains the same live `CayuApp` reference and is never deep-copied. Corpus-mode
+execution has the same explicit authority seam: `CorpusTarget.app` remains the
+live candidate application, and every `ModelJudgeTarget.app` remains the live
+judge application behind its trusted evaluator key. The portable corpus carries
+only the key and a content revision. Target validation requires the selected
+tool-free judge agent to resolve exactly one provider, and that revision binds
+Cayu's judge semantics, the app manifest, and the exact secret-redacted agent
+specification (including system prompt, provider options, and thinking config).
+Changing any of that authority changes the implementation revision and makes
+results incomparable; corpus data never supplies an app or provider handle.
 `EvalCaseComparison` and `EvalRunComparison` scores are optional finite values in
 the inclusive range from 0 through 1, matching their source eval results.
 `compare_eval_runs` accepts finite nonnegative score tolerances and rejects
 non-finite values before regression detection.
+
+Durable `EvalRunRecord` values expose `attempt_count` as public retry
+attribution, not as ownership authority. It is zero before the first claim and
+otherwise equals the latest fenced ownership epoch, including after terminal
+publication. The private claim token remains store-internal. A reclaimed worker
+may repeat candidate and judge provider calls, but only the current epoch can
+publish a result.
 
 Checkpoint field updates that can race with runtime finalization use `transform_checkpoint(...)`; transcript repair uses `append_transcript_messages_and_transform_checkpoint(...)` when it must update both atomically. Built-in stores execute those transforms while holding their session/checkpoint write boundary (a process-local lock for the in-memory store, an immediate write transaction for SQLite, and a row lock for PostgreSQL). Interruption-aware checkpoint replacements explicitly take the current `pending_session_interrupt` and `pending_interruption_cascade` values—including their absence—from that transactional snapshot, so an older runtime snapshot can neither erase active interruption state nor resurrect cleared state.
 
@@ -3029,6 +3045,90 @@ budget. The optional server exposes this at
 `causal_budget_id`, `session_ids`, `session_count`, and the same estimated-cost
 fields as per-session cost summaries, plus `session_costs` for per-session
 breakdown.
+
+### Paired cost-and-quality comparisons
+
+`compare_paired_cost_quality(request)` is the one public aggregation path for a
+quality-gated cost comparison. It is pure: callers resolve durable events into
+`CostLineItem` evidence, attach application-owned attribution and quality
+results, and pass a `PairedCostQualityComparisonRequest`. The runtime neither
+loads sessions nor runs an evaluator inside this function.
+
+The request is bounded to 256 pairs, 2,048 attempts per side, 4,096 attempts
+across the request, 64 quality references per side, and 8 MiB of canonical JSON
+input. Pair ids must be unique and the request cannot be empty; those are
+validation errors. Missing baseline/candidate sides and empty attempt sets
+remain representable so the report can return typed `unavailable` findings.
+Identity values are bounded to 512 characters and evidence references to 2,048
+characters. Attempt ordinals, token counters, and other integers cannot exceed
+the durable signed-64-bit JSON bound; cost decimals are finite, non-negative,
+bounded to that maximum value, and limited to 64 coefficient digits and 64
+decimal places. Models are frozen and transitively revalidated so caller
+mutation cannot rewrite accepted evidence or the resulting report.
+
+Each `PairedCostAttempt` retains attempt and operation ids, ordinal, operation
+kind, session/branch/role, provider/model, optional source-checkpoint identity,
+and one frozen `ComparisonCostLineItem`. Use
+`ComparisonCostLineItem.from_cost_line_item(...)` to detach the estimator's
+ordinary `CostLineItem` before construction. The comparison projection is an
+explicit allowlist: it bounds pricing/provenance text and never retains
+`BillingIdentity`, request/completion evidence, or other arbitrary provider
+metadata. A retry uses the same operation id with the next contiguous ordinal.
+Operation kinds distinguish ordinary model steps,
+compaction, structured-output repair, evaluation, application repair, and
+comparison controls. A required provider attempt without usable counters uses
+`cost=None` plus a bounded `usage_unavailable_reason`; an unpriced attempt keeps
+its usage-bearing `CostLineItem` and missing-pricing reason. Missing provider or
+model identity is unavailable rather than guessed.
+
+Every side declares workload, task, source, comparison role, strategy, output
+mode/token cap, an opaque `ComparableGenerationSettings.revision`, optional
+pricing-catalog version/generated-at identity, and an optional
+`PairedQualityEvidence`. The generation revision is a `sha256:` content
+identifier over the caller's canonical non-secret generation controls; it
+commits to controls such as sampling, reasoning, and response-format settings
+without serializing them into the report. A `verified` pair requires both sides
+to use the same workload/task/source/role/output budget/generation settings and
+the same quality contract name, version, threshold, and role, with internally
+consistent passing scores.
+The sets of available attempt-level source-checkpoint identities must also
+match; asymmetric or different retained checkpoint evidence is unavailable.
+The application defines that rubric and supplies bounded, non-secret evidence
+references. Different strategies may legitimately use different providers,
+models, or catalog tiers; compatibility means the same catalog snapshot,
+one currency, complete usage, and a provenance-bearing price resolution for
+every priced attempt—not that both strategies must execute the same model.
+
+Pair status precedence is `unavailable`, `unpriced`,
+`measured_unmatched`, then `verified`. Missing/contradictory pair, identity,
+usage, catalog, currency, or provenance evidence is `unavailable`. Complete
+usage with one or more unmatched price rows is `unpriced`. Comparable priced
+usage with missing, asymmetric, unavailable, failed, or incompatible quality
+evidence is `measured_unmatched`; its raw cost delta remains visible but is not
+eligible for verified aggregation. Only a fully comparable, quality-passing
+pair is `verified`.
+
+The report separately recomputes first/retry counts, token/cache counters,
+priced/unpriced/missing counts, and currency-local costs for each operation,
+session, branch, and whole supplied side. Aggregate arithmetic includes only
+verified pairs from one workload/task/role/output-budget/quality cohort under
+one pricing-catalog snapshot, never combines currencies, and records each
+excluded pair with typed findings. Mixing otherwise verified cohorts makes
+aggregate arithmetic unavailable rather than silently pooling unrelated work.
+Savings are `baseline - candidate`;
+percentages use `Decimal`,
+round-half-even to `0.01`. Zero baselines produce no percentage and the explicit
+`zero_baseline` state. Negative savings remain negative with
+`cost_direction="increased_cost"`.
+
+`PairedCostQualityComparisonReport.schema_version` is `1`. JSON-mode dumps
+serialize decimal values as strings and have no prompt, message, model-output,
+credential, or arbitrary metadata field. Quality evidence references are
+opaque `sha256:` content identifiers, never artifact locations or arbitrary
+clean text; callers retain the private mapping from an identifier to evaluator
+material. Catalog version/generated-at plus each price row's source, URL, and
+as-of provenance reproduce the estimate boundary. This is runtime accounting
+evidence, not a provider invoice.
 
 The optional server also exposes
 `POST /api/causal-budgets/{causal_budget_id}/summary` for one-call work-item

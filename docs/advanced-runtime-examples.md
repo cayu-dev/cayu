@@ -26,6 +26,9 @@ its comparison-only attempt is reported separately from durable session spend.
 Both summaries must preserve a mandatory retention token, and the candidate
 must recover it after the second compaction, so lower counters alone cannot
 pass the scenario.
+The paired attempts are serialized through the public v1 cost-and-quality
+report as `comparison_control` and `compaction`; the quality contract remains
+the application-owned mandatory-token check.
 The second session compaction must summarize only the previous checkpoint plus
 newly compactable messages. Deterministic coverage is PR-safe and uses clearly
 labeled fixture prices; the credential-gated Anthropic path additionally
@@ -52,7 +55,10 @@ prove that:
 - the repair addresses the evaluator's critique.
 
 This turns session forking into a cost and quality strategy rather than a copy
-of chat history.
+of chat history. The matched branch-call denominator is serialized through the
+public v1 cost-and-quality report. Evaluator and repair sessions remain visible
+outside that narrow pair, so their downstream spend is not hidden or
+asymmetrically converted into branch savings.
 
 ### Compute during approval waits without granting authority
 

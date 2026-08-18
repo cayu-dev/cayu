@@ -18,8 +18,11 @@ from pydantic import (
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, json_utf8_size_within_limit
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
+    _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_CASES,
+    EVAL_CORPUS_MAX_JUDGE_RUBRIC_CHARS,
+    EVAL_CORPUS_MAX_JUDGE_RUBRIC_VERSION_CHARS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_TOOL_NAMES,
     EVAL_CORPUS_MAX_TRIALS,
@@ -37,6 +40,7 @@ from cayu.evals.corpus import (
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
+    ModelJudgeAssertionSpec,
     RootStatusAssertionSpec,
     ToolCalledAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
@@ -73,6 +77,11 @@ PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
 PublishedStatus = Literal["passed", "failed", "unavailable", "error"]
 PublishedOutcome = Literal["passed", "failed", "unavailable", "error"]
+PublishedModelJudgeDiagnostic = Literal[
+    "judgment_recorded",
+    "evaluator_error",
+    "evidence_unavailable",
+]
 
 _ASSERTION_MESSAGE = {
     "passed": "Assertion passed.",
@@ -128,6 +137,14 @@ _TRIAL_CODES_BY_STATUS = {
         EvalTrialDiagnosticCode.CASE_TIMEOUT,
     },
 }
+
+
+def _model_judge_diagnostic(outcome: PublishedOutcome) -> PublishedModelJudgeDiagnostic:
+    if outcome in {"passed", "failed"}:
+        return "judgment_recorded"
+    if outcome == "unavailable":
+        return "evidence_unavailable"
+    return "evaluator_error"
 
 
 class _PublishedAssertionDetail(_PortableModel):
@@ -283,6 +300,51 @@ class PublishedMaxEstimatedCostDetail(_PublishedAssertionDetail):
         return self
 
 
+class PublishedModelJudgeDetail(_PublishedAssertionDetail):
+    """Bounded public contract and safe outcome evidence for one model judgment."""
+
+    kind: Literal["model_judge"] = "model_judge"
+    evaluator_key: StrictStr
+    evaluator_implementation_revision: StrictStr
+    rubric: StrictStr
+    rubric_version: StrictStr
+    threshold: StrictFloat = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    include_transcript: StrictBool
+    diagnostic: PublishedModelJudgeDiagnostic
+
+    @field_validator("evaluator_key")
+    @classmethod
+    def validate_evaluator_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("evaluator_implementation_revision")
+    @classmethod
+    def validate_evaluator_implementation_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("rubric")
+    @classmethod
+    def validate_rubric(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_RUBRIC_CHARS,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("rubric_version")
+    @classmethod
+    def validate_rubric_version(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_RUBRIC_VERSION_CHARS,
+            nonblank=True,
+            clean=True,
+        )
+
+
 PublishedAssertionDetail: TypeAlias = Annotated[
     PublishedRootStatusDetail
     | PublishedChildStatusDetail
@@ -294,7 +356,8 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedMaxModelStepsDetail
     | PublishedUsageRecordedDetail
     | PublishedMaxTotalTokensDetail
-    | PublishedMaxEstimatedCostDetail,
+    | PublishedMaxEstimatedCostDetail
+    | PublishedModelJudgeDetail,
     Field(discriminator="kind"),
 ]
 
@@ -323,6 +386,12 @@ class PublishedAssertionResult(_PortableModel):
         if self.outcome in {"unavailable", "error"}:
             if self.score is not None:
                 raise ValueError("Unavailable/error published assertions cannot have a score.")
+        elif isinstance(self.detail, PublishedModelJudgeDetail):
+            if self.score is None:
+                raise ValueError("Scored published model judges require a score.")
+            expected_outcome = "passed" if self.score >= self.detail.threshold else "failed"
+            if self.outcome != expected_outcome:
+                raise ValueError("Published model-judge score is inconsistent.")
         elif self.score != (1.0 if self.outcome == "passed" else 0.0):
             raise ValueError("Published deterministic assertion score is inconsistent.")
         if self.code != self.outcome or self.message != _ASSERTION_MESSAGE[self.outcome]:
@@ -340,6 +409,10 @@ class PublishedAssertionResult(_PortableModel):
                 raise ValueError(
                     "Unavailable published cost observations require unpriced model steps."
                 )
+        if isinstance(self.detail, PublishedModelJudgeDetail):
+            expected_diagnostic = _model_judge_diagnostic(self.outcome)
+            if self.detail.diagnostic != expected_diagnostic:
+                raise ValueError("Published model-judge diagnostic contradicts the outcome.")
         if (
             self.outcome in {"passed", "failed"}
             and isinstance(self.detail, PublishedMaxEstimatedCostDetail)
@@ -699,6 +772,8 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.actual is not None
     if isinstance(detail, PublishedMaxEstimatedCostDetail):
         return detail.estimated_cost is not None
+    if isinstance(detail, PublishedModelJudgeDetail):
+        return detail.diagnostic == "judgment_recorded"
     return True
 
 
@@ -727,6 +802,8 @@ def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
         if detail.unpriced_model_steps:
             return None
         return Decimal(detail.estimated_cost) <= Decimal(detail.maximum)
+    if isinstance(detail, PublishedModelJudgeDetail):
+        return None
     if isinstance(detail, PublishedToolsCalledInOrderDetail):
         return detail.matched
     return None
@@ -754,6 +831,8 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
         return "usage"
     if isinstance(detail, PublishedMaxEstimatedCostDetail):
         return "cost"
+    if isinstance(detail, PublishedModelJudgeDetail):
+        return "model-judge"
     raise AssertionError("Unreachable published assertion detail type.")
 
 
@@ -775,8 +854,20 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
         static_detail = (detail.kind, detail.minimum)
     elif isinstance(detail, PublishedMaxTotalTokensDetail):
         static_detail = (detail.kind, detail.maximum)
-    else:
+    elif isinstance(detail, PublishedMaxEstimatedCostDetail):
         static_detail = (detail.kind, detail.maximum, detail.currency)
+    elif isinstance(detail, PublishedModelJudgeDetail):
+        static_detail = (
+            detail.kind,
+            detail.evaluator_key,
+            detail.evaluator_implementation_revision,
+            detail.rubric,
+            detail.rubric_version,
+            detail.threshold,
+            detail.include_transcript,
+        )
+    else:
+        raise AssertionError("Unreachable published assertion detail type.")
     return assertion.assertion_id, assertion.assertion_revision, *static_detail
 
 
@@ -804,7 +895,45 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
         return (*base, spec.maximum)
     if type(spec) is MaxEstimatedCostAssertionSpec:
         return (*base, spec.maximum, spec.currency)
+    if type(spec) is ModelJudgeAssertionSpec:
+        return (
+            *base,
+            spec.evaluator_key,
+            spec.rubric,
+            spec.rubric_version,
+            spec.threshold,
+            spec.include_transcript,
+        )
     raise AssertionError("Unreachable portable assertion specification type.")
+
+
+def _published_assertion_matches_spec(
+    assertion: PublishedAssertionResult,
+    spec: AssertionSpec,
+) -> bool:
+    """Check that published assertion settings retain the corpus's portable contract.
+
+    A model-judge implementation revision is resolved from the execution target and
+    deliberately retained in published results for comparison.  It is not part of
+    the portable corpus assertion, so it must not prevent that result from being
+    bound to the corpus that requested the evaluator key and rubric.
+    """
+
+    if type(spec) is not ModelJudgeAssertionSpec:
+        return _assertion_contract(assertion) == _assertion_spec_contract(spec)
+    detail = assertion.detail
+    if type(detail) is not PublishedModelJudgeDetail:
+        return False
+    return (
+        assertion.assertion_id,
+        assertion.assertion_revision,
+        detail.kind,
+        detail.evaluator_key,
+        detail.rubric,
+        detail.rubric_version,
+        detail.threshold,
+        detail.include_transcript,
+    ) == _assertion_spec_contract(spec)
 
 
 def _validate_published_eval_run_for_corpus(
@@ -843,10 +972,12 @@ def _validate_published_eval_run_for_corpus(
     for case_spec, published_case in zip(case_specs, run.cases, strict=True):
         if len(published_case.trials) != expected.trials:
             raise ValueError("Published eval run trial counts do not match its corpus suite.")
-        expected_assertions = tuple(_assertion_spec_contract(spec) for spec in case_spec.assertions)
         if any(
-            tuple(_assertion_contract(assertion) for assertion in trial.assertions)
-            != expected_assertions
+            len(trial.assertions) != len(case_spec.assertions)
+            or any(
+                not _published_assertion_matches_spec(assertion, spec)
+                for assertion, spec in zip(trial.assertions, case_spec.assertions, strict=True)
+            )
             for trial in published_case.trials
         ):
             raise ValueError(
@@ -874,7 +1005,7 @@ def _validate_trial_observations(
     availability_by_area: dict[str, set[bool]] = {}
     for assertion in assertions:
         detail = assertion.detail
-        if assertion.outcome != "error":
+        if assertion.outcome != "error" and not isinstance(detail, PublishedModelJudgeDetail):
             area = _detail_evidence_area(detail)
             availability_by_area.setdefault(area, set()).add(_detail_has_observation(detail))
         if isinstance(detail, PublishedRootStatusDetail) and detail.actual is not None:
@@ -1112,6 +1243,26 @@ def _published_detail(
             priced_model_steps=priced_steps,
             unpriced_model_steps=unpriced_steps,
         )
+    if type(spec) is ModelJudgeAssertionSpec:
+        resolved_revision = result.metadata.get(
+            _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY
+        )
+        if type(resolved_revision) is not str:
+            raise ValueError(
+                "Internal model-judge result did not record its resolved implementation revision."
+            )
+        return PublishedModelJudgeDetail(
+            evaluator_key=spec.evaluator_key,
+            evaluator_implementation_revision=_sha256_revision(
+                resolved_revision,
+                "resolved model-judge implementation revision",
+            ),
+            rubric=spec.rubric,
+            rubric_version=spec.rubric_version,
+            threshold=spec.threshold,
+            include_transcript=spec.include_transcript,
+            diagnostic=_model_judge_diagnostic(result.outcome.value),
+        )
     raise AssertionError("Unreachable portable assertion detail type.")
 
 
@@ -1126,6 +1277,12 @@ def _published_assertion(
         raise ValueError(
             "Internal assertion result revision does not match the corpus assertion contract."
         )
+    if (
+        type(spec) is ModelJudgeAssertionSpec
+        and result.score is not None
+        and result.threshold != spec.threshold
+    ):
+        raise ValueError("Internal model-judge threshold does not match the corpus contract.")
     outcome = result.outcome.value
     return PublishedAssertionResult(
         assertion_id=spec.id,

@@ -11,6 +11,11 @@ These are provider-reported live measurements, not deterministic fixtures. All
 six final trials used `claude-haiku-4-5-20251001` through the direct Anthropic
 API and passed every example-specific runtime and task-quality assertion.
 
+These July artifacts predate `PairedCostQualityComparisonReport` v1. Their
+measurements remain historical evidence under the denominators below; current
+example runs emit the typed public report and must not relabel an old artifact
+as v1 without rerunning it.
+
 ## Results
 
 | Workload | Verified trials | Paired baseline | Cayu candidate | Aggregate savings | Trial median | Trial range |

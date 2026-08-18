@@ -5,7 +5,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from tests.evals.eval_store_conformance import assert_eval_store_conformance
-from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_corpus_execution import (
+    _corpus,
+    _model_judge_corpus,
+    _model_judge_target,
+    _provider,
+    _target,
+)
 
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument, EvalSuiteSpec
 from cayu.evals.execution import run_corpus_suite
@@ -263,12 +269,14 @@ def test_memory_store_claims_are_fenced_reclaimable_and_cancellable() -> None:
         assert claimed is not None
         first_claim = claimed.claim
         assert first_claim.epoch == 1
+        assert claimed.run.attempt_count == 1
 
         clock.advance(11)
         reclaimed = await store.claim_run(lease_seconds=10)
         assert reclaimed is not None
         second_claim = reclaimed.claim
         assert second_claim.epoch == 2
+        assert reclaimed.run.attempt_count == 2
         with pytest.raises(EvalRunClaimLost):
             await store.heartbeat_run(first_claim)
 
@@ -276,12 +284,14 @@ def test_memory_store_claims_are_fenced_reclaimable_and_cancellable() -> None:
         assert cancelling.status is EvalRunStatus.CANCELLING
         cancelled = await store.finish_cancel(second_claim)
         assert cancelled.status is EvalRunStatus.CANCELLED
+        assert cancelled.attempt_count == 2
         assert cancelled.finished_at is not None
         assert await store.finish_cancel(second_claim) == cancelled
 
         await _admit_run(store, _request(corpus, run_id="run-2", key="request-2"))
         queued_cancelled = await store.request_cancel("run-2")
         assert queued_cancelled.status is EvalRunStatus.CANCELLED
+        assert queued_cancelled.attempt_count == 0
         assert await store.claim_run() is None
 
         await _admit_run(store, _request(corpus, run_id="run-3", key="request-3"))
@@ -290,6 +300,7 @@ def test_memory_store_claims_are_fenced_reclaimable_and_cancellable() -> None:
         clock.advance(11)
         expired_cancelled = await store.request_cancel("run-3")
         assert expired_cancelled.status is EvalRunStatus.CANCELLED
+        assert expired_cancelled.attempt_count == 1
         assert expired_cancelled.ownership is None
         with pytest.raises(EvalRunClaimLost):
             await store.heartbeat_run(expiring.claim)
@@ -316,6 +327,7 @@ def test_memory_store_publishes_only_matching_immutable_safe_results() -> None:
 
         completed = await _publish_result(store, claim, result)
         assert completed.status is EvalRunStatus.COMPLETED
+        assert completed.attempt_count == 1
         assert completed.result is not None
         assert completed.result.revision == result.revision
         assert await _publish_result(store, claim, result) == completed
@@ -329,6 +341,40 @@ def test_memory_store_publishes_only_matching_immutable_safe_results() -> None:
         )
         with pytest.raises(Exception):
             await _publish_result(store, claim, changed)
+
+    asyncio.run(exercise())
+
+
+def test_repeated_model_judge_attempts_are_fenced_and_remain_attributable() -> None:
+    async def exercise() -> None:
+        clock = _Clock()
+        store = InMemoryEvalStore(clock=clock)
+        judge, judge_provider = _model_judge_target(requests=2)
+        candidate_provider = _provider(trials=2)
+        target = _target(candidate_provider, model_judges=(judge,))
+        corpus = _model_judge_corpus(judge)
+        await _save_corpus(store, corpus)
+        await _admit_run(store, _request(corpus))
+
+        first_lease = await store.claim_run(lease_seconds=10)
+        assert first_lease is not None
+        first_result = await run_corpus_suite(target, corpus, corpus.suites[0].id)
+
+        clock.advance(11)
+        second_lease = await store.claim_run(lease_seconds=10)
+        assert second_lease is not None
+        second_result = await run_corpus_suite(target, corpus, corpus.suites[0].id)
+
+        with pytest.raises(EvalRunClaimLost):
+            await _publish_result(store, first_lease.claim, first_result)
+        completed = await _publish_result(store, second_lease.claim, second_result)
+
+        assert completed.status is EvalRunStatus.COMPLETED
+        assert completed.attempt_count == 2
+        assert second_lease.claim.epoch == 2
+        assert len(candidate_provider.requests) == 2
+        assert len(judge_provider.requests) == 2
+        assert await store.load_result(completed.id) == second_result
 
     asyncio.run(exercise())
 

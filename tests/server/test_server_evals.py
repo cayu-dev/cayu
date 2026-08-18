@@ -15,12 +15,18 @@ pytest.importorskip("sse_starlette")
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
-from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_corpus_execution import (
+    _corpus,
+    _model_judge_corpus,
+    _model_judge_target,
+    _provider,
+    _target,
+)
 
 import cayu.evals.execution as execution_module
 import cayu.server.evals_worker as evals_worker_module
 import cayu.storage.evals_sqlite as evals_sqlite_module
-from cayu import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu import AgentSpec, CayuApp, ModelJudgeTarget, ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument
 from cayu.evals.execution import run_corpus_suite
 from cayu.evals.store import EvalRunRequest, EvalRunStatus, InMemoryEvalStore
@@ -695,6 +701,31 @@ class _BlockingProvider(ModelProvider):
             yield ModelStreamEvent.text_delta("")
 
 
+class _RecoveringJudgeProvider(ModelProvider):
+    name = "recovering-judge-provider"
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self.request_count = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        with self._lock:
+            self.request_count += 1
+            attempt = self.request_count
+        if attempt == 1:
+            self.started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        yield ModelStreamEvent.text_delta('{"score": 0.9, "rationale": "recovered judgment"}')
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
 class _FailingProvider(ModelProvider):
     name = "failing-eval-provider"
 
@@ -785,6 +816,116 @@ def test_running_eval_cancellation_stops_execution_before_terminalizing(tmp_path
             )
     finally:
         asyncio.run(store.close())
+
+
+def test_attached_worker_runs_the_same_trusted_model_judge_contract(tmp_path) -> None:
+    judge, judge_provider = _model_judge_target()
+    candidate_provider = _provider(trials=1)
+    target = _target(candidate_provider, model_judges=(judge,))
+    corpus = _model_judge_corpus(judge)
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    try:
+        with TestClient(_server(target, store)) as client:
+            imported = client.post(
+                "/api/evals/corpora",
+                headers=_AUTH_HEADERS,
+                json=corpus.model_dump(mode="json"),
+            )
+            assert imported.status_code == 201
+            admitted = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "portable-model-judge"},
+                json={
+                    "corpus_revision": corpus.revision,
+                    "suite_id": corpus.suites[0].id,
+                },
+            )
+            assert admitted.status_code == 202
+
+            terminal = _wait_for_terminal(client, admitted.json()["spec"]["run_id"])
+
+            assert terminal["status"] == "completed"
+            assert terminal["attempt_count"] == 1
+            assertion = terminal["result"]
+            assert assertion["status"] == "passed"
+            result_response = client.get(
+                f"/api/evals/runs/{terminal['spec']['run_id']}/result",
+                headers=_AUTH_HEADERS,
+            )
+            assert result_response.status_code == 200
+            detail = result_response.json()["result"]["run"]["cases"][0]["trials"][0]["assertions"][
+                0
+            ]["detail"]
+            assert detail["kind"] == "model_judge"
+            assert detail["diagnostic"] == "judgment_recorded"
+            assert len(candidate_provider.requests) == 1
+            assert len(judge_provider.requests) == 1
+    finally:
+        asyncio.run(store.close())
+
+
+def test_attached_worker_recovers_interrupted_model_judge_under_a_new_fence(tmp_path) -> None:
+    judge_provider = _RecoveringJudgeProvider()
+    judge_app = CayuApp(enable_logging=False)
+    judge_app.register_provider(judge_provider, default=True)
+    judge_app.register_agent(AgentSpec(name="judge", model="judge-model"))
+    judge = ModelJudgeTarget(
+        key="quality-judge",
+        app=judge_app,
+        agent_name="judge",
+    )
+    candidate_provider = _provider(trials=2)
+    target = _target(candidate_provider, model_judges=(judge,))
+    corpus = _model_judge_corpus(judge)
+    database = tmp_path / "evals.db"
+    store = SQLiteEvalStore(database)
+    recovery_store = None
+    run_id = None
+    try:
+        with TestClient(_server(target, store)) as client:
+            assert (
+                client.post(
+                    "/api/evals/corpora",
+                    headers=_AUTH_HEADERS,
+                    json=corpus.model_dump(mode="json"),
+                ).status_code
+                == 201
+            )
+            admitted = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "model-judge-recovery"},
+                json={
+                    "corpus_revision": corpus.revision,
+                    "suite_id": corpus.suites[0].id,
+                },
+            )
+            assert admitted.status_code == 202
+            run_id = admitted.json()["spec"]["run_id"]
+            assert judge_provider.started.wait(timeout=2)
+
+        assert run_id is not None
+        assert judge_provider.cancelled.wait(timeout=2)
+        asyncio.run(store.close())
+        recovery_store = SQLiteEvalStore(database, schema_mode=SchemaMode.VALIDATE)
+        released = asyncio.run(recovery_store.load_run(run_id))
+        assert released is not None
+        assert released.status is EvalRunStatus.QUEUED
+        assert released.attempt_count == 1
+        assert released.ownership is None
+
+        with TestClient(_server(target, recovery_store)) as client:
+            terminal = _wait_for_terminal(client, run_id)
+            assert terminal["status"] == "completed"
+            assert terminal["attempt_count"] == 2
+            assert terminal["result"]["status"] == "passed"
+
+        assert len(candidate_provider.requests) == 2
+        assert judge_provider.request_count == 2
+    finally:
+        if recovery_store is not None:
+            asyncio.run(recovery_store.close())
+        else:
+            asyncio.run(store.close())
 
 
 def test_complex_corpus_import_cannot_starve_an_active_eval_lease(

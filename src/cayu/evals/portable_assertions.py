@@ -5,11 +5,17 @@ from dataclasses import dataclass
 
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
+    _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
+    EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
     AssertionSpec,
     EvaluationEvidencePolicySpec,
     MaxEstimatedCostAssertionSpec,
+    ModelJudgeAssertionSpec,
     PricingProfileIdentityV1,
     RootStatusAssertionSpec,
+    _bounded_durable_text,
+    _content_revision,
+    _portable_id,
     _validated_assertion_spec,
     assertion_spec_revision,
     pricing_profile_identity,
@@ -17,15 +23,20 @@ from cayu.evals.corpus import (
 from cayu.evals.evidence import (
     AssertionEvidenceView,
     _build_assertion_evidence_view,
+    _redacted_text,
     _validated_currencies,
     _validated_policy,
     _validated_pricing,
     _ValidatedPricingSnapshot,
 )
+from cayu.evals.judges import LLMJudge, _first_user_text, _render_transcript
 from cayu.evals.models import EvalAssertionResult, EvalContext
 from cayu.evals.portable_evaluation import _evaluate_validated_assertion_spec
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook
+from cayu.runtime.manifest import AppManifest
+
+MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +48,95 @@ class _CompiledPricingBinding:
 
 
 _NO_PRICING = _CompiledPricingBinding(source=None, fingerprint=None)
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedModelJudgeBinding:
+    """Trusted execution authority resolved outside the portable corpus."""
+
+    key: str
+    app: CayuApp
+    agent_name: str
+    implementation_revision: str
+
+
+def _model_judge_implementation_revision(
+    *,
+    key: str,
+    app: CayuApp,
+    agent_name: str,
+) -> str:
+    """Fingerprint judge semantics plus the trusted application's public manifest."""
+
+    validated_key = _portable_id(key, "key")
+    if not isinstance(app, CayuApp):
+        raise TypeError("app must be a CayuApp.")
+    validated_agent_name = _bounded_durable_text(
+        agent_name,
+        "agent_name",
+        max_chars=256,
+        nonblank=True,
+        clean=True,
+    )
+    registered_agent = app.get_agent(validated_agent_name)
+    if registered_agent.tools:
+        raise ValueError("Trusted model judge agents must be registered without tools.")
+    manifest = app.describe()
+    if type(manifest) is not AppManifest:
+        raise TypeError("CayuApp.describe() must return an AppManifest.")
+    agent_manifest = next(
+        (agent for agent in manifest.agents if agent.name == validated_agent_name),
+        None,
+    )
+    if agent_manifest is None:
+        raise ValueError("Trusted model judge agent is absent from the application manifest.")
+    if agent_manifest.resolved_provider is None:
+        raise ValueError("Trusted model judge agent must resolve exactly one provider.")
+    app.get_provider(agent_manifest.resolved_provider)
+    redacted_agent_spec = app.redact_json(registered_agent.spec.model_dump(mode="json"))
+    if type(redacted_agent_spec) is not dict:
+        raise TypeError("Trusted model judge agent redaction must preserve its object shape.")
+    agent_spec_revision = _content_revision(
+        redacted_agent_spec,
+        "trusted model judge agent specification",
+    )
+    return _content_revision(
+        {
+            "model_judge_execution_semantics_version": (MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION),
+            "evaluator_key": validated_key,
+            "agent_name": validated_agent_name,
+            "agent_spec_revision": agent_spec_revision,
+            "app_manifest_schema_version": manifest.schema_version,
+            "app_manifest_fingerprint": manifest.fingerprint,
+        },
+        "trusted model judge implementation",
+    )
+
+
+def _trusted_model_judge_binding(
+    *,
+    key: str,
+    app: CayuApp,
+    agent_name: str,
+) -> _TrustedModelJudgeBinding:
+    validated_key = _portable_id(key, "key")
+    validated_agent_name = _bounded_durable_text(
+        agent_name,
+        "agent_name",
+        max_chars=256,
+        nonblank=True,
+        clean=True,
+    )
+    return _TrustedModelJudgeBinding(
+        key=validated_key,
+        app=app,
+        agent_name=validated_agent_name,
+        implementation_revision=_model_judge_implementation_revision(
+            key=validated_key,
+            app=app,
+            agent_name=validated_agent_name,
+        ),
+    )
 
 
 class _CompiledPortableAssertion(EvalAssertion):
@@ -123,6 +223,165 @@ class _CompiledPortableAssertion(EvalAssertion):
         )
 
 
+class _CompiledModelJudgeAssertion(EvalAssertion):
+    """One portable contract bound to a trusted, tool-free local judge."""
+
+    _app: CayuApp
+    _assertion_revision: str
+    _binding: _TrustedModelJudgeBinding
+    _evidence_policy: EvaluationEvidencePolicySpec
+    _judge: LLMJudge
+    _spec: ModelJudgeAssertionSpec
+
+    __slots__ = (
+        "_app",
+        "_assertion_revision",
+        "_binding",
+        "_evidence_policy",
+        "_judge",
+        "_spec",
+    )
+
+    def __init__(
+        self,
+        spec: ModelJudgeAssertionSpec,
+        *,
+        binding: _TrustedModelJudgeBinding,
+        app: CayuApp,
+        evidence_policy: EvaluationEvidencePolicySpec,
+    ) -> None:
+        validated_spec = ModelJudgeAssertionSpec.model_validate(
+            spec.model_dump(mode="python", round_trip=True, warnings="none")
+        )
+        if validated_spec.evaluator_key != binding.key:
+            raise ValueError("Portable model judge key does not match its trusted evaluator.")
+        object.__setattr__(self, "_spec", validated_spec)
+        object.__setattr__(self, "_binding", binding)
+        object.__setattr__(self, "_app", app)
+        object.__setattr__(self, "_evidence_policy", _validated_policy(evidence_policy))
+        object.__setattr__(
+            self,
+            "_assertion_revision",
+            assertion_spec_revision(validated_spec),
+        )
+        object.__setattr__(
+            self,
+            "_judge",
+            LLMJudge(
+                binding.app,
+                agent_name=binding.agent_name,
+                rubric=validated_spec.rubric,
+                rubric_version=validated_spec.rubric_version,
+                threshold=validated_spec.threshold,
+                include_transcript=validated_spec.include_transcript,
+                name=validated_spec.id,
+            ),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Compiled model judge assertions are immutable.")
+
+    @property
+    def name(self) -> str:
+        return self._spec.id
+
+    @property
+    def assertion_revision(self) -> str:
+        return self._assertion_revision
+
+    def _with_resolved_implementation_revision(
+        self,
+        result: EvalAssertionResult,
+    ) -> EvalAssertionResult:
+        """Preserve the trusted binding for every published judge outcome."""
+
+        return result.model_copy(
+            update={
+                "metadata": {
+                    **result.metadata,
+                    _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY: (
+                        self._binding.implementation_revision
+                    ),
+                }
+            }
+        )
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        evidence = _build_assertion_evidence_view(
+            context.trajectory,
+            evidence_policy=self._evidence_policy,
+            pricing_snapshot=None,
+            cost_currencies=(),
+            app=self._app,
+            root_evidence_available=context.root_evidence_available,
+            allow_event_count_fallback=True,
+            expected_pricing_profile_fingerprint=None,
+            bind_pricing_profile=True,
+        )
+        return await self.evaluate_evidence(evidence, context)
+
+    async def evaluate_evidence(
+        self,
+        evidence: AssertionEvidenceView,
+        context: EvalContext,
+    ) -> EvalAssertionResult:
+        try:
+            current_revision = _model_judge_implementation_revision(
+                key=self._binding.key,
+                app=self._binding.app,
+                agent_name=self._binding.agent_name,
+            )
+        except Exception:
+            return self._with_resolved_implementation_revision(
+                self.error("Trusted model judge configuration became invalid.")
+            )
+        if current_revision != self._binding.implementation_revision:
+            return self._with_resolved_implementation_revision(
+                self.error("Trusted model judge implementation changed after compilation.")
+            )
+        if evidence.final_output_state != "complete":
+            return self._with_resolved_implementation_revision(
+                self.unavailable("Final-output evidence was not retained completely.")
+            )
+        task = _redacted_text(
+            self._app,
+            _first_user_text(context.transcript),
+            "model judge task",
+        )
+        if len(task) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
+            return self._with_resolved_implementation_revision(
+                self.unavailable("Model-judge task evidence exceeded its portable bound.")
+            )
+        transcript = None
+        if self._spec.include_transcript:
+            transcript = _redacted_text(
+                self._app,
+                _render_transcript(context.transcript),
+                "model judge transcript",
+            )
+            if len(transcript) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
+                return self._with_resolved_implementation_revision(
+                    self.unavailable("Model-judge transcript evidence exceeded its portable bound.")
+                )
+        result = await self._judge._evaluate_material(
+            task=task,
+            final_output=evidence.final_output,
+            transcript_text=transcript,
+        )
+        return self._with_resolved_implementation_revision(
+            EvalAssertionResult(
+                name=self.name,
+                assertion_revision=self.assertion_revision,
+                outcome=result.outcome,
+                score=result.score,
+                threshold=result.threshold,
+                message=result.message,
+                metadata=result.metadata,
+                cost_summary=result.cost_summary,
+            )
+        )
+
+
 def _prepare_portable_assertion_evidence(
     assertions: Sequence[EvalAssertion],
     context: EvalContext,
@@ -130,9 +389,13 @@ def _prepare_portable_assertion_evidence(
     runtime_app: CayuApp | None = None,
 ) -> AssertionEvidenceView | None:
     trajectory = context.trajectory
-    compiled = tuple(
+    portable_assertions = tuple(
         assertion for assertion in assertions if type(assertion) is _CompiledPortableAssertion
     )
+    model_judge_assertions = tuple(
+        assertion for assertion in assertions if type(assertion) is _CompiledModelJudgeAssertion
+    )
+    compiled = (*portable_assertions, *model_judge_assertions)
     if not compiled:
         return None
 
@@ -155,7 +418,7 @@ def _prepare_portable_assertion_evidence(
 
     cost_assertions = tuple(
         assertion
-        for assertion in compiled
+        for assertion in portable_assertions
         if type(assertion._spec) is MaxEstimatedCostAssertionSpec
     )
     pricing_fingerprints = {assertion._pricing_binding.fingerprint for assertion in cost_assertions}
@@ -251,6 +514,8 @@ def compile_assertion_spec(
     if trusted_pricing is not None and type(trusted_pricing) is not PriceBook:
         raise TypeError("trusted_pricing must be an exact PriceBook or None.")
     validated_spec = _validated_assertion_spec(spec)
+    if type(validated_spec) is ModelJudgeAssertionSpec:
+        raise ValueError("Portable model judges require a trusted CorpusTarget evaluator binding.")
     pricing_binding = (
         _compiled_pricing_binding(trusted_pricing)
         if type(validated_spec) is MaxEstimatedCostAssertionSpec
@@ -272,6 +537,7 @@ def _compile_corpus_assertion_specs(
     trusted_pricing: PriceBook | None,
     expected_pricing_profile: PricingProfileIdentityV1 | None,
     trusted_pricing_identity: PricingProfileIdentityV1 | None = None,
+    trusted_model_judges: Sequence[_TrustedModelJudgeBinding] = (),
 ) -> tuple[EvalAssertion, ...]:
     """Compile one corpus suite with a single shared pricing binding."""
 
@@ -293,6 +559,13 @@ def _compile_corpus_assertion_specs(
         )
 
     validated_specs = tuple(_validated_assertion_spec(spec) for spec in specs)
+    model_judge_bindings: dict[str, _TrustedModelJudgeBinding] = {}
+    for binding in trusted_model_judges:
+        if type(binding) is not _TrustedModelJudgeBinding:
+            raise TypeError("trusted_model_judges must contain exact trusted model judge bindings.")
+        if binding.key in model_judge_bindings:
+            raise ValueError("Trusted model judge keys must be unique.")
+        model_judge_bindings[binding.key] = binding
     uses_pricing = any(type(spec) is MaxEstimatedCostAssertionSpec for spec in validated_specs)
     pricing_binding = _NO_PRICING
     if uses_pricing:
@@ -310,12 +583,29 @@ def _compile_corpus_assertion_specs(
             fingerprint=trusted_identity.fingerprint,
         )
 
-    return tuple(
-        _CompiledPortableAssertion(
-            spec,
-            app=app,
-            evidence_policy=evidence_policy,
-            pricing_binding=pricing_binding,
-        )
-        for spec in validated_specs
-    )
+    compiled: list[EvalAssertion] = []
+    for spec in validated_specs:
+        if type(spec) is ModelJudgeAssertionSpec:
+            binding = model_judge_bindings.get(spec.evaluator_key)
+            if binding is None:
+                raise ValueError(
+                    f"Eval corpus requires trusted model judge {spec.evaluator_key!r}."
+                )
+            compiled.append(
+                _CompiledModelJudgeAssertion(
+                    spec,
+                    binding=binding,
+                    app=app,
+                    evidence_policy=evidence_policy,
+                )
+            )
+        else:
+            compiled.append(
+                _CompiledPortableAssertion(
+                    spec,
+                    app=app,
+                    evidence_policy=evidence_policy,
+                    pricing_binding=pricing_binding,
+                )
+            )
+    return tuple(compiled)

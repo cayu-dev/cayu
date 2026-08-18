@@ -5,7 +5,9 @@ import type {
 } from "./generated/server-api"
 
 export type PromotionAssertion = EvaluationPromotionDraft["case"]["assertions"][number]
-export type PromotionAssertionKind = NonNullable<PromotionAssertion["kind"]>
+// Promotion drafts are candidate-authored. Model judges require target-owned
+// execution authority and therefore cannot be created or selected here.
+export type PromotionAssertionKind = Exclude<NonNullable<PromotionAssertion["kind"]>, "model_judge">
 
 export const PROMOTION_ASSERTION_KINDS = [
   "root_status",

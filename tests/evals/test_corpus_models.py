@@ -26,6 +26,7 @@ from cayu.evals.corpus import (
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
+    ModelJudgeAssertionSpec,
     PricingProfileIdentityV1,
     RootStatusAssertionSpec,
     RunInputSpec,
@@ -43,6 +44,24 @@ from cayu.evals.corpus import (
     merge_eval_corpora,
     merge_eval_corpus_files,
 )
+
+
+def _model_judge_assertion(
+    *,
+    evaluator_key: str = "quality-judge",
+    rubric: str = "Score whether the answer is correct and useful.",
+    rubric_version: str = "quality-v1",
+    threshold: float = 0.7,
+    include_transcript: bool = False,
+) -> ModelJudgeAssertionSpec:
+    return ModelJudgeAssertionSpec(
+        id="answer-quality",
+        evaluator_key=evaluator_key,
+        rubric=rubric,
+        rubric_version=rubric_version,
+        threshold=threshold,
+        include_transcript=include_transcript,
+    )
 
 
 def _source(*, evidence_revision: str = "sha256:" + "e" * 64):
@@ -186,6 +205,69 @@ def test_every_portable_assertion_kind_round_trips_through_a_case():
         "usage_recorded",
         "max_total_tokens",
         "max_estimated_cost",
+    )
+
+
+def test_portable_model_judge_spec_round_trips_as_bounded_authority_free_data():
+    spec = _model_judge_assertion()
+
+    restored = ModelJudgeAssertionSpec.model_validate(spec.model_dump(mode="json"))
+
+    assert restored == spec
+    assert restored.kind == "model_judge"
+    document = restored.model_dump(mode="json")
+    assert document == {
+        "id": "answer-quality",
+        "description": None,
+        "kind": "model_judge",
+        "evaluator_key": "quality-judge",
+        "rubric": "Score whether the answer is correct and useful.",
+        "rubric_version": "quality-v1",
+        "threshold": 0.7,
+        "include_transcript": False,
+    }
+    assert "app" not in document
+    assert "provider" not in document
+    assert "credential" not in document
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("evaluator_key", "UNKNOWN KEY"),
+        ("rubric", ""),
+        ("rubric_version", ""),
+        ("threshold", float("nan")),
+        ("threshold", -0.1),
+        ("threshold", 1.1),
+    ),
+)
+def test_portable_model_judge_spec_rejects_invalid_contract_fields(field, value):
+    document = _model_judge_assertion().model_dump(mode="python")
+    document[field] = value
+
+    with pytest.raises(ValidationError):
+        ModelJudgeAssertionSpec.model_validate(document)
+
+
+def test_portable_model_judge_revision_covers_every_evaluation_input():
+    original = _model_judge_assertion()
+    changes = (
+        _model_judge_assertion(evaluator_key="safety-judge"),
+        _model_judge_assertion(rubric="Score only factual correctness."),
+        _model_judge_assertion(rubric_version="quality-v2"),
+        _model_judge_assertion(threshold=0.8),
+        _model_judge_assertion(include_transcript=True),
+    )
+
+    assert (
+        len(
+            {
+                assertion_spec_revision(original),
+                *(assertion_spec_revision(item) for item in changes),
+            }
+        )
+        == 6
     )
 
 

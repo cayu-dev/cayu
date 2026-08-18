@@ -37,7 +37,12 @@ retries. First-attempt context size and model-step counts are recorded separatel
 to show whether compaction reduced the prepared request. Set
 `CAYU_RESEARCH_COUNCIL_PRICE_BOOK` to a provenance-bearing `PriceBook` JSON file
 to add a fail-closed dollar comparison across the paired branch sessions. Without
-a matching price the result remains explicitly unpriced.
+a matching price the result remains explicitly unpriced. The result uses the
+public `PairedCostQualityComparisonReport` v1 shape and applies the same
+validated-report-set gate to both sides. Its verified denominator remains the
+three matched branch calls; source preparation, evaluator, and repair sessions
+stay visible in the surrounding scenario evidence but are not asymmetrically
+folded into that branch-call percentage.
 
 See [the live Anthropic Haiku benchmark](../../docs/anthropic-haiku-cost-savings-results.md)
 for a three-trial result, exact denominators, and pricing provenance.

@@ -142,6 +142,7 @@ def _run_record_from_row(row: sqlite3.Row) -> EvalRunRecord:
             max_concurrency=row["max_concurrency"],
         ),
         status=status,
+        attempt_count=row["ownership_epoch"],
         created_at=sqlite_support.parse_datetime(row["created_at"]),
         updated_at=sqlite_support.parse_datetime(row["updated_at"]),
         started_at=_parse_optional_datetime(row["started_at"]),

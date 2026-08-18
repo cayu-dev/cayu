@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from examples._advanced_support import (
+    ComparisonSessionEvidence,
     ScenarioResult,
     advanced_run_limits,
     collect_events,
     count_model_completions,
     first_model_input_tokens,
     fork_session,
-    paired_cost_evidence,
+    paired_cost_quality_report,
     session_evidence,
     stable_output_spec,
     validated_output,
@@ -22,14 +25,19 @@ from cayu import (
     AgentSpec,
     CayuApp,
     CheckpointCompactionContextPolicy,
+    ComparableGenerationSettings,
+    ComparableOutputBudget,
+    CostQualityAttemptOperation,
     EventType,
     Message,
+    PairedQualityEvidence,
     PriceBook,
+    QualityEvidenceReference,
+    QualityEvidenceStatus,
     ResumeRequest,
     RunRequest,
     SessionStore,
     TranscriptDigestCompactor,
-    estimate_session_cost,
 )
 from cayu.providers import ModelProvider
 
@@ -327,10 +335,23 @@ async def run_scenario(
         sessions_by_role[f"baseline-{role}"].model_steps for role in research_roles
     )
     candidate_model_steps = sum(sessions_by_role[role].model_steps for role in research_roles)
-    paired_branch_cost = await _paired_cost_evidence(
+    source_checkpoint_id = (
+        f"{source_id}:context-compaction:"
+        f"{compaction_checkpoint.get('compacted_transcript_cursor', 0)}"
+    )
+    paired_branch_cost = await _paired_cost_quality_report(
         app,
-        baseline_session_ids=[baseline_ids[role] for role in research_roles],
-        candidate_session_ids=[branch_ids[role] for role in research_roles],
+        baseline_session_ids={baseline_ids[role]: role for role in research_roles},
+        candidate_session_ids={branch_ids[role]: role for role in research_roles},
+        source_checkpoint_id=source_checkpoint_id,
+        baseline_quality=_report_set_quality(
+            reports=baseline_reports,
+            session_ids=baseline_ids,
+        ),
+        candidate_quality=_report_set_quality(
+            reports=reports,
+            session_ids=branch_ids,
+        ),
         price_book=price_book,
     )
     assertions = {
@@ -416,39 +437,106 @@ async def run_scenario(
     return result
 
 
-async def _paired_cost_evidence(
+async def _paired_cost_quality_report(
     app: CayuApp,
     *,
-    baseline_session_ids: list[str],
-    candidate_session_ids: list[str],
+    baseline_session_ids: dict[str, str],
+    candidate_session_ids: dict[str, str],
+    source_checkpoint_id: str,
+    baseline_quality: PairedQualityEvidence,
+    candidate_quality: PairedQualityEvidence,
     price_book: PriceBook | None,
 ) -> dict[str, Any]:
-    if price_book is None:
-        return paired_cost_evidence(
-            candidate=(),
-            baseline=(),
-            price_book=None,
-            baseline_cost_field="paired_baseline_cost",
+    async def evidence(
+        session_id: str,
+        *,
+        role: str,
+        operation: CostQualityAttemptOperation,
+    ) -> ComparisonSessionEvidence:
+        return ComparisonSessionEvidence(
+            session_id=session_id,
+            events=tuple(await app.session_store.load_events(session_id)),
+            operation=operation,
+            role=role,
+            branch_id=session_id,
+            source_checkpoint_id=source_checkpoint_id,
         )
-    selected_price_book = price_book
 
-    async def priced_sessions(session_ids: list[str]):
-        return [
-            estimate_session_cost(
-                session_id=session_id,
-                events=await app.session_store.load_events(session_id),
-                pricing=selected_price_book,
+    baseline = tuple(
+        [
+            await evidence(
+                session_id,
+                role=role,
+                operation=CostQualityAttemptOperation.AGENT_STEP,
             )
-            for session_id in session_ids
+            for session_id, role in baseline_session_ids.items()
         ]
-
-    baseline = await priced_sessions(baseline_session_ids)
-    candidate = await priced_sessions(candidate_session_ids)
-    return paired_cost_evidence(
-        candidate=candidate,
+    )
+    candidate = tuple(
+        [
+            await evidence(
+                session_id,
+                role=role,
+                operation=CostQualityAttemptOperation.AGENT_STEP,
+            )
+            for session_id, role in candidate_session_ids.items()
+        ]
+    )
+    return paired_cost_quality_report(
+        pair_id="research-council-branches",
+        workload_id="cache-aware-research-council",
+        task_id="paired-research-report-set",
+        source_id=source_checkpoint_id,
+        role="research-report-set",
+        output_budget=ComparableOutputBudget(
+            output_mode="structured",
+            max_output_tokens=3_072,
+        ),
+        generation_settings=ComparableGenerationSettings(revision="sha256:" + "6" * 64),
+        baseline_strategy_id="uncompacted-forks",
+        candidate_strategy_id="checkpoint-compacted-forks",
         baseline=baseline,
-        price_book=selected_price_book,
-        baseline_cost_field="paired_baseline_cost",
+        candidate=candidate,
+        baseline_quality=baseline_quality,
+        candidate_quality=candidate_quality,
+        price_book=price_book,
+    )
+
+
+def _report_set_quality(
+    *,
+    reports: dict[str, dict[str, Any]],
+    session_ids: dict[str, str],
+) -> PairedQualityEvidence:
+    required_roles = ("primary-sources", "contrarian", "practitioner")
+    valid_roles = [
+        role
+        for role in required_roles
+        if role in reports
+        and set(reports[role]) == {"strategy", "claim", "evidence", "uncertainties"}
+    ]
+    score = Decimal(len(valid_roles)) / Decimal(len(required_roles))
+    return PairedQualityEvidence(
+        contract_name="validated-research-report-set",
+        contract_version="v1",
+        threshold=Decimal("1"),
+        role="research-report-set",
+        status=(
+            QualityEvidenceStatus.PASSED if score == Decimal("1") else QualityEvidenceStatus.FAILED
+        ),
+        score=score,
+        references=tuple(
+            QualityEvidenceReference(
+                kind="session",
+                reference=(
+                    "sha256:"
+                    + hashlib.sha256(
+                        f"session://{session_ids[role]}/structured-output".encode()
+                    ).hexdigest()
+                ),
+            )
+            for role in valid_roles
+        ),
     )
 
 

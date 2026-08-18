@@ -5695,6 +5695,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
@@ -5735,6 +5736,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
                 }
               ]
             },
@@ -6067,6 +6071,12 @@
       "EvalRunRecord": {
         "additionalProperties": false,
         "properties": {
+          "attempt_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Attempt Count",
+            "type": "integer"
+          },
           "cancel_requested_at": {
             "anyOf": [
               {
@@ -6153,6 +6163,7 @@
         "required": [
           "spec",
           "status",
+          "attempt_count",
           "created_at",
           "updated_at"
         ],
@@ -6574,6 +6585,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
@@ -6614,6 +6626,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
                 }
               ]
             },
@@ -7545,6 +7560,65 @@
         ],
         "title": "MessageRole",
         "type": "string"
+      },
+      "ModelJudgeAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Authority-free graded evaluation resolved by one trusted target.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "evaluator_key": {
+            "title": "Evaluator Key",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "include_transcript": {
+            "default": false,
+            "title": "Include Transcript",
+            "type": "boolean"
+          },
+          "kind": {
+            "const": "model_judge",
+            "default": "model_judge",
+            "title": "Kind",
+            "type": "string"
+          },
+          "rubric": {
+            "title": "Rubric",
+            "type": "string"
+          },
+          "rubric_version": {
+            "title": "Rubric Version",
+            "type": "string"
+          },
+          "threshold": {
+            "default": 0.5,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Threshold",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "evaluator_key",
+          "rubric",
+          "rubric_version"
+        ],
+        "title": "ModelJudgeAssertionSpec",
+        "type": "object"
       },
       "ModelPrice": {
         "additionalProperties": false,
@@ -8620,6 +8694,7 @@
                 "max_model_steps": "#/components/schemas/PublishedMaxModelStepsDetail",
                 "max_tool_calls": "#/components/schemas/PublishedMaxToolCallsDetail",
                 "max_total_tokens": "#/components/schemas/PublishedMaxTotalTokensDetail",
+                "model_judge": "#/components/schemas/PublishedModelJudgeDetail",
                 "root_status": "#/components/schemas/PublishedRootStatusDetail",
                 "tool_called": "#/components/schemas/PublishedToolCalledDetail",
                 "tools_called_in_order": "#/components/schemas/PublishedToolsCalledInOrderDetail",
@@ -8660,6 +8735,9 @@
               },
               {
                 "$ref": "#/components/schemas/PublishedMaxEstimatedCostDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedModelJudgeDetail"
               }
             ],
             "title": "Detail"
@@ -9215,6 +9293,64 @@
           "maximum"
         ],
         "title": "PublishedMaxTotalTokensDetail",
+        "type": "object"
+      },
+      "PublishedModelJudgeDetail": {
+        "additionalProperties": false,
+        "description": "Bounded public contract and safe outcome evidence for one model judgment.",
+        "properties": {
+          "diagnostic": {
+            "enum": [
+              "judgment_recorded",
+              "evaluator_error",
+              "evidence_unavailable"
+            ],
+            "title": "Diagnostic",
+            "type": "string"
+          },
+          "evaluator_implementation_revision": {
+            "title": "Evaluator Implementation Revision",
+            "type": "string"
+          },
+          "evaluator_key": {
+            "title": "Evaluator Key",
+            "type": "string"
+          },
+          "include_transcript": {
+            "title": "Include Transcript",
+            "type": "boolean"
+          },
+          "kind": {
+            "const": "model_judge",
+            "default": "model_judge",
+            "title": "Kind",
+            "type": "string"
+          },
+          "rubric": {
+            "title": "Rubric",
+            "type": "string"
+          },
+          "rubric_version": {
+            "title": "Rubric Version",
+            "type": "string"
+          },
+          "threshold": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Threshold",
+            "type": "number"
+          }
+        },
+        "required": [
+          "evaluator_key",
+          "evaluator_implementation_revision",
+          "rubric",
+          "rubric_version",
+          "threshold",
+          "include_transcript",
+          "diagnostic"
+        ],
+        "title": "PublishedModelJudgeDetail",
         "type": "object"
       },
       "PublishedRootStatusDetail": {

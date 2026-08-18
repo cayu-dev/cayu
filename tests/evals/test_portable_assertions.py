@@ -35,6 +35,7 @@ from cayu.evals.corpus import (
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
+    ModelJudgeAssertionSpec,
     RootStatusAssertionSpec,
     ToolCalledAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
@@ -1152,6 +1153,32 @@ def test_portable_assertion_failures_are_observed_negative_evidence():
 
     assert [result.outcome for result in results] == [EvalOutcome.FAILED] * 4
     assert all(result.score == 0.0 for result in results)
+
+
+def test_model_judge_spec_cannot_run_through_the_authority_free_evidence_adapter():
+    app = CayuApp(enable_logging=False)
+    policy = EvaluationEvidencePolicySpec.standard()
+    spec = ModelJudgeAssertionSpec(
+        id="quality",
+        evaluator_key="quality-judge",
+        rubric="Score correctness.",
+        rubric_version="quality-v1",
+    )
+    evidence = project_assertion_evidence_view(
+        app,
+        _trajectory(),
+        evidence_policy=policy,
+    )
+
+    with pytest.raises(ValueError, match="trusted CorpusTarget"):
+        evaluate_assertion_spec(spec, evidence)
+    with pytest.raises(ValueError, match="trusted CorpusTarget"):
+        compile_assertion_spec(
+            spec,
+            app=app,
+            evidence_policy=policy,
+            trusted_pricing=None,
+        )
 
 
 def test_compile_rejects_assertion_and_pricing_subclasses():

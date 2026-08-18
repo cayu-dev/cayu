@@ -693,6 +693,7 @@ class EvalRunResultSummary(_EvalStoreModel):
 class EvalRunRecord(_EvalStoreModel):
     spec: EvalRunSpec
     status: EvalRunStatus
+    attempt_count: StrictInt = Field(ge=0, le=_EVAL_STORE_MAX_BIGINT)
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None = None
@@ -733,8 +734,12 @@ class EvalRunRecord(_EvalStoreModel):
                 raise ValueError("Active eval runs require started_at and ownership.")
             if self.ownership.lease_expires_at <= self.updated_at:
                 raise ValueError("Active eval run leases must follow updated_at.")
+            if self.attempt_count != self.ownership.epoch:
+                raise ValueError("Active eval run attempt count must match its ownership epoch.")
         elif self.ownership is not None:
             raise ValueError("Only active eval runs expose ownership.")
+        if (self.started_at is None) != (self.attempt_count == 0):
+            raise ValueError("Eval run attempt count must agree with whether execution started.")
         if (
             self.status in {EvalRunStatus.COMPLETED, EvalRunStatus.FAILED}
             and self.started_at is None
@@ -1709,6 +1714,7 @@ class InMemoryEvalStore(EvalStore):
         return EvalRunRecord(
             spec=run_spec(state.request),
             status=state.status,
+            attempt_count=state.epoch,
             created_at=state.created_at,
             updated_at=state.updated_at,
             started_at=state.started_at,

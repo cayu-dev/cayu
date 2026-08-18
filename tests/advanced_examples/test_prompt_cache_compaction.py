@@ -6,7 +6,13 @@ from pathlib import Path
 from examples._advanced_support.runtime import _runtime_failure_summary
 from examples.prompt_cache_compaction.deterministic import run
 from examples.prompt_cache_compaction.live import _thinking_for_model
-from examples.prompt_cache_compaction.scenario import LoadStableContextTool, _usage_snapshot_payload
+from examples.prompt_cache_compaction.scenario import (
+    LoadStableContextTool,
+    _model_step_attempt_events,
+    _paired_cost_quality_report,
+    _retention_quality,
+    _usage_snapshot_payload,
+)
 
 from cayu import Event, EventType, ToolEffect
 
@@ -119,6 +125,103 @@ def test_paired_usage_evidence_distinguishes_missing_counters_from_zero() -> Non
     )
 
 
+def test_prompt_cache_pair_retains_failed_retry_attempt() -> None:
+    candidate_session_id = "candidate-session"
+    model_step_id = "mstep_11111111111111111111111111111111"
+    first_attempt_id = "matt_11111111111111111111111111111111"
+    second_attempt_id = "matt_22222222222222222222222222222222"
+    shared = {
+        "provider": "provider",
+        "model": "model",
+        "purpose": "context_compaction",
+        "step": 1,
+        "max_attempts": 2,
+        "model_step_id": model_step_id,
+    }
+    candidate_events = [
+        Event(
+            type=EventType.MODEL_STARTED,
+            session_id=candidate_session_id,
+            payload={**shared, "attempt": 1, "model_attempt_id": first_attempt_id},
+        ),
+        Event(
+            type=EventType.MODEL_RETRY,
+            session_id=candidate_session_id,
+            payload={
+                **shared,
+                "attempt": 1,
+                "next_attempt": 2,
+                "model_attempt_id": first_attempt_id,
+            },
+        ),
+        Event(
+            type=EventType.MODEL_ATTEMPT_DISCARDED,
+            session_id=candidate_session_id,
+            payload={
+                **shared,
+                "attempt": 1,
+                "next_attempt": 2,
+                "model_attempt_id": first_attempt_id,
+            },
+        ),
+        Event(
+            type=EventType.MODEL_STARTED,
+            session_id=candidate_session_id,
+            payload={**shared, "attempt": 2, "model_attempt_id": second_attempt_id},
+        ),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id=candidate_session_id,
+            payload={
+                **shared,
+                "attempt": 2,
+                "model_attempt_id": second_attempt_id,
+                "provider_name": "provider",
+                "usage_metrics": {
+                    "provider_name": "provider",
+                    "model": "model",
+                    "input_tokens": 50,
+                    "output_tokens": 0,
+                    "total_tokens": 50,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 0,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "uncached_input_tokens": 50,
+                    },
+                },
+            },
+        ),
+    ]
+    baseline_event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="baseline-session",
+        payload=candidate_events[-1].payload,
+    )
+
+    report = _paired_cost_quality_report(
+        candidate_events=_model_step_attempt_events(candidate_events, candidate_events[-1]),
+        baseline_events=(baseline_event,),
+        source_checkpoint_id="checkpoint-1",
+        baseline_quality=_retention_quality(
+            passed=True,
+            reference="session://baseline/summary",
+        ),
+        candidate_quality=_retention_quality(
+            passed=True,
+            reference="session://candidate/summary",
+        ),
+        price_book=None,
+    )
+
+    assert report["status"] == "unavailable"
+    candidate = report["pairs"][0]["candidate"]
+    assert candidate["whole_harness"]["attempt_count"] == 2
+    assert candidate["whole_harness"]["retry_attempt_count"] == 1
+    assert candidate["whole_harness"]["missing_usage_attempt_count"] == 1
+
+
 def test_prompt_cache_compaction_preserves_prefix_then_bounds_the_delta(tmp_path: Path) -> None:
     result = asyncio.run(run(tmp_path))
 
@@ -163,25 +266,25 @@ def test_prompt_cache_compaction_preserves_prefix_then_bounds_the_delta(tmp_path
         "cache_write_tokens": 0,
         "uncached_input_tokens": 1220,
     }
-    assert result.metrics["paired_first_compaction_cost"] == {
-        "status": "priced",
-        "currency": "USD",
-        "candidate_cost": "0.00060",
-        "bounded_baseline_cost": "0.00378",
-        "savings": "0.00318",
-        "savings_percent": "84.13",
-        "price_book_version": "deterministic-fixture-v1",
-        "price_book_generated_at": "2026-01-01T00:00:00Z",
-        "pricing_provider_name": "scripted",
-        "pricing_model": "scripted-model",
-        "pricing_match": "prefix",
-        "pricing_tier_max_input_tokens": None,
-        "pricing_provenance": {
+    cost_report = result.metrics["paired_first_compaction_cost"]
+    assert cost_report["schema_version"] == 1
+    assert cost_report["status"] == "verified"
+    assert cost_report["aggregate"]["eligible_pair_ids"] == ["first-prompt-cache-compaction"]
+    pair = cost_report["pairs"][0]
+    assert pair["baseline_cost"] == "0.00378"
+    assert pair["candidate_cost"] == "0.00060"
+    assert pair["savings"] == "0.00318"
+    assert pair["savings_percentage"] == "84.13"
+    assert [item["operation"] for item in pair["baseline"]["operations"]] == ["comparison_control"]
+    assert [item["operation"] for item in pair["candidate"]["operations"]] == ["compaction"]
+    assert pair["candidate"]["whole_harness"]["cache_read_input_tokens"] == 1200
+    assert pair["candidate"]["pricing_provenance"] == [
+        {
             "source": "deterministic fixture; not provider pricing",
             "url": "https://example.invalid/cayu/prompt-cache-pricing-fixture",
             "as_of": "2026-01-01",
-        },
-    }
+        }
+    ]
     assert result.metrics["retry_inclusive_candidate_session"] == {
         "input_tokens": 3877,
         "output_tokens": 40,

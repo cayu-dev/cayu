@@ -17,6 +17,8 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
+    StrictFloat,
     StrictInt,
     StrictStr,
     field_validator,
@@ -44,6 +46,13 @@ PRICING_PROFILE_IDENTITY_SCHEMA_VERSION = 1
 PRICING_PROFILE_SEMANTICS_VERSION = 1
 EVALUATION_SOURCE_IDENTITY_SCHEMA_VERSION = 1
 
+# This execution-only metadata key crosses from the trusted compiler to the
+# publisher. It is intentionally absent from portable corpus documents: the
+# target, not the corpus author, resolves the concrete judge implementation.
+_MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY = (
+    "cayu.model_judge.resolved_implementation_revision"
+)
+
 EVAL_CORPUS_MAX_BYTES = 8 << 20
 EVAL_CORPUS_MAX_SUITES = 64
 EVAL_CORPUS_MAX_CASES = 1_000
@@ -57,6 +66,8 @@ EVAL_CORPUS_MAX_MESSAGES_PER_CASE = 16
 EVAL_CORPUS_MAX_MESSAGE_CHARS = 65_536
 EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS = 262_144
 EVAL_CORPUS_MAX_FINAL_OUTPUT_ASSERTION_CHARS = 65_536
+EVAL_CORPUS_MAX_JUDGE_RUBRIC_CHARS = 16_384
+EVAL_CORPUS_MAX_JUDGE_RUBRIC_VERSION_CHARS = 256
 EVAL_CORPUS_MAX_TOOL_NAMES = 256
 EVAL_CORPUS_MAX_TRIALS = 100
 EVAL_CORPUS_MAX_TIMEOUT_SECONDS = 3_600
@@ -467,6 +478,44 @@ class MaxEstimatedCostAssertionSpec(_AssertionSpecBase):
         return value
 
 
+class ModelJudgeAssertionSpec(_AssertionSpecBase):
+    """Authority-free graded evaluation resolved by one trusted target."""
+
+    kind: Literal["model_judge"] = "model_judge"
+    evaluator_key: StrictStr
+    rubric: StrictStr
+    rubric_version: StrictStr
+    threshold: StrictFloat = Field(default=0.5, ge=0.0, le=1.0, allow_inf_nan=False)
+    include_transcript: StrictBool = False
+
+    @field_validator("evaluator_key")
+    @classmethod
+    def validate_evaluator_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("rubric")
+    @classmethod
+    def validate_rubric(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_RUBRIC_CHARS,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("rubric_version")
+    @classmethod
+    def validate_rubric_version(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_RUBRIC_VERSION_CHARS,
+            nonblank=True,
+            clean=True,
+        )
+
+
 AssertionSpec: TypeAlias = Annotated[
     RootStatusAssertionSpec
     | ChildStatusAssertionSpec
@@ -478,7 +527,8 @@ AssertionSpec: TypeAlias = Annotated[
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
     | MaxTotalTokensAssertionSpec
-    | MaxEstimatedCostAssertionSpec,
+    | MaxEstimatedCostAssertionSpec
+    | ModelJudgeAssertionSpec,
     Field(discriminator="kind"),
 ]
 
@@ -494,6 +544,7 @@ _ASSERTION_SPEC_TYPES = (
     UsageRecordedAssertionSpec,
     MaxTotalTokensAssertionSpec,
     MaxEstimatedCostAssertionSpec,
+    ModelJudgeAssertionSpec,
 )
 
 

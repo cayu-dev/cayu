@@ -99,6 +99,23 @@ test("draft validation rejects nonportable placement, duplicate assertions, and 
   assert.match(validatePromotionDraft(lossy).error, /whole number/)
 })
 
+test("promotion drafts reject target-owned model judge authority", () => {
+  const draft = draftFromCandidate()
+  draft.case.assertions = [
+    {
+      id: "quality",
+      kind: "model_judge",
+      evaluator_key: "trusted-quality-judge",
+      rubric: "The answer must be correct and concise.",
+      rubric_version: "v1",
+      threshold: 0.8,
+      include_transcript: false,
+    },
+  ]
+
+  assert.match(validatePromotionDraft(draft).error, /Unsupported assertion kind: model_judge/)
+})
+
 test("draft validation follows portable Unicode and text boundaries", () => {
   const unicode = draftFromCandidate()
   unicode.case.input.messages[0].text = "😀".repeat(40_000)

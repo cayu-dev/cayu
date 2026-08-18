@@ -17,7 +17,7 @@ from pydantic import (
 
 from cayu.evals.corpus import _sha256_revision
 from cayu.evals.execution import CorpusExecutionResult
-from cayu.evals.published import PublishedStatus
+from cayu.evals.published import PublishedStatus, _assertion_contract
 
 
 class CorpusComparisonReason(StrEnum):
@@ -269,7 +269,7 @@ class _ExecutionProjection:
     pricing_profile_fingerprint: str | None
     uses_pricing: bool
     case_contract: tuple[tuple[str, str], ...]
-    assertion_contract: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
+    assertion_contract: tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]
     summary: CorpusComparisonResultSummary
     cases: tuple[_CaseOutcome, ...]
 
@@ -290,10 +290,7 @@ def _validated_projection(
     assertion_contract = tuple(
         (
             case.case_id,
-            tuple(
-                (assertion.assertion_id, assertion.assertion_revision)
-                for assertion in case.trials[0].assertions
-            ),
+            tuple(_assertion_contract(assertion) for assertion in case.trials[0].assertions),
         )
         for case in run.cases
     )

@@ -142,6 +142,7 @@ def _run_record_from_row(row: Any) -> EvalRunRecord:
             max_concurrency=row[6],
         ),
         status=status,
+        attempt_count=row[14],
         created_at=row[8],
         updated_at=row[9],
         started_at=row[10],

@@ -53,6 +53,65 @@ The other three advanced examples focus on authority during approval,
 verified repository repair, and taint-preserving incident response. They may
 affect operational cost, but Cayu does not present them as savings examples.
 
+## Typed paired reports and claim strength
+
+`compare_paired_cost_quality(...)` is Cayu's canonical accounting path for a
+cost-optimization claim. Applications provide a bounded
+`PairedCostQualityComparisonRequest`: stable pair identity, baseline and
+candidate attempts, provider-reported `CostLineItem` evidence, an explicit
+output budget, opaque generation-settings revision, pricing-catalog identity,
+and application-owned quality results.
+Cayu recomputes operation, session, branch, side, pair, and aggregate totals and
+returns a `PairedCostQualityComparisonReport` with `schema_version=1`.
+
+The status is the strongest wording supported by the evidence:
+
+| Status | What the application may say | What it must not imply |
+| --- | --- | --- |
+| `verified` | “For these eligible pairs, under quality contract X vY at threshold Z and price book P, the candidate's estimated cost was N% lower/higher.” | A universal saving, a provider invoice, or quality beyond the declared gate. |
+| `measured_unmatched` | “Provider usage and estimated cost differed by X, but the declared quality evidence was missing, asymmetric, unavailable, or failed.” | “Savings” or equivalence. The raw delta is an observation only. |
+| `unpriced` | “Comparable provider usage was retained, but at least one required attempt had no matching price.” | A dollar delta, zero cost, or a savings percentage. |
+| `unavailable` | “The requested comparison could not be made; inspect the typed findings.” | A measured or priced comparison. |
+
+Overall report status is fail-closed, but aggregate arithmetic includes only
+`verified` pairs from one declared workload and quality cohort under one price
+book snapshot, and lists every excluded pair and reason. A
+`measured_unmatched` pair can retain its raw cost delta while remaining
+ineligible for the verified aggregate. `unpriced` retains usage and pricing
+gaps; missing usage is `unavailable`, never zero.
+
+When projecting durable runtime events, retain every dispatched provider
+attempt. A `model.started`, `model.retry`, or `model.attempt_discarded` record
+without matching completion counters becomes a missing-usage attempt; it must
+not disappear merely because a later retry completed successfully.
+
+The application owns the quality policy. Both sides must use the same contract
+name and version, threshold, role, task/source identity, output budget, and
+`ComparableGenerationSettings` revision. That revision is an opaque `sha256:`
+commitment to canonical, non-secret output-affecting settings; a mismatch fails
+closed. Quality evidence references are likewise opaque `sha256:` identifiers
+whose private artifact mapping stays with the application—raw prompts,
+messages, model output, credentials, and arbitrary metadata are not fields in
+the report. The request is capped at 4,096 attempts and 8 MiB of canonical
+JSON, with durable integer ceilings and 64-digit, 64-decimal-place costs on
+each cost projection. Different models or legitimate pricing tiers may be part
+of one strategy comparison; every attempt still retains its configured/effective
+identity and resolved price provenance. Mixed currencies, different catalog
+identities, absent provenance, contradictory usage, missing sides, and duplicate
+identities fail closed.
+
+Pair and aggregate arithmetic uses `Decimal`. Savings are
+`baseline_cost - candidate_cost`; percentage is that value divided by baseline
+cost and rounded to two decimal places with round-half-even. A zero baseline
+has `savings_percentage_state="zero_baseline"` and no percentage. A candidate
+that costs more retains a negative saving and
+`cost_direction="increased_cost"`.
+
+Run `uv run python examples/cost_quality_comparison.py` for a deterministic
+report containing all four statuses. The advanced prompt-cache and research
+council examples emit the same public v1 shape while keeping their
+workload-specific quality checks in scenario code.
+
 ## Cost governance map
 
 | Governance need | Runtime contract | What it prevents |
@@ -76,7 +135,8 @@ Usage and estimated cost are not invoices. A provider may charge a failed or
 aborted attempt without returning usable token counters; negotiated rates,
 gateways, regional pricing, rounding, and catalog age can also differ from the
 runtime estimate. Cayu preserves error/retry evidence and unpriced gaps rather
-than manufacturing zero-cost line items.
+than manufacturing zero-cost line items. A `verified` paired report verifies
+the declared comparison contract; it does not turn an estimate into an invoice.
 
 ## Evidence protocol for a savings claim
 
@@ -130,6 +190,8 @@ explicit; neither should be silently treated as permission to spend.
   `uv run python -m examples.prompt_cache_compaction.app`.
 - Inspect durable session and causal reports with
   `uv run python examples/usage_cost_summary.py`.
+- Inspect all paired proof statuses with
+  `uv run python examples/cost_quality_comparison.py`.
 - Review [Advanced runtime strategies](advanced-runtime-examples.md) for dated
   live observations and proof boundaries.
 - Review [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)

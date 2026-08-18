@@ -15,6 +15,8 @@ from cayu import (
     EvaluationSourceIdentityV1,
     FinalOutputEqualsAssertionSpec,
     Message,
+    ModelJudgeAssertionSpec,
+    ModelJudgeTarget,
     ModelStreamEvent,
     RunInputSpec,
     RunRequest,
@@ -99,6 +101,78 @@ def build_failing_corpus_eval_plan() -> EvalPlan:
     return _corpus_eval_plan(output="Denied")
 
 
+def _model_judge_eval_plan_and_corpus() -> tuple[EvalPlan, EvalCorpusDocument]:
+    candidate_app = CayuApp(enable_logging=False)
+    candidate_app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("Approved"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    candidate_app.register_agent(AgentSpec(name="agent", model="fixture-model"))
+    judge_app = CayuApp(enable_logging=False)
+    judge_app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta('{"score": 0.9, "rationale": "correct"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    judge_app.register_agent(AgentSpec(name="judge", model="judge-model"))
+    judge = ModelJudgeTarget(
+        key="quality-judge",
+        app=judge_app,
+        agent_name="judge",
+    )
+    target = CorpusTarget(
+        key="refund-agent",
+        app=candidate_app,
+        request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
+        application_release_id="release-2026-08-06",
+        model_judges=(judge,),
+    )
+    suite = EvalSuiteSpec.create(
+        id="refunds",
+        name="Refunds",
+        trial_request=TrialRequestSpec(trials=1, timeout_seconds=30),
+    )
+    case = EvalCaseSpec.create(
+        id="refund-quality",
+        suite_id=suite.id,
+        name="Refund quality",
+        source=_source(),
+        input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Review refund."),)),
+        assertions=(
+            ModelJudgeAssertionSpec(
+                id="quality",
+                evaluator_key=judge.key,
+                rubric="Score correctness.",
+                rubric_version="quality-v1",
+                threshold=0.8,
+            ),
+        ),
+    )
+    return (
+        EvalPlan(corpus_target=target),
+        EvalCorpusDocument.create(
+            target_key=target.key,
+            evidence_policy=target.evidence_policy,
+            suites=(suite,),
+            cases=(case,),
+        ),
+    )
+
+
+def build_model_judge_eval_plan() -> EvalPlan:
+    plan, _ = _model_judge_eval_plan_and_corpus()
+    return plan
+
+
 def test_eval_run_executes_downloaded_corpus_and_writes_safe_json_and_html(
     tmp_path: Path,
     monkeypatch,
@@ -133,6 +207,39 @@ def test_eval_run_executes_downloaded_corpus_and_writes_safe_json_and_html(
     assert "session_id" not in serialized
     assert '"final_output":' not in serialized
     assert '"text": "Approved"' in serialized
+
+
+def test_eval_run_cli_executes_portable_model_judge_through_corpus_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _, corpus = _model_judge_eval_plan_and_corpus()
+    corpus_path = tmp_path / "model-judge-corpus.json"
+    result_path = tmp_path / "model-judge-result.json"
+    corpus_path.write_text(eval_corpus_to_json(corpus), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(
+        [
+            "eval",
+            "run",
+            f"{__name__}:build_model_judge_eval_plan",
+            "--corpus",
+            str(corpus_path),
+            "--output",
+            str(result_path),
+        ]
+    )
+
+    result = load_corpus_execution_result(result_path)
+    detail = result.run.cases[0].trials[0].assertions[0].detail
+    assert exit_code == 0
+    assert result.run.score == 0.9
+    assert detail.kind == "model_judge"
+    assert detail.diagnostic == "judgment_recorded"
+    serialized = result_path.read_text(encoding="utf-8")
+    assert "judge_output" not in serialized
+    assert "rationale" not in serialized
 
 
 def test_eval_report_and_compare_accept_dashboard_corpus_results_with_stable_exits(

@@ -60,6 +60,9 @@ corresponding credentials or service.
 ## Operations and advanced strategies
 
 - [`usage_cost_summary.py`](usage_cost_summary.py) — session usage and cost reporting.
+- [`cost_quality_comparison.py`](cost_quality_comparison.py) — deterministic paired
+  accounting with `verified`, `measured_unmatched`, `unpriced`, and `unavailable`
+  proof statuses.
 - [`real_spend_budget_live.py`](real_spend_budget_live.py) — live causal budget enforcement.
 - [`context_counting_live.py`](context_counting_live.py) and
   [`context_pressure_calibration_live.py`](context_pressure_calibration_live.py) — context limits and calibration.

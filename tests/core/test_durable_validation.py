@@ -4,6 +4,7 @@ import json
 import math
 from copy import deepcopy
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -52,6 +53,13 @@ def test_json_utf8_size_counter_supports_dates() -> None:
 
     assert json_utf8_size_within_limit(value, 12)
     assert not json_utf8_size_within_limit(value, 11)
+
+
+def test_json_utf8_size_counter_supports_pydantic_decimal_serialization() -> None:
+    value = Decimal("12.50")
+
+    assert json_utf8_size_within_limit(value, 7)
+    assert not json_utf8_size_within_limit(value, 6)
 
 
 def test_json_utf8_size_counter_distinguishes_overflow_from_unsupported_values() -> None:

@@ -145,9 +145,15 @@ runtime event payload.
 
 The portable assertion kinds in schema version 1 cover root and child terminal
 status, final-output equality/containment, tool presence/order/count, model-step
-and token limits, recorded usage, and estimated-cost limits. Cost assertions
-require a `PricingProfileIdentityV1`; the identity fingerprints trusted pricing
-used elsewhere and never embeds or authorizes a `PriceBook`.
+and token limits, recorded usage, estimated-cost limits, and trusted model
+judgments. Cost assertions require a `PricingProfileIdentityV1`; the identity
+fingerprints trusted pricing used elsewhere and never embeds or authorizes a
+`PriceBook`. A `ModelJudgeAssertionSpec` remains data-only: it carries a bounded
+rubric and rubric version, threshold, transcript-selection flag, trusted
+evaluator key. The target resolves that key to its local trusted judge
+implementation at execution time. Each published result records the resolved
+implementation revision, so the same portable corpus remains reusable across
+trusted evaluator rollouts while comparisons still reject different judges.
 
 Corpus documents are definitions, not executable application configuration.
 Parsing one never imports project code or invokes a provider, tool, environment,
@@ -188,16 +194,37 @@ and CLI execution resolves that authority from the project-owned eval target:
 
 ```python
 from cayu import (
+    AgentSpec,
+    CayuApp,
     CorpusTarget,
     EvalPlan,
     EvaluationEvidencePolicySpec,
     Message,
+    ModelJudgeAssertionSpec,
+    ModelJudgeTarget,
     RunRequest,
 )
 
 
 def build_eval() -> EvalPlan:
     app = build_app()
+    judge_app = CayuApp()
+    judge_app.register_provider(build_judge_provider(), default=True)
+    judge_app.register_agent(AgentSpec(name="quality-judge", model="judge-model"))
+    judge = ModelJudgeTarget(
+        key="quality-judge",
+        app=judge_app,
+        agent_name="quality-judge",
+    )
+    quality_assertion = ModelJudgeAssertionSpec(
+        id="answer-quality",
+        evaluator_key=judge.key,
+        rubric="Score correctness and usefulness.",
+        rubric_version="quality-v1",
+        threshold=0.8,
+        include_transcript=False,
+    )
+    # Include quality_assertion in the authority-free EvalCaseSpec.
     return EvalPlan(
         corpus_target=CorpusTarget(
             key="refund-agent",
@@ -213,12 +240,13 @@ def build_eval() -> EvalPlan:
             application_release_id="refund-service-2026-08-06",
             evidence_policy=EvaluationEvidencePolicySpec.standard(),
             # price_book=trusted_price_book,  # required when the corpus uses cost assertions
+            model_judges=(judge,),
         )
     )
 ```
 
 `CorpusTarget` is immutable and defensively copies its request, bootstrap,
-evidence-policy, limit, and optional pricing inputs. Its request base must have
+evidence-policy, limit, optional pricing, and model-judge target inputs. Its request base must have
 no messages, session/parent/causal/task identity, structured-output request,
 prior redaction state, or runtime authority. Bootstrap messages are bounded
 single-text-part system or user messages. Compilation produces exactly that
@@ -242,6 +270,23 @@ used by `compile_assertion_spec(...)`; there is no second evaluator. All cost
 assertions in the selected suite share one
 compile-time pricing binding, so the trusted PriceBook is validated and
 fingerprinted once for the suite rather than once per assertion.
+
+Portable model judges deepen that same compiler rather than introducing a
+scorer or plugin registry. `ModelJudgeTarget` binds one portable evaluator key
+to a locally constructed `CayuApp` and registered agent. The agent must exist
+and be tool-free. Missing keys, invalid registrations, missing or ambiguous
+provider resolution, and tool-bearing
+registrations reject during compilation before the candidate provider is
+called. The resolved implementation revision covers Cayu's model-judge execution
+semantics, evaluator key, agent name, the judge app's complete public
+`AppManifest`, and the exact secret-redacted agent specification, including its
+system prompt, provider options, and thinking configuration. A trusted judge
+rollout changes that resolved revision, not the portable corpus contract: the
+fresh revision is published with the result and cross-revision comparisons are
+incomparable. Deterministic specs do not resolve or invoke this authority.
+`evaluate_assertion_spec(...)` and standalone `compile_assertion_spec(...)`
+therefore reject a model-judge spec: executable resolution is available only
+through an explicit trusted `CorpusTarget`.
 `run_corpus_suite(...)` and corpus-mode
 `run_eval_plan(...)` execute that compiled suite through `run_eval_suite(...)`,
 bind the pre-dispatch corpus contract, and publish through
@@ -266,7 +311,12 @@ regression comparison. It requires the same target key, corpus/suite/case/
 assertion contract, evidence policy, and applicable pricing identity, while
 deliberately allowing a different fresh application release and AppManifest.
 It returns stable incomparable reason codes; it does not silently compare
-different evaluation contracts.
+different evaluation contracts. Model-judge rubric text/version, threshold,
+transcript selection, and evaluator key contribute to the assertion and corpus
+revisions. The resolved implementation revision contributes only to the
+published assertion binding, so a judge rollout leaves a portable corpus valid
+while making cross-revision results incomparable rather than manufacturing a
+score delta.
 
 Portable assertions consume one immutable `AssertionEvidenceView`, produced by
 `project_assertion_evidence_view(...)` from a validated `Trajectory`. The view
@@ -314,6 +364,22 @@ bounded-away observation is `unavailable`, while a complete observed negative is
 `failed`. Tool-order assertions use model-requested transcript order;
 tool-presence/count assertions use calls that actually started.
 
+A portable model judge is intentionally online rather than part of that pure
+evidence adapter. It receives the candidate task and complete bounded final
+output after the candidate app's secret-redaction boundary; setting
+`include_transcript=True` additionally sends the redacted transcript when its
+rendered text fits the portable 262,144-character bound. Treat those values as
+provider-bound data and apply the same privacy review used for any external
+model call. Missing, truncated, or over-limit graded evidence is `unavailable`
+and does not invoke the judge. Candidate text is delimited as untrusted data and
+embedded closing delimiters are neutralized; the trusted judge agent receives
+no tools. The internal `LLMJudge` audit record may contain the exact prompt and
+raw judge output, but portable publication projects only the frozen rubric
+contract, score/outcome, and a fixed safe diagnostic (`judgment_recorded`,
+`evaluator_error`, or `evidence_unavailable`). It never publishes raw judge
+output, rationale, provider/model identity, prompt, exception text, app, or
+credentials.
+
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
 produces a content-addressed schema-version-2 `PublishedEvalRun` containing
@@ -336,6 +402,14 @@ direct publication without the runner-owned projection marks output unavailable
 instead of copying `EvalTrialResult.final_output`. Tool-order
 decisions are checked against the complete bounded order retained by evaluation;
 only boolean matches and safe counts cross the publishing boundary.
+Model-judge results retain the bounded rubric and rubric version, threshold,
+transcript-selection flag, evaluator key, implementation revision, continuous
+score/outcome, and fixed safe diagnostic. A valid finite score is candidate
+evidence: the threshold decides `passed` versus `failed`. Missing authority,
+judge configuration drift, provider/runtime failure, an attempted tool call,
+an incomplete session, empty output, or an invalid score is `error` with no
+numeric score; judge failure is never converted into a candidate-quality
+failure.
 Trial, case, and run scores and statuses are rederived from the retained
 published children. Public diagnostics use fixed Cayu-owned reason codes and
 messages that distinguish assertion, lifecycle, evidence, and timeout failures
@@ -747,7 +821,10 @@ Corpus revisions and results are immutable. Admission is idempotent, claims use
 expiring fenced epochs, cancellation intent is durable, and publication is
 atomic with terminal run state. A retry with a stale lease cannot heartbeat,
 publish, fail, cancel, or release another worker's run. Ordinary run reads never
-contain the private claim token or admission idempotency digest.
+contain the private claim token or admission idempotency digest. Every run
+record retains a bounded `attempt_count`: zero before first claim and otherwise
+the latest fenced ownership epoch, including after terminalization. This makes
+recovery/retry attempts attributable without exposing the private claim token.
 Workers must heartbeat active claims before their lease expires, stop work when
 cancellation is requested, and release still-owned work during a controlled
 shutdown. Those execution-loop policies are deliberately outside the store;
@@ -823,6 +900,14 @@ stops local work without publishing. Controlled shutdown cancels and releases
 still-owned work so another process or restart can claim it; an unclean stop
 remains recoverable after lease expiry. No partial run is ever represented as
 passed.
+
+The fence covers publication, not external side effects. If a lease is lost
+after a model request began, recovery may execute the candidate and judge calls
+again; Cayu does not claim exactly-once model calls. Only the current fenced
+owner can publish, and the terminal run's `attempt_count` records how many
+ownership epochs were issued. Corpus trial/case/assertion ceilings and the
+configured concurrency bound each attempt; operators should also apply normal
+provider budgets and rate limits to judge apps.
 
 SQLite is the embedded single-database choice. PostgreSQL permits multiple
 server processes to compete safely for the same target's queued work through
@@ -957,6 +1042,19 @@ deterministically testable by injecting a scripted provider. Every judgment is *
 `metadata` records the judge's provider/model, the `rubric` (and optional `rubric_version`), the
 exact `prompt`, the raw `judge_output`, and the parsed `score`/`rationale`. Pass
 `include_transcript=True` to give the judge the full transcript, not just the final output.
+
+For authority-free corpora, use `ModelJudgeAssertionSpec` plus a trusted
+`ModelJudgeTarget` on `CorpusTarget`. SDK `run_corpus_suite(...)`, corpus-mode
+`cayu eval run`, and the server-attached durable worker all resolve and execute
+that same compiled assertion. Unlike direct `LLMJudge` results, the portable
+published result deliberately omits raw audit metadata and retains only its
+bounded contract, score/outcome, and safe diagnostic.
+
+Candidate quality and judge health are separate outcomes. Only a successfully parsed,
+finite score can produce `passed` or `failed`. Invalid judge configuration, provider or
+runtime failure, an attempted tool call, an incomplete judge session, empty output, and an
+invalid score produce `error` with no numeric score. Release gates must treat that state as
+inconclusive rather than evidence that the candidate failed the rubric.
 
 ## Trajectories & Replay
 

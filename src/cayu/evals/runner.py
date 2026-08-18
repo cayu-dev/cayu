@@ -1084,7 +1084,10 @@ async def _evaluate_assertions_with_prepared_evidence(
     portable_evidence: AssertionEvidenceView | None,
     portable_evidence_error: Exception | None,
 ) -> tuple[EvalAssertionResult, ...]:
-    from cayu.evals.portable_assertions import _CompiledPortableAssertion
+    from cayu.evals.portable_assertions import (
+        _CompiledModelJudgeAssertion,
+        _CompiledPortableAssertion,
+    )
 
     results: list[EvalAssertionResult] = []
     for assertion in assertions:
@@ -1097,6 +1100,12 @@ async def _evaluate_assertions_with_prepared_evidence(
                 if portable_evidence is None:
                     raise RuntimeError("Compiled assertion evidence was not prepared.")
                 result = assertion.evaluate_evidence(portable_evidence)
+            elif type(assertion) is _CompiledModelJudgeAssertion:
+                if portable_evidence_error is not None:
+                    raise portable_evidence_error
+                if portable_evidence is None:
+                    raise RuntimeError("Compiled assertion evidence was not prepared.")
+                result = await assertion.evaluate_evidence(portable_evidence, context)
             else:
                 result = assertion.evaluate(context)
                 if inspect.isawaitable(result):

@@ -2894,7 +2894,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -3073,6 +3073,10 @@ export type EvalRunPage = {
  * EvalRunRecord
  */
 export type EvalRunRecord = {
+    /**
+     * Attempt Count
+     */
+    attempt_count: number;
     /**
      * Cancel Requested At
      */
@@ -3350,7 +3354,7 @@ export type EvaluationPromotionCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -3858,6 +3862,46 @@ export type MaxTotalTokensAssertionSpec = {
  * MessageRole
  */
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
+
+/**
+ * ModelJudgeAssertionSpec
+ *
+ * Authority-free graded evaluation resolved by one trusted target.
+ */
+export type ModelJudgeAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Evaluator Key
+     */
+    evaluator_key: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Include Transcript
+     */
+    include_transcript?: boolean;
+    /**
+     * Kind
+     */
+    kind?: 'model_judge';
+    /**
+     * Rubric
+     */
+    rubric: string;
+    /**
+     * Rubric Version
+     */
+    rubric_version: string;
+    /**
+     * Threshold
+     */
+    threshold?: number;
+};
 
 /**
  * ModelPrice
@@ -4474,7 +4518,9 @@ export type PublishedAssertionResult = {
         kind: 'max_total_tokens';
     } & PublishedMaxTotalTokensDetail) | ({
         kind: 'max_estimated_cost';
-    } & PublishedMaxEstimatedCostDetail);
+    } & PublishedMaxEstimatedCostDetail) | ({
+        kind: 'model_judge';
+    } & PublishedModelJudgeDetail);
     /**
      * Message
      */
@@ -4746,6 +4792,46 @@ export type PublishedMaxTotalTokensDetail = {
      * Maximum
      */
     maximum: number;
+};
+
+/**
+ * PublishedModelJudgeDetail
+ *
+ * Bounded public contract and safe outcome evidence for one model judgment.
+ */
+export type PublishedModelJudgeDetail = {
+    /**
+     * Diagnostic
+     */
+    diagnostic: 'judgment_recorded' | 'evaluator_error' | 'evidence_unavailable';
+    /**
+     * Evaluator Implementation Revision
+     */
+    evaluator_implementation_revision: string;
+    /**
+     * Evaluator Key
+     */
+    evaluator_key: string;
+    /**
+     * Include Transcript
+     */
+    include_transcript: boolean;
+    /**
+     * Kind
+     */
+    kind?: 'model_judge';
+    /**
+     * Rubric
+     */
+    rubric: string;
+    /**
+     * Rubric Version
+     */
+    rubric_version: string;
+    /**
+     * Threshold
+     */
+    threshold: number;
 };
 
 /**

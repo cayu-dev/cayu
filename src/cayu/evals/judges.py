@@ -45,8 +45,9 @@ class LLMJudge(EvalAssertion):
 
     The graded material (task, final output, transcript) is delimited as untrusted data in
     the judge prompt, and the score is only accepted as a well-formed JSON object — a run
-    under test cannot smuggle instructions or a fake score past the rubric, and a garbled
-    judge reply fails the assertion instead of being salvaged into a guessed score.
+    under test cannot smuggle instructions or a fake score past the rubric. Judge
+    configuration, execution, safety, and response-decoding failures are evaluator errors,
+    never evidence that the candidate failed its rubric.
     """
 
     def __init__(
@@ -79,19 +80,37 @@ class LLMJudge(EvalAssertion):
         return self._name or "LLMJudge"
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        return await self._evaluate_material(
+            task=_first_user_text(context.transcript),
+            final_output=context.final_output,
+            transcript_text=(
+                _render_transcript(context.transcript) if self._include_transcript else None
+            ),
+        )
+
+    async def _evaluate_material(
+        self,
+        *,
+        task: str,
+        final_output: str,
+        transcript_text: str | None,
+    ) -> EvalAssertionResult:
         try:
             registered_agent = self._app.get_agent(self._agent_name)
         except Exception as exc:
-            return self.failed(f"Judge configuration is invalid: {type(exc).__name__}: {exc}")
+            return self.error(f"Judge configuration is invalid: {type(exc).__name__}: {exc}")
         if registered_agent.tools:
             tool_names = ", ".join(sorted(registered_agent.tools))
-            return self.failed(
+            return self.error(
                 f"Judge agent {self._agent_name!r} must be tool-free; registered tools: "
                 f"{tool_names}."
             )
 
-        prompt = _build_judge_prompt(
-            self._rubric, context, include_transcript=self._include_transcript
+        prompt = _build_judge_prompt_from_material(
+            self._rubric,
+            task=task,
+            final_output=final_output,
+            transcript=transcript_text,
         )
         session_id: str | None = None
         tool_call_observed = False
@@ -110,31 +129,35 @@ class LLMJudge(EvalAssertion):
                     if str(event.type).startswith("tool.call."):
                         tool_call_observed = True
                 if session_id is None:
-                    return self.failed("Judge run produced no session.")
+                    return self.error("Judge run produced no session.")
                 transcript = await self._app.session_store.load_transcript(session_id)
                 session = await self._app.session_store.load(session_id)
             except Exception as exc:
-                return self.failed(f"Judge run failed: {type(exc).__name__}: {exc}")
+                audit = await self._failure_audit_metadata(prompt, session_id)
+                return self.error(
+                    f"Judge run failed: {type(exc).__name__}: {exc}",
+                    metadata=audit,
+                )
         finally:
             await self._delete_judge_session(session_id)
 
         text = final_output_text(transcript)
         audit = self._audit_metadata(prompt, text, session)
         if tool_call_observed:
-            return self.failed("Judge attempted a tool call.", metadata=audit)
+            return self.error("Judge attempted a tool call.", metadata=audit)
         if session is None or session.status != SessionStatus.COMPLETED:
             status = session.status.value if session is not None else "missing"
-            return self.failed(
+            return self.error(
                 f"Judge session did not complete successfully (status={status}).",
                 metadata=audit,
             )
         if not text.strip():
             # app.run() ends a failed judge session without raising; distinguish that from
             # "produced output but no score".
-            return self.failed("Judge produced no output to score.", metadata=audit)
+            return self.error("Judge produced no output to score.", metadata=audit)
         score, rationale = _parse_judge_score(text)
         if score is None:
-            return self.failed(
+            return self.error(
                 f"Judge did not return a parseable score: {text[:_ERROR_PREVIEW]!r}",
                 metadata=audit,
             )
@@ -156,6 +179,18 @@ class LLMJudge(EvalAssertion):
         with contextlib.suppress(Exception):
             await self._app.session_store.delete_session(session_id)
 
+    async def _failure_audit_metadata(self, prompt: str, session_id: str | None) -> dict[str, Any]:
+        if session_id is None:
+            return {}
+        text = ""
+        session: Session | None = None
+        with contextlib.suppress(Exception):
+            transcript = await self._app.session_store.load_transcript(session_id)
+            text = final_output_text(transcript)
+        with contextlib.suppress(Exception):
+            session = await self._app.session_store.load(session_id)
+        return self._audit_metadata(prompt, text, session)
+
     def _audit_metadata(self, prompt: str, text: str, session: Session | None) -> dict[str, Any]:
         # A transparent, self-contained record of the judgment: which judge model/provider,
         # the rubric (+ version), the exact prompt, and the raw output.
@@ -173,13 +208,27 @@ class LLMJudge(EvalAssertion):
 
 
 def _build_judge_prompt(rubric: str, context: EvalContext, *, include_transcript: bool) -> str:
+    return _build_judge_prompt_from_material(
+        rubric,
+        task=_first_user_text(context.transcript),
+        final_output=context.final_output,
+        transcript=_render_transcript(context.transcript) if include_transcript else None,
+    )
+
+
+def _build_judge_prompt_from_material(
+    rubric: str,
+    *,
+    task: str,
+    final_output: str,
+    transcript: str | None,
+) -> str:
     parts = [rubric, "", _JUDGE_INSTRUCTIONS, "", _DATA_NOTICE]
-    task = _first_user_text(context.transcript)
     if task:
         parts += ["", "Task given to the agent:", _delimit(task)]
-    parts += ["", "Agent's final output:", _delimit(context.final_output or "(empty)")]
-    if include_transcript:
-        parts += ["", "Full transcript:", _delimit(_render_transcript(context.transcript))]
+    parts += ["", "Agent's final output:", _delimit(final_output or "(empty)")]
+    if transcript is not None:
+        parts += ["", "Full transcript:", _delimit(transcript)]
     return "\n".join(parts)
 
 

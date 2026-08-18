@@ -637,6 +637,14 @@ class JsonUtf8SizeCounter:
                 self.encountered_unsupported_value = True
                 return False
             return self._consume(len(rendered.encode("utf-8")))
+        if isinstance(value, Decimal):
+            try:
+                rendered = str(value)
+            except (OverflowError, ValueError):
+                self.encountered_unsupported_value = True
+                return False
+            # Pydantic JSON serializes Decimals as strings.
+            return self._string(rendered)
         if isinstance(value, BaseModel):
             fields = type(value).model_fields
             if not self._consume(2):

@@ -3268,9 +3268,86 @@ def test_llm_judge_rejects_tool_bearing_agent_before_model_request():
     assert provider.requests == []
     assert tool.calls == 0
     assert asyncio.run(app.session_store.list_sessions()).sessions == []
-    assert result.passed is False
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
     assert "must be tool-free" in result.message
     assert "dangerous" in result.message
+
+
+def test_llm_judge_invalid_registration_is_an_evaluator_error():
+    app = CayuApp(enable_logging=False)
+    judge = LLMJudge(app, agent_name="missing-judge", rubric="Score.", threshold=0.5)
+
+    result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
+
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
+    assert "configuration is invalid" in result.message
+
+
+def test_llm_judge_provider_failure_is_an_evaluator_error():
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.error("judge provider unavailable"),
+                ModelStreamEvent.completed({"finish_reason": "error"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="judge", model="fake-model"))
+    judge = LLMJudge(app, agent_name="judge", rubric="Score.", threshold=0.5)
+
+    result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
+
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
+    assert "did not complete successfully" in result.message
+
+
+def test_llm_judge_no_session_is_an_evaluator_error():
+    class NoSessionJudgeApp(CayuApp):
+        async def run(self, request):
+            if False:
+                yield Event(type=EventType.SESSION_STARTED, session_id="unreachable")
+
+    app = NoSessionJudgeApp(enable_logging=False)
+    app.register_agent(AgentSpec(name="judge", model="fake-model"))
+    judge = LLMJudge(app, agent_name="judge", rubric="Score.", threshold=0.5)
+
+    result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
+
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
+    assert result.message == "Judge run produced no session."
+
+
+def test_llm_judge_runtime_error_retains_audit_after_session_started():
+    class ExplodingJudgeApp(CayuApp):
+        async def run(self, request):
+            yield Event(type=EventType.SESSION_STARTED, session_id="judge-session")
+            raise RuntimeError("judge transport failed")
+
+    app = ExplodingJudgeApp(enable_logging=False)
+    app.register_agent(AgentSpec(name="judge", model="fake-model"))
+    judge = LLMJudge(
+        app,
+        agent_name="judge",
+        rubric="Score the answer.",
+        rubric_version="rubric-v2",
+        threshold=0.5,
+    )
+
+    result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
+
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
+    assert result.metadata["judge_agent"] == "judge"
+    assert result.metadata["rubric"] == "Score the answer."
+    assert result.metadata["rubric_version"] == "rubric-v2"
+    assert result.metadata["prompt"]
+    assert result.metadata["judge_output"] == ""
 
 
 def test_llm_judge_adversarial_candidate_cannot_reach_another_agents_tool():
@@ -3297,7 +3374,8 @@ def test_llm_judge_adversarial_candidate_cannot_reach_another_agents_tool():
     assert provider.requests[0].tools == []
     assert adversarial_output in result.metadata["prompt"]
     assert tool.calls == 0
-    assert result.passed is False
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
     assert "tool call" in result.message.lower()
 
 
@@ -3351,7 +3429,8 @@ def test_llm_judge_rejects_non_finite_score():
         threshold=0.5,
     )
     result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
-    assert result.passed is False
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
     assert "parseable" in result.message
 
 
@@ -3363,7 +3442,8 @@ def test_llm_judge_rejects_out_of_range_json_score():
         threshold=0.5,
     )
     result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
-    assert result.passed is False
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
     assert "parseable" in result.message
 
 
@@ -3375,7 +3455,8 @@ def test_llm_judge_rejects_out_of_range_labelled_score():
         threshold=0.5,
     )
     result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
-    assert result.passed is False
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
     assert "parseable" in result.message
 
 
@@ -3399,8 +3480,25 @@ def test_llm_judge_unparseable_output_fails():
         threshold=0.5,
     )
     result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
-    assert result.passed is False
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
     assert "parseable" in result.message
+
+
+def test_llm_judge_empty_output_is_an_evaluator_error():
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="judge", model="fake-model"))
+    judge = LLMJudge(app, agent_name="judge", rubric="Score.", threshold=0.5)
+
+    result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
+
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
+    assert result.message == "Judge produced no output to score."
 
 
 def test_llm_judge_no_regex_salvage_for_malformed_json():
@@ -3413,7 +3511,8 @@ def test_llm_judge_no_regex_salvage_for_malformed_json():
         threshold=0.5,
     )
     result = asyncio.run(judge.evaluate(_context(session=_session(), final_output="x")))
-    assert result.passed is False
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
     assert "parseable" in result.message
 
 
@@ -3520,6 +3619,40 @@ def test_llm_judge_score_flows_into_case_score():
     assert result.assertions[0].score == 0.5
     assert result.status == EvalStatus.PASSED
     assert result.score == 0.5  # the continuous judge score flows into the case score
+
+
+def test_llm_judge_error_flows_into_case_and_run_outcomes_without_a_score():
+    judge = LLMJudge(
+        _judge_app("not a score"),
+        agent_name="judge",
+        rubric="Score.",
+        threshold=0.5,
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    case = EvalCase(
+        id="judge-error",
+        request=RunRequest(agent_name="agent", messages=[Message.text("user", "go")], max_steps=1),
+        assertions=[judge],
+    )
+
+    run = asyncio.run(run_eval_suite(app, EvalSuite(id="s", cases=[case])))
+
+    assert run.status is EvalStatus.ERROR
+    assert run.score is None
+    assert run.cases[0].status is EvalStatus.ERROR
+    assert run.cases[0].score is None
+    assert run.cases[0].assertions[0].outcome is EvalOutcome.ERROR
+    assert run.cases[0].assertions[0].score is None
 
 
 def test_capture_probes_survives_artifact_store_error():

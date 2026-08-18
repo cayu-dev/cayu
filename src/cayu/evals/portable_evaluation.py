@@ -12,6 +12,7 @@ from cayu.evals.corpus import (
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
+    ModelJudgeAssertionSpec,
     RootStatusAssertionSpec,
     ToolCalledAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
@@ -281,6 +282,8 @@ def _evaluate_validated_assertion_outcome(
     evidence: AssertionEvidenceView,
 ) -> EvalAssertionResult:
     validated_spec = spec
+    if type(validated_spec) is ModelJudgeAssertionSpec:
+        raise ValueError("Portable model judges require a trusted CorpusTarget evaluator binding.")
     if type(validated_spec) is RootStatusAssertionSpec:
         return _evaluate_root_status(
             name=validated_spec.id,
