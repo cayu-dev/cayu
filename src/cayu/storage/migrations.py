@@ -242,6 +242,12 @@ REVISIONS: tuple[Revision, ...] = (
     # after hard deletion. Existing receipts are deliberately not inferred or
     # backfilled; populated receipt tables require an operator-approved rebuild.
     Revision(revision=41, kind=RevisionKind.BREAKING, compatible_from=41),
+    # Replace mutable knowledge rows and replace-in-place chunks with stable
+    # logical identities, immutable numbered revisions, revision-bound chunks,
+    # and CAS publication receipts. This prerelease contract intentionally
+    # refuses populated pre-revision knowledge databases instead of maintaining
+    # a backfill or dual read/write path.
+    Revision(revision=42, kind=RevisionKind.BREAKING, compatible_from=42),
 )
 
 #: The revision an empty database is initialized to.

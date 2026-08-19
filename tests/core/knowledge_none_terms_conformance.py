@@ -108,7 +108,7 @@ async def assert_entry_wide_none_terms_conformance(
         ),
     ]
     for entry, chunks in cases:
-        await store.put_entry_with_chunks(entry, chunks)
+        await store.create_entry(entry, chunks)
 
     wide = await store.search(
         KnowledgeQuery(
@@ -144,7 +144,7 @@ async def assert_entry_wide_none_terms_conformance(
 async def assert_entry_wide_none_terms_precede_chunk_pagination(
     store: KnowledgeStore,
 ) -> None:
-    await store.put_entry_with_chunks(
+    await store.create_entry(
         KnowledgeEntry(id="excluded_many_chunks", text="Integration summary."),
         [
             *[
@@ -164,8 +164,8 @@ async def assert_entry_wide_none_terms_precede_chunk_pagination(
             ),
         ],
     )
-    await store.put_entry(KnowledgeEntry(id="safe_a", text="GitHub safe control A."))
-    await store.put_entry(KnowledgeEntry(id="safe_b", text="GitHub safe control B."))
+    await store.create_entry(KnowledgeEntry(id="safe_a", text="GitHub safe control A."))
+    await store.create_entry(KnowledgeEntry(id="safe_b", text="GitHub safe control B."))
 
     result = await store.search(
         KnowledgeQuery(

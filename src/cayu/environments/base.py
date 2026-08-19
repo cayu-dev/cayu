@@ -31,13 +31,11 @@ else:
 DEFAULT_WORKSPACE_INSTRUCTION_PATHS = ("AGENTS.md", ".cayu/AGENTS.md")
 DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES = 32 * 1024
 _KNOWLEDGE_STORE_METHODS = (
-    "put_entry",
+    "create_entry",
+    "append_entry_revision",
     "get_entry",
-    "update_entry_status",
     "transition_entry_status",
     "delete_entry",
-    "replace_chunks",
-    "put_entry_with_chunks",
     "read_chunks",
     "search",
     "list_entries",

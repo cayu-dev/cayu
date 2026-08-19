@@ -33,14 +33,16 @@ from cayu.storage import (
     KnowledgeEntry,
     KnowledgeListGroup,
     KnowledgeListQuery,
-    KnowledgePublicationConflict,
     KnowledgeQuery,
+    KnowledgeRevisionConflict,
+    KnowledgeRevisionResetRequired,
     KnowledgeSearchMode,
     KnowledgeStatus,
     KnowledgeVisibility,
     SQLiteKnowledgeStore,
     SQLiteSessionStore,
 )
+from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.tools import RememberKnowledgeTool
 
@@ -51,6 +53,21 @@ async def _close(store) -> None:
     close = getattr(store, "close", None)
     if close is not None:
         await close()
+
+
+def _reconcile_sqlite_through_revision_41(connection: sqlite3.Connection) -> None:
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 41
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+            app_min_supported=41,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
 
 
 def test_sqlite_knowledge_access_scope_conformance(tmp_path) -> None:
@@ -69,7 +86,7 @@ def test_sqlite_scoped_entry_hydration_uses_one_read_snapshot(tmp_path) -> None:
     privileged = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
 
     async def seed() -> None:
-        await privileged.put_entry(
+        await privileged.create_entry(
             KnowledgeEntry(
                 id="entry",
                 text="snapshot protected",
@@ -83,7 +100,7 @@ def test_sqlite_scoped_entry_hydration_uses_one_read_snapshot(tmp_path) -> None:
     class RacingStore(SQLiteKnowledgeStore):
         changed = False
 
-        def _load_labels_unlocked(self, entry_id: str) -> dict[str, str]:
+        def _load_labels_unlocked(self, entry_id: str, revision: int) -> dict[str, str]:
             if not self.changed:
                 self.changed = True
                 peer = sqlite3.connect(database)
@@ -95,7 +112,7 @@ def test_sqlite_scoped_entry_hydration_uses_one_read_snapshot(tmp_path) -> None:
                     peer.commit()
                 finally:
                     peer.close()
-            return super()._load_labels_unlocked(entry_id)
+            return super()._load_labels_unlocked(entry_id, revision)
 
     scope = KnowledgeAccessScope.for_namespace(
         "default",
@@ -134,10 +151,10 @@ def test_sqlite_knowledge_store_rejects_out_of_range_chunk_index_atomically(tmp_
                 chunk_index=0,
                 text="chunk",
             )
-            chunk.chunk_index = MAX_KNOWLEDGE_CHUNK_INDEX + 1
+            object.__setattr__(chunk, "chunk_index", MAX_KNOWLEDGE_CHUNK_INDEX + 1)
 
             with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
-                await store.put_entry_with_chunks(entry, [chunk])
+                await store.create_entry(entry, [chunk])
             assert await store.get_entry(entry.id) is None
             assert await store.read_chunks(entry.id) == []
         finally:
@@ -178,7 +195,7 @@ def test_sqlite_knowledge_publication_serializes_independent_writers(tmp_path) -
                 return (
                     operation_id,
                     asyncio.run(
-                        store.publish_entry_with_chunks(
+                        store.publish_entry_revision(
                             entry,
                             chunks,
                             operation_id=operation_id,
@@ -209,7 +226,7 @@ def test_sqlite_knowledge_publication_serializes_independent_writers(tmp_path) -
             conflicts = [outcome for outcome in outcomes if isinstance(outcome[1], Exception)]
             assert len(successes) == 1
             assert len(conflicts) == 1
-            assert isinstance(conflicts[0][1], KnowledgePublicationConflict)
+            assert isinstance(conflicts[0][1], KnowledgeRevisionConflict)
             expected_entry, expected_chunks = (
                 (entry_a, chunks_a)
                 if successes[0][0] == "cross-connection-a"
@@ -229,17 +246,22 @@ def test_sqlite_knowledge_publication_receipt_survives_restart(tmp_path) -> None
         path = tmp_path / "publication-restart.sqlite"
         entry, chunks = publication_material(entry_id="restart-publication")
         store = SQLiteKnowledgeStore(path, access_scope=_ACCESS_SCOPE)
-        receipt = await store.publish_entry_with_chunks(
+        receipt = await store.publish_entry_revision(
             entry,
             chunks,
             operation_id="restart-operation",
         )
-        reviewed = await store.update_entry_status(entry.id, KnowledgeStatus.ARCHIVED)
+        reviewed = await store.transition_entry_status(
+            entry.id,
+            expected_revision=entry.revision,
+            from_status=KnowledgeStatus.ACTIVE,
+            to_status=KnowledgeStatus.ARCHIVED,
+        )
         await _close(store)
 
         reopened = SQLiteKnowledgeStore(path, access_scope=_ACCESS_SCOPE)
         try:
-            replay = await reopened.publish_entry_with_chunks(
+            replay = await reopened.publish_entry_revision(
                 entry,
                 chunks,
                 operation_id="restart-operation",
@@ -247,7 +269,10 @@ def test_sqlite_knowledge_publication_receipt_survives_restart(tmp_path) -> None
             assert replay.replayed is True
             assert replay.committed_at == receipt.committed_at
             assert await reopened.get_entry(entry.id) == reviewed
-            assert await reopened.read_chunks(entry.id) == chunks
+            assert await reopened.read_chunks(entry.id, revision=entry.revision) == chunks
+            current_chunks = await reopened.read_chunks(entry.id)
+            assert [chunk.text for chunk in current_chunks] == [chunk.text for chunk in chunks]
+            assert all(chunk.entry_revision == reviewed.revision for chunk in current_chunks)
         finally:
             await _close(reopened)
 
@@ -256,19 +281,21 @@ def test_sqlite_knowledge_publication_receipt_survives_restart(tmp_path) -> None
 
 def test_sqlite_remember_knowledge_reconciles_ack_loss_and_restart(tmp_path) -> None:
     class AcknowledgementLossSQLiteStore(SQLiteKnowledgeStore):
-        async def publish_entry_with_chunks(
+        async def publish_entry_revision(
             self,
             entry,
             chunks,
             *,
             access_scope=None,
             operation_id,
+            expected_revision=None,
         ):
-            await super().publish_entry_with_chunks(
+            await super().publish_entry_revision(
                 entry,
                 chunks,
                 access_scope=access_scope,
                 operation_id=operation_id,
+                expected_revision=expected_revision,
             )
             raise RuntimeError("secret canary acknowledgement failure")
 
@@ -334,7 +361,7 @@ def test_sqlite_knowledge_publication_rolls_back_each_material_write(
         failing = FailingPublicationStore(path, access_scope=_ACCESS_SCOPE)
         try:
             with pytest.raises(RuntimeError, match=rf"{failure_phase}-boundary"):
-                await failing.publish_entry_with_chunks(
+                await failing.publish_entry_revision(
                     entry,
                     chunks,
                     operation_id="rollback-operation",
@@ -349,7 +376,7 @@ def test_sqlite_knowledge_publication_rolls_back_each_material_write(
 
         reopened = SQLiteKnowledgeStore(path, access_scope=_ACCESS_SCOPE)
         try:
-            receipt = await reopened.publish_entry_with_chunks(
+            receipt = await reopened.publish_entry_revision(
                 entry,
                 chunks,
                 operation_id="rollback-operation",
@@ -402,7 +429,7 @@ def test_sqlite_knowledge_store_persists_entries_chunks_and_filters(tmp_path) ->
     store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
 
     async def write() -> None:
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="invoice_warning",
                 text="Do not send invoice reminders when the PO number is missing.",
@@ -430,7 +457,7 @@ def test_sqlite_knowledge_store_persists_entries_chunks_and_filters(tmp_path) ->
                 )
             ],
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="other_project_warning",
                 text="Invoice reminders require a PO number.",
@@ -498,15 +525,15 @@ def test_sqlite_knowledge_store_defaults_hide_inactive_and_expired(tmp_path) -> 
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="active", text="deployment warning"))
-        await store.put_entry(
+        await store.create_entry(KnowledgeEntry(id="active", text="deployment warning"))
+        await store.create_entry(
             KnowledgeEntry(
                 id="pending",
                 text="deployment warning",
                 status=KnowledgeStatus.PENDING,
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="expired",
                 text="deployment warning",
@@ -533,8 +560,8 @@ def test_sqlite_knowledge_store_prune_expired_hard_deletes(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="active", text="deployment warning"))
-        await store.put_entry(
+        await store.create_entry(KnowledgeEntry(id="active", text="deployment warning"))
+        await store.create_entry(
             KnowledgeEntry(
                 id="expired",
                 text="deployment warning",
@@ -560,7 +587,7 @@ def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> No
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="pending",
                 text="Remote sandbox Git pushes should use a brokered credential proxy.",
@@ -571,6 +598,7 @@ def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> No
         )
         active = await store.transition_entry_status(
             "pending",
+            expected_revision=1,
             from_status=KnowledgeStatus.PENDING,
             to_status=KnowledgeStatus.ACTIVE,
             expected_namespace="project:cayu",
@@ -579,12 +607,13 @@ def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> No
         with pytest.raises(ValueError, match="not 'pending'"):
             await store.transition_entry_status(
                 "pending",
+                expected_revision=active.revision,
                 from_status=KnowledgeStatus.PENDING,
                 to_status=KnowledgeStatus.ARCHIVED,
                 expected_namespace="project:cayu",
                 expected_labels={"project": "cayu"},
             )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="pending_other",
                 text="Other project knowledge.",
@@ -596,6 +625,7 @@ def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> No
         with pytest.raises(ValueError, match="expected namespace"):
             await store.transition_entry_status(
                 "pending_other",
+                expected_revision=1,
                 from_status=KnowledgeStatus.PENDING,
                 to_status=KnowledgeStatus.ACTIVE,
                 expected_namespace="project:cayu",
@@ -603,6 +633,7 @@ def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> No
         with pytest.raises(ValueError, match="expected labels"):
             await store.transition_entry_status(
                 "pending_other",
+                expected_revision=1,
                 from_status=KnowledgeStatus.PENDING,
                 to_status=KnowledgeStatus.ACTIVE,
                 expected_labels={"project": "cayu"},
@@ -615,18 +646,17 @@ def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> No
     assert active.status is KnowledgeStatus.ACTIVE
 
 
-def test_sqlite_knowledge_store_update_entry_status_guards_concurrent_delete(tmp_path) -> None:
+def test_sqlite_knowledge_store_transition_rejects_missing_entry(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        # Simulate the check-then-write race: the entry is seen by the load but is
-        # gone by the time the UPDATE runs (e.g. a concurrent hard delete). The
-        # in-statement rowcount guard must surface this as a missing entry rather
-        # than silently succeeding.
-        stale = KnowledgeEntry(id="ghost", text="already deleted", status=KnowledgeStatus.PENDING)
-        store._load_entry_unlocked = lambda entry_id: stale  # type: ignore[assignment]
         with pytest.raises(KeyError, match="ghost"):
-            await store.update_entry_status("ghost", KnowledgeStatus.ARCHIVED)
+            await store.transition_entry_status(
+                "ghost",
+                expected_revision=1,
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ARCHIVED,
+            )
         await _close(store)
 
     asyncio.run(run())
@@ -636,7 +666,7 @@ def test_sqlite_knowledge_store_preserves_custom_chunks_on_entry_update(tmp_path
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry_with_chunks(
+        current = await store.create_entry(
             KnowledgeEntry(id="doc", text="Document summary.", metadata={"version": 1}),
             [
                 KnowledgeChunk(
@@ -648,8 +678,9 @@ def test_sqlite_knowledge_store_preserves_custom_chunks_on_entry_update(tmp_path
                 )
             ],
         )
-        await store.put_entry(
-            KnowledgeEntry(id="doc", text="Document summary.", metadata={"version": 2})
+        await store.append_entry_revision(
+            current.model_copy(update={"revision": 2, "metadata": {"version": 2}}),
+            expected_revision=1,
         )
         chunks = await store.read_chunks("doc")
         result = await store.search(KnowledgeQuery(text="custom indexed"))
@@ -668,7 +699,7 @@ def test_sqlite_knowledge_store_empty_kind_filter_returns_no_matches(tmp_path) -
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="entry", text="billing memory"))
+        await store.create_entry(KnowledgeEntry(id="entry", text="billing memory"))
         result = await store.search(KnowledgeQuery(text="billing", kinds=[]))
         await _close(store)
         return result
@@ -683,7 +714,7 @@ def test_sqlite_knowledge_store_search_reports_preview_truncation(tmp_path) -> N
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="entry", text="billing memory has more text"))
+        await store.create_entry(KnowledgeEntry(id="entry", text="billing memory has more text"))
         result = await store.search(KnowledgeQuery(text="billing", max_bytes=7))
         await _close(store)
         return result
@@ -699,7 +730,7 @@ def test_sqlite_knowledge_store_search_dedupes_across_large_chunk_matches(tmp_pa
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="large", text="invoice corpus"),
             [
                 KnowledgeChunk(
@@ -711,7 +742,7 @@ def test_sqlite_knowledge_store_search_dedupes_across_large_chunk_matches(tmp_pa
                 for index in range(1200)
             ],
         )
-        await store.put_entry(KnowledgeEntry(id="small", text="invoice policy"))
+        await store.create_entry(KnowledgeEntry(id="small", text="invoice policy"))
         result = await store.search(KnowledgeQuery(text="invoice", limit=2))
         await _close(store)
         return result
@@ -727,13 +758,13 @@ def test_sqlite_knowledge_store_structured_keyword_search(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="github_secret", text="GitHub push requires a credential broker.")
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="sendgrid_secret", text="SendGrid email uses a secret proxy.")
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="github_test", text="GitHub test credentials are fixture-only.")
         )
         result = await store.search(
@@ -798,7 +829,7 @@ def test_sqlite_knowledge_store_searches_entry_text_with_custom_chunks(tmp_path)
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="broker_summary",
                 text="Remote sandbox Git operations need a brokered credential boundary.",
@@ -827,7 +858,7 @@ def test_sqlite_knowledge_store_matches_singular_plural_token_variants(tmp_path)
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="remote_git",
                 title="Remote sandbox Git credential boundary",
@@ -837,7 +868,7 @@ def test_sqlite_knowledge_store_matches_singular_plural_token_variants(tmp_path)
                 ),
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="fixture",
                 text="Fixture credentials in local tests are not production guidance.",
@@ -861,8 +892,8 @@ def test_sqlite_knowledge_store_matches_y_plural_token_variants(tmp_path) -> Non
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
-        await store.put_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
+        await store.create_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
+        await store.create_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
         key_result = await store.search(KnowledgeQuery(text="key"))
         policy_result = await store.search(KnowledgeQuery(text="policy"))
         await _close(store)
@@ -878,7 +909,7 @@ def test_sqlite_knowledge_store_all_terms_match_across_entry_document(tmp_path) 
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="split_match",
                 title="GitHub credential policy",
@@ -908,7 +939,7 @@ def test_sqlite_knowledge_store_all_terms_do_not_match_across_unrelated_chunks(
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="split_chunks", text="General operations note."),
             [
                 KnowledgeChunk(
@@ -938,7 +969,7 @@ def test_sqlite_knowledge_store_lists_entries_and_facets(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="runbook",
                 namespace="ops",
@@ -947,7 +978,7 @@ def test_sqlite_knowledge_store_lists_entries_and_facets(tmp_path) -> None:
                 text="Payment reminder runbook.",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="warning",
                 namespace="ops",
@@ -956,7 +987,7 @@ def test_sqlite_knowledge_store_lists_entries_and_facets(tmp_path) -> None:
                 text="Do not send reminders without approval.",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="archived",
                 namespace="ops",
@@ -990,7 +1021,7 @@ def test_sqlite_knowledge_store_caps_facets(tmp_path) -> None:
 
     async def run():
         for index in range(5):
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id=f"entry_{index}",
                     labels={"area": f"area_{index}"},
@@ -1017,7 +1048,7 @@ def test_sqlite_knowledge_store_chunk_windows_and_truncation(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="doc", text="summary"),
             [
                 KnowledgeChunk(id="chunk_0", entry_id="doc", chunk_index=0, text="alpha beta"),
@@ -1045,36 +1076,130 @@ def test_sqlite_knowledge_store_chunk_windows_and_truncation(tmp_path) -> None:
     assert truncated[0].content_hash is None
 
 
-def test_sqlite_knowledge_store_rejects_invalid_chunk_replacement(tmp_path) -> None:
+def test_sqlite_knowledge_store_rejects_invalid_revision_chunks(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="entry", text="text"))
+        current = await store.create_entry(KnowledgeEntry(id="entry", text="text"))
+        successor = current.model_copy(update={"revision": 2})
         with pytest.raises(ValueError, match="cannot be empty"):
-            await store.replace_chunks("entry", [])
+            await store.append_entry_revision(successor, [], expected_revision=1)
         with pytest.raises(ValueError, match="belong"):
-            await store.replace_chunks(
-                "entry",
-                [KnowledgeChunk(id="chunk", entry_id="other", chunk_index=0, text="text")],
+            await store.append_entry_revision(
+                successor,
+                [
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="other",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="text",
+                    )
+                ],
+                expected_revision=1,
             )
         with pytest.raises(ValueError, match="ids"):
-            await store.replace_chunks(
-                "entry",
+            await store.append_entry_revision(
+                successor,
                 [
-                    KnowledgeChunk(id="chunk", entry_id="entry", chunk_index=0, text="first"),
-                    KnowledgeChunk(id="chunk", entry_id="entry", chunk_index=1, text="second"),
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="first",
+                    ),
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=1,
+                        text="second",
+                    ),
                 ],
+                expected_revision=1,
             )
         await _close(store)
 
     asyncio.run(run())
 
 
+def test_sqlite_knowledge_schema_rejects_a_dangling_current_revision(tmp_path) -> None:
+    database = tmp_path / "current-revision-fk.sqlite"
+
+    async def create() -> None:
+        store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+        try:
+            await store.create_entry(KnowledgeEntry(id="entry", text="current"))
+        finally:
+            await store.close()
+
+    asyncio.run(create())
+
+    connection = sqlite_support.connect(database)
+    try:
+        with pytest.raises(sqlite3.IntegrityError), sqlite_support._transaction(connection):
+            connection.execute(
+                "UPDATE cayu_knowledge_entries SET current_revision = ? WHERE id = ?",
+                (2, "entry"),
+            )
+        assert (
+            connection.execute(
+                "SELECT current_revision FROM cayu_knowledge_entries WHERE id = ?",
+                ("entry",),
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("object_name", "drop_sql"),
+    (
+        (
+            "cayu_knowledge_current_entries",
+            "DROP VIEW cayu_knowledge_current_entries",
+        ),
+        (
+            "idx_cayu_knowledge_revisions_status",
+            "DROP INDEX idx_cayu_knowledge_revisions_status",
+        ),
+        (
+            "cayu_knowledge_chunks_fts",
+            "DROP TABLE cayu_knowledge_chunks_fts",
+        ),
+    ),
+)
+def test_sqlite_revision_schema_validation_rejects_missing_structural_objects(
+    tmp_path,
+    object_name: str,
+    drop_sql: str,
+) -> None:
+    database = tmp_path / f"missing-{object_name}.sqlite"
+    store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+    asyncio.run(store.close())
+
+    connection = sqlite_support.connect(database)
+    try:
+        connection.execute(drop_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match=object_name):
+        SQLiteKnowledgeStore(
+            database,
+            access_scope=_ACCESS_SCOPE,
+            schema_mode=schema_migrations.SchemaMode.VALIDATE,
+        )
+
+
 def test_sqlite_knowledge_store_rejects_unsupported_search_modes(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="entry", text="billing memory"))
+        await store.create_entry(KnowledgeEntry(id="entry", text="billing memory"))
         with pytest.raises(ValueError, match="supports only auto and keyword"):
             await store.search(KnowledgeQuery(text="billing", mode=KnowledgeSearchMode.SEMANTIC))
         await _close(store)
@@ -1087,7 +1212,7 @@ def test_sqlite_knowledge_store_batches_multi_entry_hit_hydration(tmp_path) -> N
 
     async def run():
         for index in range(3):
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id=f"entry_{index}",
                     text=f"Shared deployment warning number {index}.",
@@ -1119,8 +1244,8 @@ def test_sqlite_knowledge_store_list_reports_multi_chunk_counts(tmp_path) -> Non
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        await store.put_entry(KnowledgeEntry(id="single", text="Single chunk entry."))
-        await store.put_entry_with_chunks(
+        await store.create_entry(KnowledgeEntry(id="single", text="Single chunk entry."))
+        await store.create_entry(
             KnowledgeEntry(id="multi", text="Multi chunk entry."),
             [
                 KnowledgeChunk(
@@ -1146,9 +1271,9 @@ def test_sqlite_knowledge_store_search_survives_entry_text_only_update(tmp_path)
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=_ACCESS_SCOPE)
 
     async def run():
-        # Custom chunk whose body differs from the entry text drives put_entry down
+        # Custom chunk whose body differs from the entry text drives create_entry down
         # the untouched-chunks branch, which now refreshes the FTS rows exactly once.
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="doc", title="Original title", text="Original entry summary."),
             [
                 KnowledgeChunk(
@@ -1159,8 +1284,17 @@ def test_sqlite_knowledge_store_search_survives_entry_text_only_update(tmp_path)
                 )
             ],
         )
-        await store.put_entry(
-            KnowledgeEntry(id="doc", title="Revised heading", text="Revised entry summary.")
+        current = await store.get_entry("doc")
+        assert current is not None
+        await store.append_entry_revision(
+            current.model_copy(
+                update={
+                    "revision": current.revision + 1,
+                    "title": "Revised heading",
+                    "text": "Revised entry summary.",
+                }
+            ),
+            expected_revision=current.revision,
         )
         by_title = await store.search(KnowledgeQuery(text="revised heading"))
         by_text = await store.search(KnowledgeQuery(text="revised summary"))
@@ -1187,7 +1321,9 @@ def test_sqlite_knowledge_schema_migrates_and_coexists_with_session_store(tmp_pa
     knowledge_store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
 
     async def write_knowledge() -> None:
-        await knowledge_store.put_entry(KnowledgeEntry(id="entry", text="shared database memory"))
+        await knowledge_store.create_entry(
+            KnowledgeEntry(id="entry", text="shared database memory")
+        )
         result = await knowledge_store.search(KnowledgeQuery(text="shared database"))
         assert [hit.entry.id for hit in result.hits] == ["entry"]
         await _close(knowledge_store)
@@ -1222,3 +1358,144 @@ def test_sqlite_knowledge_schema_migrates_and_coexists_with_session_store(tmp_pa
     assert knowledge_table is not None
     assert knowledge_fts is not None
     assert publication_receipts is not None
+
+
+def test_sqlite_revision_migration_refuses_populated_legacy_knowledge_unchanged(
+    tmp_path,
+) -> None:
+    database = tmp_path / "populated-revision-41.sqlite"
+    connection = sqlite_support.connect(database)
+    try:
+        _reconcile_sqlite_through_revision_41(connection)
+        connection.execute(
+            """
+            INSERT INTO cayu_knowledge_entries (
+                id, namespace, text, kind, visibility, status,
+                created_by_type, created_by, created_at, updated_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-entry",
+                "default",
+                "legacy text must survive",
+                "fact",
+                "global",
+                "active",
+                "system",
+                "legacy-test",
+                "2026-08-18T09:00:00+00:00",
+                "2026-08-18T09:00:00+00:00",
+                '{"proof":"unchanged"}',
+            ),
+        )
+        connection.execute(
+            "INSERT INTO cayu_knowledge_labels (entry_id, key, value) VALUES (?, ?, ?)",
+            ("legacy-entry", "project", "cayu"),
+        )
+        connection.execute(
+            """
+            INSERT INTO cayu_knowledge_chunks (
+                id, entry_id, chunk_index, text, metadata_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            ("legacy-entry:0", "legacy-entry", 0, "legacy chunk must survive", "{}"),
+        )
+        connection.commit()
+
+        schema_before = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name LIKE 'cayu_knowledge_%' ORDER BY type, name"
+        ).fetchall()
+        data_before = (
+            connection.execute("SELECT * FROM cayu_knowledge_entries").fetchall(),
+            connection.execute("SELECT * FROM cayu_knowledge_labels").fetchall(),
+            connection.execute("SELECT * FROM cayu_knowledge_chunks").fetchall(),
+        )
+        ledger_before = connection.execute(
+            "SELECT revision, kind, compatible_from FROM cayu_schema_migrations ORDER BY revision"
+        ).fetchall()
+        connection.close()
+
+        with pytest.raises(KnowledgeRevisionResetRequired) as raised:
+            SQLiteKnowledgeStore(
+                database,
+                schema_mode=schema_migrations.SchemaMode.MIGRATE,
+                access_scope=_ACCESS_SCOPE,
+            )
+
+        connection = sqlite_support.connect(database)
+        connection.execute("BEGIN IMMEDIATE")
+        connection.rollback()
+        assert raised.value.assessment.populated_tables == (
+            "cayu_knowledge_chunks",
+            "cayu_knowledge_entries",
+            "cayu_knowledge_labels",
+        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert (
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name LIKE 'cayu_knowledge_%' ORDER BY type, name"
+            ).fetchall()
+            == schema_before
+        )
+        assert (
+            connection.execute("SELECT * FROM cayu_knowledge_entries").fetchall(),
+            connection.execute("SELECT * FROM cayu_knowledge_labels").fetchall(),
+            connection.execute("SELECT * FROM cayu_knowledge_chunks").fetchall(),
+        ) == data_before
+        assert (
+            connection.execute(
+                "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
+                "ORDER BY revision"
+            ).fetchall()
+            == ledger_before
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_migration_refuses_populated_unversioned_knowledge_before_ddl(
+    tmp_path,
+) -> None:
+    database = tmp_path / "populated-unversioned.sqlite"
+    connection = sqlite_support.connect(database)
+    try:
+        connection.execute(
+            "CREATE TABLE cayu_knowledge_entries (id TEXT PRIMARY KEY, text TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO cayu_knowledge_entries (id, text) VALUES (?, ?)",
+            ("unversioned-entry", "must survive"),
+        )
+        connection.commit()
+        schema_before = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        data_before = connection.execute("SELECT * FROM cayu_knowledge_entries").fetchall()
+        connection.close()
+
+        with pytest.raises(KnowledgeRevisionResetRequired):
+            SQLiteKnowledgeStore(
+                database,
+                schema_mode=schema_migrations.SchemaMode.MIGRATE,
+                access_scope=_ACCESS_SCOPE,
+            )
+
+        connection = sqlite_support.connect(database)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_schema_migrations'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+            == schema_before
+        )
+        assert connection.execute("SELECT * FROM cayu_knowledge_entries").fetchall() == data_before
+    finally:
+        connection.close()

@@ -10,6 +10,7 @@ from cayu.storage import (
     KnowledgeEntry,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
+    KnowledgeRevisionConflict,
     KnowledgeStatus,
 )
 
@@ -47,20 +48,22 @@ def publication_material(
 
 async def assert_owned_publication_conformance(store: Any) -> None:
     entry, chunks = publication_material()
-    receipt = await store.publish_entry_with_chunks(
+    receipt = await store.publish_entry_revision(
         entry,
         chunks,
         operation_id="operation-primary",
     )
     assert type(receipt) is KnowledgePublicationReceipt
     assert receipt.replayed is False
+    assert receipt.entry_revision == 1
+    assert receipt.expected_revision is None
     assert await store.get_entry(entry.id) == entry
     assert await store.read_chunks(entry.id) == chunks
 
     invalid_entry, invalid_chunks = publication_material(entry_id="invalid-publication-entry")
     invalid_chunks[0].metadata["non_finite"] = float("inf")
     try:
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             invalid_entry,
             invalid_chunks,
             operation_id="invalid-publication-operation",
@@ -75,7 +78,7 @@ async def assert_owned_publication_conformance(store: Any) -> None:
         operation_id="invalid-publication-operation",
     )
 
-    replay = await store.publish_entry_with_chunks(
+    replay = await store.publish_entry_revision(
         entry,
         chunks,
         operation_id="operation-primary",
@@ -86,7 +89,7 @@ async def assert_owned_publication_conformance(store: Any) -> None:
 
     conflicting_entry = entry.model_copy(update={"title": "conflicting request"})
     try:
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             conflicting_entry,
             chunks,
             operation_id="operation-primary",
@@ -98,20 +101,26 @@ async def assert_owned_publication_conformance(store: Any) -> None:
         raise AssertionError("An operation identity accepted conflicting material.")
 
     try:
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             entry,
             chunks,
             operation_id="operation-second-writer",
         )
-    except KnowledgePublicationConflict as exc:
-        assert exc.reason in {"entry_occupied", "concurrent_occupancy"}
+    except KnowledgeRevisionConflict as exc:
+        assert exc.expected_revision is None
+        assert exc.actual_revision == 1
     else:  # pragma: no cover - assertion branch
         raise AssertionError("A second operation overwrote an occupied entry identity.")
     assert await store.get_entry(entry.id) == entry
     assert await store.read_chunks(entry.id) == chunks
 
-    updated = await store.update_entry_status(entry.id, KnowledgeStatus.ARCHIVED)
-    historical_replay = await store.publish_entry_with_chunks(
+    updated = await store.transition_entry_status(
+        entry.id,
+        expected_revision=entry.revision,
+        from_status=KnowledgeStatus.ACTIVE,
+        to_status=KnowledgeStatus.ARCHIVED,
+    )
+    historical_replay = await store.publish_entry_revision(
         entry,
         chunks,
         operation_id="operation-primary",
@@ -126,12 +135,12 @@ async def assert_owned_publication_conformance(store: Any) -> None:
         entry_id="acknowledgement_loss_publication",
         timestamp_offset=2,
     )
-    committed = await store.publish_entry_with_chunks(
+    committed = await store.publish_entry_revision(
         ack_lost_entry,
         ack_lost_chunks,
         operation_id="acknowledgement-loss-operation",
     )
-    replayed = await store.publish_entry_with_chunks(
+    replayed = await store.publish_entry_revision(
         ack_lost_entry,
         ack_lost_chunks,
         operation_id="acknowledgement-loss-operation",
@@ -154,13 +163,13 @@ async def assert_concurrent_publication_conformance(store: Any) -> None:
         try:
             return (
                 operation_id,
-                await store.publish_entry_with_chunks(
+                await store.publish_entry_revision(
                     entry,
                     chunks,
                     operation_id=operation_id,
                 ),
             )
-        except KnowledgePublicationConflict as exc:
+        except KnowledgeRevisionConflict as exc:
             return operation_id, exc
 
     outcomes = await asyncio.gather(
@@ -168,7 +177,7 @@ async def assert_concurrent_publication_conformance(store: Any) -> None:
         publish("concurrent-b", entry_b, chunks_b),
     )
     receipts = [item for item in outcomes if isinstance(item[1], KnowledgePublicationReceipt)]
-    conflicts = [item for item in outcomes if isinstance(item[1], KnowledgePublicationConflict)]
+    conflicts = [item for item in outcomes if isinstance(item[1], KnowledgeRevisionConflict)]
     assert len(receipts) == 1
     assert len(conflicts) == 1
     expected_entry, expected_chunks = (
@@ -199,7 +208,7 @@ async def assert_concurrent_publication_conformance(store: Any) -> None:
         try:
             return (
                 operation_id,
-                await store.publish_entry_with_chunks(
+                await store.publish_entry_revision(
                     entry,
                     chunks,
                     operation_id=operation_id,
@@ -233,12 +242,16 @@ async def assert_concurrent_publication_conformance(store: Any) -> None:
 
 async def assert_stale_operation_cannot_replace_newer_publication(store: Any) -> None:
     old_entry, old_chunks = publication_material(entry_id="reused_publication_entry")
-    await store.publish_entry_with_chunks(
+    await store.publish_entry_revision(
         old_entry,
         old_chunks,
         operation_id="stale-operation",
     )
-    deleted = await store.delete_entry(old_entry.id, hard=True)
+    deleted = await store.delete_entry(
+        old_entry.id,
+        expected_revision=old_entry.revision,
+        hard=True,
+    )
     assert deleted is not None
 
     new_entry, new_chunks = publication_material(
@@ -246,13 +259,13 @@ async def assert_stale_operation_cannot_replace_newer_publication(store: Any) ->
         text="A newer owner committed this replacement.",
         timestamp_offset=1,
     )
-    await store.publish_entry_with_chunks(
+    await store.publish_entry_revision(
         new_entry,
         new_chunks,
         operation_id="newer-operation",
     )
 
-    replay = await store.publish_entry_with_chunks(
+    replay = await store.publish_entry_revision(
         old_entry,
         old_chunks,
         operation_id="stale-operation",

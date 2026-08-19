@@ -73,8 +73,8 @@ def assess_knowledge_revision_transition(
 ) -> KnowledgeRevisionTransitionAssessment:
     """Classify a complete, backend-owned legacy knowledge population inspection.
 
-    The future revision migration supplies the exact backend table set. Requiring
-    an exact match prevents an omitted table from silently turning an incomplete
+    Each backend migration supplies its exact legacy table set. Requiring an
+    exact match prevents an omitted table from silently turning an incomplete
     inspection into approval.
     """
 

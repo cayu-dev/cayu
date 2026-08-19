@@ -302,6 +302,7 @@ _TABLES = (
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
     "cayu_knowledge_chunks",
+    "cayu_knowledge_revisions",
     "cayu_knowledge_entries",
     "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",
@@ -619,11 +620,14 @@ def test_revision_forty_one_rejects_populated_knowledge_receipt_database(
         import psycopg
 
         await _drop_all(postgres_dsn)
+        revisions = schema.REVISIONS
+        schema.REVISIONS = tuple(revision for revision in revisions if revision.revision <= 40)
         creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
         try:
             await creator.ensure_schema()
         finally:
             await creator.close()
+            schema.REVISIONS = revisions
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
@@ -635,23 +639,17 @@ def test_revision_forty_one_rejects_populated_knowledge_receipt_database(
                         request_sha256,
                         entry_created_at,
                         entry_updated_at,
-                        committed_at,
-                        access_snapshot
+                        committed_at
                     ) VALUES (
                         'op_existing',
                         'entry_existing',
                         repeat('a', 64),
                         NOW(),
                         NOW(),
-                        NOW(),
-                        '{}'::jsonb
+                        NOW()
                     )
                     """
                 )
-                await cur.execute(
-                    "ALTER TABLE cayu_knowledge_publication_receipts DROP COLUMN access_snapshot"
-                )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 41")
             await conn.commit()
 
         migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)

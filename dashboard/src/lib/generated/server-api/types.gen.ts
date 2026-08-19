@@ -640,6 +640,10 @@ export type ApiKnowledgeChunk = {
      */
     entry_id: string;
     /**
+     * Entry Revision
+     */
+    entry_revision: number;
+    /**
      * Metadata
      */
     metadata: {
@@ -713,6 +717,10 @@ export type ApiKnowledgeListItem = {
      * Namespace
      */
     namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
     /**
      * Source Id
      */
@@ -927,6 +935,10 @@ export type ApiReviewedKnowledgeEntry = {
      * Namespace
      */
     namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
     /**
      * Source Id
      */
@@ -4113,6 +4125,10 @@ export type PendingKnowledgeDetailResponse = {
      * Namespace
      */
     namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
     /**
      * Source Id
      */

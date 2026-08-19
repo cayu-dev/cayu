@@ -40,8 +40,8 @@ from cayu import (
     InMemoryKnowledgeStore,
     InMemoryTaskStore,
     KnowledgeAccessScope,
-    KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeRevisionConflict,
     KnowledgeStatus,
     LocalArtifactStore,
     Message,
@@ -1627,26 +1627,13 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
         knowledge_review_namespace="project:cayu",
         knowledge_review_labels={"project": "cayu", "tenant": "trusted"},
     )
-    asyncio.run(
-        store.replace_chunks(
-            "pending_git",
-            [
-                KnowledgeChunk(
-                    id="pending_git:0",
-                    entry_id="pending_git",
-                    chunk_index=0,
-                    text="Remote sandbox Git pushes should use a brokered credential proxy.",
-                )
-            ],
-            access_scope=access_scope,
-        )
-    )
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
 
     pending = client.get("/api/knowledge/pending")
     assert pending.status_code == 200
     body = pending.json()
     assert [entry["entry_id"] for entry in body["entries"]] == ["pending_git"]
+    assert body["entries"][0]["revision"] == 1
     assert body["entries"][0]["title"] == "Remote sandbox Git credentials"
     assert body["entries"][0]["text_preview"] == "Remote sandbox Git credentials"
     assert body["total_entries_known"] == 1
@@ -1658,12 +1645,14 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
         detail_body["text"] == "Remote sandbox Git pushes should use a brokered credential proxy."
     )
     assert detail_body["metadata"] == {"review_note": "inspect before approving"}
-    assert [chunk["chunk_id"] for chunk in detail_body["chunks"]] == ["pending_git:0"]
+    assert [chunk["chunk_id"] for chunk in detail_body["chunks"]] == ["pending_git:r1:0"]
+    assert detail_body["chunks"][0]["entry_revision"] == 1
     assert detail_body["chunks"][0]["text"] == detail_body["text"]
 
     approved = client.post("/api/knowledge/pending_git/approve")
     assert approved.status_code == 200
     assert approved.json()["status"] == "active"
+    assert approved.json()["revision"] == 2
 
     empty = client.get("/api/knowledge/pending")
     assert empty.status_code == 200
@@ -1698,6 +1687,33 @@ def test_server_rejects_pending_knowledge_with_archived_status() -> None:
     pending = client.get("/api/knowledge/pending")
     assert pending.status_code == 200
     assert pending.json()["entries"] == []
+
+
+def test_server_maps_concurrent_knowledge_review_revision_to_conflict() -> None:
+    class RacingKnowledgeStore(InMemoryKnowledgeStore):
+        async def transition_entry_status(self, entry_id, *, expected_revision, **kwargs):
+            raise KnowledgeRevisionConflict(
+                entry_id,
+                expected_revision=expected_revision,
+                actual_revision=expected_revision + 1,
+            )
+
+    store = RacingKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="pending_race",
+                text="Concurrent review candidate.",
+                status=KnowledgeStatus.PENDING,
+            )
+        ],
+        access_scope=KnowledgeAccessScope.privileged(),
+    )
+    client = TestClient(create_server(CayuApp(knowledge_store=store), config=_LOCAL_SERVER_CONFIG))
+
+    response = client.post("/api/knowledge/pending_race/approve")
+
+    assert response.status_code == 409
+    assert "revision conflict" in response.json()["detail"]
 
 
 def test_server_knowledge_review_reports_missing_store_and_scope_errors() -> None:

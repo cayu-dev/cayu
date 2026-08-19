@@ -6,25 +6,25 @@ from cayu.storage import KnowledgeEntry, KnowledgeQuery, KnowledgeStore
 async def assert_token_exact_phrase_search_conformance(store: KnowledgeStore) -> None:
     """Require structured phrases to match consecutive complete normalized tokens."""
 
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="phrase_exact",
             text="A Cat dog pairing is token exact.",
         )
     )
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="phrase_substrings",
             text="Only copycat dogma appears here.",
         )
     )
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="phrase_reversed",
             text="The dog cat ordering is reversed.",
         )
     )
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="phrase_across_fields",
             title="The copy cat",

@@ -116,15 +116,16 @@ class _StalledKnowledgePublicationStore(_TestKnowledgeStore):
         self.operation_id: str | None = None
         self.publish_calls = 0
 
-    async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+    async def publish_entry_revision(self, entry, chunks, *, operation_id, expected_revision=None):
         self.publish_calls += 1
         self.operation_id = operation_id
         self.dispatched.set()
         await self.release.wait()
-        receipt = await super().publish_entry_with_chunks(
+        receipt = await super().publish_entry_revision(
             entry,
             chunks,
             operation_id=operation_id,
+            expected_revision=expected_revision,
         )
         self.settled.set()
         return receipt
@@ -160,12 +161,13 @@ class _CancellationResistantKnowledgeReadStore(_TestKnowledgeStore):
             await self._stall()
         return await super().get_entry(entry_id)
 
-    async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+    async def publish_entry_revision(self, entry, chunks, *, operation_id, expected_revision=None):
         self.publish_calls += 1
-        return await super().publish_entry_with_chunks(
+        return await super().publish_entry_revision(
             entry,
             chunks,
             operation_id=operation_id,
+            expected_revision=expected_revision,
         )
 
 
@@ -295,7 +297,9 @@ def test_remember_knowledge_ambiguous_failure_event_is_bounded_and_content_free(
     exception_canary = "private store diagnostic must not enter failure evidence"
 
     class AmbiguousKnowledgeStore(_TestKnowledgeStore):
-        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+        async def publish_entry_revision(
+            self, entry, chunks, *, operation_id, expected_revision=None
+        ):
             raise RuntimeError(f"{exception_canary}: {knowledge_canary}")
 
     async def run():
@@ -679,7 +683,9 @@ def test_remember_knowledge_detaches_hostile_conflict_classification_at_runtime(
         cast("Any", failure).reason = HostileReason()
 
     class HostileConflictStore(_TestKnowledgeStore):
-        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+        async def publish_entry_revision(
+            self, entry, chunks, *, operation_id, expected_revision=None
+        ):
             del entry, chunks, operation_id
             raise failure
 
@@ -751,6 +757,8 @@ def test_remember_knowledge_omits_unconfirmed_receipt_id_from_failure_evidence(
                 receipt = KnowledgePublicationReceipt(
                     operation_id=operation_id,
                     entry_id=canary,
+                    entry_revision=1,
+                    expected_revision=None,
                     request_sha256="0" * 64,
                     entry_created_at=committed_at,
                     entry_updated_at=committed_at,
@@ -759,7 +767,9 @@ def test_remember_knowledge_omits_unconfirmed_receipt_id_from_failure_evidence(
                 self.receipts[operation_id] = receipt
             return receipt
 
-        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+        async def publish_entry_revision(
+            self, entry, chunks, *, operation_id, expected_revision=None
+        ):
             del entry, chunks, operation_id
             self.publish_calls += 1
             raise AssertionError("A prior receipt must prevent publication dispatch.")
@@ -904,6 +914,7 @@ def test_remember_knowledge_success_withholds_arguments_from_events_and_transcri
         structured = completed.payload["result"]["structured"]
         assert structured["entry"] == {
             "entry_id": stored_entry.id,
+            "revision": stored_entry.revision,
             "status": "pending",
         }
     assert [event.payload["result"]["structured"]["written"] for event in public_completed] == [
@@ -1284,18 +1295,23 @@ def test_remember_knowledge_contains_store_output_cancellation_during_validation
             return KnowledgePublicationReceipt(
                 operation_id=operation_id,
                 entry_id="forged-receipt-entry",
+                entry_revision=1,
+                expected_revision=None,
                 request_sha256="0" * 64,
                 entry_created_at=committed_at,
                 entry_updated_at=committed_at,
                 committed_at=committed_at,
             ).model_copy(update={"committed_at": hostile_datetime()})
 
-        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+        async def publish_entry_revision(
+            self, entry, chunks, *, operation_id, expected_revision=None
+        ):
             self.publish_calls += 1
-            receipt = await super().publish_entry_with_chunks(
+            receipt = await super().publish_entry_revision(
                 entry,
                 chunks,
                 operation_id=operation_id,
+                expected_revision=expected_revision,
             )
             if output_phase != "publication":
                 return receipt

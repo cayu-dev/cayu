@@ -3543,8 +3543,9 @@ compatible-result regression projection used by the dashboard and local CI.
 Server contract version 10 adds bounded provider-operation cancellation and
 accounting reconciliation state to session inspection. Server contract version
 11 replaces the independent new-run model override with one exact provider and
-model target. Clients generated against contract version 1 through 10 must
-regenerate from the current OpenAPI document.
+model target. Server contract version 12 makes the exact knowledge revision
+required on entry and chunk projections. Clients generated against contract
+version 1 through 11 must regenerate from the current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
@@ -6205,9 +6206,11 @@ Postgres full-text search with entry/chunk filters. These stores support `auto`
 and `keyword` query modes and reject semantic, hybrid, and external modes so apps
 do not mistake keyword stores for embedding or external retrieval backends.
 Each SQLite source chunk owns a stable integer key that is also its FTS5 rowid.
-Entry refresh, chunk replacement, hard deletion, and expiry pruning resolve those
-keys through the source entry/chunk index and maintain only the affected FTS rows;
-ordinary writes never scan the global FTS table by its `UNINDEXED` identifiers.
+Revision append, hard deletion, and expiry pruning resolve those keys through the
+source entry/chunk index and maintain only the affected FTS rows; ordinary writes
+never scan the global FTS table by its `UNINDEXED` identifiers. Historical rows
+remain bound to their exact entry revision, and current search joins reject them
+after the logical entry advances.
 Source and FTS changes share one SQLite writer transaction. Schema revision 37
 rebuilds legacy knowledge FTS data atomically from authoritative entry and chunk
 rows during the explicit migration step. After an interruption, the database is
@@ -6249,28 +6252,35 @@ Postgres embedding operational contract:
   derived embedding table before starting a store with the new dimensions.
 - The embedding table is derived data. Rebuilding it is safe when source
   knowledge remains in `cayu_knowledge_entries` and `cayu_knowledge_chunks`.
-- Existing keyword knowledge is not embedded implicitly at search time. Use
-  bounded `backfill_embeddings(KnowledgeListQuery(...), limit=N)` jobs to index
-  it deliberately. Repeated default backfills advance through missing/stale
-  chunks; use `refresh_existing=True` only when intentionally re-embedding
-  current rows for the configured model and dimensions. Switching to another
-  embedding model with the same dimensions is a bounded re-indexing job; switching
-  dimensions is a schema rebuild.
+- Semantic search lazily backfills a bounded set of missing embeddings inside
+  the authorized query scope so a transient write-time provider outage does not
+  permanently hide canonical knowledge. Use bounded
+  `backfill_embeddings(KnowledgeListQuery(...), limit=N)` jobs for deliberate
+  bulk indexing. Repeated default backfills advance through missing/stale chunks;
+  use `refresh_existing=True` only when intentionally re-embedding current rows
+  for the configured model and dimensions. Switching to another embedding model
+  with the same dimensions is a bounded re-indexing job; switching dimensions is
+  a schema rebuild.
 - Search embeds the query text, then searches persisted chunk vectors matching
-  the configured model, dimensions, and current chunk content hash. Updating an
-  entry or replacing chunks updates the affected vectors.
+  the configured model, dimensions, current entry revision, and chunk content
+  hash. Appending a revision derives vectors for its exact chunk set.
 - HNSW is created for `vector(N)` when `N <= 2000`, matching pgvector's HNSW
   limit for the `vector` type. Larger dimensions are valid for exact pgvector
   search, but do not get the HNSW index in this store.
 - Embedding calls are provider calls. Apps should account for provider latency,
   rate limits, retention, and billing when writing entries or running backfill.
 
-- `KnowledgeEntry`: one reusable knowledge record with `namespace`, `labels`,
+- `KnowledgeEntry`: one immutable revision snapshot of a reusable logical
+  knowledge record. Its positive `revision` (bounded by
+  `MAX_KNOWLEDGE_REVISION`) participates in identity alongside `id`; `namespace`
+  and `created_at` remain fixed across revisions. The snapshot
+  carries `labels`,
   extensible `kind`, visibility, status, source refs, audit timestamps,
   importance/confidence hints, aspects, impact targets, and metadata.
-- `KnowledgeChunk`: bounded readable chunks for long entries. Stores may keep
-  one default chunk for short entries, or replace the complete chunk set after
-  indexing a larger source. A chunk ID identifies one chunk across the entire
+- `KnowledgeChunk`: bounded readable chunks for one exact entry revision. Its
+  positive `entry_revision` must equal the owning entry revision. Stores may
+  keep one default chunk for short entries or publish a complete custom chunk
+  set with a new revision. A chunk ID identifies one chunk across the entire
   store, not merely within an entry. A write that would reuse a chunk ID owned
   by another entry fails atomically: the existing entry and chunks remain
   unchanged, and the conflicting entry is not created. Built-in in-memory,
@@ -6309,27 +6319,42 @@ closed at later redaction boundaries.
 The store contract is intentionally entry/chunk oriented:
 
 ```python
-await store.put_entry(entry)
-await store.get_entry(entry_id)
-await store.update_entry_status(entry_id, KnowledgeStatus.ARCHIVED)
-await store.transition_entry_status(
+created = await store.create_entry(entry, chunks)
+current = await store.get_entry(entry_id)
+historical = await store.get_entry(entry_id, revision=1)
+appended = await store.append_entry_revision(
+    next_entry,
+    next_chunks,
+    expected_revision=current.revision,
+)
+reviewed = await store.transition_entry_status(
     entry_id,
+    expected_revision=appended.revision,
     from_status=KnowledgeStatus.PENDING,
     to_status=KnowledgeStatus.ACTIVE,
 )
-await store.delete_entry(entry_id, hard=False)
-await store.replace_chunks(entry_id, chunks)
-await store.put_entry_with_chunks(entry, chunks)
-receipt = await store.publish_entry_with_chunks(
+await store.delete_entry(entry_id, expected_revision=reviewed.revision, hard=False)
+receipt = await store.publish_entry_revision(
     entry,
     chunks,
     operation_id="tool-attempt-identity",
+    expected_revision=None,
 )
 receipt = await store.load_entry_publication_receipt("tool-attempt-identity")
-await store.read_chunks(entry_id, chunk_index=3, around=1)
+await store.read_chunks(entry_id, revision=1, chunk_index=3, around=1)
 result = await store.search(query)
 listing = await store.list_entries(list_query)
 ```
+
+Current search/list and direct current reads authorize the current revision.
+An explicit historical entry or chunk read authorizes both the requested
+snapshot and the logical entry's current revision in one backend read boundary,
+so a tombstone or later restriction cannot be bypassed by requesting an older
+revision. A privileged audit scope can read both. Lifecycle mutation first
+authorizes the current revision. An authorized principal may retire it to
+`archived` or `deleted` without receiving read permission for that destination;
+promotion or reactivation still requires the destination status, namespace,
+labels, visibility, source, and expiration constraints to pass.
 
 Embeddings use a separate provider contract so model providers and vector stores
 do not need to share implementation details:
@@ -6380,8 +6405,9 @@ result = await indexer.index_text(
 
 Small overlap is enabled by default so important text is less likely to be split
 across chunk boundaries. `max_chunks` and byte limits keep indexing bounded.
-`skip_unchanged=True` avoids rewriting only when the stored source hash, derived
-entry metadata, and derived chunks all match the newly indexed output.
+`skip_unchanged=True` avoids appending a revision only when the stored source
+hash, derived entry metadata, and derived chunks all match the newly indexed
+output. A changed source appends exactly one successor with compare-and-swap.
 
 Apps can expose explicit agent recall by attaching a knowledge store to the
 environment and registering the built-in tools:
@@ -6417,32 +6443,34 @@ model-provided query text, structured keyword fields (`any`/`all`/`none`/
 `phrases`), and filters. It returns ranked compact previews plus entry/chunk ids;
 `preview_bytes` controls per-hit snippet size, while `max_bytes` caps the total
 tool payload.
-`read_knowledge` then expands one returned entry by `entry_id`, optional
-`chunk_index`, neighboring `around` window, chunk cap, and byte cap. These tools
+`read_knowledge` then expands one returned entry by `entry_id`, optional exact
+`revision`, `chunk_index`, neighboring `around` window, chunk cap, and byte cap. These tools
 fail as normal tool errors when the active environment has no `knowledge_store`,
 so apps explicitly choose which agents can recall durable knowledge.
 
 Apps may also register `RememberKnowledgeTool` when an agent should be allowed
-to propose new durable knowledge. The tool is create-only: it does not accept an
-`entry_id` and cannot edit, archive, or delete existing entries. It writes
+to propose new durable knowledge. The tool is proposal-only: it does not accept
+an `entry_id` and cannot arbitrarily edit, archive, or delete entries. It writes
 through `KnowledgeIndexer` and the store's operation-owned publication boundary
 so entry text, chunks, and immutable receipt evidence become visible atomically.
 The runtime tool-call idempotency key is the publication operation identity.
 Exact retries return the existing receipt; reuse with different entry or chunk
-material fails as a conflict, and an occupied deterministic entry id is never
-overwritten. Built-in memory, SQLite, and PostgreSQL stores implement this
+material fails as a conflict. A matching non-live deterministic entry advances
+through a CAS-guarded successor revision; unrelated occupied identities are
+never overwritten. Built-in memory, SQLite, and PostgreSQL stores implement this
 boundary. Existing custom stores remain importable, but `remember_knowledge`
 fails closed with a fixed, content-free error unless both owned-publication
-hooks are implemented; it never calls legacy `put_entry_with_chunks` as a
-fallback. This prevents a check-then-upsert race from overwriting an unrelated
+hooks are implemented. This prevents a check-then-write race from overwriting an unrelated
 writer that concurrently occupies the deterministic entry id.
 
-`publish_entry_with_chunks` and `load_entry_publication_receipt` are optional,
+`publish_entry_revision` and `load_entry_publication_receipt` are optional,
 non-abstract `KnowledgeStore` extension hooks. A custom implementation must
-create the entry, its complete ordered chunk set, and one immutable receipt in a
-single atomic mutation; retain the receipt across entry deletion; reject an
-occupied entry id; bind the receipt digest to the complete normalized entry and
-chunks; keep receipt operation and entry identities within 256 UTF-8 bytes; and
+create revision 1 or append exactly `expected_revision + 1`, commit its complete
+ordered chunk set, advance the current pointer, and insert one immutable receipt
+in a single atomic mutation; retain the receipt across entry deletion; reject a
+stale expected revision; bind the receipt digest to the expected revision plus
+the complete normalized entry and chunks; keep receipt operation and entry
+identities within 256 UTF-8 bytes; and
 return the same committed timestamps with `replayed=true` for an exact operation
 replay (`replayed=false` is reserved for the transaction that inserted it).
 Custom stores must call the public `prepare_knowledge_publication(...)` helper
@@ -6450,7 +6478,7 @@ before their transaction and persist the returned copied entry, ordered chunks,
 and canonical request digest. The helper is available from both `cayu` and
 `cayu.storage`; independently reproducing its serialization envelope is not part
 of the extension contract.
-The receipt is historical commit evidence: later review, chunk replacement, or
+The receipt is historical commit evidence: later review, successor publication, or
 hard deletion does not invalidate an exact replay and an old replay never
 rewrites the entry's current state. A replay reports
 `publication_replayed=true`, `written=false`, `already_known=null`, and
@@ -6458,11 +6486,20 @@ rewrites the entry's current state. A replay reports
 still exists or retains its original lifecycle status.
 Derived embedding work may occur after that source transaction and does not
 change publication ownership. A delayed derived write is admitted only while
-its source chunk identity and material still match current source state, so it
-cannot overwrite or remove embeddings produced for a newer publication.
+its source entry revision, chunk identity, and material still match current
+source state, so it cannot overwrite or remove embeddings produced for a newer publication.
 Exact source-publication replays do not redispatch derived embedding work.
-Revision 35 adds durable receipt storage and is a breaking mixed-worker boundary
-because older workers can perform unsafe identity-based compensation.
+Revision 42 introduces immutable knowledge revisions as a breaking boundary.
+Migration refuses a populated pre-42 knowledge store before changing any schema
+or data; this prerelease contract intentionally requires recreating that store
+instead of carrying a permanent legacy/backfill path. Empty databases migrate
+atomically, and memory, SQLite, and PostgreSQL expose the same behavior. SQLite
+and PostgreSQL startup validates the full revision schema—authoritative and
+auxiliary tables, columns and types, keys and bounds, foreign keys, the current
+revision view, search structures, and required indexes—rather than trusting the
+migration ledger or a small column subset. Revision advancement is bounded by
+`MAX_KNOWLEDGE_REVISION`; exhaustion fails before a lifecycle mutation or
+backend write is attempted.
 
 `RememberKnowledgePolicy` controls
 the actual stored status, namespace, visibility, required labels, and allowed
@@ -6551,9 +6588,9 @@ that can reach the provider. If the wrapped policy removes the anchor, the
 manifest and its checkpoint frame are discarded rather than being attached to a
 different message with identical content. The
 original user text and file parts remain separate and unchanged after that part.
-The manifest uses the versioned `cayu.knowledge_candidates.v1` format: valid JSON
+The manifest uses the versioned `cayu.knowledge_candidates.v2` format: valid JSON
 enclosed by `<cayu_knowledge_candidates>` / `</cayu_knowledge_candidates>` markers.
-It contains entry ids, kinds, source metadata, and bounded excerpts, plus an
+It contains entry ids, exact positive revisions, kinds, source metadata, and bounded excerpts, plus an
 explicit notice that the candidates are runtime-retrieved, potentially incomplete
 or untrusted reference data rather than the user's words or instructions. Marker
 characters inside retrieved values are JSON-escaped so retrieved content cannot

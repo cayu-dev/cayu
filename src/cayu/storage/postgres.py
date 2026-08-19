@@ -12,10 +12,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, ClassVar, Literal, LiteralString, cast
+from typing import Any, ClassVar, Literal, LiteralString, NoReturn, cast
 from uuid import uuid4
 
 try:
+    from psycopg import sql
     from psycopg.errors import (
         DeadlockDetected,
         DuplicateTable,
@@ -409,6 +410,7 @@ from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
+from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -427,24 +429,31 @@ from cayu.storage.memory import (
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
     KnowledgeQuery,
+    KnowledgeRevisionConflict,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _copy_chunks_for_revision,
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
     _knowledge_chunk_content_hash,
     _knowledge_publication_operation_id,
     _knowledge_scope_allows_snapshot,
+    _next_knowledge_revision,
     _parse_knowledge_access_snapshot_json,
     _require_knowledge_entry_access,
+    _require_knowledge_successor_access,
     _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
     _validate_knowledge_publication_replay,
+    _validate_knowledge_revision,
     _validate_nonnegative_float,
     _validate_positive_int,
+    _validate_revision_append,
+    _validate_revision_successor,
     _validate_unit_float,
     copy_knowledge_access_scope,
     copy_knowledge_chunk,
@@ -1333,6 +1342,201 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     41: (
         "ALTER TABLE cayu_knowledge_publication_receipts "
         "ADD COLUMN IF NOT EXISTS access_snapshot JSONB NOT NULL",
+    ),
+    42: (
+        # Embeddings are derived and the preflight rejects any populated table.
+        # Preserve an existing empty vector(N) table because its dimension is an
+        # application-owned schema choice that the generic storage migration
+        # cannot reconstruct. Detach it while the authoritative tables are
+        # rebuilt, then restore its canonical foreign keys below.
+        "ALTER TABLE IF EXISTS cayu_knowledge_embeddings "
+        "DROP CONSTRAINT IF EXISTS cayu_knowledge_embeddings_chunk_id_fkey",
+        "ALTER TABLE IF EXISTS cayu_knowledge_embeddings "
+        "DROP CONSTRAINT IF EXISTS cayu_knowledge_embeddings_entry_id_fkey",
+        "DROP VIEW IF EXISTS cayu_knowledge_current_entries",
+        "DROP TABLE IF EXISTS cayu_knowledge_publication_receipts",
+        "DROP TABLE IF EXISTS cayu_knowledge_chunks",
+        "DROP TABLE IF EXISTS cayu_knowledge_impact_targets",
+        "DROP TABLE IF EXISTS cayu_knowledge_aspects",
+        "DROP TABLE IF EXISTS cayu_knowledge_labels",
+        "ALTER TABLE IF EXISTS cayu_knowledge_entries "
+        "DROP CONSTRAINT IF EXISTS cayu_knowledge_entries_current_revision_fk",
+        "DROP TABLE IF EXISTS cayu_knowledge_revisions",
+        "DROP TABLE IF EXISTS cayu_knowledge_entries",
+        """
+        CREATE TABLE cayu_knowledge_entries (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            current_revision INTEGER NOT NULL
+                CHECK (current_revision > 0 AND current_revision <= 2147483647),
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE cayu_knowledge_revisions (
+            entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL CHECK (revision > 0 AND revision <= 2147483647),
+            text TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_by_type TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            source_type TEXT,
+            source_uri TEXT,
+            source_id TEXT,
+            source_hash TEXT,
+            importance DOUBLE PRECISION,
+            importance_source TEXT,
+            confidence DOUBLE PRECISION,
+            last_used_at TIMESTAMPTZ,
+            expires_at TIMESTAMPTZ,
+            title TEXT,
+            metadata JSONB NOT NULL,
+            PRIMARY KEY (entry_id, revision)
+        )
+        """,
+        """
+        ALTER TABLE cayu_knowledge_entries
+        ADD CONSTRAINT cayu_knowledge_entries_current_revision_fk
+        FOREIGN KEY (id, current_revision)
+        REFERENCES cayu_knowledge_revisions(entry_id, revision)
+        DEFERRABLE INITIALLY DEFERRED
+        """,
+        """
+        CREATE TABLE cayu_knowledge_labels (
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (entry_id, entry_revision, key),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE cayu_knowledge_aspects (
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL,
+            aspect TEXT NOT NULL,
+            PRIMARY KEY (entry_id, entry_revision, aspect),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE cayu_knowledge_impact_targets (
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL,
+            impact_target TEXT NOT NULL,
+            PRIMARY KEY (entry_id, entry_revision, impact_target),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE cayu_knowledge_chunks (
+            id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+            text TEXT NOT NULL,
+            content_hash TEXT,
+            source_uri TEXT,
+            metadata JSONB NOT NULL,
+            UNIQUE (entry_id, entry_revision, chunk_index),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        )
+        """,
+        "ALTER TABLE IF EXISTS cayu_knowledge_embeddings "
+        "ADD CONSTRAINT cayu_knowledge_embeddings_chunk_id_fkey "
+        "FOREIGN KEY (chunk_id) REFERENCES cayu_knowledge_chunks(id) ON DELETE CASCADE",
+        "ALTER TABLE IF EXISTS cayu_knowledge_embeddings "
+        "ADD CONSTRAINT cayu_knowledge_embeddings_entry_id_fkey "
+        "FOREIGN KEY (entry_id) REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE",
+        """
+        CREATE TABLE cayu_knowledge_publication_receipts (
+            operation_id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            expected_revision INTEGER
+                CHECK (expected_revision > 0 AND expected_revision <= 2147483647),
+            request_sha256 TEXT NOT NULL,
+            entry_created_at TIMESTAMPTZ NOT NULL,
+            entry_updated_at TIMESTAMPTZ NOT NULL,
+            committed_at TIMESTAMPTZ NOT NULL,
+            access_snapshot JSONB NOT NULL,
+            CHECK (
+                (expected_revision IS NULL AND entry_revision = 1)
+                OR entry_revision = expected_revision + 1
+            )
+        )
+        """,
+        """
+        CREATE VIEW cayu_knowledge_current_entries AS
+        SELECT
+            logical.id AS id,
+            revision.revision AS revision,
+            logical.namespace AS namespace,
+            revision.text,
+            revision.kind,
+            revision.visibility,
+            revision.status,
+            revision.created_by_type,
+            revision.created_by,
+            revision.created_at,
+            revision.updated_at,
+            revision.source_type,
+            revision.source_uri,
+            revision.source_id,
+            revision.source_hash,
+            revision.importance,
+            revision.importance_source,
+            revision.confidence,
+            revision.last_used_at,
+            revision.expires_at,
+            revision.title,
+            revision.metadata
+        FROM cayu_knowledge_entries AS logical
+        JOIN cayu_knowledge_revisions AS revision
+          ON revision.entry_id = logical.id
+         AND revision.revision = logical.current_revision
+        """,
+        "CREATE INDEX idx_cayu_knowledge_entries_namespace_current "
+        "ON cayu_knowledge_entries(namespace, current_revision, id)",
+        "CREATE INDEX idx_cayu_knowledge_revisions_status "
+        "ON cayu_knowledge_revisions(status, entry_id, revision)",
+        "CREATE INDEX idx_cayu_knowledge_revisions_kind "
+        "ON cayu_knowledge_revisions(kind, entry_id, revision)",
+        "CREATE INDEX idx_cayu_knowledge_revisions_visibility "
+        "ON cayu_knowledge_revisions(visibility, entry_id, revision)",
+        "CREATE INDEX idx_cayu_knowledge_revisions_source "
+        "ON cayu_knowledge_revisions(source_type, source_id, entry_id, revision)",
+        "CREATE INDEX idx_cayu_knowledge_revisions_expires_at "
+        "ON cayu_knowledge_revisions(expires_at, entry_id, revision)",
+        "CREATE INDEX idx_cayu_knowledge_revisions_title_fts "
+        "ON cayu_knowledge_revisions USING GIN "
+        "(to_tsvector('simple', COALESCE(title, '')))",
+        "CREATE INDEX idx_cayu_knowledge_revisions_text_fts "
+        "ON cayu_knowledge_revisions USING GIN (to_tsvector('simple', text))",
+        "CREATE INDEX idx_cayu_knowledge_labels_key_value_entry "
+        "ON cayu_knowledge_labels(key, value, entry_id, entry_revision)",
+        "CREATE INDEX idx_cayu_knowledge_aspects_aspect_entry "
+        "ON cayu_knowledge_aspects(aspect, entry_id, entry_revision)",
+        "CREATE INDEX idx_cayu_knowledge_impact_targets_target_entry "
+        "ON cayu_knowledge_impact_targets(impact_target, entry_id, entry_revision)",
+        "CREATE INDEX idx_cayu_knowledge_chunks_entry_revision_index "
+        "ON cayu_knowledge_chunks(entry_id, entry_revision, chunk_index)",
+        "CREATE INDEX idx_cayu_knowledge_chunks_text_fts "
+        "ON cayu_knowledge_chunks USING GIN (to_tsvector('simple', text))",
+        "CREATE INDEX idx_cayu_knowledge_publication_receipts_entry_revision "
+        "ON cayu_knowledge_publication_receipts(entry_id, entry_revision)",
     ),
 }
 
@@ -2304,6 +2508,35 @@ async def _reject_populated_pre_knowledge_access_snapshot_database(cur: Any) -> 
         )
 
 
+async def _reject_populated_pre_knowledge_revision_database(cur: Any) -> None:
+    candidates = (
+        "cayu_knowledge_entries",
+        "cayu_knowledge_labels",
+        "cayu_knowledge_aspects",
+        "cayu_knowledge_impact_targets",
+        "cayu_knowledge_chunks",
+        "cayu_knowledge_publication_receipts",
+        "cayu_knowledge_embeddings",
+    )
+    counts: dict[str, int] = {}
+    for table in candidates:
+        await cur.execute("SELECT to_regclass(%s)", (table,))
+        registered = await cur.fetchone()
+        if registered is None or registered[0] is None:
+            continue
+        await cur.execute(
+            sql.SQL("SELECT EXISTS(SELECT 1 FROM {} LIMIT 1)").format(sql.Identifier(table))
+        )
+        row = await cur.fetchone()
+        counts[table] = 1 if row is not None and row[0] is True else 0
+    if not counts:
+        return
+    require_empty_knowledge_revision_transition(
+        counts,
+        required_tables=counts,
+    )
+
+
 async def _transcript_cursor(cur: Any, session_id: str) -> int:
     """Return the permanent next transcript position, independent of retention."""
 
@@ -2529,6 +2762,10 @@ class _PostgresStoreBase:
                         and any(revision.revision == 41 for revision in schema.pending(current))
                     ):
                         await _reject_populated_pre_knowledge_access_snapshot_database(cur)
+                    if current < 42 and any(
+                        revision.revision == 42 for revision in schema.pending(current)
+                    ):
+                        await _reject_populated_pre_knowledge_revision_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -2548,6 +2785,8 @@ class _PostgresStoreBase:
                             await self._validate_task_invocation_column(cur)
                         if self._min_required_revision >= 41:
                             await self._validate_knowledge_publication_access_snapshot_column(cur)
+                        if self._min_required_revision >= 42:
+                            await self._validate_knowledge_revision_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -2692,6 +2931,10 @@ class _PostgresStoreBase:
             await self._validate_task_terminalization_receipt_table(cur)
         if self._min_required_revision >= 39:
             await self._validate_task_invocation_column(cur)
+        if self._min_required_revision >= 41:
+            await self._validate_knowledge_publication_access_snapshot_column(cur)
+        if self._min_required_revision >= 42:
+            await self._validate_knowledge_revision_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -2762,6 +3005,8 @@ class _PostgresStoreBase:
             await self._validate_task_invocation_column(cur)
         if revision.revision == 41:
             await self._validate_knowledge_publication_access_snapshot_column(cur)
+        if revision.revision == 42:
+            await self._validate_knowledge_revision_schema(cur)
 
     async def _validate_knowledge_publication_access_snapshot_column(
         self,
@@ -2783,6 +3028,390 @@ class _PostgresStoreBase:
                 "with Cayu's knowledge authorization contract. Recreate the Cayu "
                 "database from a known-good revision-41 schema."
             )
+
+    async def _validate_knowledge_revision_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_knowledge_entries": (
+                ("id", "text", "NO"),
+                ("namespace", "text", "NO"),
+                ("current_revision", "integer", "NO"),
+                ("created_at", "timestamp with time zone", "NO"),
+                ("updated_at", "timestamp with time zone", "NO"),
+            ),
+            "cayu_knowledge_revisions": (
+                ("entry_id", "text", "NO"),
+                ("revision", "integer", "NO"),
+                ("text", "text", "NO"),
+                ("kind", "text", "NO"),
+                ("visibility", "text", "NO"),
+                ("status", "text", "NO"),
+                ("created_by_type", "text", "NO"),
+                ("created_by", "text", "NO"),
+                ("created_at", "timestamp with time zone", "NO"),
+                ("updated_at", "timestamp with time zone", "NO"),
+                ("source_type", "text", "YES"),
+                ("source_uri", "text", "YES"),
+                ("source_id", "text", "YES"),
+                ("source_hash", "text", "YES"),
+                ("importance", "double precision", "YES"),
+                ("importance_source", "text", "YES"),
+                ("confidence", "double precision", "YES"),
+                ("last_used_at", "timestamp with time zone", "YES"),
+                ("expires_at", "timestamp with time zone", "YES"),
+                ("title", "text", "YES"),
+                ("metadata", "jsonb", "NO"),
+            ),
+            "cayu_knowledge_labels": (
+                ("entry_id", "text", "NO"),
+                ("entry_revision", "integer", "NO"),
+                ("key", "text", "NO"),
+                ("value", "text", "NO"),
+            ),
+            "cayu_knowledge_aspects": (
+                ("entry_id", "text", "NO"),
+                ("entry_revision", "integer", "NO"),
+                ("aspect", "text", "NO"),
+            ),
+            "cayu_knowledge_impact_targets": (
+                ("entry_id", "text", "NO"),
+                ("entry_revision", "integer", "NO"),
+                ("impact_target", "text", "NO"),
+            ),
+            "cayu_knowledge_chunks": (
+                ("id", "text", "NO"),
+                ("entry_id", "text", "NO"),
+                ("entry_revision", "integer", "NO"),
+                ("chunk_index", "integer", "NO"),
+                ("text", "text", "NO"),
+                ("content_hash", "text", "YES"),
+                ("source_uri", "text", "YES"),
+                ("metadata", "jsonb", "NO"),
+            ),
+            "cayu_knowledge_publication_receipts": (
+                ("operation_id", "text", "NO"),
+                ("entry_id", "text", "NO"),
+                ("entry_revision", "integer", "NO"),
+                ("expected_revision", "integer", "YES"),
+                ("request_sha256", "text", "NO"),
+                ("entry_created_at", "timestamp with time zone", "NO"),
+                ("entry_updated_at", "timestamp with time zone", "NO"),
+                ("committed_at", "timestamp with time zone", "NO"),
+                ("access_snapshot", "jsonb", "NO"),
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_name, column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = ANY(%s)
+            ORDER BY table_name, ordinal_position
+            """,
+            (list(expected_columns),),
+        )
+        actual_columns: dict[str, list[tuple[str, str, str]]] = {}
+        for table, column, data_type, nullable in await cur.fetchall():
+            actual_columns.setdefault(str(table), []).append(
+                (str(column), str(data_type), str(nullable))
+            )
+        for table, columns in expected_columns.items():
+            if tuple(actual_columns.get(table, ())) != columns:
+                self._raise_knowledge_revision_schema_error(table)
+
+        expected_view_columns = (
+            "id",
+            "revision",
+            "namespace",
+            "text",
+            "kind",
+            "visibility",
+            "status",
+            "created_by_type",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "source_type",
+            "source_uri",
+            "source_id",
+            "source_hash",
+            "importance",
+            "importance_source",
+            "confidence",
+            "last_used_at",
+            "expires_at",
+            "title",
+            "metadata",
+        )
+        await cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_knowledge_current_entries'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(str(row[0]) for row in await cur.fetchall()) != expected_view_columns:
+            self._raise_knowledge_revision_schema_error("cayu_knowledge_current_entries")
+        await cur.execute(
+            """
+            SELECT pg_get_viewdef(view_record.oid, TRUE)
+            FROM pg_catalog.pg_class AS view_record
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = view_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND view_record.relname = 'cayu_knowledge_current_entries'
+              AND view_record.relkind = 'v'
+            """
+        )
+        view_row = await cur.fetchone()
+        view_sql = " ".join(str(view_row[0]).lower().split()) if view_row is not None else ""
+        if (
+            "cayu_knowledge_entries logical" not in view_sql
+            or "cayu_knowledge_revisions revision" not in view_sql
+            or "revision.revision = logical.current_revision" not in view_sql
+        ):
+            self._raise_knowledge_revision_schema_error("cayu_knowledge_current_entries")
+
+        expected_constraints: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+            "cayu_knowledge_entries": (
+                ("p", ("primary key (id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (id, current_revision)",
+                        "references cayu_knowledge_revisions(entry_id, revision)",
+                        "deferrable initially deferred",
+                    ),
+                ),
+                ("c", ("current_revision", "> 0", "2147483647")),
+            ),
+            "cayu_knowledge_revisions": (
+                ("p", ("primary key (entry_id, revision)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (entry_id)",
+                        "references cayu_knowledge_entries(id)",
+                        "on delete cascade",
+                    ),
+                ),
+                ("c", ("revision", "> 0", "2147483647")),
+            ),
+            "cayu_knowledge_labels": (
+                ("p", ("primary key (entry_id, entry_revision, key)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (entry_id, entry_revision)",
+                        "references cayu_knowledge_revisions(entry_id, revision)",
+                        "on delete cascade",
+                    ),
+                ),
+            ),
+            "cayu_knowledge_aspects": (
+                ("p", ("primary key (entry_id, entry_revision, aspect)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (entry_id, entry_revision)",
+                        "references cayu_knowledge_revisions(entry_id, revision)",
+                        "on delete cascade",
+                    ),
+                ),
+            ),
+            "cayu_knowledge_impact_targets": (
+                ("p", ("primary key (entry_id, entry_revision, impact_target)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (entry_id, entry_revision)",
+                        "references cayu_knowledge_revisions(entry_id, revision)",
+                        "on delete cascade",
+                    ),
+                ),
+            ),
+            "cayu_knowledge_chunks": (
+                ("p", ("primary key (id)",)),
+                ("u", ("unique (entry_id, entry_revision, chunk_index)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (entry_id, entry_revision)",
+                        "references cayu_knowledge_revisions(entry_id, revision)",
+                        "on delete cascade",
+                    ),
+                ),
+                ("c", ("entry_revision", "> 0", "2147483647")),
+                ("c", ("chunk_index", ">= 0")),
+            ),
+            "cayu_knowledge_publication_receipts": (
+                ("p", ("primary key (operation_id)",)),
+                ("c", ("entry_revision", "> 0", "2147483647")),
+                ("c", ("expected_revision", "> 0", "2147483647")),
+                (
+                    "c",
+                    (
+                        "expected_revision is null",
+                        "entry_revision = 1",
+                        "entry_revision = (expected_revision + 1)",
+                    ),
+                ),
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_record.relname,
+                   constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = ANY(%s)
+            ORDER BY table_record.relname, constraint_record.contype,
+                     constraint_record.conname
+            """,
+            (list(expected_constraints),),
+        )
+        actual_constraints: dict[str, list[tuple[str, str]]] = {}
+        for table, constraint_type, definition in await cur.fetchall():
+            actual_constraints.setdefault(str(table), []).append(
+                (
+                    str(constraint_type),
+                    " ".join(str(definition).lower().split()),
+                )
+            )
+        for table, expected in expected_constraints.items():
+            remaining = list(actual_constraints.get(table, ()))
+            for constraint_type, fragments in expected:
+                match = next(
+                    (
+                        candidate
+                        for candidate in remaining
+                        if candidate[0] == constraint_type
+                        and all(fragment in candidate[1] for fragment in fragments)
+                    ),
+                    None,
+                )
+                if match is None:
+                    self._raise_knowledge_revision_schema_error(table)
+                remaining.remove(match)
+            if remaining:
+                self._raise_knowledge_revision_schema_error(table)
+
+        expected_indexes = {
+            "idx_cayu_knowledge_entries_namespace_current": (
+                "cayu_knowledge_entries",
+                "using btree (namespace, current_revision, id)",
+            ),
+            "idx_cayu_knowledge_revisions_status": (
+                "cayu_knowledge_revisions",
+                "using btree (status, entry_id, revision)",
+            ),
+            "idx_cayu_knowledge_revisions_kind": (
+                "cayu_knowledge_revisions",
+                "using btree (kind, entry_id, revision)",
+            ),
+            "idx_cayu_knowledge_revisions_visibility": (
+                "cayu_knowledge_revisions",
+                "using btree (visibility, entry_id, revision)",
+            ),
+            "idx_cayu_knowledge_revisions_source": (
+                "cayu_knowledge_revisions",
+                "using btree (source_type, source_id, entry_id, revision)",
+            ),
+            "idx_cayu_knowledge_revisions_expires_at": (
+                "cayu_knowledge_revisions",
+                "using btree (expires_at, entry_id, revision)",
+            ),
+            "idx_cayu_knowledge_revisions_title_fts": (
+                "cayu_knowledge_revisions",
+                "using gin",
+                "to_tsvector",
+                "title",
+            ),
+            "idx_cayu_knowledge_revisions_text_fts": (
+                "cayu_knowledge_revisions",
+                "using gin",
+                "to_tsvector",
+                "text",
+            ),
+            "idx_cayu_knowledge_labels_key_value_entry": (
+                "cayu_knowledge_labels",
+                "using btree (key, value, entry_id, entry_revision)",
+            ),
+            "idx_cayu_knowledge_aspects_aspect_entry": (
+                "cayu_knowledge_aspects",
+                "using btree (aspect, entry_id, entry_revision)",
+            ),
+            "idx_cayu_knowledge_impact_targets_target_entry": (
+                "cayu_knowledge_impact_targets",
+                "using btree (impact_target, entry_id, entry_revision)",
+            ),
+            "idx_cayu_knowledge_chunks_entry_revision_index": (
+                "cayu_knowledge_chunks",
+                "using btree (entry_id, entry_revision, chunk_index)",
+            ),
+            "idx_cayu_knowledge_chunks_text_fts": (
+                "cayu_knowledge_chunks",
+                "using gin",
+                "to_tsvector",
+                "text",
+            ),
+            "idx_cayu_knowledge_publication_receipts_entry_revision": (
+                "cayu_knowledge_publication_receipts",
+                "using btree (entry_id, entry_revision)",
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_record.relname,
+                   index_record.relname,
+                   index_state.indisvalid,
+                   index_state.indisready,
+                   pg_get_indexdef(index_record.oid)
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND index_record.relname = ANY(%s)
+            """,
+            (list(expected_indexes),),
+        )
+        actual_indexes = {
+            str(index): (
+                str(table),
+                bool(valid),
+                bool(ready),
+                " ".join(str(definition).lower().split()),
+            )
+            for table, index, valid, ready, definition in await cur.fetchall()
+        }
+        for index, fragments in expected_indexes.items():
+            actual = actual_indexes.get(index)
+            if (
+                actual is None
+                or actual[0] != fragments[0]
+                or not actual[1]
+                or not actual[2]
+                or any(fragment not in actual[3] for fragment in fragments[1:])
+            ):
+                self._raise_knowledge_revision_schema_error(index)
+
+    @staticmethod
+    def _raise_knowledge_revision_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            f"Postgres schema object {name!r} conflicts with Cayu's "
+            "revision-first knowledge contract. Recreate the Cayu database "
+            "from a known-good revision-42 schema."
+        )
 
     async def _validate_task_terminalization_receipt_table(self, cur: Any) -> None:
         await cur.execute(
@@ -3068,6 +3697,8 @@ class _PostgresStoreBase:
             and any(revision.revision == 41 for revision in schema.pending(current))
         ):
             await _reject_populated_pre_knowledge_access_snapshot_database(cur)
+        if current < 42 and any(revision.revision == 42 for revision in schema.pending(current)):
+            await _reject_populated_pre_knowledge_revision_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -4631,7 +5262,7 @@ async def _begin_knowledge_read_snapshot(cur: Any) -> None:
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
-    _min_required_revision = 41
+    _min_required_revision = 42
 
     def __init__(
         self,
@@ -4656,51 +5287,85 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             read_only=read_only,
         )
 
-    async def put_entry(
+    async def create_entry(
         self,
         entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
-        _require_knowledge_entry_access(scope, entry, operation="put_entry")
+        _validate_revision_append(entry, expected_revision=None)
+        _require_knowledge_entry_access(scope, entry, operation="create_entry")
+        copied_chunks = (
+            [_default_chunk_for_entry(entry)]
+            if chunks is None
+            else _copy_knowledge_entry_chunks(entry.id, entry.revision, chunks)
+        )
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    default_chunk = _default_chunk_for_entry(entry)
+                    # Every mutation acquires identity categories in the same
+                    # order: operation (when present), entry, then chunks.
+                    # Appends sometimes discover inherited chunk ids only after
+                    # locking/loading the current entry, so combining categories
+                    # here would permit an entry/chunk advisory-lock deadlock.
+                    await _lock_knowledge_entry(cur, entry.id)
                     await _lock_knowledge_write_identities(
-                        cur,
-                        entry_ids=(entry.id,),
-                        chunk_ids=(default_chunk.id,),
+                        cur, chunk_ids=tuple(chunk.id for chunk in copied_chunks)
                     )
                     existing_entry = await self._load_entry(cur, entry.id)
                     if existing_entry is not None:
                         _require_knowledge_entry_access(
                             scope,
                             existing_entry,
-                            operation="put_entry",
+                            operation="create_entry",
                         )
-                    existing_chunks = await self._load_chunks(cur, entry.id)
-                    if (
-                        existing_entry is None
-                        or not existing_chunks
-                        or _knowledge_has_only_default_chunk(existing_entry, existing_chunks)
-                    ):
-                        replacement_chunks = [default_chunk]
-                        await self._require_chunk_ids_available(
-                            cur,
+                        raise KnowledgeRevisionConflict(
                             entry.id,
-                            replacement_chunks,
-                            access_scope=scope,
-                            operation="put_entry",
+                            expected_revision=None,
+                            actual_revision=existing_entry.revision,
                         )
-                    else:
-                        replacement_chunks = None
-                    await self._upsert_entry(cur, entry)
-                    if replacement_chunks is not None:
-                        await self._replace_chunks(cur, entry.id, replacement_chunks)
+                    await self._require_chunk_ids_available(
+                        cur,
+                        copied_chunks,
+                        access_scope=scope,
+                        operation="create_entry",
+                    )
+                    await self._insert_entry(cur, entry)
+                    await self._insert_chunks(cur, entry, copied_chunks)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return copy_knowledge_entry(entry)
+
+    async def append_entry_revision(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
+        entry = copy_knowledge_entry(entry)
+        _validate_revision_append(entry, expected_revision=expected_revision)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await _lock_knowledge_entry(cur, entry.id)
+                    await self._append_revision(
+                        cur,
+                        entry,
+                        expected_revision=expected_revision,
+                        chunks=chunks,
+                        access_scope=scope,
+                        operation="append_entry_revision",
+                    )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4711,59 +5376,28 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         entry_id: str,
         *,
+        revision: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
+        if revision is not None:
+            _validate_knowledge_revision(revision, "revision")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
-            return await self._load_entry_in_scope(cur, entry_id, scope)
-
-    async def update_entry_status(
-        self,
-        entry_id: str,
-        status: KnowledgeStatus,
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        scope = self._operation_access_scope(access_scope)
-        entry_id = require_clean_nonblank(entry_id, "entry_id")
-        if not isinstance(status, KnowledgeStatus):
-            raise ValueError("status must be a KnowledgeStatus.")
-        await self._ensure_ready()
-        async with self._pool.connection() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    await _lock_knowledge_entry(cur, entry_id)
-                    entry = await self._load_entry(cur, entry_id)
-                    if entry is None:
-                        raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
-                    _require_knowledge_entry_access(scope, entry, operation="update_entry_status")
-                    target = entry.model_copy(update={"status": status})
-                    _require_knowledge_entry_access(scope, target, operation="update_entry_status")
-                    updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
-                    await cur.execute(
-                        """
-                        UPDATE cayu_knowledge_entries
-                        SET status = %s, updated_at = %s
-                        WHERE id = %s
-                        """,
-                        (str(status), pg_support.to_utc(updated_at), entry_id),
-                    )
-                    loaded = await self._load_entry(cur, entry_id)
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
-        if loaded is None:
-            raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
-        return loaded
+            return await self._load_entry_in_scope(
+                cur,
+                entry_id,
+                scope,
+                revision=revision,
+            )
 
     async def transition_entry_status(
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope | None = None,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
@@ -4772,6 +5406,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
+        _validate_knowledge_revision(expected_revision, "expected_revision")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
         if not isinstance(to_status, KnowledgeStatus):
@@ -4782,80 +5417,58 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             else None
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
-        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(scope)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_entry(cur, entry_id)
-                    scope_clauses: list[str] = []
-                    scope_params: list[object] = []
-                    if expected_namespace is not None:
-                        scope_clauses.append("e.namespace = %s")
-                        scope_params.append(expected_namespace)
-                    for key, value in expected_labels.items():
-                        scope_clauses.append(
-                            """
-                            EXISTS (
-                                SELECT 1
-                                FROM cayu_knowledge_labels AS label
-                                WHERE label.entry_id = e.id
-                                  AND label.key = %s
-                                  AND label.value = %s
-                            )
-                            """
-                        )
-                        scope_params.extend([key, value])
-                    scope_sql = "".join(f" AND {clause}" for clause in scope_clauses)
-                    update_sql = cast(
-                        "LiteralString",
-                        f"""
-                        UPDATE cayu_knowledge_entries AS e
-                        SET status = %s, updated_at = GREATEST(NOW(), created_at, updated_at)
-                        WHERE e.id = %s AND e.status = %s
-                        {scope_sql}
-                        {access_sql}
-                        """,
+                    entry = await self._load_entry(cur, entry_id)
+                    if entry is None:
+                        raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+                    _require_knowledge_entry_access(
+                        scope,
+                        entry,
+                        operation="transition_entry_status",
                     )
-                    await cur.execute(
-                        update_sql,
-                        (
-                            str(to_status),
+                    if entry.revision != expected_revision:
+                        raise KnowledgeRevisionConflict(
                             entry_id,
-                            str(from_status),
-                            *scope_params,
-                            *access_params,
-                        ),
-                    )
-                    if cur.rowcount != 1:
-                        entry = await self._load_entry(cur, entry_id)
-                        if entry is None:
-                            raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
-                        _require_knowledge_entry_access(
-                            scope,
-                            entry,
-                            operation="transition_entry_status",
+                            expected_revision=expected_revision,
+                            actual_revision=entry.revision,
                         )
-                        if expected_namespace is not None and entry.namespace != expected_namespace:
+                    if expected_namespace is not None and entry.namespace != expected_namespace:
+                        raise ValueError(
+                            f"Knowledge entry {entry_id!r} does not match expected namespace."
+                        )
+                    for key, value in expected_labels.items():
+                        if entry.labels.get(key) != value:
                             raise ValueError(
-                                f"Knowledge entry {entry_id!r} does not match expected namespace."
+                                f"Knowledge entry {entry_id!r} does not match expected labels."
                             )
-                        for key, value in expected_labels.items():
-                            if entry.labels.get(key) != value:
-                                raise ValueError(
-                                    f"Knowledge entry {entry_id!r} does not match expected labels."
-                                )
+                    if entry.status is not from_status:
                         raise ValueError(
                             f"Knowledge entry {entry_id!r} is {entry.status.value!r}, "
                             f"not {from_status.value!r}."
                         )
-                    loaded = await self._load_entry(cur, entry_id)
-                    if loaded is not None:
-                        _require_knowledge_entry_access(
-                            scope,
-                            loaded,
-                            operation="transition_entry_status",
-                        )
+                    loaded = entry.model_copy(
+                        update={
+                            "revision": _next_knowledge_revision(expected_revision),
+                            "status": to_status,
+                            "updated_at": max(
+                                datetime.now(UTC),
+                                entry.created_at,
+                                entry.updated_at,
+                            ),
+                        }
+                    )
+                    await self._append_revision(
+                        cur,
+                        loaded,
+                        expected_revision=expected_revision,
+                        chunks=None,
+                        access_scope=scope,
+                        operation="transition_entry_status",
+                    )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4868,11 +5481,15 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
+        _validate_knowledge_revision(expected_revision, "expected_revision")
+        if type(hard) is not bool:
+            raise ValueError("`hard` must be a boolean.")
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -4883,6 +5500,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         await conn.commit()
                         return None
                     _require_knowledge_entry_access(scope, entry, operation="delete_entry")
+                    if entry.revision != expected_revision:
+                        raise KnowledgeRevisionConflict(
+                            entry_id,
+                            expected_revision=expected_revision,
+                            actual_revision=entry.revision,
+                        )
                     if hard:
                         await cur.execute(
                             "DELETE FROM cayu_knowledge_entries WHERE id = %s",
@@ -4890,17 +5513,25 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         )
                         await conn.commit()
                         return copy_knowledge_entry(entry)
-                    target = entry.model_copy(update={"status": KnowledgeStatus.DELETED})
-                    _require_knowledge_entry_access(scope, target, operation="delete_entry")
-                    await cur.execute(
-                        """
-                        UPDATE cayu_knowledge_entries
-                        SET status = %s, updated_at = GREATEST(NOW(), created_at, updated_at)
-                        WHERE id = %s
-                        """,
-                        (str(KnowledgeStatus.DELETED), entry_id),
+                    loaded = entry.model_copy(
+                        update={
+                            "revision": _next_knowledge_revision(expected_revision),
+                            "status": KnowledgeStatus.DELETED,
+                            "updated_at": max(
+                                datetime.now(UTC),
+                                entry.created_at,
+                                entry.updated_at,
+                            ),
+                        }
                     )
-                    loaded = await self._load_entry(cur, entry_id)
+                    await self._append_revision(
+                        cur,
+                        loaded,
+                        expected_revision=expected_revision,
+                        chunks=None,
+                        access_scope=scope,
+                        operation="delete_entry",
+                    )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4930,8 +5561,10 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     await cur.execute(
                         cast(
                             "LiteralString",
-                            "DELETE FROM cayu_knowledge_entries AS e "
-                            "WHERE expires_at IS NOT NULL AND expires_at <= %s "
+                            "DELETE FROM cayu_knowledge_entries AS logical "
+                            "USING cayu_knowledge_current_entries AS e "
+                            "WHERE logical.id = e.id "
+                            "AND e.expires_at IS NOT NULL AND e.expires_at <= %s "
                             f"{access_sql}",
                         ),
                         (cutoff, *access_params),
@@ -4943,107 +5576,31 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise
         return pruned
 
-    async def replace_chunks(
-        self,
-        entry_id: str,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> list[KnowledgeChunk]:
-        scope = self._operation_access_scope(access_scope)
-        entry_id = require_clean_nonblank(entry_id, "entry_id")
-        copied_chunks = _copy_knowledge_entry_chunks(entry_id, chunks)
-        await self._ensure_ready()
-        async with self._pool.connection() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    await _lock_knowledge_write_identities(
-                        cur,
-                        entry_ids=(entry_id,),
-                        chunk_ids=tuple(chunk.id for chunk in copied_chunks),
-                    )
-                    entry = await self._load_entry(cur, entry_id)
-                    if entry is None:
-                        raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
-                    _require_knowledge_entry_access(scope, entry, operation="replace_chunks")
-                    await self._require_chunk_ids_available(
-                        cur,
-                        entry_id,
-                        copied_chunks,
-                        access_scope=scope,
-                        operation="replace_chunks",
-                    )
-                    await self._replace_chunks(cur, entry_id, copied_chunks)
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
-        return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
-
-    async def put_entry_with_chunks(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        scope = self._operation_access_scope(access_scope)
-        entry = copy_knowledge_entry(entry)
-        _require_knowledge_entry_access(scope, entry, operation="put_entry_with_chunks")
-        copied_chunks = _copy_knowledge_entry_chunks(entry.id, chunks)
-        await self._ensure_ready()
-        async with self._pool.connection() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    await _lock_knowledge_write_identities(
-                        cur,
-                        entry_ids=(entry.id,),
-                        chunk_ids=tuple(chunk.id for chunk in copied_chunks),
-                    )
-                    existing_entry = await self._load_entry(cur, entry.id)
-                    if existing_entry is not None:
-                        _require_knowledge_entry_access(
-                            scope,
-                            existing_entry,
-                            operation="put_entry_with_chunks",
-                        )
-                    await self._require_chunk_ids_available(
-                        cur,
-                        entry.id,
-                        copied_chunks,
-                        access_scope=scope,
-                        operation="put_entry_with_chunks",
-                    )
-                    await self._upsert_entry(cur, entry)
-                    await self._replace_chunks(cur, entry.id, copied_chunks)
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
-        return copy_knowledge_entry(entry)
-
-    async def publish_entry_with_chunks(
+    async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
+        expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
         operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
-            entry, chunks, operation_id=operation_id
+            entry,
+            chunks,
+            operation_id=operation_id,
+            expected_revision=expected_revision,
         )
-        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_with_chunks")
+        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await _lock_knowledge_write_identities(cur, operation_ids=(operation_id,))
+                    await _lock_knowledge_entry(cur, copied_entry.id)
                     await _lock_knowledge_write_identities(
-                        cur,
-                        entry_ids=(copied_entry.id,),
-                        chunk_ids=tuple(chunk.id for chunk in copied_chunks),
-                        operation_ids=(operation_id,),
+                        cur, chunk_ids=tuple(chunk.id for chunk in copied_chunks)
                     )
                     existing_receipt = await self._load_publication_receipt(
                         cur,
@@ -5066,26 +5623,44 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         _require_knowledge_entry_access(
                             scope,
                             existing_entry,
-                            operation="publish_entry_with_chunks",
+                            operation="publish_entry_revision",
                         )
-                        raise KnowledgePublicationConflict("entry_occupied")
+                    actual_revision = None if existing_entry is None else existing_entry.revision
+                    if actual_revision != expected_revision:
+                        raise KnowledgeRevisionConflict(
+                            copied_entry.id,
+                            expected_revision=expected_revision,
+                            actual_revision=actual_revision,
+                        )
+                    if existing_entry is not None:
+                        _validate_revision_successor(existing_entry, copied_entry)
                     await self._require_chunk_ids_available(
                         cur,
-                        copied_entry.id,
                         copied_chunks,
                         access_scope=scope,
-                        operation="publish_entry_with_chunks",
+                        operation="publish_entry_revision",
                     )
                     receipt = KnowledgePublicationReceipt(
                         operation_id=operation_id,
                         entry_id=copied_entry.id,
+                        entry_revision=copied_entry.revision,
+                        expected_revision=expected_revision,
                         request_sha256=request_sha256,
                         entry_created_at=copied_entry.created_at,
                         entry_updated_at=copied_entry.updated_at,
                         committed_at=datetime.now(UTC),
                     )
-                    await self._insert_entry(cur, copied_entry)
-                    await self._replace_chunks(cur, copied_entry.id, copied_chunks)
+                    if existing_entry is None:
+                        await self._insert_entry(cur, copied_entry)
+                    else:
+                        assert expected_revision is not None
+                        await self._insert_revision(cur, copied_entry)
+                        await self._advance_current_revision(
+                            cur,
+                            copied_entry,
+                            expected_revision=expected_revision,
+                        )
+                    await self._insert_chunks(cur, copied_entry, copied_chunks)
                     await self._insert_publication_receipt(cur, receipt, copied_entry)
                 await conn.commit()
                 return copy_knowledge_publication_receipt(receipt)
@@ -5113,6 +5688,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         entry_id: str,
         *,
+        revision: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         chunk_index: int | None = None,
         around: int = 0,
@@ -5121,6 +5697,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     ) -> list[KnowledgeChunk]:
         scope = self._operation_access_scope(access_scope)
         entry_id = require_clean_nonblank(entry_id, "entry_id")
+        if revision is not None:
+            _validate_knowledge_revision(revision, "revision")
         if chunk_index is not None:
             _validate_knowledge_nonnegative_int(chunk_index, "chunk_index")
         _validate_knowledge_nonnegative_int(around, "around")
@@ -5131,9 +5709,15 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
-            if await self._load_entry_in_scope(cur, entry_id, scope) is None:
+            entry = await self._load_entry_in_scope(
+                cur,
+                entry_id,
+                scope,
+                revision=revision,
+            )
+            if entry is None:
                 return []
-            chunks = await self._load_chunks(cur, entry_id)
+            chunks = await self._load_chunks(cur, entry_id, revision=entry.revision)
         if chunk_index is not None:
             chunks = _center_knowledge_chunk_window(
                 chunks,
@@ -5230,7 +5814,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     "LiteralString",
                     f"""
                     SELECT e.id
-                    FROM cayu_knowledge_entries AS e
+                    FROM cayu_knowledge_current_entries AS e
                     WHERE TRUE
                     {where_sql}
                     ORDER BY COALESCE(e.importance, 0.0) DESC,
@@ -5257,67 +5841,34 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             total_entries_known=total_entries_known,
         )
 
-    async def _upsert_entry(self, cur: Any, entry: KnowledgeEntry) -> None:
-        await cur.execute(
-            """
-            INSERT INTO cayu_knowledge_entries (
-                id,
-                namespace,
-                text,
-                kind,
-                visibility,
-                status,
-                created_by_type,
-                created_by,
-                created_at,
-                updated_at,
-                source_type,
-                source_uri,
-                source_id,
-                source_hash,
-                importance,
-                importance_source,
-                confidence,
-                last_used_at,
-                expires_at,
-                title,
-                metadata
-            )
-            VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-            ON CONFLICT (id) DO UPDATE SET
-                namespace = excluded.namespace,
-                text = excluded.text,
-                kind = excluded.kind,
-                visibility = excluded.visibility,
-                status = excluded.status,
-                created_by_type = excluded.created_by_type,
-                created_by = excluded.created_by,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                source_type = excluded.source_type,
-                source_uri = excluded.source_uri,
-                source_id = excluded.source_id,
-                source_hash = excluded.source_hash,
-                importance = excluded.importance,
-                importance_source = excluded.importance_source,
-                confidence = excluded.confidence,
-                last_used_at = excluded.last_used_at,
-                expires_at = excluded.expires_at,
-                title = excluded.title,
-                metadata = excluded.metadata
-            """,
-            _knowledge_entry_row_values(entry),
-        )
-        await self._replace_entry_lists(cur, entry)
-
     async def _insert_entry(self, cur: Any, entry: KnowledgeEntry) -> None:
         await cur.execute(
             """
             INSERT INTO cayu_knowledge_entries (
                 id,
                 namespace,
+                current_revision,
+                created_at,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                entry.id,
+                entry.namespace,
+                entry.revision,
+                pg_support.to_utc(entry.created_at),
+                pg_support.to_utc(entry.updated_at),
+            ),
+        )
+        await self._insert_revision(cur, entry)
+
+    async def _insert_revision(self, cur: Any, entry: KnowledgeEntry) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_revisions (
+                entry_id,
+                revision,
                 text,
                 kind,
                 visibility,
@@ -5345,7 +5896,123 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             """,
             _knowledge_entry_row_values(entry),
         )
-        await self._replace_entry_lists(cur, entry)
+        if entry.labels:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_labels (entry_id, entry_revision, key, value)
+                VALUES (%s, %s, %s, %s)
+                """,
+                [
+                    (entry.id, entry.revision, key, value)
+                    for key, value in sorted(entry.labels.items())
+                ],
+            )
+        if entry.aspects:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_aspects (entry_id, entry_revision, aspect)
+                VALUES (%s, %s, %s)
+                """,
+                [(entry.id, entry.revision, aspect) for aspect in entry.aspects],
+            )
+        if entry.impact_targets:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_impact_targets (
+                    entry_id, entry_revision, impact_target
+                )
+                VALUES (%s, %s, %s)
+                """,
+                [(entry.id, entry.revision, target) for target in entry.impact_targets],
+            )
+
+    async def _advance_current_revision(
+        self,
+        cur: Any,
+        entry: KnowledgeEntry,
+        *,
+        expected_revision: int,
+    ) -> None:
+        await cur.execute(
+            """
+            UPDATE cayu_knowledge_entries
+            SET current_revision = %s, updated_at = %s
+            WHERE id = %s AND current_revision = %s
+            """,
+            (
+                entry.revision,
+                pg_support.to_utc(entry.updated_at),
+                entry.id,
+                expected_revision,
+            ),
+        )
+        if cur.rowcount != 1:
+            current = await self._load_entry(cur, entry.id)
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=None if current is None else current.revision,
+            )
+
+    async def _append_revision(
+        self,
+        cur: Any,
+        entry: KnowledgeEntry,
+        *,
+        expected_revision: int,
+        chunks: list[KnowledgeChunk] | None,
+        access_scope: KnowledgeAccessScope,
+        operation: str,
+    ) -> None:
+        _validate_revision_append(entry, expected_revision=expected_revision)
+        current = await self._load_entry(cur, entry.id)
+        if current is None:
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=None,
+            )
+        _require_knowledge_entry_access(access_scope, current, operation=operation)
+        if current.revision != expected_revision:
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=current.revision,
+            )
+        _validate_revision_successor(current, entry)
+        _require_knowledge_successor_access(access_scope, entry, operation=operation)
+        previous_chunks = await self._load_chunks(
+            cur,
+            entry.id,
+            revision=current.revision,
+        )
+        if chunks is not None:
+            copied_chunks = _copy_knowledge_entry_chunks(
+                entry.id,
+                entry.revision,
+                chunks,
+            )
+        elif _knowledge_has_only_default_chunk(current, previous_chunks):
+            copied_chunks = [_default_chunk_for_entry(entry)]
+        else:
+            copied_chunks = _copy_chunks_for_revision(previous_chunks, entry)
+        await _lock_knowledge_write_identities(
+            cur,
+            chunk_ids=tuple(chunk.id for chunk in copied_chunks),
+        )
+        await self._require_chunk_ids_available(
+            cur,
+            copied_chunks,
+            access_scope=access_scope,
+            operation=operation,
+        )
+        await self._insert_revision(cur, entry)
+        await self._insert_chunks(cur, entry, copied_chunks)
+        await self._advance_current_revision(
+            cur,
+            entry,
+            expected_revision=expected_revision,
+        )
 
     async def _load_publication_receipt(
         self,
@@ -5359,6 +6026,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             SELECT
                 operation_id,
                 entry_id,
+                entry_revision,
+                expected_revision,
                 request_sha256,
                 entry_created_at,
                 entry_updated_at,
@@ -5373,19 +6042,21 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if row is None:
             return None
         try:
-            snapshot = _parse_knowledge_access_snapshot_json(row[6])
+            snapshot = _parse_knowledge_access_snapshot_json(row[8])
             receipt = KnowledgePublicationReceipt(
                 operation_id=row[0],
                 entry_id=row[1],
-                request_sha256=row[2],
-                entry_created_at=row[3],
-                entry_updated_at=row[4],
-                committed_at=row[5],
+                entry_revision=row[2],
+                expected_revision=row[3],
+                request_sha256=row[4],
+                entry_created_at=row[5],
+                entry_updated_at=row[6],
+                committed_at=row[7],
             )
         except Exception:
             raise KnowledgePublicationConflict("malformed_receipt") from None
         if not _knowledge_scope_allows_snapshot(access_scope, snapshot):
-            raise KnowledgeAccessDenied("publish_entry_with_chunks")
+            raise KnowledgeAccessDenied("publish_entry_revision")
         return receipt
 
     async def _load_publication_receipt_in_scope(
@@ -5399,6 +6070,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             SELECT
                 operation_id,
                 entry_id,
+                entry_revision,
+                expected_revision,
                 request_sha256,
                 entry_created_at,
                 entry_updated_at,
@@ -5413,16 +6086,18 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if row is None:
             return None
         try:
-            snapshot = _parse_knowledge_access_snapshot_json(row[6])
+            snapshot = _parse_knowledge_access_snapshot_json(row[8])
             if not _knowledge_scope_allows_snapshot(access_scope, snapshot):
                 return None
             return KnowledgePublicationReceipt(
                 operation_id=row[0],
                 entry_id=row[1],
-                request_sha256=row[2],
-                entry_created_at=row[3],
-                entry_updated_at=row[4],
-                committed_at=row[5],
+                entry_revision=row[2],
+                expected_revision=row[3],
+                request_sha256=row[4],
+                entry_created_at=row[5],
+                entry_updated_at=row[6],
+                committed_at=row[7],
             )
         except Exception:
             raise KnowledgePublicationConflict("malformed_receipt") from None
@@ -5438,17 +6113,21 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             INSERT INTO cayu_knowledge_publication_receipts (
                 operation_id,
                 entry_id,
+                entry_revision,
+                expected_revision,
                 request_sha256,
                 entry_created_at,
                 entry_updated_at,
                 committed_at,
                 access_snapshot
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             """,
             (
                 receipt.operation_id,
                 receipt.entry_id,
+                receipt.entry_revision,
+                receipt.expected_revision,
                 receipt.request_sha256,
                 receipt.entry_created_at,
                 receipt.entry_updated_at,
@@ -5457,57 +6136,25 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             ),
         )
 
-    async def _replace_entry_lists(self, cur: Any, entry: KnowledgeEntry) -> None:
-        for table in (
-            "cayu_knowledge_labels",
-            "cayu_knowledge_aspects",
-            "cayu_knowledge_impact_targets",
-        ):
-            await cur.execute(f"DELETE FROM {table} WHERE entry_id = %s", (entry.id,))
-        if entry.labels:
-            await cur.executemany(
-                """
-                INSERT INTO cayu_knowledge_labels (entry_id, key, value)
-                VALUES (%s, %s, %s)
-                """,
-                [(entry.id, key, value) for key, value in sorted(entry.labels.items())],
-            )
-        if entry.aspects:
-            await cur.executemany(
-                """
-                INSERT INTO cayu_knowledge_aspects (entry_id, aspect)
-                VALUES (%s, %s)
-                """,
-                [(entry.id, aspect) for aspect in entry.aspects],
-            )
-        if entry.impact_targets:
-            await cur.executemany(
-                """
-                INSERT INTO cayu_knowledge_impact_targets (entry_id, impact_target)
-                VALUES (%s, %s)
-                """,
-                [(entry.id, target) for target in entry.impact_targets],
-            )
-
-    async def _replace_chunks(
+    async def _insert_chunks(
         self,
         cur: Any,
-        entry_id: str,
+        entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
     ) -> None:
-        await cur.execute("DELETE FROM cayu_knowledge_chunks WHERE entry_id = %s", (entry_id,))
         await cur.executemany(
             """
             INSERT INTO cayu_knowledge_chunks (
                 id,
                 entry_id,
+                entry_revision,
                 chunk_index,
                 text,
                 content_hash,
                 source_uri,
                 metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             [_knowledge_chunk_row_values(chunk) for chunk in chunks],
         )
@@ -5515,7 +6162,6 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     async def _require_chunk_ids_available(
         self,
         cur: Any,
-        entry_id: str,
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope,
@@ -5530,13 +6176,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 WITH occupied AS (
                     SELECT DISTINCT entry_id
                     FROM cayu_knowledge_chunks
-                    WHERE id = ANY(%s) AND entry_id <> %s
+                    WHERE id = ANY(%s)
                 )
                 SELECT
                     occupied.entry_id,
                     EXISTS (
                         SELECT 1
-                        FROM cayu_knowledge_entries AS e
+                        FROM cayu_knowledge_current_entries AS e
                         WHERE e.id = occupied.entry_id
                         {access_sql}
                     ) AS authorized
@@ -5544,7 +6190,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 ORDER BY occupied.entry_id
                 """,
             ),
-            (proposed_ids, entry_id, *access_params),
+            (proposed_ids, *access_params),
         )
         occupied = [(str(row[0]), bool(row[1])) for row in await cur.fetchall()]
         if any(not authorized for _, authorized in occupied):
@@ -5552,11 +6198,19 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if occupied:
             raise KnowledgeChunkConflict(operation)
 
-    async def _load_entry(self, cur: Any, entry_id: str) -> KnowledgeEntry | None:
-        await cur.execute(
-            """
+    async def _load_entry(
+        self,
+        cur: Any,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+    ) -> KnowledgeEntry | None:
+        if revision is None:
+            await cur.execute(
+                """
             SELECT
                 id,
+                revision,
                 namespace,
                 text,
                 kind,
@@ -5577,19 +6231,57 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 expires_at,
                 title,
                 metadata
-            FROM cayu_knowledge_entries
+            FROM cayu_knowledge_current_entries
             WHERE id = %s
-            """,
-            (entry_id,),
-        )
+                """,
+                (entry_id,),
+            )
+        else:
+            await cur.execute(
+                """
+                SELECT
+                    logical.id,
+                    revision.revision,
+                    logical.namespace,
+                    revision.text,
+                    revision.kind,
+                    revision.visibility,
+                    revision.status,
+                    revision.created_by_type,
+                    revision.created_by,
+                    revision.created_at,
+                    revision.updated_at,
+                    revision.source_type,
+                    revision.source_uri,
+                    revision.source_id,
+                    revision.source_hash,
+                    revision.importance,
+                    revision.importance_source,
+                    revision.confidence,
+                    revision.last_used_at,
+                    revision.expires_at,
+                    revision.title,
+                    revision.metadata
+                FROM cayu_knowledge_entries AS logical
+                JOIN cayu_knowledge_revisions AS revision
+                  ON revision.entry_id = logical.id
+                WHERE logical.id = %s AND revision.revision = %s
+                """,
+                (entry_id, revision),
+            )
         row = await cur.fetchone()
         if row is None:
             return None
+        selected_revision = int(row[1])
         return _knowledge_entry_from_row(
             row,
-            labels=await self._load_labels(cur, entry_id),
-            aspects=await self._load_aspects(cur, entry_id),
-            impact_targets=await self._load_impact_targets(cur, entry_id),
+            labels=await self._load_labels(cur, entry_id, selected_revision),
+            aspects=await self._load_aspects(cur, entry_id, selected_revision),
+            impact_targets=await self._load_impact_targets(
+                cur,
+                entry_id,
+                selected_revision,
+            ),
         )
 
     async def _load_entry_in_scope(
@@ -5597,55 +6289,100 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         cur: Any,
         entry_id: str,
         access_scope: KnowledgeAccessScope,
+        *,
+        revision: int | None = None,
     ) -> KnowledgeEntry | None:
-        where_sql, params = _postgres_knowledge_access_scope_filter_sql(access_scope)
-        await cur.execute(
-            cast(
-                "LiteralString",
-                f"""
-                SELECT
-                    e.id,
-                    e.namespace,
-                    e.text,
-                    e.kind,
-                    e.visibility,
-                    e.status,
-                    e.created_by_type,
-                    e.created_by,
-                    e.created_at,
-                    e.updated_at,
-                    e.source_type,
-                    e.source_uri,
-                    e.source_id,
-                    e.source_hash,
-                    e.importance,
-                    e.importance_source,
-                    e.confidence,
-                    e.last_used_at,
-                    e.expires_at,
-                    e.title,
-                    e.metadata
-                FROM cayu_knowledge_entries AS e
-                WHERE e.id = %s
-                {where_sql}
-                """,
-            ),
-            (entry_id, *params),
+        access_now = datetime.now(UTC)
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(
+            access_scope,
+            now=access_now,
         )
+        if revision is None:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT e.*
+                    FROM cayu_knowledge_current_entries AS e
+                    WHERE e.id = %s
+                    {access_sql}
+                    """,
+                ),
+                (entry_id, *access_params),
+            )
+        else:
+            current_access_sql, current_access_params = _postgres_knowledge_access_scope_filter_sql(
+                access_scope,
+                entry_alias="current_entry",
+                now=access_now,
+            )
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT e.*
+                    FROM (
+                        SELECT
+                            logical.id AS id,
+                            stored.revision AS revision,
+                            logical.namespace AS namespace,
+                            stored.text AS text,
+                            stored.kind AS kind,
+                            stored.visibility AS visibility,
+                            stored.status AS status,
+                            stored.created_by_type AS created_by_type,
+                            stored.created_by AS created_by,
+                            stored.created_at AS created_at,
+                            stored.updated_at AS updated_at,
+                            stored.source_type AS source_type,
+                            stored.source_uri AS source_uri,
+                            stored.source_id AS source_id,
+                            stored.source_hash AS source_hash,
+                            stored.importance AS importance,
+                            stored.importance_source AS importance_source,
+                            stored.confidence AS confidence,
+                            stored.last_used_at AS last_used_at,
+                            stored.expires_at AS expires_at,
+                            stored.title AS title,
+                            stored.metadata AS metadata
+                        FROM cayu_knowledge_entries AS logical
+                        JOIN cayu_knowledge_revisions AS stored
+                          ON stored.entry_id = logical.id
+                        WHERE logical.id = %s AND stored.revision = %s
+                    ) AS e
+                    JOIN cayu_knowledge_current_entries AS current_entry
+                      ON current_entry.id = e.id
+                    WHERE TRUE
+                    {access_sql}
+                    {current_access_sql}
+                    """,
+                ),
+                (
+                    entry_id,
+                    revision,
+                    *access_params,
+                    *current_access_params,
+                ),
+            )
         row = await cur.fetchone()
         if row is None:
             return None
+        selected_revision = int(row[1])
         return _knowledge_entry_from_row(
             row,
-            labels=await self._load_labels(cur, entry_id),
-            aspects=await self._load_aspects(cur, entry_id),
-            impact_targets=await self._load_impact_targets(cur, entry_id),
+            labels=await self._load_labels(cur, entry_id, selected_revision),
+            aspects=await self._load_aspects(cur, entry_id, selected_revision),
+            impact_targets=await self._load_impact_targets(
+                cur,
+                entry_id,
+                selected_revision,
+            ),
         )
 
     async def _load_chunk(self, cur: Any, chunk_id: str) -> KnowledgeChunk | None:
         await cur.execute(
             """
-            SELECT id, entry_id, chunk_index, text, content_hash, source_uri, metadata
+            SELECT id, entry_id, entry_revision, chunk_index, text, content_hash, source_uri, metadata
             FROM cayu_knowledge_chunks
             WHERE id = %s
             """,
@@ -5656,51 +6393,62 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return None
         return _knowledge_chunk_from_row(row)
 
-    async def _load_chunks(self, cur: Any, entry_id: str) -> list[KnowledgeChunk]:
+    async def _load_chunks(
+        self,
+        cur: Any,
+        entry_id: str,
+        *,
+        revision: int,
+    ) -> list[KnowledgeChunk]:
         await cur.execute(
             """
-            SELECT id, entry_id, chunk_index, text, content_hash, source_uri, metadata
+            SELECT id, entry_id, entry_revision, chunk_index, text, content_hash, source_uri, metadata
             FROM cayu_knowledge_chunks
-            WHERE entry_id = %s
+            WHERE entry_id = %s AND entry_revision = %s
             ORDER BY chunk_index ASC
             """,
-            (entry_id,),
+            (entry_id, revision),
         )
         return [_knowledge_chunk_from_row(row) for row in await cur.fetchall()]
 
-    async def _load_labels(self, cur: Any, entry_id: str) -> dict[str, str]:
+    async def _load_labels(self, cur: Any, entry_id: str, revision: int) -> dict[str, str]:
         await cur.execute(
             """
             SELECT key, value
             FROM cayu_knowledge_labels
-            WHERE entry_id = %s
+            WHERE entry_id = %s AND entry_revision = %s
             ORDER BY key ASC
             """,
-            (entry_id,),
+            (entry_id, revision),
         )
         return {row[0]: row[1] for row in await cur.fetchall()}
 
-    async def _load_aspects(self, cur: Any, entry_id: str) -> list[str]:
+    async def _load_aspects(self, cur: Any, entry_id: str, revision: int) -> list[str]:
         await cur.execute(
             """
             SELECT aspect
             FROM cayu_knowledge_aspects
-            WHERE entry_id = %s
+            WHERE entry_id = %s AND entry_revision = %s
             ORDER BY aspect ASC
             """,
-            (entry_id,),
+            (entry_id, revision),
         )
         return [row[0] for row in await cur.fetchall()]
 
-    async def _load_impact_targets(self, cur: Any, entry_id: str) -> list[str]:
+    async def _load_impact_targets(
+        self,
+        cur: Any,
+        entry_id: str,
+        revision: int,
+    ) -> list[str]:
         await cur.execute(
             """
             SELECT impact_target
             FROM cayu_knowledge_impact_targets
-            WHERE entry_id = %s
+            WHERE entry_id = %s AND entry_revision = %s
             ORDER BY impact_target ASC
             """,
-            (entry_id,),
+            (entry_id, revision),
         )
         return [row[0] for row in await cur.fetchall()]
 
@@ -5716,6 +6464,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             """
             SELECT
                 id,
+                revision,
                 namespace,
                 text,
                 kind,
@@ -5736,7 +6485,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 expires_at,
                 title,
                 metadata
-            FROM cayu_knowledge_entries
+            FROM cayu_knowledge_current_entries
             WHERE id = ANY(%s)
             """,
             (unique_ids,),
@@ -5765,7 +6514,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return {}
         await cur.execute(
             """
-            SELECT id, entry_id, chunk_index, text, content_hash, source_uri, metadata
+            SELECT id, entry_id, entry_revision, chunk_index, text, content_hash, source_uri, metadata
             FROM cayu_knowledge_chunks
             WHERE id = ANY(%s)
             """,
@@ -5783,10 +6532,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return {}
         await cur.execute(
             """
-            SELECT entry_id, COUNT(*)
-            FROM cayu_knowledge_chunks
-            WHERE entry_id = ANY(%s)
-            GROUP BY entry_id
+            SELECT chunk.entry_id, COUNT(*)
+            FROM cayu_knowledge_chunks AS chunk
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = chunk.entry_id
+             AND logical.current_revision = chunk.entry_revision
+            WHERE chunk.entry_id = ANY(%s)
+            GROUP BY chunk.entry_id
             """,
             (unique_ids,),
         )
@@ -5801,10 +6553,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return {}
         await cur.execute(
             """
-            SELECT entry_id, key, value
-            FROM cayu_knowledge_labels
-            WHERE entry_id = ANY(%s)
-            ORDER BY entry_id ASC, key ASC
+            SELECT label.entry_id, label.key, label.value
+            FROM cayu_knowledge_labels AS label
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = label.entry_id
+             AND logical.current_revision = label.entry_revision
+            WHERE label.entry_id = ANY(%s)
+            ORDER BY label.entry_id ASC, label.key ASC
             """,
             (entry_ids,),
         )
@@ -5822,10 +6577,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return {}
         await cur.execute(
             """
-            SELECT entry_id, aspect
-            FROM cayu_knowledge_aspects
-            WHERE entry_id = ANY(%s)
-            ORDER BY entry_id ASC, aspect ASC
+            SELECT aspect.entry_id, aspect.aspect
+            FROM cayu_knowledge_aspects AS aspect
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = aspect.entry_id
+             AND logical.current_revision = aspect.entry_revision
+            WHERE aspect.entry_id = ANY(%s)
+            ORDER BY aspect.entry_id ASC, aspect.aspect ASC
             """,
             (entry_ids,),
         )
@@ -5843,10 +6601,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return {}
         await cur.execute(
             """
-            SELECT entry_id, impact_target
-            FROM cayu_knowledge_impact_targets
-            WHERE entry_id = ANY(%s)
-            ORDER BY entry_id ASC, impact_target ASC
+            SELECT target.entry_id, target.impact_target
+            FROM cayu_knowledge_impact_targets AS target
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = target.entry_id
+             AND logical.current_revision = target.entry_revision
+            WHERE target.entry_id = ANY(%s)
+            ORDER BY target.entry_id ASC, target.impact_target ASC
             """,
             (entry_ids,),
         )
@@ -5866,7 +6627,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             f"""
             SELECT COUNT(DISTINCT e.id)
             FROM cayu_knowledge_chunks AS c
-            JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
+            JOIN cayu_knowledge_current_entries AS e
+              ON e.id = c.entry_id AND e.revision = c.entry_revision
             WHERE {search_filter_sql}
             {where_sql}
             """,
@@ -5899,7 +6661,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         to_tsquery('simple', %s)
                     ) AS score
                 FROM cayu_knowledge_chunks AS c
-                JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
+                JOIN cayu_knowledge_current_entries AS e
+                  ON e.id = c.entry_id AND e.revision = c.entry_revision
                 WHERE {search_filter_sql}
                 {where_sql}
                 ORDER BY score DESC,
@@ -5986,7 +6749,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         await cur.execute(
             f"""
             SELECT COUNT(*)
-            FROM cayu_knowledge_entries AS e
+            FROM cayu_knowledge_current_entries AS e
             WHERE TRUE
             {where_sql}
             """,
@@ -6135,75 +6898,124 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             await self._reconcile_embedding_schema()
             self._embedding_schema_ready = True
 
-    async def put_entry(
+    async def create_entry(
         self,
         entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
-        stored = await super().put_entry(entry, access_scope=scope)
-        await self._embed_entry_chunks_best_effort(stored.id, access_scope=scope)
+        stored = await super().create_entry(
+            entry,
+            access_scope=scope,
+            chunks=chunks,
+        )
+        await self._embed_entry_chunks_best_effort(
+            stored.id,
+            stored.revision,
+            access_scope=scope,
+        )
         return stored
 
-    async def publish_entry_with_chunks(
+    async def append_entry_revision(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
+        stored = await super().append_entry_revision(
+            entry,
+            expected_revision=expected_revision,
+            access_scope=scope,
+            chunks=chunks,
+        )
+        await self._embed_entry_chunks_best_effort(
+            stored.id,
+            stored.revision,
+            access_scope=scope,
+        )
+        return stored
+
+    async def transition_entry_status(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+        from_status: KnowledgeStatus,
+        to_status: KnowledgeStatus,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
+        stored = await super().transition_entry_status(
+            entry_id,
+            expected_revision=expected_revision,
+            access_scope=scope,
+            from_status=from_status,
+            to_status=to_status,
+            expected_namespace=expected_namespace,
+            expected_labels=expected_labels,
+        )
+        await self._embed_entry_chunks_best_effort(
+            stored.id,
+            stored.revision,
+            access_scope=scope,
+        )
+        return stored
+
+    async def delete_entry(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+        hard: bool = False,
+    ) -> KnowledgeEntry | None:
+        scope = self._operation_access_scope(access_scope)
+        stored = await super().delete_entry(
+            entry_id,
+            expected_revision=expected_revision,
+            access_scope=scope,
+            hard=hard,
+        )
+        if stored is not None and not hard:
+            await self._embed_entry_chunks_best_effort(
+                stored.id,
+                stored.revision,
+                access_scope=scope,
+            )
+        return stored
+
+    async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
+        expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
-        receipt = await super().publish_entry_with_chunks(
+        receipt = await super().publish_entry_revision(
             entry,
             chunks,
             access_scope=scope,
             operation_id=operation_id,
+            expected_revision=expected_revision,
         )
         if receipt.replayed:
             return receipt
-        # Owned publication exposes a bounded post-commit warning through the
-        # remember tool when derived work fails. Legacy writes retain their
-        # established best-effort behavior below.
-        await self._embed_entry_chunks(receipt.entry_id, access_scope=scope)
+        await self._embed_entry_chunks(
+            receipt.entry_id,
+            receipt.entry_revision,
+            access_scope=scope,
+        )
         return receipt
-
-    async def replace_chunks(
-        self,
-        entry_id: str,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> list[KnowledgeChunk]:
-        scope = self._operation_access_scope(access_scope)
-        stored_chunks = await super().replace_chunks(
-            entry_id,
-            chunks,
-            access_scope=scope,
-        )
-        await self._embed_entry_chunks_best_effort(
-            entry_id,
-            access_scope=scope,
-            chunks=stored_chunks,
-        )
-        return stored_chunks
-
-    async def put_entry_with_chunks(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        scope = self._operation_access_scope(access_scope)
-        stored = await super().put_entry_with_chunks(
-            entry,
-            chunks,
-            access_scope=scope,
-        )
-        await self._embed_entry_chunks_best_effort(stored.id, access_scope=scope)
-        return stored
 
     async def backfill_embeddings(
         self,
@@ -6530,7 +7342,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     FROM cayu_knowledge_embeddings AS emb
                     JOIN cayu_knowledge_chunks AS c
                       ON c.id = emb.chunk_id AND c.entry_id = emb.entry_id
-                    JOIN cayu_knowledge_entries AS e ON e.id = emb.entry_id
+                    JOIN cayu_knowledge_current_entries AS e
+                      ON e.id = emb.entry_id AND e.revision = c.entry_revision
                     WHERE emb.model = %s
                       AND emb.dimensions = %s
                       AND emb.embedding_space_version = %s
@@ -6633,9 +7446,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 cast(
                     "LiteralString",
                     f"""
-                    SELECT c.id, c.entry_id, c.chunk_index, c.text, c.content_hash, c.source_uri, c.metadata
+                    SELECT c.id, c.entry_id, c.entry_revision, c.chunk_index,
+                           c.text, c.content_hash, c.source_uri, c.metadata
                     FROM cayu_knowledge_chunks AS c
-                    JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
+                    JOIN cayu_knowledge_current_entries AS e
+                      ON e.id = c.entry_id AND e.revision = c.entry_revision
                     {current_embedding_join_sql}
                     WHERE TRUE
                     {where_sql}
@@ -6680,7 +7495,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             preview_text = chunk.text
             score_normalized = normalized_score if semantic_matched else None
             if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
-                chunks = await self._load_chunks(cur, entry.id)
+                chunks = await self._load_chunks(
+                    cur,
+                    entry.id,
+                    revision=entry.revision,
+                )
                 keyword_score, keyword_chunk, keyword_reason, keyword_preview = _score_entry(
                     entry,
                     chunks,
@@ -6758,6 +7577,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
     async def _embed_entry_chunks(
         self,
         entry_id: str,
+        revision: int,
         *,
         access_scope: KnowledgeAccessScope,
         chunks: list[KnowledgeChunk] | None = None,
@@ -6765,16 +7585,25 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            if await self._load_entry_in_scope(cur, entry_id, scope) is None:
+            if (
+                await self._load_entry_in_scope(
+                    cur,
+                    entry_id,
+                    scope,
+                    revision=revision,
+                )
+                is None
+            ):
                 return
             if chunks is None:
-                chunks = await self._load_chunks(cur, entry_id)
+                chunks = await self._load_chunks(cur, entry_id, revision=revision)
         await self._embed_chunks(chunks)
         await self._drop_stale_entry_embeddings(entry_id)
 
     async def _embed_entry_chunks_best_effort(
         self,
         entry_id: str,
+        revision: int,
         *,
         access_scope: KnowledgeAccessScope,
         chunks: list[KnowledgeChunk] | None = None,
@@ -6790,6 +7619,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         try:
             await self._embed_entry_chunks(
                 entry_id,
+                revision,
                 access_scope=access_scope,
                 chunks=chunks,
             )
@@ -6978,6 +7808,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                   AND NOT EXISTS (
                       SELECT 1
                       FROM cayu_knowledge_chunks AS current_chunk
+                      JOIN cayu_knowledge_entries AS logical
+                        ON logical.id = current_chunk.entry_id
+                       AND logical.current_revision = current_chunk.entry_revision
                       WHERE current_chunk.id = embedding.chunk_id
                         AND current_chunk.entry_id = embedding.entry_id
                   )
@@ -16690,7 +17523,7 @@ def _decode_model_completion_stage_record(value: Any) -> dict[str, Any]:
 def _knowledge_entry_row_values(entry: KnowledgeEntry) -> tuple[object, ...]:
     return (
         entry.id,
-        entry.namespace,
+        entry.revision,
         entry.text,
         entry.kind,
         str(entry.visibility),
@@ -16722,29 +17555,30 @@ def _knowledge_entry_from_row(
 ) -> KnowledgeEntry:
     return KnowledgeEntry(
         id=row[0],
-        namespace=row[1],
-        text=row[2],
-        kind=row[3],
-        visibility=KnowledgeVisibility(row[4]),
-        status=KnowledgeStatus(row[5]),
-        created_by_type=KnowledgeActorType(row[6]),
-        created_by=row[7],
-        created_at=pg_support.to_utc(row[8]),
-        updated_at=pg_support.to_utc(row[9]),
-        source_type=row[10],
-        source_uri=row[11],
-        source_id=row[12],
-        source_hash=row[13],
-        importance=row[14],
-        importance_source=row[15],
-        confidence=row[16],
-        last_used_at=pg_support.to_utc_optional(row[17]),
-        expires_at=pg_support.to_utc_optional(row[18]),
-        title=row[19],
+        revision=row[1],
+        namespace=row[2],
+        text=row[3],
+        kind=row[4],
+        visibility=KnowledgeVisibility(row[5]),
+        status=KnowledgeStatus(row[6]),
+        created_by_type=KnowledgeActorType(row[7]),
+        created_by=row[8],
+        created_at=pg_support.to_utc(row[9]),
+        updated_at=pg_support.to_utc(row[10]),
+        source_type=row[11],
+        source_uri=row[12],
+        source_id=row[13],
+        source_hash=row[14],
+        importance=row[15],
+        importance_source=row[16],
+        confidence=row[17],
+        last_used_at=pg_support.to_utc_optional(row[18]),
+        expires_at=pg_support.to_utc_optional(row[19]),
+        title=row[20],
         labels=labels,
         aspects=aspects,
         impact_targets=impact_targets,
-        metadata=_json_obj(row[20]),
+        metadata=_json_obj(row[21]),
     )
 
 
@@ -16752,6 +17586,7 @@ def _knowledge_chunk_row_values(chunk: KnowledgeChunk) -> tuple[object, ...]:
     return (
         chunk.id,
         chunk.entry_id,
+        chunk.entry_revision,
         chunk.chunk_index,
         chunk.text,
         chunk.content_hash,
@@ -16764,16 +17599,18 @@ def _knowledge_chunk_from_row(row: tuple[Any, ...]) -> KnowledgeChunk:
     return KnowledgeChunk(
         id=row[0],
         entry_id=row[1],
-        chunk_index=row[2],
-        text=row[3],
-        content_hash=row[4],
-        source_uri=row[5],
-        metadata=_json_obj(row[6]),
+        entry_revision=row[2],
+        chunk_index=row[3],
+        text=row[4],
+        content_hash=row[5],
+        source_uri=row[6],
+        metadata=_json_obj(row[7]),
     )
 
 
 def _copy_knowledge_entry_chunks(
     entry_id: str,
+    entry_revision: int,
     chunks: list[KnowledgeChunk],
 ) -> list[KnowledgeChunk]:
     if type(chunks) is not list:
@@ -16786,6 +17623,8 @@ def _copy_knowledge_entry_chunks(
     for chunk in copied_chunks:
         if chunk.entry_id != entry_id:
             raise ValueError("Knowledge chunks must belong to the entry.")
+        if chunk.entry_revision != entry_revision:
+            raise ValueError("Knowledge chunks must belong to the exact entry revision.")
         if chunk.id in seen_ids:
             raise ValueError("Knowledge chunk ids must be unique within an entry.")
         if chunk.chunk_index in seen_indexes:
@@ -16852,41 +17691,47 @@ def _postgres_knowledge_list_filter_sql(
 def _postgres_knowledge_access_scope_filter_sql(
     scope: KnowledgeAccessScope,
     *,
+    entry_alias: str = "e",
     now: datetime | None = None,
 ) -> tuple[str, list[object]]:
+    if entry_alias not in {"e", "current_entry"}:
+        raise ValueError("Unsupported knowledge access-filter alias.")
     clauses: list[str] = []
     params: list[object] = []
     if not scope.allow_all_namespaces:
-        clauses.append("e.namespace = ANY(%s)")
+        clauses.append(f"{entry_alias}.namespace = ANY(%s)")
         params.append(list(scope.allowed_namespaces))
     for key, value in scope.required_labels.items():
         clauses.append(
-            """
+            f"""
             EXISTS (
                 SELECT 1
                 FROM cayu_knowledge_labels AS access_label
-                WHERE access_label.entry_id = e.id
+                WHERE access_label.entry_id = {entry_alias}.id
+                  AND access_label.entry_revision = {entry_alias}.revision
                   AND access_label.key = %s
                   AND access_label.value = %s
             )
             """
         )
         params.extend([key, value])
-    clauses.append("e.visibility = ANY(%s)")
+    clauses.append(f"{entry_alias}.visibility = ANY(%s)")
     params.append([str(visibility) for visibility in scope.allowed_visibilities])
-    clauses.append("e.status = ANY(%s)")
+    clauses.append(f"{entry_alias}.status = ANY(%s)")
     params.append([str(status) for status in scope.allowed_statuses])
     if scope.allowed_source_types is not None:
-        clauses.append("e.source_type = ANY(%s)")
+        clauses.append(f"{entry_alias}.source_type = ANY(%s)")
         params.append(list(scope.allowed_source_types))
     if scope.allowed_source_ids is not None:
-        clauses.append("e.source_id = ANY(%s)")
+        clauses.append(f"{entry_alias}.source_id = ANY(%s)")
         params.append(list(scope.allowed_source_ids))
     if not scope.include_expired:
         if now is None:
-            clauses.append("(e.expires_at IS NULL OR e.expires_at > NOW())")
+            clauses.append(
+                f"({entry_alias}.expires_at IS NULL OR {entry_alias}.expires_at > NOW())"
+            )
         else:
-            clauses.append("(e.expires_at IS NULL OR e.expires_at > %s)")
+            clauses.append(f"({entry_alias}.expires_at IS NULL OR {entry_alias}.expires_at > %s)")
             params.append(now)
     return " AND " + " AND ".join(clauses), params
 
@@ -16916,6 +17761,7 @@ def _postgres_knowledge_metadata_filter_sql(
                 SELECT 1
                 FROM cayu_knowledge_labels AS label
                 WHERE label.entry_id = e.id
+                  AND label.entry_revision = e.revision
                   AND label.key = %s
                   AND label.value = %s
             )
@@ -16947,6 +17793,7 @@ def _postgres_knowledge_metadata_filter_sql(
                 SELECT 1
                 FROM cayu_knowledge_aspects AS aspect
                 WHERE aspect.entry_id = e.id
+                  AND aspect.entry_revision = e.revision
                   AND aspect.aspect = ANY(%s)
             )
             """
@@ -16959,6 +17806,7 @@ def _postgres_knowledge_metadata_filter_sql(
                 SELECT 1
                 FROM cayu_knowledge_impact_targets AS target
                 WHERE target.entry_id = e.id
+                  AND target.entry_revision = e.revision
                   AND target.impact_target = ANY(%s)
             )
             """
@@ -17077,6 +17925,7 @@ def _postgres_knowledge_none_filter_sql(query: KnowledgeQuery) -> tuple[str, lis
                     SELECT 1
                     FROM cayu_knowledge_chunks AS excluded_chunk
                     WHERE excluded_chunk.entry_id = e.id
+                      AND excluded_chunk.entry_revision = e.revision
                       AND to_tsvector('simple', excluded_chunk.text)
                           @@ to_tsquery('simple', %s)
                 )
@@ -17134,7 +17983,7 @@ def _postgres_list_facet_sql(
                 "LiteralString",
                 f"""
                 SELECT NULL AS key, e.kind AS value, COUNT(*) AS count
-                FROM cayu_knowledge_entries AS e
+                FROM cayu_knowledge_current_entries AS e
                 WHERE TRUE
                 {where_sql}
                 GROUP BY e.kind
@@ -17150,7 +17999,7 @@ def _postgres_list_facet_sql(
                 "LiteralString",
                 f"""
                 SELECT NULL AS key, e.namespace AS value, COUNT(*) AS count
-                FROM cayu_knowledge_entries AS e
+                FROM cayu_knowledge_current_entries AS e
                 WHERE TRUE
                 {where_sql}
                 GROUP BY e.namespace
@@ -17166,8 +18015,9 @@ def _postgres_list_facet_sql(
                 "LiteralString",
                 f"""
                 SELECT label.key AS key, label.value AS value, COUNT(DISTINCT e.id) AS count
-                FROM cayu_knowledge_entries AS e
-                JOIN cayu_knowledge_labels AS label ON label.entry_id = e.id
+                FROM cayu_knowledge_current_entries AS e
+                JOIN cayu_knowledge_labels AS label
+                  ON label.entry_id = e.id AND label.entry_revision = e.revision
                 WHERE TRUE
                 {where_sql}
                 GROUP BY label.key, label.value
@@ -17183,8 +18033,9 @@ def _postgres_list_facet_sql(
                 "LiteralString",
                 f"""
                 SELECT NULL AS key, aspect.aspect AS value, COUNT(DISTINCT e.id) AS count
-                FROM cayu_knowledge_entries AS e
-                JOIN cayu_knowledge_aspects AS aspect ON aspect.entry_id = e.id
+                FROM cayu_knowledge_current_entries AS e
+                JOIN cayu_knowledge_aspects AS aspect
+                  ON aspect.entry_id = e.id AND aspect.entry_revision = e.revision
                 WHERE TRUE
                 {where_sql}
                 GROUP BY aspect.aspect
@@ -17200,8 +18051,9 @@ def _postgres_list_facet_sql(
                 "LiteralString",
                 f"""
                 SELECT NULL AS key, target.impact_target AS value, COUNT(DISTINCT e.id) AS count
-                FROM cayu_knowledge_entries AS e
-                JOIN cayu_knowledge_impact_targets AS target ON target.entry_id = e.id
+                FROM cayu_knowledge_current_entries AS e
+                JOIN cayu_knowledge_impact_targets AS target
+                  ON target.entry_id = e.id AND target.entry_revision = e.revision
                 WHERE TRUE
                 {where_sql}
                 GROUP BY target.impact_target
@@ -17217,7 +18069,7 @@ def _postgres_list_facet_sql(
                 "LiteralString",
                 f"""
                 SELECT NULL AS key, e.visibility AS value, COUNT(*) AS count
-                FROM cayu_knowledge_entries AS e
+                FROM cayu_knowledge_current_entries AS e
                 WHERE TRUE
                 {where_sql}
                 GROUP BY e.visibility
@@ -17232,7 +18084,7 @@ def _postgres_list_facet_sql(
             "LiteralString",
             f"""
             SELECT NULL AS key, e.source_type AS value, COUNT(*) AS count
-            FROM cayu_knowledge_entries AS e
+            FROM cayu_knowledge_current_entries AS e
             WHERE e.source_type IS NOT NULL
             {where_sql}
             GROUP BY e.source_type
@@ -17328,6 +18180,7 @@ def _bounded_knowledge_chunks(
                 KnowledgeChunk(
                     id=copied.id,
                     entry_id=copied.entry_id,
+                    entry_revision=copied.entry_revision,
                     text=truncated_text,
                     chunk_index=copied.chunk_index,
                     content_hash=None,
@@ -17358,8 +18211,9 @@ def _knowledge_preview_for_match(
 
 def _default_chunk_for_entry(entry: KnowledgeEntry) -> KnowledgeChunk:
     return KnowledgeChunk(
-        id=f"{entry.id}:0",
+        id=f"{entry.id}:r{entry.revision}:0",
         entry_id=entry.id,
+        entry_revision=entry.revision,
         text=entry.text,
         chunk_index=0,
         content_hash=sha256(entry.text.encode("utf-8")).hexdigest(),
@@ -17378,6 +18232,7 @@ def _knowledge_has_only_default_chunk(
     return (
         chunk.id == default_chunk.id
         and chunk.entry_id == default_chunk.entry_id
+        and chunk.entry_revision == default_chunk.entry_revision
         and chunk.text == default_chunk.text
         and chunk.chunk_index == default_chunk.chunk_index
         and chunk.content_hash == default_chunk.content_hash

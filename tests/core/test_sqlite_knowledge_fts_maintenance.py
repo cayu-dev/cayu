@@ -33,6 +33,37 @@ async def _close(store: object) -> None:
         await close()
 
 
+def _reconcile_through_revision_37(
+    connection: sqlite3.Connection,
+    schema_mode: schema_migrations.SchemaMode,
+) -> None:
+    """Exercise the historical migration without crossing the revision-42 reset."""
+
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 37
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_mode,
+            app_min_supported=37,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+
+
+def _migrate_legacy_through_revision_37(db_path: Path) -> None:
+    connection = sqlite_support.connect(db_path)
+    try:
+        _reconcile_through_revision_37(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+        )
+    finally:
+        connection.close()
+
+
 def _assert_peer_writer_can_begin(db_path: Path) -> None:
     """Prove a failed migration released SQLite's writer lock at any schema revision."""
 
@@ -60,11 +91,58 @@ def _chunks(entry_id: str, *texts: str) -> list[KnowledgeChunk]:
 def _downgrade_knowledge_layout_to_revision_36(db_path: Path) -> None:
     connection = sqlite_support.connect(db_path)
     try:
+        # This helper deliberately dismantles revision 42's mutually dependent
+        # entry/revision tables to fabricate a historical revision-36 database.
+        # Disable enforcement only for that test-only reconstruction; the
+        # resulting legacy schema is reopened with enforcement enabled.
+        connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("BEGIN IMMEDIATE")
+        connection.executescript(
+            """
+            CREATE TEMP TABLE legacy_knowledge_entries AS
+            SELECT * FROM cayu_knowledge_current_entries;
+            CREATE TEMP TABLE legacy_knowledge_labels AS
+            SELECT labels.entry_id, labels.key, labels.value
+            FROM cayu_knowledge_labels AS labels
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = labels.entry_id
+             AND logical.current_revision = labels.entry_revision;
+            CREATE TEMP TABLE legacy_knowledge_aspects AS
+            SELECT aspects.entry_id, aspects.aspect
+            FROM cayu_knowledge_aspects AS aspects
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = aspects.entry_id
+             AND logical.current_revision = aspects.entry_revision;
+            CREATE TEMP TABLE legacy_knowledge_impact_targets AS
+            SELECT targets.entry_id, targets.impact_target
+            FROM cayu_knowledge_impact_targets AS targets
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = targets.entry_id
+             AND logical.current_revision = targets.entry_revision;
+            CREATE TEMP TABLE legacy_knowledge_chunks AS
+            SELECT chunks.*
+            FROM cayu_knowledge_chunks AS chunks
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = chunks.entry_id
+             AND logical.current_revision = chunks.entry_revision;
+
+            DROP VIEW cayu_knowledge_current_entries;
+            DROP TABLE cayu_knowledge_chunks_fts;
+            DROP TABLE cayu_knowledge_publication_receipts;
+            DROP TABLE cayu_knowledge_chunks;
+            DROP TABLE cayu_knowledge_impact_targets;
+            DROP TABLE cayu_knowledge_aspects;
+            DROP TABLE cayu_knowledge_labels;
+            DROP TABLE cayu_knowledge_revisions;
+            DROP TABLE cayu_knowledge_entries;
+            """
+        )
+        connection.executescript(sqlite_support._MIGRATION_STEPS[6])
         connection.execute("DROP TABLE cayu_knowledge_chunks_fts")
+        connection.execute("DROP TABLE cayu_knowledge_chunks")
         connection.execute(
             """
-            CREATE TABLE cayu_knowledge_chunks_revision_36 (
+            CREATE TABLE cayu_knowledge_chunks (
                 id TEXT PRIMARY KEY,
                 entry_id TEXT NOT NULL
                     REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
@@ -79,20 +157,46 @@ def _downgrade_knowledge_layout_to_revision_36(db_path: Path) -> None:
         )
         connection.execute(
             """
-            INSERT INTO cayu_knowledge_chunks_revision_36 (
+            INSERT INTO cayu_knowledge_entries (
+                id, namespace, text, kind, visibility, status,
+                created_by_type, created_by, created_at, updated_at,
+                source_type, source_uri, source_id, source_hash,
+                importance, importance_source, confidence, last_used_at,
+                expires_at, title, metadata_json
+            )
+            SELECT
+                id, namespace, text, kind, visibility, status,
+                created_by_type, COALESCE(created_by, ''), created_at, updated_at,
+                source_type, source_uri, source_id, source_hash,
+                importance, importance_source, confidence, last_used_at,
+                expires_at, title, metadata_json
+            FROM legacy_knowledge_entries
+            """
+        )
+        connection.execute(
+            "INSERT INTO cayu_knowledge_labels (entry_id, key, value) "
+            "SELECT entry_id, key, value FROM legacy_knowledge_labels"
+        )
+        connection.execute(
+            "INSERT INTO cayu_knowledge_aspects (entry_id, aspect) "
+            "SELECT entry_id, aspect FROM legacy_knowledge_aspects"
+        )
+        connection.execute(
+            "INSERT INTO cayu_knowledge_impact_targets (entry_id, impact_target) "
+            "SELECT entry_id, impact_target FROM legacy_knowledge_impact_targets"
+        )
+        connection.execute(
+            """
+            INSERT INTO cayu_knowledge_chunks (
                 rowid, id, entry_id, chunk_index, text,
                 content_hash, source_uri, metadata_json
             )
             SELECT
                 fts_rowid, id, entry_id, chunk_index, text,
                 content_hash, source_uri, metadata_json
-            FROM cayu_knowledge_chunks
+            FROM legacy_knowledge_chunks
             ORDER BY fts_rowid
             """
-        )
-        connection.execute("DROP TABLE cayu_knowledge_chunks")
-        connection.execute(
-            "ALTER TABLE cayu_knowledge_chunks_revision_36 RENAME TO cayu_knowledge_chunks"
         )
         connection.execute(
             "CREATE INDEX idx_cayu_knowledge_chunks_entry_index "
@@ -128,6 +232,7 @@ def _downgrade_knowledge_layout_to_revision_36(db_path: Path) -> None:
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 37")
         connection.execute("PRAGMA user_version = 36")
         connection.commit()
+        connection.execute("PRAGMA foreign_keys = ON")
     except BaseException:
         connection.rollback()
         raise
@@ -251,8 +356,18 @@ def _assert_exact_fts_mapping(
     entry_id: str,
     chunk_ids: list[str],
 ) -> None:
+    entry_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(cayu_knowledge_entries)")
+    }
+    current_join = (
+        "JOIN cayu_knowledge_entries AS logical "
+        "ON logical.id = chunk.entry_id "
+        "AND logical.current_revision = chunk.entry_revision"
+        if "current_revision" in entry_columns
+        else ""
+    )
     rows = connection.execute(
-        """
+        f"""
         SELECT
             chunk.fts_rowid,
             fts.rowid,
@@ -262,6 +377,7 @@ def _assert_exact_fts_mapping(
             fts.entry_id
         FROM cayu_knowledge_chunks AS chunk
         JOIN cayu_knowledge_chunks_fts AS fts ON fts.rowid = chunk.fts_rowid
+        {current_join}
         WHERE chunk.entry_id = ?
         ORDER BY chunk.chunk_index
         """,
@@ -281,65 +397,77 @@ def _seed_unrelated_corpus(
     if chunk_count == 0:
         return
     entry = KnowledgeEntry(id="unrelated", title="Other", text="unrelated corpus")
-    values = (
-        entry.id,
-        entry.namespace,
-        entry.text,
-        str(entry.kind),
-        str(entry.visibility),
-        str(entry.status),
-        str(entry.created_by_type),
-        entry.created_by,
-        sqlite_support.format_datetime(entry.created_at),
-        sqlite_support.format_datetime(entry.updated_at),
-        entry.source_type,
-        entry.source_uri,
-        entry.source_id,
-        entry.source_hash,
-        entry.importance,
-        entry.importance_source,
-        entry.confidence,
-        None,
-        None,
-        entry.title,
-        "{}",
-    )
     with connection:
         connection.execute(
             """
             INSERT INTO cayu_knowledge_entries (
-                id, namespace, text, kind, visibility, status,
+                id, namespace, current_revision, created_at, updated_at
+            )
+            VALUES (?, ?, 1, ?, ?)
+            """,
+            (
+                entry.id,
+                entry.namespace,
+                sqlite_support.format_datetime(entry.created_at),
+                sqlite_support.format_datetime(entry.updated_at),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO cayu_knowledge_revisions (
+                entry_id, revision, text, kind, visibility, status,
                 created_by_type, created_by, created_at, updated_at,
                 source_type, source_uri, source_id, source_hash,
                 importance, importance_source, confidence, last_used_at,
                 expires_at, title, metadata_json
             )
             VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
-            values,
+            (
+                entry.id,
+                entry.text,
+                str(entry.kind),
+                str(entry.visibility),
+                str(entry.status),
+                str(entry.created_by_type),
+                entry.created_by,
+                sqlite_support.format_datetime(entry.created_at),
+                sqlite_support.format_datetime(entry.updated_at),
+                entry.source_type,
+                entry.source_uri,
+                entry.source_id,
+                entry.source_hash,
+                entry.importance,
+                entry.importance_source,
+                entry.confidence,
+                None,
+                None,
+                entry.title,
+                "{}",
+            ),
         )
         connection.executemany(
             """
             INSERT INTO cayu_knowledge_chunks (
-                id, entry_id, chunk_index, text,
+                id, entry_id, entry_revision, chunk_index, text,
                 content_hash, source_uri, metadata_json
             )
-            VALUES (?, 'unrelated', ?, ?, NULL, NULL, '{}')
+            VALUES (?, 'unrelated', 1, ?, ?, NULL, NULL, '{}')
             """,
             [
-                (f"unrelated:{index}", index, f"unrelated body {index}")
+                (f"unrelated:r1:{index}", index, f"unrelated body {index}")
                 for index in range(chunk_count)
             ],
         )
         connection.execute(
             """
             INSERT INTO cayu_knowledge_chunks_fts (
-                rowid, entry_id, chunk_id, title, text
+                rowid, entry_id, entry_revision, chunk_id, title, text
             )
             SELECT
-                fts_rowid, entry_id, id, 'Other',
+                fts_rowid, entry_id, entry_revision, id, 'Other',
                 'unrelated corpus' || char(10) || text
             FROM cayu_knowledge_chunks
             WHERE entry_id = 'unrelated'
@@ -378,11 +506,11 @@ def test_revision_37_migrates_legacy_fts_and_preserves_ranking(tmp_path: Path) -
     async def seed() -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry_with_chunks(
+            await store.create_entry(
                 KnowledgeEntry(id="alpha", title="Shared", text="shared summary"),
                 _chunks("alpha", "shared first", "shared second"),
             )
-            await store.put_entry_with_chunks(
+            await store.create_entry(
                 KnowledgeEntry(id="beta", title="Other", text="shared summary"),
                 _chunks("beta", "shared third"),
             )
@@ -410,20 +538,14 @@ def test_revision_37_migrates_legacy_fts_and_preserves_ranking(tmp_path: Path) -
     finally:
         legacy.close()
 
-    migrated = SQLiteKnowledgeStore(
-        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
-    )
-    asyncio.run(_close(migrated))
+    _migrate_legacy_through_revision_37(db_path)
     after = _raw_ranked_matches(db_path, "shared")
 
     assert [row[0] for row in after] == [row[0] for row in before]
     assert [row[1] for row in after] == pytest.approx([row[1] for row in before])
     connection = sqlite3.connect(db_path)
     try:
-        assert (
-            connection.execute("PRAGMA user_version").fetchone()[0]
-            == schema_migrations.LATEST_REVISION
-        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
         assert connection.execute(
             "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 37"
         ).fetchone() == ("breaking", 37)
@@ -443,10 +565,7 @@ def test_revision_37_migrates_legacy_fts_and_preserves_ranking(tmp_path: Path) -
     finally:
         connection.close()
 
-    retried = SQLiteKnowledgeStore(
-        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
-    )
-    asyncio.run(_close(retried))
+    _migrate_legacy_through_revision_37(db_path)
 
 
 def test_revision_37_failure_rolls_back_legacy_schema_and_search(
@@ -458,7 +577,7 @@ def test_revision_37_failure_rolls_back_legacy_schema_and_search(
     async def seed() -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry(KnowledgeEntry(id="legacy", text="searchable legacy"))
+            await store.create_entry(KnowledgeEntry(id="legacy", text="searchable legacy"))
         finally:
             await _close(store)
 
@@ -478,7 +597,7 @@ def test_revision_37_failure_rolls_back_legacy_schema_and_search(
     connection = sqlite_support.connect(db_path)
     try:
         with pytest.raises(RuntimeError, match="injected revision-37"):
-            sqlite_support.reconcile_schema(
+            _reconcile_through_revision_37(
                 connection,
                 schema_migrations.SchemaMode.MIGRATE,
             )
@@ -499,7 +618,7 @@ def test_revision_37_failure_rolls_back_legacy_schema_and_search(
             WHERE cayu_knowledge_chunks_fts MATCH 'searchable'
             """
             ).fetchone()[0]
-            == "legacy:0"
+            == "legacy:r1:0"
         )
     finally:
         check.close()
@@ -509,10 +628,7 @@ def test_revision_37_failure_rolls_back_legacy_schema_and_search(
         "_validate_revision_37_knowledge_fts_data",
         original,
     )
-    repaired = SQLiteKnowledgeStore(
-        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
-    )
-    asyncio.run(_close(repaired))
+    _migrate_legacy_through_revision_37(db_path)
 
 
 @pytest.mark.parametrize(
@@ -532,7 +648,7 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
     async def seed() -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
+            await store.create_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
         finally:
             await _close(store)
 
@@ -545,7 +661,7 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
         with pytest.raises(
             expected_exception, match="injected" if failure != "after_begin" else None
         ):
-            sqlite_support.reconcile_schema(
+            _reconcile_through_revision_37(
                 boundary,  # type: ignore[arg-type]
                 schema_migrations.SchemaMode.MIGRATE,
             )
@@ -559,23 +675,17 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
 
         _assert_peer_writer_can_begin(db_path)
 
-        sqlite_support.reconcile_schema(
+        _reconcile_through_revision_37(
             boundary,  # type: ignore[arg-type]
             schema_migrations.SchemaMode.MIGRATE,
         )
-        assert (
-            connection.execute("PRAGMA user_version").fetchone()[0]
-            == schema_migrations.LATEST_REVISION
-        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
     finally:
         connection.close()
 
-    migrated = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
-    try:
-        result = asyncio.run(migrated.search(KnowledgeQuery(text="legacy searchable")))
-        assert [hit.entry.id for hit in result.hits] == ["legacy"]
-    finally:
-        asyncio.run(_close(migrated))
+    assert [chunk_id for chunk_id, _ in _raw_ranked_matches(db_path, "legacy searchable")] == [
+        "legacy:r1:0"
+    ]
 
 
 def test_revision_37_commit_acknowledgement_loss_preserves_committed_migration(
@@ -586,7 +696,7 @@ def test_revision_37_commit_acknowledgement_loss_preserves_committed_migration(
     async def seed() -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
+            await store.create_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
         finally:
             await _close(store)
 
@@ -596,7 +706,7 @@ def test_revision_37_commit_acknowledgement_loss_preserves_committed_migration(
     boundary = _MigrationBoundaryConnection(connection, failure="after_commit")
     try:
         with pytest.raises(sqlite3.OperationalError, match="acknowledgement loss"):
-            sqlite_support.reconcile_schema(
+            _reconcile_through_revision_37(
                 boundary,  # type: ignore[arg-type]
                 schema_migrations.SchemaMode.MIGRATE,
             )
@@ -606,27 +716,17 @@ def test_revision_37_commit_acknowledgement_loss_preserves_committed_migration(
 
         # Retrying on the same connection observes the durable marker and only
         # validates the already-complete source/FTS relationship.
-        sqlite_support.reconcile_schema(
+        _reconcile_through_revision_37(
             boundary,  # type: ignore[arg-type]
             schema_migrations.SchemaMode.MIGRATE,
         )
     finally:
         connection.close()
 
-    peer = SQLiteSessionStore(db_path)
-    migrated = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
-    try:
-        asyncio.run(
-            peer.create(
-                RunRequest(agent_name="agent", session_id="peer-after-commit", messages=[]),
-                identity=SessionIdentity(provider_name="fake", model="fake-model"),
-            )
-        )
-        result = asyncio.run(migrated.search(KnowledgeQuery(text="legacy searchable")))
-        assert [hit.entry.id for hit in result.hits] == ["legacy"]
-    finally:
-        asyncio.run(_close(migrated))
-        asyncio.run(_close(peer))
+    _assert_peer_writer_can_begin(db_path)
+    assert [chunk_id for chunk_id, _ in _raw_ranked_matches(db_path, "legacy searchable")] == [
+        "legacy:r1:0"
+    ]
 
 
 def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
@@ -637,7 +737,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
     async def seed() -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
+            await store.create_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
         finally:
             await _close(store)
 
@@ -650,7 +750,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
         rollback_failure=True,
     )
     with pytest.raises(ExceptionGroup) as caught:
-        sqlite_support.reconcile_schema(
+        _reconcile_through_revision_37(
             boundary,  # type: ignore[arg-type]
             schema_migrations.SchemaMode.MIGRATE,
         )
@@ -679,7 +779,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
                 "SELECT chunk_id FROM cayu_knowledge_chunks_fts "
                 "WHERE cayu_knowledge_chunks_fts MATCH 'searchable'"
             ).fetchone()[0]
-            == "legacy:0"
+            == "legacy:r1:0"
         )
     finally:
         check.close()
@@ -688,19 +788,14 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
 
     retry = sqlite_support.connect(db_path)
     try:
-        sqlite_support.reconcile_schema(retry, schema_migrations.SchemaMode.MIGRATE)
-        assert (
-            retry.execute("PRAGMA user_version").fetchone()[0] == schema_migrations.LATEST_REVISION
-        )
+        _reconcile_through_revision_37(retry, schema_migrations.SchemaMode.MIGRATE)
+        assert retry.execute("PRAGMA user_version").fetchone()[0] == 37
     finally:
         retry.close()
 
-    migrated = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
-    try:
-        result = asyncio.run(migrated.search(KnowledgeQuery(text="legacy searchable")))
-        assert [hit.entry.id for hit in result.hits] == ["legacy"]
-    finally:
-        asyncio.run(_close(migrated))
+    assert [chunk_id for chunk_id, _ in _raw_ranked_matches(db_path, "legacy searchable")] == [
+        "legacy:r1:0"
+    ]
 
 
 @pytest.mark.parametrize("primary_kind", ["ordinary", "sigint"])
@@ -724,7 +819,7 @@ def test_sqlite_knowledge_rollback_failure_preserves_primary_and_fences_store(
         store = FailingStore(db_path, access_scope=_ACCESS_SCOPE)
         peer: SQLiteKnowledgeStore | None = None
         try:
-            await store.put_entry(KnowledgeEntry(id="target", text="originaltoken"))
+            await store.create_entry(KnowledgeEntry(id="target", text="originaltoken"))
             connection = store._connection
             boundary = _MigrationBoundaryConnection(
                 connection,
@@ -736,7 +831,15 @@ def test_sqlite_knowledge_rollback_failure_preserves_primary_and_fences_store(
             previous_sigint_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
             try:
                 with pytest.raises(BaseExceptionGroup) as caught:
-                    await store.put_entry(KnowledgeEntry(id="target", text="replacementtoken"))
+                    await store.append_entry_revision(
+                        KnowledgeEntry(
+                            id="target",
+                            revision=2,
+                            text="replacementtoken",
+                            created_at=(await store.get_entry("target")).created_at,
+                        ),
+                        expected_revision=1,
+                    )
             finally:
                 signal.signal(signal.SIGINT, previous_sigint_handler)
 
@@ -770,7 +873,7 @@ def test_sqlite_knowledge_rollback_failure_preserves_primary_and_fences_store(
                 for hit in (await peer.search(KnowledgeQuery(text="originaltoken"))).hits
             ] == ["target"]
             assert (await peer.search(KnowledgeQuery(text="replacementtoken"))).hits == []
-            await peer.put_entry(KnowledgeEntry(id="peer", text="peer write"))
+            await peer.create_entry(KnowledgeEntry(id="peer", text="peer write"))
         finally:
             if peer is not None:
                 await _close(peer)
@@ -786,7 +889,7 @@ def test_sqlite_knowledge_mutations_keep_exact_fts_rows(tmp_path: Path) -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
             entry = KnowledgeEntry(id="mutable", title="Original", text="old summary")
-            await store.put_entry_with_chunks(
+            await store.create_entry(
                 entry,
                 _chunks("mutable", "old first", "old second"),
             )
@@ -796,22 +899,27 @@ def test_sqlite_knowledge_mutations_keep_exact_fts_rows(tmp_path: Path) -> None:
                 chunk_ids=["mutable:0", "mutable:1"],
             )
 
-            await store.put_entry(KnowledgeEntry(id="mutable", title="Revised", text="new summary"))
+            await store.append_entry_revision(
+                entry.model_copy(update={"revision": 2, "title": "Revised", "text": "new summary"}),
+                expected_revision=1,
+            )
             assert [
                 hit.entry.id for hit in (await store.search(KnowledgeQuery(text="Revised"))).hits
             ] == ["mutable"]
             assert (await store.search(KnowledgeQuery(text="Original"))).hits == []
 
-            await store.replace_chunks(
-                "mutable",
+            await store.append_entry_revision(
+                entry.model_copy(update={"revision": 3, "title": "Revised", "text": "new summary"}),
                 [
                     KnowledgeChunk(
                         id="mutable:replacement",
                         entry_id="mutable",
+                        entry_revision=3,
                         chunk_index=0,
                         text="replacement body",
                     )
                 ],
+                expected_revision=2,
             )
             _assert_exact_fts_mapping(
                 store._connection,
@@ -821,7 +929,7 @@ def test_sqlite_knowledge_mutations_keep_exact_fts_rows(tmp_path: Path) -> None:
             assert (await store.search(KnowledgeQuery(text="old second"))).hits == []
 
             published = KnowledgeEntry(id="published", text="published body")
-            await store.publish_entry_with_chunks(
+            await store.publish_entry_revision(
                 published,
                 _chunks("published", "published body"),
                 operation_id="publish-operation",
@@ -837,7 +945,7 @@ def test_sqlite_knowledge_mutations_keep_exact_fts_rows(tmp_path: Path) -> None:
                 text="expired body",
                 expires_at=datetime.now(UTC) - timedelta(seconds=1),
             )
-            await store.put_entry(expired)
+            await store.create_entry(expired)
             assert await store.prune_expired() == 1
             assert (
                 store._connection.execute(
@@ -846,7 +954,7 @@ def test_sqlite_knowledge_mutations_keep_exact_fts_rows(tmp_path: Path) -> None:
                 is None
             )
 
-            assert await store.delete_entry("mutable", hard=True) is not None
+            assert await store.delete_entry("mutable", expected_revision=3, hard=True) is not None
             assert (
                 store._connection.execute(
                     "SELECT 1 FROM cayu_knowledge_chunks_fts WHERE entry_id = 'mutable'"
@@ -887,10 +995,13 @@ def test_sqlite_knowledge_refresh_failure_rolls_back_source_and_fts(
             access_scope=_ACCESS_SCOPE,
         )
         try:
-            await store.put_entry(KnowledgeEntry(id="atomic", text="original body"))
+            original = await store.create_entry(KnowledgeEntry(id="atomic", text="original body"))
             store.fail_at = failure_phase
             with pytest.raises(RuntimeError, match="injected"):
-                await store.put_entry(KnowledgeEntry(id="atomic", text="revised body"))
+                await store.append_entry_revision(
+                    original.model_copy(update={"revision": 2, "text": "revised body"}),
+                    expected_revision=1,
+                )
             store.fail_at = None
 
             loaded = await store.get_entry("atomic")
@@ -902,7 +1013,7 @@ def test_sqlite_knowledge_refresh_failure_rolls_back_source_and_fts(
             _assert_exact_fts_mapping(
                 store._connection,
                 entry_id="atomic",
-                chunk_ids=["atomic:0"],
+                chunk_ids=["atomic:r1:0"],
             )
         finally:
             await _close(store)
@@ -916,10 +1027,10 @@ def test_sqlite_knowledge_cancellation_before_writer_admission_is_atomic(
     async def run() -> None:
         store = SQLiteKnowledgeStore(tmp_path / "cancelled.sqlite", access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry(KnowledgeEntry(id="cancelled", text="original"))
+            await store.create_entry(KnowledgeEntry(id="cancelled", text="original"))
             await store._lock.acquire()
             task = asyncio.create_task(
-                store.put_entry(KnowledgeEntry(id="cancelled", text="replacement"))
+                store.create_entry(KnowledgeEntry(id="cancelled", text="replacement"))
             )
             try:
                 await asyncio.sleep(0)
@@ -944,9 +1055,9 @@ def test_sqlite_knowledge_cancellation_before_writer_admission_is_atomic(
 @pytest.mark.parametrize(
     ("entrance", "interrupt_hook"),
     [
-        ("put_entry", "fts"),
-        ("put_entry_with_chunks", "fts"),
-        ("publish_entry_with_chunks", "receipt"),
+        ("append_default", "fts"),
+        ("append_chunks", "fts"),
+        ("publish_entry_revision", "receipt"),
     ],
 )
 def test_sqlite_knowledge_interruption_rolls_back_and_releases_writer(
@@ -974,8 +1085,9 @@ def test_sqlite_knowledge_interruption_rolls_back_and_releases_writer(
         peer = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         peer._connection.execute("PRAGMA busy_timeout = 100")
         try:
-            if entrance != "publish_entry_with_chunks":
-                await store.put_entry_with_chunks(
+            original: KnowledgeEntry | None = None
+            if entrance != "publish_entry_revision":
+                original = await store.create_entry(
                     KnowledgeEntry(id="target", title="Original", text="originaltoken"),
                     _chunks("target", "original chunk"),
                 )
@@ -984,25 +1096,41 @@ def test_sqlite_knowledge_interruption_rolls_back_and_releases_writer(
             previous_sigint_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
             try:
                 with pytest.raises(KeyboardInterrupt):
-                    if entrance == "put_entry":
-                        await store.put_entry(
-                            KnowledgeEntry(
-                                id="target",
-                                title="Replacement",
-                                text="replacementtoken",
-                            )
-                        )
-                    elif entrance == "put_entry_with_chunks":
-                        await store.put_entry_with_chunks(
-                            KnowledgeEntry(
-                                id="target",
-                                title="Replacement",
-                                text="replacementtoken",
+                    if entrance == "append_default":
+                        assert original is not None
+                        await store.append_entry_revision(
+                            original.model_copy(
+                                update={
+                                    "revision": 2,
+                                    "title": "Replacement",
+                                    "text": "replacementtoken",
+                                }
                             ),
-                            _chunks("target", "replacement chunk"),
+                            expected_revision=1,
+                        )
+                    elif entrance == "append_chunks":
+                        assert original is not None
+                        await store.append_entry_revision(
+                            original.model_copy(
+                                update={
+                                    "revision": 2,
+                                    "title": "Replacement",
+                                    "text": "replacementtoken",
+                                }
+                            ),
+                            [
+                                KnowledgeChunk(
+                                    id="target:r2:0",
+                                    entry_id="target",
+                                    entry_revision=2,
+                                    chunk_index=0,
+                                    text="replacement chunk",
+                                )
+                            ],
+                            expected_revision=1,
                         )
                     else:
-                        await store.publish_entry_with_chunks(
+                        await store.publish_entry_revision(
                             KnowledgeEntry(id="target", text="replacementtoken"),
                             _chunks("target", "replacement chunk"),
                             operation_id="interrupted-publication",
@@ -1012,7 +1140,7 @@ def test_sqlite_knowledge_interruption_rolls_back_and_releases_writer(
             store.interrupt_at = None
 
             assert not store._connection.in_transaction
-            if entrance == "publish_entry_with_chunks":
+            if entrance == "publish_entry_revision":
                 assert await store.get_entry("target") is None
                 assert await store.load_entry_publication_receipt("interrupted-publication") is None
                 assert (await store.search(KnowledgeQuery(text="replacementtoken"))).hits == []
@@ -1028,7 +1156,7 @@ def test_sqlite_knowledge_interruption_rolls_back_and_releases_writer(
                 ] == ["target"]
                 assert (await store.search(KnowledgeQuery(text="replacementtoken"))).hits == []
 
-            await peer.put_entry(KnowledgeEntry(id="peer", text="peer write"))
+            await peer.create_entry(KnowledgeEntry(id="peer", text="peer write"))
             assert await peer.get_entry("peer") is not None
         finally:
             await _close(peer)
@@ -1051,7 +1179,7 @@ def _measure_single_entry_refresh(
     ]:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry_with_chunks(
+            target = await store.create_entry(
                 KnowledgeEntry(id="target", title="Before", text="target summary"),
                 _chunks("target", "target one", "target two"),
             )
@@ -1071,8 +1199,11 @@ def _measure_single_entry_refresh(
             store._connection.set_trace_callback(statements.append)
             store._connection.set_progress_handler(count_progress, 100)
             try:
-                await store.put_entry(
-                    KnowledgeEntry(id="target", title="After", text="revised summary")
+                await store.append_entry_revision(
+                    target.model_copy(
+                        update={"revision": 2, "title": "After", "text": "revised summary"}
+                    ),
+                    expected_revision=1,
                 )
             finally:
                 store._connection.set_progress_handler(None, 0)
@@ -1085,8 +1216,8 @@ def _measure_single_entry_refresh(
                     EXPLAIN QUERY PLAN
                     SELECT id, fts_rowid
                     FROM cayu_knowledge_chunks
-                        INDEXED BY idx_cayu_knowledge_chunks_entry_index
-                    WHERE entry_id = 'target'
+                        INDEXED BY idx_cayu_knowledge_chunks_entry_revision_index
+                    WHERE entry_id = 'target' AND entry_revision = 2
                     ORDER BY chunk_index
                     """
                 )
@@ -1120,15 +1251,14 @@ def test_single_entry_fts_refresh_is_independent_of_unrelated_corpus(tmp_path: P
     assert large_progress <= small_progress + 20
     assert before == after
     normalized = [" ".join(statement.lower().split()) for statement in statements]
-    fts_deletes = [
+    fts_inserts = [
         statement
         for statement in normalized
-        if statement.startswith("delete from cayu_knowledge_chunks_fts")
+        if statement.startswith("insert into cayu_knowledge_chunks_fts")
     ]
-    assert fts_deletes
-    assert all("where rowid =" in statement for statement in fts_deletes)
-    assert all("where entry_id =" not in statement for statement in fts_deletes)
-    assert "idx_cayu_knowledge_chunks_entry_index" in plan
+    assert fts_inserts
+    assert all("entry_revision" in statement for statement in fts_inserts)
+    assert "idx_cayu_knowledge_chunks_entry_revision_index" in plan
 
 
 @pytest.mark.stress
@@ -1141,7 +1271,7 @@ def test_bounded_knowledge_refresh_does_not_starve_shared_checkpoint_write(
         knowledge = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         session_store = SQLiteSessionStore(db_path)
         try:
-            await knowledge.put_entry_with_chunks(
+            await knowledge.create_entry(
                 KnowledgeEntry(id="target", text="target summary"),
                 _chunks("target", "target one", "target two"),
             )
@@ -1163,11 +1293,14 @@ def test_bounded_knowledge_refresh_does_not_starve_shared_checkpoint_write(
     errors: list[BaseException] = []
     progress_calls = 0
 
-    original_delete_fts = knowledge._delete_entry_fts_unlocked
+    original_insert_fts = knowledge._insert_entry_fts_unlocked
 
-    def pause_after_target_fts_delete(entry_id: str) -> None:
-        original_delete_fts(entry_id)
-        if entry_id == "target":
+    def pause_after_target_fts_insert(
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        original_insert_fts(entry, chunks)
+        if entry.id == "target" and entry.revision == 2:
             knowledge_paused.set()
             if not release_knowledge.wait(5):
                 raise RuntimeError("checkpoint writer did not contend for SQLite ownership")
@@ -1177,7 +1310,7 @@ def test_bounded_knowledge_refresh_does_not_starve_shared_checkpoint_write(
         progress_calls += 1
         return int(progress_calls > 100)
 
-    knowledge._delete_entry_fts_unlocked = pause_after_target_fts_delete  # type: ignore[method-assign]
+    knowledge._insert_entry_fts_unlocked = pause_after_target_fts_insert  # type: ignore[method-assign]
     knowledge._connection.set_progress_handler(bound_knowledge_work, 100)
     checkpoint_store._connection.set_trace_callback(
         lambda statement: checkpoint_begin.set() if statement.startswith("BEGIN") else None
@@ -1185,8 +1318,13 @@ def test_bounded_knowledge_refresh_does_not_starve_shared_checkpoint_write(
 
     def refresh_knowledge() -> None:
         try:
+            current = asyncio.run(knowledge.get_entry("target"))
+            assert current is not None
             asyncio.run(
-                knowledge.put_entry(KnowledgeEntry(id="target", text="revised target summary"))
+                knowledge.append_entry_revision(
+                    current.model_copy(update={"revision": 2, "text": "revised target summary"}),
+                    expected_revision=1,
+                )
             )
         except BaseException as exc:
             errors.append(exc)
@@ -1245,7 +1383,7 @@ def test_sigkill_during_revision_37_migration_rolls_back_and_retries(
     async def seed() -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
+            await store.create_entry(KnowledgeEntry(id="legacy", text="legacy searchable"))
             _seed_unrelated_corpus(store._connection, chunk_count=5000)
         finally:
             await _close(store)
@@ -1274,7 +1412,14 @@ def pause_in_transaction():
     return 0
 
 connection.set_progress_handler(pause_in_transaction, 100)
-support.reconcile_schema(connection, migrations.SchemaMode.MIGRATE)
+migrations.REVISIONS = tuple(
+    revision for revision in migrations.REVISIONS if revision.revision <= 37
+)
+support.reconcile_schema(
+    connection,
+    migrations.SchemaMode.MIGRATE,
+    app_min_supported=37,
+)
 """
     process = subprocess.Popen(
         [sys.executable, "-c", program, str(db_path), str(marker)],
@@ -1304,19 +1449,16 @@ support.reconcile_schema(connection, migrations.SchemaMode.MIGRATE)
             WHERE cayu_knowledge_chunks_fts MATCH 'searchable'
             """
             ).fetchone()[0]
-            == "legacy:0"
+            == "legacy:r1:0"
         )
     finally:
         connection.close()
 
-    migrated = SQLiteKnowledgeStore(
-        db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE, access_scope=_ACCESS_SCOPE
+    _migrate_legacy_through_revision_37(db_path)
+    assert (
+        next(chunk_id for chunk_id, _ in _raw_ranked_matches(db_path, "legacy searchable"))
+        == "legacy:r1:0"
     )
-    try:
-        result = asyncio.run(migrated.search(KnowledgeQuery(text="legacy searchable")))
-        assert [hit.entry.id for hit in result.hits] == ["legacy"]
-    finally:
-        asyncio.run(_close(migrated))
 
 
 @pytest.mark.process
@@ -1327,7 +1469,7 @@ def test_sigkill_during_knowledge_refresh_cannot_publish_half_state(tmp_path: Pa
     async def seed() -> None:
         store = SQLiteKnowledgeStore(db_path, access_scope=_ACCESS_SCOPE)
         try:
-            await store.put_entry(KnowledgeEntry(id="target", text="originaltoken"))
+            await store.create_entry(KnowledgeEntry(id="target", text="originaltoken"))
         finally:
             await _close(store)
 
@@ -1337,7 +1479,7 @@ import asyncio
 import pathlib
 import sys
 import time
-from cayu.storage import KnowledgeAccessScope, KnowledgeEntry, SQLiteKnowledgeStore
+from cayu.storage import KnowledgeAccessScope, SQLiteKnowledgeStore
 
 db_path = pathlib.Path(sys.argv[1])
 marker = pathlib.Path(sys.argv[2])
@@ -1351,7 +1493,13 @@ def pause_before_fts(entry, chunks):
         time.sleep(1)
 
 store._insert_entry_fts_unlocked = pause_before_fts
-asyncio.run(store.put_entry(KnowledgeEntry(id='target', text='replacementtoken')))
+current = asyncio.run(store.get_entry('target'))
+asyncio.run(
+    store.append_entry_revision(
+        current.model_copy(update={'revision': 2, 'text': 'replacementtoken'}),
+        expected_revision=1,
+    )
+)
 """
     process = subprocess.Popen(
         [sys.executable, "-c", program, str(db_path), str(marker)],
@@ -1378,7 +1526,7 @@ asyncio.run(store.put_entry(KnowledgeEntry(id='target', text='replacementtoken')
         _assert_exact_fts_mapping(
             store._connection,
             entry_id="target",
-            chunk_ids=["target:0"],
+            chunk_ids=["target:r1:0"],
         )
     finally:
         asyncio.run(_close(store))

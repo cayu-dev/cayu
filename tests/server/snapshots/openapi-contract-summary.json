@@ -1038,6 +1038,12 @@
           "title": "Entry Id",
           "type": "string"
         },
+        "entry_revision": {
+          "maximum": 2147483647.0,
+          "minimum": 1.0,
+          "title": "Entry Revision",
+          "type": "integer"
+        },
         "metadata": {
           "additionalProperties": true,
           "title": "Metadata",
@@ -1062,6 +1068,7 @@
       "required": [
         "chunk_id",
         "entry_id",
+        "entry_revision",
         "chunk_index",
         "text",
         "content_hash",
@@ -1166,6 +1173,12 @@
           "title": "Namespace",
           "type": "string"
         },
+        "revision": {
+          "maximum": 2147483647.0,
+          "minimum": 1.0,
+          "title": "Revision",
+          "type": "integer"
+        },
         "source_id": {
           "anyOf": [
             {
@@ -1229,6 +1242,7 @@
       },
       "required": [
         "entry_id",
+        "revision",
         "namespace",
         "kind",
         "visibility",
@@ -1632,6 +1646,12 @@
           "title": "Namespace",
           "type": "string"
         },
+        "revision": {
+          "maximum": 2147483647.0,
+          "minimum": 1.0,
+          "title": "Revision",
+          "type": "integer"
+        },
         "source_id": {
           "anyOf": [
             {
@@ -1695,6 +1715,7 @@
       },
       "required": [
         "entry_id",
+        "revision",
         "namespace",
         "kind",
         "visibility",
@@ -5114,6 +5135,12 @@
           "title": "Namespace",
           "type": "string"
         },
+        "revision": {
+          "maximum": 2147483647.0,
+          "minimum": 1.0,
+          "title": "Revision",
+          "type": "integer"
+        },
         "source_id": {
           "anyOf": [
             {
@@ -5177,6 +5204,7 @@
       },
       "required": [
         "entry_id",
+        "revision",
         "namespace",
         "kind",
         "visibility",
@@ -5990,7 +6018,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "11",
+          "default": "12",
           "title": "Contract Version",
           "type": "string"
         },
@@ -9301,7 +9329,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "11",
+          "default": "12",
           "title": "Contract Version",
           "type": "string"
         }

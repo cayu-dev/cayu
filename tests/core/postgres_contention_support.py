@@ -15,6 +15,7 @@ POSTGRES_CONTENTION_TABLES = (
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
     "cayu_knowledge_chunks",
+    "cayu_knowledge_revisions",
     "cayu_knowledge_entries",
     "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",

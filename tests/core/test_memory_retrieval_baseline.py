@@ -68,7 +68,7 @@ def test_public_memory_retrieval_baseline_is_reproducible_across_builtin_backend
 def test_memory_retrieval_baseline_requires_an_empty_store() -> None:
     async def run() -> None:
         store = InMemoryKnowledgeStore()
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="existing", text="existing knowledge"),
             access_scope=KnowledgeAccessScope.privileged(),
         )

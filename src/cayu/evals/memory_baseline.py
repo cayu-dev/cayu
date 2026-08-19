@@ -390,12 +390,13 @@ async def run_memory_retrieval_baseline(
     entries_by_id = {entry.id: entry for entry in corpus.entries}
     for corpus_entry in corpus.entries:
         entry = corpus_entry.to_entry()
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             entry,
-            [
+            chunks=[
                 KnowledgeChunk(
-                    id=f"{entry.id}:0",
+                    id=f"{entry.id}:r{entry.revision}:0",
                     entry_id=entry.id,
+                    entry_revision=entry.revision,
                     chunk_index=0,
                     text=entry.text,
                 )

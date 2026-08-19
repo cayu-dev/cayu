@@ -100,6 +100,7 @@ from cayu.server.sse import (
     SseErrorCode,
     SseErrorKind,
 )
+from cayu.storage.memory import MAX_KNOWLEDGE_REVISION
 
 SERVER_API_PREFIX = "/api"
 SSE_CONTENT_TYPE = "text/event-stream"
@@ -1718,6 +1719,7 @@ class ApiTaskDetail(ApiTaskListItem):
 
 class ApiKnowledgeEntryBase(ApiBaseModel):
     entry_id: str
+    revision: StrictInt = Field(ge=1, le=MAX_KNOWLEDGE_REVISION)
     namespace: str
     kind: str
     visibility: str
@@ -1758,6 +1760,7 @@ class PendingKnowledgeListResponse(ApiBaseModel):
 class ApiKnowledgeChunk(ApiBaseModel):
     chunk_id: str
     entry_id: str
+    entry_revision: StrictInt = Field(ge=1, le=MAX_KNOWLEDGE_REVISION)
     chunk_index: StrictInt = Field(ge=0)
     text: str
     content_hash: str | None

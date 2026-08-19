@@ -327,6 +327,7 @@ from cayu.storage import (
     KnowledgeEntry,
     KnowledgeListItem,
     KnowledgeReviewWorkflow,
+    KnowledgeRevisionConflict,
     KnowledgeVisibility,
 )
 from cayu.vaults import REDACTED_SECRET
@@ -3188,6 +3189,7 @@ def _serialize_task_detail(cayu_app: Any, task: Task) -> dict[str, Any]:
 def _serialize_knowledge_entry_base(entry: KnowledgeEntry) -> dict[str, Any]:
     return {
         "entry_id": entry.id,
+        "revision": entry.revision,
         "namespace": entry.namespace,
         "kind": entry.kind,
         "visibility": entry.visibility.value,
@@ -3237,6 +3239,7 @@ def _serialize_knowledge_chunk(chunk: KnowledgeChunk) -> dict[str, Any]:
     return {
         "chunk_id": chunk.id,
         "entry_id": chunk.entry_id,
+        "entry_revision": chunk.entry_revision,
         "chunk_index": chunk.chunk_index,
         "text": chunk.text,
         "content_hash": chunk.content_hash,
@@ -7300,6 +7303,8 @@ def create_router(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except KnowledgeRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _serialize_reviewed_knowledge_entry(entry)
@@ -7372,6 +7377,7 @@ def create_router(
         try:
             chunks = await knowledge_store.read_chunks(
                 entry.id,
+                revision=entry.revision,
                 access_scope=knowledge_access_scope,
                 max_chunks=max_chunks,
                 max_bytes=max_bytes,

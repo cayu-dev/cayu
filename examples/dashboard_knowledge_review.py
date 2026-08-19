@@ -32,7 +32,7 @@ DATA_DIR = WORKSPACE / "data"
 
 
 async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
-    await store.put_entry_with_chunks(
+    await store.create_entry(
         KnowledgeEntry(
             id="pending_remote_git_credentials",
             namespace="project:cayu",
@@ -62,8 +62,9 @@ async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
         ),
         [
             KnowledgeChunk(
-                id="pending_remote_git_credentials:0",
+                id="pending_remote_git_credentials:r1:0",
                 entry_id="pending_remote_git_credentials",
+                entry_revision=1,
                 chunk_index=0,
                 text=(
                     "Remote sandbox Git clone and push operations should use a brokered "
@@ -71,8 +72,9 @@ async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
                 ),
             ),
             KnowledgeChunk(
-                id="pending_remote_git_credentials:1",
+                id="pending_remote_git_credentials:r1:1",
                 entry_id="pending_remote_git_credentials",
+                entry_revision=1,
                 chunk_index=1,
                 text=(
                     "Credential injection must happen on the trusted Cayu side, outside the "
@@ -81,7 +83,7 @@ async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
             ),
         ],
     )
-    await store.put_entry_with_chunks(
+    await store.create_entry(
         KnowledgeEntry(
             id="pending_invoice_refund_policy",
             namespace="project:cayu",
@@ -105,20 +107,22 @@ async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
         ),
         [
             KnowledgeChunk(
-                id="pending_invoice_refund_policy:0",
+                id="pending_invoice_refund_policy:r1:0",
                 entry_id="pending_invoice_refund_policy",
+                entry_revision=1,
                 chunk_index=0,
                 text="Invoice refunds over 500 USD require finance operations approval.",
             ),
             KnowledgeChunk(
-                id="pending_invoice_refund_policy:1",
+                id="pending_invoice_refund_policy:r1:1",
                 entry_id="pending_invoice_refund_policy",
+                entry_revision=1,
                 chunk_index=1,
                 text="Audit data must include approver, reason, invoice id, and timestamp.",
             ),
         ],
     )
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="active_sendgrid_proxy",
             namespace="project:cayu",

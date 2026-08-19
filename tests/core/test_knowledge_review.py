@@ -13,6 +13,7 @@ from cayu.storage import (
     KnowledgeListQuery,
     KnowledgeQuery,
     KnowledgeReviewWorkflow,
+    KnowledgeRevisionConflict,
     KnowledgeStatus,
 )
 
@@ -20,11 +21,24 @@ _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 
 
 class ScopeDriftKnowledgeStore(InMemoryKnowledgeStore):
-    async def get_entry(self, entry_id: str, *, access_scope=None) -> KnowledgeEntry | None:
-        entry = await super().get_entry(entry_id, access_scope=access_scope)
+    async def get_entry(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope=None,
+    ) -> KnowledgeEntry | None:
+        entry = await super().get_entry(
+            entry_id,
+            revision=revision,
+            access_scope=access_scope,
+        )
         if entry is not None and entry.id == "pending_git":
-            await self.put_entry(
-                entry.model_copy(update={"labels": {"project": "other"}}),
+            await self.append_entry_revision(
+                entry.model_copy(
+                    update={"revision": entry.revision + 1, "labels": {"project": "other"}}
+                ),
+                expected_revision=entry.revision,
                 access_scope=access_scope,
             )
         return entry
@@ -205,7 +219,7 @@ def test_review_workflow_refuses_entries_outside_scope() -> None:
         asyncio.run(run())
 
 
-def test_review_workflow_rechecks_scope_during_status_transition() -> None:
+def test_review_workflow_rejects_revision_drift_during_status_transition() -> None:
     async def run():
         store = ScopeDriftKnowledgeStore(
             [
@@ -226,7 +240,7 @@ def test_review_workflow_rechecks_scope_during_status_transition() -> None:
         )
         await workflow.approve("pending_git")
 
-    with pytest.raises(ValueError, match="expected labels"):
+    with pytest.raises(KnowledgeRevisionConflict):
         asyncio.run(run())
 
 

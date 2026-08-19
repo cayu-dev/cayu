@@ -2678,6 +2678,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (39, 39),
         (40, 40),
         (41, 41),
+        (42, 42),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -2686,8 +2687,15 @@ def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(
     tmp_path,
 ) -> None:
     db_path = tmp_path / "pre-knowledge-access-snapshot.sqlite"
-    store = SQLiteSessionStore(db_path)
-    asyncio.run(_close(store))
+    revisions = schema_migrations.REVISIONS
+    schema_migrations.REVISIONS = tuple(
+        revision for revision in revisions if revision.revision <= 40
+    )
+    try:
+        store = SQLiteSessionStore(db_path)
+        asyncio.run(_close(store))
+    finally:
+        schema_migrations.REVISIONS = revisions
 
     connection = sqlite3.connect(db_path)
     try:
@@ -2699,9 +2707,8 @@ def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(
                 request_sha256,
                 entry_created_at,
                 entry_updated_at,
-                committed_at,
-                access_snapshot_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                committed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 "op_existing",
@@ -2710,23 +2717,24 @@ def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
-                "{}",
             ),
         )
-        connection.execute(
-            "ALTER TABLE cayu_knowledge_publication_receipts DROP COLUMN access_snapshot_json"
-        )
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 41")
-        connection.execute("PRAGMA user_version = 40")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(
-        schema_migrations.SchemaTooOld,
-        match="cannot infer one for existing receipts",
-    ):
-        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+    revisions = schema_migrations.REVISIONS
+    schema_migrations.REVISIONS = tuple(
+        revision for revision in revisions if revision.revision <= 41
+    )
+    try:
+        with pytest.raises(
+            schema_migrations.SchemaTooOld,
+            match="cannot infer one for existing receipts",
+        ):
+            SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+    finally:
+        schema_migrations.REVISIONS = revisions
 
     connection = sqlite3.connect(db_path)
     try:

@@ -3373,6 +3373,24 @@ def test_cayu_app_passes_environment_knowledge_store_to_tools() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "revision",
+    (None, 0, True, runtime_context_module.MAX_KNOWLEDGE_REVISION + 1),
+)
+def test_knowledge_candidate_manifest_requires_a_positive_exact_revision(revision) -> None:
+    candidate = {"entry_id": "entry", "kind": "fact"}
+    if revision is not None:
+        candidate["revision"] = revision
+
+    assert runtime_context_module._is_valid_knowledge_candidate_payload(candidate) is False
+    assert (
+        runtime_context_module._is_valid_knowledge_candidate_payload(
+            {"entry_id": "entry", "kind": "fact", "revision": 1}
+        )
+        is True
+    )
+
+
 def test_cayu_app_knowledge_injection_adds_model_context_without_rewriting_transcript() -> None:
     store = InMemorySessionStore()
     knowledge_store = _TestKnowledgeStore(
@@ -3452,10 +3470,11 @@ def test_cayu_app_knowledge_injection_adds_model_context_without_rewriting_trans
     assert len(payload["candidates"]) == 1
     candidate = payload["candidates"][0]
     assert candidate["entry_id"] == "git_policy"
+    assert candidate["revision"] == 1
     assert candidate["kind"] == "procedure"
     assert candidate["namespace"] == "project:cayu"
     assert candidate["title"] == "Remote sandbox Git credential boundary"
-    assert candidate["chunk_id"] == "git_policy:0"
+    assert candidate["chunk_id"] == "git_policy:r1:0"
     assert candidate["chunk_index"] == 0
     assert candidate["score"] > 0
     assert candidate["score_kind"] == "inmemory_keyword"
@@ -3467,7 +3486,7 @@ def test_cayu_app_knowledge_injection_adds_model_context_without_rewriting_trans
     assert injected_event.payload["hit_count"] == 1
     assert injected_event.payload["candidate_count"] == 1
     assert injected_event.payload["injected_bytes"] == len(manifest.encode("utf-8"))
-    assert injected_event.payload["format"] == "cayu.knowledge_candidates.v1"
+    assert injected_event.payload["format"] == "cayu.knowledge_candidates.v2"
     assert injected_event.payload["manifest_truncated"] is True
     assert injected_event.payload["projection"] == "anchored_user_runtime_context"
     assert "tool_call_id" not in injected_event.payload
@@ -3476,7 +3495,8 @@ def test_cayu_app_knowledge_injection_adds_model_context_without_rewriting_trans
     assert source["namespace"] == "project:cayu"
     assert source["kind"] == "procedure"
     assert source["title"] == "Remote sandbox Git credential boundary"
-    assert source["chunk_id"] == "git_policy:0"
+    assert source["revision"] == 1
+    assert source["chunk_id"] == "git_policy:r1:0"
     assert source["chunk_index"] == 0
     assert source["score"] > 0
     assert source["score_kind"] == "inmemory_keyword"

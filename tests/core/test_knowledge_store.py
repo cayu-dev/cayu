@@ -32,6 +32,7 @@ from cayu.embeddings import (
 from cayu.storage import (
     BUILTIN_KNOWLEDGE_KINDS,
     MAX_KNOWLEDGE_CHUNK_INDEX,
+    MAX_KNOWLEDGE_REVISION,
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
     KnowledgeAccessDenied,
@@ -47,6 +48,7 @@ from cayu.storage import (
     KnowledgeListQuery,
     KnowledgeListResult,
     KnowledgeQuery,
+    KnowledgeRevisionConflict,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
     KnowledgeStatus,
@@ -75,9 +77,9 @@ def test_knowledge_store_requires_or_binds_an_explicit_access_scope() -> None:
         original = KnowledgeAccessScope.for_namespace("tenant-a")
         bound = InMemoryKnowledgeStore(access_scope=original)
         original.allowed_namespaces.append("tenant-b")
-        await bound.put_entry(KnowledgeEntry(id="a", namespace="tenant-a", text="allowed"))
+        await bound.create_entry(KnowledgeEntry(id="a", namespace="tenant-a", text="allowed"))
         with pytest.raises(KnowledgeAccessDenied):
-            await bound.put_entry(KnowledgeEntry(id="b", namespace="tenant-b", text="denied"))
+            await bound.create_entry(KnowledgeEntry(id="b", namespace="tenant-b", text="denied"))
         with pytest.raises(KnowledgeAccessDenied, match="access_scope_override"):
             await bound.search(
                 KnowledgeQuery(text="anything"),
@@ -231,6 +233,37 @@ def test_knowledge_entry_and_chunk_enforce_portable_durable_values() -> None:
     )
     assert boundary_chunk.chunk_index == MAX_KNOWLEDGE_CHUNK_INDEX
 
+    boundary_entry = KnowledgeEntry(
+        id="entry_revision_boundary",
+        revision=MAX_KNOWLEDGE_REVISION,
+        text="memory",
+    )
+    boundary_revision_chunk = KnowledgeChunk(
+        id="chunk_revision_boundary",
+        entry_id=boundary_entry.id,
+        entry_revision=MAX_KNOWLEDGE_REVISION,
+        chunk_index=0,
+        text="chunk",
+    )
+    assert boundary_entry.revision == MAX_KNOWLEDGE_REVISION
+    assert boundary_revision_chunk.entry_revision == MAX_KNOWLEDGE_REVISION
+
+    with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_REVISION)):
+        KnowledgeEntry(
+            id="entry_revision_out_of_range",
+            revision=MAX_KNOWLEDGE_REVISION + 1,
+            text="memory",
+        )
+
+    with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_REVISION)):
+        KnowledgeChunk(
+            id="chunk_revision_out_of_range",
+            entry_id=entry.id,
+            entry_revision=MAX_KNOWLEDGE_REVISION + 1,
+            chunk_index=0,
+            text="chunk",
+        )
+
     with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
         KnowledgeChunk(
             id="chunk_out_of_range",
@@ -302,7 +335,7 @@ def test_in_memory_knowledge_store_revalidates_poisoned_chunk_batch_atomically()
         poisoned_chunk.metadata["bad"] = float("inf")
 
         with pytest.raises((DurableValueError, ValidationError)) as invalid_batch:
-            await store.put_entry_with_chunks(entry, [valid_chunk, poisoned_chunk])
+            await store.create_entry(entry, [valid_chunk, poisoned_chunk])
         durable_error = extract_durable_value_error(invalid_batch.value)
         assert durable_error is not None
         assert durable_error.code == "non_finite_number"
@@ -322,10 +355,10 @@ def test_in_memory_knowledge_store_rejects_out_of_range_chunk_index_atomically()
             chunk_index=0,
             text="chunk",
         )
-        chunk.chunk_index = MAX_KNOWLEDGE_CHUNK_INDEX + 1
+        object.__setattr__(chunk, "chunk_index", MAX_KNOWLEDGE_CHUNK_INDEX + 1)
 
         with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
-            await store.put_entry_with_chunks(entry, [chunk])
+            await store.create_entry(entry, [chunk])
         assert await store.get_entry(entry.id) is None
         assert await store.read_chunks(entry.id) == []
 
@@ -343,7 +376,7 @@ def test_in_memory_knowledge_store_owned_publication_conformance() -> None:
 
 
 def test_knowledge_store_owned_publication_hooks_are_not_abstract() -> None:
-    assert "publish_entry_with_chunks" not in KnowledgeStore.__abstractmethods__
+    assert "publish_entry_revision" not in KnowledgeStore.__abstractmethods__
     assert "load_entry_publication_receipt" not in KnowledgeStore.__abstractmethods__
 
 
@@ -392,6 +425,20 @@ def test_knowledge_hit_rejects_chunk_for_different_entry() -> None:
     chunk = KnowledgeChunk(id="chunk_1", entry_id="entry_2", chunk_index=0, text="other")
 
     with pytest.raises(ValidationError, match="chunk.entry_id"):
+        KnowledgeHit(entry=entry, chunk=chunk)
+
+
+def test_knowledge_hit_rejects_chunk_for_different_revision() -> None:
+    entry = KnowledgeEntry(id="entry_1", revision=2, text="current billing memory")
+    chunk = KnowledgeChunk(
+        id="chunk_1",
+        entry_id=entry.id,
+        entry_revision=1,
+        chunk_index=0,
+        text="superseded billing memory",
+    )
+
+    with pytest.raises(ValidationError, match="chunk.entry_revision"):
         KnowledgeHit(entry=entry, chunk=chunk)
 
 
@@ -446,7 +493,7 @@ def test_knowledge_search_result_rejects_too_many_hits_and_duplicate_ranks() -> 
 def test_in_memory_knowledge_store_searches_filters_and_scopes() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="invoice_warning",
                 text="Do not send invoice reminders when the PO number is missing.",
@@ -456,7 +503,7 @@ def test_in_memory_knowledge_store_searches_filters_and_scopes() -> None:
                 visibility=KnowledgeVisibility.PROJECT,
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="other_project_warning",
                 text="Do not send invoice reminders when the PO number is missing.",
@@ -466,7 +513,7 @@ def test_in_memory_knowledge_store_searches_filters_and_scopes() -> None:
                 visibility=KnowledgeVisibility.PROJECT,
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="invoice_procedure",
                 text="Payment reminders should include invoice number and vendor name.",
@@ -510,7 +557,7 @@ def test_in_memory_knowledge_store_rejects_duplicate_seed_entry_ids() -> None:
 def test_in_memory_knowledge_store_excludes_non_active_and_expired_by_default() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="active",
                 text="Active deployment warning.",
@@ -518,7 +565,7 @@ def test_in_memory_knowledge_store_excludes_non_active_and_expired_by_default() 
                 kind="warning",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="pending",
                 text="Pending deployment warning.",
@@ -527,7 +574,7 @@ def test_in_memory_knowledge_store_excludes_non_active_and_expired_by_default() 
                 status=KnowledgeStatus.PENDING,
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="expired",
                 text="Expired deployment warning.",
@@ -565,10 +612,10 @@ def test_in_memory_knowledge_store_prune_expired_removes_expired_entries() -> No
     # prune_expired reclaims them for good.
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="active", text="Active deployment warning.", kind="warning")
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="expired",
                 text="Expired deployment warning.",
@@ -596,7 +643,7 @@ def test_in_memory_embedding_store_prune_expired_drops_embeddings() -> None:
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="expired",
                 text="Expired secret rotation runbook.",
@@ -619,6 +666,36 @@ def test_in_memory_embedding_store_prune_expired_drops_embeddings() -> None:
     assert pruned == 1
     assert embeddings_after == 0
     assert entry is None
+
+
+def test_in_memory_embedding_lifecycle_revisions_replace_stale_derived_rows() -> None:
+    async def run() -> tuple[KnowledgeEntry, KnowledgeEntry, dict[str, object]]:
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+        )
+        created = await store.create_entry(
+            KnowledgeEntry(id="lifecycle-embedding", text="GitHub credential proxy.")
+        )
+        archived = await store.transition_entry_status(
+            created.id,
+            expected_revision=created.revision,
+            from_status=KnowledgeStatus.ACTIVE,
+            to_status=KnowledgeStatus.ARCHIVED,
+        )
+        deleted = await store.delete_entry(
+            archived.id,
+            expected_revision=archived.revision,
+        )
+        assert deleted is not None
+        return archived, deleted, dict(store._chunk_embeddings)
+
+    archived, deleted, embeddings = asyncio.run(run())
+
+    assert archived.revision == 2
+    assert deleted.revision == 3
+    assert list(embeddings) == ["lifecycle-embedding:r3:0"]
 
 
 def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider_awaits() -> None:
@@ -662,7 +739,7 @@ def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider
             chunk_index=0,
             text=original.text,
         )
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             original,
             [original_chunk],
             access_scope=privileged,
@@ -679,26 +756,34 @@ def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider
             )
         )
         await asyncio.wait_for(provider.query_started.wait(), timeout=2)
-        replacement = KnowledgeEntry(
-            id=original.id,
-            namespace="tenant-b",
-            text="Tenant B secret credential policy.",
+        replacement = original.model_copy(
+            update={
+                "revision": 2,
+                "status": KnowledgeStatus.ARCHIVED,
+                "text": "Archived secret credential policy.",
+            }
         )
         replacement_chunk = KnowledgeChunk(
-            id=original_chunk.id,
+            id="shared-entry:r2:0",
             entry_id=replacement.id,
+            entry_revision=replacement.revision,
             chunk_index=0,
             text=replacement.text,
         )
-        await store.put_entry_with_chunks(
+        await store.append_entry_revision(
             replacement,
             [replacement_chunk],
+            expected_revision=original.revision,
             access_scope=privileged,
         )
         provider.release_query.set()
         result = await search_task
 
-        assert await store.get_entry(original.id, access_scope=tenant_scope) is None
+        active_scope = KnowledgeAccessScope.for_namespace(
+            "tenant-a",
+            allowed_statuses=[KnowledgeStatus.ACTIVE],
+        )
+        assert await store.get_entry(original.id, access_scope=active_scope) is None
         assert result.hits
         returned_chunk = result.hits[0].chunk
         assert returned_chunk is not None
@@ -745,21 +830,25 @@ def test_in_memory_owned_publication_does_not_apply_stale_derived_embeddings() -
         )
         old_chunks = [old_chunks[0].model_copy(update={"id": "old-publication-chunk"})]
         old_task = asyncio.create_task(
-            store.publish_entry_with_chunks(
+            store.publish_entry_revision(
                 old_entry,
                 old_chunks,
                 operation_id="old-embedding-publication",
             )
         )
         await asyncio.wait_for(provider.first_started.wait(), timeout=2)
-        await store.delete_entry(old_entry.id, hard=True)
+        await store.delete_entry(
+            old_entry.id,
+            expected_revision=old_entry.revision,
+            hard=True,
+        )
         new_entry, new_chunks = publication_material(
             entry_id=old_entry.id,
             text="Invoice payment refund policy.",
             timestamp_offset=1,
         )
         new_chunks = [new_chunks[0].model_copy(update={"id": "new-publication-chunk"})]
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             new_entry,
             new_chunks,
             operation_id="new-embedding-publication",
@@ -797,12 +886,12 @@ def test_in_memory_owned_publication_replay_does_not_repeat_failed_embedding() -
             text="Durable source publication survives derived work failure.",
         )
         with pytest.raises(RuntimeError, match="embedding provider is unavailable"):
-            await store.publish_entry_with_chunks(
+            await store.publish_entry_revision(
                 entry,
                 chunks,
                 operation_id="failed-derived-replay-operation",
             )
-        receipt = await store.publish_entry_with_chunks(
+        receipt = await store.publish_entry_revision(
             entry,
             chunks,
             operation_id="failed-derived-replay-operation",
@@ -832,7 +921,7 @@ def test_in_memory_knowledge_store_chunks_are_bounded_and_scope_checked() -> Non
             labels={"project": "agent_a"},
             kind="document",
         )
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             entry,
             [
                 KnowledgeChunk(id="chunk_0", entry_id="long_doc", chunk_index=0, text="alpha beta"),
@@ -874,7 +963,7 @@ def test_in_memory_knowledge_store_chunks_are_bounded_and_scope_checked() -> Non
 def test_in_memory_knowledge_store_truncated_chunk_clears_content_hash() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="doc", text="Document summary."),
             [
                 KnowledgeChunk(
@@ -898,7 +987,7 @@ def test_in_memory_knowledge_store_truncated_chunk_clears_content_hash() -> None
 def test_in_memory_knowledge_store_rejects_ambiguous_chunk_window() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(KnowledgeEntry(id="entry_1", text="memory"))
+        await store.create_entry(KnowledgeEntry(id="entry_1", text="memory"))
         with pytest.raises(ValueError, match="around"):
             await store.read_chunks("entry_1", around=1)
 
@@ -908,7 +997,7 @@ def test_in_memory_knowledge_store_rejects_ambiguous_chunk_window() -> None:
 def test_in_memory_knowledge_store_rejects_unsupported_search_modes() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(KnowledgeEntry(id="entry_1", text="billing memory"))
+        await store.create_entry(KnowledgeEntry(id="entry_1", text="billing memory"))
         with pytest.raises(ValueError, match="supports only auto and keyword"):
             await store.search(KnowledgeQuery(text="billing", mode=KnowledgeSearchMode.SEMANTIC))
 
@@ -923,14 +1012,14 @@ def test_in_memory_embedding_knowledge_store_semantic_search() -> None:
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="git_policy",
                 text="GitHub pushes should use a trusted proxy for the secret token.",
                 kind="procedure",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="invoice_policy",
                 text="Invoice refunds require payment approval.",
@@ -959,10 +1048,10 @@ def test_in_memory_embedding_knowledge_store_auto_uses_hybrid_search() -> None:
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="credential_policy", text="Use a credential proxy.")
         )
-        await store.put_entry(KnowledgeEntry(id="email_policy", text="SendGrid email guide."))
+        await store.create_entry(KnowledgeEntry(id="email_policy", text="SendGrid email guide."))
         result = await store.search(KnowledgeQuery(text="credential"))
         return result
 
@@ -982,7 +1071,7 @@ def test_in_memory_embedding_knowledge_store_hybrid_labels_keyword_only_hits() -
             embedding_model="test-embedding",
             semantic_min_score=1.0,
         )
-        await store.put_entry(KnowledgeEntry(id="deploy", text="Deployment checklist."))
+        await store.create_entry(KnowledgeEntry(id="deploy", text="Deployment checklist."))
         return await store.search(KnowledgeQuery(text="deployment"))
 
     result = asyncio.run(run())
@@ -1001,8 +1090,8 @@ def test_in_memory_embedding_knowledge_store_min_score_uses_normalized_score() -
             embedding_model="test-embedding",
             semantic_min_score=0.70,
         )
-        await store.put_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
-        await store.put_entry(KnowledgeEntry(id="unrelated", text="Deployment checklist."))
+        await store.create_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
+        await store.create_entry(KnowledgeEntry(id="unrelated", text="Deployment checklist."))
         return await store.search(
             KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
         )
@@ -1022,8 +1111,8 @@ def test_in_memory_embedding_knowledge_store_query_min_score_overrides_store_def
             embedding_model="test-embedding",
             semantic_min_score=1.0,
         )
-        await store.put_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
-        await store.put_entry(KnowledgeEntry(id="orthogonal", text="Invoice payment policy."))
+        await store.create_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
+        await store.create_entry(KnowledgeEntry(id="orthogonal", text="Invoice payment policy."))
         return await store.search(
             KnowledgeQuery(
                 text="auth broker",
@@ -1047,9 +1136,16 @@ def test_in_memory_embedding_knowledge_store_refreshes_changed_chunks() -> None:
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry(KnowledgeEntry(id="policy", text="GitHub token policy."))
+        await store.create_entry(KnowledgeEntry(id="policy", text="GitHub token policy."))
         first = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
-        await store.put_entry(KnowledgeEntry(id="policy", text="Invoice payment policy."))
+        current = await store.get_entry("policy")
+        assert current is not None
+        await store.append_entry_revision(
+            current.model_copy(
+                update={"revision": current.revision + 1, "text": "Invoice payment policy."}
+            ),
+            expected_revision=current.revision,
+        )
         second = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         third = await store.search(KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC))
         return first, second, third
@@ -1069,7 +1165,7 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="policy", text="Policy summary."),
             [
                 KnowledgeChunk(
@@ -1078,16 +1174,20 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
             ],
         )
         first = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
-        await store.replace_chunks(
-            "policy",
+        current = await store.get_entry("policy")
+        assert current is not None
+        await store.append_entry_revision(
+            current.model_copy(update={"revision": current.revision + 1}),
             [
                 KnowledgeChunk(
                     id="custom-new",
                     entry_id="policy",
+                    entry_revision=current.revision + 1,
                     chunk_index=0,
                     text="Invoice refund.",
                 )
             ],
+            expected_revision=current.revision,
         )
         second = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         third = await store.search(KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC))
@@ -1112,7 +1212,7 @@ def test_in_memory_embedding_store_rejects_cross_entry_chunk_id_collision_atomic
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
         )
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="alpha", text="GitHub auth policy."),
             [
                 KnowledgeChunk(
@@ -1126,7 +1226,7 @@ def test_in_memory_embedding_store_rejects_cross_entry_chunk_id_collision_atomic
         embeddings_before = dict(store._chunk_embeddings)
 
         with pytest.raises(KnowledgeChunkConflict):
-            await store.put_entry_with_chunks(
+            await store.create_entry(
                 KnowledgeEntry(id="beta", text="Invoice policy."),
                 [
                     KnowledgeChunk(
@@ -1155,11 +1255,11 @@ def test_in_memory_embedding_store_rejects_cross_entry_chunk_id_collision_atomic
 def test_in_memory_store_rejects_default_chunk_id_collision_atomically() -> None:
     async def run() -> tuple[KnowledgeEntry | None, list[KnowledgeChunk]]:
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="alpha", text="GitHub auth policy."),
             [
                 KnowledgeChunk(
-                    id="beta:0",
+                    id="beta:r1:0",
                     entry_id="alpha",
                     chunk_index=0,
                     text="GitHub auth policy.",
@@ -1168,14 +1268,14 @@ def test_in_memory_store_rejects_default_chunk_id_collision_atomically() -> None
         )
 
         with pytest.raises(KnowledgeChunkConflict):
-            await store.put_entry(KnowledgeEntry(id="beta", text="Invoice policy."))
+            await store.create_entry(KnowledgeEntry(id="beta", text="Invoice policy."))
 
         return await store.get_entry("beta"), await store.read_chunks("alpha")
 
     beta, alpha_chunks = asyncio.run(run())
 
     assert beta is None
-    assert [(chunk.entry_id, chunk.id) for chunk in alpha_chunks] == [("alpha", "beta:0")]
+    assert [(chunk.entry_id, chunk.id) for chunk in alpha_chunks] == [("alpha", "beta:r1:0")]
 
 
 def test_in_memory_embedding_knowledge_store_honors_none_terms() -> None:
@@ -1186,8 +1286,8 @@ def test_in_memory_embedding_knowledge_store_honors_none_terms() -> None:
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
-        await store.put_entry(
+        await store.create_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
+        await store.create_entry(
             KnowledgeEntry(id="excluded", text="GitHub credential proxy deprecated.")
         )
         return await store.search(
@@ -1211,17 +1311,24 @@ def test_in_memory_embedding_knowledge_store_does_not_embed_none_term_candidates
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
-        await store.put_entry(
+        await store.create_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
+        await store.create_entry(
             KnowledgeEntry(id="excluded", text="GitHub credential proxy deprecated.")
         )
-        await store.replace_chunks(
-            "safe",
+        current = await store.get_entry("safe")
+        assert current is not None
+        await store.append_entry_revision(
+            current.model_copy(update={"revision": current.revision + 1}),
             [
                 KnowledgeChunk(
-                    id="safe:0", entry_id="safe", chunk_index=0, text="GitHub auth proxy."
+                    id="safe:r2:0",
+                    entry_id="safe",
+                    entry_revision=current.revision + 1,
+                    chunk_index=0,
+                    text="GitHub auth proxy.",
                 )
             ],
+            expected_revision=current.revision,
         )
         provider.calls.clear()
         store._chunk_embeddings.clear()
@@ -1250,7 +1357,7 @@ def test_in_memory_embedding_knowledge_store_empty_candidates_do_not_embed_query
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="policy",
                 text="GitHub credential proxy.",
@@ -1284,7 +1391,7 @@ def test_in_memory_embedding_knowledge_store_rejects_wrong_dimensions() -> None:
             embedding_dimensions=2,
         )
         with pytest.raises(ValueError, match="unexpected dimension"):
-            await store.put_entry(KnowledgeEntry(id="policy", text="GitHub credential proxy."))
+            await store.create_entry(KnowledgeEntry(id="policy", text="GitHub credential proxy."))
 
     asyncio.run(run())
 
@@ -1301,8 +1408,8 @@ def test_text_embedding_usage_rejects_bool_token_counts() -> None:
 def test_in_memory_knowledge_store_keyword_search_does_not_match_substrings() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(KnowledgeEntry(id="substring", text="the deployment checklist"))
-        await store.put_entry(KnowledgeEntry(id="token", text="he should approve deployment"))
+        await store.create_entry(KnowledgeEntry(id="substring", text="the deployment checklist"))
+        await store.create_entry(KnowledgeEntry(id="token", text="he should approve deployment"))
         return await store.search(KnowledgeQuery(text="he"))
 
     result = asyncio.run(run())
@@ -1313,7 +1420,7 @@ def test_in_memory_knowledge_store_keyword_search_does_not_match_substrings() ->
 def test_in_memory_knowledge_store_title_match_uses_title_preview() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="entry",
                 title="Invoice approval warning",
@@ -1334,7 +1441,7 @@ def test_in_memory_knowledge_store_uses_importance_as_ranking_tiebreaker() -> No
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         older = datetime(2026, 1, 1, tzinfo=UTC)
         newer = datetime(2026, 1, 2, tzinfo=UTC)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="high_importance",
                 text="invoice reminder policy",
@@ -1343,7 +1450,7 @@ def test_in_memory_knowledge_store_uses_importance_as_ranking_tiebreaker() -> No
                 updated_at=older,
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="low_importance",
                 text="invoice reminder policy",
@@ -1362,13 +1469,13 @@ def test_in_memory_knowledge_store_uses_importance_as_ranking_tiebreaker() -> No
 def test_in_memory_knowledge_store_structured_keyword_search() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="github_secret", text="GitHub push requires a credential broker.")
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="sendgrid_secret", text="SendGrid email uses a secret proxy.")
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="github_test", text="GitHub test credentials are fixture-only.")
         )
         return await store.search(
@@ -1421,7 +1528,7 @@ def test_in_memory_knowledge_stores_apply_none_terms_to_the_complete_entry(
 def test_in_memory_knowledge_store_searches_entry_text_with_custom_chunks() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="broker_summary",
                 text="Remote sandbox Git operations need a brokered credential boundary.",
@@ -1447,7 +1554,7 @@ def test_in_memory_knowledge_store_searches_entry_text_with_custom_chunks() -> N
 def test_in_memory_knowledge_store_matches_singular_plural_token_variants() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="remote_git",
                 title="Remote sandbox Git credential boundary",
@@ -1457,7 +1564,7 @@ def test_in_memory_knowledge_store_matches_singular_plural_token_variants() -> N
                 ),
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="fixture",
                 text="Fixture credentials in local tests are not production guidance.",
@@ -1478,8 +1585,8 @@ def test_in_memory_knowledge_store_matches_singular_plural_token_variants() -> N
 def test_in_memory_knowledge_store_matches_y_plural_token_variants() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
-        await store.put_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
+        await store.create_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
+        await store.create_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
         key_result = await store.search(KnowledgeQuery(text="key"))
         policy_result = await store.search(KnowledgeQuery(text="policy"))
         return key_result, policy_result
@@ -1493,7 +1600,7 @@ def test_in_memory_knowledge_store_matches_y_plural_token_variants() -> None:
 def test_in_memory_knowledge_store_all_terms_match_across_entry_document() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="split_match",
                 title="GitHub credential policy",
@@ -1518,7 +1625,7 @@ def test_in_memory_knowledge_store_all_terms_match_across_entry_document() -> No
 def test_in_memory_knowledge_store_all_terms_do_not_match_across_unrelated_chunks() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="split_chunks", text="General operations note."),
             [
                 KnowledgeChunk(
@@ -1545,7 +1652,7 @@ def test_in_memory_knowledge_store_all_terms_do_not_match_across_unrelated_chunk
 def test_in_memory_knowledge_store_lists_entries_and_facets() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="runbook",
                 namespace="ops",
@@ -1555,7 +1662,7 @@ def test_in_memory_knowledge_store_lists_entries_and_facets() -> None:
                 text="Payment reminder runbook.",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="warning",
                 namespace="ops",
@@ -1565,7 +1672,7 @@ def test_in_memory_knowledge_store_lists_entries_and_facets() -> None:
                 text="Do not send reminders without approval.",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="archived",
                 namespace="ops",
@@ -1596,7 +1703,7 @@ def test_in_memory_knowledge_store_caps_facets() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         for index in range(5):
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id=f"entry_{index}",
                     labels={"area": f"area_{index}"},
@@ -1658,30 +1765,50 @@ def test_in_memory_knowledge_store_entry_and_chunk_lifecycle() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         entry = KnowledgeEntry(id="runbook", text="Deploy with the blue-green checklist.")
-        written = await store.put_entry(entry)
+        written = await store.create_entry(entry)
         default_chunks = await store.read_chunks("runbook")
-        updated = await store.put_entry(
-            KnowledgeEntry(id="runbook", text="Updated deploy checklist.")
+        updated = await store.append_entry_revision(
+            entry.model_copy(update={"revision": 2, "text": "Updated deploy checklist."}),
+            expected_revision=1,
         )
         updated_default_chunks = await store.read_chunks("runbook")
-        replaced_chunks = await store.replace_chunks(
-            "runbook",
+        revised = await store.append_entry_revision(
+            updated.model_copy(update={"revision": 3}),
             [
                 KnowledgeChunk(
-                    id="runbook:1", entry_id="runbook", chunk_index=1, text="Run smoke tests."
+                    id="runbook:r3:1",
+                    entry_id="runbook",
+                    entry_revision=3,
+                    chunk_index=1,
+                    text="Run smoke tests.",
                 ),
                 KnowledgeChunk(
-                    id="runbook:0", entry_id="runbook", chunk_index=0, text="Deploy to blue."
+                    id="runbook:r3:0",
+                    entry_id="runbook",
+                    entry_revision=3,
+                    chunk_index=0,
+                    text="Deploy to blue.",
                 ),
                 KnowledgeChunk(
-                    id="runbook:2", entry_id="runbook", chunk_index=2, text="Shift traffic."
+                    id="runbook:r3:2",
+                    entry_id="runbook",
+                    entry_revision=3,
+                    chunk_index=2,
+                    text="Shift traffic.",
                 ),
             ],
+            expected_revision=2,
         )
+        replaced_chunks = await store.read_chunks("runbook", revision=revised.revision)
         window = await store.read_chunks("runbook", chunk_index=1, around=1, max_chunks=3)
-        archived = await store.update_entry_status("runbook", KnowledgeStatus.ARCHIVED)
-        soft_deleted = await store.delete_entry("runbook")
-        hard_deleted = await store.delete_entry("runbook", hard=True)
+        archived = await store.transition_entry_status(
+            "runbook",
+            expected_revision=3,
+            from_status=KnowledgeStatus.ACTIVE,
+            to_status=KnowledgeStatus.ARCHIVED,
+        )
+        soft_deleted = await store.delete_entry("runbook", expected_revision=4)
+        hard_deleted = await store.delete_entry("runbook", expected_revision=5, hard=True)
         missing = await store.get_entry("runbook")
         return (
             written,
@@ -1713,8 +1840,16 @@ def test_in_memory_knowledge_store_entry_and_chunk_lifecycle() -> None:
     assert [chunk.chunk_index for chunk in default_chunks] == [0]
     assert updated.text == "Updated deploy checklist."
     assert [chunk.text for chunk in updated_default_chunks] == ["Updated deploy checklist."]
-    assert [chunk.id for chunk in replaced_chunks] == ["runbook:0", "runbook:1", "runbook:2"]
-    assert [chunk.id for chunk in window] == ["runbook:0", "runbook:1", "runbook:2"]
+    assert [chunk.id for chunk in replaced_chunks] == [
+        "runbook:r3:0",
+        "runbook:r3:1",
+        "runbook:r3:2",
+    ]
+    assert [chunk.id for chunk in window] == [
+        "runbook:r3:0",
+        "runbook:r3:1",
+        "runbook:r3:2",
+    ]
     assert archived.status == KnowledgeStatus.ARCHIVED
     assert soft_deleted.status == KnowledgeStatus.DELETED
     assert hard_deleted is not None
@@ -1725,7 +1860,7 @@ def test_in_memory_knowledge_store_entry_and_chunk_lifecycle() -> None:
 def test_in_memory_knowledge_store_preserves_custom_single_chunk_on_entry_update() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        await store.put_entry_with_chunks(
+        current = await store.create_entry(
             KnowledgeEntry(id="doc", text="Document summary.", metadata={"version": 1}),
             [
                 KnowledgeChunk(
@@ -1737,15 +1872,17 @@ def test_in_memory_knowledge_store_preserves_custom_single_chunk_on_entry_update
                 )
             ],
         )
-        await store.put_entry(
-            KnowledgeEntry(id="doc", text="Document summary.", metadata={"version": 2})
+        await store.append_entry_revision(
+            current.model_copy(update={"revision": 2, "metadata": {"version": 2}}),
+            expected_revision=1,
         )
         return await store.read_chunks("doc")
 
     chunks = asyncio.run(run())
 
     assert len(chunks) == 1
-    assert chunks[0].id == "doc:0"
+    assert chunks[0].id == "doc:r2:0"
+    assert chunks[0].entry_revision == 2
     assert chunks[0].text == "Custom indexed body."
     assert chunks[0].metadata == {"indexer": "custom"}
 
@@ -1754,7 +1891,7 @@ def test_in_memory_knowledge_store_status_update_is_monotonic_for_imported_times
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         imported_at = datetime.now(UTC) + timedelta(days=1)
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="future_import",
                 text="Imported knowledge.",
@@ -1762,7 +1899,12 @@ def test_in_memory_knowledge_store_status_update_is_monotonic_for_imported_times
                 updated_at=imported_at,
             )
         )
-        return await store.update_entry_status("future_import", KnowledgeStatus.ARCHIVED)
+        return await store.transition_entry_status(
+            "future_import",
+            expected_revision=1,
+            from_status=KnowledgeStatus.ACTIVE,
+            to_status=KnowledgeStatus.ARCHIVED,
+        )
 
     updated = asyncio.run(run())
 
@@ -1770,37 +1912,83 @@ def test_in_memory_knowledge_store_status_update_is_monotonic_for_imported_times
     assert updated.updated_at >= updated.created_at
 
 
-def test_in_memory_knowledge_store_rejects_invalid_chunk_replacement() -> None:
+def test_in_memory_knowledge_store_rejects_invalid_revision_chunks() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        with pytest.raises(KeyError):
-            await store.replace_chunks(
-                "missing",
-                [KnowledgeChunk(id="chunk", entry_id="missing", chunk_index=0, text="text")],
+        missing = KnowledgeEntry(id="missing", revision=2, text="text")
+        with pytest.raises(KnowledgeRevisionConflict):
+            await store.append_entry_revision(
+                missing,
+                [
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="missing",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="text",
+                    )
+                ],
+                expected_revision=1,
             )
-        await store.put_entry(KnowledgeEntry(id="entry", text="text"))
+        current = await store.create_entry(KnowledgeEntry(id="entry", text="text"))
+        successor = current.model_copy(update={"revision": 2})
         with pytest.raises(ValueError, match="cannot be empty"):
-            await store.replace_chunks("entry", [])
+            await store.append_entry_revision(successor, [], expected_revision=1)
         with pytest.raises(ValueError, match="belong"):
-            await store.replace_chunks(
-                "entry",
-                [KnowledgeChunk(id="chunk", entry_id="other", chunk_index=0, text="text")],
+            await store.append_entry_revision(
+                successor,
+                [
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="other",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="text",
+                    )
+                ],
+                expected_revision=1,
             )
         with pytest.raises(ValueError, match="ids"):
-            await store.replace_chunks(
-                "entry",
+            await store.append_entry_revision(
+                successor,
                 [
-                    KnowledgeChunk(id="chunk", entry_id="entry", chunk_index=0, text="first"),
-                    KnowledgeChunk(id="chunk", entry_id="entry", chunk_index=1, text="second"),
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="first",
+                    ),
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=1,
+                        text="second",
+                    ),
                 ],
+                expected_revision=1,
             )
         with pytest.raises(ValueError, match="indexes"):
-            await store.replace_chunks(
-                "entry",
+            await store.append_entry_revision(
+                successor,
                 [
-                    KnowledgeChunk(id="chunk_1", entry_id="entry", chunk_index=0, text="first"),
-                    KnowledgeChunk(id="chunk_2", entry_id="entry", chunk_index=0, text="second"),
+                    KnowledgeChunk(
+                        id="chunk_1",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="first",
+                    ),
+                    KnowledgeChunk(
+                        id="chunk_2",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="second",
+                    ),
                 ],
+                expected_revision=1,
             )
 
     asyncio.run(run())
@@ -1810,7 +1998,7 @@ def test_in_memory_knowledge_store_search_result_reports_truncation() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         for index in range(3):
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id=f"entry_{index}",
                     text="billing reminder policy",
@@ -1818,7 +2006,7 @@ def test_in_memory_knowledge_store_search_result_reports_truncation() -> None:
                     updated_at=datetime(2026, 1, index + 1, tzinfo=UTC),
                 )
             )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="single_entry",
                 text="policy content that exceeds the byte cap",
@@ -1854,8 +2042,8 @@ def test_in_memory_knowledge_store_get_enforces_query_scope_and_owns_copies() ->
             namespace="projects",
             labels={"project": "alpha"},
         )
-        await store.put_entry(entry)
-        entry.text = "mutated outside"
+        await store.create_entry(entry)
+        entry.labels["project"] = "mutated-outside"
         loaded = await store.get_entry("entry_1")
         allowed_query = KnowledgeQuery(
             text="memory", namespace="projects", labels={"project": "alpha"}
@@ -1875,16 +2063,17 @@ def test_in_memory_knowledge_store_get_enforces_query_scope_and_owns_copies() ->
             else None
         )
         assert allowed is not None
-        allowed.text = "mutated copy"
+        allowed.labels["project"] = "mutated-copy"
         loaded_again = await store.get_entry("entry_1")
         return allowed, denied, loaded_again
 
     allowed, denied, loaded_again = asyncio.run(run())
 
-    assert allowed.text == "mutated copy"
+    assert allowed.labels["project"] == "mutated-copy"
     assert denied is None
     assert loaded_again is not None
     assert loaded_again.text == "Project-specific memory."
+    assert loaded_again.labels == {"project": "alpha"}
 
 
 def test_copy_knowledge_entry_rejects_subclasses_before_attribute_access() -> None:

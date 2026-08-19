@@ -62,7 +62,7 @@ async def _run_contract(
         embedding_dimensions=dimensions,
         semantic_min_score=SEMANTIC_MIN_SCORE,
     )
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="remote_git_credentials",
             kind="procedure",
@@ -76,7 +76,7 @@ async def _run_contract(
             ),
         )
     )
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="invoice_approval",
             kind="procedure",
@@ -85,7 +85,7 @@ async def _run_contract(
             text="Invoice refunds require approval and audit logging before payment.",
         )
     )
-    await store.put_entry(
+    await store.create_entry(
         KnowledgeEntry(
             id="sendgrid_proxy",
             kind="procedure",

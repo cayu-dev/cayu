@@ -36,6 +36,7 @@ DEFAULT_KNOWLEDGE_KIND = "fact"
 DEFAULT_KNOWLEDGE_LIMIT = 10
 DEFAULT_KNOWLEDGE_MAX_BYTES = 20_000
 MAX_KNOWLEDGE_CHUNK_INDEX = 2**31 - 1
+MAX_KNOWLEDGE_REVISION = 2**31 - 1
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -74,6 +75,9 @@ class KnowledgeStatus(StrEnum):
     PENDING = "pending"
     ARCHIVED = "archived"
     DELETED = "deleted"
+
+
+_KNOWLEDGE_RETIREMENT_STATUSES = frozenset({KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED})
 
 
 class KnowledgeVisibility(StrEnum):
@@ -125,6 +129,29 @@ class KnowledgeChunkConflict(RuntimeError):
     def __init__(self, operation: str) -> None:
         self.operation = require_clean_nonblank(operation, "operation")
         super().__init__("Knowledge chunk identity conflicts with durable state.")
+
+
+class KnowledgeRevisionConflict(RuntimeError):
+    """A canonical write lost a compare-and-swap race."""
+
+    def __init__(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int | None,
+        actual_revision: int | None,
+    ) -> None:
+        self.entry_id = require_clean_nonblank(entry_id, "entry_id")
+        if expected_revision is not None:
+            _validate_knowledge_revision(expected_revision, "expected_revision")
+        if actual_revision is not None:
+            _validate_knowledge_revision(actual_revision, "actual_revision")
+        self.expected_revision = expected_revision
+        self.actual_revision = actual_revision
+        super().__init__(
+            f"Knowledge entry {self.entry_id!r} revision conflict: expected "
+            f"{self.expected_revision!r}, found {self.actual_revision!r}."
+        )
 
 
 class KnowledgeAccessScope(BaseModel):
@@ -242,11 +269,12 @@ class KnowledgeAccessScope(BaseModel):
 
 
 class KnowledgeEntry(BaseModel):
-    """Durable, source-attributed knowledge item."""
+    """Immutable snapshot of one exact logical knowledge revision."""
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     id: str
+    revision: int = 1
     text: str
     namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
     labels: dict[str, str] = Field(default_factory=dict)
@@ -285,6 +313,12 @@ class KnowledgeEntry(BaseModel):
     @classmethod
     def validate_clean_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "revision")
+        return value
 
     @field_validator("text")
     @classmethod
@@ -380,10 +414,13 @@ class _KnowledgeAccessSnapshot(BaseModel):
 
 
 class KnowledgeChunk(BaseModel):
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    """Immutable chunk belonging to one exact knowledge revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     id: str
     entry_id: str
+    entry_revision: int = 1
     text: str
     chunk_index: int
     content_hash: str | None = None
@@ -423,6 +460,12 @@ class KnowledgeChunk(BaseModel):
             raise ValueError(
                 f"`{info.field_name}` must be less than or equal to {MAX_KNOWLEDGE_CHUNK_INDEX}."
             )
+        return value
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
         return value
 
 
@@ -681,6 +724,8 @@ class KnowledgeHit(BaseModel):
     def validate_chunk_belongs_to_entry(self) -> KnowledgeHit:
         if self.chunk is not None and self.chunk.entry_id != self.entry.id:
             raise ValueError("`chunk.entry_id` must match `entry.id`.")
+        if self.chunk is not None and self.chunk.entry_revision != self.entry.revision:
+            raise ValueError("`chunk.entry_revision` must match `entry.revision`.")
         if self.text_preview is None and self.text_preview_complete:
             raise ValueError("`text_preview_complete` requires `text_preview`.")
         return self
@@ -895,6 +940,8 @@ class KnowledgePublicationReceipt(BaseModel):
 
     operation_id: str = Field(max_length=256)
     entry_id: str = Field(max_length=256)
+    entry_revision: int
+    expected_revision: int | None
     request_sha256: str
     entry_created_at: datetime
     entry_updated_at: datetime
@@ -915,6 +962,28 @@ class KnowledgePublicationReceipt(BaseModel):
         if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
             raise ValueError("`request_sha256` must be a lowercase SHA-256 digest.")
         return value
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
+        return value
+
+    @field_validator("expected_revision")
+    @classmethod
+    def validate_expected_revision(cls, value: int | None) -> int | None:
+        if value is not None:
+            _validate_knowledge_revision(value, "expected_revision")
+        return value
+
+    @model_validator(mode="after")
+    def validate_revision_transition(self) -> KnowledgePublicationReceipt:
+        expected_entry_revision = (
+            1 if self.expected_revision is None else self.expected_revision + 1
+        )
+        if self.entry_revision != expected_entry_revision:
+            raise ValueError("`entry_revision` must follow `expected_revision`.")
+        return self
 
     @field_validator("entry_created_at", "entry_updated_at", "committed_at")
     @classmethod
@@ -969,95 +1038,81 @@ class KnowledgeStore(ABC):
         return (KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD)
 
     @abstractmethod
-    async def put_entry(
+    async def create_entry(
         self,
         entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        """Insert or update one knowledge entry by id."""
+        """Create revision 1 of a previously unoccupied logical entry id."""
+
+    @abstractmethod
+    async def append_entry_revision(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        """Append exactly one revision using compare-and-swap."""
 
     @abstractmethod
     async def get_entry(
         self,
         entry_id: str,
         *,
+        revision: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
-        """Load one entry by id."""
-
-    @abstractmethod
-    async def update_entry_status(
-        self,
-        entry_id: str,
-        status: KnowledgeStatus,
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        """Update one entry status and return the updated entry."""
+        """Load the current revision, or one exact historical revision."""
 
     @abstractmethod
     async def transition_entry_status(
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope | None = None,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
         expected_namespace: str | None = None,
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry:
-        """Conditionally update one entry status and return the updated entry."""
+        """Append one lifecycle-only revision using compare-and-swap."""
 
     @abstractmethod
     async def delete_entry(
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
-        """Soft-delete one entry by default, or hard-delete when requested."""
+        """Append a tombstone by default, or physically erase after a CAS check."""
 
-    @abstractmethod
-    async def replace_chunks(
-        self,
-        entry_id: str,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> list[KnowledgeChunk]:
-        """Replace the complete chunk set for an existing entry."""
-
-    @abstractmethod
-    async def put_entry_with_chunks(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        """Atomically write one entry and its complete chunk set."""
-
-    async def publish_entry_with_chunks(
+    async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
+        expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
-        """Create one entry exactly once and retain immutable replay evidence.
+        """Publish one create/append exactly once with immutable replay evidence.
 
-        This optional extension hook is non-abstract so existing out-of-tree
-        stores remain importable. Implementations must commit the entry, chunks,
-        and receipt atomically and must never overwrite an occupied entry id.
+        Implementations commit the revision, chunks, current pointer, and receipt
+        atomically. ``expected_revision=None`` creates revision 1; a positive
+        value appends exactly its successor.
         Use :func:`prepare_knowledge_publication` to copy and bind the canonical
         authority tuple before entering the store transaction.
         """
 
         raise NotImplementedError(
-            "This KnowledgeStore does not support owned knowledge publication."
+            "This KnowledgeStore does not support owned revision publication."
         )
 
     async def load_entry_publication_receipt(
@@ -1077,13 +1132,14 @@ class KnowledgeStore(ABC):
         self,
         entry_id: str,
         *,
+        revision: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         chunk_index: int | None = None,
         around: int = 0,
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
-        """Read bounded chunks for one entry."""
+        """Read bounded chunks for the current or one exact historical revision."""
 
     @abstractmethod
     async def search(
@@ -1132,85 +1188,119 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._default_access_scope = (
             None if access_scope is None else copy_knowledge_access_scope(access_scope)
         )
-        self._entries: dict[str, KnowledgeEntry] = {}
-        self._chunks: dict[str, list[KnowledgeChunk]] = {}
+        self._entries: dict[str, dict[int, KnowledgeEntry]] = {}
+        self._current_revisions: dict[str, int] = {}
+        self._chunks: dict[tuple[str, int], list[KnowledgeChunk]] = {}
         self._publication_receipts: dict[str, KnowledgePublicationReceipt] = {}
         self._publication_access: dict[str, _KnowledgeAccessSnapshot] = {}
         if entries:
             for entry in entries:
                 copied = copy_knowledge_entry(entry)
+                if copied.revision != 1:
+                    raise ValueError("Initial knowledge entries must be revision 1.")
                 if copied.id in self._entries:
                     raise ValueError(f"Duplicate knowledge entry id {copied.id!r}.")
-                self._entries[copied.id] = copied
-                self._chunks[copied.id] = [_default_chunk_for_entry(copied)]
+                self._entries[copied.id] = {1: copied}
+                self._current_revisions[copied.id] = 1
+                self._chunks[(copied.id, 1)] = [_default_chunk_for_entry(copied)]
 
-    async def put_entry(
+    async def create_entry(
         self,
         entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
-        _require_knowledge_entry_access(scope, entry, operation="put_entry")
-        existing_entry = self._entries.get(entry.id)
-        if existing_entry is not None:
-            _require_knowledge_entry_access(scope, existing_entry, operation="put_entry")
-        existing_chunks = self._chunks.get(entry.id)
-        replacement_chunks: list[KnowledgeChunk] | None = None
-        if (
-            existing_entry is None
-            or existing_chunks is None
-            or _has_only_default_chunk(existing_entry, existing_chunks)
-        ):
-            replacement_chunks = [_default_chunk_for_entry(entry)]
-            self._require_chunk_ids_available(
+        _validate_revision_append(entry, expected_revision=None)
+        _require_knowledge_entry_access(scope, entry, operation="create_entry")
+        existing = self._current_entry(entry.id)
+        if existing is not None:
+            _require_knowledge_entry_access(scope, existing, operation="create_entry")
+            raise KnowledgeRevisionConflict(
                 entry.id,
-                replacement_chunks,
-                access_scope=scope,
-                operation="put_entry",
+                expected_revision=None,
+                actual_revision=existing.revision,
             )
-        self._entries[entry.id] = entry
-        if replacement_chunks is not None:
-            self._chunks[entry.id] = replacement_chunks
+        copied_chunks = self._revision_chunks(entry, chunks)
+        self._require_chunk_ids_available(
+            copied_chunks,
+            access_scope=scope,
+            operation="create_entry",
+        )
+        self._entries[entry.id] = {1: entry}
+        self._current_revisions[entry.id] = 1
+        self._chunks[(entry.id, 1)] = copied_chunks
+        return copy_knowledge_entry(entry)
+
+    async def append_entry_revision(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        scope = self._operation_access_scope(access_scope)
+        entry = copy_knowledge_entry(entry)
+        _validate_revision_append(entry, expected_revision=expected_revision)
+        current = self._current_entry(entry.id)
+        if current is None:
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=None,
+            )
+        _require_knowledge_entry_access(scope, current, operation="append_entry_revision")
+        if current.revision != expected_revision:
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=current.revision,
+            )
+        _validate_revision_successor(current, entry)
+        _require_knowledge_successor_access(
+            scope,
+            entry,
+            operation="append_entry_revision",
+        )
+        copied_chunks = self._revision_chunks(entry, chunks, previous=current)
+        self._require_chunk_ids_available(
+            copied_chunks,
+            access_scope=scope,
+            operation="append_entry_revision",
+        )
+        self._entries[entry.id][entry.revision] = entry
+        self._chunks[(entry.id, entry.revision)] = copied_chunks
+        self._current_revisions[entry.id] = entry.revision
         return copy_knowledge_entry(entry)
 
     async def get_entry(
         self,
         entry_id: str,
         *,
+        revision: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
-        entry = self._entries.get(clean_id)
+        if revision is not None:
+            _validate_knowledge_revision(revision, "revision")
+        if revision is not None:
+            current = self._current_entry(clean_id)
+            if current is None or not _knowledge_scope_allows_entry(scope, current):
+                return None
+        entry = self._entry_revision(clean_id, revision)
         if entry is None or not _knowledge_scope_allows_entry(scope, entry):
             return None
         return copy_knowledge_entry(entry)
-
-    async def update_entry_status(
-        self,
-        entry_id: str,
-        status: KnowledgeStatus,
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
-        entry = self._entries.get(clean_id)
-        if entry is None:
-            raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-        _require_knowledge_entry_access(scope, entry, operation="update_entry_status")
-        updated = entry.model_copy(update={"status": status, "updated_at": _next_updated_at(entry)})
-        updated = copy_knowledge_entry(updated)
-        _require_knowledge_entry_access(scope, updated, operation="update_entry_status")
-        self._entries[clean_id] = updated
-        return copy_knowledge_entry(updated)
 
     async def transition_entry_status(
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope | None = None,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
@@ -1219,6 +1309,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
+        _validate_knowledge_revision(expected_revision, "expected_revision")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
         if not isinstance(to_status, KnowledgeStatus):
@@ -1229,10 +1320,16 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             else None
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
-        entry = self._entries.get(clean_id)
+        entry = self._current_entry(clean_id)
         if entry is None:
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
         _require_knowledge_entry_access(scope, entry, operation="transition_entry_status")
+        if entry.revision != expected_revision:
+            raise KnowledgeRevisionConflict(
+                clean_id,
+                expected_revision=expected_revision,
+                actual_revision=entry.revision,
+            )
         if entry.status is not from_status:
             raise ValueError(
                 f"Knowledge entry {clean_id!r} is {entry.status.value!r}, "
@@ -1244,34 +1341,53 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if entry.labels.get(key) != value:
                 raise ValueError(f"Knowledge entry {clean_id!r} does not match expected labels.")
         updated = entry.model_copy(
-            update={"status": to_status, "updated_at": _next_updated_at(entry)}
+            update={
+                "revision": _next_knowledge_revision(expected_revision),
+                "status": to_status,
+                "updated_at": _next_updated_at(entry),
+            }
         )
-        updated = copy_knowledge_entry(updated)
-        _require_knowledge_entry_access(scope, updated, operation="transition_entry_status")
-        self._entries[clean_id] = updated
-        return copy_knowledge_entry(updated)
+        return await self.append_entry_revision(
+            updated,
+            expected_revision=expected_revision,
+            access_scope=scope,
+        )
 
     async def delete_entry(
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
-        entry = self._entries.get(clean_id)
+        _validate_knowledge_revision(expected_revision, "expected_revision")
+        if type(hard) is not bool:
+            raise ValueError("`hard` must be a boolean.")
+        entry = self._current_entry(clean_id)
         if entry is None:
             return None
         _require_knowledge_entry_access(scope, entry, operation="delete_entry")
+        if entry.revision != expected_revision:
+            raise KnowledgeRevisionConflict(
+                clean_id,
+                expected_revision=expected_revision,
+                actual_revision=entry.revision,
+            )
         if hard:
             self._entries.pop(clean_id, None)
-            self._chunks.pop(clean_id, None)
+            self._current_revisions.pop(clean_id, None)
+            for key in [key for key in self._chunks if key[0] == clean_id]:
+                self._chunks.pop(key, None)
             return copy_knowledge_entry(entry)
-        return await self.update_entry_status(
+        return await self.transition_entry_status(
             clean_id,
-            KnowledgeStatus.DELETED,
+            expected_revision=expected_revision,
             access_scope=scope,
+            from_status=entry.status,
+            to_status=KnowledgeStatus.DELETED,
         )
 
     async def prune_expired(
@@ -1284,124 +1400,87 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         cutoff = datetime.now(UTC) if now is None else now
         expired_ids = [
             entry_id
-            for entry_id, entry in self._entries.items()
+            for entry_id in self._entries
+            if (entry := self._current_entry(entry_id)) is not None
             if entry.expires_at is not None
             and entry.expires_at <= cutoff
             and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
         ]
         for entry_id in expired_ids:
             self._entries.pop(entry_id, None)
-            self._chunks.pop(entry_id, None)
+            self._current_revisions.pop(entry_id, None)
+            for key in [key for key in self._chunks if key[0] == entry_id]:
+                self._chunks.pop(key, None)
         return len(expired_ids)
 
-    async def replace_chunks(
-        self,
-        entry_id: str,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> list[KnowledgeChunk]:
-        scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
-        entry = self._entries.get(clean_id)
-        if entry is None:
-            raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
-        _require_knowledge_entry_access(scope, entry, operation="replace_chunks")
-        copied_chunks = _copy_entry_chunks(clean_id, chunks)
-        self._require_chunk_ids_available(
-            clean_id,
-            copied_chunks,
-            access_scope=scope,
-            operation="replace_chunks",
-        )
-        self._chunks[clean_id] = copied_chunks
-        return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
-
-    async def put_entry_with_chunks(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        scope = self._operation_access_scope(access_scope)
-        copied_entry = copy_knowledge_entry(entry)
-        _require_knowledge_entry_access(scope, copied_entry, operation="put_entry_with_chunks")
-        existing_entry = self._entries.get(copied_entry.id)
-        if existing_entry is not None:
-            _require_knowledge_entry_access(
-                scope,
-                existing_entry,
-                operation="put_entry_with_chunks",
-            )
-        copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
-        self._require_chunk_ids_available(
-            copied_entry.id,
-            copied_chunks,
-            access_scope=scope,
-            operation="put_entry_with_chunks",
-        )
-        self._entries[copied_entry.id] = copied_entry
-        self._chunks[copied_entry.id] = copied_chunks
-        return copy_knowledge_entry(copied_entry)
-
-    async def publish_entry_with_chunks(
+    async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
+        expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
         operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
-            entry, chunks, operation_id=operation_id
+            entry,
+            chunks,
+            operation_id=operation_id,
+            expected_revision=expected_revision,
         )
-        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_with_chunks")
+        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
         existing_receipt = self._publication_receipts.get(operation_id)
         if existing_receipt is not None:
             receipt_access = self._publication_access.get(operation_id)
             if receipt_access is None:
                 raise KnowledgePublicationConflict("malformed_receipt")
             if not _knowledge_scope_allows_snapshot(scope, receipt_access):
-                raise KnowledgeAccessDenied("publish_entry_with_chunks")
+                raise KnowledgeAccessDenied("publish_entry_revision")
             _validate_knowledge_publication_replay(
                 existing_receipt,
                 entry=copied_entry,
                 request_sha256=request_sha256,
             )
             return copy_knowledge_publication_receipt(existing_receipt, replayed=True)
-        existing_entry = self._entries.get(copied_entry.id)
+        existing_entry = self._current_entry(copied_entry.id)
+        actual_revision = None if existing_entry is None else existing_entry.revision
         if existing_entry is not None:
             _require_knowledge_entry_access(
-                scope,
-                existing_entry,
-                operation="publish_entry_with_chunks",
+                scope, existing_entry, operation="publish_entry_revision"
             )
-            raise KnowledgePublicationConflict("entry_occupied")
+        if actual_revision != expected_revision:
+            raise KnowledgeRevisionConflict(
+                copied_entry.id,
+                expected_revision=expected_revision,
+                actual_revision=actual_revision,
+            )
+        if existing_entry is not None:
+            _validate_revision_successor(existing_entry, copied_entry)
         self._require_chunk_ids_available(
-            copied_entry.id,
             copied_chunks,
             access_scope=scope,
-            operation="publish_entry_with_chunks",
+            operation="publish_entry_revision",
         )
         receipt = KnowledgePublicationReceipt(
             operation_id=operation_id,
             entry_id=copied_entry.id,
+            entry_revision=copied_entry.revision,
+            expected_revision=expected_revision,
             request_sha256=request_sha256,
             entry_created_at=copied_entry.created_at,
             entry_updated_at=copied_entry.updated_at,
             committed_at=datetime.now(UTC),
         )
-        self._entries[copied_entry.id] = copied_entry
-        self._chunks[copied_entry.id] = copied_chunks
+        self._entries.setdefault(copied_entry.id, {})[copied_entry.revision] = copied_entry
+        self._chunks[(copied_entry.id, copied_entry.revision)] = copied_chunks
+        self._current_revisions[copied_entry.id] = copied_entry.revision
         self._publication_receipts[operation_id] = receipt
         self._publication_access[operation_id] = _knowledge_access_snapshot(copied_entry)
         return copy_knowledge_publication_receipt(receipt)
 
     def _require_chunk_ids_available(
         self,
-        entry_id: str,
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope,
@@ -1409,13 +1488,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> None:
         proposed_ids = {chunk.id for chunk in chunks}
         occupied_entry_ids: set[str] = set()
-        for existing_entry_id, existing_chunks in self._chunks.items():
-            if existing_entry_id == entry_id:
-                continue
+        for (existing_entry_id, _), existing_chunks in self._chunks.items():
             if any(chunk.id in proposed_ids for chunk in existing_chunks):
                 occupied_entry_ids.add(existing_entry_id)
         for occupied_entry_id in sorted(occupied_entry_ids):
-            owner = self._entries.get(occupied_entry_id)
+            owner = self._current_entry(occupied_entry_id)
             if owner is None:
                 raise KnowledgeChunkConflict(operation)
             _require_knowledge_entry_access(
@@ -1425,6 +1502,38 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             )
         if occupied_entry_ids:
             raise KnowledgeChunkConflict(operation)
+
+    def _current_entry(self, entry_id: str) -> KnowledgeEntry | None:
+        revision = self._current_revisions.get(entry_id)
+        if revision is None:
+            return None
+        return self._entries[entry_id][revision]
+
+    def _entry_revision(
+        self,
+        entry_id: str,
+        revision: int | None,
+    ) -> KnowledgeEntry | None:
+        selected_revision = self._current_revisions.get(entry_id) if revision is None else revision
+        if selected_revision is None:
+            return None
+        return self._entries.get(entry_id, {}).get(selected_revision)
+
+    def _revision_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None,
+        *,
+        previous: KnowledgeEntry | None = None,
+    ) -> list[KnowledgeChunk]:
+        if chunks is not None:
+            return _copy_entry_chunks(entry.id, entry.revision, chunks)
+        if previous is None:
+            return [_default_chunk_for_entry(entry)]
+        previous_chunks = self._chunks.get((previous.id, previous.revision), [])
+        if _has_only_default_chunk(previous, previous_chunks):
+            return [_default_chunk_for_entry(entry)]
+        return _copy_chunks_for_revision(previous_chunks, entry)
 
     async def load_entry_publication_receipt(
         self,
@@ -1446,6 +1555,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self,
         entry_id: str,
         *,
+        revision: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         chunk_index: int | None = None,
         around: int = 0,
@@ -1454,7 +1564,13 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> list[KnowledgeChunk]:
         scope = self._operation_access_scope(access_scope)
         clean_id = require_clean_nonblank(entry_id, "entry_id")
-        entry = self._entries.get(clean_id)
+        if revision is not None:
+            _validate_knowledge_revision(revision, "revision")
+        if revision is not None:
+            current = self._current_entry(clean_id)
+            if current is None or not _knowledge_scope_allows_entry(scope, current):
+                return []
+        entry = self._entry_revision(clean_id, revision)
         if entry is None or not _knowledge_scope_allows_entry(scope, entry):
             return []
         if chunk_index is not None:
@@ -1466,7 +1582,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         _validate_positive_int(max_bytes, "max_bytes")
         start_index = 0 if chunk_index is None else max(0, chunk_index - around)
         end_index = None if chunk_index is None else chunk_index + around
-        chunks = self._chunks.get(clean_id, [])
+        chunks = self._chunks.get((clean_id, entry.revision), [])
         if chunk_index is not None:
             chunks = _center_chunk_window(chunks, chunk_index=chunk_index, max_chunks=max_chunks)
         return _bounded_chunks(
@@ -1489,12 +1605,15 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             raise ValueError("InMemoryKnowledgeStore supports only auto and keyword search modes.")
         terms = _knowledge_query_terms(knowledge_query)
         scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str]] = []
-        for entry in self._entries.values():
+        for entry_id in self._entries:
+            entry = self._current_entry(entry_id)
+            if entry is None:  # pragma: no cover - internal invariant
+                continue
             if not _knowledge_scope_allows_entry(scope, entry):
                 continue
             if not _entry_matches_query(entry, knowledge_query):
                 continue
-            chunks = self._chunks.get(entry.id, [])
+            chunks = self._chunks.get((entry.id, entry.revision), [])
             if _entry_matches_none_terms(entry, chunks, terms):
                 continue
             score, chunk, reason, preview_text = _score_entry(entry, chunks, knowledge_query)
@@ -1558,7 +1677,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         knowledge_query = copy_knowledge_list_query(query)
         entries = [
             entry
-            for entry in self._entries.values()
+            for entry_id in self._entries
+            if (entry := self._current_entry(entry_id)) is not None
             if _knowledge_scope_allows_entry(scope, entry)
             if _entry_matches_list_query(entry, knowledge_query)
         ]
@@ -1593,7 +1713,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             items.append(
                 KnowledgeListItem(
                     entry=entry,
-                    chunk_count=len(self._chunks.get(entry.id, [])),
+                    chunk_count=len(self._chunks.get((entry.id, entry.revision), [])),
                     text_preview=preview,
                     text_preview_complete=preview_complete,
                 )
@@ -1655,25 +1775,50 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             KnowledgeSearchMode.HYBRID,
         )
 
-    async def put_entry(
+    async def create_entry(
         self,
         entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        stored = await super().put_entry(entry, access_scope=access_scope)
-        await self._embed_entry_chunks(stored.id)
+        stored = await super().create_entry(
+            entry,
+            access_scope=access_scope,
+            chunks=chunks,
+        )
+        await self._embed_entry_chunks(stored.id, stored.revision)
+        return stored
+
+    async def append_entry_revision(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk] | None = None,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEntry:
+        stored = await super().append_entry_revision(
+            entry,
+            expected_revision=expected_revision,
+            access_scope=access_scope,
+            chunks=chunks,
+        )
+        await self._embed_entry_chunks(stored.id, stored.revision)
+        self._drop_stale_entry_embeddings(stored.id)
         return stored
 
     async def delete_entry(
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
         deleted = await super().delete_entry(
             entry_id,
+            expected_revision=expected_revision,
             access_scope=access_scope,
             hard=hard,
         )
@@ -1691,7 +1836,8 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         cutoff = datetime.now(UTC) if now is None else now
         expired_ids = [
             entry_id
-            for entry_id, entry in self._entries.items()
+            for entry_id in self._entries
+            if (entry := self._current_entry(entry_id)) is not None
             if entry.expires_at is not None
             and entry.expires_at <= cutoff
             and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
@@ -1701,56 +1847,25 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             self._drop_entry_embeddings(entry_id)
         return pruned
 
-    async def replace_chunks(
-        self,
-        entry_id: str,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> list[KnowledgeChunk]:
-        stored_chunks = await super().replace_chunks(
-            entry_id,
-            chunks,
-            access_scope=access_scope,
-        )
-        await self._embed_chunks(stored_chunks)
-        self._drop_stale_entry_embeddings(entry_id)
-        return stored_chunks
-
-    async def put_entry_with_chunks(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk],
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        stored = await super().put_entry_with_chunks(
-            entry,
-            chunks,
-            access_scope=access_scope,
-        )
-        stored_chunks = self._chunks.get(stored.id, [])
-        await self._embed_chunks(stored_chunks)
-        self._drop_stale_entry_embeddings(stored.id)
-        return stored
-
-    async def publish_entry_with_chunks(
+    async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
+        expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
-        receipt = await super().publish_entry_with_chunks(
+        receipt = await super().publish_entry_revision(
             entry,
             chunks,
             access_scope=access_scope,
             operation_id=operation_id,
+            expected_revision=expected_revision,
         )
         if receipt.replayed:
             return receipt
-        stored_chunks = self._chunks.get(receipt.entry_id, [])
+        stored_chunks = self._chunks.get((receipt.entry_id, receipt.entry_revision), [])
         await self._embed_chunks(stored_chunks)
         self._drop_stale_entry_embeddings(receipt.entry_id)
         return receipt
@@ -1776,8 +1891,11 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             )
         terms = _knowledge_query_terms(knowledge_query)
         candidates: list[tuple[KnowledgeEntry, list[KnowledgeChunk]]] = []
-        for entry in self._entries.values():
-            chunks = self._chunks.get(entry.id, [])
+        for entry_id in self._entries:
+            entry = self._current_entry(entry_id)
+            if entry is None:  # pragma: no cover - internal invariant
+                continue
+            chunks = self._chunks.get((entry.id, entry.revision), [])
             if not _knowledge_scope_allows_entry(scope, entry):
                 continue
             if not _entry_matches_query(entry, knowledge_query):
@@ -1866,8 +1984,8 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         )
         return _search_result_from_scored_embeddings(scored, knowledge_query, score_kind=score_kind)
 
-    async def _embed_entry_chunks(self, entry_id: str) -> None:
-        await self._embed_chunks(self._chunks.get(entry_id, []))
+    async def _embed_entry_chunks(self, entry_id: str, revision: int) -> None:
+        await self._embed_chunks(self._chunks.get((entry_id, revision), []))
 
     async def _embed_chunks(self, chunks: list[KnowledgeChunk]) -> dict[str, list[float]]:
         vectors = {
@@ -1969,7 +2087,12 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         self,
         entry_id: str,
     ) -> None:
-        current_ids = {chunk.id for chunk in self._chunks.get(entry_id, [])}
+        current = self._current_entry(entry_id)
+        current_ids = (
+            set()
+            if current is None
+            else {chunk.id for chunk in self._chunks.get((entry_id, current.revision), [])}
+        )
         stale_ids = [
             chunk_id
             for chunk_id, embedding in self._chunk_embeddings.items()
@@ -1979,7 +2102,13 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             self._chunk_embeddings.pop(chunk_id, None)
 
     def _chunk_is_current(self, chunk: KnowledgeChunk) -> bool:
-        return any(current == chunk for current in self._chunks.get(chunk.entry_id, []))
+        current = self._current_entry(chunk.entry_id)
+        if current is None or current.revision != chunk.entry_revision:
+            return False
+        return any(
+            stored == chunk
+            for stored in self._chunks.get((chunk.entry_id, chunk.entry_revision), [])
+        )
 
 
 def copy_knowledge_access_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessScope:
@@ -2077,11 +2206,43 @@ def _require_knowledge_entry_access(
         raise KnowledgeAccessDenied(operation)
 
 
+def _require_knowledge_successor_access(
+    scope: KnowledgeAccessScope,
+    entry: KnowledgeEntry,
+    *,
+    operation: str,
+) -> None:
+    """Authorize a successor without coupling retirement to audit visibility.
+
+    A principal that can mutate the current revision may retire it without also
+    receiving read access to archived or deleted material. Every other scope
+    dimension remains enforced, and promotion/reactivation still requires the
+    destination status to be present in the supplied scope.
+    """
+
+    if (
+        entry.status in _KNOWLEDGE_RETIREMENT_STATUSES
+        and entry.status not in scope.allowed_statuses
+    ):
+        retirement_scope = scope.model_copy(
+            update={
+                "allowed_statuses": sorted(
+                    {*scope.allowed_statuses, entry.status},
+                    key=str,
+                )
+            }
+        )
+        _require_knowledge_entry_access(retirement_scope, entry, operation=operation)
+        return
+    _require_knowledge_entry_access(scope, entry, operation=operation)
+
+
 def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
     if type(entry) is not KnowledgeEntry:
         raise TypeError("KnowledgeEntry instances must not be subclasses.")
     return KnowledgeEntry(
         id=entry.id,
+        revision=entry.revision,
         text=entry.text,
         namespace=entry.namespace,
         labels=copy_label_map(entry.labels, "labels"),
@@ -2114,6 +2275,7 @@ def copy_knowledge_chunk(chunk: KnowledgeChunk) -> KnowledgeChunk:
     return KnowledgeChunk(
         id=chunk.id,
         entry_id=chunk.entry_id,
+        entry_revision=chunk.entry_revision,
         text=chunk.text,
         chunk_index=chunk.chunk_index,
         content_hash=chunk.content_hash,
@@ -2132,6 +2294,8 @@ def copy_knowledge_publication_receipt(
     return KnowledgePublicationReceipt(
         operation_id=receipt.operation_id,
         entry_id=receipt.entry_id,
+        entry_revision=receipt.entry_revision,
+        expected_revision=receipt.expected_revision,
         request_sha256=receipt.request_sha256,
         entry_created_at=receipt.entry_created_at,
         entry_updated_at=receipt.entry_updated_at,
@@ -2145,16 +2309,23 @@ def prepare_knowledge_publication(
     chunks: list[KnowledgeChunk],
     *,
     operation_id: str,
+    expected_revision: int | None = None,
 ) -> tuple[str, KnowledgeEntry, list[KnowledgeChunk], str]:
-    """Copy and bind the complete create-only publication authority tuple."""
+    """Copy and bind one complete revision-publication authority tuple."""
 
     clean_operation_id = _knowledge_publication_operation_id(operation_id)
     copied_entry = copy_knowledge_entry(entry)
-    copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
+    _validate_revision_append(copied_entry, expected_revision=expected_revision)
+    copied_chunks = _copy_entry_chunks(
+        copied_entry.id,
+        copied_entry.revision,
+        chunks,
+    )
     request_sha256 = sha256(
         canonical_durable_json_bytes(
             {
-                "contract": "cayu-knowledge-publication-v1",
+                "contract": "cayu-knowledge-revision-publication-v1",
+                "expected_revision": expected_revision,
                 "entry": copied_entry.model_dump(mode="json"),
                 "chunks": [chunk.model_dump(mode="json") for chunk in copied_chunks],
             },
@@ -2180,11 +2351,49 @@ def _validate_knowledge_publication_replay(
     receipt = copy_knowledge_publication_receipt(receipt)
     if (
         receipt.entry_id != entry.id
+        or receipt.entry_revision != entry.revision
         or receipt.request_sha256 != request_sha256
         or receipt.entry_created_at != entry.created_at
         or receipt.entry_updated_at != entry.updated_at
     ):
         raise KnowledgePublicationConflict("operation_mismatch")
+
+
+def _validate_revision_append(
+    entry: KnowledgeEntry,
+    *,
+    expected_revision: int | None,
+) -> None:
+    target_revision = (
+        1 if expected_revision is None else _next_knowledge_revision(expected_revision)
+    )
+    _validate_knowledge_revision(entry.revision, "entry.revision")
+    if entry.revision != target_revision:
+        raise ValueError(
+            f"Knowledge revision must be {target_revision} for expected_revision "
+            f"{expected_revision!r}."
+        )
+
+
+def _next_knowledge_revision(expected_revision: int) -> int:
+    _validate_knowledge_revision(expected_revision, "expected_revision")
+    if expected_revision == MAX_KNOWLEDGE_REVISION:
+        raise ValueError(f"Knowledge revision cannot advance beyond {MAX_KNOWLEDGE_REVISION}.")
+    return expected_revision + 1
+
+
+def _validate_revision_successor(
+    current: KnowledgeEntry,
+    successor: KnowledgeEntry,
+) -> None:
+    if successor.id != current.id:
+        raise ValueError("Knowledge revision must preserve the logical entry id.")
+    if successor.namespace != current.namespace:
+        raise ValueError("Knowledge revision must preserve the logical namespace.")
+    if successor.created_at != current.created_at:
+        raise ValueError("Knowledge revision must preserve the logical creation time.")
+    if successor.updated_at < current.updated_at:
+        raise ValueError("Knowledge revision `updated_at` cannot move backwards.")
 
 
 def copy_knowledge_query(query: KnowledgeQuery) -> KnowledgeQuery:
@@ -2271,7 +2480,11 @@ def copy_knowledge_facet(facet: KnowledgeFacet) -> KnowledgeFacet:
     )
 
 
-def _copy_entry_chunks(entry_id: str, chunks: list[KnowledgeChunk]) -> list[KnowledgeChunk]:
+def _copy_entry_chunks(
+    entry_id: str,
+    entry_revision: int,
+    chunks: list[KnowledgeChunk],
+) -> list[KnowledgeChunk]:
     if type(chunks) is not list:
         raise ValueError("`chunks` must be a list.")
     if not chunks:
@@ -2282,6 +2495,8 @@ def _copy_entry_chunks(entry_id: str, chunks: list[KnowledgeChunk]) -> list[Know
     for chunk in copied_chunks:
         if chunk.entry_id != entry_id:
             raise ValueError("Knowledge chunks must belong to the entry.")
+        if chunk.entry_revision != entry_revision:
+            raise ValueError("Knowledge chunks must belong to the exact entry revision.")
         if chunk.id in seen_ids:
             raise ValueError("Knowledge chunk ids must be unique within an entry.")
         if chunk.chunk_index in seen_indexes:
@@ -2289,6 +2504,27 @@ def _copy_entry_chunks(entry_id: str, chunks: list[KnowledgeChunk]) -> list[Know
         seen_ids.add(chunk.id)
         seen_indexes.add(chunk.chunk_index)
     return sorted(copied_chunks, key=lambda chunk: chunk.chunk_index)
+
+
+def _copy_chunks_for_revision(
+    chunks: list[KnowledgeChunk],
+    entry: KnowledgeEntry,
+) -> list[KnowledgeChunk]:
+    if not chunks:
+        return [_default_chunk_for_entry(entry)]
+    return [
+        KnowledgeChunk(
+            id=f"{entry.id}:r{entry.revision}:{chunk.chunk_index}",
+            entry_id=entry.id,
+            entry_revision=entry.revision,
+            text=chunk.text,
+            chunk_index=chunk.chunk_index,
+            content_hash=chunk.content_hash,
+            source_uri=chunk.source_uri,
+            metadata=chunk.metadata,
+        )
+        for chunk in chunks
+    ]
 
 
 def _center_chunk_window(
@@ -2334,6 +2570,7 @@ def _bounded_chunks(
                 KnowledgeChunk(
                     id=copied.id,
                     entry_id=copied.entry_id,
+                    entry_revision=copied.entry_revision,
                     text=truncated_text,
                     chunk_index=copied.chunk_index,
                     content_hash=None,
@@ -2756,8 +2993,9 @@ def _plural_search_token(token: str) -> str:
 
 def _default_chunk_for_entry(entry: KnowledgeEntry) -> KnowledgeChunk:
     return KnowledgeChunk(
-        id=f"{entry.id}:0",
+        id=f"{entry.id}:r{entry.revision}:0",
         entry_id=entry.id,
+        entry_revision=entry.revision,
         text=entry.text,
         chunk_index=0,
         content_hash=sha256(entry.text.encode("utf-8")).hexdigest(),
@@ -2777,6 +3015,7 @@ def _has_only_default_chunk(entry: KnowledgeEntry, chunks: list[KnowledgeChunk])
     return (
         chunk.id == default_chunk.id
         and chunk.entry_id == default_chunk.entry_id
+        and chunk.entry_revision == default_chunk.entry_revision
         and chunk.text == default_chunk.text
         and chunk.chunk_index == default_chunk.chunk_index
         and chunk.content_hash == default_chunk.content_hash
@@ -2799,6 +3038,12 @@ def _validate_positive_int(value: int, field_name: str) -> None:
         raise ValueError(f"`{field_name}` must be an integer.")
     if value <= 0:
         raise ValueError(f"`{field_name}` must be greater than 0.")
+
+
+def _validate_knowledge_revision(value: int, field_name: str) -> None:
+    _validate_positive_int(value, field_name)
+    if value > MAX_KNOWLEDGE_REVISION:
+        raise ValueError(f"`{field_name}` must be at most {MAX_KNOWLEDGE_REVISION}.")
 
 
 def _validate_nonnegative_float(value: float, field_name: str) -> float:

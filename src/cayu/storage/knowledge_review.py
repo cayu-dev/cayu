@@ -40,6 +40,7 @@ class _KnowledgeReviewStore(Protocol):
         self,
         entry_id: str,
         *,
+        expected_revision: int,
         access_scope: KnowledgeAccessScope,
         from_status: KnowledgeStatus,
         to_status: KnowledgeStatus,
@@ -126,6 +127,7 @@ class KnowledgeReviewWorkflow:
         entry = await self._require_pending_entry(entry_id)
         return await self.store.transition_entry_status(
             entry.id,
+            expected_revision=entry.revision,
             access_scope=self.access_scope,
             from_status=KnowledgeStatus.PENDING,
             to_status=KnowledgeStatus.ACTIVE,
@@ -139,6 +141,7 @@ class KnowledgeReviewWorkflow:
         entry = await self._require_pending_entry(entry_id)
         return await self.store.transition_entry_status(
             entry.id,
+            expected_revision=entry.revision,
             access_scope=self.access_scope,
             from_status=KnowledgeStatus.PENDING,
             to_status=KnowledgeStatus.ARCHIVED,

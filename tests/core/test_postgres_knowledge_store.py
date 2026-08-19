@@ -36,10 +36,12 @@ from cayu.storage import (
     KnowledgeListGroup,
     KnowledgeListQuery,
     KnowledgeQuery,
+    KnowledgeRevisionResetRequired,
     KnowledgeSearchMode,
     KnowledgeStatus,
     KnowledgeVisibility,
 )
+from cayu.storage import migrations as schema_migrations
 from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, SchemaMode
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -54,6 +56,7 @@ _TABLES = (
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
     "cayu_knowledge_chunks",
+    "cayu_knowledge_revisions",
     "cayu_knowledge_entries",
     "cayu_event_watcher_state",
     "cayu_budget_reservation_identities",
@@ -170,6 +173,37 @@ async def _drop_all(dsn: str) -> None:
         await conn.commit()
 
 
+async def _legacy_knowledge_snapshot(cursor) -> tuple[object, ...]:
+    await cursor.execute(
+        """
+        SELECT table_name, column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name LIKE 'cayu_knowledge_%'
+        ORDER BY table_name, ordinal_position
+        """
+    )
+    schema_rows = tuple(await cursor.fetchall())
+    await cursor.execute(
+        "SELECT id, namespace, text, metadata::text FROM cayu_knowledge_entries ORDER BY id"
+    )
+    entries = tuple(await cursor.fetchall())
+    await cursor.execute(
+        "SELECT entry_id, key, value FROM cayu_knowledge_labels ORDER BY entry_id, key"
+    )
+    labels = tuple(await cursor.fetchall())
+    await cursor.execute(
+        "SELECT id, entry_id, chunk_index, text, metadata::text "
+        "FROM cayu_knowledge_chunks ORDER BY id"
+    )
+    chunks = tuple(await cursor.fetchall())
+    await cursor.execute(
+        "SELECT revision, kind, compatible_from FROM cayu_schema_migrations ORDER BY revision"
+    )
+    ledger = tuple(await cursor.fetchall())
+    return schema_rows, entries, labels, chunks, ledger
+
+
 def _new_store(dsn: str):
     from cayu import PostgresKnowledgeStore
 
@@ -247,7 +281,7 @@ def test_postgres_scoped_entry_hydration_uses_one_read_snapshot(
         await _drop_all(postgres_dsn)
         privileged = _new_store(postgres_dsn)
         try:
-            await privileged.put_entry(
+            await privileged.create_entry(
                 KnowledgeEntry(
                     id="entry",
                     text="snapshot protected",
@@ -260,21 +294,27 @@ def test_postgres_scoped_entry_hydration_uses_one_read_snapshot(
         class RacingStore(PostgresKnowledgeStore):
             changed = False
 
-            async def _load_labels(self, cur, entry_id: str) -> dict[str, str]:
+            async def _load_labels(
+                self,
+                cur,
+                entry_id: str,
+                revision: int,
+            ) -> dict[str, str]:
                 if not self.changed:
                     self.changed = True
                     peer = _new_store(postgres_dsn)
                     try:
-                        await peer.put_entry(
-                            KnowledgeEntry(
-                                id=entry_id,
-                                text="snapshot protected",
-                                labels={"project": "beta"},
-                            )
+                        current = await peer.get_entry(entry_id)
+                        assert current is not None
+                        await peer.append_entry_revision(
+                            current.model_copy(
+                                update={"revision": 2, "labels": {"project": "beta"}}
+                            ),
+                            expected_revision=1,
                         )
                     finally:
                         await peer.close()
-                return await super()._load_labels(cur, entry_id)
+                return await super()._load_labels(cur, entry_id, revision)
 
         scope = KnowledgeAccessScope.for_namespace(
             "default",
@@ -327,7 +367,7 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
         )
         privileged = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
         try:
-            await privileged.put_entry_with_chunks(original, [original_chunk])
+            await privileged.create_entry(original, [original_chunk])
         finally:
             await privileged.close()
 
@@ -339,27 +379,29 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
                     self.changed = True
                     peer = _new_store(postgres_dsn)
                     try:
-                        await peer.replace_chunks(
-                            original.id,
+                        await peer.append_entry_revision(
+                            original.model_copy(update={"revision": 2}),
                             [
                                 KnowledgeChunk(
                                     id="tenant-a-replacement",
                                     entry_id=original.id,
+                                    entry_revision=2,
                                     chunk_index=0,
                                     text="Tenant A replacement policy.",
                                 )
                             ],
+                            expected_revision=1,
                         )
                         tenant_b = KnowledgeEntry(
                             id="tenant-b-entry",
                             namespace="tenant-b",
                             text="Tenant B secret credential policy.",
                         )
-                        await peer.put_entry_with_chunks(
+                        await peer.create_entry(
                             tenant_b,
                             [
                                 KnowledgeChunk(
-                                    id=original_chunk.id,
+                                    id="tenant-b:r1:0",
                                     entry_id=tenant_b.id,
                                     chunk_index=0,
                                     text=tenant_b.text,
@@ -403,7 +445,7 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
                 "tenant-a-replacement"
             ]
             reused = await current.read_chunks("tenant-b-entry")
-            assert reused[0].id == original_chunk.id
+            assert reused[0].id == "tenant-b:r1:0"
             assert reused[0].text == "Tenant B secret credential policy."
         finally:
             await current.close()
@@ -442,7 +484,7 @@ def test_postgres_hybrid_lanes_share_one_read_snapshot(postgres_dsn: str) -> Non
         )
         privileged = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
         try:
-            await privileged.put_entry_with_chunks(original, [original_chunk])
+            await privileged.create_entry(original, [original_chunk])
         finally:
             await privileged.close()
 
@@ -467,8 +509,12 @@ def test_postgres_hybrid_lanes_share_one_read_snapshot(postgres_dsn: str) -> Non
                     self.changed = True
                     peer = _new_store(postgres_dsn)
                     try:
-                        await peer.delete_entry(original.id, hard=True)
-                        await peer.put_entry_with_chunks(later, [later_chunk])
+                        await peer.delete_entry(
+                            original.id,
+                            expected_revision=original.revision,
+                            hard=True,
+                        )
+                        await peer.create_entry(later, [later_chunk])
                     finally:
                         await peer.close()
                 return scored
@@ -550,21 +596,25 @@ def test_postgres_owned_publication_does_not_apply_stale_derived_embeddings(
             )
             old_chunks = [old_chunks[0].model_copy(update={"id": "old-publication-chunk"})]
             old_task = asyncio.create_task(
-                store.publish_entry_with_chunks(
+                store.publish_entry_revision(
                     old_entry,
                     old_chunks,
                     operation_id="old-embedding-publication",
                 )
             )
             await asyncio.wait_for(provider.first_started.wait(), timeout=2)
-            await store.delete_entry(old_entry.id, hard=True)
+            await store.delete_entry(
+                old_entry.id,
+                expected_revision=old_entry.revision,
+                hard=True,
+            )
             new_entry, new_chunks = publication_material(
                 entry_id=old_entry.id,
                 text="Invoice payment refund policy.",
                 timestamp_offset=1,
             )
             new_chunks = [new_chunks[0].model_copy(update={"id": "new-publication-chunk"})]
-            await store.publish_entry_with_chunks(
+            await store.publish_entry_revision(
                 new_entry,
                 new_chunks,
                 operation_id="new-embedding-publication",
@@ -641,12 +691,18 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
                 text="Old GitHub credential policy.",
             )
             old_chunks = [old_chunks[0].model_copy(update={"id": "old-delete-chunk"})]
-            await store.publish_entry_with_chunks(
+            await store.publish_entry_revision(
                 old_entry,
                 old_chunks,
                 operation_id="old-delete-operation",
             )
-            delete_task = asyncio.create_task(store.delete_entry(old_entry.id, hard=True))
+            delete_task = asyncio.create_task(
+                store.delete_entry(
+                    old_entry.id,
+                    expected_revision=old_entry.revision,
+                    hard=True,
+                )
+            )
             cleanup_wait = asyncio.create_task(store.cleanup_started.wait())
             done, _ = await asyncio.wait(
                 {delete_task, cleanup_wait},
@@ -663,7 +719,7 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
                 # Reproduce the historical race: the source delete committed,
                 # then its redundant derived cleanup stalled while a new source
                 # and embedding were published under the same entry identity.
-                await store.publish_entry_with_chunks(
+                await store.publish_entry_revision(
                     new_entry,
                     new_chunks,
                     operation_id="new-delete-operation",
@@ -672,7 +728,7 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
                 await delete_task
             else:
                 await delete_task
-                await store.publish_entry_with_chunks(
+                await store.publish_entry_revision(
                     new_entry,
                     new_chunks,
                     operation_id="new-delete-operation",
@@ -720,11 +776,19 @@ def test_postgres_remember_knowledge_reconciles_ack_loss_and_restart(
         from cayu import PostgresKnowledgeStore, RememberKnowledgeTool, ToolContext
 
         class AcknowledgementLossPostgresStore(PostgresKnowledgeStore):
-            async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
-                await super().publish_entry_with_chunks(
+            async def publish_entry_revision(
+                self,
+                entry,
+                chunks,
+                *,
+                operation_id,
+                expected_revision=None,
+            ):
+                await super().publish_entry_revision(
                     entry,
                     chunks,
                     operation_id=operation_id,
+                    expected_revision=expected_revision,
                 )
                 raise RuntimeError("secret canary acknowledgement failure")
 
@@ -833,8 +897,8 @@ def test_postgres_knowledge_publication_rolls_back_each_material_write(
                 await super()._insert_entry(cur, entry)
                 self._fail_after("entry")
 
-            async def _replace_chunks(self, cur, entry_id, chunks) -> None:
-                await super()._replace_chunks(cur, entry_id, chunks)
+            async def _insert_chunks(self, cur, entry, chunks) -> None:
+                await super()._insert_chunks(cur, entry, chunks)
                 self._fail_after("chunks")
 
             async def _insert_publication_receipt(self, cur, receipt, entry) -> None:
@@ -861,7 +925,7 @@ def test_postgres_knowledge_publication_rolls_back_each_material_write(
                 )
                 store.failure_phase = failure_phase
                 with pytest.raises(RuntimeError, match=rf"{failure_phase}-boundary"):
-                    await store.publish_entry_with_chunks(
+                    await store.publish_entry_revision(
                         entry,
                         chunks,
                         operation_id=f"postgres-rollback-{failure_phase}",
@@ -913,10 +977,10 @@ def test_postgres_knowledge_store_rejects_out_of_range_chunk_index_atomically(
             chunk_index=0,
             text="chunk",
         )
-        chunk.chunk_index = MAX_KNOWLEDGE_CHUNK_INDEX + 1
+        object.__setattr__(chunk, "chunk_index", MAX_KNOWLEDGE_CHUNK_INDEX + 1)
 
         with pytest.raises(ValueError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
-            await store.put_entry_with_chunks(entry, [chunk])
+            await store.create_entry(entry, [chunk])
         assert await store.get_entry(entry.id) is None
         assert await store.read_chunks(entry.id) == []
 
@@ -925,7 +989,7 @@ def test_postgres_knowledge_store_rejects_out_of_range_chunk_index_atomically(
 
 def test_postgres_knowledge_store_persists_entries_chunks_and_filters(postgres_dsn: str) -> None:
     async def ops(store):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="invoice_warning",
                 text="Do not send invoice reminders when the PO number is missing.",
@@ -953,7 +1017,7 @@ def test_postgres_knowledge_store_persists_entries_chunks_and_filters(postgres_d
                 )
             ],
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="other_project_warning",
                 text="Invoice reminders require a PO number.",
@@ -1017,7 +1081,7 @@ def test_postgres_embedding_knowledge_store_persists_semantic_vectors(postgres_d
         provider = KeywordEmbeddingProvider()
         store = _new_embedding_store(postgres_dsn, provider)
         try:
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id="git_policy",
                     text="Use a credential broker for GitHub auth from remote sandboxes.",
@@ -1027,7 +1091,7 @@ def test_postgres_embedding_knowledge_store_persists_semantic_vectors(postgres_d
                     aspects=["credentials", "git"],
                 )
             )
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id="invoice_policy",
                     text="Invoice refunds require payment approval.",
@@ -1086,8 +1150,10 @@ def test_postgres_embedding_knowledge_store_query_min_score_overrides_store_defa
         store = _new_embedding_store(postgres_dsn, provider)
         store.semantic_min_score = 1.0
         try:
-            await store.put_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
-            await store.put_entry(KnowledgeEntry(id="orthogonal", text="Invoice payment policy."))
+            await store.create_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
+            await store.create_entry(
+                KnowledgeEntry(id="orthogonal", text="Invoice payment policy.")
+            )
             return await store.search(
                 KnowledgeQuery(
                     text="auth broker",
@@ -1103,6 +1169,59 @@ def test_postgres_embedding_knowledge_store_query_min_score_overrides_store_defa
     assert [hit.entry.id for hit in result.hits] == ["matching", "orthogonal"]
     assert result.hits[0].score_normalized == 1.0
     assert result.hits[1].score_normalized == 0.5
+
+
+def test_postgres_embedding_lifecycle_revisions_replace_stale_derived_rows(
+    postgres_dsn: str,
+) -> None:
+    async def ops() -> tuple[KnowledgeEntry, KnowledgeEntry, list[tuple[str, int]]]:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            created = await store.create_entry(
+                KnowledgeEntry(id="lifecycle-embedding", text="GitHub credential proxy.")
+            )
+            archived = await store.transition_entry_status(
+                created.id,
+                expected_revision=created.revision,
+                from_status=KnowledgeStatus.ACTIVE,
+                to_status=KnowledgeStatus.ARCHIVED,
+            )
+            deleted = await store.delete_entry(
+                archived.id,
+                expected_revision=archived.revision,
+            )
+            assert deleted is not None
+        finally:
+            await store.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(
+                """
+                SELECT chunk.id, chunk.entry_revision
+                FROM cayu_knowledge_embeddings AS embedding
+                JOIN cayu_knowledge_chunks AS chunk
+                  ON chunk.id = embedding.chunk_id
+                 AND chunk.entry_id = embedding.entry_id
+                WHERE embedding.entry_id = %s
+                ORDER BY chunk.entry_revision, chunk.id
+                """,
+                (created.id,),
+            )
+            rows = [(str(row[0]), int(row[1])) for row in await cursor.fetchall()]
+        return archived, deleted, rows
+
+    archived, deleted, rows = asyncio.run(ops())
+
+    assert archived.revision == 2
+    assert deleted.revision == 3
+    assert rows == [("lifecycle-embedding:r3:0", 3)]
 
 
 def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
@@ -1193,7 +1312,7 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
         await _skip_if_pgvector_unavailable(postgres_dsn)
         base = _new_store(postgres_dsn)
         try:
-            await base.put_entry(
+            await base.create_entry(
                 KnowledgeEntry(
                     id="git_policy",
                     text="Use a credential broker for GitHub auth from remote sandboxes.",
@@ -1202,7 +1321,7 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
                     kind="procedure",
                 )
             )
-            await base.put_entry(
+            await base.create_entry(
                 KnowledgeEntry(
                     id="invoice_policy",
                     text="GitHub token pushes should use the broker.",
@@ -1211,7 +1330,7 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
                     kind="procedure",
                 )
             )
-            await base.put_entry(
+            await base.create_entry(
                 KnowledgeEntry(
                     id="other_policy",
                     text="Invoice refunds require payment approval.",
@@ -1337,7 +1456,7 @@ def test_postgres_embedding_store_flags_and_continues_then_lazily_backfills(
             # Provider is down while the durable write happens: the entry must be
             # stored and returned even though embedding fails (flag-and-continue).
             provider.fail = True
-            stored = await store.put_entry(
+            stored = await store.create_entry(
                 KnowledgeEntry(
                     id="git_policy",
                     text="Use a credential broker for GitHub auth from remote sandboxes.",
@@ -1396,15 +1515,15 @@ def test_postgres_knowledge_store_defaults_hide_inactive_and_expired(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="active", text="deployment warning"))
-        await store.put_entry(
+        await store.create_entry(KnowledgeEntry(id="active", text="deployment warning"))
+        await store.create_entry(
             KnowledgeEntry(
                 id="pending",
                 text="deployment warning",
                 status=KnowledgeStatus.PENDING,
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="expired",
                 text="deployment warning",
@@ -1429,7 +1548,7 @@ def test_postgres_knowledge_store_preserves_custom_chunks_on_entry_update(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry_with_chunks(
+        current = await store.create_entry(
             KnowledgeEntry(id="doc", text="Document summary.", metadata={"version": 1}),
             [
                 KnowledgeChunk(
@@ -1441,8 +1560,9 @@ def test_postgres_knowledge_store_preserves_custom_chunks_on_entry_update(
                 )
             ],
         )
-        await store.put_entry(
-            KnowledgeEntry(id="doc", text="Document summary.", metadata={"version": 2})
+        await store.append_entry_revision(
+            current.model_copy(update={"revision": 2, "metadata": {"version": 2}}),
+            expected_revision=1,
         )
         chunks = await store.read_chunks("doc")
         result = await store.search(KnowledgeQuery(text="custom indexed"))
@@ -1460,7 +1580,7 @@ def test_postgres_knowledge_store_empty_kind_filter_returns_no_matches(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="entry", text="billing memory"))
+        await store.create_entry(KnowledgeEntry(id="entry", text="billing memory"))
         return await store.search(KnowledgeQuery(text="billing", kinds=[]))
 
     result = _run(postgres_dsn, ops)
@@ -1473,7 +1593,7 @@ def test_postgres_knowledge_store_search_reports_preview_truncation(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="entry", text="billing memory has more text"))
+        await store.create_entry(KnowledgeEntry(id="entry", text="billing memory has more text"))
         return await store.search(KnowledgeQuery(text="billing", max_bytes=7))
 
     result = _run(postgres_dsn, ops)
@@ -1487,7 +1607,7 @@ def test_postgres_knowledge_store_search_dedupes_across_large_chunk_matches(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="large", text="invoice corpus"),
             [
                 KnowledgeChunk(
@@ -1499,7 +1619,7 @@ def test_postgres_knowledge_store_search_dedupes_across_large_chunk_matches(
                 for index in range(1200)
             ],
         )
-        await store.put_entry(KnowledgeEntry(id="small", text="invoice policy"))
+        await store.create_entry(KnowledgeEntry(id="small", text="invoice policy"))
         return await store.search(KnowledgeQuery(text="invoice", limit=2))
 
     result = _run(postgres_dsn, ops)
@@ -1511,13 +1631,13 @@ def test_postgres_knowledge_store_search_dedupes_across_large_chunk_matches(
 
 def test_postgres_knowledge_store_structured_keyword_search(postgres_dsn: str) -> None:
     async def ops(store):
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="github_secret", text="GitHub push requires a credential broker.")
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="sendgrid_secret", text="SendGrid email uses a secret proxy.")
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(id="github_test", text="GitHub test credentials are fixture-only.")
         )
         return await store.search(
@@ -1608,14 +1728,14 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
             # Exceed pgvector's default HNSW candidate list so the exact safe
             # vector cannot be reached after nearer candidates are excluded.
             for index in range(64):
-                await store.put_entry(
+                await store.create_entry(
                     KnowledgeEntry(
                         id=f"excluded_{index}",
                         title="Deprecated integration",
                         text=f"GitHub credential instructions {index}.",
                     )
                 )
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id="safe",
                     text="Invoice payment instructions for the valid lower-ranked candidate.",
@@ -1638,8 +1758,10 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
             hnsw_query = f"""
                 SELECT e.id
                 FROM cayu_knowledge_embeddings AS emb
-                JOIN cayu_knowledge_chunks AS c ON c.id = emb.chunk_id
-                JOIN cayu_knowledge_entries AS e ON e.id = emb.entry_id
+                JOIN cayu_knowledge_chunks AS c
+                  ON c.id = emb.chunk_id AND c.entry_id = emb.entry_id
+                JOIN cayu_knowledge_current_entries AS e
+                  ON e.id = emb.entry_id AND e.revision = c.entry_revision
                 WHERE emb.model = %s
                   AND emb.dimensions = %s
                   AND emb.embedding_space_version = %s
@@ -1702,7 +1824,7 @@ def test_postgres_embedding_lazy_backfill_filters_none_terms_before_limit(
         await _drop_all(postgres_dsn)
         base_store = _new_store(postgres_dsn)
         try:
-            await base_store.put_entry_with_chunks(
+            await base_store.create_entry(
                 KnowledgeEntry(
                     id="excluded",
                     text="Integration summary.",
@@ -1723,7 +1845,7 @@ def test_postgres_embedding_lazy_backfill_filters_none_terms_before_limit(
                     ),
                 ],
             )
-            await base_store.put_entry(
+            await base_store.create_entry(
                 KnowledgeEntry(
                     id="safe",
                     text="GitHub safe-marker instructions.",
@@ -1763,7 +1885,7 @@ def test_postgres_knowledge_store_searches_entry_text_with_custom_chunks(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="broker_summary",
                 text="Remote sandbox Git operations need a brokered credential boundary.",
@@ -1790,7 +1912,7 @@ def test_postgres_knowledge_store_matches_singular_plural_token_variants(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="remote_git",
                 title="Remote sandbox Git credential boundary",
@@ -1800,7 +1922,7 @@ def test_postgres_knowledge_store_matches_singular_plural_token_variants(
                 ),
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="fixture",
                 text="Fixture credentials in local tests are not production guidance.",
@@ -1822,8 +1944,8 @@ def test_postgres_knowledge_store_matches_y_plural_token_variants(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
-        await store.put_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
+        await store.create_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
+        await store.create_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
         key_result = await store.search(KnowledgeQuery(text="key"))
         policy_result = await store.search(KnowledgeQuery(text="policy"))
         return key_result, policy_result
@@ -1838,7 +1960,7 @@ def test_postgres_knowledge_store_all_terms_match_across_entry_document(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(
                 id="split_match",
                 title="GitHub credential policy",
@@ -1864,7 +1986,7 @@ def test_postgres_knowledge_store_all_terms_do_not_match_across_unrelated_chunks
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="split_chunks", text="General operations note."),
             [
                 KnowledgeChunk(
@@ -1890,7 +2012,7 @@ def test_postgres_knowledge_store_all_terms_do_not_match_across_unrelated_chunks
 
 def test_postgres_knowledge_store_lists_entries_and_facets(postgres_dsn: str) -> None:
     async def ops(store):
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="runbook",
                 namespace="ops",
@@ -1899,7 +2021,7 @@ def test_postgres_knowledge_store_lists_entries_and_facets(postgres_dsn: str) ->
                 text="Payment reminder runbook.",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="warning",
                 namespace="ops",
@@ -1908,7 +2030,7 @@ def test_postgres_knowledge_store_lists_entries_and_facets(postgres_dsn: str) ->
                 text="Do not send reminders without approval.",
             )
         )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="archived",
                 namespace="ops",
@@ -1938,7 +2060,7 @@ def test_postgres_knowledge_store_lists_entries_and_facets(postgres_dsn: str) ->
 def test_postgres_knowledge_store_caps_facets(postgres_dsn: str) -> None:
     async def ops(store):
         for index in range(5):
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id=f"entry_{index}",
                     labels={"area": f"area_{index}"},
@@ -1961,7 +2083,7 @@ def test_postgres_knowledge_store_caps_facets(postgres_dsn: str) -> None:
 
 def test_postgres_knowledge_store_chunk_windows_and_truncation(postgres_dsn: str) -> None:
     async def ops(store):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             KnowledgeEntry(id="doc", text="summary"),
             [
                 KnowledgeChunk(id="chunk_0", entry_id="doc", chunk_index=0, text="alpha beta"),
@@ -1990,7 +2112,7 @@ def test_postgres_knowledge_store_chunk_windows_and_truncation(postgres_dsn: str
 
 def test_postgres_knowledge_store_title_match_uses_title_preview(postgres_dsn: str) -> None:
     async def ops(store):
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="title_match",
                 title="Invoice approval warning",
@@ -2010,7 +2132,7 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="pending_runbook",
                 text="deployment rollback procedure",
@@ -2021,6 +2143,7 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
         )
         active = await store.transition_entry_status(
             "pending_runbook",
+            expected_revision=1,
             from_status=KnowledgeStatus.PENDING,
             to_status=KnowledgeStatus.ACTIVE,
             expected_namespace="project:cayu",
@@ -2029,12 +2152,13 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
         with pytest.raises(ValueError, match="not 'pending'"):
             await store.transition_entry_status(
                 "pending_runbook",
+                expected_revision=active.revision,
                 from_status=KnowledgeStatus.PENDING,
                 to_status=KnowledgeStatus.ARCHIVED,
                 expected_namespace="project:cayu",
                 expected_labels={"project": "cayu"},
             )
-        await store.put_entry(
+        await store.create_entry(
             KnowledgeEntry(
                 id="pending_other",
                 text="other project procedure",
@@ -2046,6 +2170,7 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
         with pytest.raises(ValueError, match="expected namespace"):
             await store.transition_entry_status(
                 "pending_other",
+                expected_revision=1,
                 from_status=KnowledgeStatus.PENDING,
                 to_status=KnowledgeStatus.ACTIVE,
                 expected_namespace="project:cayu",
@@ -2053,22 +2178,38 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
         with pytest.raises(ValueError, match="expected labels"):
             await store.transition_entry_status(
                 "pending_other",
+                expected_revision=1,
                 from_status=KnowledgeStatus.PENDING,
                 to_status=KnowledgeStatus.ACTIVE,
                 expected_labels={"project": "cayu"},
             )
-        await store.put_entry(KnowledgeEntry(id="runbook", text="deployment rollback procedure"))
-        archived = await store.update_entry_status("runbook", KnowledgeStatus.ARCHIVED)
+        runbook = await store.create_entry(
+            KnowledgeEntry(id="runbook", text="deployment rollback procedure")
+        )
+        archived = await store.transition_entry_status(
+            "runbook",
+            expected_revision=runbook.revision,
+            from_status=KnowledgeStatus.ACTIVE,
+            to_status=KnowledgeStatus.ARCHIVED,
+        )
         archived_search = await store.search(
             KnowledgeQuery(text="deployment", statuses=[KnowledgeStatus.ARCHIVED])
         )
-        soft_deleted = await store.delete_entry("runbook")
+        soft_deleted = await store.delete_entry(
+            "runbook",
+            expected_revision=archived.revision,
+        )
         deleted_search = await store.search(
             KnowledgeQuery(text="deployment", statuses=[KnowledgeStatus.DELETED])
         )
-        hard_deleted = await store.delete_entry("runbook", hard=True)
+        assert soft_deleted is not None
+        hard_deleted = await store.delete_entry(
+            "runbook",
+            expected_revision=soft_deleted.revision,
+            hard=True,
+        )
         missing = await store.get_entry("runbook")
-        missing_delete = await store.delete_entry("runbook", hard=True)
+        missing_delete = await store.delete_entry("runbook", expected_revision=1, hard=True)
         return (
             active,
             archived,
@@ -2103,35 +2244,150 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
     assert missing_delete is None
 
 
-def test_postgres_knowledge_store_rejects_invalid_chunk_replacement(
+def test_postgres_knowledge_store_rejects_invalid_revision_chunks(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="entry", text="text"))
+        current = await store.create_entry(KnowledgeEntry(id="entry", text="text"))
+        successor = current.model_copy(update={"revision": 2})
         with pytest.raises(ValueError, match="cannot be empty"):
-            await store.replace_chunks("entry", [])
+            await store.append_entry_revision(successor, [], expected_revision=1)
         with pytest.raises(ValueError, match="belong"):
-            await store.replace_chunks(
-                "entry",
-                [KnowledgeChunk(id="chunk", entry_id="other", chunk_index=0, text="text")],
+            await store.append_entry_revision(
+                successor,
+                [
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="other",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="text",
+                    )
+                ],
+                expected_revision=1,
             )
         with pytest.raises(ValueError, match="ids"):
-            await store.replace_chunks(
-                "entry",
+            await store.append_entry_revision(
+                successor,
                 [
-                    KnowledgeChunk(id="chunk", entry_id="entry", chunk_index=0, text="first"),
-                    KnowledgeChunk(id="chunk", entry_id="entry", chunk_index=1, text="second"),
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="first",
+                    ),
+                    KnowledgeChunk(
+                        id="chunk",
+                        entry_id="entry",
+                        entry_revision=2,
+                        chunk_index=1,
+                        text="second",
+                    ),
                 ],
+                expected_revision=1,
             )
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_knowledge_schema_rejects_a_dangling_current_revision(
+    postgres_dsn: str,
+) -> None:
+    async def ops() -> int:
+        import psycopg
+        from psycopg.errors import ForeignKeyViolation
+
+        await _drop_all(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.create_entry(KnowledgeEntry(id="entry", text="current"))
+        finally:
+            await store.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            with pytest.raises(ForeignKeyViolation):
+                async with connection.transaction(), connection.cursor() as cursor:
+                    await cursor.execute(
+                        "UPDATE cayu_knowledge_entries SET current_revision = %s WHERE id = %s",
+                        (2, "entry"),
+                    )
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT current_revision FROM cayu_knowledge_entries WHERE id = %s",
+                    ("entry",),
+                )
+                row = await cursor.fetchone()
+                assert row is not None
+                return int(row[0])
+
+    assert asyncio.run(ops()) == 1
+
+
+@pytest.mark.parametrize(
+    ("object_name", "drop_sql"),
+    (
+        (
+            "cayu_knowledge_current_entries",
+            "DROP VIEW cayu_knowledge_current_entries",
+        ),
+        (
+            "idx_cayu_knowledge_revisions_status",
+            "DROP INDEX idx_cayu_knowledge_revisions_status",
+        ),
+        (
+            "cayu_knowledge_entries",
+            "ALTER TABLE cayu_knowledge_entries "
+            "DROP CONSTRAINT cayu_knowledge_entries_current_revision_fk",
+        ),
+    ),
+)
+def test_postgres_revision_schema_validation_rejects_missing_structural_objects(
+    postgres_dsn: str,
+    object_name: str,
+    drop_sql: str,
+) -> None:
+    async def ops() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        create_store = _new_store(postgres_dsn)
+        try:
+            await create_store.ensure_schema()
+        finally:
+            await create_store.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(drop_sql)
+            await connection.commit()
+
+        validate_store = PostgresKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match=object_name):
+                await validate_store.ensure_schema()
+        finally:
+            await validate_store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(ops())
 
 
 def test_postgres_knowledge_store_rejects_unsupported_search_modes(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="entry", text="billing memory"))
+        await store.create_entry(KnowledgeEntry(id="entry", text="billing memory"))
         with pytest.raises(ValueError, match="supports only auto and keyword"):
             await store.search(KnowledgeQuery(text="billing", mode=KnowledgeSearchMode.SEMANTIC))
 
@@ -2171,7 +2427,7 @@ def test_postgres_knowledge_schema_migrates_and_coexists_with_session_store(
             schema_mode=SchemaMode.CREATE,
         )
         try:
-            await knowledge_store.put_entry(
+            await knowledge_store.create_entry(
                 KnowledgeEntry(id="entry", text="shared database memory")
             )
             result = await knowledge_store.search(KnowledgeQuery(text="shared database"))
@@ -2212,7 +2468,7 @@ def test_postgres_knowledge_schema_migrates_and_coexists_with_session_store(
 def test_postgres_knowledge_store_batches_multi_entry_hit_hydration(postgres_dsn: str) -> None:
     async def ops(store):
         for index in range(3):
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id=f"entry_{index}",
                     text=f"Shared deployment warning number {index}.",
@@ -2240,8 +2496,8 @@ def test_postgres_knowledge_store_batches_multi_entry_hit_hydration(postgres_dsn
 
 def test_postgres_knowledge_store_list_reports_multi_chunk_counts(postgres_dsn: str) -> None:
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="single", text="Single chunk entry."))
-        await store.put_entry_with_chunks(
+        await store.create_entry(KnowledgeEntry(id="single", text="Single chunk entry."))
+        await store.create_entry(
             KnowledgeEntry(id="multi", text="Multi chunk entry."),
             [
                 KnowledgeChunk(
@@ -2276,8 +2532,8 @@ async def _count_embeddings(dsn: str) -> int:
 def test_postgres_knowledge_store_prune_expired_hard_deletes(postgres_dsn: str) -> None:
     # MEM-05: prune_expired hard-deletes expired entries; the read filter only hides them.
     async def ops(store):
-        await store.put_entry(KnowledgeEntry(id="active", text="deployment warning"))
-        await store.put_entry(
+        await store.create_entry(KnowledgeEntry(id="active", text="deployment warning"))
+        await store.create_entry(
             KnowledgeEntry(
                 id="expired",
                 text="deployment warning",
@@ -2303,7 +2559,7 @@ def test_postgres_embedding_store_prune_expired_cascades_to_embeddings(postgres_
         await _skip_if_pgvector_unavailable(postgres_dsn)
         store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
         try:
-            await store.put_entry(
+            await store.create_entry(
                 KnowledgeEntry(
                     id="expired",
                     text="GitHub credential proxy runbook.",
@@ -2334,7 +2590,9 @@ def test_postgres_embedding_store_stamps_embedding_space_version(postgres_dsn: s
         await _skip_if_pgvector_unavailable(postgres_dsn)
         store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
         try:
-            await store.put_entry(KnowledgeEntry(id="doc", text="GitHub credential proxy runbook."))
+            await store.create_entry(
+                KnowledgeEntry(id="doc", text="GitHub credential proxy runbook.")
+            )
             result = await store.search(
                 KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
             )
@@ -2383,7 +2641,9 @@ def test_postgres_embedding_store_excludes_and_reembeds_other_space_versions(
         await _skip_if_pgvector_unavailable(postgres_dsn)
         store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
         try:
-            await store.put_entry(KnowledgeEntry(id="doc", text="GitHub credential proxy runbook."))
+            await store.create_entry(
+                KnowledgeEntry(id="doc", text="GitHub credential proxy runbook.")
+            )
             version_before = await _distinct_embedding_versions(postgres_dsn)
 
             # Prior rows are now a different embedding space.
@@ -2438,6 +2698,174 @@ async def _embedding_space_version_column_exists(dsn: str) -> bool:
         return await cur.fetchone() is not None
 
 
+async def _embedding_foreign_keys(dsn: str) -> tuple[tuple[str, str], ...]:
+    import psycopg
+
+    async with (
+        await psycopg.AsyncConnection.connect(dsn) as conn,
+        conn.cursor() as cur,
+    ):
+        await cur.execute(
+            """
+            SELECT conname, pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE conrelid = 'cayu_knowledge_embeddings'::regclass
+              AND contype = 'f'
+            ORDER BY conname
+            """
+        )
+        return tuple((str(name), str(definition)) for name, definition in await cur.fetchall())
+
+
+def test_postgres_revision_migration_refuses_populated_legacy_knowledge_unchanged(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+
+        await _drop_all(postgres_dsn)
+        revisions = schema_migrations.REVISIONS
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 41
+        )
+        legacy_schema = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            await legacy_schema.ensure_schema()
+        finally:
+            await legacy_schema.close()
+            schema_migrations.REVISIONS = revisions
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_entries (
+                    id, namespace, text, kind, visibility, status,
+                    created_by_type, created_by, created_at, updated_at, metadata
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                """,
+                (
+                    "legacy-entry",
+                    "default",
+                    "legacy text must survive",
+                    "fact",
+                    "global",
+                    "active",
+                    "system",
+                    "legacy-test",
+                    datetime(2026, 8, 18, 9, 0, tzinfo=UTC),
+                    datetime(2026, 8, 18, 9, 0, tzinfo=UTC),
+                    '{"proof":"unchanged"}',
+                ),
+            )
+            await cursor.execute(
+                "INSERT INTO cayu_knowledge_labels (entry_id, key, value) VALUES (%s, %s, %s)",
+                ("legacy-entry", "project", "cayu"),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_chunks (
+                    id, entry_id, chunk_index, text, metadata
+                ) VALUES (%s, %s, %s, %s, %s::jsonb)
+                """,
+                ("legacy-entry:0", "legacy-entry", 0, "legacy chunk must survive", "{}"),
+            )
+            await connection.commit()
+
+            before = await _legacy_knowledge_snapshot(cursor)
+
+        migration = PostgresKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            with pytest.raises(KnowledgeRevisionResetRequired) as raised:
+                await migration.ensure_schema()
+        finally:
+            await migration.close()
+
+        assert raised.value.assessment.populated_tables == (
+            "cayu_knowledge_chunks",
+            "cayu_knowledge_entries",
+            "cayu_knowledge_labels",
+        )
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            assert await _legacy_knowledge_snapshot(cursor) == before
+        assert before[-1][-1] == (41, "breaking", 41)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_migration_refuses_unversioned_knowledge_before_ddl(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(
+                "CREATE TABLE cayu_knowledge_entries (id TEXT PRIMARY KEY, text TEXT NOT NULL)"
+            )
+            await cursor.execute(
+                "INSERT INTO cayu_knowledge_entries (id, text) VALUES (%s, %s)",
+                ("unversioned-entry", "must survive"),
+            )
+            await connection.commit()
+
+        migration = PostgresKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            with pytest.raises(KnowledgeRevisionResetRequired):
+                await migration.ensure_schema()
+        finally:
+            await migration.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT to_regclass('cayu_schema_migrations')")
+            assert await cursor.fetchone() == (None,)
+            await cursor.execute("SELECT id, text FROM cayu_knowledge_entries")
+            assert await cursor.fetchall() == [("unversioned-entry", "must survive")]
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
 def test_postgres_storage_migrate_adds_embedding_space_version_to_existing_table(
     postgres_dsn: str,
 ) -> None:
@@ -2477,6 +2905,7 @@ def test_postgres_storage_migrate_adds_embedding_space_version_to_existing_table
         finally:
             await session_store.close()
         column_after = await _embedding_space_version_column_exists(postgres_dsn)
+        foreign_keys = await _embedding_foreign_keys(postgres_dsn)
 
         # And the embedding store now opens clean in the default VALIDATE mode.
         validate_store = PostgresEmbeddingKnowledgeStore(
@@ -2492,10 +2921,20 @@ def test_postgres_storage_migrate_adds_embedding_space_version_to_existing_table
             validated = True
         finally:
             await validate_store.close()
-        return column_before, column_after, validated
+        return column_before, column_after, foreign_keys, validated
 
-    column_before, column_after, validated = asyncio.run(ops())
+    column_before, column_after, foreign_keys, validated = asyncio.run(ops())
 
     assert column_before is False  # sanity: we really simulated a pre-column table
     assert column_after is True  # the deploy migrate path added it
+    assert foreign_keys == (
+        (
+            "cayu_knowledge_embeddings_chunk_id_fkey",
+            "FOREIGN KEY (chunk_id) REFERENCES cayu_knowledge_chunks(id) ON DELETE CASCADE",
+        ),
+        (
+            "cayu_knowledge_embeddings_entry_id_fkey",
+            "FOREIGN KEY (entry_id) REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE",
+        ),
+    )
     assert validated  # VALIDATE-mode startup no longer strands

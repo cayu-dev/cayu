@@ -65,7 +65,7 @@ def test_knowledge_injection_runtime_contract_pins_candidate_manifest() -> None:
         f"`{_KNOWLEDGE_CANDIDATES_OPEN_TAG}`",
         f"`{_KNOWLEDGE_CANDIDATES_CLOSE_TAG}`",
         "valid JSON",
-        "entry ids, kinds, source metadata, and bounded excerpts",
+        "entry ids, exact positive revisions, kinds, source metadata, and bounded excerpts",
         "ordinary `read_knowledge` tool",
         "does not fabricate assistant tool calls or tool-result messages",
         "strict provider tool-history validation",
@@ -256,6 +256,8 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "through revision 40 before deploying them" in unreleased
     assert "Breaking schema revision 41" in unreleased
     assert "confirm revision 41 before starting current workers" in unreleased
+    assert "Breaking schema revision 42" in unreleased
+    assert "confirm revision 42 before starting current workers" in unreleased
 
 
 def test_queued_dispatch_revision_40_migration_covers_custom_task_types() -> None:

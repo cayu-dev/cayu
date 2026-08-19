@@ -28,6 +28,7 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _next_knowledge_revision,
     copy_knowledge_access_scope,
     copy_knowledge_chunk,
     copy_knowledge_entry,
@@ -241,6 +242,8 @@ class KnowledgeIndexResult(BaseModel):
         for chunk in self.chunks:
             if chunk.entry_id != self.entry.id:
                 raise ValueError("`chunks` must belong to `entry`.")
+            if chunk.entry_revision != self.entry.revision:
+                raise ValueError("`chunks` must belong to the exact `entry` revision.")
             if chunk.content_hash != _hash_text(chunk.text):
                 raise ValueError("`chunks[].content_hash` must match chunk text.")
             if chunk.metadata.get("source_hash") != self.source_hash:
@@ -300,7 +303,12 @@ class KnowledgeIndexer:
             title=request.title,
             metadata=request.metadata,
         )
-        chunks, truncated = _build_chunks(entry_id, request, source_hash=source_hash)
+        chunks, truncated = _build_chunks(
+            entry_id,
+            entry.revision,
+            request,
+            source_hash=source_hash,
+        )
         return KnowledgeIndexResult(
             entry=entry,
             chunks=chunks,
@@ -326,23 +334,38 @@ class KnowledgeIndexer:
             and existing is not None
             and existing.source_hash == result.source_hash
             and _same_indexed_entry(existing, result.entry)
-            and _same_indexed_chunks(
-                await self.store.read_chunks(
-                    result.entry.id,
-                    access_scope=self.access_scope,
-                    max_chunks=len(result.chunks) + 1,
-                    max_bytes=_chunk_comparison_max_bytes(result.chunks),
-                ),
-                result.chunks,
-            )
         ):
-            return result.model_copy(update={"unchanged": True})
-        await self.store.put_entry_with_chunks(
-            result.entry,
-            result.chunks,
+            current_chunks = await self.store.read_chunks(
+                result.entry.id,
+                revision=existing.revision,
+                access_scope=self.access_scope,
+                max_chunks=len(result.chunks) + 1,
+                max_bytes=_chunk_comparison_max_bytes(result.chunks),
+            )
+            if _same_indexed_chunks(current_chunks, result.chunks):
+                return result.model_copy(
+                    update={
+                        "entry": existing,
+                        "chunks": current_chunks,
+                        "chunk_count": len(current_chunks),
+                        "unchanged": True,
+                    }
+                )
+        if existing is None:
+            await self.store.create_entry(
+                result.entry,
+                chunks=result.chunks,
+                access_scope=self.access_scope,
+            )
+            return result.model_copy(update={"written": True})
+        revised = _index_result_for_successor(result, existing)
+        await self.store.append_entry_revision(
+            revised.entry,
+            expected_revision=existing.revision,
+            chunks=revised.chunks,
             access_scope=self.access_scope,
         )
-        return result.model_copy(update={"written": True})
+        return revised.model_copy(update={"written": True})
 
 
 def copy_knowledge_index_request(request: KnowledgeIndexRequest) -> KnowledgeIndexRequest:
@@ -401,6 +424,7 @@ class _TextBlock:
 
 def _build_chunks(
     entry_id: str,
+    entry_revision: int,
     request: KnowledgeIndexRequest,
     *,
     source_hash: str,
@@ -424,8 +448,9 @@ def _build_chunks(
         chunk_index = len(chunks)
         chunks.append(
             KnowledgeChunk(
-                id=f"{entry_id}:{chunk_index}",
+                id=f"{entry_id}:r{entry_revision}:{chunk_index}",
                 entry_id=entry_id,
+                entry_revision=entry_revision,
                 text=text,
                 chunk_index=chunk_index,
                 content_hash=_hash_text(text),
@@ -478,8 +503,9 @@ def _build_chunks(
         chunk_text = _bounded_entry_text(request.text, request.chunk_target_bytes)
         chunks.append(
             KnowledgeChunk(
-                id=f"{entry_id}:0",
+                id=f"{entry_id}:r{entry_revision}:0",
                 entry_id=entry_id,
+                entry_revision=entry_revision,
                 text=chunk_text,
                 chunk_index=0,
                 content_hash=_hash_text(chunk_text),
@@ -684,6 +710,40 @@ def _same_indexed_entry(existing: KnowledgeEntry, indexed: KnowledgeEntry) -> bo
     )
 
 
+def _index_result_for_successor(
+    result: KnowledgeIndexResult,
+    existing: KnowledgeEntry,
+) -> KnowledgeIndexResult:
+    if result.entry.id != existing.id:
+        raise ValueError("Indexed successor must preserve the logical entry id.")
+    if result.entry.namespace != existing.namespace:
+        raise ValueError("Indexed successor must preserve the logical namespace.")
+    revision = _next_knowledge_revision(existing.revision)
+    entry = result.entry.model_copy(
+        update={
+            "revision": revision,
+            "created_at": existing.created_at,
+            "updated_at": max(datetime.now(UTC), existing.updated_at),
+        }
+    )
+    chunks = [
+        chunk.model_copy(
+            update={
+                "id": f"{entry.id}:r{revision}:{chunk.chunk_index}",
+                "entry_revision": revision,
+            }
+        )
+        for chunk in result.chunks
+    ]
+    return result.model_copy(
+        update={
+            "entry": entry,
+            "chunks": chunks,
+            "chunk_count": len(chunks),
+        }
+    )
+
+
 def _same_indexed_chunks(existing: list[KnowledgeChunk], indexed: list[KnowledgeChunk]) -> bool:
     if len(existing) != len(indexed):
         return False
@@ -694,8 +754,7 @@ def _same_indexed_chunks(existing: list[KnowledgeChunk], indexed: list[Knowledge
 
 def _same_indexed_chunk(existing: KnowledgeChunk, indexed: KnowledgeChunk) -> bool:
     return (
-        existing.id == indexed.id
-        and existing.entry_id == indexed.entry_id
+        existing.entry_id == indexed.entry_id
         and existing.text == indexed.text
         and existing.chunk_index == indexed.chunk_index
         and existing.content_hash == indexed.content_hash

@@ -141,7 +141,20 @@ async def _seed_keyword_knowledge(dsn: str) -> dict[str, int]:
             if existing is not None and _same_demo_entry(existing, entry):
                 unchanged += 1
                 continue
-            await store.put_entry(entry)
+            if existing is None:
+                await store.create_entry(entry)
+            else:
+                successor = entry.model_copy(
+                    update={
+                        "revision": existing.revision + 1,
+                        "created_at": existing.created_at,
+                        "updated_at": max(existing.updated_at, entry.updated_at),
+                    }
+                )
+                await store.append_entry_revision(
+                    successor,
+                    expected_revision=existing.revision,
+                )
             inserted_or_updated += 1
     finally:
         await store.close()

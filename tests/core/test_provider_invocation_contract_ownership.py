@@ -149,7 +149,7 @@ def test_embedding_store_revalidates_provider_results() -> None:
     )
 
     with pytest.raises(ValidationError, match="finite"):
-        asyncio.run(store.put_entry(KnowledgeEntry(id="entry-1", text="portable text")))
+        asyncio.run(store.create_entry(KnowledgeEntry(id="entry-1", text="portable text")))
 
 
 def _session() -> Session:

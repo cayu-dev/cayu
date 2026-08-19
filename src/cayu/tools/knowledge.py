@@ -32,6 +32,7 @@ from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    MAX_KNOWLEDGE_REVISION,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeActorType,
@@ -46,11 +47,13 @@ from cayu.storage.memory import (
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
     KnowledgeQuery,
+    KnowledgeRevisionConflict,
     KnowledgeSearchMode,
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
     _knowledge_publication_operation_id,
+    _next_knowledge_revision,
     copy_knowledge_access_scope,
     copy_knowledge_entry,
     copy_knowledge_publication_receipt,
@@ -105,7 +108,7 @@ _LIST_KNOWLEDGE_STORE_METHODS = ("list_entries",)
 _READ_KNOWLEDGE_STORE_METHODS = ("read_chunks",)
 _REMEMBER_KNOWLEDGE_STORE_METHODS = (
     "get_entry",
-    "publish_entry_with_chunks",
+    "publish_entry_revision",
     "load_entry_publication_receipt",
 )
 
@@ -487,10 +490,12 @@ class RememberKnowledgeTool(Tool):
             "for stable facts, preferences, procedures, warnings, decisions, or lessons "
             "that should be reusable beyond the current turn. Model-authored knowledge "
             "is policy-controlled and defaults to pending review unless the application "
-            "explicitly allows active writes. This tool creates new entries only; it does "
-            "not edit, archive, or delete existing knowledge. Remembering identical text "
-            "with the same kind again returns the existing entry instead of writing a "
-            "duplicate."
+            "explicitly allows active writes. This tool creates logical entries and never "
+            "mutates a stored revision; it cannot edit, archive, or delete one. If identical "
+            "archived, deleted, or expired knowledge already owns the logical id, it appends "
+            "a reviewed successor revision. "
+            "Remembering identical live text with the same kind returns the existing entry "
+            "instead of writing a duplicate."
         ),
         input_schema={
             "type": "object",
@@ -672,6 +677,7 @@ class RememberKnowledgeTool(Tool):
                 source_hash=source_hash,
             )
         )
+        revision_parent: KnowledgeEntry | None = None
         if prior_receipt is None:
             # Deduplication is best-effort, but the extension read still needs
             # an owned task boundary so store-originated cancellation cannot
@@ -694,21 +700,7 @@ class RememberKnowledgeTool(Tool):
                 ):
                     if _remember_existing_entry_is_live(existing_entry):
                         return _remember_knowledge_already_known_result(existing_entry)
-                    replacement_entry = await _remember_live_or_next_replacement_entry(
-                        store,
-                        entry_id=entry_id,
-                        operation_id=operation_id,
-                        text=text,
-                        source_hash=source_hash,
-                        namespace=policy.default_namespace,
-                        kind=kind,
-                        visibility=policy.default_visibility,
-                        required_labels=policy.require_labels,
-                        operation_registry=self._read_operations,
-                    )
-                    if isinstance(replacement_entry, KnowledgeEntry):
-                        return _remember_knowledge_already_known_result(replacement_entry)
-                    entry_id = replacement_entry
+                    revision_parent = existing_entry
                 elif existing_entry.source_hash == source_hash:
                     return _knowledge_write_failed_result(
                         entry_id=entry_id,
@@ -746,6 +738,8 @@ class RememberKnowledgeTool(Tool):
                 skip_unchanged=False,
             )
             result = KnowledgeIndexer().build(request)
+            if revision_parent is not None:
+                result = _remember_result_for_successor(result, revision_parent)
             if result.truncated:
                 raise ValueError("`text` exceeds the configured remember_knowledge chunk capacity.")
         if prior_receipt is not None:
@@ -998,8 +992,8 @@ def _remember_store_supports_owned_publication(store: Any) -> bool:
         store = store._store
     store_type = type(store)
     return (
-        getattr(store_type, "publish_entry_with_chunks", None)
-        is not KnowledgeStore.publish_entry_with_chunks
+        getattr(store_type, "publish_entry_revision", None)
+        is not KnowledgeStore.publish_entry_revision
         and getattr(store_type, "load_entry_publication_receipt", None)
         is not KnowledgeStore.load_entry_publication_receipt
     )
@@ -1013,6 +1007,8 @@ def _remember_publication_conflict(
     # Subclasses can override attribute access. Exact-type admission plus
     # object-level state lookup prevents extension code from running while the
     # runtime classifies the failure.
+    if type(failure) is KnowledgeRevisionConflict:
+        return True, "revision_conflict"
     if type(failure) is not KnowledgePublicationConflict:
         return False, None
     try:
@@ -1043,6 +1039,8 @@ def _remember_deterministic_publication_failure(
         return "access_denied"
     if type(failure) is KnowledgeChunkConflict:
         return "publication_conflict"
+    if type(failure) is KnowledgeRevisionConflict:
+        return "publication_conflict"
     return None
 
 
@@ -1067,6 +1065,7 @@ async def _remember_publish_owned(
         result.entry,
         result.chunks,
         operation_id=operation_id,
+        expected_revision=_remember_expected_revision(result.entry),
     )
 
     async def operation_factory(
@@ -1076,10 +1075,11 @@ async def _remember_publish_owned(
         operation_id: str = operation_id,
     ) -> KnowledgePublicationReceipt:
         return copy_knowledge_publication_receipt(
-            await store.publish_entry_with_chunks(
+            await store.publish_entry_revision(
                 entry,
                 chunks,
                 operation_id=operation_id,
+                expected_revision=_remember_expected_revision(entry),
             )
         )
 
@@ -1204,6 +1204,7 @@ async def _remember_publish_owned(
     elif failure_is_conflict and conflict_reason in {
         "entry_occupied",
         "concurrent_occupancy",
+        "revision_conflict",
     }:
         winner = await _remember_live_matching_entry(
             store,
@@ -1289,10 +1290,13 @@ async def _remember_observe_owned_publication(
             result.entry,
             result.chunks,
             operation_id=operation_id,
+            expected_revision=_remember_expected_revision(result.entry),
         )
         confirmed = (
             durable_receipt.operation_id == operation_id
             and durable_receipt.entry_id == expected_entry.id
+            and durable_receipt.entry_revision == expected_entry.revision
+            and durable_receipt.expected_revision == _remember_expected_revision(expected_entry)
             and durable_receipt.request_sha256 == request_sha256
             and durable_receipt.entry_created_at == expected_entry.created_at
             and durable_receipt.entry_updated_at == expected_entry.updated_at
@@ -1416,6 +1420,8 @@ def _remember_receipt_identity(receipt: KnowledgePublicationReceipt) -> tuple[ob
     return (
         copied.operation_id,
         copied.entry_id,
+        copied.entry_revision,
+        copied.expected_revision,
         copied.request_sha256,
         copied.entry_created_at,
         copied.entry_updated_at,
@@ -1431,6 +1437,7 @@ def _remember_result_with_receipt_identity(
         result.entry.model_copy(
             update={
                 "id": receipt.entry_id,
+                "revision": receipt.entry_revision,
                 "created_at": receipt.entry_created_at,
                 "updated_at": receipt.entry_updated_at,
             }
@@ -1439,8 +1446,9 @@ def _remember_result_with_receipt_identity(
     replay_chunks = [
         chunk.model_copy(
             update={
-                "id": f"{receipt.entry_id}:{chunk.chunk_index}",
+                "id": (f"{receipt.entry_id}:r{receipt.entry_revision}:{chunk.chunk_index}"),
                 "entry_id": receipt.entry_id,
+                "entry_revision": receipt.entry_revision,
             }
         )
         for chunk in result.chunks
@@ -1453,6 +1461,42 @@ def _remember_result_with_receipt_identity(
             }
         )
     )
+
+
+def _remember_result_for_successor(result: Any, parent: KnowledgeEntry) -> Any:
+    result = copy_knowledge_index_result(result)
+    if result.entry.id != parent.id or result.entry.namespace != parent.namespace:
+        raise ValueError("Remembered revision must preserve logical identity and namespace.")
+    revision = _next_knowledge_revision(parent.revision)
+    entry = result.entry.model_copy(
+        update={
+            "revision": revision,
+            "created_at": parent.created_at,
+            "updated_at": max(datetime.now(UTC), parent.updated_at),
+        }
+    )
+    chunks = [
+        chunk.model_copy(
+            update={
+                "id": f"{entry.id}:r{revision}:{chunk.chunk_index}",
+                "entry_revision": revision,
+            }
+        )
+        for chunk in result.chunks
+    ]
+    return copy_knowledge_index_result(
+        result.model_copy(
+            update={
+                "entry": entry,
+                "chunks": chunks,
+                "chunk_count": len(chunks),
+            }
+        )
+    )
+
+
+def _remember_expected_revision(entry: KnowledgeEntry) -> int | None:
+    return None if entry.revision == 1 else entry.revision - 1
 
 
 async def _remember_live_matching_entry(
@@ -1540,7 +1584,7 @@ def _remember_knowledge_replayed_result(result: Any) -> ToolResult:
             "Its current lifecycle state was not checked."
         ),
         structured={
-            "entry": {"entry_id": entry.id},
+            "entry": {"entry_id": entry.id, "revision": entry.revision},
             "chunk_count": result.chunk_count,
             "written": False,
             "already_known": None,
@@ -1555,47 +1599,6 @@ def _remember_existing_entry_is_live(entry: KnowledgeEntry) -> bool:
     if entry.status not in {KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING}:
         return False
     return entry.expires_at is None or entry.expires_at > datetime.now(UTC)
-
-
-async def _remember_live_or_next_replacement_entry(
-    store: Any,
-    *,
-    entry_id: str,
-    operation_id: str,
-    text: str,
-    source_hash: str,
-    namespace: str,
-    kind: str,
-    visibility: KnowledgeVisibility,
-    required_labels: dict[str, str],
-    operation_registry: BoundedInvocationOperationRegistry,
-) -> KnowledgeEntry | str:
-    for index in range(1, 11):
-        replacement_entry_id = _remember_stale_replacement_entry_id(entry_id, index)
-        replacement_entry = await _remember_load_entry(
-            store,
-            replacement_entry_id,
-            operation_registry=operation_registry,
-        )
-        if replacement_entry is None:
-            return replacement_entry_id
-        if _remember_entry_matches_material_and_scope(
-            replacement_entry,
-            expected_entry_id=replacement_entry_id,
-            text=text,
-            source_hash=source_hash,
-            namespace=namespace,
-            kind=kind,
-            visibility=visibility,
-            required_labels=required_labels,
-        ) and _remember_existing_entry_is_live(replacement_entry):
-            return replacement_entry
-    return _remember_operation_fallback_entry_id(entry_id, operation_id)
-
-
-def _remember_stale_replacement_entry_id(entry_id: str, index: int) -> str:
-    suffix = "_live" if index == 1 else f"_live_{index}"
-    return f"{entry_id}{suffix}"
 
 
 def _remember_operation_fallback_entry_id(entry_id: str, operation_id: str) -> str:
@@ -1894,7 +1897,7 @@ class ReadKnowledgeTool(Tool):
         description=(
             "Read bounded chunks from any knowledge entry returned by automatic "
             "knowledge candidates, search_knowledge, or list_knowledge. Use entry_id "
-            "with an optional chunk_index and around window to expand context."
+            "with an optional revision, chunk_index, and around window to expand context."
         ),
         input_schema={
             "type": "object",
@@ -1905,6 +1908,14 @@ class ReadKnowledgeTool(Tool):
                     "minLength": 1,
                     "pattern": "\\S",
                     "description": "Knowledge entry id to read.",
+                },
+                "revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_KNOWLEDGE_REVISION,
+                    "description": (
+                        "Optional exact historical revision. Defaults to the current revision."
+                    ),
                 },
                 "chunk_index": {
                     "type": "integer",
@@ -1948,6 +1959,13 @@ class ReadKnowledgeTool(Tool):
                 require_clean_nonblank(_require_arg_string(args, "entry_id"), "entry_id"),
                 "entry_id",
             )
+            revision = _optional_nonnegative_int(
+                args,
+                "revision",
+                maximum=MAX_KNOWLEDGE_REVISION,
+            )
+            if revision == 0:
+                raise ValueError("Tool argument `revision` must be greater than zero.")
             chunk_index = _optional_nonnegative_int(args, "chunk_index")
             around = _optional_nonnegative_int(
                 args,
@@ -1971,6 +1989,7 @@ class ReadKnowledgeTool(Tool):
             )
         chunks = await store.read_chunks(
             entry_id,
+            revision=revision,
             chunk_index=chunk_index,
             around=around,
             max_chunks=max_chunks,
@@ -1985,6 +2004,7 @@ class ReadKnowledgeTool(Tool):
             content=content,
             structured={
                 "entry_id": entry_id,
+                "revision": chunks[0].entry_revision if chunks else revision,
                 "chunk_index": chunk_index,
                 "around": around,
                 "max_chunks": max_chunks,
@@ -2061,23 +2081,36 @@ class _ScopedKnowledgeStoreHandle:
             **kwargs,
         )
 
-    async def get_entry(self, entry_id):
+    async def get_entry(self, entry_id, **kwargs):
         if self._scope_is_store_bound:
-            return await self._store.get_entry(entry_id)
-        return await self._store.get_entry(entry_id, access_scope=self._access_scope)
+            return await self._store.get_entry(entry_id, **kwargs)
+        return await self._store.get_entry(
+            entry_id,
+            access_scope=self._access_scope,
+            **kwargs,
+        )
 
-    async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+    async def publish_entry_revision(
+        self,
+        entry,
+        chunks,
+        *,
+        operation_id,
+        expected_revision=None,
+    ):
         if self._scope_is_store_bound:
-            return await self._store.publish_entry_with_chunks(
+            return await self._store.publish_entry_revision(
                 entry,
                 chunks,
                 operation_id=operation_id,
+                expected_revision=expected_revision,
             )
-        return await self._store.publish_entry_with_chunks(
+        return await self._store.publish_entry_revision(
             entry,
             chunks,
             access_scope=self._access_scope,
             operation_id=operation_id,
+            expected_revision=expected_revision,
         )
 
     async def load_entry_publication_receipt(self, operation_id):
@@ -2317,6 +2350,7 @@ def _knowledge_hit_payload(
     )
     return {
         "entry_id": entry.id,
+        "revision": entry.revision,
         "namespace": entry.namespace,
         "kind": entry.kind,
         "visibility": entry.visibility.value,
@@ -2347,6 +2381,7 @@ def _remembered_entry_payload(entry: KnowledgeEntry) -> dict[str, Any]:
 
     return {
         "entry_id": entry.id,
+        "revision": entry.revision,
         "status": entry.status.value,
     }
 
@@ -2366,6 +2401,7 @@ def _knowledge_list_item_payload(
     )
     return {
         "entry_id": entry.id,
+        "revision": entry.revision,
         "namespace": entry.namespace,
         "kind": entry.kind,
         "visibility": entry.visibility.value,
@@ -2496,6 +2532,7 @@ def _knowledge_chunk_payload(chunk: KnowledgeChunk) -> dict[str, Any]:
     return {
         "chunk_id": chunk.id,
         "entry_id": chunk.entry_id,
+        "entry_revision": chunk.entry_revision,
         "chunk_index": chunk.chunk_index,
         "text": chunk.text,
         "content_hash": chunk.content_hash,

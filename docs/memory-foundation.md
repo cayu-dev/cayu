@@ -1,18 +1,19 @@
 # Memory foundation contracts
 
-This document freezes the Phase 0 contracts for Cayu's v5.1 long-term-memory
-work. It intentionally does not implement immutable knowledge revisions,
-cross-source recall, context composition, curation, or automatic governance.
+This document records the Phase 0 contracts for Cayu's v5.1 long-term-memory
+work and the immutable knowledge-revision core now built on them. Cross-source
+recall, context composition, curation, evidence, and automatic governance remain
+separate layers.
 
 ## Knowledge and memory are different layers
 
 **Knowledge** is durable canonical semantic material: entries, chunks, source
-identity, lifecycle, and (in the revision design) evidence and immutable
-revisions. **Memory** is the larger recall system that can retrieve permitted
+identity, lifecycle, and immutable revisions, with evidence added by a later
+slice. **Memory** is the larger recall system that can retrieve permitted
 knowledge, transcript episodes, artifact-derived documents, and other typed
 sources, fuse them, select a bounded context contribution, and record exposure.
 
-The current `KnowledgeStore` is therefore one future memory source. The WRRF
+The current `KnowledgeStore` is therefore one memory source. The WRRF
 types in `cayu.retrieval` are source-neutral and do not turn transcripts or
 artifacts into knowledge.
 
@@ -43,6 +44,17 @@ chunk-writing path authorizes an existing chunk's owning entry before reporting
 occupancy. A foreign-scope collision therefore raises `KnowledgeAccessDenied`,
 while an authorized collision raises the backend-independent
 `KnowledgeChunkConflict` without leaving a partial entry, chunk set, or receipt.
+
+An exact historical entry or chunk read must satisfy the scope twice: against
+the requested immutable snapshot and against the logical entry's current
+revision. Archiving, deleting, expiring, relabeling, or otherwise restricting a
+current revision therefore revokes ordinary access to its history; only an
+explicit scope that can read both states can audit it. Mutation authorization is
+slightly different by design. A principal that can mutate the current revision
+may append an `archived` or `deleted` successor without gaining read access to
+that retirement state. Promotion or reactivation into any other state still
+requires the destination state and every other destination attribute to satisfy
+the scope.
 
 ```python
 from cayu import (
@@ -76,7 +88,8 @@ backfilled.
 
 ## Revision-schema reset policy
 
-The future revision-first knowledge schema is a deliberate breaking contract:
+The revision-first knowledge schema at database revision 42 is a deliberate
+breaking contract:
 
 - fresh databases and completely empty legacy knowledge tables may initialize;
 - populated mutable-knowledge tables require an operator-approved database
@@ -85,10 +98,15 @@ The future revision-first knowledge schema is a deliberate breaking contract:
   shadow-write, fall back to mutable reads, or expose a revision-optional API.
 
 `require_empty_knowledge_revision_transition(...)` is the content-free decision
-primitive for the later backend-specific revision migration. The backend must
-supply the complete required table set and counts. An incomplete inspection
-fails; any populated table raises `KnowledgeRevisionResetRequired` before
-mutation.
+primitive used by each backend migration. The backend supplies the complete
+required table set and population evidence. An incomplete inspection fails; any
+populated table raises `KnowledgeRevisionResetRequired` before schema, data, or
+migration-ledger mutation. The empty transition installs immutable entry
+revisions, revision-bound chunks, and a current-revision pointer atomically.
+Normal startup validates the complete authoritative revision layout, including
+table columns and types, keys and revision bounds, foreign keys, the current
+revision view, FTS structures, and required indexes. A recorded revision-42
+database with a missing or conflicting object fails before serving traffic.
 
 ## Deterministic weighted rank fusion
 

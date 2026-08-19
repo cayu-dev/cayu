@@ -60,8 +60,15 @@ from cayu._validation import (
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_knowledge_embeddings",
     "cayu_task_terminalization_receipts",
     "cayu_knowledge_publication_receipts",
+    "cayu_knowledge_labels",
+    "cayu_knowledge_aspects",
+    "cayu_knowledge_impact_targets",
+    "cayu_knowledge_chunks",
+    "cayu_knowledge_revisions",
+    "cayu_knowledge_entries",
     "cayu_event_watcher_state",
     "cayu_budget_reservation_identities",
     "cayu_events",

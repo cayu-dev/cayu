@@ -50,8 +50,8 @@ disambiguates them so a name never sends you down the wrong path.
 ## A few load-bearing terms
 
 - **Knowledge vs memory.** Knowledge is durable canonical semantic material
-  (entries, chunks, source identity, lifecycle, and eventually immutable
-  revisions/evidence). Memory is the broader recall and context system that may
+  (entries, chunks, source identity, lifecycle, and immutable revisions; later
+  slices add evidence). Memory is the broader recall and context system that may
   retrieve permitted knowledge, transcript episodes, and artifact-derived
   documents. A `KnowledgeStore` is one memory source, not the whole memory
   system. See [Memory foundation contracts](memory-foundation.md).

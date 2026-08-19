@@ -109,6 +109,7 @@ from cayu.runtime.usage import (
 )
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    MAX_KNOWLEDGE_REVISION,
     KnowledgeHit,
     KnowledgeQuery,
     KnowledgeSearchMode,
@@ -275,7 +276,7 @@ def copy_context_pressure_estimate(
     return ContextPressureEstimate(**estimate.model_dump())
 
 
-_KNOWLEDGE_CANDIDATES_FORMAT_VERSION = 1
+_KNOWLEDGE_CANDIDATES_FORMAT_VERSION = 2
 _KNOWLEDGE_CANDIDATES_OPEN_TAG = "<cayu_knowledge_candidates>"
 _KNOWLEDGE_CANDIDATES_CLOSE_TAG = "</cayu_knowledge_candidates>"
 _KNOWLEDGE_CANDIDATES_NOTICE = (
@@ -298,7 +299,7 @@ _KNOWLEDGE_CANDIDATE_OPTIONAL_STRING_FIELDS = frozenset(
         "title",
     }
 )
-_KNOWLEDGE_CANDIDATE_INTEGER_FIELDS = frozenset({"chunk_index", "rank"})
+_KNOWLEDGE_CANDIDATE_INTEGER_FIELDS = frozenset({"chunk_index", "rank", "revision"})
 _KNOWLEDGE_CANDIDATE_NUMBER_FIELDS = frozenset({"score", "score_normalized"})
 _KNOWLEDGE_CANDIDATE_FIELDS = (
     _KNOWLEDGE_CANDIDATE_REQUIRED_STRING_FIELDS
@@ -6571,6 +6572,7 @@ def _is_valid_knowledge_candidate_payload(candidate: Any) -> bool:
     if (
         type(candidate) is not dict
         or not _KNOWLEDGE_CANDIDATE_REQUIRED_STRING_FIELDS.issubset(candidate)
+        or "revision" not in candidate
         or not set(candidate).issubset(_KNOWLEDGE_CANDIDATE_FIELDS)
     ):
         return False
@@ -6588,7 +6590,12 @@ def _is_valid_knowledge_candidate_payload(candidate: Any) -> bool:
         if field_name not in candidate:
             continue
         value = candidate[field_name]
-        if type(value) is not int or value < (1 if field_name == "rank" else 0):
+        minimum = 1 if field_name in {"rank", "revision"} else 0
+        if (
+            type(value) is not int
+            or value < minimum
+            or (field_name == "revision" and value > MAX_KNOWLEDGE_REVISION)
+        ):
             return False
     for field_name in _KNOWLEDGE_CANDIDATE_NUMBER_FIELDS:
         if field_name not in candidate:
@@ -7027,6 +7034,7 @@ def _format_knowledge_candidates(
 
         compact = {
             "entry_id": candidate["entry_id"],
+            "revision": candidate["revision"],
             "kind": candidate["kind"],
         }
         if not _knowledge_manifest_fits(
@@ -7273,6 +7281,7 @@ def _knowledge_candidate_payload(
 
     candidate: dict[str, Any] = {
         "entry_id": bounded(entry.id),
+        "revision": entry.revision,
         "kind": bounded(entry.kind),
         "namespace": bounded(entry.namespace),
     }
@@ -7442,6 +7451,7 @@ def _knowledge_source_payload(hit: KnowledgeHit) -> dict[str, Any]:
     )
     return {
         "entry_id": entry.id,
+        "revision": entry.revision,
         "namespace": entry.namespace,
         "kind": entry.kind,
         "title": entry.title,

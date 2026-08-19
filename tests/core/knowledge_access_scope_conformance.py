@@ -113,11 +113,17 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         denied_status,
         denied_expired,
     ):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             entry,
             [_chunk(entry)],
             access_scope=privileged,
         )
+    denied_namespace_current = denied_namespace.model_copy(update={"revision": 2})
+    await store.append_entry_revision(
+        denied_namespace_current,
+        expected_revision=denied_namespace.revision,
+        access_scope=privileged,
+    )
 
     scope = KnowledgeAccessScope.for_namespace(
         "tenant-a",
@@ -153,38 +159,44 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         assert await store.read_chunks(entry_id, access_scope=scope) == []
 
     with pytest.raises(KnowledgeAccessDenied):
-        await store.update_entry_status(
-            denied_namespace.id,
-            KnowledgeStatus.ARCHIVED,
-            access_scope=scope,
-        )
-    with pytest.raises(KnowledgeAccessDenied):
         await store.transition_entry_status(
             denied_namespace.id,
+            expected_revision=denied_namespace_current.revision,
             from_status=KnowledgeStatus.ACTIVE,
             to_status=KnowledgeStatus.ARCHIVED,
             access_scope=scope,
         )
     with pytest.raises(KnowledgeAccessDenied):
-        await store.delete_entry(denied_namespace.id, access_scope=scope, hard=True)
-    with pytest.raises(KnowledgeAccessDenied):
-        await store.replace_chunks(
+        await store.delete_entry(
             denied_namespace.id,
-            [_chunk(denied_namespace)],
+            expected_revision=denied_namespace_current.revision,
+            access_scope=scope,
+            hard=True,
+        )
+    with pytest.raises(KnowledgeAccessDenied):
+        await store.append_entry_revision(
+            denied_namespace_current.model_copy(update={"revision": 3}),
+            expected_revision=denied_namespace_current.revision,
+            access_scope=scope,
+        )
+    with pytest.raises(KnowledgeAccessDenied):
+        await store.append_entry_revision(
+            denied_namespace_current,
+            expected_revision=denied_namespace.revision,
             access_scope=scope,
         )
 
     takeover = allowed.model_copy(update={"id": denied_namespace.id})
     with pytest.raises(KnowledgeAccessDenied):
-        await store.put_entry(takeover, access_scope=scope)
+        await store.create_entry(takeover, access_scope=scope)
     with pytest.raises(KnowledgeAccessDenied):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             takeover,
             [_chunk(takeover)],
             access_scope=scope,
         )
     with pytest.raises(KnowledgeAccessDenied):
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             takeover,
             [_chunk(takeover)],
             operation_id="scoped-entry-takeover",
@@ -194,14 +206,19 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
     receipt_entry = allowed.model_copy(
         update={"id": "receipt-entry", "text": "sharedscope durable receipt"}
     )
-    receipt = await store.publish_entry_with_chunks(
+    receipt = await store.publish_entry_revision(
         receipt_entry,
         [_chunk(receipt_entry)],
         operation_id="scoped-receipt",
         access_scope=scope,
     )
     assert receipt.replayed is False
-    await store.delete_entry(receipt_entry.id, access_scope=scope, hard=True)
+    await store.delete_entry(
+        receipt_entry.id,
+        expected_revision=receipt_entry.revision,
+        access_scope=scope,
+        hard=True,
+    )
     assert (
         await store.load_entry_publication_receipt(
             "scoped-receipt",
@@ -209,7 +226,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         )
         is not None
     )
-    replay = await store.publish_entry_with_chunks(
+    replay = await store.publish_entry_revision(
         receipt_entry,
         [_chunk(receipt_entry)],
         operation_id="scoped-receipt",
@@ -235,7 +252,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     with pytest.raises(KnowledgeAccessDenied):
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             other_receipt_entry,
             [_chunk(other_receipt_entry)],
             operation_id="scoped-receipt",
@@ -249,8 +266,8 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     foreign_chunk_id = "foreign-global-chunk"
-    foreign_default_chunk_id = "foreign-default-probe:0"
-    await store.put_entry_with_chunks(
+    foreign_default_chunk_id = "foreign-default-probe:r1:0"
+    await store.create_entry(
         foreign_chunk_owner,
         [
             _chunk(foreign_chunk_owner, chunk_id=foreign_chunk_id),
@@ -269,7 +286,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     foreign_replace_original = _chunk(foreign_replace_target)
-    await store.put_entry_with_chunks(
+    await store.create_entry(
         foreign_replace_target,
         [foreign_replace_original],
         access_scope=scope,
@@ -281,7 +298,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     with pytest.raises(KnowledgeAccessDenied) as denied_default:
-        await store.put_entry(foreign_default_probe, access_scope=scope)
+        await store.create_entry(foreign_default_probe, access_scope=scope)
     assert foreign_chunk_owner.id not in str(denied_default.value)
     assert foreign_default_chunk_id not in str(denied_default.value)
     assert await store.get_entry(foreign_default_probe.id, access_scope=scope) is None
@@ -293,7 +310,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     with pytest.raises(KnowledgeAccessDenied):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             foreign_put_probe,
             [_chunk(foreign_put_probe, chunk_id=foreign_chunk_id)],
             access_scope=scope,
@@ -307,7 +324,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     with pytest.raises(KnowledgeAccessDenied):
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             foreign_publication_probe,
             [_chunk(foreign_publication_probe, chunk_id=foreign_chunk_id)],
             operation_id="foreign-chunk-publication",
@@ -323,9 +340,14 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
     )
 
     with pytest.raises(KnowledgeAccessDenied):
-        await store.replace_chunks(
-            foreign_replace_target.id,
-            [_chunk(foreign_replace_target, chunk_id=foreign_chunk_id)],
+        await store.append_entry_revision(
+            foreign_replace_target.model_copy(update={"revision": 2}),
+            [
+                _chunk(foreign_replace_target, chunk_id=foreign_chunk_id).model_copy(
+                    update={"entry_revision": 2}
+                )
+            ],
+            expected_revision=foreign_replace_target.revision,
             access_scope=scope,
         )
     assert await store.read_chunks(foreign_replace_target.id, access_scope=scope) == [
@@ -339,8 +361,8 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     accessible_chunk_id = "accessible-global-chunk"
-    accessible_default_chunk_id = "accessible-default-probe:0"
-    await store.put_entry_with_chunks(
+    accessible_default_chunk_id = "accessible-default-probe:r1:0"
+    await store.create_entry(
         accessible_chunk_owner,
         [
             _chunk(accessible_chunk_owner, chunk_id=accessible_chunk_id),
@@ -359,7 +381,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     accessible_replace_original = _chunk(accessible_replace_target)
-    await store.put_entry_with_chunks(
+    await store.create_entry(
         accessible_replace_target,
         [accessible_replace_original],
         access_scope=scope,
@@ -371,7 +393,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     with pytest.raises(KnowledgeChunkConflict):
-        await store.put_entry(accessible_default_probe, access_scope=scope)
+        await store.create_entry(accessible_default_probe, access_scope=scope)
     assert await store.get_entry(accessible_default_probe.id, access_scope=scope) is None
 
     accessible_put_probe = _entry(
@@ -381,7 +403,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     with pytest.raises(KnowledgeChunkConflict):
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             accessible_put_probe,
             [_chunk(accessible_put_probe, chunk_id=accessible_chunk_id)],
             access_scope=scope,
@@ -395,7 +417,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
     )
     with pytest.raises(KnowledgeChunkConflict):
-        await store.publish_entry_with_chunks(
+        await store.publish_entry_revision(
             accessible_publication_probe,
             [_chunk(accessible_publication_probe, chunk_id=accessible_chunk_id)],
             operation_id="accessible-chunk-publication",
@@ -411,9 +433,14 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
     )
 
     with pytest.raises(KnowledgeChunkConflict):
-        await store.replace_chunks(
-            accessible_replace_target.id,
-            [_chunk(accessible_replace_target, chunk_id=accessible_chunk_id)],
+        await store.append_entry_revision(
+            accessible_replace_target.model_copy(update={"revision": 2}),
+            [
+                _chunk(accessible_replace_target, chunk_id=accessible_chunk_id).model_copy(
+                    update={"entry_revision": 2}
+                )
+            ],
+            expected_revision=accessible_replace_target.revision,
             access_scope=scope,
         )
     assert await store.read_chunks(accessible_replace_target.id, access_scope=scope) == [
@@ -427,7 +454,7 @@ async def assert_knowledge_access_scope_conformance(store: KnowledgeStore) -> No
         source_id="source-a",
         expires_at=datetime.now(UTC) + timedelta(days=1),
     )
-    await store.put_entry_with_chunks(
+    await store.create_entry(
         future_expiring,
         [_chunk(future_expiring)],
         access_scope=privileged,

@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -41,6 +41,7 @@ from cayu.runtime.tasks import (
 )
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
+from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -1512,6 +1513,177 @@ _MIGRATION_STEPS: dict[int, str] = {
                 '$.queued_dispatch_terminal_receipts.receipts'
             ) IS NOT NULL;
     """,
+    42: """
+        DROP VIEW IF EXISTS cayu_knowledge_current_entries;
+        DROP TABLE IF EXISTS cayu_knowledge_chunks_fts;
+        DROP TABLE IF EXISTS cayu_knowledge_publication_receipts;
+        DROP TABLE IF EXISTS cayu_knowledge_chunks;
+        DROP TABLE IF EXISTS cayu_knowledge_impact_targets;
+        DROP TABLE IF EXISTS cayu_knowledge_aspects;
+        DROP TABLE IF EXISTS cayu_knowledge_labels;
+        DROP TABLE IF EXISTS cayu_knowledge_revisions;
+        DROP TABLE IF EXISTS cayu_knowledge_entries;
+
+        CREATE TABLE cayu_knowledge_entries (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            current_revision INTEGER NOT NULL
+                CHECK (current_revision > 0 AND current_revision <= 2147483647),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (id, current_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision)
+                DEFERRABLE INITIALLY DEFERRED
+        );
+
+        CREATE TABLE cayu_knowledge_revisions (
+            entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL CHECK (revision > 0 AND revision <= 2147483647),
+            text TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_by_type TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            source_type TEXT,
+            source_uri TEXT,
+            source_id TEXT,
+            source_hash TEXT,
+            importance REAL,
+            importance_source TEXT,
+            confidence REAL,
+            last_used_at TEXT,
+            expires_at TEXT,
+            title TEXT,
+            metadata_json TEXT NOT NULL,
+            PRIMARY KEY (entry_id, revision)
+        );
+
+        CREATE TABLE cayu_knowledge_labels (
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (entry_id, entry_revision, key),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE TABLE cayu_knowledge_aspects (
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL,
+            aspect TEXT NOT NULL,
+            PRIMARY KEY (entry_id, entry_revision, aspect),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE TABLE cayu_knowledge_impact_targets (
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL,
+            impact_target TEXT NOT NULL,
+            PRIMARY KEY (entry_id, entry_revision, impact_target),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE TABLE cayu_knowledge_chunks (
+            fts_rowid INTEGER PRIMARY KEY,
+            id TEXT NOT NULL UNIQUE,
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+            text TEXT NOT NULL,
+            content_hash TEXT,
+            source_uri TEXT,
+            metadata_json TEXT NOT NULL,
+            UNIQUE (entry_id, entry_revision, chunk_index),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE cayu_knowledge_chunks_fts
+        USING fts5(
+            entry_id UNINDEXED,
+            entry_revision UNINDEXED,
+            chunk_id UNINDEXED,
+            title,
+            text
+        );
+
+        CREATE TABLE cayu_knowledge_publication_receipts (
+            operation_id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            expected_revision INTEGER
+                CHECK (expected_revision > 0 AND expected_revision <= 2147483647),
+            request_sha256 TEXT NOT NULL,
+            entry_created_at TEXT NOT NULL,
+            entry_updated_at TEXT NOT NULL,
+            committed_at TEXT NOT NULL,
+            access_snapshot_json TEXT NOT NULL,
+            CHECK (
+                (expected_revision IS NULL AND entry_revision = 1)
+                OR entry_revision = expected_revision + 1
+            )
+        );
+
+        CREATE VIEW cayu_knowledge_current_entries AS
+        SELECT
+            logical.id AS id,
+            revision.revision AS revision,
+            logical.namespace AS namespace,
+            revision.text AS text,
+            revision.kind AS kind,
+            revision.visibility AS visibility,
+            revision.status AS status,
+            revision.created_by_type AS created_by_type,
+            revision.created_by AS created_by,
+            revision.created_at AS created_at,
+            revision.updated_at AS updated_at,
+            revision.source_type AS source_type,
+            revision.source_uri AS source_uri,
+            revision.source_id AS source_id,
+            revision.source_hash AS source_hash,
+            revision.importance AS importance,
+            revision.importance_source AS importance_source,
+            revision.confidence AS confidence,
+            revision.last_used_at AS last_used_at,
+            revision.expires_at AS expires_at,
+            revision.title AS title,
+            revision.metadata_json AS metadata_json
+        FROM cayu_knowledge_entries AS logical
+        JOIN cayu_knowledge_revisions AS revision
+          ON revision.entry_id = logical.id
+         AND revision.revision = logical.current_revision;
+
+        CREATE INDEX idx_cayu_knowledge_entries_namespace_current
+            ON cayu_knowledge_entries(namespace, current_revision, id);
+        CREATE INDEX idx_cayu_knowledge_revisions_status
+            ON cayu_knowledge_revisions(status, entry_id, revision);
+        CREATE INDEX idx_cayu_knowledge_revisions_kind
+            ON cayu_knowledge_revisions(kind, entry_id, revision);
+        CREATE INDEX idx_cayu_knowledge_revisions_visibility
+            ON cayu_knowledge_revisions(visibility, entry_id, revision);
+        CREATE INDEX idx_cayu_knowledge_revisions_source
+            ON cayu_knowledge_revisions(source_type, source_id, entry_id, revision);
+        CREATE INDEX idx_cayu_knowledge_revisions_expires_at
+            ON cayu_knowledge_revisions(expires_at, entry_id, revision);
+        CREATE INDEX idx_cayu_knowledge_labels_key_value_entry
+            ON cayu_knowledge_labels(key, value, entry_id, entry_revision);
+        CREATE INDEX idx_cayu_knowledge_aspects_aspect_entry
+            ON cayu_knowledge_aspects(aspect, entry_id, entry_revision);
+        CREATE INDEX idx_cayu_knowledge_impact_targets_target_entry
+            ON cayu_knowledge_impact_targets(impact_target, entry_id, entry_revision);
+        CREATE INDEX idx_cayu_knowledge_chunks_entry_revision_index
+            ON cayu_knowledge_chunks(entry_id, entry_revision, chunk_index);
+        CREATE INDEX idx_cayu_knowledge_publication_receipts_entry_revision
+            ON cayu_knowledge_publication_receipts(entry_id, entry_revision);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -1669,6 +1841,39 @@ def _reject_populated_pre_knowledge_access_snapshot_database(
             "knowledge publication receipt and cannot infer one for existing "
             "receipts. Recreate the Cayu database before starting this build."
         )
+
+
+def _reject_populated_pre_knowledge_revision_database(
+    connection: sqlite3.Connection,
+) -> None:
+    candidates = (
+        "cayu_knowledge_entries",
+        "cayu_knowledge_labels",
+        "cayu_knowledge_aspects",
+        "cayu_knowledge_impact_targets",
+        "cayu_knowledge_chunks",
+        "cayu_knowledge_publication_receipts",
+        "cayu_knowledge_embeddings",
+    )
+    existing = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'cayu_knowledge_%'"
+        )
+    }
+    inspected = [table for table in candidates if table in existing]
+    if not inspected:
+        return
+    counts = {
+        table: int(
+            connection.execute(f"SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)").fetchone()[0]
+        )
+        for table in inspected
+    }
+    require_empty_knowledge_revision_transition(
+        counts,
+        required_tables=inspected,
+    )
 
 
 def _backfill_session_activity(connection: sqlite3.Connection) -> None:
@@ -1923,6 +2128,17 @@ _KNOWLEDGE_CHUNK_LEGACY_COLUMNS = (
     "metadata_json",
 )
 _KNOWLEDGE_CHUNK_KEYED_COLUMNS = ("fts_rowid", *_KNOWLEDGE_CHUNK_LEGACY_COLUMNS)
+_KNOWLEDGE_CHUNK_REVISION_COLUMNS = (
+    "fts_rowid",
+    "id",
+    "entry_id",
+    "entry_revision",
+    "chunk_index",
+    "text",
+    "content_hash",
+    "source_uri",
+    "metadata_json",
+)
 
 
 def _sqlite_table_columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
@@ -2033,6 +2249,12 @@ def _validate_revision_37_knowledge_fts_data(connection: sqlite3.Connection) -> 
 
 def _migrate_revision_thirty_seven_knowledge_fts(connection: sqlite3.Connection) -> None:
     columns = _sqlite_table_columns(connection, "cayu_knowledge_chunks")
+    if columns == _KNOWLEDGE_CHUNK_REVISION_COLUMNS:
+        # A current binary may be recovering a revision-42 schema whose ledger
+        # was restored or rewound independently. Revision 42 will validate the
+        # revision-bound layout later in the same migration sequence; revision
+        # 37 must not reject that known-newer shape first.
+        return
     if columns == _KNOWLEDGE_CHUNK_KEYED_COLUMNS:
         # Greenfield baseline databases already have the current layout. This also
         # makes an explicitly retried migration safe if the schema was prepared by
@@ -2482,10 +2704,20 @@ def reconcile_schema(
       validate. The default for SQLite (dev / test / local durability).
     - ``migrate``: apply pending forward revisions, then validate.
     """
+    state = read_schema_state(connection)
+    if (
+        schema_mode is not schema.SchemaMode.VALIDATE
+        and state.revision < 42
+        and any(revision.revision == 42 for revision in schema.pending(state.revision))
+    ):
+        # This check intentionally precedes even bookkeeping-table DDL. A
+        # populated unversioned/partially versioned knowledge schema is not a
+        # fresh database and must remain recoverable for an explicit reset.
+        _reject_populated_pre_knowledge_revision_database(connection)
     if schema_mode is not schema.SchemaMode.VALIDATE:
         connection.execute(_MIGRATIONS_TABLE_DDL)
         connection.commit()
-    state = read_schema_state(connection)
+        state = read_schema_state(connection)
     if schema_mode is schema.SchemaMode.VALIDATE:
         schema.validate(state, app_min_supported=app_min_supported)
     elif schema_mode is schema.SchemaMode.CREATE:
@@ -2520,10 +2752,12 @@ def reconcile_schema(
             _validate_workflow_replay_indexes(connection, require_all=True)
     if app_min_supported >= 36:
         _validate_session_invocation_column(connection)
-    if current.revision >= 37:
+    if 37 <= current.revision < 42:
         # Structural validation is intentionally constant-size. The full source/
         # FTS census belongs to the one-time revision hook, never ordinary startup.
         _validate_revision_37_knowledge_fts_schema(connection)
+    if current.revision >= 42:
+        _validate_revision_42_knowledge_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
@@ -2543,6 +2777,298 @@ def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
             "Cayu's required invocation-provenance contract. Recreate the Cayu "
             "database from a known-good revision-36 schema."
         )
+
+
+def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> None:
+    required_tables = {
+        "cayu_knowledge_entries": (
+            ("id", "TEXT", 0, 1),
+            ("namespace", "TEXT", 1, 0),
+            ("current_revision", "INTEGER", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ),
+        "cayu_knowledge_revisions": (
+            ("entry_id", "TEXT", 1, 1),
+            ("revision", "INTEGER", 1, 2),
+            ("text", "TEXT", 1, 0),
+            ("kind", "TEXT", 1, 0),
+            ("visibility", "TEXT", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("created_by_type", "TEXT", 1, 0),
+            ("created_by", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+            ("source_type", "TEXT", 0, 0),
+            ("source_uri", "TEXT", 0, 0),
+            ("source_id", "TEXT", 0, 0),
+            ("source_hash", "TEXT", 0, 0),
+            ("importance", "REAL", 0, 0),
+            ("importance_source", "TEXT", 0, 0),
+            ("confidence", "REAL", 0, 0),
+            ("last_used_at", "TEXT", 0, 0),
+            ("expires_at", "TEXT", 0, 0),
+            ("title", "TEXT", 0, 0),
+            ("metadata_json", "TEXT", 1, 0),
+        ),
+        "cayu_knowledge_labels": (
+            ("entry_id", "TEXT", 1, 1),
+            ("entry_revision", "INTEGER", 1, 2),
+            ("key", "TEXT", 1, 3),
+            ("value", "TEXT", 1, 0),
+        ),
+        "cayu_knowledge_aspects": (
+            ("entry_id", "TEXT", 1, 1),
+            ("entry_revision", "INTEGER", 1, 2),
+            ("aspect", "TEXT", 1, 3),
+        ),
+        "cayu_knowledge_impact_targets": (
+            ("entry_id", "TEXT", 1, 1),
+            ("entry_revision", "INTEGER", 1, 2),
+            ("impact_target", "TEXT", 1, 3),
+        ),
+        "cayu_knowledge_chunks": (
+            ("fts_rowid", "INTEGER", 0, 1),
+            ("id", "TEXT", 1, 0),
+            ("entry_id", "TEXT", 1, 0),
+            ("entry_revision", "INTEGER", 1, 0),
+            ("chunk_index", "INTEGER", 1, 0),
+            ("text", "TEXT", 1, 0),
+            ("content_hash", "TEXT", 0, 0),
+            ("source_uri", "TEXT", 0, 0),
+            ("metadata_json", "TEXT", 1, 0),
+        ),
+        "cayu_knowledge_publication_receipts": (
+            ("operation_id", "TEXT", 0, 1),
+            ("entry_id", "TEXT", 1, 0),
+            ("entry_revision", "INTEGER", 1, 0),
+            ("expected_revision", "INTEGER", 0, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("entry_created_at", "TEXT", 1, 0),
+            ("entry_updated_at", "TEXT", 1, 0),
+            ("committed_at", "TEXT", 1, 0),
+            ("access_snapshot_json", "TEXT", 1, 0),
+        ),
+    }
+    for table, expected in required_tables.items():
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        actual = tuple((str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5])) for row in rows)
+        if actual != expected:
+            _raise_revision_42_sqlite_schema_error(table)
+
+    expected_foreign_keys = {
+        "cayu_knowledge_entries": (
+            ("cayu_knowledge_revisions", "current_revision", "revision", "NO ACTION"),
+            ("cayu_knowledge_revisions", "id", "entry_id", "NO ACTION"),
+        ),
+        "cayu_knowledge_revisions": (("cayu_knowledge_entries", "entry_id", "id", "CASCADE"),),
+        "cayu_knowledge_labels": (
+            ("cayu_knowledge_revisions", "entry_id", "entry_id", "CASCADE"),
+            ("cayu_knowledge_revisions", "entry_revision", "revision", "CASCADE"),
+        ),
+        "cayu_knowledge_aspects": (
+            ("cayu_knowledge_revisions", "entry_id", "entry_id", "CASCADE"),
+            ("cayu_knowledge_revisions", "entry_revision", "revision", "CASCADE"),
+        ),
+        "cayu_knowledge_impact_targets": (
+            ("cayu_knowledge_revisions", "entry_id", "entry_id", "CASCADE"),
+            ("cayu_knowledge_revisions", "entry_revision", "revision", "CASCADE"),
+        ),
+        "cayu_knowledge_chunks": (
+            ("cayu_knowledge_revisions", "entry_id", "entry_id", "CASCADE"),
+            ("cayu_knowledge_revisions", "entry_revision", "revision", "CASCADE"),
+        ),
+        "cayu_knowledge_publication_receipts": (),
+    }
+    for table, expected in expected_foreign_keys.items():
+        actual = tuple(
+            sorted(
+                (
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]),
+                    str(row[6]).upper(),
+                )
+                for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+            )
+        )
+        if actual != expected:
+            _raise_revision_42_sqlite_schema_error(table)
+
+    required_unique_keys = {
+        "cayu_knowledge_entries": (("id",),),
+        "cayu_knowledge_revisions": (("entry_id", "revision"),),
+        "cayu_knowledge_labels": (("entry_id", "entry_revision", "key"),),
+        "cayu_knowledge_aspects": (("entry_id", "entry_revision", "aspect"),),
+        "cayu_knowledge_impact_targets": (("entry_id", "entry_revision", "impact_target"),),
+        "cayu_knowledge_chunks": (
+            ("id",),
+            ("entry_id", "entry_revision", "chunk_index"),
+        ),
+        "cayu_knowledge_publication_receipts": (("operation_id",),),
+    }
+    for table, keys in required_unique_keys.items():
+        if any(not _sqlite_has_unique_index(connection, table, key) for key in keys):
+            _raise_revision_42_sqlite_schema_error(table)
+
+    required_indexes = {
+        "idx_cayu_knowledge_entries_namespace_current": (
+            "cayu_knowledge_entries",
+            ("namespace", "current_revision", "id"),
+        ),
+        "idx_cayu_knowledge_revisions_status": (
+            "cayu_knowledge_revisions",
+            ("status", "entry_id", "revision"),
+        ),
+        "idx_cayu_knowledge_revisions_kind": (
+            "cayu_knowledge_revisions",
+            ("kind", "entry_id", "revision"),
+        ),
+        "idx_cayu_knowledge_revisions_visibility": (
+            "cayu_knowledge_revisions",
+            ("visibility", "entry_id", "revision"),
+        ),
+        "idx_cayu_knowledge_revisions_source": (
+            "cayu_knowledge_revisions",
+            ("source_type", "source_id", "entry_id", "revision"),
+        ),
+        "idx_cayu_knowledge_revisions_expires_at": (
+            "cayu_knowledge_revisions",
+            ("expires_at", "entry_id", "revision"),
+        ),
+        "idx_cayu_knowledge_labels_key_value_entry": (
+            "cayu_knowledge_labels",
+            ("key", "value", "entry_id", "entry_revision"),
+        ),
+        "idx_cayu_knowledge_aspects_aspect_entry": (
+            "cayu_knowledge_aspects",
+            ("aspect", "entry_id", "entry_revision"),
+        ),
+        "idx_cayu_knowledge_impact_targets_target_entry": (
+            "cayu_knowledge_impact_targets",
+            ("impact_target", "entry_id", "entry_revision"),
+        ),
+        "idx_cayu_knowledge_chunks_entry_revision_index": (
+            "cayu_knowledge_chunks",
+            ("entry_id", "entry_revision", "chunk_index"),
+        ),
+        "idx_cayu_knowledge_publication_receipts_entry_revision": (
+            "cayu_knowledge_publication_receipts",
+            ("entry_id", "entry_revision"),
+        ),
+    }
+    for index, (table, columns) in required_indexes.items():
+        row = connection.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        ).fetchone()
+        actual_columns = tuple(
+            str(column[2]) for column in connection.execute(f"PRAGMA index_info({index})")
+        )
+        if row is None or str(row[0]) != table or actual_columns != columns:
+            _raise_revision_42_sqlite_schema_error(index)
+
+    current_view = connection.execute(
+        "SELECT type, sql FROM sqlite_master WHERE name = 'cayu_knowledge_current_entries'"
+    ).fetchone()
+    current_view_sql = _normalize_sqlite_schema_sql(
+        None if current_view is None else current_view[1]
+    )
+    current_view_columns = _sqlite_table_columns(
+        connection,
+        "cayu_knowledge_current_entries",
+    )
+    if (
+        current_view is None
+        or str(current_view[0]) != "view"
+        or current_view_columns
+        != (
+            "id",
+            "revision",
+            "namespace",
+            "text",
+            "kind",
+            "visibility",
+            "status",
+            "created_by_type",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "source_type",
+            "source_uri",
+            "source_id",
+            "source_hash",
+            "importance",
+            "importance_source",
+            "confidence",
+            "last_used_at",
+            "expires_at",
+            "title",
+            "metadata_json",
+        )
+        or "from cayu_knowledge_entries as logical" not in current_view_sql
+        or "join cayu_knowledge_revisions as revision" not in current_view_sql
+        or "revision.revision = logical.current_revision" not in current_view_sql
+    ):
+        _raise_revision_42_sqlite_schema_error("cayu_knowledge_current_entries")
+
+    fts = connection.execute(
+        "SELECT type, sql FROM sqlite_master WHERE name = 'cayu_knowledge_chunks_fts'"
+    ).fetchone()
+    fts_sql = _normalize_sqlite_schema_sql(None if fts is None else fts[1])
+    if (
+        fts is None
+        or str(fts[0]) != "table"
+        or _sqlite_table_columns(connection, "cayu_knowledge_chunks_fts")
+        != ("entry_id", "entry_revision", "chunk_id", "title", "text")
+        or "using fts5" not in fts_sql
+        or any(
+            fragment not in fts_sql
+            for fragment in (
+                "entry_id unindexed",
+                "entry_revision unindexed",
+                "chunk_id unindexed",
+            )
+        )
+    ):
+        _raise_revision_42_sqlite_schema_error("cayu_knowledge_chunks_fts")
+
+    required_table_sql = {
+        "cayu_knowledge_entries": (
+            "check (current_revision > 0 and current_revision <= 2147483647)",
+            "deferrable initially deferred",
+        ),
+        "cayu_knowledge_revisions": ("check (revision > 0 and revision <= 2147483647)",),
+        "cayu_knowledge_chunks": (
+            "check (entry_revision > 0 and entry_revision <= 2147483647)",
+            "check (chunk_index >= 0)",
+        ),
+        "cayu_knowledge_publication_receipts": (
+            "check (entry_revision > 0 and entry_revision <= 2147483647)",
+            "check (expected_revision > 0 and expected_revision <= 2147483647)",
+            "entry_revision = expected_revision + 1",
+        ),
+    }
+    for table, fragments in required_table_sql.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+        if any(fragment not in normalized for fragment in fragments):
+            _raise_revision_42_sqlite_schema_error(table)
+
+
+def _normalize_sqlite_schema_sql(value: object | None) -> str:
+    return " ".join(str(value or "").lower().split())
+
+
+def _raise_revision_42_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        f"SQLite schema object {name!r} conflicts with Cayu's revision-first "
+        "knowledge contract. Recreate the Cayu database from a known-good "
+        "revision-42 schema."
+    )
 
 
 def _validate_knowledge_publication_access_snapshot_column(
@@ -2790,6 +3316,8 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         and any(revision.revision == 41 for revision in schema.pending(current))
     ):
         _reject_populated_pre_knowledge_access_snapshot_database(connection)
+    if current < 42 and any(revision.revision == 42 for revision in schema.pending(current)):
+        _reject_populated_pre_knowledge_revision_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -2837,6 +3365,11 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return
     with _transaction(connection):
+        if rev.revision == 42:
+            # Recheck under the same immediate writer transaction that owns the
+            # destructive reset DDL. A legacy writer cannot populate an empty
+            # table between the refusal check and the schema replacement.
+            _reject_populated_pre_knowledge_revision_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -2850,6 +3383,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             hook(connection)
         if rev.revision == 41:
             _validate_knowledge_publication_access_snapshot_column(connection)
+        if rev.revision == 42:
+            _validate_revision_42_knowledge_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

@@ -52,7 +52,8 @@ Do not send payment reminders when the PO number is missing.
     assert result.text_bytes == len(text.encode("utf-8"))
     assert result.chunk_count == len(result.chunks)
     assert len(result.chunks) >= 2
-    assert result.chunks[0].id == "payments:0"
+    assert result.chunks[0].id == "payments:r1:0"
+    assert all(chunk.entry_revision == 1 for chunk in result.chunks)
     assert result.chunks[0].content_hash is not None
     assert "Payments" in result.chunks[0].text
     assert result.chunks[-1].metadata["heading_paths"] == [["Payments", "Reminders"]]
@@ -193,13 +194,43 @@ def test_knowledge_indexer_rewrites_when_metadata_changes_with_same_text() -> No
     assert chunks[0].metadata["version"] == "new"
 
 
+def test_knowledge_indexer_does_not_read_chunks_after_entry_metadata_mismatch() -> None:
+    class ReadCountingStore(InMemoryKnowledgeStore):
+        chunk_read_count = 0
+
+        async def read_chunks(self, *args, **kwargs):
+            self.chunk_read_count += 1
+            return await super().read_chunks(*args, **kwargs)
+
+    async def run() -> int:
+        store = ReadCountingStore(access_scope=_ACCESS_SCOPE)
+        indexer = KnowledgeIndexer(store)
+        await indexer.index_text(
+            KnowledgeIndexRequest(
+                text="Stable policy text.",
+                entry_id="metadata-fast-path",
+                labels={"version": "old"},
+            )
+        )
+        await indexer.index_text(
+            KnowledgeIndexRequest(
+                text="Stable policy text.",
+                entry_id="metadata-fast-path",
+                labels={"version": "new"},
+            )
+        )
+        return store.chunk_read_count
+
+    assert asyncio.run(run()) == 0
+
+
 def test_knowledge_indexer_rewrites_when_store_has_stale_extra_chunks() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
         indexer = KnowledgeIndexer(store)
         request = KnowledgeIndexRequest(text="Same policy text.", entry_id="stale-extra")
         built = indexer.build(request)
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             built.entry,
             [
                 *built.chunks,

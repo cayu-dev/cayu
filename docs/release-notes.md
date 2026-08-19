@@ -97,6 +97,44 @@ changes always project and preflight portable history, including same-model
 transitions. Local workspace branches now reject source/private per-directory
 path-semantics mismatches and revalidate those semantics before publication.
 
+### Knowledge updates are immutable, revision-addressed publications
+
+Knowledge entries now retain immutable revisions and a transactional current
+revision pointer. Every chunk belongs to an exact entry revision; compare-and-
+swap publication permits only the successor of the caller's expected current
+revision, and concurrent stale writers receive a typed conflict. Current and
+historical reads are explicit, lifecycle changes append revisions, current-only
+search and list operations cannot surface stale material, and hard deletion
+removes the complete revision history. In-memory, SQLite, and PostgreSQL stores
+share the same revision, access-control, publication-receipt, and defensive-copy
+contract. Runtime context candidates and knowledge-facing APIs carry the exact
+revision they expose.
+
+Historical entry and chunk reads now require authorization for both the exact
+snapshot and the logical entry's current revision, so an older active revision
+cannot bypass a later tombstone or access restriction. Authorized principals can
+still retire current material to `archived` or `deleted` without being granted
+read access to the retired state; promotion and reactivation continue to require
+destination access. Revision exhaustion is rejected before mutation with the
+same error across all built-in backends.
+
+The server contract advances from version 11 to version 12 because knowledge
+entry and chunk representations now require their exact revision. Upgrade
+independently deployed servers, packaged dashboards, and generated clients
+together.
+
+Breaking schema revision 42 replaces the mutable knowledge layout. Fresh stores
+and stores whose legacy knowledge tables are all empty migrate normally. A
+populated pre-42 knowledge store is refused before Cayu changes its schema,
+data, or migration ledger: stop older writers, take an application-consistent
+backup, and explicitly replace/reset that database rather than fabricating
+revision history. Run `cayu storage status` followed by `cayu storage migrate`,
+then confirm revision 42 before starting current workers. Mixed pre-42 and
+revision-42 knowledge writers are unsupported. Revision-42 startup also verifies
+the complete knowledge table, constraint, current-view, search-structure, and
+required-index contract and refuses a damaged or conflicting schema before
+serving reads.
+
 ### New runs use one atomic model target
 
 `RunRequest.target` now accepts an optional exact

@@ -506,12 +506,13 @@ async def seed_pending_knowledge(store: SQLiteKnowledgeStore) -> None:
         ),
     ]
     for entry in entries:
-        await store.put_entry_with_chunks(
+        await store.create_entry(
             entry,
             [
                 KnowledgeChunk(
-                    id=f"{entry.id}:0",
+                    id=f"{entry.id}:r{entry.revision}:0",
                     entry_id=entry.id,
+                    entry_revision=entry.revision,
                     chunk_index=0,
                     text=entry.text,
                     metadata={"demo": True},
