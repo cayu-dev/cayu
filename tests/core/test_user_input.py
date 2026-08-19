@@ -1279,7 +1279,12 @@ def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() 
                 )
             )
         )
-    assert caught.value.changed_component_classes == (ExecutionProfileComponentClass.DIRECT_TOOLS,)
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+    )
     assert echo.metadata_by_text == {}
     assert final_provider.requests == []
 

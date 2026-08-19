@@ -104,6 +104,9 @@ class GitChangesTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         with tool_argument_validation():

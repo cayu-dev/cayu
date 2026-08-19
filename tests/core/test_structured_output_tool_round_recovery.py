@@ -3,12 +3,19 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from importlib.metadata import version
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 from tests.core._execution_profile_fixtures import create_admitted_session
 
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+)
 from cayu.core.messages import ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -24,11 +31,13 @@ from cayu.runtime import (
     SessionStatus,
     StructuredOutputSpec,
 )
+from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.sessions import (
     ModelCompletionStageRequest,
@@ -66,6 +75,11 @@ class _SideEffectTool(Tool):
             "properties": {"value": {"type": "string"}},
             "required": ["value"],
         },
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:structured-output-side-effect",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self) -> None:
@@ -117,6 +131,7 @@ class _PublishedStructuredStep:
     completion_event: Event
     model_intent: dict
     model_receipt: RuntimePublicationReceipt
+    execution_profile: ExecutionProfileIdentity
 
 
 def _answer_spec(*, max_retries: int = 2) -> StructuredOutputSpec:
@@ -174,6 +189,21 @@ async def _publish_structured_model_step(
 ) -> _PublishedStructuredStep:
     user_message = Message.text("user", "produce the final structured answer")
     interaction_id = f"interaction-{session_id}"
+    profile_app = CayuApp(enable_logging=False)
+    profile_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=tools,
+    )
+    execution_profile = execution_profile_admission.resolve_execution_profile_identity(
+        registered_agent=profile_app._agents["assistant"],
+        provider_name=provider_name,
+        model="fake-model",
+        durable_system_prompt=None,
+        runtime_name="cayu",
+        runtime_version=version("cayu"),
+        redactor=profile_app._secret_redactor,
+        process_identity=profile_app._execution_profile_process_identity,
+    )
     admitted = await create_admitted_session(
         store,
         request=RunRequest(
@@ -194,6 +224,7 @@ async def _publish_structured_model_step(
             }
             for tool in tools
         ),
+        execution_profile=execution_profile,
         interaction_id=interaction_id,
         secret_redactor=redactor,
     )
@@ -348,6 +379,7 @@ async def _publish_structured_model_step(
         completion_event=completion_event,
         model_intent=intent,
         model_receipt=promoted.receipt,
+        execution_profile=execution_profile,
     )
 
 

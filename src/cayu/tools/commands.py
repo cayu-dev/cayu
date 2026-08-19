@@ -14,6 +14,7 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import (
     _COMMAND_POLICY_DENIAL_SOURCE,
     Tool,
@@ -107,6 +108,12 @@ class CommandPolicy(ABC):
     ``ExecCommandTool(policy=...)``.
     """
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return a stable application declaration, or ``None`` when non-portable."""
+
+        return None
+
     @abstractmethod
     async def evaluate(self, ctx: ToolContext, request: CommandRequest) -> CommandPolicyResult:
         """Return whether this command may execute."""
@@ -167,6 +174,11 @@ class ExecCommandTool(Tool):
             ),
         },
     )
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        """Return Cayu-owned behavior inputs; command policy is profiled separately."""
+
+        return {}
 
     def __init__(
         self,

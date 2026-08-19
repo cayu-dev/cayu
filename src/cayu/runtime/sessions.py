@@ -164,6 +164,7 @@ from cayu.runtime.execution_profiles import (
     copy_execution_profile_adoption_intent,
     copy_execution_profile_decision,
     execution_profile_baseline_from_session_metadata,
+    execution_profile_changes_authority,
     execution_profile_from_session_metadata,
     execution_profile_metadata_after_adoption,
     execution_profile_session_metadata,
@@ -14113,9 +14114,9 @@ def _validate_execution_profile_admission(
             raise ValueError("Only accepted execution-profile decisions can admit work.")
         if (
             decision.kind is ExecutionProfileDecisionKind.COMPATIBLE_REUSE
-            and ExecutionProfileComponentClass.DIRECT_TOOLS in changed
+            and execution_profile_changes_authority(changed)
         ):
-            raise ValueError("Generic compatible reuse cannot broaden direct-tool authority.")
+            raise ValueError("Generic compatible reuse cannot change execution authority.")
         provider_target_changed = ExecutionProfileComponentClass.PROVIDER_TARGET in changed
         if provider_target_changed != (model_transition is not None):
             raise ValueError(

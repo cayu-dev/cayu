@@ -10,6 +10,7 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     Message,
     ModelStreamEvent,
     RunRequest,
@@ -30,6 +31,11 @@ class FileSideEffectTool(Tool):
         name="write_external_effect",
         description="Append one externally visible effect.",
         input_schema={"type": "object", "properties": {}},
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:sqlite-write-failure:file-side-effect-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self, path: Path, store_path: Path) -> None:

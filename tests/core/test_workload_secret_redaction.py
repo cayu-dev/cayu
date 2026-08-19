@@ -38,6 +38,7 @@ from cayu.core import (
     AgentSpec,
     Event,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     Message,
     MessageRole,
     ToolCallPart,
@@ -3026,6 +3027,11 @@ def test_approval_denial_schema_keys_do_not_block_model_continuation(secret: str
             name="approval_tool",
             description="Must be denied in this test.",
             input_schema={"type": "object", "properties": {}},
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:workload-secrets:approval-tool",
+                behavior_version="1",
+                implementation_version="1",
+            ),
         )
 
         async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -3033,6 +3039,14 @@ def test_approval_denial_schema_keys_do_not_block_model_continuation(secret: str
             raise AssertionError("denied tool must not execute")
 
     class ApprovalPolicy(ToolPolicy):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:workload-secrets:approval-policy",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
             del request
             return ToolPolicyResult(

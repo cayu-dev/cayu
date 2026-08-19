@@ -36,6 +36,7 @@ from cayu.core import (
     AgentSpec,
     Event,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     Message,
     MessageRole,
     ToolCallPart,
@@ -720,6 +721,11 @@ class _WorkspaceObservationRecoveryTool(Tool):
         name="workspace_recovery_write",
         parallel_safe=False,
         workspace_mutation=True,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:workspace-recovery-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self) -> None:
@@ -737,6 +743,17 @@ class _WorkspaceObservationRecoveryTool(Tool):
                 b"written once",
             )
         return ToolResult(content="written")
+
+
+def _workspace_observation_recovery_environment_spec() -> EnvironmentSpec:
+    return EnvironmentSpec(
+        name="local",
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:workspace-recovery-environment",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
 
 
 class _ApprovalRecoveryProvider(ModelProvider):
@@ -810,6 +827,11 @@ class _ApprovalRecoveryTool(Tool):
             "required": ["value"],
         },
         effect=ToolEffect.EXTERNAL,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:approval-recovery-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self, calls: list[dict[str, Any]]) -> None:
@@ -879,6 +901,14 @@ class _ChangingApprovalPolicy(ToolPolicy):
     def __init__(self, calls: list[ToolPolicyDecision]) -> None:
         self._calls = calls
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:changing-approval-policy",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         del request
         decision = (
@@ -889,6 +919,17 @@ class _ChangingApprovalPolicy(ToolPolicy):
             decision=decision,
             reason=f"stateful policy returned {decision.value}",
         )
+
+
+def _approval_recovery_environment_spec() -> EnvironmentSpec:
+    return EnvironmentSpec(
+        name="approval-environment",
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:approval-recovery-environment",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
 
 
 class _SimulatedProcessLoss(BaseException):
@@ -2838,7 +2879,7 @@ def test_session_store_conformance_recovers_workspace_observation_through_public
             first_app.register_provider(first_provider, default=True)
             first_app.register_environment(
                 Environment(
-                    EnvironmentSpec(name="local"),
+                    _workspace_observation_recovery_environment_spec(),
                     workspace=LocalWorkspace(
                         workspace_root,
                         workspace_id="workspace-observation-runtime",
@@ -2926,7 +2967,7 @@ def test_session_store_conformance_recovers_workspace_observation_through_public
             recovery_app.register_provider(recovery_provider, default=True)
             recovery_app.register_environment(
                 Environment(
-                    EnvironmentSpec(name="local"),
+                    _workspace_observation_recovery_environment_spec(),
                     workspace=LocalWorkspace(
                         workspace_root,
                         workspace_id="workspace-observation-runtime",
@@ -2949,7 +2990,7 @@ def test_session_store_conformance_recovers_workspace_observation_through_public
             competing_app.register_provider(competing_provider, default=True)
             competing_app.register_environment(
                 Environment(
-                    EnvironmentSpec(name="local"),
+                    _workspace_observation_recovery_environment_spec(),
                     workspace=LocalWorkspace(
                         workspace_root,
                         workspace_id="workspace-observation-runtime",
@@ -3520,7 +3561,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
             first_app.register_provider(_ApprovalRecoveryProvider(), default=True)
             first_app.register_environment(
                 Environment(
-                    EnvironmentSpec(name="approval-environment"),
+                    _approval_recovery_environment_spec(),
                     binding=binding,
                 ),
                 default=True,
@@ -3600,7 +3641,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
             )
             retry_app.register_environment(
                 Environment(
-                    EnvironmentSpec(name="approval-environment"),
+                    _approval_recovery_environment_spec(),
                     binding=binding,
                 ),
                 default=True,
@@ -3608,7 +3649,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
             retry_app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[_ApprovalRecoveryTool(tool_calls)],
-                tool_policy=AllowAllToolPolicy(),
+                tool_policy=_ChangingApprovalPolicy([]),
             )
             opposite = (
                 ToolApprovalDecision.DENY
@@ -3988,7 +4029,7 @@ def test_session_store_conformance_approval_event_ack_loss_rejects_request_drift
             retry_app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[_ApprovalMetadataTool(calls)],
-                tool_policy=AllowAllToolPolicy(),
+                tool_policy=_ChangingApprovalPolicy([]),
             )
             recovered = await retry_app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(session_id=session_id)
@@ -4083,7 +4124,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
             first_app.register_provider(_ApprovalRecoveryProvider(), default=True)
             first_app.register_environment(
                 Environment(
-                    EnvironmentSpec(name="approval-environment"),
+                    _approval_recovery_environment_spec(),
                     binding=binding,
                 ),
                 default=True,
@@ -4188,7 +4229,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
             )
             retry_app.register_environment(
                 Environment(
-                    EnvironmentSpec(name="approval-environment"),
+                    _approval_recovery_environment_spec(),
                     binding=binding,
                 ),
                 default=True,
@@ -4196,7 +4237,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
             retry_app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[_ApprovalRecoveryTool(tool_calls)],
-                tool_policy=AllowAllToolPolicy(),
+                tool_policy=_ChangingApprovalPolicy([]),
             )
             matching_request = ToolApprovalRequest(
                 session_id=session_id,
@@ -4431,7 +4472,7 @@ def test_session_store_conformance_lossy_legacy_grant_cannot_authorize_pending_s
             retry_app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[_ApprovalMetadataTool(calls)],
-                tool_policy=AllowAllToolPolicy(),
+                tool_policy=_ChangingApprovalPolicy(policy_calls),
             )
             retry = [
                 event
@@ -4680,6 +4721,14 @@ def test_session_store_conformance_lost_policy_authority_never_becomes_executabl
         def __init__(self, calls: list[str]) -> None:
             self._calls = calls
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name=f"tests:lost-outcome-policy:{lost_outcome}",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
             del request
             self._calls.append(lost_outcome)
@@ -4752,7 +4801,7 @@ def test_session_store_conformance_lost_policy_authority_never_becomes_executabl
             recovery_app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[_ApprovalRecoveryTool(tool_calls)],
-                tool_policy=AllowAllToolPolicy(),
+                tool_policy=LostOutcomePolicy(policy_calls),
             )
 
             resume_events = [
@@ -4899,6 +4948,10 @@ def test_session_store_conformance_registration_drift_rejects_paused_call(
 
             assert raised.value.changed_component_classes == (
                 ExecutionProfileComponentClass.DIRECT_TOOLS,
+                ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+                ExecutionProfileComponentClass.EXECUTION_POLICIES,
+                ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+                ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
             )
             assert late_calls == []
             assert protected_calls == []

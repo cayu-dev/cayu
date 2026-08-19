@@ -23,6 +23,7 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.core.events import Event, EventType
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runtime._child_session_identity import (
@@ -305,6 +306,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         description: str | None = None,
         background_registry: BackgroundSubagentTaskRegistry | None = None,
         session_store: SessionStore | None = None,
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
     ) -> None:
         if background_registry is not None and not isinstance(
             background_registry, BackgroundSubagentTaskRegistry
@@ -338,6 +340,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                 parallel_safe=False,
                 effect=ToolEffect.EXTERNAL,
                 description=tool_description,
+                execution_profile_identity=execution_profile_identity,
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -890,6 +893,7 @@ class SubagentResultTool(Tool):
         default_timeout_s: float = DEFAULT_SUBAGENT_RESULT_WAIT_TIMEOUT_S,
         background_registry: BackgroundSubagentTaskRegistry | None = None,
         task_store: TaskStore | None = None,
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
     ) -> None:
         if not isinstance(session_store, SessionStore):
             raise TypeError("SubagentResultTool requires a SessionStore.")
@@ -924,6 +928,7 @@ class SubagentResultTool(Tool):
                     "child_session_id for one child, or all=true to wait for every "
                     "asynchronous subagent started by the current session."
                 ),
+                execution_profile_identity=execution_profile_identity,
                 input_schema={
                     "type": "object",
                     "properties": {

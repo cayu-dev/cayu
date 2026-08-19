@@ -8,6 +8,7 @@ from uuid import uuid4
 from cayu._validation import require_durable_clean_nonblank
 from cayu._workspace_mutation import WorkspaceMutationProcessFence
 from cayu.core.agents import AgentSpec
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import Tool, ToolEffect, ToolResult
 from cayu.environments import (
     BoundWorkspace,
@@ -41,8 +42,10 @@ class RegisteredAgentState:
     context_policy: ContextPolicy
     context_overflow_policy: ContextPolicy | None
     tool_policy: ToolPolicy
+    tool_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     runtime_hooks: tuple[RegisteredRuntimeHook, ...]
     loop_policies: tuple[LoopPolicy, ...]
+    loop_policy_execution_profile_identities: tuple[ExecutionProfileBehaviorIdentity | None, ...]
     execution_requirements: ExecutionRequirements
     registration_source: str | None = None
     registration_symbol: str | None = None
@@ -57,6 +60,8 @@ class RegisteredTool:
     effect: ToolEffect
     publish_arguments: bool
     workspace_mutation: bool
+    execution_profile_identity: ExecutionProfileBehaviorIdentity | None
+    command_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool: Tool
     child_session_recovery: ChildSessionRecoveryMatcher | None = None
 
@@ -66,6 +71,7 @@ class RegisteredRuntimeHook:
     """A runtime hook paired with its validated, registration-time identity."""
 
     name: str
+    execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     hook: RuntimeHook
 
     def __post_init__(self) -> None:
@@ -92,6 +98,8 @@ class RegisteredProvider:
 class RegisteredEnvironment:
     spec: EnvironmentSpec
     environment: Environment
+    runner_execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
+    factory_execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
     factory: EnvironmentFactory | None = None
     # Capability provenance survives factory materialization without retaining
     # the live factory as part of the session-owned environment lifecycle.

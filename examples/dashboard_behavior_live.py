@@ -59,8 +59,15 @@ from cayu.providers import (
     bedrock_billing_identity,
     completed_bedrock_billing_identity,
 )
-from cayu.runtime import EventQuery, InMemorySessionStore, SessionIdentity, SessionStatus
-from cayu.runtime.execution_profiles import build_execution_profile_identity
+from cayu.runtime import (
+    EventQuery,
+    InMemorySessionStore,
+    SessionIdentity,
+    SessionStatus,
+)
+from cayu.runtime import (
+    _execution_profile_admission as execution_profile_admission,
+)
 from cayu.server import (
     BasicAuth,
     DashboardConfig,
@@ -322,30 +329,25 @@ def _profiled_session_identity(
     """Build the exact profile used by low-level resumable dashboard fixtures."""
 
     runtime_version = version("cayu")
-    registered_agent = app.get_agent(AGENT_NAME)
-    direct_tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "schema": tool.schema,
-            "parallel_safe": tool.parallel_safe,
-            "effect": tool.effect.value,
-            **({"workspace_mutation": True} if tool.workspace_mutation else {}),
-        }
-        for tool in registered_agent.tools.values()
-    ]
+    registered_agent = app._agents[AGENT_NAME]
+    engine = app._session_engine
     return SessionIdentity(
         provider_name=provider_name,
         model=model,
         runtime_name="cayu",
         runtime_version=runtime_version,
-        execution_profile=build_execution_profile_identity(
+        execution_profile=execution_profile_admission.resolve_execution_profile_identity(
+            registered_agent=registered_agent,
             runtime_name="cayu",
             runtime_version=runtime_version,
             provider_name=provider_name,
             model=model,
             durable_system_prompt=registered_agent.spec.system_prompt,
-            direct_tools=direct_tools,
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+            runtime_hooks=engine._runtime_hooks,
+            loop_policies=engine._loop_policies,
+            loop_policy_identities=engine._loop_policy_execution_profile_identities,
         ),
     )
 

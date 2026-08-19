@@ -22,6 +22,7 @@ from cayu.core import (
     AgentSpec,
     Event,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     Message,
     ProviderStatePart,
     TextPart,
@@ -148,6 +149,11 @@ class ProfileTool(Tool):
             description="Profile-bound dispatch test tool.",
             input_schema={"type": "object", "properties": {}},
             effect="none",
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name=f"tests:dispatch:profile-tool:{name}",
+                behavior_version="1",
+                implementation_version="1",
+            ),
         )
         super().__init__()
         self.calls = 0

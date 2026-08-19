@@ -10,7 +10,15 @@ from copy import deepcopy
 import psycopg
 import pytest
 
-from cayu.core import AgentSpec, Event, EventType, Message, ToolContext, ToolResult
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    ToolContext,
+    ToolResult,
+)
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -67,6 +75,22 @@ from cayu.tools import (
     SubagentTool,
 )
 from cayu.vaults import SecretRedactor, SecretRef, StaticVault
+
+_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
+    name="tests:durable-subagent-tool",
+    behavior_version="1",
+    implementation_version="1",
+)
+_MODIFY_DURABLE_SUBAGENT_TASK_HOOK_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
+    name="tests:modify-durable-subagent-task-hook",
+    behavior_version="1",
+    implementation_version="1",
+)
+_MODIFY_DURABLE_SUBAGENT_TASK_AND_RESULT_HOOK_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
+    name="tests:modify-durable-subagent-task-and-result-hook",
+    behavior_version="1",
+    implementation_version="1",
+)
 
 
 async def _collect(stream: AsyncIterator[Event]) -> list[Event]:
@@ -658,6 +682,10 @@ class _CopyingDurableSubagentContextTool(SubagentTool):
 
 
 class _ModifyDurableSubagentTaskHook(RuntimeHook):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _MODIFY_DURABLE_SUBAGENT_TASK_HOOK_PROFILE_IDENTITY
+
     async def before_tool_call(
         self,
         context: BeforeToolCallHookContext,
@@ -673,6 +701,10 @@ class _ModifyDurableSubagentTaskHook(RuntimeHook):
 
 
 class _ModifyDurableSubagentTaskAndResultHook(_ModifyDurableSubagentTaskHook):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _MODIFY_DURABLE_SUBAGENT_TASK_AND_RESULT_HOOK_PROFILE_IDENTITY
+
     async def after_tool_call(self, context):
         if context.tool_name != "subagent":
             return None
@@ -781,6 +813,7 @@ def _register_durable_subagent_agents(app: CayuApp) -> None:
         tools=[
             SubagentTool(
                 app,
+                execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                 agents={
                     "reviewer": SubagentSpec(
                         agent_name="reviewer",
@@ -995,6 +1028,7 @@ def test_missing_child_provider_is_durably_rejected_without_stranding_parent() -
             tools=[
                 SubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -1060,6 +1094,7 @@ def test_restart_replays_durable_preparation_rejection_without_retrying_child() 
             tools=[
                 SubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -1145,6 +1180,7 @@ def test_restart_can_publish_preparation_rejection_from_seed_only() -> None:
             tools=[
                 SubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -1365,6 +1401,7 @@ def test_terminal_publication_compacts_modified_arguments_after_result_replaceme
             tools=[
                 SubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -2315,6 +2352,7 @@ def test_parent_recovery_uses_durable_effective_arguments_after_hook_modificatio
             tools=[
                 SubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -2435,6 +2473,7 @@ def test_modified_handoff_receipt_retains_arguments_until_recovery_publication()
             tools=[
                 SubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -2560,6 +2599,7 @@ def test_durable_submission_rejects_post_hook_secret_before_checkpoint_or_queue(
             tools=[
                 SubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -2631,6 +2671,7 @@ def test_durable_submission_rejects_invocation_scoped_secret_before_persistence(
             tools=[
                 _ResolveSecretThenSubmitDurableSubagentTool(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",
@@ -2709,6 +2750,7 @@ def test_durable_submission_seals_before_active_secret_resolution_can_race_seed(
         )
         tool = _ResolveSecretDuringDurableSubagentTool(
             app,
+            execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
             agents={
                 "reviewer": SubagentSpec(
                     agent_name="reviewer",
@@ -4548,6 +4590,7 @@ def test_durable_submission_rejects_retargeted_genuine_authority(tool_type) -> N
             tools=[
                 tool_type(
                     app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
                     agents={
                         "reviewer": SubagentSpec(
                             agent_name="reviewer",

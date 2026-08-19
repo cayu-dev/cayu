@@ -25,6 +25,12 @@ from cayu import (
     EventOrder,
     EventQuery,
     EventType,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     InMemorySessionStore,
     InMemoryTaskStore,
     InvocationOrigin,
@@ -346,6 +352,29 @@ class BlockingFinalizationStore(MemoryProductStore):
         )
 
 
+class _AuthorizeProductContinuationProfile(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "tests:authorize-product-continuation-profile:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        if request.changed_component_classes == (
+            ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ):
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="The authenticated product continuation may install its receipt policy.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.REJECT,
+            reason="The product continuation policy does not authorize other profile changes.",
+        )
+
+
 def _build_service(
     provider=None,
     *,
@@ -359,6 +388,7 @@ def _build_service(
     secret_redactor=None,
     product_api_path="/api",
     control_plane_path="/cayu",
+    execution_profile_policy=None,
 ):
     provider = provider or ScriptedModelProvider(
         [
@@ -372,6 +402,7 @@ def _build_service(
         session_store=session_store if session_store is not None else InMemorySessionStore(),
         task_store=task_store if task_store is not None else InMemoryTaskStore(),
         secret_redactor=secret_redactor,
+        execution_profile_policy=execution_profile_policy,
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
@@ -1333,7 +1364,10 @@ def test_product_continuation_adoption_retry_survives_product_state_changes() ->
             ],
         ]
     )
-    service, store, _provider = _build_service(provider=provider)
+    service, store, _provider = _build_service(
+        provider=provider,
+        execution_profile_policy=_AuthorizeProductContinuationProfile(),
+    )
 
     async def prepare() -> ProductOperation:
         operation = (
@@ -1478,6 +1512,13 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
             identity=profiled_session_identity(
                 provider_name=provider.name,
                 model="scripted-model",
+                invocation_loop_policies=(
+                    _ProductResultReceiptPolicy(
+                        service=service,
+                        operation=reservation.operation,
+                        claim_id="claim_abandoned_session_fixture",
+                    ),
+                ),
             ),
         )
         interaction_id = "interaction_abandoned_session"

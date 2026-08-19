@@ -21,6 +21,7 @@ from cayu import (
     CayuApp,
     Event,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     InMemorySessionStore,
     Message,
     RunRequest,
@@ -134,6 +135,11 @@ class DeployServiceTool(Tool):
             "additionalProperties": False,
         },
         effect=ToolEffect.IDEMPOTENT,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="examples:counterfactual-approval:deploy-service",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self, state: DeploymentState) -> None:

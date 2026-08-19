@@ -6,7 +6,7 @@ from typing import Literal
 
 import pytest
 
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
 from cayu.core.messages import ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -50,6 +50,11 @@ class _SideEffectTool(Tool):
             "properties": {"value": {"type": "string"}},
             "required": ["value"],
         },
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:tool-round-publication:side-effect-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self) -> None:

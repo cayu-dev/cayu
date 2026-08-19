@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from pydantic import SecretStr
 
+from cayu import ExecutionProfileBehaviorIdentity
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -506,6 +507,11 @@ class _MarkerTool(Tool):
                 input_schema={"type": "object", "additionalProperties": False},
                 parallel_safe=False,
                 effect=ToolEffect.EXTERNAL,
+                execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                    name="tests:recovery-marker-tool",
+                    behavior_version="1",
+                    implementation_version="1",
+                ),
             )
         )
         self.marker_path = marker_path
@@ -698,6 +704,11 @@ def _subagent_app(config: dict[str, Any], *, initial: bool) -> CayuApp:
                         mode=SubagentExecutionMode.BACKGROUND,
                     )
                 },
+                execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                    name="tests:recovery-subagent-tool",
+                    behavior_version="1",
+                    implementation_version="1",
+                ),
             )
         ],
     )

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import Message, MessageRole, copy_message
 
 if TYPE_CHECKING:
@@ -151,6 +152,12 @@ class BeforeStopContext:
 
 
 class LoopPolicy:
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return a stable application declaration, or ``None`` when non-portable."""
+
+        return None
+
     @property
     def name(self) -> str:
         return type(self).__name__

@@ -15,6 +15,10 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.artifacts import ArtifactStore
+from cayu.core.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
 from cayu.environments.bindings import WorkspaceBinding
 from cayu.mcp.base import McpServerSpec, copy_mcp_server_spec
 from cayu.proxies import CredentialProxy
@@ -47,6 +51,7 @@ class EnvironmentSpec(BaseModel):
 
     name: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+    execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -292,6 +297,9 @@ def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
     return type(spec)(
         name=spec.name,
         metadata=copy_json_value(spec.metadata, "metadata"),
+        execution_profile_identity=copy_execution_profile_behavior_identity(
+            spec.execution_profile_identity
+        ),
     )
 
 

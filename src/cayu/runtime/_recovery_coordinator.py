@@ -1074,6 +1074,8 @@ class ExecutionProfileContinuationValidator(Protocol):
         checkpoint: dict[str, Any] | None,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
+        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
         *,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
@@ -1345,6 +1347,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             recovered_provider,
+            None,
         )
         cancellation = await self._cancel_provider_operation(
             session,
@@ -1668,6 +1671,7 @@ class RecoveryCoordinator:
                     checkpoint,
                     registered_agent,
                     recovered_provider,
+                    None,
                 )
                 if isinstance(operation, RecoverableProviderOperationStart):
                     recovered = await self._recover_provider_operation_start(
@@ -2923,6 +2927,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             registered_provider,
+            response.loop_policies,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -3025,6 +3030,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             registered_provider,
+            request.loop_policies,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -3194,6 +3200,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             registered_provider,
+            request.loop_policies,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -3977,6 +3984,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             registered_provider,
+            request.loop_policies,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -4149,6 +4157,7 @@ class RecoveryCoordinator:
             checkpoint,
             registered_agent,
             registered_provider,
+            request.loop_policies,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -4201,6 +4210,8 @@ class RecoveryCoordinator:
                 checkpoint,
                 registered_agent,
                 registered_provider,
+                request.loop_policies,
+                execution_profile_snapshot.profile,
             )
         if self._session_control.has_active_tasks(loaded_session.id):
             raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")

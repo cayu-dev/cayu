@@ -15,6 +15,7 @@ from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_tree_contains, set_exception_cause
 from cayu._task_wait import capture_awaitable_outcome, unexpected_child_cancellation_error
@@ -44,6 +45,7 @@ from cayu.core.events import (
     event_with_durable_sequence,
     validate_public_custom_event_type,
 )
+from cayu.core.execution_identity import copy_execution_profile_behavior_identity
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -98,6 +100,9 @@ from cayu.runtime._event_projection import (
     public_event_linkage_sequence,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._execution_profile_identity_validation import (
+    copy_secret_free_execution_profile_behavior_identity,
+)
 from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
 )
@@ -759,17 +764,33 @@ class CayuApp:
             raise TypeError("execution_profile_policy must be an ExecutionProfilePolicy.")
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
-        hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
+        resolved_secret_redactor = (
+            secret_redactor if secret_redactor is not None else SecretRedactor()
+        )
+        hooks = _validate_runtime_hooks(
+            runtime_hooks,
+            field_name="runtime_hooks",
+            redactor=resolved_secret_redactor,
+        )
         policies = validate_loop_policies(loop_policies, field_name="loop_policies")
+        policy_execution_profile_identities = tuple(
+            copy_secret_free_execution_profile_behavior_identity(
+                policy.execution_profile_identity,
+                redactor=resolved_secret_redactor,
+                field_name=f"loop_policies[{index}].execution_profile_identity",
+            )
+            for index, policy in enumerate(policies)
+        )
+        # Opaque registrations are comparable only within this frozen app
+        # registration. A new app may carry different behavior behind the same
+        # component type and slot, even when it lives in the same OS process.
+        self._execution_profile_process_identity = uuid4().hex
         # Wall-clock seam for time-based approval expiry (tests inject a fake).
         self._clock = _clock_or_utc_now(clock)
         manifest_policy = copy_mcp_manifest_policy(mcp_manifest_policy)
         result_projection_policy = copy_tool_result_projection_policy(tool_result_projection_policy)
         context_counting_config = copy_context_counting_config(context_counting)
         request_footprint_config = copy_request_footprint_config(request_footprint)
-        resolved_secret_redactor = (
-            secret_redactor if secret_redactor is not None else SecretRedactor()
-        )
         execution_profile_policy_identity = None
         if execution_profile_policy is not None:
             execution_profile_policy_identity = require_durable_clean_nonblank(
@@ -890,6 +911,7 @@ class CayuApp:
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
+        self._loop_policy_execution_profile_identities = policy_execution_profile_identities
         self._mcp_manifest_policy = manifest_policy
         self._tool_result_projection_policy = result_projection_policy
         self._context_counting = context_counting_config
@@ -1033,6 +1055,9 @@ class CayuApp:
             clock=self._clock,
             runtime_hooks=self._runtime_hooks,
             loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=(
+                self._loop_policy_execution_profile_identities
+            ),
             hook_runtime=self,
             get_registered_agent=self._get_registered_agent,
             get_registered_provider=self._get_registered_provider,
@@ -1044,6 +1069,7 @@ class CayuApp:
             effective_retry_policy=self._effective_retry_policy,
             execution_profile_policy=execution_profile_policy,
             execution_profile_policy_identity=execution_profile_policy_identity,
+            execution_profile_process_identity=self._execution_profile_process_identity,
         )
         self._durable_subagent_coordinator = DurableSubagentCoordinator(
             session_store=self.session_store,
@@ -1556,6 +1582,7 @@ class CayuApp:
         stored_runtime_hooks = _validate_runtime_hooks(
             runtime_hooks,
             field_name="runtime_hooks",
+            redactor=self._secret_redactor,
         )
         stored_loop_policies = validate_loop_policies(
             loop_policies,
@@ -1584,7 +1611,10 @@ class CayuApp:
         for tool in agent_tools:
             if not isinstance(tool, Tool):
                 raise TypeError("Agent tools must be Tool instances.")
-            registered_tool = _validate_registered_tool(tool)
+            registered_tool = _validate_registered_tool(
+                tool,
+                redactor=self._secret_redactor,
+            )
             if registered_tool.name in tools_by_name:
                 raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
             tools_by_name[registered_tool.name] = registered_tool
@@ -1596,8 +1626,23 @@ class CayuApp:
             context_policy=stored_context_policy,
             context_overflow_policy=stored_context_overflow_policy,
             tool_policy=stored_tool_policy,
+            tool_policy_execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    stored_tool_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="tool_policy.execution_profile_identity",
+                )
+            ),
             runtime_hooks=stored_runtime_hooks,
             loop_policies=stored_loop_policies,
+            loop_policy_execution_profile_identities=tuple(
+                copy_secret_free_execution_profile_behavior_identity(
+                    policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name=f"loop_policies[{index}].execution_profile_identity",
+                )
+                for index, policy in enumerate(stored_loop_policies)
+            ),
             execution_requirements=stored_execution_requirements,
             registration_source=registration_source,
             registration_symbol=registration_symbol,
@@ -1645,7 +1690,10 @@ class CayuApp:
         if not isinstance(default, bool):
             raise TypeError("Environment default flag must be a bool.")
         stored_environment = copy_environment(environment)
-        stored_spec = _validate_environment_spec(stored_environment.spec)
+        stored_spec = _validate_environment_spec(
+            stored_environment.spec,
+            redactor=self._secret_redactor,
+        )
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
         artifact_store = stored_environment.artifact_store
@@ -1655,6 +1703,13 @@ class CayuApp:
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
             environment=stored_environment,
+            runner_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+                None
+                if stored_environment.runner is None
+                else stored_environment.runner.execution_profile_identity,
+                redactor=self._secret_redactor,
+                field_name="environment.runner.execution_profile_identity",
+            ),
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
@@ -1679,7 +1734,10 @@ class CayuApp:
             raise TypeError("Environment factory registration requires an EnvironmentFactory.")
         if not isinstance(default, bool):
             raise TypeError("Environment factory default flag must be a bool.")
-        stored_spec = _validate_environment_spec(spec)
+        stored_spec = _validate_environment_spec(
+            spec,
+            redactor=self._secret_redactor,
+        )
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
         stored_environment = Environment(stored_spec, artifact_store=artifact_store)
@@ -1691,6 +1749,11 @@ class CayuApp:
             environment=stored_environment,
             factory=factory,
             factory_backed=True,
+            factory_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+                factory.execution_profile_identity,
+                redactor=self._secret_redactor,
+                field_name="environment_factory.execution_profile_identity",
+            ),
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
@@ -1824,6 +1887,16 @@ class CayuApp:
                 runtime_records.RegisteredEnvironment(
                     spec=registered_environment.spec.model_copy(deep=True),
                     environment=copy_environment(registered_environment.environment),
+                    runner_execution_profile_identity=(
+                        copy_execution_profile_behavior_identity(
+                            registered_environment.runner_execution_profile_identity
+                        )
+                    ),
+                    factory_execution_profile_identity=(
+                        copy_execution_profile_behavior_identity(
+                            registered_environment.factory_execution_profile_identity
+                        )
+                    ),
                     factory=registered_environment.factory,
                     factory_backed=registered_environment.factory_backed,
                     bound_workspace=(
@@ -1866,6 +1939,12 @@ class CayuApp:
         return runtime_records.RegisteredEnvironment(
             spec=registered_environment.spec.model_copy(deep=True),
             environment=copy_environment(registered_environment.environment),
+            runner_execution_profile_identity=copy_execution_profile_behavior_identity(
+                registered_environment.runner_execution_profile_identity
+            ),
+            factory_execution_profile_identity=copy_execution_profile_behavior_identity(
+                registered_environment.factory_execution_profile_identity
+            ),
             binding_generation_id=registered_environment.binding_generation_id,
         )
 
@@ -3653,6 +3732,8 @@ class CayuApp:
         checkpoint: dict[str, Any] | None,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
+        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
         *,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
@@ -3662,6 +3743,8 @@ class CayuApp:
             checkpoint=checkpoint,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
+            request_loop_policies=request_loop_policies,
+            frozen_candidate_profile=frozen_candidate_profile,
             require_open_interaction=require_open_interaction,
             additional_profile_fingerprints=additional_profile_fingerprints,
         )
@@ -4444,6 +4527,12 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         effect=tool.effect,
         publish_arguments=tool.publish_arguments,
         workspace_mutation=tool.workspace_mutation,
+        execution_profile_identity=copy_execution_profile_behavior_identity(
+            tool.execution_profile_identity
+        ),
+        command_policy_execution_profile_identity=copy_execution_profile_behavior_identity(
+            tool.command_policy_execution_profile_identity
+        ),
         tool=tool.tool,
         child_session_recovery=tool.child_session_recovery,
     )
@@ -4499,7 +4588,11 @@ def _validate_provider_model_patterns(value: Iterable[str] | None) -> tuple[str,
     )
 
 
-def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
+def _validate_registered_tool(
+    tool: Tool,
+    *,
+    redactor: SecretRedactor,
+) -> runtime_records.RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
         raise TypeError("Agent tools must define ToolSpec instances.")
@@ -4524,6 +4617,7 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         effect=spec.effect,
         workspace_mutation=spec.workspace_mutation,
     )
+    command_policy = getattr(tool, "command_policy", None)
     return runtime_records.RegisteredTool(
         name=validated_spec.name,
         description=validated_spec.description,
@@ -4532,6 +4626,20 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         effect=validated_spec.effect,
         publish_arguments=publish_arguments,
         workspace_mutation=validated_spec.workspace_mutation,
+        execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+            tool.execution_profile_identity,
+            redactor=redactor,
+            field_name=f"tools[{name!r}].execution_profile_identity",
+        ),
+        command_policy_execution_profile_identity=(
+            copy_secret_free_execution_profile_behavior_identity(
+                None
+                if command_policy is None
+                else getattr(command_policy, "execution_profile_identity", None),
+                redactor=redactor,
+                field_name=f"tools[{name!r}].command_policy.execution_profile_identity",
+            )
+        ),
         tool=tool,
         child_session_recovery=(
             tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None
@@ -4555,7 +4663,11 @@ def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
     )
 
 
-def _validate_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
+def _validate_environment_spec(
+    spec: EnvironmentSpec,
+    *,
+    redactor: SecretRedactor,
+) -> EnvironmentSpec:
     if type(spec) is not EnvironmentSpec:
         raise TypeError("Environment registration requires an EnvironmentSpec.")
     if type(spec.name) is not str:
@@ -4563,6 +4675,11 @@ def _validate_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
     return EnvironmentSpec(
         name=spec.name,
         metadata=copy_json_value(spec.metadata, "metadata"),
+        execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+            spec.execution_profile_identity,
+            redactor=redactor,
+            field_name="environment_spec.execution_profile_identity",
+        ),
     )
 
 
@@ -4615,6 +4732,7 @@ def _validate_runtime_hooks(
     hooks: Iterable[RuntimeHook] | None,
     *,
     field_name: str,
+    redactor: SecretRedactor,
 ) -> tuple[runtime_records.RegisteredRuntimeHook, ...]:
     if hooks is None:
         return ()
@@ -4625,12 +4743,17 @@ def _validate_runtime_hooks(
     except TypeError as exc:
         raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.") from exc
     registered_hooks: list[runtime_records.RegisteredRuntimeHook] = []
-    for hook in hook_list:
+    for index, hook in enumerate(hook_list):
         if not isinstance(hook, RuntimeHook):
             raise TypeError(f"{field_name} must contain RuntimeHook instances.")
         registered_hooks.append(
             runtime_records.RegisteredRuntimeHook(
                 name=hook.name,
+                execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+                    hook.execution_profile_identity,
+                    redactor=redactor,
+                    field_name=(f"{field_name}[{index}].execution_profile_identity"),
+                ),
                 hook=hook,
             )
         )

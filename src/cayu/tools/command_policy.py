@@ -81,6 +81,25 @@ class ProcessCommandPolicy(CommandPolicy):
             raise TypeError("shell_decision must be a CommandPolicyDecision.")
         self._shell_decision = shell_decision
 
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        """Return public policy inputs without exposing exact environment values."""
+
+        # Exact values commonly contain credentials. Hashing them into a public
+        # component fingerprint would create a durable offline guessing oracle.
+        if self._allowed_env_values:
+            return None
+        return {
+            "allowed_executables": sorted(self._allowed_executables),
+            "approval_required_executables": sorted(self._approval_required_executables),
+            "allowed_cwds": sorted(self._allowed_cwds),
+            "allowed_env_names": sorted(self._allowed_env_names),
+            "max_env_value_bytes": self._max_env_value_bytes,
+            "allow_stdin": self._allow_stdin,
+            "max_stdin_bytes": self._max_stdin_bytes,
+            "max_timeout_s": self._max_timeout_s,
+            "shell_decision": self._shell_decision.value,
+        }
+
     async def evaluate(
         self,
         ctx: ToolContext,

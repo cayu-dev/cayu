@@ -33,7 +33,9 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
 
-EXECUTION_PROFILE_SCHEMA_VERSION = 1
+EXECUTION_PROFILE_SCHEMA_VERSION = 2
+_EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
+_ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
 _EXECUTION_PROFILE_RECORD_TYPE = "cayu.execution-profile"
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_RECORD_TYPE = "cayu.active-invocation-execution-profile"
@@ -48,6 +50,13 @@ class ExecutionProfileComponentClass(StrEnum):
     PROVIDER_TARGET = "provider_target"
     DURABLE_SYSTEM_PROJECTION = "durable_system_projection"
     DIRECT_TOOLS = "direct_tools"
+    TOOL_IMPLEMENTATIONS = "tool_implementations"
+    TOOL_VIEW_GRANTS = "tool_view_grants"
+    EXECUTION_POLICIES = "execution_policies"
+    INVOCATION_POLICIES = "invocation_policies"
+    RUNTIME_HOOKS = "runtime_hooks"
+    EXECUTION_ENVIRONMENT = "execution_environment"
+    EFFECT_AUTHORITY = "effect_authority"
 
 
 class ExecutionProfileIdentityStrength(StrEnum):
@@ -55,7 +64,30 @@ class ExecutionProfileIdentityStrength(StrEnum):
 
     APPLICATION_VERSIONED = "application_versioned"
     STRUCTURAL = "structural"
+    PROCESS_LOCAL = "process_local"
     UNAVAILABLE = "unavailable"
+
+
+_AUTHORITY_COMPONENT_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ExecutionProfileComponentClass.RUNTIME_HOOKS,
+        ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+    }
+)
+
+
+def execution_profile_changes_authority(
+    component_classes: Iterable[ExecutionProfileComponentClass],
+) -> bool:
+    """Return whether a difference can change governed execution authority."""
+
+    return any(component in _AUTHORITY_COMPONENT_CLASSES for component in component_classes)
 
 
 class ExecutionProfileIdentityAvailability(StrEnum):
@@ -192,11 +224,10 @@ class ExecutionProfilePolicyRequest(BaseModel):
         )
         if self.changed_component_classes != expected:
             raise ValueError("changed_component_classes do not match the supplied profiles.")
-        if (
-            ExecutionProfileComponentClass.DIRECT_TOOLS in expected
-            and not self.authority_review_required
-        ):
-            raise ValueError("Direct-tool changes require execution-profile authority review.")
+        if execution_profile_changes_authority(expected) and not self.authority_review_required:
+            raise ValueError(
+                "Authority-changing components require execution-profile authority review."
+            )
         return self
 
 
@@ -327,22 +358,19 @@ class ExecutionProfileDecision(BaseModel):
         ):
             raise ValueError("A denied authority decision cannot admit an execution profile.")
         if self.kind is ExecutionProfileDecisionKind.COMPATIBLE_REUSE and any(
-            component
-            in {
-                ExecutionProfileComponentClass.DIRECT_TOOLS,
-                ExecutionProfileComponentClass.PROVIDER_TARGET,
-            }
+            component in _AUTHORITY_COMPONENT_CLASSES
+            or component is ExecutionProfileComponentClass.PROVIDER_TARGET
             for component in changed
         ):
             raise ValueError(
-                "Compatible reuse cannot change direct-tool or persistent provider authority."
+                "Compatible reuse cannot change execution or persistent provider authority."
             )
         if (
             self.kind is ExecutionProfileDecisionKind.ADOPTED
-            and ExecutionProfileComponentClass.DIRECT_TOOLS in changed
+            and any(component in _AUTHORITY_COMPONENT_CLASSES for component in changed)
             and self.authority_decision is not ExecutionProfileAuthorityDecision.AUTHORIZED
         ):
-            raise ValueError("Direct-tool adoption requires explicit authority.")
+            raise ValueError("Execution-authority adoption requires explicit authority.")
         if self.kind is ExecutionProfileDecisionKind.ADOPTED:
             if self.actor is None:
                 raise ValueError("Adopted execution profiles require an attributable actor.")
@@ -408,7 +436,7 @@ class ExecutionProfileIdentity(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1] = EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1, 2] = EXECUTION_PROFILE_SCHEMA_VERSION
     fingerprint: str
     components: tuple[ExecutionProfileComponentIdentity, ...]
 
@@ -422,13 +450,30 @@ class ExecutionProfileIdentity(BaseModel):
     @model_validator(mode="after")
     def validate_components(self) -> ExecutionProfileIdentity:
         classes = tuple(component.component_class for component in self.components)
-        required_classes = tuple(sorted(ExecutionProfileComponentClass, key=str))
+        required_classes = tuple(
+            sorted(
+                (
+                    {
+                        ExecutionProfileComponentClass.RUNTIME,
+                        ExecutionProfileComponentClass.PROVIDER_TARGET,
+                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+                        ExecutionProfileComponentClass.DIRECT_TOOLS,
+                    }
+                    if self.schema_version == 1
+                    else set(ExecutionProfileComponentClass)
+                ),
+                key=str,
+            )
+        )
         if classes != required_classes:
             raise ValueError(
                 "Execution-profile components must contain every required class exactly once "
                 "in sorted order."
             )
-        expected = _profile_fingerprint(self.components)
+        expected = _profile_fingerprint(
+            self.components,
+            schema_version=self.schema_version,
+        )
         if self.fingerprint != expected:
             raise ValueError("Execution-profile fingerprint does not match its components.")
         return self
@@ -451,7 +496,7 @@ class ActiveInvocationExecutionProfile(BaseModel):
     record_type: Literal["cayu.active-invocation-execution-profile"] = (
         _ACTIVE_INVOCATION_EXECUTION_PROFILE_RECORD_TYPE
     )
-    schema_version: Literal[1] = EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1] = _ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION
     session_id: str
     interaction_id: str
     run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
@@ -609,6 +654,18 @@ def execution_profile_decision_payload(
     return payload
 
 
+def _aggregate_identity_strength(
+    *,
+    process_local: bool,
+    application_versioned: bool,
+) -> ExecutionProfileIdentityStrength:
+    if process_local:
+        return ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    if application_versioned:
+        return ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+    return ExecutionProfileIdentityStrength.STRUCTURAL
+
+
 def build_execution_profile_identity(
     *,
     runtime_name: str,
@@ -617,14 +674,136 @@ def build_execution_profile_identity(
     model: str,
     durable_system_prompt: str | None,
     direct_tools: Iterable[Mapping[str, Any]],
+    tool_implementations: Iterable[Mapping[str, Any]] | None = None,
+    tool_implementations_process_local: bool = False,
+    tool_implementations_application_versioned: bool = False,
+    tool_view_grants: Mapping[str, Any] | None = None,
+    execution_policies: Mapping[str, Any] | None = None,
+    execution_policies_process_local: bool = False,
+    execution_policies_application_versioned: bool = False,
+    invocation_policies: Iterable[Mapping[str, Any]] = (),
+    invocation_policies_process_local: bool = False,
+    invocation_policies_application_versioned: bool = False,
+    runtime_hooks: Iterable[Mapping[str, Any]] = (),
+    runtime_hooks_process_local: bool = False,
+    runtime_hooks_application_versioned: bool = False,
+    execution_environment: Mapping[str, Any] | None = None,
+    execution_environment_process_local: bool = False,
+    execution_environment_application_versioned: bool = False,
+    effect_authority: Mapping[str, Any] | None = None,
 ) -> ExecutionProfileIdentity:
     """Build a profile without retaining raw prompts, schemas, or tool names."""
 
+    direct_tool_material = list(direct_tools)
+    implementation_material = (
+        [{"tool": item.get("name")} for item in direct_tool_material]
+        if tool_implementations is None
+        else list(tool_implementations)
+    )
     components = (
         _available_component(
             ExecutionProfileComponentClass.DIRECT_TOOLS,
             ExecutionProfileIdentityStrength.STRUCTURAL,
-            list(direct_tools),
+            direct_tool_material,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+            _aggregate_identity_strength(
+                process_local=tool_implementations_process_local,
+                application_versioned=tool_implementations_application_versioned,
+            ),
+            implementation_material,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            (
+                {
+                    "view_kind": "direct",
+                    "generation": 1,
+                    "grant_baseline": [item.get("name") for item in direct_tool_material],
+                }
+                if tool_view_grants is None
+                else tool_view_grants
+            ),
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.EXECUTION_POLICIES,
+            _aggregate_identity_strength(
+                process_local=execution_policies_process_local,
+                application_versioned=execution_policies_application_versioned,
+            ),
+            (
+                {
+                    "tool_policy": "cayu:allow-all-tool-policy:v1",
+                    "command_policies": [],
+                    "loop_policies": [],
+                }
+                if execution_policies is None
+                else execution_policies
+            ),
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.INVOCATION_POLICIES,
+            _aggregate_identity_strength(
+                process_local=invocation_policies_process_local,
+                application_versioned=invocation_policies_application_versioned,
+            ),
+            list(invocation_policies),
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.RUNTIME_HOOKS,
+            _aggregate_identity_strength(
+                process_local=runtime_hooks_process_local,
+                application_versioned=runtime_hooks_application_versioned,
+            ),
+            list(runtime_hooks),
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+            _aggregate_identity_strength(
+                process_local=execution_environment_process_local,
+                application_versioned=execution_environment_application_versioned,
+            ),
+            (
+                {
+                    "environment": None,
+                    "execution_requirements": {
+                        "code_trust": "trusted",
+                        "real_secret_visibility": "allowed",
+                        "network_access": "unrestricted",
+                        "guest_privilege": "unrestricted",
+                        "host_filesystem": "unrestricted",
+                        "cancellation": "best_effort",
+                        "cleanup": "best_effort",
+                        "durability": "ephemeral",
+                        "minimum_evidence": "declared",
+                        "evidence_overrides": [],
+                    },
+                }
+                if execution_environment is None
+                else execution_environment
+            ),
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            (
+                {
+                    "tool_effects": [
+                        {
+                            "name": item.get("name"),
+                            "effect": item.get("effect"),
+                            "workspace_mutation": bool(item.get("workspace_mutation", False)),
+                        }
+                        for item in direct_tool_material
+                    ],
+                    "credential_authority": "none",
+                    "egress_authority": "unrestricted",
+                }
+                if effect_authority is None
+                else effect_authority
+            ),
         ),
         _available_component(
             ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
@@ -639,7 +818,7 @@ def build_execution_profile_identity(
         (
             _available_component(
                 ExecutionProfileComponentClass.RUNTIME,
-                ExecutionProfileIdentityStrength.APPLICATION_VERSIONED,
+                ExecutionProfileIdentityStrength.STRUCTURAL,
                 {"runtime_name": runtime_name, "runtime_version": runtime_version},
             )
             if runtime_version is not None
@@ -648,7 +827,10 @@ def build_execution_profile_identity(
     )
     sorted_components = tuple(sorted(components, key=lambda component: component.component_class))
     return ExecutionProfileIdentity(
-        fingerprint=_profile_fingerprint(sorted_components),
+        fingerprint=_profile_fingerprint(
+            sorted_components,
+            schema_version=EXECUTION_PROFILE_SCHEMA_VERSION,
+        ),
         components=sorted_components,
     )
 
@@ -697,7 +879,11 @@ def execution_profile_with_component(
     by_class[component.component_class] = component
     components = tuple(sorted(by_class.values(), key=lambda item: item.component_class))
     return ExecutionProfileIdentity(
-        fingerprint=_profile_fingerprint(components),
+        schema_version=profile.schema_version,
+        fingerprint=_profile_fingerprint(
+            components,
+            schema_version=profile.schema_version,
+        ),
         components=components,
     )
 
@@ -729,7 +915,7 @@ def execution_profile_session_metadata(
     dumped = profile.model_dump(mode="json")
     return {
         "record_type": _EXECUTION_PROFILE_RECORD_TYPE,
-        "schema_version": EXECUTION_PROFILE_SCHEMA_VERSION,
+        "schema_version": _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION,
         "baseline": dumped,
         "expected": dumped,
     }
@@ -764,7 +950,7 @@ def execution_profile_from_session_metadata(
         raise ValueError("Session execution-profile metadata is malformed.")
     if (
         raw["record_type"] != _EXECUTION_PROFILE_RECORD_TYPE
-        or raw["schema_version"] != EXECUTION_PROFILE_SCHEMA_VERSION
+        or raw["schema_version"] != _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION
     ):
         raise ValueError("Session execution-profile metadata version is unsupported.")
     # Revalidate both identities after every backend round trip. The immutable
@@ -790,7 +976,7 @@ def execution_profile_baseline_from_session_metadata(
         raise ValueError("Session execution-profile metadata is malformed.")
     if (
         raw["record_type"] != _EXECUTION_PROFILE_RECORD_TYPE
-        or raw["schema_version"] != EXECUTION_PROFILE_SCHEMA_VERSION
+        or raw["schema_version"] != _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION
     ):
         raise ValueError("Session execution-profile metadata version is unsupported.")
     # Validate the mutable expectation too. A malformed sibling field must not
@@ -902,9 +1088,11 @@ def _unavailable_component(
 
 def _profile_fingerprint(
     components: tuple[ExecutionProfileComponentIdentity, ...],
+    *,
+    schema_version: int,
 ) -> str:
     material = {
-        "schema_version": EXECUTION_PROFILE_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "components": [component.model_dump(mode="json") for component in components],
     }
     return sha256(canonical_durable_json_bytes(material, "execution_profile")).hexdigest()

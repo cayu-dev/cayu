@@ -9,7 +9,15 @@ import pytest
 from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu import SQLiteSessionStore
-from cayu.core import AgentSpec, Event, EventType, Message, ThinkingConfig, ThinkingPart
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    ThinkingConfig,
+    ThinkingPart,
+)
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import (
     ModelProvider,
@@ -598,6 +606,11 @@ class _LookupTool(Tool):
             "required": ["query"],
         },
         effect=ToolEffect.NONE,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:provider-operation-cursor-recovery:lookup-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -1685,16 +1698,7 @@ async def _stage_partial_operation(
         ),
         provider_name=provider.name,
         model="fake-model",
-        direct_tools=(
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "schema": tool.schema,
-                "parallel_safe": tool.spec.parallel_safe,
-                "effect": tool.spec.effect.value,
-            }
-            for tool in tools
-        ),
+        tools=tools,
         interaction_id=interaction_id,
     )
     session = admitted.session

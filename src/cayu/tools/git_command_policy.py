@@ -102,6 +102,21 @@ class GitCommandPolicy(CommandPolicy):
             field_name="max_commit_message_bytes",
         )
 
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        """Return portable Git authority when the nested policy is exactly built in."""
+
+        if type(self._process_policy) is not ProcessCommandPolicy:
+            return None
+        nested = ProcessCommandPolicy._execution_profile_material(self._process_policy)
+        if nested is None:
+            return None
+        return {
+            "process_policy": nested,
+            "git_executables": sorted(self._git_executables),
+            "allowed_repositories": sorted(self._allowed_repositories),
+            "max_commit_message_bytes": self._max_commit_message_bytes,
+        }
+
     async def evaluate(
         self,
         ctx: ToolContext,

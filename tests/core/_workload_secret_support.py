@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import cast
 
-from cayu.core import Event
+from cayu.core import Event, ExecutionProfileBehaviorIdentity
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -49,6 +49,11 @@ class SideEffectTool(Tool):
         name="side_effect",
         description="Record execution.",
         input_schema={"type": "object", "properties": {}},
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:workload-secrets:side-effect-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self) -> None:
@@ -62,6 +67,14 @@ class SideEffectTool(Tool):
 
 
 class RequireApprovalPolicy(ToolPolicy):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:workload-secrets:require-approval-policy",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         return ToolPolicyResult(
             decision=ToolPolicyDecision.REQUIRE_APPROVAL,

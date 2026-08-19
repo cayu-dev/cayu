@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from cayu import SQLiteSessionStore
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
 from cayu.core.messages import ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -30,6 +30,7 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_engine as session_engine
@@ -53,7 +54,6 @@ from cayu.runtime.checkpoints import (
 )
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
-    build_execution_profile_identity,
     checkpoint_with_active_invocation_execution_profile,
 )
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
@@ -148,6 +148,11 @@ class _NeverExecutedTool(Tool):
             "properties": {"value": {"type": "string"}},
             "required": ["value"],
         },
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:model-completion-recovery:echo-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self) -> None:
@@ -165,31 +170,27 @@ def _test_execution_profile(
     provider_name: str,
     tool_name: str | None = None,
 ) -> ExecutionProfileIdentity:
-    tool_spec = None
+    tool: Tool | None = None
     if tool_name == _NeverExecutedTool.spec.name:
-        tool_spec = _NeverExecutedTool.spec
+        tool = _NeverExecutedTool()
     elif tool_name == UserInputTool.spec.name:
-        tool_spec = UserInputTool.spec
+        tool = UserInputTool()
     elif tool_name is not None:
         raise ValueError(f"Unsupported test tool: {tool_name}")
-    direct_tools = []
-    if tool_spec is not None:
-        direct_tools.append(
-            {
-                "name": tool_spec.name,
-                "description": tool_spec.description,
-                "schema": tool_spec.input_schema,
-                "parallel_safe": tool_spec.parallel_safe,
-                "effect": tool_spec.effect.value,
-            }
-        )
-    return build_execution_profile_identity(
+    profile_app = CayuApp(enable_logging=False)
+    profile_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[] if tool is None else [tool],
+    )
+    return execution_profile_admission.resolve_execution_profile_identity(
+        registered_agent=profile_app._agents["assistant"],
         runtime_name="cayu",
         runtime_version=session_engine._runtime_version(),
         provider_name=provider_name,
         model="fake-model",
         durable_system_prompt=None,
-        direct_tools=direct_tools,
+        redactor=profile_app._secret_redactor,
+        process_identity=profile_app._execution_profile_process_identity,
     )
 
 
@@ -1016,8 +1017,25 @@ def test_resume_rejects_in_flight_model_boundary_before_status_change() -> None:
     assert provider.requests == []
 
 
-def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider_call() -> None:
+def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_resolutions = 0
+    original_profile_resolver = execution_profile_admission.resolve_execution_profile_identity
+
+    def count_profile_resolution(*args, **kwargs):
+        nonlocal profile_resolutions
+        profile_resolutions += 1
+        return original_profile_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(
+        execution_profile_admission,
+        "resolve_execution_profile_identity",
+        count_profile_resolution,
+    )
+
     async def run():
+        nonlocal profile_resolutions
         store = InMemorySessionStore()
         provider = _RecordingProvider(
             [
@@ -1037,6 +1055,7 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
         await store.release_run_fence(staged.session.id)
         await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
         app = _register_runtime(store, provider, tool=tool)
+        profile_resolutions = 0
 
         resume_events = [
             event
@@ -1047,6 +1066,7 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
                 )
             )
         ]
+        resume_profile_resolutions = profile_resolutions
         assert provider.requests == []
         assert tool.calls == 0
         pending = await _private_pending_approval(store, staged.session.id)
@@ -1067,10 +1087,18 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
                 )
             )
         ]
-        return store, provider, tool, staged, [*resume_events, *resolution_events]
+        return (
+            store,
+            provider,
+            tool,
+            staged,
+            [*resume_events, *resolution_events],
+            resume_profile_resolutions,
+        )
 
-    store, provider, tool, staged, events = asyncio.run(run())
+    store, provider, tool, staged, events, resume_profile_resolutions = asyncio.run(run())
     session_id = staged.session.id
+    assert resume_profile_resolutions == 1
     transcript = asyncio.run(store.load_transcript(session_id))
     durable_events = asyncio.run(store.load_events(session_id))
     model_receipt = asyncio.run(

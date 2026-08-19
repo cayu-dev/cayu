@@ -336,6 +336,26 @@ class DockerRunner(Runner):
     def resource_key(self) -> tuple[object, ...]:
         return ("docker", self.name)
 
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        """Return portable configuration when no deployment-local grants are present."""
+
+        # Secret declarations, guest overlays, and host CLI environment grants
+        # can carry or resolve deployment-local values. They must not become a
+        # durable public hash oracle.
+        if self.secret_env or self.env_overlay or self.docker_cli_env_allowlist:
+            return None
+        return {
+            "name": self.name,
+            "default_cwd": self.default_cwd,
+            "close_action": self.close_action,
+            "docker_path": self.docker_path,
+            "credential_mode": self.credential_mode.value,
+            "allow_raw_secret_env": self._allow_raw_secret_env,
+            "cancel_timeout_s": self.cancel_timeout_s,
+            "cancellation_cleanup": self.cancellation_cleanup,
+            "timeout_cleanup": self.timeout_cleanup,
+        }
+
     def __init__(
         self,
         name: str,

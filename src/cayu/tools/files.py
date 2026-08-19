@@ -231,6 +231,24 @@ class ReadFileTool(Tool):
         max_attachment_limit_bytes=DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES,
     )
 
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        """Return bounded reader configuration when every reader is Cayu-owned."""
+
+        reader_components: dict[type[ArtifactReader], str] = {
+            ImageArtifactReader: "cayu.tools.files:ImageArtifactReader",
+            PdfArtifactReader: "cayu.tools.files:PdfArtifactReader",
+            TextArtifactReader: "cayu.tools.files:TextArtifactReader",
+        }
+        try:
+            artifact_readers = [reader_components[type(reader)] for reader in self.artifact_readers]
+        except KeyError:
+            return None
+        return {
+            "default_attachment_limit_bytes": self.default_attachment_limit_bytes,
+            "max_attachment_limit_bytes": self.max_attachment_limit_bytes,
+            "artifact_readers": artifact_readers,
+        }
+
     def __init__(
         self,
         *,
@@ -1606,6 +1624,9 @@ class EditFileTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -1836,6 +1857,9 @@ class DeleteFileTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -1948,6 +1972,9 @@ class WriteFileTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -2049,6 +2076,9 @@ class ListFilesTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
@@ -2111,6 +2141,9 @@ class ListArtifactsTool(Tool):
             "additionalProperties": False,
         },
     )
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

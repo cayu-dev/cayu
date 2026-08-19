@@ -19,6 +19,7 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     Message,
     ResumeRequest,
     RunRequest,
@@ -55,6 +56,11 @@ class ReadUntrustedEvidenceTool(Tool):
         description="Read raw, untrusted incident evidence.",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         effect=ToolEffect.NONE,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="examples:tainted-incident:read-untrusted-evidence",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self, state: IncidentState) -> None:
@@ -74,6 +80,11 @@ class SanitizeIncidentTool(Tool):
         description="Extract inert incident facts while excluding embedded instructions.",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         effect=ToolEffect.NONE,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="examples:tainted-incident:sanitize-incident",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self, state: IncidentState) -> None:
@@ -108,6 +119,11 @@ class SendNotificationTool(Tool):
             "additionalProperties": False,
         },
         effect=ToolEffect.EXTERNAL,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="examples:tainted-incident:send-notification",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self, state: IncidentState) -> None:
@@ -137,6 +153,11 @@ class RotateCredentialsTool(Tool):
             "additionalProperties": False,
         },
         effect=ToolEffect.EXTERNAL,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="examples:tainted-incident:rotate-credentials",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self, state: IncidentState) -> None:

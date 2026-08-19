@@ -86,6 +86,20 @@ class LocalRunner(Runner):
 
     isolation = "local"
 
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        """Return portable configuration when no host-local behavior is inherited."""
+
+        # Inherited host state and arbitrary credential resolvers are executable
+        # inputs whose behavior Cayu cannot reproduce across processes.
+        if self.inherit_env or self.secret_env:
+            return None
+        return {
+            "root": str(self.root),
+            "inherit_env": False,
+            "credential_mode": self.credential_mode.value,
+            "allow_raw_secret_env": self._allow_raw_secret_env,
+        }
+
     def execution_capability_evidence(self) -> ExecutionCapabilityEvidence:
         """Declare the local-process boundary without representing it as isolation."""
 

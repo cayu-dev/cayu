@@ -52,6 +52,9 @@ class UserInputTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         # Reached only when the runtime did not intercept the call as a pause: either the question
         # was blank/missing, or another tool in the same round required approval (approval takes

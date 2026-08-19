@@ -7,28 +7,43 @@ import sqlite3
 import warnings
 from collections.abc import AsyncIterator
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
+import cayu.runtime._execution_profile_admission as execution_profile_admission
 import cayu.runtime._session_engine as session_engine_module
 from cayu import (
     EXECUTION_PROFILE_METADATA_KEY,
     AgentSpec,
     BeforeStopContext,
     BeforeStopDecision,
+    BrowserWebFetchAdapter,
     CayuApp,
+    CommandPolicy,
+    CommandPolicyDecision,
+    CommandPolicyResult,
+    CommandRequest,
+    DenyPatternRule,
+    DockerRunner,
     Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     EnvironmentSpec,
     Event,
     EventType,
+    ExecCommandTool,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAdoptionRejected,
     ExecutionProfileAuthorityDecision,
+    ExecutionProfileBehaviorIdentity,
     ExecutionProfileComponentClass,
     ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
     ExecutionProfileIdentityAvailability,
+    ExecutionProfileIdentityStrength,
     ExecutionProfileMigrationRequired,
     ExecutionProfileMismatchError,
     ExecutionProfilePolicy,
@@ -37,24 +52,40 @@ from cayu import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     InMemorySessionStore,
+    LocalRunner,
     LoopPolicy,
     Message,
     ModelTarget,
+    ParameterConstrainedToolPolicy,
+    ProcessCommandPolicy,
+    RememberKnowledgePolicy,
+    RememberKnowledgeTool,
+    RequiredAllowlistRule,
+    RequiredFieldRule,
     ResolutionActor,
     ResolutionActorSource,
     ResumeRequest,
     RunRequest,
+    RuntimeHook,
     ScriptedModelProvider,
+    SearchTextTool,
     SecretRedactor,
     SessionIdentity,
     SessionStatus,
     SQLiteSessionStore,
+    StaticToolPolicy,
     StructuredOutputSpec,
+    TaintAwareToolPolicy,
     ThinkingConfig,
     Tool,
     ToolContext,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
     ToolResult,
     ToolSpec,
+    WebFetchTool,
 )
 from cayu.providers import ModelStreamEvent
 from cayu.runtime._event_projection import project_persisted_runtime_event
@@ -72,17 +103,12 @@ from cayu.runtime.sessions import (
 )
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        "src/cayu/cli/scaffold.py",
-        "examples/dashboard_behavior_live.py",
-    ],
-)
-def test_exact_runtime_profile_mirrors_include_workspace_mutation(path: str) -> None:
-    source = (Path(__file__).resolve().parents[2] / path).read_text(encoding="utf-8")
+def test_dashboard_profile_fixture_delegates_to_the_runtime_resolver() -> None:
+    path = Path(__file__).resolve().parents[2] / "examples/dashboard_behavior_live.py"
+    source = path.read_text(encoding="utf-8")
 
-    assert '**({"workspace_mutation": True} if tool.workspace_mutation else {})' in source
+    assert "execution_profile_admission.resolve_execution_profile_identity(" in source
+    assert "process_identity=app._execution_profile_process_identity" in source
 
 
 class RecordingTool(Tool):
@@ -99,6 +125,11 @@ class RecordingTool(Tool):
             input_schema={"type": "object", "properties": {}},
             parallel_safe=parallel_safe,
             workspace_mutation=workspace_mutation,
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:recording-tool",
+                behavior_version="1",
+                implementation_version="1",
+            ),
         )
         super().__init__()
         self.calls: list[dict] = []
@@ -106,6 +137,117 @@ class RecordingTool(Tool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         self.calls.append(args)
         return ToolResult(content="recorded")
+
+
+class IdentityConfiguredTool(Tool):
+    def __init__(
+        self,
+        identity: ExecutionProfileBehaviorIdentity | None,
+        *,
+        input_schema: dict | None = None,
+        opaque_behavior: str = "default",
+    ) -> None:
+        self.spec = ToolSpec(
+            name="identity_configured_tool",
+            description="Exercise implementation identity admission.",
+            input_schema=(
+                {"type": "object", "properties": {}} if input_schema is None else input_schema
+            ),
+            execution_profile_identity=identity,
+        )
+        super().__init__()
+        self.opaque_behavior = opaque_behavior
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(content="not called")
+
+
+class AlternateIdentityConfiguredTool(IdentityConfiguredTool):
+    """A distinct opaque implementation with the same public tool contract."""
+
+
+class OpaqueWebFetchAdapter:
+    async def fetch(self, ctx: ToolContext, request: object) -> ToolResult:
+        return ToolResult(content="not called")
+
+
+class IdentityConfiguredEnvironmentFactory(EnvironmentFactory):
+    def __init__(self, identity: ExecutionProfileBehaviorIdentity | None = None) -> None:
+        self._identity = identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity or _test_behavior_identity("environment-factory")
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        return EnvironmentFactoryResult(
+            environment=Environment(EnvironmentSpec(name=request.environment_name)),
+        )
+
+
+class IdentityConfiguredToolPolicy(ToolPolicy):
+    def __init__(self, identity: ExecutionProfileBehaviorIdentity) -> None:
+        self._identity = identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+
+class IdentityConfiguredHook(RuntimeHook):
+    def __init__(
+        self,
+        name: str,
+        identity: ExecutionProfileBehaviorIdentity | None = None,
+    ) -> None:
+        self._name = name
+        self._identity = identity
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity or ExecutionProfileBehaviorIdentity(
+            name=f"tests:identity-configured-hook:{self.name}",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+
+class IdentityConfiguredCommandPolicy(CommandPolicy):
+    def __init__(self, identity: ExecutionProfileBehaviorIdentity) -> None:
+        self._identity = identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity
+
+    async def evaluate(
+        self,
+        ctx: ToolContext,
+        request: CommandRequest,
+    ) -> CommandPolicyResult:
+        del ctx, request
+        return CommandPolicyResult(decision=CommandPolicyDecision.ALLOW)
+
+
+class IdentityConfiguredRunner(LocalRunner):
+    def __init__(
+        self,
+        root: Path,
+        identity: ExecutionProfileBehaviorIdentity,
+    ) -> None:
+        super().__init__(root)
+        self._identity = identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity
 
 
 class PreflightRecordingProvider(ScriptedModelProvider):
@@ -162,10 +304,28 @@ class ConfiguredAdoptionLoopPolicy(LoopPolicy):
     def adoption_replay_identity(self) -> str:
         return self._identity
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:configured-adoption-loop-policy",
+            behavior_version=self._identity,
+            implementation_version="1",
+        )
+
     async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
         self.calls += 1
         self.metadata.append(context.metadata)
         return await super().before_stop(context)
+
+
+class OpaqueConfiguredLoopPolicy(LoopPolicy):
+    def __init__(self, decision: BeforeStopDecision) -> None:
+        self._decision = decision
+        self.calls = 0
+
+    async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
+        self.calls += 1
+        return self._decision
 
 
 class ConcurrentCompletedAdoptionStore(InMemorySessionStore):
@@ -610,6 +770,1423 @@ def test_app_rejects_nonportable_execution_profile_policy_identity() -> None:
         CayuApp(execution_profile_policy=policy, enable_logging=False)
 
 
+def _test_behavior_identity(
+    name: str,
+    *,
+    behavior_version: str = "1",
+    implementation_version: str = "1",
+) -> ExecutionProfileBehaviorIdentity:
+    return ExecutionProfileBehaviorIdentity(
+        name=f"tests:{name}",
+        behavior_version=behavior_version,
+        implementation_version=implementation_version,
+    )
+
+
+def test_profile_strengths_report_identity_provenance() -> None:
+    def resolve(
+        app: CayuApp,
+        *,
+        request_loop_policies: tuple[LoopPolicy, ...] = (),
+    ) -> ExecutionProfileIdentity:
+        return execution_profile_admission.resolve_execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            runtime_name="cayu",
+            runtime_version="test",
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+            registered_environment=app._get_registered_environment(None),
+            runtime_hooks=app._runtime_hooks,
+            loop_policies=app._loop_policies,
+            loop_policy_identities=app._loop_policy_execution_profile_identities,
+            invocation_loop_policies=request_loop_policies,
+            invocation_loop_policy_identities=tuple(
+                policy.execution_profile_identity for policy in request_loop_policies
+            ),
+        )
+
+    cayu_owned_app = CayuApp(enable_logging=False)
+    cayu_owned_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SearchTextTool()],
+        tool_policy=TaintAwareToolPolicy(
+            taint_sources={"search_text": ("external",)},
+            protected_tools={"search_text": ("external",)},
+        ),
+    )
+    cayu_owned_profile = resolve(cayu_owned_app)
+
+    identity = _test_behavior_identity("declared-authority")
+    declared_app = CayuApp(
+        runtime_hooks=(IdentityConfiguredHook("declared-hook", identity),),
+        enable_logging=False,
+    )
+    declared_app.register_environment(
+        Environment(
+            EnvironmentSpec(name="declared-environment", execution_profile_identity=identity)
+        ),
+        default=True,
+    )
+    declared_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[IdentityConfiguredTool(identity)],
+        tool_policy=IdentityConfiguredToolPolicy(identity),
+    )
+    declared_profile = resolve(
+        declared_app,
+        request_loop_policies=(ConfiguredAdoptionLoopPolicy("declared-invocation"),),
+    )
+
+    structural_components = (
+        ExecutionProfileComponentClass.RUNTIME,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ExecutionProfileComponentClass.RUNTIME_HOOKS,
+        ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+    )
+    for component_class in structural_components:
+        assert (
+            cayu_owned_profile.component(component_class).strength
+            is ExecutionProfileIdentityStrength.STRUCTURAL
+        )
+
+    for component_class in structural_components[1:]:
+        assert (
+            declared_profile.component(component_class).strength
+            is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+        )
+    assert (
+        declared_profile.component(ExecutionProfileComponentClass.RUNTIME).strength
+        is ExecutionProfileIdentityStrength.STRUCTURAL
+    )
+
+
+def test_cayu_profile_material_extractors_require_exact_registered_types(tmp_path: Path) -> None:
+    class DerivedSearchTextTool(SearchTextTool):
+        pass
+
+    class DerivedLocalRunner(LocalRunner):
+        pass
+
+    class DerivedStaticToolPolicy(StaticToolPolicy):
+        pass
+
+    assert execution_profile_admission._cayu_tool_material(SearchTextTool()) is not None
+    assert execution_profile_admission._cayu_tool_material(DerivedSearchTextTool()) is None
+    assert execution_profile_admission._cayu_runner_material(LocalRunner(tmp_path)) is not None
+    assert execution_profile_admission._cayu_runner_material(DerivedLocalRunner(tmp_path)) is None
+    assert (
+        execution_profile_admission._cayu_policy_material(StaticToolPolicy(allow=("search_text",)))
+        is not None
+    )
+    assert (
+        execution_profile_admission._cayu_policy_material(
+            DerivedStaticToolPolicy(allow=("search_text",))
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "registration_kind",
+    [
+        "app_runtime_hook",
+        "app_loop_policy",
+        "tool",
+        "command_policy",
+        "tool_policy",
+        "agent_runtime_hook",
+        "agent_loop_policy",
+        "environment_spec",
+        "environment_runner",
+        "factory_spec",
+        "environment_factory",
+    ],
+)
+def test_app_rejects_workload_secrets_in_behavior_identity_registrations(
+    registration_kind: str,
+    tmp_path: Path,
+) -> None:
+    secret = "execution-profile-identity-secret-canary"
+    identity = _test_behavior_identity(
+        registration_kind,
+        behavior_version=f"release:{secret}",
+    )
+    redactor = SecretRedactor(secret)
+
+    if registration_kind == "app_runtime_hook":
+        with pytest.raises(ValueError, match="configured workload secret") as caught:
+            CayuApp(
+                runtime_hooks=(IdentityConfiguredHook("secret-hook", identity),),
+                secret_redactor=redactor,
+                enable_logging=False,
+            )
+    elif registration_kind == "app_loop_policy":
+        with pytest.raises(ValueError, match="configured workload secret") as caught:
+            CayuApp(
+                loop_policies=(ConfiguredAdoptionLoopPolicy(f"release:{secret}"),),
+                secret_redactor=redactor,
+                enable_logging=False,
+            )
+    else:
+        app = CayuApp(secret_redactor=redactor, enable_logging=False)
+        with pytest.raises(ValueError, match="configured workload secret") as caught:
+            if registration_kind == "tool":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    tools=[IdentityConfiguredTool(identity)],
+                )
+            elif registration_kind == "command_policy":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    tools=[ExecCommandTool(policy=IdentityConfiguredCommandPolicy(identity))],
+                )
+            elif registration_kind == "tool_policy":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    tools=[IdentityConfiguredTool(_test_behavior_identity("safe-tool"))],
+                    tool_policy=IdentityConfiguredToolPolicy(identity),
+                )
+            elif registration_kind == "agent_runtime_hook":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    runtime_hooks=(IdentityConfiguredHook("secret-hook", identity),),
+                )
+            elif registration_kind == "agent_loop_policy":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    loop_policies=(ConfiguredAdoptionLoopPolicy(f"release:{secret}"),),
+                )
+            elif registration_kind == "environment_spec":
+                app.register_environment(
+                    Environment(
+                        EnvironmentSpec(
+                            name="environment",
+                            execution_profile_identity=identity,
+                        )
+                    )
+                )
+            elif registration_kind == "environment_runner":
+                app.register_environment(
+                    Environment(
+                        EnvironmentSpec(name="environment"),
+                        runner=IdentityConfiguredRunner(tmp_path, identity),
+                    )
+                )
+            elif registration_kind == "factory_spec":
+                app.register_environment_factory(
+                    EnvironmentSpec(
+                        name="environment",
+                        execution_profile_identity=identity,
+                    ),
+                    IdentityConfiguredEnvironmentFactory(),
+                )
+            else:
+                assert registration_kind == "environment_factory"
+                app.register_environment_factory(
+                    EnvironmentSpec(name="environment"),
+                    IdentityConfiguredEnvironmentFactory(identity),
+                )
+
+        assert app.list_agents() == ()
+        assert app.list_environments() == ()
+
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+
+
+def test_public_agent_registration_does_not_serialize_a_mutated_behavior_identity(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "execution-profile-registration-serializer-secret-canary-ABCDEFGHIJKLMNOP"
+
+    class SecretBearingValue:
+        def __repr__(self) -> str:
+            return secret
+
+    tool = IdentityConfiguredTool(_test_behavior_identity("mutated-registration"))
+    identity = tool.spec.execution_profile_identity
+    assert type(identity) is ExecutionProfileBehaviorIdentity
+    object.__setattr__(identity, "behavior_version", SecretBearingValue())
+    app = CayuApp(
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    with (
+        warnings.catch_warnings(record=True) as emitted,
+        caplog.at_level(logging.WARNING),
+        pytest.raises(ValidationError) as raised,
+    ):
+        warnings.simplefilter("always")
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+        )
+
+    exception_chain: list[BaseException] = []
+    current: BaseException | None = raised.value
+    while current is not None and all(current is not item for item in exception_chain):
+        exception_chain.append(current)
+        current = current.__cause__ or current.__context__
+    captured = capsys.readouterr()
+    diagnostic_output = " ".join(
+        (
+            *(value for error in exception_chain for value in (str(error), repr(error))),
+            captured.out,
+            captured.err,
+            *(record.getMessage() for record in caplog.records),
+            *(str(record.message) for record in emitted),
+        )
+    )
+    assert emitted == []
+    assert secret not in diagnostic_output
+    assert app.list_agents() == ()
+
+
+def test_request_loop_policy_rejects_workload_secret_identity_before_session_creation() -> None:
+    async def exercise() -> None:
+        secret = "execution-profile-request-identity-secret-canary"
+        store = InMemorySessionStore()
+        provider = _completed_provider()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(ValueError, match="configured workload secret") as caught:
+            await _collect(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="secret-request-profile-identity",
+                        messages=[Message.text("user", "first")],
+                        loop_policies=(ConfiguredAdoptionLoopPolicy(f"release:{secret}"),),
+                    )
+                )
+            )
+
+        assert secret not in str(caught.value)
+        assert secret not in repr(caught.value)
+        assert await store.load("secret-request-profile-identity") is None
+        assert provider.requests == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("material_kind", "component_class"),
+    [
+        ("tool", ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS),
+        ("policy", ExecutionProfileComponentClass.EXECUTION_POLICIES),
+        ("runner", ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT),
+    ],
+)
+def test_redactor_known_builtin_material_is_process_local(
+    material_kind: str,
+    component_class: ExecutionProfileComponentClass,
+    tmp_path: Path,
+) -> None:
+    secret = "execution-profile-material-secret-canary"
+    runner_root = tmp_path / secret
+    runner_root.mkdir()
+
+    def configured_app() -> CayuApp:
+        app = CayuApp(
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        tools: list[Tool] = []
+        tool_policy: ToolPolicy | None = None
+        if material_kind == "tool":
+            tools.append(SearchTextTool(exclude_directories=(secret,)))
+        elif material_kind == "policy":
+            tool_policy = TaintAwareToolPolicy(
+                taint_sources={"read_email": (secret,)},
+                protected_tools={"send_email": (secret,)},
+            )
+        else:
+            assert material_kind == "runner"
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name="sandbox",
+                        execution_profile_identity=_test_behavior_identity("sandbox"),
+                    ),
+                    runner=LocalRunner(runner_root),
+                ),
+                default=True,
+            )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=tools,
+            tool_policy=tool_policy,
+        )
+        return app
+
+    fingerprints: list[str | None] = []
+    for _ in range(2):
+        app = configured_app()
+        profile = session_engine_module._execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            registered_environment=app._get_registered_environment(None),
+            process_identity=app._execution_profile_process_identity,
+        )
+        component = profile.component(component_class)
+        assert component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+        fingerprints.append(component.fingerprint)
+
+    assert fingerprints[0] != fingerprints[1]
+
+
+def test_remember_knowledge_application_policy_is_process_local_and_secret_safe() -> None:
+    private_scope = "tenant-profile-scope-canary"
+    fingerprints: list[str | None] = []
+
+    for _ in range(2):
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[
+                RememberKnowledgeTool(
+                    policy=RememberKnowledgePolicy(
+                        default_namespace=private_scope,
+                        require_labels={"tenant": private_scope},
+                    )
+                )
+            ],
+        )
+        profile = session_engine_module._execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            registered_environment=app._get_registered_environment(None),
+            process_identity=app._execution_profile_process_identity,
+        )
+        component = profile.component(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS)
+
+        assert component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+        assert private_scope not in json.dumps(component.model_dump(mode="json"), sort_keys=True)
+        fingerprints.append(component.fingerprint)
+
+    assert fingerprints[0] != fingerprints[1]
+
+
+def test_remember_knowledge_default_policy_retains_structural_identity() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[RememberKnowledgeTool()],
+    )
+
+    profile = session_engine_module._execution_profile_identity(
+        registered_agent=app._agents["assistant"],
+        provider_name="fake",
+        model="fake-model",
+        durable_system_prompt=None,
+        redactor=app._secret_redactor,
+        registered_environment=app._get_registered_environment(None),
+        process_identity=app._execution_profile_process_identity,
+    )
+
+    assert (
+        profile.component(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS).strength
+        is ExecutionProfileIdentityStrength.STRUCTURAL
+    )
+
+
+def test_declared_remember_knowledge_policy_identity_is_portable() -> None:
+    identity = _test_behavior_identity("remember-knowledge-policy")
+    component_fingerprints: list[str | None] = []
+
+    for _ in range(2):
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[
+                RememberKnowledgeTool(
+                    spec=RememberKnowledgeTool.spec.model_copy(
+                        update={"execution_profile_identity": identity},
+                        deep=True,
+                    ),
+                    policy=RememberKnowledgePolicy(
+                        default_namespace="tenant-knowledge",
+                        require_labels={"tenant": "acme"},
+                    ),
+                )
+            ],
+        )
+        profile = session_engine_module._execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            registered_environment=app._get_registered_environment(None),
+            process_identity=app._execution_profile_process_identity,
+        )
+        component = profile.component(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS)
+
+        assert component.strength is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+        component_fingerprints.append(component.fingerprint)
+
+    assert component_fingerprints[0] == component_fingerprints[1]
+
+
+def test_unversioned_custom_tool_identity_is_scoped_to_one_app_instance() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-process-local-tool"
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[IdentityConfiguredTool(None, opaque_behavior="restricted")],
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        original = await store.load(session_id)
+        assert original is not None
+        profile = execution_profile_from_session_metadata(original.metadata)
+        implementation = profile.component(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS)
+        assert implementation.availability is ExecutionProfileIdentityAvailability.AVAILABLE
+        assert implementation.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+
+        await _collect(
+            original_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "same app")],
+                )
+            )
+        )
+
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        restarted_provider = _completed_provider()
+        replacement_app.register_provider(restarted_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[IdentityConfiguredTool(None, opaque_behavior="expanded")],
+        )
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "replacement app")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert restarted_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_process_local_identity_detects_a_different_custom_type_in_the_same_process() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-process-local-tool-type"
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[IdentityConfiguredTool(None)],
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        replacement_provider = _completed_provider()
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(replacement_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[AlternateIdentityConfiguredTool(None)],
+        )
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "different opaque implementation")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert replacement_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_cayu_tool_with_opaque_adapter_is_process_local_without_declared_identity() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-opaque-built-in-tool-adapter"
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WebFetchTool(adapter=OpaqueWebFetchAdapter())],
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        original = await store.load(session_id)
+        assert original is not None
+        implementation = execution_profile_from_session_metadata(original.metadata).component(
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS
+        )
+        assert implementation.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+
+        restarted_provider = _completed_provider()
+        restarted_app = CayuApp(session_store=store, enable_logging=False)
+        restarted_app.register_provider(restarted_provider, default=True)
+        restarted_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WebFetchTool(adapter=OpaqueWebFetchAdapter())],
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                restarted_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "foreign process")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert restarted_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_declared_identity_makes_opaque_built_in_tool_adapter_portable() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-versioned-built-in-tool-adapter"
+        store = InMemorySessionStore()
+        identity = _test_behavior_identity("opaque-web-fetch-adapter")
+
+        def configured_app() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_completed_provider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[
+                    WebFetchTool(
+                        adapter=OpaqueWebFetchAdapter(),
+                        spec=WebFetchTool.spec.model_copy(
+                            update={"execution_profile_identity": identity}
+                        ),
+                    )
+                ],
+            )
+            return app
+
+        await _collect(
+            configured_app().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        events = await _collect(
+            configured_app().resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "portable restart")],
+                )
+            )
+        )
+
+        assert events[0].type is EventType.INTERACTION_STARTED
+
+    asyncio.run(exercise())
+
+
+def test_browser_adapter_dom_limit_changes_implementation_profile_before_work() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-browser-dom-limit"
+        store = InMemorySessionStore()
+
+        def configured_app(*, max_dom_nodes: int) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[WebFetchTool(adapter=BrowserWebFetchAdapter(max_dom_nodes=max_dom_nodes))],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app(max_dom_nodes=100)
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        restarted_app, _restarted_provider = configured_app(max_dom_nodes=100)
+        resumed = await _collect(
+            restarted_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "same browser limit")],
+                )
+            )
+        )
+        assert resumed[0].type is EventType.INTERACTION_STARTED
+
+        changed_app, changed_provider = configured_app(max_dom_nodes=101)
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed browser limit")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_custom_browser_worker_is_app_local_without_declared_identity() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-custom-browser-worker"
+        store = InMemorySessionStore()
+
+        def configured_app() -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[
+                    WebFetchTool(
+                        adapter=BrowserWebFetchAdapter(
+                            worker_command=("python", "-m", "application_browser_worker")
+                        )
+                    )
+                ],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app()
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        session = await store.load(session_id)
+        assert session is not None
+        tool_component = execution_profile_from_session_metadata(session.metadata).component(
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS
+        )
+        assert tool_component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+
+        restarted_app, restarted_provider = configured_app()
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                restarted_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "replacement app")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert restarted_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_cayu_tool_configuration_changes_implementation_profile_before_work() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-built-in-tool-configuration"
+        store = InMemorySessionStore()
+
+        def configured_app(*, max_preview_bytes: int) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[SearchTextTool(max_preview_bytes=max_preview_bytes)],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app(max_preview_bytes=500)
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        changed_app, changed_provider = configured_app(max_preview_bytes=501)
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed built-in configuration")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_versioned_custom_tool_identity_is_portable_and_detects_implementation_drift() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-versioned-tool"
+        store = InMemorySessionStore()
+        stable_identity = _test_behavior_identity("portable-tool")
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[IdentityConfiguredTool(stable_identity)],
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        restarted_app = CayuApp(session_store=store, enable_logging=False)
+        restarted_app.register_provider(_completed_provider(), default=True)
+        restarted_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[IdentityConfiguredTool(stable_identity)],
+        )
+        await _collect(
+            restarted_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "portable restart")],
+                )
+            )
+        )
+
+        changed_app = CayuApp(session_store=store, enable_logging=False)
+        changed_provider = _completed_provider()
+        changed_app.register_provider(changed_provider, default=True)
+        changed_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[
+                IdentityConfiguredTool(
+                    _test_behavior_identity(
+                        "portable-tool",
+                        implementation_version="2",
+                    )
+                )
+            ],
+        )
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed implementation")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_public_resume_rejects_changed_tool_schema_before_work() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-tool-schema"
+        store = InMemorySessionStore()
+        identity = _test_behavior_identity("schema-tool")
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[IdentityConfiguredTool(identity)],
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        replacement_provider = _completed_provider()
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(replacement_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[
+                IdentityConfiguredTool(
+                    identity,
+                    input_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                )
+            ],
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed schema")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.DIRECT_TOOLS,
+        )
+        assert replacement_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_public_resume_rejects_changed_environment_identity_before_work() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-environment-identity"
+        store = InMemorySessionStore()
+
+        def configured_app(implementation_version: str) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name="sandbox",
+                        execution_profile_identity=_test_behavior_identity(
+                            "sandbox",
+                            implementation_version=implementation_version,
+                        ),
+                    )
+                ),
+                default=True,
+            )
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app, provider
+
+        original_app, _original_provider = configured_app("1")
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        replacement_app, replacement_provider = configured_app("2")
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed environment")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        )
+        assert replacement_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_cayu_runner_configuration_is_portable_and_detects_drift(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-built-in-runner-configuration"
+        store = InMemorySessionStore()
+        original_root = tmp_path / "original"
+        changed_root = tmp_path / "changed"
+        original_root.mkdir()
+        changed_root.mkdir()
+        environment_identity = _test_behavior_identity("local-environment")
+
+        def configured_app(root: Path) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name="local",
+                        execution_profile_identity=environment_identity,
+                    ),
+                    runner=LocalRunner(root),
+                ),
+                default=True,
+            )
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app, provider
+
+        original_app, _original_provider = configured_app(original_root)
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        restarted_app, _restarted_provider = configured_app(original_root)
+        restarted = await _collect(
+            restarted_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "portable restart")],
+                )
+            )
+        )
+        assert restarted[0].type is EventType.INTERACTION_STARTED
+
+        changed_app, changed_provider = configured_app(changed_root)
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed runner root")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        )
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_docker_environment_grants_are_process_local_profile_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        canary = "docker-profile-overlay-secret-canary"
+        monkeypatch.setattr(
+            "cayu.runners.docker._require_docker",
+            lambda path: path or "/test/docker",
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_completed_provider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="docker",
+                    execution_profile_identity=_test_behavior_identity("docker-environment"),
+                ),
+                runner=DockerRunner(
+                    "profile-container",
+                    docker_path="/test/docker",
+                    env_overlay={"PRIVATE_TOKEN": canary},
+                ),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-docker-environment-grant",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        )
+        session = await store.load("execution-profile-docker-environment-grant")
+        assert session is not None
+        component = execution_profile_from_session_metadata(session.metadata).component(
+            ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT
+        )
+        assert component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+        assert canary not in json.dumps(session.metadata, sort_keys=True)
+
+    asyncio.run(exercise())
+
+
+def test_factory_managed_effect_authority_is_not_claimed_as_absent() -> None:
+    async def profile_for(*, factory_backed: bool) -> ExecutionProfileIdentity:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_completed_provider(), default=True)
+        spec = EnvironmentSpec(
+            name="managed",
+            execution_profile_identity=_test_behavior_identity("managed-environment"),
+        )
+        if factory_backed:
+            app.register_environment_factory(
+                spec,
+                IdentityConfiguredEnvironmentFactory(),
+                default=True,
+            )
+        else:
+            app.register_environment(Environment(spec), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"factory-authority-{factory_backed}",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        )
+        session = await store.load(f"factory-authority-{factory_backed}")
+        assert session is not None
+        return execution_profile_from_session_metadata(session.metadata)
+
+    static_profile = asyncio.run(profile_for(factory_backed=False))
+    factory_profile = asyncio.run(profile_for(factory_backed=True))
+
+    assert static_profile.component(
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY
+    ) != factory_profile.component(ExecutionProfileComponentClass.EFFECT_AUTHORITY)
+
+
+def test_policy_and_ordered_hook_identities_are_independent_profile_components() -> None:
+    async def changed_components(
+        *,
+        original_policy_version: str = "1",
+        replacement_policy_version: str = "1",
+        original_hook_order: tuple[str, ...] = ("first", "second"),
+        replacement_hook_order: tuple[str, ...] = ("first", "second"),
+    ) -> tuple[ExecutionProfileComponentClass, ...]:
+        session_id = f"execution-profile-policy-hooks-{original_policy_version}-{uuid4().hex}"
+        store = InMemorySessionStore()
+
+        def configured_app(*, policy_version: str, hook_order: tuple[str, ...]) -> CayuApp:
+            app = CayuApp(
+                session_store=store,
+                runtime_hooks=tuple(IdentityConfiguredHook(name) for name in hook_order),
+                enable_logging=False,
+            )
+            app.register_provider(_completed_provider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[IdentityConfiguredTool(_test_behavior_identity("portable-tool"))],
+                tool_policy=IdentityConfiguredToolPolicy(
+                    _test_behavior_identity(
+                        "portable-tool-policy",
+                        behavior_version=policy_version,
+                    )
+                ),
+            )
+            return app
+
+        original_app = configured_app(
+            policy_version=original_policy_version,
+            hook_order=original_hook_order,
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        replacement_app = configured_app(
+            policy_version=replacement_policy_version,
+            hook_order=replacement_hook_order,
+        )
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed authority")],
+                    )
+                )
+            )
+        return caught.value.changed_component_classes
+
+    policy_change = asyncio.run(
+        changed_components(original_policy_version="1", replacement_policy_version="2")
+    )
+    hook_order_change = asyncio.run(changed_components(replacement_hook_order=("second", "first")))
+
+    assert policy_change == (ExecutionProfileComponentClass.EXECUTION_POLICIES,)
+    assert hook_order_change == (ExecutionProfileComponentClass.RUNTIME_HOOKS,)
+
+
+@pytest.mark.parametrize("rule_kind", ["allowlist", "deny_pattern"])
+def test_parameter_policy_with_exact_values_is_app_local(rule_kind: str) -> None:
+    async def exercise() -> None:
+        canary = "execution-profile-parameter-policy-secret-canary"
+        store = InMemorySessionStore()
+        session_id = f"execution-profile-parameter-policy-{rule_kind}"
+
+        rule = (
+            RequiredAllowlistRule("target", values=(canary,))
+            if rule_kind == "allowlist"
+            else DenyPatternRule("target", patterns=(canary,))
+        )
+
+        def configured_app() -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tool_policy=ParameterConstrainedToolPolicy({"identity_configured_tool": (rule,)}),
+                tools=[IdentityConfiguredTool(_test_behavior_identity("parameter-tool"))],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app()
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        session = await store.load(session_id)
+        assert session is not None
+        policy_component = execution_profile_from_session_metadata(session.metadata).component(
+            ExecutionProfileComponentClass.EXECUTION_POLICIES
+        )
+        assert policy_component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+        assert canary not in json.dumps(session.metadata, sort_keys=True)
+
+        restarted_app, restarted_provider = configured_app()
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                restarted_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "replacement app")],
+                    )
+                )
+            )
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        )
+        assert restarted_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_structural_parameter_policy_is_portable_and_detects_rule_drift() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        session_id = "execution-profile-structural-parameter-policy"
+
+        def configured_app(*, parameter: str) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tool_policy=ParameterConstrainedToolPolicy(
+                    {"identity_configured_tool": (RequiredFieldRule(parameter),)}
+                ),
+                tools=[IdentityConfiguredTool(_test_behavior_identity("parameter-tool"))],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app(parameter="target")
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        restarted_app, _restarted_provider = configured_app(parameter="target")
+        resumed = await _collect(
+            restarted_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "portable policy")],
+                )
+            )
+        )
+        assert resumed[0].type is EventType.INTERACTION_STARTED
+
+        changed_app, changed_provider = configured_app(parameter="other_target")
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed policy")],
+                    )
+                )
+            )
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        )
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_process_command_policy_with_exact_environment_values_is_app_local() -> None:
+    async def exercise() -> None:
+        canary = "execution-profile-policy-secret-canary"
+        store = InMemorySessionStore()
+
+        def configured_app() -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[
+                    ExecCommandTool(
+                        policy=ProcessCommandPolicy(
+                            allowed_executables={"git"},
+                            allowed_cwds={"/workspace"},
+                            allowed_env_values={"TOKEN": canary},
+                        )
+                    )
+                ],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app()
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-secret-command-policy",
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        session = await store.load("execution-profile-secret-command-policy")
+        assert session is not None
+        policy_component = execution_profile_from_session_metadata(session.metadata).component(
+            ExecutionProfileComponentClass.EXECUTION_POLICIES
+        )
+        assert policy_component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+        assert canary not in json.dumps(session.metadata, sort_keys=True)
+
+        replacement_app, replacement_provider = configured_app()
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id="execution-profile-secret-command-policy",
+                        messages=[Message.text("user", "replacement app")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        )
+        assert replacement_provider.requests == []
+
+    asyncio.run(exercise())
+
+
 def test_public_resume_rejects_changed_direct_tools_before_work() -> None:
     async def exercise() -> None:
         store = InMemorySessionStore()
@@ -655,6 +2232,8 @@ def test_public_resume_rejects_changed_direct_tools_before_work() -> None:
 
         assert caught.value.changed_component_classes == (
             ExecutionProfileComponentClass.DIRECT_TOOLS,
+            ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
         )
         assert replacement_provider.requests == []
         assert replacement_tool.calls == []
@@ -677,7 +2256,11 @@ def test_public_resume_rejects_changed_direct_tools_before_work() -> None:
         events = await store.load_events("execution-profile-tool-drift")
         rejection = events[-1]
         assert rejection.type == EventType.SESSION_EXECUTION_PROFILE_REJECTED
-        assert rejection.payload["changed_component_classes"] == ["direct_tools"]
+        assert rejection.payload["changed_component_classes"] == [
+            "direct_tools",
+            "effect_authority",
+            "tool_view_grants",
+        ]
         assert set(rejection.payload) == {
             "actor",
             "authority_decision",
@@ -758,6 +2341,7 @@ def test_public_resume_rejects_changed_workspace_mutation_declaration_before_wor
 
         assert caught.value.changed_component_classes == (
             ExecutionProfileComponentClass.DIRECT_TOOLS,
+            ExecutionProfileComponentClass.EFFECT_AUTHORITY,
         )
         assert replacement_provider.requests == []
         assert replacement_tool.calls == []
@@ -765,7 +2349,7 @@ def test_public_resume_rejects_changed_workspace_mutation_declaration_before_wor
     asyncio.run(exercise())
 
 
-def test_default_false_workspace_mutation_keeps_legacy_direct_tool_profile_shape() -> None:
+def test_default_false_workspace_mutation_keeps_direct_tool_component_shape() -> None:
     async def exercise() -> None:
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
@@ -807,7 +2391,9 @@ def test_default_false_workspace_mutation_keeps_legacy_direct_tool_profile_shape
         ],
     )
 
-    assert stored == legacy
+    assert stored.component(ExecutionProfileComponentClass.DIRECT_TOOLS) == legacy.component(
+        ExecutionProfileComponentClass.DIRECT_TOOLS
+    )
 
 
 def test_explicit_authorized_tool_profile_adoption_is_atomic_and_replayable() -> None:
@@ -1178,6 +2764,169 @@ def test_adoption_replay_binds_stable_request_loop_policy_configuration() -> Non
             )
         assert len(profile_policy.requests) == 1
         assert len(provider.requests) == 1
+
+    asyncio.run(exercise())
+
+
+def test_request_loop_policy_is_separate_invocation_authority() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-request-loop-policy"
+        store = InMemorySessionStore()
+
+        def configured_app() -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app, provider
+
+        original_app, _original_provider = configured_app()
+        original_policy = ConfiguredAdoptionLoopPolicy("request-policy:v1")
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                    loop_policies=(original_policy,),
+                )
+            )
+        )
+        stored_session = await store.load(session_id)
+        assert stored_session is not None
+        invocation_policies = execution_profile_from_session_metadata(
+            stored_session.metadata
+        ).component(ExecutionProfileComponentClass.INVOCATION_POLICIES)
+        assert (
+            invocation_policies.strength is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+        )
+
+        changed_app, changed_provider = configured_app()
+        changed_policy = ConfiguredAdoptionLoopPolicy("request-policy:v2")
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed request policy")],
+                        loop_policies=(changed_policy,),
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        )
+        assert changed_policy.calls == 0
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_opaque_request_loop_policy_exact_instance_is_process_local_reusable() -> None:
+    async def exercise() -> None:
+        batch = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"}),
+        ]
+        provider = ScriptedModelProvider([batch, batch], name="fake")
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        policy = OpaqueConfiguredLoopPolicy(BeforeStopDecision.complete("configured-v1"))
+
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-opaque-request-policy-reuse",
+                    messages=[Message.text("user", "first")],
+                    loop_policies=(policy,),
+                )
+            )
+        )
+        created = await store.load("execution-profile-opaque-request-policy-reuse")
+        assert created is not None
+        created_profile = execution_profile_from_session_metadata(created.metadata)
+        assert (
+            created_profile.component(ExecutionProfileComponentClass.INVOCATION_POLICIES).strength
+            is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+        )
+
+        await _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id="execution-profile-opaque-request-policy-reuse",
+                    messages=[Message.text("user", "second")],
+                    loop_policies=(policy,),
+                )
+            )
+        )
+        resumed = await store.load("execution-profile-opaque-request-policy-reuse")
+        assert resumed is not None
+        assert execution_profile_from_session_metadata(resumed.metadata) == created_profile
+        assert policy.calls == 2
+        assert len(provider.requests) == 2
+
+    asyncio.run(exercise())
+
+
+def test_opaque_request_loop_policy_replacement_is_rejected_within_app() -> None:
+    async def exercise() -> None:
+        batch = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"}),
+        ]
+        provider = ScriptedModelProvider([batch, batch], name="fake")
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        original = OpaqueConfiguredLoopPolicy(BeforeStopDecision.complete("configured-v1"))
+
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-opaque-request-policy-replacement",
+                    messages=[Message.text("user", "first")],
+                    loop_policies=(original,),
+                )
+            )
+        )
+        session_before = await store.load("execution-profile-opaque-request-policy-replacement")
+        transcript_before = await store.load_transcript(
+            "execution-profile-opaque-request-policy-replacement"
+        )
+        replacement = OpaqueConfiguredLoopPolicy(BeforeStopDecision.fail("replacement behavior"))
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                app.resume(
+                    ResumeRequest(
+                        session_id="execution-profile-opaque-request-policy-replacement",
+                        messages=[Message.text("user", "second")],
+                        loop_policies=(replacement,),
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        )
+        assert original.calls == 1
+        assert replacement.calls == 0
+        assert len(provider.requests) == 1
+        session_after = await store.load("execution-profile-opaque-request-policy-replacement")
+        assert session_before is not None
+        assert session_after is not None
+        assert session_after.status is session_before.status
+        assert session_after.run_epoch == session_before.run_epoch
+        assert (
+            await store.load_transcript("execution-profile-opaque-request-policy-replacement")
+            == transcript_before
+        )
 
     asyncio.run(exercise())
 
@@ -2243,6 +3992,8 @@ def test_public_resume_rejects_reordered_direct_tools_before_work() -> None:
 
         assert caught.value.changed_component_classes == (
             ExecutionProfileComponentClass.DIRECT_TOOLS,
+            ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
         )
         assert replacement_provider.requests == []
         assert replacement_write.calls == []

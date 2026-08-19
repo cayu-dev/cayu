@@ -49,6 +49,9 @@ def _profile(*, tool_name: str) -> ExecutionProfileIdentity:
                 "effect": "external",
             }
         ],
+        tool_implementations=[{"implementation": "test:recording-tool:v1"}],
+        tool_view_grants={"view_kind": "test", "generation": 1},
+        effect_authority={"authority": "test-fixture"},
     )
 
 

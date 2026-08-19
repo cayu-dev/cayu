@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
@@ -18,6 +18,7 @@ from cayu._validation import (
     require_nonblank,
 )
 from cayu.core.agents import AgentSpec
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import ToolEffect
 from cayu.runtime.sessions import Session
 
@@ -126,12 +127,21 @@ class ToolPolicyResult(BaseModel):
 class ToolPolicy(ABC):
     """Authorizes registered tool calls before execution."""
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return a stable application declaration, or ``None`` when non-portable."""
+
+        return None
+
     @abstractmethod
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         """Return whether this tool call may execute."""
 
 
 class AllowAllToolPolicy(ToolPolicy):
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
@@ -152,6 +162,12 @@ class StaticToolPolicy(ToolPolicy):
     ) -> None:
         self.allow = _copy_tool_name_set(allow, "allow") if allow is not None else None
         self.deny = _copy_tool_name_set(deny, "deny") if deny is not None else frozenset()
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {
+            "allow": None if self.allow is None else sorted(self.allow),
+            "deny": sorted(self.deny),
+        }
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         if request.tool_name in self.deny:
@@ -191,6 +207,12 @@ class AlwaysRequireApprovalToolPolicy(ToolPolicy):
             decision=ToolPolicyDecision.REQUIRE_APPROVAL,
             approval_expires_in_seconds=expires_in_seconds,
         ).approval_expires_in_seconds
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {
+            "tools": None if self.tools is None else sorted(self.tools),
+            "expires_in_seconds": self.expires_in_seconds,
+        }
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         if self.tools is None or request.tool_name in self.tools:
@@ -239,6 +261,12 @@ class RequiredFieldRule(ParameterRule):
     def parameter(self) -> str:
         return self._parameter
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {
+            "component": "cayu.runtime.tool_policy:RequiredFieldRule",
+            "parameter": self.parameter,
+        }
+
     def check(self, arguments: dict[str, Any]) -> str | None:
         value = _get_argument_path(arguments, self._path)
         if value is _MISSING:
@@ -266,6 +294,11 @@ class AllowlistRule(ParameterRule):
     def parameter(self) -> str:
         return self._parameter
 
+    def _execution_profile_material(self) -> None:
+        # Exact values may contain private, low-entropy identifiers. Publishing
+        # their digest would create an offline guessing oracle.
+        return None
+
     def check(self, arguments: dict[str, Any]) -> str | None:
         value = _get_argument_path(arguments, self._path)
         if value is _MISSING:
@@ -290,6 +323,9 @@ class RequiredAllowlistRule(ParameterRule):
     @property
     def parameter(self) -> str:
         return self._parameter
+
+    def _execution_profile_material(self) -> None:
+        return None
 
     def check(self, arguments: dict[str, Any]) -> str | None:
         violation = self._violation(arguments)
@@ -340,6 +376,9 @@ class DenyPatternRule(ParameterRule):
     def parameter(self) -> str:
         return self._parameter
 
+    def _execution_profile_material(self) -> None:
+        return None
+
     def check(self, arguments: dict[str, Any]) -> str | None:
         value = _get_argument_path(arguments, self._path)
         if value is _MISSING:
@@ -377,6 +416,35 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
         for tool_name, tool_rules in rules.items():
             name = require_clean_nonblank(tool_name, "tool_name")
             self.rules[name] = _copy_parameter_rules(tool_rules, f"rules[{name!r}]")
+
+    def _execution_profile_material(self) -> dict[str, Any] | None:
+        """Return material only when every rule has a safe exact-type extractor."""
+
+        extractors: dict[
+            type[object],
+            Callable[[Any], dict[str, object] | None],
+        ] = {
+            RequiredFieldRule: RequiredFieldRule._execution_profile_material,
+            AllowlistRule: AllowlistRule._execution_profile_material,
+            RequiredAllowlistRule: RequiredAllowlistRule._execution_profile_material,
+            DenyPatternRule: DenyPatternRule._execution_profile_material,
+        }
+        rules: dict[str, list[dict[str, Any]]] = {}
+        for tool_name, tool_rules in sorted(self.rules.items()):
+            material = []
+            for rule in tool_rules:
+                extractor = extractors.get(type(rule))
+                if extractor is None:
+                    return None
+                rule_material = extractor(rule)
+                if rule_material is None:
+                    return None
+                material.append(rule_material)
+            rules[tool_name] = material
+        return {
+            "decision": self.decision.value,
+            "rules": rules,
+        }
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         rules = self.rules.get(request.tool_name)
@@ -456,6 +524,17 @@ class TaintAwareToolPolicy(ToolPolicy):
         self.taint_sources = MappingProxyType(copied_sources)
         self.protected_tools = MappingProxyType(copied_protected)
         self.decision = decision
+
+    def _execution_profile_material(self) -> dict[str, Any]:
+        return {
+            "taint_sources": {
+                name: sorted(labels) for name, labels in sorted(self.taint_sources.items())
+            },
+            "protected_tools": {
+                name: sorted(labels) for name, labels in sorted(self.protected_tools.items())
+            },
+            "decision": self.decision.value,
+        }
 
     def labels_for_source_tool(self, tool_name: str) -> frozenset[str]:
         """Return labels added when ``tool_name`` produces a terminal result."""

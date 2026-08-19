@@ -1332,6 +1332,7 @@ from cayu import (
     InteractionSummaryEvidence,
     InvocationOrigin,
     InvocationOriginTrust,
+    LoopPolicy,
     Message,
     ModelStreamEvent,
     RunRequest,
@@ -1347,9 +1348,9 @@ from cayu import (
     TaskExecutionSource,
     TaskInvocationSnapshot,
     TaskStatus,
-    build_execution_profile_identity,
     session_invocation_from_task,
 )
+from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime.sessions import run_request_with_task_invocation
 from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.server import (
@@ -1407,33 +1408,34 @@ def profiled_session_identity(
     agent_name: str,
     provider_name: str,
     model: str,
+    invocation_loop_policies: tuple[LoopPolicy, ...] = (),
 ) -> SessionIdentity:
     # Mirror the runtime-owned identity for this manually seeded resume fixture.
     runtime_version = version("cayu")
-    registered_agent = app.get_agent(agent_name)
-    direct_tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "schema": tool.schema,
-            "parallel_safe": tool.parallel_safe,
-            "effect": tool.effect.value,
-            **({"workspace_mutation": True} if tool.workspace_mutation else {}),
-        }
-        for tool in registered_agent.tools.values()
-    ]
+    registered_agent = app._agents[agent_name]
+    engine = app._session_engine
+    invocation_loop_policy_identities = tuple(
+        policy.execution_profile_identity for policy in invocation_loop_policies
+    )
     return SessionIdentity(
         provider_name=provider_name,
         model=model,
         runtime_name="cayu",
         runtime_version=runtime_version,
-        execution_profile=build_execution_profile_identity(
+        execution_profile=execution_profile_admission.resolve_execution_profile_identity(
+            registered_agent=registered_agent,
             runtime_name="cayu",
             runtime_version=runtime_version,
             provider_name=provider_name,
             model=model,
             durable_system_prompt=registered_agent.spec.system_prompt,
-            direct_tools=direct_tools,
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+            runtime_hooks=engine._runtime_hooks,
+            loop_policies=engine._loop_policies,
+            loop_policy_identities=engine._loop_policy_execution_profile_identities,
+            invocation_loop_policies=invocation_loop_policies,
+            invocation_loop_policy_identities=invocation_loop_policy_identities,
         ),
     )
 
@@ -2158,11 +2160,15 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 ),
             ),
         )
+        invocation_loop_policies = await first_service._continuation_loop_policies(
+            reservation.operation.session_id
+        )
         session_identity = profiled_session_identity(
             first_service.cayu_app,
             agent_name=first_service.agent_name,
             provider_name=provider.name,
             model="scripted-model",
+            invocation_loop_policies=invocation_loop_policies,
         )
         await first_service.cayu_app.session_store.create(
             run_request_with_task_invocation(

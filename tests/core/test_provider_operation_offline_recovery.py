@@ -18,6 +18,7 @@ from cayu.core import (
     AgentSpec,
     Event,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     Message,
     ThinkingConfig,
     ThinkingPart,
@@ -69,6 +70,7 @@ from cayu.runtime import (
     SessionStore,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolPolicy,
 )
 from cayu.runtime import _model_step_executor as model_step_executor
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
@@ -632,6 +634,14 @@ class _RecordingInterruptedProfileHook(RuntimeHook):
     def __init__(self) -> None:
         self.execution_profiles: list[ExecutionProfileIdentity | None] = []
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:provider-operation-offline-recovery:interruption-hook",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
         self.execution_profiles.append(context.execution_profile)
 
@@ -660,6 +670,11 @@ class _LookupTool(Tool):
             "required": ["query"],
         },
         effect=ToolEffect.NONE,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:provider-operation-offline-recovery:lookup-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -712,6 +727,8 @@ async def _stage_offline_operation(
     prior_events: tuple[Event, ...] = (),
     tools: tuple[Tool, ...] = (),
     step: int = 1,
+    tool_policy: ToolPolicy | None = None,
+    runtime_hooks: tuple[RuntimeHook, ...] = (),
 ) -> Message:
     user_message = Message.text("user", "finish this while no worker is attached")
     interaction_id = f"interaction-{session_id}"
@@ -733,16 +750,9 @@ async def _stage_offline_operation(
     session_identity = profiled_session_identity(
         provider_name=provider.name,
         model="fake-model",
-        direct_tools=(
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "schema": tool.schema,
-                "parallel_safe": tool.spec.parallel_safe,
-                "effect": tool.spec.effect.value,
-            }
-            for tool in tools
-        ),
+        tools=tools,
+        tool_policy=tool_policy,
+        runtime_hooks=runtime_hooks,
     )
     execution_profile = session_identity.execution_profile
     assert execution_profile is not None
@@ -1368,7 +1378,11 @@ def test_unregistered_agent_recovery_leaves_terminal_interaction_and_stage_untou
         store = InMemorySessionStore()
         provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
         session_id = f"terminal-unregistered-agent-{'batch' if batched else 'single'}"
-        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await _stage_offline_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
         await store.update_status(session_id, SessionStatus.COMPLETED)
         await store.append_event(
             session_id,
@@ -3257,6 +3271,7 @@ async def assert_offline_provider_operation_reuses_run_limit_accounting(
         started_at=started_at,
         prior_events=prior_events,
         tools=(tool,),
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
     )
 
     app = CayuApp(session_store=store, enable_logging=False)
@@ -3814,7 +3829,11 @@ def test_interruption_claim_acknowledgement_loss_releases_committed_epoch() -> N
         session_id = "offline-provider-interruption-claim-ack-loss"
         store = _CommitThenRaiseInterruptionClaimStore()
         provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
-        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await _stage_offline_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -3985,7 +4004,12 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition() -
         replacement_provider = _CancellableOfflineOperationProvider()
         hook = _RecordingInterruptedProfileHook()
         session_id = "offline-interruption-frozen-provider"
-        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await _stage_offline_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+            runtime_hooks=(hook,),
+        )
         active_profile = active_invocation_execution_profile_from_checkpoint(
             await store.load_checkpoint(session_id)
         )

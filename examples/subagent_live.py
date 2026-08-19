@@ -14,6 +14,7 @@ from cayu import (
     AgentSpec,
     AnthropicProvider,
     CayuApp,
+    ExecutionProfileBehaviorIdentity,
     InMemoryTaskStore,
     Message,
     OpenAIProvider,
@@ -48,6 +49,11 @@ async def main() -> None:
 
     subagents = SubagentTool(
         app,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="examples:subagent-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
         agents={
             "reviewer": SubagentSpec(
                 agent_name="reviewer",
@@ -57,7 +63,15 @@ async def main() -> None:
             )
         },
     )
-    subagent_result = SubagentResultTool(app.session_store, task_store=task_store)
+    subagent_result = SubagentResultTool(
+        app.session_store,
+        task_store=task_store,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="examples:subagent-result-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
     if mode in {SubagentExecutionMode.BACKGROUND, SubagentExecutionMode.DURABLE}:
         execution_kind = "durable" if mode is SubagentExecutionMode.DURABLE else "background"
         builder_prompt = (

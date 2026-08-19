@@ -19,7 +19,13 @@ from cayu import (
     PostgresSessionStore,
     SQLiteSessionStore,
 )
-from cayu.core import AgentSpec, EventType, Message, ToolEffect
+from cayu.core import (
+    AgentSpec,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    ToolEffect,
+)
 from cayu.core.messages import ProviderStatePart, ThinkingPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
@@ -44,6 +50,8 @@ from cayu.runtime import (
     CayuApp,
     EventQuery,
     EventWatcher,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
     IncompleteSessionRecoveryRequest,
     InMemoryEventSink,
     InMemoryEventWatcherStore,
@@ -84,6 +92,21 @@ from cayu.tools.user_input import UserInputTool
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 
+def _test_behavior_identity(name: str) -> ExecutionProfileBehaviorIdentity:
+    return ExecutionProfileBehaviorIdentity(
+        name=f"tests:tool-start-quarantine:{name}",
+        behavior_version="1",
+        implementation_version="1",
+    )
+
+
+def _portable_environment_spec(name: str) -> EnvironmentSpec:
+    return EnvironmentSpec(
+        name=name,
+        execution_profile_identity=_test_behavior_identity(f"environment:{name}"),
+    )
+
+
 class _ResolveAfterStartTool(Tool):
     spec = ToolSpec(
         name="resolve_after_start",
@@ -92,7 +115,15 @@ class _ResolveAfterStartTool(Tool):
     )
 
     def __init__(self, *, secret_source: str = "vault") -> None:
-        super().__init__()
+        super().__init__(
+            self.spec.model_copy(
+                update={
+                    "execution_profile_identity": _test_behavior_identity(
+                        f"{type(self).__name__}:{secret_source}"
+                    )
+                }
+            )
+        )
         self.secret_source = secret_source
         self.arguments: list[dict[str, Any]] = []
 
@@ -144,6 +175,7 @@ class _ResolveNamedSecretTool(Tool):
         name="resolve_named_secret",
         description="Resolve the named invocation secret.",
         input_schema={"type": "object", "additionalProperties": True},
+        execution_profile_identity=_test_behavior_identity("resolve-named-secret-tool"),
     )
 
     def __init__(self) -> None:
@@ -280,6 +312,10 @@ class _CaptureInterruptedHook(RuntimeHook):
     def __init__(self) -> None:
         self.terminal_events: list[Any] = []
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _test_behavior_identity("capture-interrupted-hook")
+
     async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
         self.terminal_events.append(context.terminal_event)
 
@@ -288,6 +324,10 @@ class _CaptureAfterToolArgumentsHook(RuntimeHook):
     def __init__(self) -> None:
         self.arguments: list[dict[str, Any]] = []
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _test_behavior_identity("capture-after-tool-arguments-hook")
+
     async def after_tool_call(self, context: ToolCallHookContext) -> None:
         self.arguments.append(context.arguments)
 
@@ -295,6 +335,10 @@ class _CaptureAfterToolArgumentsHook(RuntimeHook):
 class _CaptureAfterToolResultsHook(RuntimeHook):
     def __init__(self) -> None:
         self.results: list[ToolResult] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _test_behavior_identity("capture-after-tool-results-hook")
 
     async def after_tool_call(self, context: ToolCallHookContext) -> None:
         self.results.append(context.result)
@@ -710,7 +754,7 @@ def test_restart_blocks_started_call_without_durable_secret_scope(
         first_app.register_provider(provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 vault=first_vault if secret_source == "vault" else None,
                 proxy=PassthroughProxy(first_vault) if secret_source == "proxy" else None,
             ),
@@ -741,7 +785,7 @@ def test_restart_blocks_started_call_without_durable_secret_scope(
         recovery_app = CayuApp(session_store=recovery_store, enable_logging=False)
         recovery_app.register_provider(provider, default=True)
         recovery_app.register_environment(
-            Environment(EnvironmentSpec(name="local")),
+            Environment(_portable_environment_spec("local")),
             default=True,
         )
         recovery_app.register_agent(
@@ -749,17 +793,21 @@ def test_restart_blocks_started_call_without_durable_secret_scope(
             tools=[recovery_tool],
         )
 
-        recovered_events = [
-            event
-            async for event in recovery_app.resume(
-                ResumeRequest(
-                    session_id=session_id,
-                    messages=[Message.text("user", "continue")],
+        with pytest.raises(ExecutionProfileMismatchError) as exc_info:
+            _ = [
+                event
+                async for event in recovery_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                    )
                 )
-            )
-        ]
+            ]
 
-        assert recovered_events[-1].type is EventType.SESSION_FAILED
+        assert exc_info.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
         assert recovery_tool.arguments == []
         assert len(provider.requests) == 1
         durable_events = await recovery_store.load_events(session_id)
@@ -767,7 +815,7 @@ def test_restart_blocks_started_call_without_durable_secret_scope(
         exported = io.StringIO()
         assert await export_sessions(recovery_store, stream=exported) == 1
         assert secret not in repr(first_events)
-        assert secret not in repr(recovered_events)
+        assert secret not in repr(exc_info.value)
         assert secret not in repr(durable_events)
         assert secret not in repr(transcript)
         exported_record = json.loads(exported.getvalue())
@@ -1084,7 +1132,7 @@ async def _run_approval_resolution_scenario() -> None:
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             vault=StaticVault({"api_key": secret}),
         ),
         default=True,
@@ -1118,12 +1166,13 @@ async def _run_approval_resolution_scenario() -> None:
     resumed_app = CayuApp(
         session_store=store,
         event_sinks=[sink],
+        runtime_hooks=[hook],
         enable_logging=False,
     )
     resumed_app.register_provider(provider, default=True)
     resumed_app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             vault=StaticVault({"api_key": secret}),
         ),
         default=True,
@@ -1164,6 +1213,10 @@ def test_approval_pause_keeps_late_secret_arguments_private_until_execution() ->
 
 def test_multi_call_approval_continuation_uses_round_wide_unavailable_arguments() -> None:
     class ApproveFirstCallPolicy(ToolPolicy):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("approve-first-call-policy")
+
         async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
             secret = request.arguments["provided"]
             if request.tool_call_id == "call_requires_approval":
@@ -1190,6 +1243,9 @@ def test_multi_call_approval_continuation_uses_round_wide_unavailable_arguments(
             description="Resolve the secret only for the selected sibling call.",
             input_schema={"type": "object", "additionalProperties": True},
             effect=ToolEffect.NONE,
+            execution_profile_identity=_test_behavior_identity(
+                "resolve-conditionally-after-approval-tool"
+            ),
         )
 
         async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
@@ -1206,6 +1262,10 @@ def test_multi_call_approval_continuation_uses_round_wide_unavailable_arguments(
         def __init__(self) -> None:
             self.results: list[ToolResult] = []
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("capture-after-tool-result-hook")
+
         async def after_tool_call(self, context: ToolCallHookContext) -> None:
             self.results.append(context.result)
 
@@ -1215,6 +1275,7 @@ def test_multi_call_approval_continuation_uses_round_wide_unavailable_arguments(
         sink = InMemoryEventSink()
         watcher_store = InMemoryEventWatcherStore()
         hook = _CaptureInterruptedHook()
+        after_tool_hook = CaptureAfterToolResultHook()
         provider = FakeProvider(
             [
                 [
@@ -1245,13 +1306,13 @@ def test_multi_call_approval_continuation_uses_round_wide_unavailable_arguments(
             session_store=store,
             event_sinks=[sink],
             event_watcher_store=watcher_store,
-            runtime_hooks=[hook],
+            runtime_hooks=[hook, after_tool_hook],
             enable_logging=False,
         )
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 vault=StaticVault({"shared": secret}),
             ),
             default=True,
@@ -1310,17 +1371,16 @@ def test_multi_call_approval_continuation_uses_round_wide_unavailable_arguments(
             )
         assert secret not in repr(observed)
 
-        after_tool_hook = CaptureAfterToolResultHook()
         resumed_app = CayuApp(
             session_store=store,
             event_sinks=[sink],
-            runtime_hooks=[after_tool_hook],
+            runtime_hooks=[hook, after_tool_hook],
             enable_logging=False,
         )
         resumed_app.register_provider(provider, default=True)
         resumed_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 vault=StaticVault({"shared": secret}),
             ),
             default=True,
@@ -1381,6 +1441,10 @@ async def _run_user_input_resolution_scenario() -> None:
     sibling_arguments = {"provided": secret, "nested": {"value": secret}}
 
     class UserInputMixedPolicy(ToolPolicy):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("user-input-mixed-policy")
+
         async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
             if request.tool_call_id == "call_denied_before_input_resolution":
                 return ToolPolicyResult(
@@ -1394,6 +1458,7 @@ async def _run_user_input_resolution_scenario() -> None:
     sink = InMemoryEventSink()
     watcher_store = InMemoryEventWatcherStore()
     hook = _CaptureInterruptedHook()
+    after_tool_hook = _CaptureAfterToolResultsHook()
     provider = FakeProvider(
         [
             [
@@ -1425,14 +1490,14 @@ async def _run_user_input_resolution_scenario() -> None:
         session_store=store,
         event_sinks=[sink],
         event_watcher_store=watcher_store,
-        runtime_hooks=[hook],
+        runtime_hooks=[hook, after_tool_hook],
         secret_redactor=SecretRedactor("tool_call_id"),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             vault=StaticVault({"api_key": secret}),
         ),
         default=True,
@@ -1519,18 +1584,17 @@ async def _run_user_input_resolution_scenario() -> None:
             )
         ),
     )
-    after_tool_hook = _CaptureAfterToolResultsHook()
     restarted_app = CayuApp(
         session_store=store,
         event_sinks=[sink],
-        runtime_hooks=[after_tool_hook],
+        runtime_hooks=[hook, after_tool_hook],
         secret_redactor=SecretRedactor("tool_call_id"),
         enable_logging=False,
     )
     restarted_app.register_provider(provider, default=True)
     restarted_app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             vault=StaticVault({"api_key": secret}),
         ),
         default=True,
@@ -2271,7 +2335,7 @@ async def _run_restart_recovery_scenario() -> None:
     first_app.register_provider(provider, default=True)
     first_app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             vault=StaticVault({"api_key": secret}),
         ),
         default=True,
@@ -2296,7 +2360,7 @@ async def _run_restart_recovery_scenario() -> None:
     recovery_app.register_provider(provider, default=True)
     recovery_app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             vault=StaticVault({"api_key": secret}),
         ),
         default=True,
@@ -2379,7 +2443,7 @@ def test_pre_field_v2_recovery_blocks_missing_invocation_projection() -> None:
         first_app.register_provider(provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 vault=StaticVault({"api_key": secret}),
             ),
             default=True,
@@ -2415,7 +2479,7 @@ def test_pre_field_v2_recovery_blocks_missing_invocation_projection() -> None:
         recovery_app.register_provider(provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 vault=StaticVault({"api_key": secret}),
             ),
             default=True,
@@ -3092,6 +3156,9 @@ def test_restart_fails_closed_for_a_partial_staged_multi_call_round() -> None:
             input_schema={"type": "object", "additionalProperties": True},
             effect=ToolEffect.NONE,
             parallel_safe=False,
+            execution_profile_identity=_test_behavior_identity(
+                "partial-stage-echo-or-resolve-tool"
+            ),
         )
 
         def __init__(self) -> None:
@@ -3136,7 +3203,7 @@ def test_restart_fails_closed_for_a_partial_staged_multi_call_round() -> None:
         first_app.register_provider(provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="dynamic"),
+                _portable_environment_spec("dynamic"),
                 vault=StaticVault({"shared": secret}),
             ),
             default=True,
@@ -3170,7 +3237,7 @@ def test_restart_fails_closed_for_a_partial_staged_multi_call_round() -> None:
         recovery_app.register_provider(provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="dynamic"),
+                _portable_environment_spec("dynamic"),
                 vault=StaticVault({"shared": secret}),
             ),
             default=True,
@@ -3414,6 +3481,10 @@ def test_pause_restart_rejects_static_to_dynamic_secret_scope_upgrade(
     environment_name = "restart-capability"
 
     class PausePolicy(ToolPolicy):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity(f"pause-policy:{pause_kind}")
+
         async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
             if pause_kind == "approval" and request.tool_call_id == "call_pause":
                 return ToolPolicyResult(
@@ -3430,6 +3501,9 @@ def test_pause_restart_rejects_static_to_dynamic_secret_scope_upgrade(
             input_schema={"type": "object", "additionalProperties": True},
             effect=ToolEffect.NONE,
             parallel_safe=False,
+            execution_profile_identity=_test_behavior_identity(
+                "echo-or-resolve-after-restart-tool"
+            ),
         )
 
         def __init__(self) -> None:
@@ -3492,7 +3566,7 @@ def test_pause_restart_rejects_static_to_dynamic_secret_scope_upgrade(
             app.register_provider(provider, default=True)
             app.register_environment(
                 Environment(
-                    EnvironmentSpec(name=environment_name),
+                    _portable_environment_spec(environment_name),
                     vault=(StaticVault({"restart_secret": secret}) if dynamic else None),
                 ),
                 default=True,
@@ -3523,7 +3597,7 @@ def test_pause_restart_rejects_static_to_dynamic_secret_scope_upgrade(
             approval = next(
                 event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
             )
-            with pytest.raises(RuntimeError, match="cannot add dynamic secret resolution"):
+            with pytest.raises(ExecutionProfileMismatchError) as exc_info:
                 await collect_tool_approval_events(
                     restarted_app,
                     ToolApprovalRequest(
@@ -3538,7 +3612,7 @@ def test_pause_restart_rejects_static_to_dynamic_secret_scope_upgrade(
             awaiting = next(
                 event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
             )
-            with pytest.raises(RuntimeError, match="cannot add dynamic secret resolution"):
+            with pytest.raises(ExecutionProfileMismatchError) as exc_info:
                 _ = [
                     event
                     async for event in restarted_app.resolve_user_input(
@@ -3549,6 +3623,10 @@ def test_pause_restart_rejects_static_to_dynamic_secret_scope_upgrade(
                         )
                     )
                 ]
+
+        assert exc_info.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+        )
 
         assert secret in repr(paused)
         assert tool.calls == []
@@ -3566,6 +3644,7 @@ def test_restart_preserves_completed_hooks_and_fails_closed_for_pending_hooks() 
             description="Return one safe result for staged-hook recovery.",
             input_schema={"type": "object", "additionalProperties": True},
             effect=ToolEffect.NONE,
+            execution_profile_identity=_test_behavior_identity("safe-result-tool"),
         )
 
         def __init__(self) -> None:
@@ -3580,6 +3659,10 @@ def test_restart_preserves_completed_hooks_and_fails_closed_for_pending_hooks() 
     class CountingModifyHook(RuntimeHook):
         def __init__(self) -> None:
             self.calls: list[str] = []
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("counting-modify-hook")
 
         async def after_tool_call(
             self,
@@ -3625,7 +3708,7 @@ def test_restart_preserves_completed_hooks_and_fails_closed_for_pending_hooks() 
         first_app.register_provider(provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="dynamic"),
+                _portable_environment_spec("dynamic"),
                 vault=StaticVault({"unused": "unused-secret-canary"}),
             ),
             default=True,
@@ -3656,7 +3739,7 @@ def test_restart_preserves_completed_hooks_and_fails_closed_for_pending_hooks() 
         recovery_app.register_provider(provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="dynamic"),
+                _portable_environment_spec("dynamic"),
                 vault=StaticVault({"unused": "unused-secret-canary"}),
             ),
             default=True,

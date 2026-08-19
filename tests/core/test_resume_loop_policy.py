@@ -13,6 +13,7 @@ from cayu import (
     BeforeStopContext,
     BeforeStopDecision,
     CayuApp,
+    ExecutionProfileBehaviorIdentity,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     LoopPolicy,
@@ -33,6 +34,14 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
         def __deepcopy__(self, _memo):
             raise AssertionError("request loop policies must not be deep-copied")
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:resume-loop-policy:stateful-policy",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def before_stop(self, _context: BeforeStopContext) -> BeforeStopDecision:
             self.calls += 1
             return BeforeStopDecision.complete()
@@ -49,6 +58,7 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
         initial = Message.text("user", "start")
+        policy = StatefulPolicy()
         await store.create(
             RunRequest(
                 agent_name="assistant",
@@ -58,6 +68,7 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
             identity=profiled_session_identity(
                 provider_name=provider.name,
                 model="scripted-model",
+                invocation_loop_policies=(policy,),
             ),
         )
         interaction_id = "interaction_stateful_policy_resume"
@@ -85,7 +96,6 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
         )
         assert recovered.status is SessionStatus.INTERRUPTED
 
-        policy = StatefulPolicy()
         events = [
             event
             async for event in app.resume(

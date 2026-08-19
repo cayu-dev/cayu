@@ -19,6 +19,7 @@ from cayu import (
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     InMemoryTaskStore,
     Message,
     ModelStreamEvent,
@@ -158,6 +159,11 @@ class _PublishChangeTool(Tool):
             "required": ["change"],
         },
         effect=ToolEffect.EXTERNAL,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:task-worker:publish-change-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

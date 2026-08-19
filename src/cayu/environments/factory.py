@@ -19,6 +19,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionRequirements,
@@ -651,6 +652,12 @@ class EnvironmentFactoryResult:
 
 class EnvironmentFactory(ABC):
     """Creates or attaches a concrete environment for a session."""
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return a stable application declaration, or ``None`` when non-portable."""
+
+        return None
 
     def execution_admission_candidate(
         self,

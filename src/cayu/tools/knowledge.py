@@ -337,6 +337,14 @@ class SearchKnowledgeTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, Any]:
+        """Return the bounded configuration that governs knowledge search."""
+
+        return {
+            "allow_score_override": self._allow_score_override,
+            "auto_min_score": self._auto_min_score,
+        }
+
     def __init__(
         self,
         spec: ToolSpec | None = None,
@@ -536,6 +544,24 @@ class RememberKnowledgeTool(Tool):
             "required": ["text"],
         },
     )
+
+    def _execution_profile_material(self) -> dict[str, Any] | None:
+        """Return material only when the write policy is Cayu's public default."""
+
+        policy = self._policy
+        if policy != RememberKnowledgePolicy():
+            # Application policy contains exact storage scope and attribution
+            # values. Even an unkeyed hash of that low-entropy material would
+            # provide a durable offline guessing oracle. Callers that need
+            # cross-process portability must explicitly version the behavior
+            # through ToolSpec.execution_profile_identity.
+            return None
+        return {
+            "policy": "cayu_default",
+            "max_text_bytes": self._max_text_bytes,
+            "chunk_target_bytes": self._chunk_target_bytes,
+            "max_chunks": self._max_chunks,
+        }
 
     def __init__(
         self,
@@ -1778,6 +1804,9 @@ class ListKnowledgeTool(Tool):
         },
     )
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
@@ -1944,6 +1973,9 @@ class ReadKnowledgeTool(Tool):
             "required": ["entry_id"],
         },
     )
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

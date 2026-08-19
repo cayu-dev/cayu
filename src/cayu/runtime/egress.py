@@ -39,6 +39,10 @@ from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu._workspace_mutation import detached_workspace_mutation_process_signal
 from cayu.artifacts import ArtifactStore
 from cayu.core.events import Event, EventType
+from cayu.core.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
 from cayu.egress import (
     ApprovedEgressDestination,
     CredentialKind,
@@ -371,6 +375,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         event_emitter: EventEmitter | None = None,
         upstream: EgressUpstream | None = None,
         require_test_mode_credentials: bool = True,
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
     ) -> None:
         if not credentials and not approved_destinations:
             raise ValueError(
@@ -439,6 +444,15 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._emitter = event_emitter
         self._upstream = upstream
         self._require_test_mode = require_test_mode_credentials
+        self._execution_profile_identity = copy_execution_profile_behavior_identity(
+            execution_profile_identity
+        )
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return the application declaration for this configured egress factory."""
+
+        return self._execution_profile_identity
 
     def execution_admission_candidate(
         self,

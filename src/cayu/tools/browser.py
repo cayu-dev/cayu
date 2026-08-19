@@ -236,6 +236,25 @@ class BrowserWebFetchAdapter:
         self.max_requests = _bounded_max_requests(max_requests)
         self.max_dom_nodes = _bounded_max_dom_nodes(max_dom_nodes)
 
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        """Return material only for Cayu's shipped browser worker."""
+
+        # An arbitrary executable can change independently while retaining the
+        # same command spelling supplied by an application.
+        worker_argv = self._worker_command.argv
+        if worker_argv is None or worker_argv != list(DEFAULT_BROWSER_FETCH_WORKER_COMMAND):
+            return None
+        return {
+            "component": "cayu.tools.browser:BrowserWebFetchAdapter",
+            "worker_command": {
+                "kind": self._worker_command.kind,
+                "argv": list(worker_argv),
+                "shell": self._worker_command.shell,
+            },
+            "max_requests": self.max_requests,
+            "max_dom_nodes": self.max_dom_nodes,
+        }
+
     async def fetch(
         self,
         ctx: ToolContext,

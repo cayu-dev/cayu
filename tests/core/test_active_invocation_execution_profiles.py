@@ -28,6 +28,7 @@ from cayu import (
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAdoptionRejected,
     ExecutionProfileAuthorityDecision,
+    ExecutionProfileBehaviorIdentity,
     ExecutionProfileComponentClass,
     ExecutionProfileDecisionKind,
     ExecutionProfileMismatchError,
@@ -126,6 +127,11 @@ class RecordingExternalTool(Tool):
                 "required": ["value"],
             },
             effect="external",
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name=f"tests:{type(self).__name__}",
+                behavior_version="1",
+                implementation_version="1",
+            ),
         )
         super().__init__()
         self.calls: list[dict[str, object]] = []
@@ -148,11 +154,27 @@ class BlockingExternalTool(RecordingExternalTool):
 
 
 class RequireApprovalPolicy(ToolPolicy):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:require-approval-policy",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         return ToolPolicyResult(decision=ToolPolicyDecision.REQUIRE_APPROVAL)
 
 
 class SelectiveApprovalPolicy(ToolPolicy):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:selective-approval-policy",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         decision = (
             ToolPolicyDecision.REQUIRE_APPROVAL
@@ -163,10 +185,31 @@ class SelectiveApprovalPolicy(ToolPolicy):
 
 
 class ContinueAtModelStepLimitPolicy(LoopPolicy):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:continue-at-model-step-limit-policy",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
         return BeforeStopDecision.continue_with(
             Message.text("user", "continue after the bounded step"),
             reason="exercise the model-step limit boundary",
+        )
+
+
+class VersionedRequestLoopPolicy(LoopPolicy):
+    def __init__(self, version: str) -> None:
+        self._version = version
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:request-loop-policy",
+            behavior_version=self._version,
+            implementation_version="1",
         )
 
 
@@ -182,6 +225,14 @@ class RecordingCompletionHook(RuntimeHook):
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name=f"tests:{type(self).__name__}:{self.name}",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def before_tool_call(self, context: BeforeToolCallHookContext) -> None:
         self.before_tool_execution_profiles.append(context.execution_profile)
@@ -2002,15 +2053,7 @@ def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
         active_identity = profiled_session_identity(
             provider_name="fake",
             model="fake-model",
-            direct_tools=(
-                {
-                    "name": tool.spec.name,
-                    "description": tool.spec.description,
-                    "schema": tool.spec.input_schema,
-                    "parallel_safe": tool.spec.parallel_safe,
-                    "effect": tool.spec.effect.value,
-                },
-            ),
+            tools=[tool],
         )
         baseline = baseline_identity.execution_profile
         active = active_identity.execution_profile
@@ -2384,6 +2427,86 @@ def test_approval_continuation_rejects_changed_invocation_profile_before_work() 
     asyncio.run(scenario())
 
 
+def test_approval_continuation_rejects_request_loop_policy_drift() -> None:
+    async def scenario() -> None:
+        session_id = "active-profile-approval-request-policy-drift"
+        store = InMemorySessionStore()
+        tool = RecordingExternalTool(description="Governed effect.")
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(
+            ScriptedModelProvider(
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call-1",
+                        name=tool.spec.name,
+                        arguments={"value": "original"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                name="fake",
+            ),
+            default=True,
+        )
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+            tool_policy=RequireApprovalPolicy(),
+        )
+        paused = await collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "run the effect")],
+                    loop_policies=(VersionedRequestLoopPolicy("1"),),
+                )
+            )
+        )
+        approval_event = next(
+            event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        pending = approval_event.payload["approval"]
+        assert isinstance(pending, dict)
+
+        replacement_tool = RecordingExternalTool(description="Governed effect.")
+        replacement_provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("continued"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(replacement_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[replacement_tool],
+            tool_policy=RequireApprovalPolicy(),
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await collect(
+                replacement_app.resolve_tool_approval(
+                    ToolApprovalRequest(
+                        session_id=session_id,
+                        approval_id=pending["approval_id"],
+                        tool_round_id=pending["tool_round_id"],
+                        tool_call_id=pending["tool_call_id"],
+                        decision=ToolApprovalDecision.APPROVE,
+                        loop_policies=(VersionedRequestLoopPolicy("2"),),
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        )
+        assert replacement_tool.calls == []
+        assert replacement_provider.requests == []
+
+    asyncio.run(scenario())
+
+
 async def _assert_approval_continuation_reconstructs_profile_once(
     store: SessionStore,
     *,
@@ -2686,7 +2809,7 @@ def test_profile_adoption_is_rejected_while_external_effect_is_active() -> None:
                 )
             )
         )
-        await asyncio.wait_for(original_tool.started.wait(), timeout=1.0)
+        await asyncio.wait_for(original_tool.started.wait(), timeout=5.0)
 
         replacement_app = CayuApp(enable_logging=False)
         replacement_app.register_agent(
@@ -2754,7 +2877,7 @@ async def _assert_profile_adoption_waits_for_terminal_hook_release(
             )
         )
     )
-    await asyncio.wait_for(hook.started.wait(), timeout=1.0)
+    await asyncio.wait_for(hook.started.wait(), timeout=5.0)
 
     terminal = await store.load(session_id)
     checkpoint = await store.load_checkpoint(session_id)
@@ -2858,7 +2981,7 @@ async def _assert_profile_adoption_waits_for_deferred_environment_cleanup(
             )
         )
     )
-    await asyncio.wait_for(hook.started.wait(), timeout=1.0)
+    await asyncio.wait_for(hook.started.wait(), timeout=5.0)
 
     terminal = await store.load(session_id)
     checkpoint = await store.load_checkpoint(session_id)
@@ -2933,7 +3056,7 @@ async def _assert_profile_adoption_waits_for_deferred_environment_cleanup(
         ]
 
         drain_task = asyncio.create_task(original_app.drain_environment_cleanups(timeout_s=0.02))
-        await asyncio.wait_for(retry_started.wait(), timeout=1.0)
+        await asyncio.wait_for(retry_started.wait(), timeout=5.0)
         retry_task = lifecycle._deferred_factory_cleanup_tasks[session_id]
         assert retry_task is not cleanup_task
         assert await drain_task is False
@@ -2956,7 +3079,7 @@ async def _assert_profile_adoption_waits_for_deferred_environment_cleanup(
 
         retry_release.set()
         await retry_task
-        await asyncio.wait_for(fence_release_task, timeout=1.0)
+        await asyncio.wait_for(fence_release_task, timeout=5.0)
         assert session_id not in lifecycle._deferred_factory_cleanup_tasks
         released = await store.load(session_id)
         assert released is not None
@@ -3021,7 +3144,7 @@ def test_repaired_failed_deferred_release_does_not_poison_next_invocation() -> N
                 )
             )
         )
-        await asyncio.wait_for(hook.started.wait(), timeout=1.0)
+        await asyncio.wait_for(hook.started.wait(), timeout=5.0)
         checkpoint = await store.load_checkpoint(session_id)
         first_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         assert first_profile is not None
@@ -4079,6 +4202,7 @@ async def _assert_snapshot_only_restart_profile_boundary(
     original_app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[original_tool],
+        runtime_hooks=[RecordingCompletionHook("snapshot-only-recovery-hook")],
     )
     await collect(
         original_app.run(

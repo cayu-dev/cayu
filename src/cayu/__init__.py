@@ -33,6 +33,7 @@ from cayu.artifacts import (
 )
 from cayu.core.agents import Agent, AgentAuthoringState, AgentSpec
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -1689,6 +1690,7 @@ __all__ = [
     "ExecutionProfileAdoptionIntent",
     "ExecutionProfileAdoptionRejected",
     "ExecutionProfileAuthorityDecision",
+    "ExecutionProfileBehaviorIdentity",
     "ExecutionProfileComponentClass",
     "ExecutionProfileComponentIdentity",
     "ExecutionProfileDecision",

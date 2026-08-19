@@ -41,6 +41,7 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runners._cleanup import RunnerCleanupResult
 from cayu.runners._diagnostics import (
     trusted_runner_error_type_name,
@@ -718,6 +719,12 @@ class Runner(ABC):
     isolation: str = "unknown"
     default_cwd: str = "/"
     system_execution_mode: RunnerSystemExecutionMode = "shared"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return a stable application declaration, or ``None`` when non-portable."""
+
+        return None
 
     _closed: bool = False
     _exec_closed: bool = False

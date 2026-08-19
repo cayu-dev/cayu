@@ -25,7 +25,17 @@ from cayu._exception_state import set_exception_state
 from cayu._validation import canonical_durable_json_bytes
 from cayu._workspace_mutation import WorkspaceMutationSettlementError
 from cayu.artifacts import ArtifactMetadata, ArtifactScope, LocalArtifactStore
-from cayu.core import AgentSpec, Event, EventType, Message, Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.environments import (
     DeterministicWorkspaceBinding,
     Environment,
@@ -113,6 +123,19 @@ def _admit_test_workspace_observation_intent(
 
 async def collect_events(app: CayuApp, request: RunRequest):
     return [event async for event in app.run(request)]
+
+
+def _portable_environment_spec(name: str) -> EnvironmentSpec:
+    """Declare equivalent test environments portable across recovery app instances."""
+
+    return EnvironmentSpec(
+        name=name,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name=f"tests:workspace-mutation-receipts:{name}",
+            behavior_version="stable",
+            implementation_version="test-build",
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -427,6 +450,11 @@ class _BulkWriteTool(Tool):
         name="bulk_write",
         parallel_safe=False,
         workspace_mutation=True,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:bulk-write-tool",
+            behavior_version="stable",
+            implementation_version="test-build",
+        ),
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -443,6 +471,11 @@ class _NoopWorkspaceMutationTool(Tool):
         name="noop_workspace_mutation",
         parallel_safe=False,
         workspace_mutation=True,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:noop-workspace-mutation-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -889,6 +922,14 @@ class _WorkspaceObservationRecoveryFactory(EnvironmentFactory):
         self.workspace_id = workspace_id
         self.create_calls = 0
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:workspace-observation-recovery-factory",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def create(
         self,
         request: EnvironmentFactoryRequest,
@@ -897,7 +938,7 @@ class _WorkspaceObservationRecoveryFactory(EnvironmentFactory):
         self.root.mkdir(parents=True, exist_ok=True)
         return EnvironmentFactoryResult(
             Environment(
-                EnvironmentSpec(name=request.environment_name),
+                _portable_environment_spec(request.environment_name),
                 workspace=LocalWorkspace(self.root, workspace_id=self.workspace_id),
                 runner=LocalRunner(self.root),
                 binding=DeterministicWorkspaceBinding(),
@@ -1780,7 +1821,7 @@ def test_workspace_mutation_without_binding_records_unsupported_evidence(tmp_pat
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="unconfigured-binding-workspace"),
             ),
             default=True,
@@ -1863,7 +1904,7 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="git-workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=GitRepositoryBinding(
@@ -1992,7 +2033,7 @@ def test_configured_observation_identity_is_admitted_before_durable_intent(
         binding_type = type(secret_identity, (DeterministicWorkspaceBinding,), {})
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(
                     tmp_path,
                     workspace_id=(
@@ -2086,7 +2127,7 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id=secret_identity),
                 binding=AbortAfterIntentBinding(),
                 vault=StaticVault({"workspace_identity": secret_identity}),
@@ -2126,7 +2167,7 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
         recovery_app.register_provider(recovery_provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id=secret_identity),
                 binding=AbortAfterIntentBinding(),
                 vault=StaticVault({"workspace_identity": secret_identity}),
@@ -2210,7 +2251,7 @@ def test_cancellation_resistant_final_observer_fences_finalization_and_reuse(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="final-observer-workspace"),
                 binding=binding,
             ),
@@ -2281,7 +2322,7 @@ def test_final_workspace_observer_restores_caller_cancellation_requests(
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="final-cancel-workspace"),
                 binding=binding,
             ),
@@ -2862,7 +2903,7 @@ def test_thread_backed_before_observer_timeout_fences_tool_dispatch_and_reuse(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="thread-observer-workspace"),
                 binding=binding,
             ),
@@ -2932,7 +2973,7 @@ def test_cancellation_resistant_after_observer_fences_finalization_and_reuse(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="after-observer-workspace"),
                 binding=binding,
             ),
@@ -3024,7 +3065,7 @@ def test_detached_runner_mutation_settles_before_receipt_and_following_tool(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -3111,7 +3152,7 @@ def test_supervisory_tool_exit_fences_environment_reuse_until_detached_mutation_
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
             ),
@@ -3187,7 +3228,7 @@ def test_workspace_mutation_generator_exit_propagates_without_false_terminal_evi
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=_GeneratorExitWorkspace(
                     tmp_path,
                     workspace_id="generator-exit-mutation-workspace",
@@ -3242,7 +3283,7 @@ def test_cancelled_runner_mutation_returns_promptly_and_fences_reuse(tmp_path) -
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -3315,7 +3356,7 @@ def test_public_runner_cancellation_before_dispatch_does_not_quarantine_reuse(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -3389,7 +3430,7 @@ def test_timed_out_runner_mutation_returns_promptly_and_fences_reuse(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -3470,7 +3511,7 @@ def test_supervisory_runner_signal_retains_environment_fence_until_settlement(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -3559,7 +3600,7 @@ def test_supervisory_exit_during_runner_dispatch_fences_reuse_through_deferred_s
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -3662,7 +3703,7 @@ def test_unproven_runner_mutation_stops_before_receipt_and_following_tool(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=binding,
@@ -3753,7 +3794,7 @@ def test_unproven_runner_mutation_fences_environment_reuse_until_settled(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=binding,
@@ -3843,7 +3884,7 @@ def test_concurrent_factory_mutations_retain_every_child_settlement_owner(
             await self.initial_pair_created.wait()
             return EnvironmentFactoryResult(
                 Environment(
-                    EnvironmentSpec(name=request.environment_name),
+                    _portable_environment_spec(request.environment_name),
                     workspace=LocalWorkspace(
                         root,
                         workspace_id=f"factory-{request.session_id}",
@@ -3859,7 +3900,7 @@ def test_concurrent_factory_mutations_retain_every_child_settlement_owner(
         app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_environment_factory(
-            EnvironmentSpec(name="dynamic"),
+            _portable_environment_spec("dynamic"),
             factory,
             default=True,
         )
@@ -3969,7 +4010,7 @@ def test_operator_cleanup_drain_settles_retained_runner_mutation_fence(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=binding,
@@ -4024,7 +4065,7 @@ def test_cancelled_environment_reuse_wait_keeps_settlement_probe_owned(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=binding,
@@ -4104,7 +4145,7 @@ def test_hostile_runner_artifact_fails_closed_without_diagnostic_leakage(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=binding,
@@ -4217,7 +4258,7 @@ def test_runner_settlement_signal_is_sanitized_at_public_runtime_boundary(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -4315,7 +4356,7 @@ def test_cayu_app_records_git_workspace_mutation_receipt_before_initial_commit(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="unborn-git-workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=GitRepositoryBinding(
@@ -4370,7 +4411,7 @@ def test_cayu_app_records_durable_no_change_workspace_mutation_receipt(tmp_path)
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="no-change-workspace"),
                 binding=DeterministicWorkspaceBinding(),
             ),
@@ -4432,7 +4473,7 @@ def test_malformed_deterministic_workspace_result_is_typed_capture_failure(tmp_p
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=_MalformedListWorkspace(
                     tmp_path,
                     workspace_id="malformed-result-workspace",
@@ -4494,7 +4535,7 @@ def test_workspace_receipt_waits_for_dynamic_secret_scope_before_publication(
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             workspace=LocalWorkspace(
                 workspace_root,
                 workspace_id="workspace-secret-scope",
@@ -4581,7 +4622,7 @@ def test_terminal_workspace_revision_quarantines_dynamic_secret_scope(
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             workspace=LocalWorkspace(tmp_path, workspace_id="git-secret-workspace"),
             runner=LocalRunner(tmp_path),
             binding=GitRepositoryBinding(
@@ -4679,7 +4720,7 @@ def test_private_workspace_arguments_quarantine_receipt_paths(
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             workspace=LocalWorkspace(tmp_path, workspace_id="workspace-private-argument"),
             binding=DeterministicWorkspaceBinding(),
         ),
@@ -4738,7 +4779,7 @@ def test_multi_call_workspace_receipt_cannot_precede_sibling_secret_scope(
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             workspace=LocalWorkspace(tmp_path, workspace_id="workspace-sibling-secret"),
             binding=DeterministicWorkspaceBinding(),
             vault=StaticVault({"workspace_path": secret_path}),
@@ -4800,7 +4841,7 @@ def test_stream_abandonment_remains_authoritative_during_staged_settlement_failu
         app.register_provider(_AwaitedRunnerAndFollowingProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 runner=runner,
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
@@ -4853,7 +4894,7 @@ def test_approval_resume_preserves_workspace_receipt_model_step(tmp_path) -> Non
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -4910,7 +4951,7 @@ def test_user_input_resume_preserves_workspace_receipt_model_step(tmp_path) -> N
         app.register_provider(_UserInputThenMutationProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -4993,7 +5034,7 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
         app.register_provider(_BulkProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="git-workspace"),
                 runner=LocalRunner(workspace_root),
                 artifact_store=artifacts,
@@ -5106,7 +5147,7 @@ def test_artifact_store_failures_are_bounded_without_replacing_tool_outcome(
         app.register_provider(_BulkProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=artifact_store_type(artifact_root),
                 binding=DeterministicWorkspaceBinding(),
@@ -5164,7 +5205,7 @@ def test_artifact_store_generator_exit_propagates_without_false_terminal_evidenc
         app.register_provider(_BulkProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=_GeneratorExitArtifactStore(artifact_root),
                 binding=DeterministicWorkspaceBinding(),
@@ -5214,7 +5255,7 @@ def test_artifact_store_process_control_is_not_lost_to_concurrent_cancellation(
         app.register_provider(_BulkProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=artifact_store,
                 binding=DeterministicWorkspaceBinding(),
@@ -5433,7 +5474,7 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=_GeneratorExitArtifactStore(artifact_root),
                 binding=DeterministicWorkspaceBinding(),
@@ -5650,7 +5691,7 @@ def test_stalled_receipt_artifact_write_is_bounded_without_replacing_tool_outcom
         app.register_provider(_BulkProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=artifacts,
                 binding=DeterministicWorkspaceBinding(),
@@ -5725,7 +5766,7 @@ def test_receipt_artifacts_inside_workspace_do_not_contaminate_tool_delta(tmp_pa
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="git-workspace"),
                 runner=LocalRunner(tmp_path),
                 artifact_store=LocalArtifactStore(tmp_path / ".artifacts"),
@@ -5798,7 +5839,7 @@ def test_revision_observer_failure_is_visible_without_replacing_tool_outcome(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=binding,
@@ -5849,7 +5890,7 @@ def test_revision_observer_runtime_limit_is_typed_without_replacing_tool_outcome
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=_OversizedObserverBinding(),
@@ -5903,7 +5944,7 @@ def test_malformed_revision_observer_is_sanitized_before_serialization(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=_MalformedObserverBinding(),
@@ -5958,7 +5999,7 @@ def test_observer_owned_cancellation_fails_closed_before_tool_dispatch(tmp_path)
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=_ChildCancelledObserverBinding(),
@@ -6028,7 +6069,7 @@ def test_observer_owned_generator_exit_propagates_and_does_not_quarantine_reuse(
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="generator-exit-workspace"),
                 binding=binding,
             ),
@@ -6082,7 +6123,7 @@ def test_observer_process_control_is_not_lost_to_concurrent_cancellation(
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="concurrent-control-workspace"),
                 binding=binding,
             ),
@@ -6159,7 +6200,7 @@ def test_stalled_observer_is_bounded_without_replacing_tool_outcome(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=binding,
@@ -6208,7 +6249,7 @@ def test_caller_cancellation_during_after_observation_preserves_tool_terminal(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=binding,
@@ -6271,7 +6312,7 @@ def test_operator_interruption_during_receipt_append_preserves_tool_terminal(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6339,7 +6380,7 @@ def test_terminal_failure_after_capture_cancellation_preserves_caller_cancellati
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6402,7 +6443,7 @@ def test_later_terminal_cancellation_does_not_replace_capture_cancellation(tmp_p
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6463,7 +6504,7 @@ def test_workspace_capture_publication_failure_preserves_tool_terminal(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6528,7 +6569,7 @@ def test_committed_malformed_workspace_acknowledgement_reconciles_exact_receipt(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6587,7 +6628,7 @@ def test_uncommitted_malformed_workspace_acknowledgement_is_not_fanned_out(
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6652,7 +6693,7 @@ def test_cancelled_workspace_publication_preserves_initial_and_reconciliation_fa
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6707,7 +6748,7 @@ def test_self_consistent_conflicting_workspace_acknowledgement_is_not_fanned_out
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6814,7 +6855,7 @@ def test_abandoning_after_workspace_event_does_not_erase_tool_terminal(tmp_path)
         app.register_provider(_ScriptedProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6885,7 +6926,7 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
         first_app.register_provider(first_provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6931,7 +6972,7 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
         recovery_app.register_provider(recovery_provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -6947,7 +6988,7 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
         competing_app.register_provider(competing_provider, default=True)
         competing_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -7059,7 +7100,7 @@ def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
         first_app = CayuApp(session_store=store, enable_logging=False)
         first_app.register_provider(first_provider, default=True)
         first_app.register_environment_factory(
-            EnvironmentSpec(name="dynamic"),
+            _portable_environment_spec("dynamic"),
             first_factory,
             default=True,
         )
@@ -7096,7 +7137,7 @@ def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(recovery_provider, default=True)
         recovery_app.register_environment_factory(
-            EnvironmentSpec(name="dynamic"),
+            _portable_environment_spec("dynamic"),
             recovery_factory,
             default=True,
         )
@@ -7183,7 +7224,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
         first_app.register_provider(first_provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -7217,7 +7258,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
         recovery_app.register_provider(recovery_provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -7358,7 +7399,7 @@ def test_workspace_observation_recovery_reports_partial_artifact_state(
         first_app.register_provider(first_provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=artifact_store,
                 binding=DeterministicWorkspaceBinding(),
@@ -7417,7 +7458,7 @@ def test_workspace_observation_recovery_reports_partial_artifact_state(
         )
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=recovery_artifact_store,
                 binding=DeterministicWorkspaceBinding(),
@@ -7493,7 +7534,7 @@ def test_recovery_does_not_downgrade_failed_delta_when_artifact_is_missing(
         first_app.register_provider(_BulkProvider(), default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=artifact_store,
                 binding=DeterministicWorkspaceBinding(),
@@ -7529,7 +7570,7 @@ def test_recovery_does_not_downgrade_failed_delta_when_artifact_is_missing(
         recovery_app.register_provider(_BulkProvider(), default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=LocalArtifactStore(
                     artifact_root,
@@ -7579,7 +7620,7 @@ def test_recovery_retains_late_artifact_intent_until_store_cleanup(
         first_app.register_provider(_BulkProvider(), default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=artifacts,
                 binding=DeterministicWorkspaceBinding(),
@@ -7617,7 +7658,7 @@ def test_recovery_retains_late_artifact_intent_until_store_cleanup(
         recovery_app.register_provider(_BulkProvider(), default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=artifacts,
                 binding=DeterministicWorkspaceBinding(),
@@ -7703,7 +7744,7 @@ def test_workspace_observation_recovery_rejects_foreign_authority_before_artifac
         first_app.register_provider(_BulkProvider(), default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=LocalArtifactStore(
                     artifact_root,
@@ -7759,7 +7800,7 @@ def test_workspace_observation_recovery_rejects_foreign_authority_before_artifac
         recovery_app.register_provider(_BulkProvider(), default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=tracking_store,
                 binding=DeterministicWorkspaceBinding(),
@@ -7817,7 +7858,7 @@ def test_workspace_observation_recovery_rejects_same_name_observer_authority_cha
         first_app.register_provider(_ScriptedProvider(), default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=first_binding,
@@ -7864,7 +7905,7 @@ def test_workspace_observation_recovery_rejects_same_name_observer_authority_cha
         recovery_app.register_provider(recovery_provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=recovery_binding,
@@ -7906,7 +7947,7 @@ def test_workspace_observation_recovery_rejects_foreign_durable_tool_outcome(
         first_app.register_provider(first_provider, default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=LocalArtifactStore(
                     artifact_root,
@@ -7970,7 +8011,7 @@ def test_workspace_observation_recovery_rejects_foreign_durable_tool_outcome(
         recovery_app.register_provider(recovery_provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=tracking_store,
                 binding=DeterministicWorkspaceBinding(),
@@ -8026,7 +8067,7 @@ def test_workspace_observation_recovery_rejects_foreign_delta_event(
         first_app.register_provider(_ScriptedProvider(), default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -8097,7 +8138,7 @@ def test_workspace_observation_recovery_rejects_foreign_delta_event(
         recovery_app.register_provider(recovery_provider, default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 runner=LocalRunner(tmp_path),
                 binding=DeterministicWorkspaceBinding(),
@@ -8137,7 +8178,7 @@ def test_workspace_observation_recovery_validates_delta_before_artifact_read(
         first_app.register_provider(_BulkProvider(), default=True)
         first_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=LocalArtifactStore(
                     artifact_root,
@@ -8197,7 +8238,7 @@ def test_workspace_observation_recovery_validates_delta_before_artifact_read(
         recovery_app.register_provider(_BulkProvider(), default=True)
         recovery_app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
                 artifact_store=tracking_store,
                 binding=DeterministicWorkspaceBinding(),
@@ -8232,7 +8273,7 @@ def test_workspace_receipt_closes_before_tool_cancellation_propagates(tmp_path) 
         app.register_provider(_CancelProvider(), default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
                 binding=DeterministicWorkspaceBinding(),
             ),
@@ -8289,7 +8330,7 @@ def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_timeout(
     )
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             workspace=workspace,
             binding=DeterministicWorkspaceBinding(),
         ),
@@ -8351,7 +8392,7 @@ def test_workspace_receipt_waits_for_cancellation_opaque_mutation_after_task_can
     )
     app.register_environment(
         Environment(
-            EnvironmentSpec(name="local"),
+            _portable_environment_spec("local"),
             workspace=workspace,
             binding=DeterministicWorkspaceBinding(),
         ),
@@ -8421,7 +8462,7 @@ def test_store_cancellation_group_during_mutation_settlement_is_operational_fail
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
             ),
@@ -8490,7 +8531,7 @@ def test_caller_cancellation_remains_authoritative_over_mutation_failure_group(
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
             ),
@@ -8550,7 +8591,7 @@ def test_repeated_cancellation_during_mutation_settlement_preserves_original(
         )
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
             ),
@@ -8626,7 +8667,7 @@ def test_supervisory_exit_during_cancelled_mutation_close_fences_environment_reu
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
-                EnvironmentSpec(name="local"),
+                _portable_environment_spec("local"),
                 workspace=workspace,
                 binding=DeterministicWorkspaceBinding(),
             ),

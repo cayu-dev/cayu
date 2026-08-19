@@ -147,6 +147,20 @@ class SearchTextTool(Tool):
         max_limit=MAX_SEARCH_LIMIT,
     )
 
+    def _execution_profile_material(self) -> dict[str, Any]:
+        """Return the bounded configuration that governs search behavior."""
+
+        return {
+            "default_limit": self.default_limit,
+            "max_limit": self.max_limit,
+            "max_preview_bytes": self.max_preview_bytes,
+            "max_result_bytes": self.max_result_bytes,
+            "timeout_s": self.timeout_s,
+            "capture_limit_bytes": self.capture_limit_bytes,
+            "max_file_size_bytes": self.max_file_size_bytes,
+            "exclude_directories": list(self.exclude_directories),
+        }
+
     def __init__(
         self,
         *,

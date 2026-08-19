@@ -183,7 +183,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert "create_agent_service(" in service_source
 
     security_test = (project / "tests/test_public_service_security.py").read_text(encoding="utf-8")
-    assert "build_execution_profile_identity" in security_test
+    assert "resolve_execution_profile_identity" in security_test
     for phrase in (
         "anonymous",
         "cross_tenant",
@@ -193,7 +193,6 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
         "background",
         "oversized",
         "profiled_session_identity",
-        "build_execution_profile_identity",
         "SessionInvocationAdmission",
         "admit_session_invocation",
     ):

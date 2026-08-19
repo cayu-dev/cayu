@@ -183,6 +183,9 @@ class WebFetchHttpTransport(Protocol):
 class SystemWebFetchResolver:
     """Resolve destinations with the local operating system resolver."""
 
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {}
+
     async def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
         return await resolve_destination(hostname, port)
 
@@ -192,6 +195,11 @@ class HttpxWebFetchTransport:
 
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
+
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        # A caller-provided HTTPX transport is executable behavior that can
+        # change independently of Cayu's release.
+        return {} if self._transport is None else None
 
     async def fetch(self, request: WebFetchHttpRequest) -> WebFetchHttpResponse:
         headers = {
@@ -272,6 +280,40 @@ class WebFetchTool(Tool):
             "required": ["url"],
         },
     )
+
+    def _execution_profile_material(self) -> dict[str, Any] | None:
+        """Return bounded fetch behavior when every collaborator is Cayu-owned."""
+
+        common = {
+            "max_response_bytes": self.max_response_bytes,
+            "max_content_bytes": self.max_content_bytes,
+            "timeout_seconds": self.timeout_seconds,
+            "max_redirects": self.max_redirects,
+        }
+        if self.adapter is not None:
+            # Browser imports this module, so keep the reverse edge local to the
+            # admission-only path after both modules have initialized.
+            from cayu.tools.browser import BrowserWebFetchAdapter
+
+            if type(self.adapter) is not BrowserWebFetchAdapter:
+                return None
+            adapter_material = BrowserWebFetchAdapter._execution_profile_material(self.adapter)
+            if adapter_material is None:
+                return None
+            return {**common, "adapter": adapter_material}
+        if type(self.resolver) is not SystemWebFetchResolver:
+            return None
+        if SystemWebFetchResolver._execution_profile_material(self.resolver) is None:
+            return None
+        if type(self.transport) is not HttpxWebFetchTransport:
+            return None
+        if HttpxWebFetchTransport._execution_profile_material(self.transport) is None:
+            return None
+        return {
+            **common,
+            "resolver": "cayu.tools.web:SystemWebFetchResolver",
+            "transport": "cayu.tools.web:HttpxWebFetchTransport",
+        }
 
     def __init__(
         self,

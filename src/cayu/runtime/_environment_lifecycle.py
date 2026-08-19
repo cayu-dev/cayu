@@ -1029,6 +1029,9 @@ class EnvironmentLifecycle:
                 spec=registered_environment.spec,
                 environment=environment,
                 factory_backed=True,
+                factory_execution_profile_identity=(
+                    registered_environment.factory_execution_profile_identity
+                ),
                 execution_candidate=(
                     None if admission_candidate is None else admission_candidate.candidate
                 ),
@@ -1613,6 +1616,12 @@ class EnvironmentLifecycle:
             spec=registered_environment.spec,
             environment=bound_environment,
             factory_backed=registered_environment.factory_backed,
+            runner_execution_profile_identity=(
+                registered_environment.runner_execution_profile_identity
+            ),
+            factory_execution_profile_identity=(
+                registered_environment.factory_execution_profile_identity
+            ),
             bound_workspace=bound,
             binding_payload=copy_json_value(base_payload, "binding_payload"),
             execution_candidate=registered_environment.execution_candidate,

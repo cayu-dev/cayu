@@ -1305,7 +1305,64 @@ Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positi
 
 ## Execution profiles
 
-Every fresh `CayuApp.run(...)` freezes a versioned `ExecutionProfileIdentity` in runtime-owned session metadata in the same transaction that creates the running session. The immutable `baseline` is that creation profile; the `expected` profile is the identity a later invocation must match. The invocation snapshot is the candidate profile resolved once by a particular public run or resume before admission and then held fixed for that invocation. The profile is a sorted set of typed component identities for the Cayu runtime, provider/model target, effective durable system-instruction projection, and registered direct-tool declarations. The system component fingerprints the fully rendered system message, including statically resolvable workspace instructions, that is subsequently persisted in the authoritative transcript. If factory materialization would change that projection after the profile is frozen, setup fails closed before model or tool work. Each component states its identity strength and availability: `application_versioned` identifies a versioned runtime/application contract, `structural` identifies only canonical inspectable structure, and `unavailable` explicitly says no deterministic proof is available. Durable records contain only SHA-256 fingerprints and classifications: raw prompts, tool names, descriptions, schemas, implementation objects, secrets, and credentials are not stored in the profile record.
+Every fresh `CayuApp.run(...)` freezes a versioned `ExecutionProfileIdentity` in runtime-owned session metadata in the same transaction that creates the running session. The immutable `baseline` is that creation profile; the `expected` profile is the identity a later invocation must match. The invocation snapshot is the candidate profile resolved once by a particular public run or resume before admission and then held fixed for that invocation. The profile is a sorted set of typed component identities covering the runtime, provider/model target, durable system projection, direct tool declarations, tool implementations, tool-view grants, registered execution policies, invocation policies, ordered hooks, environment and runner semantics, and effect authority. The system component fingerprints the fully rendered system message, including statically resolvable workspace instructions, that is subsequently persisted in the authoritative transcript. If factory materialization would change that projection after the profile is frozen, setup fails closed before model or tool work.
+
+Each component states its identity strength and availability. `application_versioned` is an application declaration, `structural` covers canonical material Cayu can inspect safely, `process_local` explicitly means that custom behavior is comparable only for the lifetime of one `CayuApp` registration, and `unavailable` means that no deterministic proof exists. A process-local component includes an app-instance-scoped opaque nonce, so retries through the same frozen registration can proceed. An opaque request-scoped loop policy additionally includes an app-local identity for the exact live policy object; reconstructing another instance of the same class therefore changes invocation authority, while reusing the exact object in the same app remains comparable. Constructing another app—even in the same operating-system process—deliberately produces a mismatch. This prevents a same-class replacement with changed opaque configuration from being mistaken for exact reuse. It is never presented as reproducible evidence. Cayu-owned built-ins use a runtime-versioned identity plus bounded behavior-affecting configuration where Cayu knows that contract. Durable profile records contain only SHA-256 fingerprints and classifications: raw prompts, tool names, descriptions, schemas, implementation objects, policy configuration, secrets, and credentials are not stored in the record.
+
+The schema-v2 component contract and its default comparison behavior are:
+
+| Component | Fingerprinted contract | Default on change |
+| --- | --- | --- |
+| `runtime` | Cayu runtime name and version | Reject; an explicit policy may classify compatible reuse or adoption. |
+| `provider_target` | Registered provider name and model | Reject; generic compatible reuse is forbidden and target changes use the explicit model-transition boundary. |
+| `durable_system_projection` | Fully rendered durable system message | Reject; an explicit policy may classify a safe boundary. |
+| `direct_tools` | Ordered names, descriptions, schemas, parallel-safety, effects, and workspace-mutation declarations | Reject as authority-changing. |
+| `tool_implementations` | Ordered application or Cayu behavior/implementation identities | Reject as authority-changing; missing custom identity is `process_local`. |
+| `tool_view_grants` | View kind, generation, and ordered grant baseline | Reject as authority-changing. The current implementation is the direct-tool view; future catalogued tool views can implement this same seam. |
+| `execution_policies` | Tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
+| `invocation_policies` | Ordered request loop policies for this run, resume, or continuation | Reject as authority-changing; missing custom identity is `process_local`. Cleanup-only recovery retains the already-admitted component instead of inventing a replacement. |
+| `runtime_hooks` | Ordered app-then-agent hook names and behavior identities | Reject as authority-changing; order is semantic and missing custom identity is `process_local`. |
+| `execution_environment` | Environment/factory/runner identities, binding shape, workspace/runner presence, and execution requirements | Reject as authority-changing; missing custom environment, factory, or runner identity is `process_local`. |
+| `effect_authority` | Tool effects, argument publication, workspace mutation, credential mode, egress and real-secret reach, and runner availability | Reject as authority-changing. |
+
+The default policy rejects every changed or unverifiable required component. A custom `ExecutionProfilePolicy` cannot return `compatible_reuse` for provider-target or authority-bearing changes. Adoption of any authority-bearing change requires explicit caller adoption intent and the separate `authority_decision="authorized"`; Cayu applies this conservative rule to contractions as well as apparent expansions because opaque application behavior can make directionality unverifiable.
+
+Applications version custom behavior with the public `ExecutionProfileBehaviorIdentity` value. `name` identifies the logical component, `behavior_version` changes when externally observable semantics or authority changes, and `implementation_version` changes for every deployed implementation revision, even when the public behavior contract is intended to stay stable:
+
+```python
+from cayu import ExecutionProfileBehaviorIdentity, ToolSpec
+
+remember_identity = ExecutionProfileBehaviorIdentity(
+    name="acme:remember-knowledge",
+    behavior_version="2",
+    implementation_version="2026.08.18.1",
+)
+
+remember_spec = ToolSpec(
+    name="remember_knowledge",
+    description="Persist reviewed knowledge.",
+    input_schema={
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    },
+    execution_profile_identity=remember_identity,
+)
+```
+
+`ToolSpec` and `EnvironmentSpec` accept `execution_profile_identity` directly. Custom `ToolPolicy`, `CommandPolicy`, `LoopPolicy`, `RuntimeHook`, `EnvironmentFactory`, and `Runner` implementations expose the same value through their `execution_profile_identity` property. Cayu copies every declaration at registration, including a command policy attached to a registered tool; request-scoped loop-policy declarations are copied at the request boundary. Applications must advance the declared versions whenever behavior-affecting code or opaque configuration changes; the declaration is an application assertion, not a code hash, signature, sandbox guarantee, or proof that two implementations really are equivalent. Identity strings must be stable, bounded, non-secret labels—never prompts, credentials, source code, or serialized configuration. Any identity field containing a value known to the configured workload-secret redactor is rejected before it can enter a public profile fingerprint.
+
+Runtime-versioned built-in identity is deliberately exact and fail-closed. Cayu fingerprints bounded configuration for built-ins whose complete adapter contract it knows, but a built-in wrapper does not make application code portable: a custom `WebFetchTool` adapter/resolver/transport, a `BrowserWebFetchAdapter` with an application-selected worker command, a custom `ReadFileTool` artifact reader, a subagent runtime/store, inherited host environment, a secret resolver, Docker guest/CLI environment grants, a `ProcessCommandPolicy` containing exact environment values, a `ParameterConstrainedToolPolicy` containing exact allowlist or deny-pattern values, or an opaque remote-runner collaborator remains `process_local` unless the enclosing tool, policy, or runner declares an application identity. The shipped browser worker alone is governed by Cayu's installed version; another executable at the same configured path can change independently of that version. Exact policy values and regular-expression sources are never hashed into durable profile material because they may contain credentials or low-entropy private identifiers and a public fingerprint would become an offline guessing oracle. Process-local material includes the exact component type so replacing one opaque implementation with another is detected within an app; the app-instance nonce also rejects same-type replacements in another app. `SubagentTool`, `SubagentResultTool`, and `VirtualEgressEnvironmentFactory` accept `execution_profile_identity=` for this purpose; other configurable tools accept it through `ToolSpec`. Custom policy, runner, and factory subclasses can expose it through their `execution_profile_identity` property. Cayu never infers reproducibility merely from a class living under the `cayu` package namespace. Because a factory must run only after admission, its pre-execution profile records workspace, binding, runner, and credential authority as `factory_managed`; the factory and environment declarations are responsible for versioning the concrete shape they will produce.
+
+`RememberKnowledgeTool` retains structural built-in identity only with Cayu's
+public default write policy. Any non-default application-configured
+`RememberKnowledgePolicy` is process-local by default because its exact
+namespace, labels, attribution, and other storage policy must not become a
+public fingerprint oracle. Applications that intentionally need equivalent
+knowledge-write behavior across processes declare a stable, non-secret
+`ToolSpec.execution_profile_identity` and advance it whenever that policy or
+implementation changes. Model-visible schema restrictions such as
+`allowed_kinds` remain part of the separate direct-tool profile component.
 
 Admission also writes an `active_invocation_execution_profile` checkpoint record in the same transaction that claims the running session. This record binds the complete redacted profile identity to the session id, interaction id, and run epoch. Store adapters receive this transition as one typed `SessionInvocationAdmission`: a clean resume starts a new interaction under the session's expected profile, while a continuation must present the exact active snapshot and historical interaction. The live loop keeps the already-resolved agent, provider, environment, and exact immutable profile object through model steps, provider retries and reconciliation, tool rounds, tool and terminal hooks, environment cleanup, and terminal transitions; mutating a process-local registration after admission therefore does not change that invocation. Pending tool rounds, approvals, user-input pauses, and recoverable model-completion stages carry the same profile fingerprint. The active record remains recovery authority across interruption, cleanup, and terminal transitions until a later clean invocation atomically replaces it.
 
@@ -1558,6 +1615,13 @@ dispatcher responsibility.
 requires a `CayuApp` configured with a `TaskStore`, a `TaskStoreDispatcher`
 using that same task store, and a session store that supports atomic initial
 PENDING checkpoints (the built-in in-memory, SQLite, and PostgreSQL stores do).
+Because `SubagentTool` embeds an application runtime and stores that Cayu cannot
+inspect as portable behavior, deployments that recover a parent through a
+reconstructed `CayuApp` must give the tool a stable
+`execution_profile_identity` and advance it whenever that behavior changes. A
+registered `SubagentResultTool` needs its own declaration for the same reason.
+Omitting these declarations deliberately limits recovery to the exact live app
+registration rather than silently trusting a replacement worker.
 Before awaiting child-profile preparation, the parent tool invocation persists
 an exact submission seed in the parent checkpoint. Preparation finalizes that
 seed into an immutable submission intent; Cayu then creates the child as PENDING

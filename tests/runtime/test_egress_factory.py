@@ -17,7 +17,17 @@ from tests.runners.lambda_microvm_harness import (
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.artifacts import LocalArtifactStore
-from cayu.core import AgentSpec, Event, EventType, Message, Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
@@ -1200,6 +1210,22 @@ def test_factory_requires_a_credential() -> None:
             policies={},
             credentials=[],
         )
+
+
+def test_factory_copies_an_application_execution_profile_identity() -> None:
+    identity = ExecutionProfileBehaviorIdentity(
+        name="tests:virtual-egress",
+        behavior_version="1",
+        implementation_version="2026.08.18",
+    )
+
+    factory = _virtual_factory(
+        runner_kind="docker",
+        execution_profile_identity=identity,
+    )
+
+    assert factory.execution_profile_identity == identity
+    assert factory.execution_profile_identity is not identity
 
 
 def test_factory_requires_explicit_runner_selection() -> None:

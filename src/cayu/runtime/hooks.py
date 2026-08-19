@@ -20,6 +20,7 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
     validate_public_custom_event_type,
 )
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
 from cayu.runtime.sessions import ForkSessionRequest, Session, copy_fork_session_request
@@ -420,6 +421,12 @@ class AfterToolCallDecision(BaseModel):
 
 
 class RuntimeHook:
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return a stable application declaration, or ``None`` when non-portable."""
+
+        return None
+
     @property
     def name(self) -> str:
         return type(self).__name__

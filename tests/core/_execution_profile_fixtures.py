@@ -6,7 +6,11 @@ from importlib.metadata import version
 from typing import Any
 from uuid import uuid4
 
+from cayu.core.agents import AgentSpec
 from cayu.core.events import Event
+from cayu.core.execution_identity import copy_execution_profile_behavior_identity
+from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.app import CayuApp
@@ -17,11 +21,13 @@ from cayu.runtime.checkpoints import (
 )
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
+    ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
-    build_execution_profile_identity,
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
 )
+from cayu.runtime.hooks import RuntimeHook
+from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.sessions import (
     RunRequest,
     Session,
@@ -29,7 +35,14 @@ from cayu.runtime.sessions import (
     SessionStore,
     bind_runtime_session_create_claim,
 )
+from cayu.runtime.tool_policy import ToolPolicy
 from cayu.vaults import SecretRedactor
+
+
+class _ProfileFixtureTool(Tool):
+    async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        del ctx, args
+        raise AssertionError("Execution-profile fixture tools must never run.")
 
 
 @dataclass(frozen=True)
@@ -51,6 +64,8 @@ async def create_admitted_session(
     model: str,
     durable_system_prompt: str | None = None,
     direct_tools: Iterable[Mapping[str, Any]] = (),
+    tools: Iterable[Tool] | None = None,
+    execution_profile: ExecutionProfileIdentity | None = None,
     interaction_id: str | None = None,
     secret_redactor: SecretRedactor | None = None,
 ) -> AdmittedSessionFixture:
@@ -78,6 +93,9 @@ async def create_admitted_session(
         model=model,
         durable_system_prompt=durable_system_prompt,
         direct_tools=direct_tools,
+        tools=tools,
+        invocation_loop_policies=prepared_request.loop_policies,
+        execution_profile=execution_profile,
     )
     execution_profile = identity.execution_profile
     if execution_profile is None:
@@ -164,23 +182,66 @@ def profiled_session_identity(
     model: str,
     durable_system_prompt: str | None = None,
     direct_tools: Iterable[Mapping[str, Any]] = (),
+    tools: Iterable[Tool] | None = None,
+    tool_policy: ToolPolicy | None = None,
+    runtime_hooks: Iterable[RuntimeHook] = (),
+    invocation_loop_policies: Iterable[LoopPolicy] = (),
+    execution_profile: ExecutionProfileIdentity | None = None,
 ) -> SessionIdentity:
     """Build the identity used by low-level tests that later enter public resume."""
 
     runtime_version = version("cayu")
+    resolved_profile = execution_profile
+    if resolved_profile is None:
+        tool_material = tuple(direct_tools)
+        resolved_tools = (
+            tuple(tools)
+            if tools is not None
+            else tuple(
+                _ProfileFixtureTool(
+                    ToolSpec(
+                        name=str(item["name"]),
+                        description=str(item.get("description", "")),
+                        input_schema=dict(item.get("schema", {})),
+                        parallel_safe=item.get("parallel_safe", True),
+                        effect=item.get("effect", "external"),
+                        workspace_mutation=item.get("workspace_mutation", False),
+                    )
+                )
+                for item in tool_material
+            )
+        )
+        if tools is not None and tool_material:
+            raise ValueError("tools and direct_tools are mutually exclusive.")
+        resolved_invocation_loop_policies = tuple(invocation_loop_policies)
+        profile_app = CayuApp(enable_logging=False)
+        profile_app.register_agent(
+            AgentSpec(name="assistant", model=model),
+            tools=resolved_tools,
+            tool_policy=tool_policy,
+            runtime_hooks=runtime_hooks,
+        )
+        resolved_profile = execution_profile_admission.resolve_execution_profile_identity(
+            registered_agent=profile_app._agents["assistant"],
+            provider_name=provider_name,
+            model=model,
+            durable_system_prompt=durable_system_prompt,
+            runtime_name="cayu",
+            runtime_version=runtime_version,
+            redactor=profile_app._secret_redactor,
+            process_identity=profile_app._execution_profile_process_identity,
+            invocation_loop_policies=resolved_invocation_loop_policies,
+            invocation_loop_policy_identities=tuple(
+                copy_execution_profile_behavior_identity(policy.execution_profile_identity)
+                for policy in resolved_invocation_loop_policies
+            ),
+        )
     return SessionIdentity(
         provider_name=provider_name,
         model=model,
         runtime_name="cayu",
         runtime_version=runtime_version,
-        execution_profile=build_execution_profile_identity(
-            runtime_name="cayu",
-            runtime_version=runtime_version,
-            provider_name=provider_name,
-            model=model,
-            durable_system_prompt=durable_system_prompt,
-            direct_tools=direct_tools,
-        ),
+        execution_profile=resolved_profile,
     )
 
 

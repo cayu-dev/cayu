@@ -51,6 +51,7 @@ from cayu.core import (
     AgentSpec,
     Event,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     Message,
     MessageRole,
     TextPart,
@@ -240,6 +241,7 @@ from cayu.runtime import (
     trim_context_turns,
 )
 from cayu.runtime import _approval_support as approval_support_module
+from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._binding_cleanup import (
@@ -1262,6 +1264,11 @@ class SideEffectTool(Tool):
         name="side_effect",
         description="Record execution.",
         input_schema={"type": "object", "properties": {}},
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:runtime:side-effect-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self) -> None:
@@ -1378,6 +1385,40 @@ class InterruptBeforeStopPolicy(LoopPolicy):
             "needs operator review",
             metadata={"classification": context.classification.type.value},
         )
+
+
+class _AuthorizeInvocationPolicyRemoval(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "tests:authorize-invocation-policy-removal:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        if request.changed_component_classes == (
+            ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ):
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="The test explicitly starts a new invocation without its one-shot gate.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.REJECT,
+            reason="The test policy authorizes only request-policy removal.",
+        )
+
+
+def _invocation_policy_removal_intent() -> ExecutionProfileAdoptionIntent:
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key="remove-one-shot-invocation-policy",
+        reason="The operator reviewed the interrupted result and starts a fresh invocation.",
+        requested_by=ResolutionActor(
+            subject="test-operator",
+            source=ResolutionActorSource.REQUEST,
+        ),
+    )
 
 
 class FailBeforeStopPolicy(LoopPolicy):
@@ -11109,7 +11150,11 @@ def test_cayu_app_before_stop_continue_at_max_steps_interrupts_and_resumes():
             ]
         )
         policy = ContinueBeforeStopPolicy("Do not persist this at the boundary.")
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AuthorizeInvocationPolicyRemoval(),
+            enable_logging=False,
+        )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -11131,6 +11176,7 @@ def test_cayu_app_before_stop_continue_at_max_steps_interrupts_and_resumes():
                 session_id="sess_before_stop_continue_at_limit",
                 messages=[Message.text("user", "resume")],
                 max_steps=1,
+                profile_adoption=_invocation_policy_removal_intent(),
             ),
         )
         resumed_session = await store.load("sess_before_stop_continue_at_limit")
@@ -11183,7 +11229,8 @@ def test_cayu_app_before_stop_continue_at_max_steps_interrupts_and_resumes():
     assert interrupted_session.status == SessionStatus.INTERRUPTED
     assert [message.role for message in interrupted_transcript] == ["user", "assistant"]
 
-    assert resumed_events[0].type == EventType.SESSION_RESUMED
+    assert resumed_events[0].type == EventType.SESSION_EXECUTION_PROFILE_DECIDED
+    assert resumed_events[1].type == EventType.SESSION_RESUMED
     assert resumed_events[-1].type == EventType.SESSION_COMPLETED
     assert resumed_session is not None
     assert resumed_session.status == SessionStatus.COMPLETED
@@ -11211,7 +11258,11 @@ def test_cayu_app_before_stop_policy_can_interrupt_and_resume():
                 ],
             ]
         )
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AuthorizeInvocationPolicyRemoval(),
+            enable_logging=False,
+        )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -11230,6 +11281,7 @@ def test_cayu_app_before_stop_policy_can_interrupt_and_resume():
             ResumeRequest(
                 session_id="sess_before_stop_interrupt",
                 messages=[Message.text("user", "continue")],
+                profile_adoption=_invocation_policy_removal_intent(),
             ),
         )
         resumed_session = await store.load("sess_before_stop_interrupt")
@@ -17315,7 +17367,19 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
         system_prompt: str,
     ) -> None:
         app.register_provider(provider, default=True)
-        app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="body",
+                    execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                        name="tests:runtime:prompt-anatomy-body",
+                        behavior_version="1",
+                        implementation_version="1",
+                    ),
+                )
+            ),
+            default=True,
+        )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model", system_prompt=system_prompt)
         )
@@ -26809,22 +26873,18 @@ def _recover_parent(
                     mode=SubagentExecutionMode(mode),
                 )
             },
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name=f"tests:runtime:recovery-subagent-tool:{mode}",
+                behavior_version="1",
+                implementation_version="1",
+            ),
         )
         app.register_agent(AgentSpec(name="parent", model="fake-model"), tools=[subagent_tool])
         app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
-        subagent_spec = subagent_tool.spec
         parent_identity = profiled_session_identity(
             provider_name="fake",
             model="fake-model",
-            direct_tools=[
-                {
-                    "name": subagent_spec.name,
-                    "description": subagent_spec.description,
-                    "schema": subagent_spec.input_schema,
-                    "parallel_safe": subagent_spec.parallel_safe,
-                    "effect": subagent_spec.effect.value,
-                }
-            ],
+            tools=[subagent_tool],
         )
         await _seed_crashed_spawn_parent(
             store,
@@ -27889,9 +27949,24 @@ def test_manual_tool_round_recovery_rebases_stale_running_operation() -> None:
     assert tool.calls == [{}]
 
 
-def test_manual_tool_round_recovery_repairs_missing_prior_terminal_evidence() -> None:
+def test_manual_tool_round_recovery_repairs_missing_prior_terminal_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session_id = "sess_tool_round_manual_missing_prior_terminal"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
+    profile_resolutions = 0
+    original_profile_resolver = execution_profile_admission.resolve_execution_profile_identity
+
+    def count_profile_resolution(*args, **kwargs):
+        nonlocal profile_resolutions
+        profile_resolutions += 1
+        return original_profile_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(
+        execution_profile_admission,
+        "resolve_execution_profile_identity",
+        count_profile_resolution,
+    )
 
     async def simulate_lost_failure_event_commit() -> None:
         # The in-memory store has no event-deletion API because durable history is
@@ -27959,6 +28034,7 @@ def test_manual_tool_round_recovery_repairs_missing_prior_terminal_evidence() ->
         )
     )
 
+    assert profile_resolutions == 1
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert [record.event.type for record in terminal_records] == [
         EventType.SESSION_FAILED,
@@ -32666,6 +32742,9 @@ def test_planned_unregistered_call_rejects_registration_drift_before_recovery():
 
         assert raised.value.changed_component_classes == (
             ExecutionProfileComponentClass.DIRECT_TOOLS,
+            ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
         )
         assert tool.calls == []
         after = await store.load(session_id)
@@ -32700,6 +32779,14 @@ def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
         def __init__(self) -> None:
             self.tool_calls: list[str] = []
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:runtime:concurrent-recovery-hook",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def after_tool_call(self, context: ToolCallHookContext) -> None:
             self.tool_calls.append(context.tool_call_id)
 
@@ -32733,6 +32820,7 @@ def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
         second_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[SideEffectTool()],
+            runtime_hooks=[hook],
         )
         await collect_events(
             app,
@@ -32836,6 +32924,14 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
             self.finish = asyncio.Event()
             self.execution_profiles: list[Any] = []
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:runtime:blocking-recovery-hook",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def after_tool_call(self, context: ToolCallHookContext) -> None:
             if not self.block:
                 return
@@ -32878,6 +32974,7 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
         second_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[SideEffectTool()],
+            runtime_hooks=[hook],
         )
 
         await collect_events(

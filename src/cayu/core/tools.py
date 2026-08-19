@@ -33,6 +33,10 @@ from cayu._validation import (
     require_nonblank,
     thaw_json_value,
 )
+from cayu.core.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
 
 if TYPE_CHECKING:
     from cayu.runners.base import ExecCommand, ExecResult
@@ -119,6 +123,7 @@ class _ToolSpecInput(BaseModel):
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
     workspace_mutation: StrictBool = False
+    execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
 
     @field_validator("input_schema", mode="before")
     @classmethod
@@ -159,6 +164,7 @@ class ToolSpec(BaseModel):
     parallel_safe: StrictBool = True
     effect: ToolEffect = ToolEffect.EXTERNAL
     workspace_mutation: StrictBool = False
+    execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
     def __init__(
@@ -170,6 +176,7 @@ class ToolSpec(BaseModel):
         parallel_safe: bool = True,
         effect: ToolEffect = ToolEffect.EXTERNAL,
         workspace_mutation: bool = False,
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         **data: Any,
     ) -> None:
         parsed = _ToolSpecInput.model_validate(
@@ -180,6 +187,7 @@ class ToolSpec(BaseModel):
                 "parallel_safe": parallel_safe,
                 "effect": effect,
                 "workspace_mutation": workspace_mutation,
+                "execution_profile_identity": execution_profile_identity,
                 **data,
             }
         )
@@ -189,6 +197,9 @@ class ToolSpec(BaseModel):
             parallel_safe=parsed.parallel_safe,
             effect=parsed.effect,
             workspace_mutation=parsed.workspace_mutation,
+            execution_profile_identity=copy_execution_profile_behavior_identity(
+                parsed.execution_profile_identity
+            ),
         )
         object.__setattr__(self, "_input_schema", _freeze_value(parsed.input_schema))
 
@@ -741,6 +752,12 @@ class Tool(ABC):
     @property
     def name(self) -> str:
         return self.spec.name
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return the stable behavior declaration frozen with this tool's spec."""
+
+        return self.spec.execution_profile_identity
 
     @property
     def _publish_arguments(self) -> bool:

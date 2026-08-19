@@ -21,6 +21,7 @@ from cayu import (
     EventType,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
+    ExecutionProfileBehaviorIdentity,
     ExecutionProfilePolicy,
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyRequest,
@@ -329,6 +330,11 @@ class _EchoTool(Tool):
                     "required": ["value"],
                     "additionalProperties": False,
                 },
+                execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                    name=f"tests:session-model-switch:echo-tool:{name}",
+                    behavior_version="1",
+                    implementation_version="1",
+                ),
             )
         )
         self.calls: list[dict] = []
@@ -339,21 +345,17 @@ class _EchoTool(Tool):
         return ToolResult(content=str(args["value"]))
 
 
-def _profiled_source_identity(*, tool: Tool | None = None) -> SessionIdentity:
+def _profiled_source_identity(
+    *,
+    tool: Tool | None = None,
+    require_approval: bool = False,
+) -> SessionIdentity:
     direct_tool = tool or _EchoTool()
-    spec = direct_tool.spec
     return profiled_session_identity(
         provider_name="source",
         model="source-model",
-        direct_tools=[
-            {
-                "name": spec.name,
-                "description": spec.description,
-                "schema": direct_tool.schema,
-                "parallel_safe": spec.parallel_safe,
-                "effect": spec.effect.value,
-            }
-        ],
+        tools=[direct_tool],
+        tool_policy=(AlwaysRequireApprovalToolPolicy() if require_approval else None),
     )
 
 
@@ -803,7 +805,7 @@ def test_sqlite_approval_continuation_uses_absolute_cursor_after_prior_retention
                 session_id="retained-approval",
                 messages=[],
             ),
-            identity=_profiled_source_identity(tool=tool),
+            identity=_profiled_source_identity(tool=tool, require_approval=True),
         )
         await store.append_transcript_messages(
             "retained-approval",

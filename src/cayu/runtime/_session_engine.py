@@ -71,6 +71,7 @@ from cayu.core.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import (
     Message,
     MessageRole,
@@ -135,6 +136,9 @@ from cayu.runtime._environment_lifecycle import (
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
     _reconcile_exact_persisted_event,
+)
+from cayu.runtime._execution_profile_identity_validation import (
+    copy_secret_free_execution_profile_behavior_identity,
 )
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
@@ -308,6 +312,7 @@ from cayu.runtime.execution_profiles import (
     changed_execution_profile_components,
     checkpoint_with_active_invocation_execution_profile,
     copy_execution_profile_policy_result,
+    execution_profile_changes_authority,
     execution_profile_decision_payload,
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
@@ -2701,6 +2706,16 @@ def _execution_profile_identity(
     provider_name: str,
     model: str,
     durable_system_prompt: str | None,
+    redactor: SecretRedactor,
+    registered_environment: runtime_records.RegisteredEnvironment | None = None,
+    process_identity: str = "standalone-profile-builder",
+    runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
+    loop_policies: tuple[LoopPolicy, ...] = (),
+    loop_policy_execution_profile_identities: tuple[
+        ExecutionProfileBehaviorIdentity | None, ...
+    ] = (),
+    request_loop_policies: tuple[LoopPolicy, ...] = (),
+    request_loop_policy_instance_identities: tuple[str | None, ...] = (),
 ) -> ExecutionProfileIdentity:
     return execution_profile_admission.resolve_execution_profile_identity(
         registered_agent=registered_agent,
@@ -2709,6 +2724,22 @@ def _execution_profile_identity(
         durable_system_prompt=durable_system_prompt,
         runtime_name="cayu",
         runtime_version=_runtime_version(),
+        redactor=redactor,
+        registered_environment=registered_environment,
+        process_identity=process_identity,
+        runtime_hooks=runtime_hooks,
+        loop_policies=loop_policies,
+        loop_policy_identities=loop_policy_execution_profile_identities,
+        invocation_loop_policies=request_loop_policies,
+        invocation_loop_policy_identities=tuple(
+            copy_secret_free_execution_profile_behavior_identity(
+                policy.execution_profile_identity,
+                redactor=redactor,
+                field_name=f"request.loop_policies[{index}].execution_profile_identity",
+            )
+            for index, policy in enumerate(request_loop_policies)
+        ),
+        invocation_loop_policy_instance_identities=(request_loop_policy_instance_identities),
     )
 
 
@@ -3532,6 +3563,9 @@ class SessionEngine:
         clock: Callable[[], datetime],
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         loop_policies: tuple[LoopPolicy, ...],
+        loop_policy_execution_profile_identities: tuple[
+            ExecutionProfileBehaviorIdentity | None, ...
+        ],
         hook_runtime: RuntimeHookRuntime,
         get_registered_agent: Callable[[str], runtime_records.RegisteredAgentState],
         get_registered_provider: Callable[[str | None], runtime_records.RegisteredProvider],
@@ -3547,6 +3581,7 @@ class SessionEngine:
         effective_retry_policy: Callable[[RetryPolicy | None], RetryPolicy],
         execution_profile_policy: ExecutionProfilePolicy | None,
         execution_profile_policy_identity: str | None,
+        execution_profile_process_identity: str,
     ) -> None:
         self.session_store = session_store
         self.task_store = task_store
@@ -3566,6 +3601,9 @@ class SessionEngine:
         self._clock = clock
         self._runtime_hooks = runtime_hooks
         self._loop_policies = loop_policies
+        if len(loop_policies) != len(loop_policy_execution_profile_identities):
+            raise ValueError("Loop-policy execution-profile identities are inconsistent.")
+        self._loop_policy_execution_profile_identities = loop_policy_execution_profile_identities
         self._hook_runtime = hook_runtime
         self._get_registered_agent = get_registered_agent
 
@@ -3585,7 +3623,23 @@ class SessionEngine:
         self._effective_retry_policy = effective_retry_policy
         self._execution_profile_policy = execution_profile_policy
         self._execution_profile_policy_identity = execution_profile_policy_identity
+        self._execution_profile_process_identity = require_clean_nonblank(
+            execution_profile_process_identity,
+            "execution_profile_process_identity",
+        )
+        self._invocation_loop_policy_identity_registry = (
+            execution_profile_admission.ProcessLocalBehaviorIdentityRegistry()
+        )
         self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
+
+    def _request_loop_policy_instance_identities(
+        self,
+        policies: tuple[LoopPolicy, ...],
+    ) -> tuple[str, ...]:
+        return tuple(
+            self._invocation_loop_policy_identity_registry.identity_for(policy)
+            for policy in policies
+        )
 
     def prepare_workflow_structured_output(self, session_id: str) -> None:
         """Opt one live workflow child into a process-local raw output handoff."""
@@ -3619,11 +3673,27 @@ class SessionEngine:
             provider_name=registered_provider.name,
             model=target.model,
             durable_system_prompt=None,
+            redactor=self._secret_redactor,
+            registered_environment=self._get_registered_environment_for_session(
+                session.environment_name
+            ),
+            process_identity=self._execution_profile_process_identity,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=(
+                self._loop_policy_execution_profile_identities
+            ),
         )
-        return execution_profile_with_component(
+        candidate = execution_profile_with_component(
             candidate,
             source_profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
         )
+        if source_profile.schema_version >= 2:
+            candidate = execution_profile_with_component(
+                candidate,
+                source_profile.component(ExecutionProfileComponentClass.INVOCATION_POLICIES),
+            )
+        return candidate
 
     async def validate_execution_profile_continuation(
         self,
@@ -3632,6 +3702,8 @@ class SessionEngine:
         checkpoint: dict[str, Any] | None,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
+        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
     ) -> ActiveInvocationExecutionProfile:
@@ -3652,6 +3724,31 @@ class SessionEngine:
             registered_provider=registered_provider,
             runtime_version=_runtime_version(),
             redactor=self._secret_redactor,
+            process_identity=self._execution_profile_process_identity,
+            registered_environment=self._get_registered_environment_for_session(
+                session.environment_name
+            ),
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_identities=self._loop_policy_execution_profile_identities,
+            invocation_loop_policies=request_loop_policies,
+            invocation_loop_policy_identities=(
+                ()
+                if request_loop_policies is None or frozen_candidate_profile is not None
+                else tuple(
+                    copy_secret_free_execution_profile_behavior_identity(
+                        policy.execution_profile_identity,
+                        redactor=self._secret_redactor,
+                        field_name=(f"request.loop_policies[{index}].execution_profile_identity"),
+                    )
+                    for index, policy in enumerate(request_loop_policies)
+                )
+            ),
+            invocation_loop_policy_instance_identities=(
+                ()
+                if request_loop_policies is None or frozen_candidate_profile is not None
+                else self._request_loop_policy_instance_identities(request_loop_policies)
+            ),
             additional_profile_fingerprints=(
                 *additional_profile_fingerprints,
                 *(
@@ -3664,35 +3761,36 @@ class SessionEngine:
                     )
                 ),
             ),
+            frozen_candidate_profile=frozen_candidate_profile,
         )
         snapshot = plan.snapshot
         candidate = plan.candidate_profile
         changed = plan.changed_component_classes
-        if not changed and require_open_interaction:
-            latest_interactions = await self.session_store.query_events(
-                EventQuery(
-                    session_id=session.id,
-                    event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
-                    order_by=EventOrder.SEQUENCE_DESC,
-                    limit=1,
-                )
-            )
-            if not latest_interactions or (
-                latest_interactions[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES
-            ):
-                raise RuntimeError(
-                    "Active invocation execution profile has no authoritative open interaction."
-                )
-            open_interaction_id = latest_interactions[0].event.interaction_id
-            if open_interaction_id is None:
-                raise RuntimeError("Interaction lifecycle event has no interaction identity.")
-            if snapshot.interaction_id != open_interaction_id:
-                raise RuntimeError(
-                    "Active invocation execution profile belongs to another interaction."
-                )
-            return snapshot
-
         if not changed:
+            if require_open_interaction:
+                latest_interactions = await self.session_store.query_events(
+                    EventQuery(
+                        session_id=session.id,
+                        event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                        order_by=EventOrder.SEQUENCE_DESC,
+                        limit=1,
+                    )
+                )
+                if not latest_interactions or (
+                    latest_interactions[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES
+                ):
+                    raise RuntimeError(
+                        "Active invocation execution profile has no authoritative open interaction."
+                    )
+                open_interaction_id = latest_interactions[0].event.interaction_id
+                if open_interaction_id is None:
+                    raise RuntimeError("Interaction lifecycle event has no interaction identity.")
+                if snapshot.interaction_id != open_interaction_id:
+                    raise RuntimeError(
+                        "Active invocation execution profile belongs to another interaction."
+                    )
+            if frozen_candidate_profile is not None:
+                return snapshot.model_copy(update={"profile": frozen_candidate_profile})
             return snapshot
 
         policy_identity = "cayu:active-invocation-profile:v1"
@@ -3808,7 +3906,7 @@ class SessionEngine:
                 intent=intent,
                 authority_review_required=(
                     force_authority_review
-                    or ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
+                    or execution_profile_changes_authority(changed_component_classes)
                 ),
                 source_provider_name=(
                     session.provider_name if source_provider_name is None else source_provider_name
@@ -3851,9 +3949,8 @@ class SessionEngine:
             policy_reason = result.reason
             authority_decision = result.authority_decision
 
-        broadens_authority = (
-            force_authority_review
-            or ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
+        broadens_authority = force_authority_review or execution_profile_changes_authority(
+            changed_component_classes
         )
         if action is ExecutionProfilePolicyAction.COMPATIBLE_REUSE:
             changes_persistent_target = (
@@ -5517,6 +5614,18 @@ class SessionEngine:
             provider_name=registered_provider.name,
             model=model,
             durable_system_prompt=rendered_system_prompt,
+            redactor=self._secret_redactor,
+            registered_environment=registered_environment,
+            process_identity=self._execution_profile_process_identity,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=(
+                self._loop_policy_execution_profile_identities
+            ),
+            request_loop_policies=request.loop_policies,
+            request_loop_policy_instance_identities=(
+                self._request_loop_policy_instance_identities(request.loop_policies)
+            ),
         )
         unavailable_profile_components = unavailable_execution_profile_components(execution_profile)
         if unavailable_profile_components:
@@ -10307,6 +10416,18 @@ class SessionEngine:
                     else loaded_session.model
                 ),
                 durable_system_prompt=None,
+                redactor=self._secret_redactor,
+                registered_environment=registered_environment,
+                process_identity=self._execution_profile_process_identity,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                loop_policy_execution_profile_identities=(
+                    self._loop_policy_execution_profile_identities
+                ),
+                request_loop_policies=request.loop_policies,
+                request_loop_policy_instance_identities=(
+                    self._request_loop_policy_instance_identities(request.loop_policies)
+                ),
             )
             replay_candidate_profile = execution_profile_with_component(
                 replay_candidate_profile,
@@ -10508,6 +10629,7 @@ class SessionEngine:
                     checkpoint=checkpoint,
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
+                    request_loop_policies=request.loop_policies,
                 )
             )
             pending_model_completion = (
@@ -10560,6 +10682,18 @@ class SessionEngine:
                     else loaded_session.model
                 ),
                 durable_system_prompt=None,
+                redactor=self._secret_redactor,
+                registered_environment=registered_environment,
+                process_identity=self._execution_profile_process_identity,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                loop_policy_execution_profile_identities=(
+                    self._loop_policy_execution_profile_identities
+                ),
+                request_loop_policies=request.loop_policies,
+                request_loop_policy_instance_identities=(
+                    self._request_loop_policy_instance_identities(request.loop_policies)
+                ),
             )
             if legacy_unprofiled_fork:
                 fork_transcript = await self.session_store.load_transcript(loaded_session.id)
@@ -10664,6 +10798,12 @@ class SessionEngine:
                     checkpoint=checkpoint,
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
+                    request_loop_policies=request.loop_policies,
+                    frozen_candidate_profile=(
+                        None
+                        if continuing_execution_profile_snapshot is None
+                        else continuing_execution_profile_snapshot.profile
+                    ),
                 )
             )
             if (
@@ -11434,6 +11574,14 @@ class SessionEngine:
                 provider_name=registered_provider.name,
                 model=model,
                 durable_system_prompt=prompt_workflow.rendered_child_prompt,
+                redactor=self._secret_redactor,
+                registered_environment=registered_environment,
+                process_identity=self._execution_profile_process_identity,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                loop_policy_execution_profile_identities=(
+                    self._loop_policy_execution_profile_identities
+                ),
             )
             if (
                 prompt_workflow.rendered_child_prompt is None

@@ -46,6 +46,7 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.core.events import Event, EventType
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import Message
 from cayu.runtime.app import CayuApp
 from cayu.runtime.invocation import (
@@ -110,6 +111,11 @@ MAX_PRODUCT_RESULT_EVIDENCE_SCAN_EVENTS = 256
 
 _PRODUCT_RESULT_RECEIPT_RECORD_TYPE = "cayu.product-result-receipt"
 _PRODUCT_RESULT_RECEIPT_SCHEMA_VERSION = 1
+_PRODUCT_PUBLICATION_EXECUTION_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
+    name="cayu.server:product-publication",
+    behavior_version="1",
+    implementation_version="1",
+)
 _PRODUCT_RECOVERY_MESSAGE = (
     "Continue this interrupted operation from its durable session state. "
     "Do not repeat work whose outcome is already recorded."
@@ -1419,6 +1425,10 @@ class _ProductResultReceiptPolicy(LoopPolicy):
         return "product-result-publication"
 
     @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _PRODUCT_PUBLICATION_EXECUTION_PROFILE_IDENTITY
+
+    @property
     def adoption_replay_identity(self) -> str:
         material = json.dumps(
             {
@@ -1494,6 +1504,10 @@ class _ProductContinuationReceiptPolicy(LoopPolicy):
     @property
     def name(self) -> str:
         return "product-continuation-publication"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _PRODUCT_PUBLICATION_EXECUTION_PROFILE_IDENTITY
 
     @property
     def adoption_replay_identity(self) -> str:
