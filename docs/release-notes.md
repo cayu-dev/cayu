@@ -101,6 +101,17 @@ model and its configured provider or normal model-pattern/default routing.
 The server contract advances from version 10 to version 11 for this breaking
 request-body change.
 
+### Local workspaces support bounded speculative branches
+
+An exact `LocalWorkspace` can now create an isolated, process-local branch from
+a complete observed workspace revision. Branches expose the ordinary workspace
+API, deterministic content-free net changes, explicit rollback, and
+conflict-checked all-or-none publication. Source snapshots, overlays, evidence,
+lifetime, and active branch count are bounded; unsafe paths, symlinks, special
+files, stale baselines, and publication conflicts fail closed. Other workspace
+backends remain explicitly unsupported, and durable reconstruction after
+process loss is not part of this first slice.
+
 ### Queued dispatch is bound to durable execution profiles
 
 Queued tasks now retain the target session instance, source and required

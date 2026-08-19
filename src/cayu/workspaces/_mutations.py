@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from cayu._filesystem_lock import cooperative_path_lock
 from cayu.workspaces.base import WorkspaceMutationOperation, WorkspaceMutationResult
+
+
+@dataclass(slots=True)
+class _LocalSourceGate:
+    readers: int = 0
+    writer: bool = False
+    waiters: int = 0
+    waiting_writers: int = 0
+
+
+_LOCAL_SOURCE_CONDITION = threading.Condition()
+_LOCAL_SOURCE_GATES: dict[str, _LocalSourceGate] = {}
+_FENCED_LOCAL_SOURCES: set[str] = set()
 
 
 def content_identity(content: bytes) -> tuple[str, str]:
@@ -63,3 +78,130 @@ def workspace_path_lock(root: Path, relative_path: str) -> Iterator[None]:
         lock_directory_name="cayu-workspace-locks",
     ):
         yield
+
+
+@contextmanager
+def workspace_source_lock(
+    root: Path,
+    *,
+    exclusive: bool,
+    fence_on_cleanup_failure: Callable[[], bool] | None = None,
+) -> Iterator[None]:
+    """Coordinate source-wide publication with ordinary local operations.
+
+    Every cooperative LocalWorkspace operation takes the shared side before a
+    path lock. Branch creation and publication take the exclusive side and
+    invoke descriptor-guarded primitives directly while they own it.
+    """
+
+    source_identity = _local_source_identity(root)
+    _acquire_local_source_gate(source_identity, exclusive=exclusive)
+    body_completed = False
+    try:
+        try:
+            with cooperative_path_lock(
+                root,
+                "__cayu_workspace_source__",
+                lock_directory_name="cayu-workspace-source-locks",
+                shared=not exclusive,
+                retain_on_exit=(
+                    (lambda: local_workspace_source_is_fenced(root)) if exclusive else None
+                ),
+            ):
+                _raise_if_local_workspace_source_fenced(root)
+                yield
+                body_completed = True
+        except BaseException:
+            if (
+                body_completed
+                and fence_on_cleanup_failure is not None
+                and fence_on_cleanup_failure()
+            ):
+                fence_local_workspace_source(root)
+            raise
+    finally:
+        _release_local_source_gate(source_identity, exclusive=exclusive)
+
+
+def fence_local_workspace_source(root: Path) -> None:
+    """Permanently fence process-local reuse after uncertain publication rollback."""
+
+    with _LOCAL_SOURCE_CONDITION:
+        _FENCED_LOCAL_SOURCES.add(_local_source_identity(root))
+        _LOCAL_SOURCE_CONDITION.notify_all()
+
+
+def local_workspace_source_is_fenced(root: Path) -> bool:
+    with _LOCAL_SOURCE_CONDITION:
+        return _local_source_identity(root) in _FENCED_LOCAL_SOURCES
+
+
+def _raise_if_local_workspace_source_fenced(root: Path) -> None:
+    if local_workspace_source_is_fenced(root):
+        raise _local_workspace_fenced_error()
+
+
+def _acquire_local_source_gate(source_identity: str, *, exclusive: bool) -> None:
+    acquired = False
+    with _LOCAL_SOURCE_CONDITION:
+        gate = _LOCAL_SOURCE_GATES.setdefault(source_identity, _LocalSourceGate())
+        gate.waiters += 1
+        if exclusive:
+            gate.waiting_writers += 1
+        try:
+            while True:
+                if source_identity in _FENCED_LOCAL_SOURCES:
+                    raise _local_workspace_fenced_error()
+                if exclusive:
+                    if not gate.writer and gate.readers == 0:
+                        gate.writer = True
+                        gate.waiting_writers -= 1
+                        acquired = True
+                        return
+                elif not gate.writer and gate.waiting_writers == 0:
+                    gate.readers += 1
+                    acquired = True
+                    return
+                _LOCAL_SOURCE_CONDITION.wait()
+        finally:
+            gate.waiters -= 1
+            if exclusive and not acquired:
+                gate.waiting_writers -= 1
+            _discard_local_source_gate_if_idle(source_identity, gate)
+
+
+def _release_local_source_gate(source_identity: str, *, exclusive: bool) -> None:
+    with _LOCAL_SOURCE_CONDITION:
+        gate = _LOCAL_SOURCE_GATES.get(source_identity)
+        if gate is None:  # pragma: no cover - acquisition/release invariant
+            raise RuntimeError("Local workspace source gate ownership disappeared.")
+        if exclusive:
+            if not gate.writer:  # pragma: no cover - acquisition/release invariant
+                raise RuntimeError("Local workspace exclusive source gate was not owned.")
+            gate.writer = False
+        else:
+            if gate.readers <= 0:  # pragma: no cover - acquisition/release invariant
+                raise RuntimeError("Local workspace shared source gate was not owned.")
+            gate.readers -= 1
+        _LOCAL_SOURCE_CONDITION.notify_all()
+        _discard_local_source_gate_if_idle(source_identity, gate)
+
+
+def _discard_local_source_gate_if_idle(
+    source_identity: str,
+    gate: _LocalSourceGate,
+) -> None:
+    if gate.readers == 0 and not gate.writer and gate.waiters == 0 and gate.waiting_writers == 0:
+        _LOCAL_SOURCE_GATES.pop(source_identity, None)
+
+
+def _local_workspace_fenced_error() -> BaseException:
+    from cayu.workspaces.branches import WorkspaceBranchFencedError
+
+    return WorkspaceBranchFencedError(
+        "Local workspace is fenced after incomplete branch publication settlement."
+    )
+
+
+def _local_source_identity(root: Path) -> str:
+    return str(root)

@@ -7,10 +7,13 @@ from bisect import insort
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runners.base import Runner
+
+if TYPE_CHECKING:
+    from cayu.workspaces.branches import WorkspaceBranchCreationResult, WorkspaceBranchRequest
 
 
 @dataclass(frozen=True)
@@ -414,6 +417,38 @@ class Workspace(ABC):
         ``Workspace`` to return a stable identity token and enable that safety check.
         """
         return None
+
+    async def create_branch(
+        self,
+        request: WorkspaceBranchRequest,
+    ) -> WorkspaceBranchCreationResult:
+        """Create an isolated bounded workspace branch when supported.
+
+        Branching is an optional capability rather than an abstract workspace
+        requirement. Backends that do not implement the complete isolation and
+        publication contract return a typed unsupported result.
+        """
+
+        from cayu.workspaces.branches import (
+            WorkspaceBranchCreationResult,
+            WorkspaceBranchOutcomeStatus,
+            _bounded_workspace_branch_evidence,
+            _copy_workspace_branch_request_envelope,
+        )
+
+        copied = _copy_workspace_branch_request_envelope(request)
+        return WorkspaceBranchCreationResult(
+            status=WorkspaceBranchOutcomeStatus.UNSUPPORTED,
+            branch=None,
+            evidence=_bounded_workspace_branch_evidence(
+                source=copied.source,
+                baseline_revision=copied.baseline_revision,
+                outcome=WorkspaceBranchOutcomeStatus.UNSUPPORTED,
+                max_bytes=copied.limits.max_evidence_bytes,
+                detail_code="workspace_branching_unsupported",
+                hash_fixed_identity_on_overflow=True,
+            ),
+        )
 
 
 class RunnerBoundWorkspace(Workspace):

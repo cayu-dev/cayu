@@ -520,12 +520,7 @@ async def observe_deterministic_workspace(
         revisions.append(revision)
         manifest.append({"path": path, "sha256": digest, "bytes": read.total_bytes})
 
-    encoded = json.dumps(
-        manifest,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    encoded = _deterministic_workspace_manifest_bytes(manifest)
     if len(encoded) > limits.max_manifest_bytes:
         return WorkspaceRevisionObservation(
             identity=identity,
@@ -536,10 +531,29 @@ async def observe_deterministic_workspace(
     return WorkspaceRevisionObservation(
         identity=identity,
         status=WorkspaceRevisionObservationStatus.SUPPORTED,
-        revision="sha256:" + hashlib.sha256(encoded).hexdigest(),
+        revision=_deterministic_workspace_manifest_revision(encoded),
         paths=tuple(revisions),
         total_paths=len(revisions),
     )
+
+
+def _deterministic_workspace_manifest_bytes(
+    manifest: list[dict[str, object]],
+) -> bytes:
+    """Encode the one canonical non-Git workspace revision manifest."""
+
+    return json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _deterministic_workspace_manifest_revision(encoded: bytes) -> str:
+    """Return the #909 revision identity for canonical manifest bytes."""
+
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def compare_workspace_revisions(

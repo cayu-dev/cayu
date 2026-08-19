@@ -4,9 +4,11 @@ import hashlib
 import os
 import tempfile
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+_RETAINED_LOCK_DESCRIPTORS: list[int] = []
 
 
 @contextmanager
@@ -15,6 +17,8 @@ def cooperative_path_lock(
     relative_path: str,
     *,
     lock_directory_name: str,
+    shared: bool = False,
+    retain_on_exit: Callable[[], bool] | None = None,
 ) -> Iterator[None]:
     """Serialize cooperative processes addressing one root-relative path."""
 
@@ -44,7 +48,7 @@ def cooperative_path_lock(
             else:
                 import fcntl
 
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
             acquired = True
             yield
         except BaseException as error:
@@ -52,7 +56,10 @@ def cooperative_path_lock(
             # does not acquire the primary error as an implicit context edge.
             operation_error = error
     finally:
-        if acquired:
+        retained = acquired and retain_on_exit is not None and retain_on_exit()
+        if retained:
+            _RETAINED_LOCK_DESCRIPTORS.append(descriptor)
+        elif acquired:
             try:
                 if os.name == "nt":
                     import msvcrt
@@ -67,14 +74,15 @@ def cooperative_path_lock(
                 if error.__cause__ is None and error.__context__ is operation_error:
                     error.__context__ = None
                 cleanup_errors.append(error)
-        try:
-            # Closing the descriptor is the final lock-release mechanism and
-            # must run even when explicit unlock or acquisition failed.
-            os.close(descriptor)
-        except BaseException as error:
-            if error.__cause__ is None and error.__context__ is operation_error:
-                error.__context__ = None
-            cleanup_errors.append(error)
+        if not retained:
+            try:
+                # Closing the descriptor is the final lock-release mechanism and
+                # must run even when explicit unlock or acquisition failed.
+                os.close(descriptor)
+            except BaseException as error:
+                if error.__cause__ is None and error.__context__ is operation_error:
+                    error.__context__ = None
+                cleanup_errors.append(error)
 
     if operation_error is not None:
         if cleanup_errors:

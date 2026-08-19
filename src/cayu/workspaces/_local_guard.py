@@ -15,6 +15,7 @@ import os
 import secrets
 import stat
 import sys
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -55,6 +56,59 @@ class _LocalGuardPathError(Exception):
     def __init__(self, status: str) -> None:
         self.status = status
         super().__init__(status)
+
+
+class _LocalGuardStagingCleanupError(RuntimeError):
+    """Retain the exact directory owner when atomic staging cannot be removed."""
+
+    def __init__(
+        self,
+        parent_fd: int,
+        temp_name: str,
+        failures: tuple[BaseException, ...],
+    ) -> None:
+        self._lock = threading.Lock()
+        self._temp_name = temp_name
+        try:
+            self._parent_fd: int | None = os.dup(parent_fd)
+        except BaseException as owner_error:
+            self._parent_fd = None
+            failures = (*failures, owner_error)
+        self.failures = failures
+        super().__init__("Workspace atomic staging cleanup did not complete.")
+
+    def retry_cleanup(self) -> bool:
+        """Retry against the pinned parent and release it after positive absence."""
+
+        with self._lock:
+            parent_fd = self._parent_fd
+            if parent_fd is None:
+                return False
+            absent, _failures = _unlink_staging_and_inspect(parent_fd, self._temp_name)
+            if not absent:
+                return False
+            self._parent_fd = None
+            with suppress(OSError):
+                os.close(parent_fd)
+            return True
+
+    @property
+    def cleanup_owned(self) -> bool:
+        with self._lock:
+            return self._parent_fd is not None
+
+    def release_cleanup_owner(self) -> None:
+        """Release the descriptor after a wider owner removed the containing tree."""
+
+        with self._lock:
+            parent_fd = self._parent_fd
+            self._parent_fd = None
+        if parent_fd is not None:
+            with suppress(OSError):
+                os.close(parent_fd)
+
+    def __del__(self) -> None:
+        self.release_cleanup_owner()
 
 
 def _require_descriptor_guard_support() -> None:
@@ -190,36 +244,123 @@ def _write_temp(parent_fd: int, name: str, content: bytes, *, mode: int | None) 
             temp.write(content)
             if mode is not None:
                 os.fchmod(temp.fileno(), mode)
-    except BaseException:
-        with suppress(FileNotFoundError):
-            os.unlink(temp_name, dir_fd=parent_fd)
+    except BaseException as primary:
+        absent, cleanup_failures = _unlink_staging_and_inspect(parent_fd, temp_name)
+        if not absent:
+            _raise_staging_cleanup_error(
+                parent_fd,
+                temp_name,
+                (primary, *cleanup_failures),
+            )
+        if _contains_fatal_cleanup_failure(cleanup_failures):
+            _raise_operation_and_cleanup_failures(primary, cleanup_failures)
         raise
     return temp_name
 
 
-def _create_at(parent_fd: int, name: str, content: bytes) -> None:
-    temp_name = _write_temp(parent_fd, name, content, mode=None)
-    try:
+def _unlink_staging_and_inspect(
+    parent_fd: int,
+    temp_name: str,
+) -> tuple[bool, tuple[BaseException, ...]]:
+    """Try twice, then prove whether one private staging name still exists."""
+
+    failures: list[BaseException] = []
+    for _attempt in range(2):
         try:
-            os.link(
-                temp_name,
-                name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError as exc:
-            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if stat.S_ISLNK(info.st_mode):
-                raise _LocalGuardPathError("escape") from exc
-            raise
-    finally:
-        with suppress(FileNotFoundError):
             os.unlink(temp_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return True, tuple(failures)
+        except BaseException as error:
+            failures.append(error)
+        else:
+            return True, tuple(failures)
+    try:
+        os.stat(temp_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True, tuple(failures)
+    except BaseException as error:
+        failures.append(error)
+    return False, tuple(failures)
+
+
+def _contains_fatal_cleanup_failure(failures: tuple[BaseException, ...]) -> bool:
+    return any(not isinstance(error, Exception) for error in failures)
+
+
+def _raise_operation_and_cleanup_failures(
+    primary: BaseException | None,
+    cleanup_failures: tuple[BaseException, ...],
+) -> NoReturn:
+    failures = cleanup_failures if primary is None else (primary, *cleanup_failures)
+    if len(failures) == 1:
+        raise failures[0]
+    raise BaseExceptionGroup(
+        "Workspace staging operation and cleanup failures.",
+        list(failures),
+    )
+
+
+def _raise_staging_cleanup_error(
+    parent_fd: int,
+    temp_name: str,
+    failures: tuple[BaseException, ...],
+) -> NoReturn:
+    error = _LocalGuardStagingCleanupError(parent_fd, temp_name, failures)
+    retained_failures = error.failures
+    cause: BaseException
+    if len(retained_failures) == 1:
+        cause = retained_failures[0]
+    else:
+        cause = BaseExceptionGroup(
+            "Workspace staging operation and cleanup failures.",
+            list(retained_failures),
+        )
+    raise error from cause
+
+
+def _create_at(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    mode: int | None = None,
+) -> None:
+    temp_name = _write_temp(parent_fd, name, content, mode=mode)
+    primary: BaseException | None = None
+    try:
+        os.link(
+            temp_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError as exc:
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except BaseException as classification_error:
+            primary = classification_error
+        else:
+            if stat.S_ISLNK(info.st_mode):
+                primary = _LocalGuardPathError("escape")
+                primary.__cause__ = exc
+            else:
+                primary = exc
+    except BaseException as error:
+        primary = error
+    absent, cleanup_failures = _unlink_staging_and_inspect(parent_fd, temp_name)
+    if not absent:
+        failures = cleanup_failures if primary is None else (primary, *cleanup_failures)
+        _raise_staging_cleanup_error(parent_fd, temp_name, failures)
+    if _contains_fatal_cleanup_failure(cleanup_failures):
+        _raise_operation_and_cleanup_failures(primary, cleanup_failures)
+    if primary is not None:
+        raise primary
 
 
 def _replace_at(parent_fd: int, name: str, content: bytes, *, mode: int) -> None:
     temp_name = _write_temp(parent_fd, name, content, mode=mode)
+    primary: BaseException | None = None
     try:
         os.rename(
             temp_name,
@@ -227,9 +368,16 @@ def _replace_at(parent_fd: int, name: str, content: bytes, *, mode: int) -> None
             src_dir_fd=parent_fd,
             dst_dir_fd=parent_fd,
         )
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(temp_name, dir_fd=parent_fd)
+    except BaseException as error:
+        primary = error
+    absent, cleanup_failures = _unlink_staging_and_inspect(parent_fd, temp_name)
+    if not absent:
+        failures = cleanup_failures if primary is None else (primary, *cleanup_failures)
+        _raise_staging_cleanup_error(parent_fd, temp_name, failures)
+    if _contains_fatal_cleanup_failure(cleanup_failures):
+        _raise_operation_and_cleanup_failures(primary, cleanup_failures)
+    if primary is not None:
+        raise primary
 
 
 def _raise_workspace_path_error(
@@ -276,6 +424,26 @@ def write_regular(root: Path, relative_path: str, content: bytes) -> None:
         _raise_workspace_path_error(exc, relative_path)
 
 
+def restore_regular(
+    root: Path,
+    relative_path: str,
+    content: bytes,
+    *,
+    mode: int,
+) -> None:
+    """Restore exact bytes and mode without following any path component."""
+
+    try:
+        with _open_parent(root, relative_path, create=True) as (parent_fd, name):
+            current_mode = _inspect_regular_target_mode(parent_fd, name)
+            if current_mode is None:
+                _create_at(parent_fd, name, content, mode=mode)
+            else:
+                _replace_at(parent_fd, name, content, mode=mode)
+    except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, relative_path)
+
+
 def replace_regular_if_revision(
     root: Path,
     relative_path: str,
@@ -302,6 +470,21 @@ def delete_regular(root: Path, relative_path: str) -> None:
     except _LocalGuardPathError as exc:
         if exc.status not in {"missing", "notdir"}:
             _raise_workspace_path_error(exc, relative_path)
+
+
+def delete_empty_directory(root: Path, relative_path: str) -> None:
+    """Remove one empty directory without following any path component."""
+
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, name):
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise _LocalGuardPathError("escape")
+            if not stat.S_ISDIR(info.st_mode):
+                raise _LocalGuardPathError("notdir")
+            os.rmdir(name, dir_fd=parent_fd)
+    except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, relative_path)
 
 
 def delete_regular_if_revision(

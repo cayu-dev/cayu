@@ -18,6 +18,7 @@ from cayu.workspaces._mutations import (
     mutation_result,
     mutation_result_from_identities,
     workspace_path_lock,
+    workspace_source_lock,
 )
 from cayu.workspaces.base import (
     Workspace,
@@ -31,6 +32,7 @@ from cayu.workspaces.base import (
     matches_list_pattern,
     validate_list_pattern,
 )
+from cayu.workspaces.branches import WorkspaceBranchCreationResult, WorkspaceBranchRequest
 
 
 class LocalWorkspace(Workspace):
@@ -60,6 +62,14 @@ class LocalWorkspace(Workspace):
         if validated is None:
             raise TypeError("Workspace max_bytes must be an integer.")
         return validated
+
+    async def create_branch(
+        self,
+        request: WorkspaceBranchRequest,
+    ) -> WorkspaceBranchCreationResult:
+        from cayu.workspaces._local_branch import create_local_workspace_branch
+
+        return await create_local_workspace_branch(self, request)
 
     async def read_bytes(
         self,
@@ -184,12 +194,18 @@ class LocalWorkspace(Workspace):
 
 
 def _write_file(root: Path, relative_path: str, content: bytes) -> None:
-    with workspace_path_lock(root, relative_path):
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
         write_regular(root, relative_path, content)
 
 
 def _delete_file(root: Path, relative_path: str) -> None:
-    with workspace_path_lock(root, relative_path):
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
         delete_regular(root, relative_path)
 
 
@@ -199,7 +215,10 @@ def _read_file_locked(
     offset: int,
     max_bytes: int | None,
 ) -> WorkspaceReadResult:
-    with workspace_path_lock(root, relative_path):
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
         return _read_file(root, relative_path, offset, max_bytes)
 
 
@@ -227,7 +246,10 @@ def _read_file(
 
 
 def _create_file(root: Path, relative_path: str, content: bytes) -> WorkspaceMutationResult:
-    with workspace_path_lock(root, relative_path):
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
         create_regular(root, relative_path, content)
         return mutation_result("create", before=None, after=content)
 
@@ -238,7 +260,10 @@ def _replace_file(
     content: bytes,
     expected_revision: str,
 ) -> WorkspaceMutationResult:
-    with workspace_path_lock(root, relative_path):
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
         before = replace_regular_if_revision(
             root,
             relative_path,
@@ -253,7 +278,10 @@ def _delete_file_if_revision(
     relative_path: str,
     expected_revision: str,
 ) -> WorkspaceMutationResult:
-    with workspace_path_lock(root, relative_path):
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
         before = delete_regular_if_revision(root, relative_path, expected_revision)
         return mutation_result_from_identities("delete", before=before, after=None)
 
@@ -263,18 +291,19 @@ def _list_files(
     pattern: str,
     limit: int | None,
 ) -> WorkspaceListResult:
-    collector = _WorkspaceListCollector(limit)
-    for path in root.rglob("*"):
-        if _has_symlink_component(root, path):
-            continue
-        resolved = path.resolve()
-        _ensure_inside_root(root, resolved)
-        if resolved == root or not resolved.is_file():
-            continue
-        if not matches_list_pattern(resolved.relative_to(root).as_posix(), pattern):
-            continue
-        collector.add(resolved.relative_to(root).as_posix())
-    return collector.result(exact_total_when_truncated=False)
+    with workspace_source_lock(root, exclusive=False):
+        collector = _WorkspaceListCollector(limit)
+        for path in root.rglob("*"):
+            if _has_symlink_component(root, path):
+                continue
+            resolved = path.resolve()
+            _ensure_inside_root(root, resolved)
+            if resolved == root or not resolved.is_file():
+                continue
+            if not matches_list_pattern(resolved.relative_to(root).as_posix(), pattern):
+                continue
+            collector.add(resolved.relative_to(root).as_posix())
+        return collector.result(exact_total_when_truncated=False)
 
 
 def _has_symlink_component(root: Path, path: Path) -> bool:
