@@ -856,9 +856,17 @@ export type ApiProviderOperationInspection = {
      */
     accounting_status: 'not_applicable' | 'reserved' | 'settled';
     /**
+     * Allowed Resolutions
+     */
+    allowed_resolutions?: Array<'fallback_retry' | 'fail'>;
+    /**
      * Cancellation Status
      */
     cancellation_status: 'not_requested' | 'requested' | 'unsupported' | 'pending' | 'cancelled' | 'completed' | 'failed' | 'unavailable';
+    /**
+     * Duplicate Request Risk
+     */
+    duplicate_request_risk?: boolean;
     /**
      * Operation Id
      */
@@ -868,13 +876,33 @@ export type ApiProviderOperationInspection = {
      */
     provider?: string | null;
     /**
+     * Recovery Reason
+     */
+    recovery_reason?: 'failed' | 'expired' | 'cancelled' | 'malformed' | 'wrong_provider' | 'unavailable' | 'ambiguous_submission' | null;
+    /**
      * Reservation Count
      */
     reservation_count: number;
     /**
+     * Resolution Action
+     */
+    resolution_action?: 'fallback_retry' | 'fail' | null;
+    /**
+     * Resolution Id
+     */
+    resolution_id?: string | null;
+    /**
+     * Run Epoch
+     */
+    run_epoch?: number | null;
+    /**
+     * Stage Id
+     */
+    stage_id?: string | null;
+    /**
      * Status
      */
-    status: 'synchronous' | 'provider_operation_in_progress' | 'reconnect_scheduled' | 'reconnect_in_progress' | 'provider_operation_reconciled';
+    status: 'synchronous' | 'provider_operation_in_progress' | 'reconnect_scheduled' | 'reconnect_in_progress' | 'provider_operation_reconciled' | 'provider_operation_unavailable' | 'ambiguous_submission' | 'fallback_retry';
     /**
      * Stream Protocol
      */
@@ -2428,6 +2456,7 @@ export type ControlPlaneCapabilities = {
 export type ControlPlaneMutationCapabilities = {
     knowledge_review: CapabilityOperation;
     pending_action_resolution: CapabilityOperation;
+    provider_operation_resolution: CapabilityOperation;
     session_annotations: CapabilityOperation;
     session_execution: CapabilityOperation;
     session_interruption: CapabilityOperation;
@@ -4507,6 +4536,45 @@ export type ProviderManifest = {
      * Usage Dialect
      */
     usage_dialect: string;
+};
+
+/**
+ * ProviderOperationResolutionAction
+ *
+ * Explicit dispositions for a provider operation Cayu cannot continue exactly.
+ */
+export type ProviderOperationResolutionAction = 'fallback_retry' | 'fail';
+
+/**
+ * ProviderOperationResolutionBody
+ *
+ * Explicit retry-or-fail disposition for unavailable provider work.
+ */
+export type ProviderOperationResolutionBody = {
+    action: ProviderOperationResolutionAction;
+    /**
+     * Expected Run Epoch
+     */
+    expected_run_epoch: number;
+    /**
+     * Metadata
+     */
+    metadata?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    resolved_by?: ResolutionActor | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Stage Id
+     */
+    stage_id: string;
 };
 
 /**
@@ -8725,6 +8793,55 @@ export type ListPendingActionsApiPendingActionsGetResponses = {
 };
 
 export type ListPendingActionsApiPendingActionsGetResponse = ListPendingActionsApiPendingActionsGetResponses[keyof ListPendingActionsApiPendingActionsGetResponses];
+
+export type ResolveProviderOperationApiProviderOperationsResolvePostData = {
+    body: ProviderOperationResolutionBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/provider-operations/resolve';
+};
+
+export type ResolveProviderOperationApiProviderOperationsResolvePostErrors = {
+    /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
+};
+
+export type ResolveProviderOperationApiProviderOperationsResolvePostError = ResolveProviderOperationApiProviderOperationsResolvePostErrors[keyof ResolveProviderOperationApiProviderOperationsResolvePostErrors];
+
+export type ResolveProviderOperationApiProviderOperationsResolvePostResponses = {
+    /**
+     * SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.
+     */
+    200: string;
+};
+
+export type ResolveProviderOperationApiProviderOperationsResolvePostResponse = ResolveProviderOperationApiProviderOperationsResolvePostResponses[keyof ResolveProviderOperationApiProviderOperationsResolvePostResponses];
 
 export type ResumeAgentApiResumePostData = {
     body: ResumeBody;

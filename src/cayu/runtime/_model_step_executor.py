@@ -99,6 +99,8 @@ from cayu.providers import (
     ProviderOperationMode,
     ProviderOperationRecoveryMetadata,
     ProviderOperationSnapshot,
+    ProviderOperationStartIdempotencySupport,
+    ProviderOperationStartRecoveryRequest,
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
@@ -227,11 +229,16 @@ from cayu.runtime.provider_operations import (
     ProviderOperationProgressEnvelope,
     ProviderOperationRecoveryResult,
     ProviderOperationRecoveryStatus,
+    ProviderOperationUnavailableReason,
     RecoverableProviderOperation,
+    RecoverableProviderOperationStart,
     commit_provider_operation_progress,
+    fallback_dispatch_ordinal_from_checkpoint,
     load_recoverable_provider_operation,
     provider_operation_progress_envelope,
     provider_operation_progress_event_id,
+    provider_operation_started_event_id,
+    provider_operation_unavailable_reason,
 )
 from cayu.runtime.request_footprints import (
     PromptContributionManifest,
@@ -491,6 +498,16 @@ def _ambiguous_provider_operation_start_error(
         error_type=type(cause).__name__,
         error_code="provider_operation_start_ambiguous",
         retryable=False,
+    )
+
+
+def is_ambiguous_provider_operation_start_error(failure: BaseException) -> bool:
+    """Return whether one failure retains start-only provider ambiguity."""
+
+    return any(
+        isinstance(candidate, ModelProviderError)
+        and candidate.error_code == "provider_operation_start_ambiguous"
+        for candidate in iter_exception_tree(failure)
     )
 
 
@@ -963,6 +980,7 @@ def _model_completion_stage_intent(
     source_transcript_cursor: int,
     request_fingerprint: str,
     recovery_context: ModelCompletionRecoveryContext | None,
+    provider_operation_start: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
     if (
@@ -972,7 +990,7 @@ def _model_completion_stage_intent(
         raise TypeError(
             "Model completion recovery context must be a ModelCompletionRecoveryContext."
         )
-    intent = {
+    intent: dict[str, Any] = {
         "schema_version": 1,
         "purpose": "assistant-turn",
         **model_attempt_identity.payload(),
@@ -984,6 +1002,11 @@ def _model_completion_stage_intent(
     }
     if recovery_context is not None:
         intent["recovery_context"] = recovery_context.model_dump(mode="json")
+    if provider_operation_start is not None:
+        intent["provider_operation_start"] = copy_durable_json_object(
+            provider_operation_start,
+            "provider_operation_start",
+        )
     return intent
 
 
@@ -1194,6 +1217,49 @@ async def _publish_model_completion(
                 "completion evidence."
             )
         raise
+
+
+def _classify_provider_recovery_failure(
+    failure: BaseException,
+    *,
+    cancellation_baseline: int,
+    operation: str,
+) -> BaseException:
+    """Keep current caller cancellation distinct from child-only cancellation."""
+
+    task = asyncio.current_task()
+    if task is not None and task.cancelling() > cancellation_baseline:
+        cancellation = _take_model_completion_cancellation(
+            failure,
+            cancellation_baseline=cancellation_baseline,
+        )
+        if cancellation is None:  # pragma: no cover - guarded by the task count
+            raise AssertionError("Provider recovery lost current task cancellation.")
+        if failure is not cancellation and not exception_tree_contains(
+            failure,
+            asyncio.CancelledError,
+        ):
+            set_exception_cause(cancellation, failure)
+        return cancellation
+    cancellations = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if isinstance(candidate, asyncio.CancelledError)
+    ]
+    if not cancellations:
+        return failure
+    fatal_leaves = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if not isinstance(candidate, BaseExceptionGroup)
+        and not isinstance(candidate, (Exception, asyncio.CancelledError))
+    ]
+    if fatal_leaves:
+        return failure
+    unexpected = unexpected_child_cancellation_error(cancellations[0], operation=operation)
+    if failure is not cancellations[0]:
+        set_exception_cause(unexpected, failure)
+    return unexpected
 
 
 def _take_model_completion_cancellation(
@@ -2174,6 +2240,162 @@ class ModelStepExecutor:
         [emitted] = await self._event_writer.fan_out_persisted([commit.event])
         return commit, emitted
 
+    async def recover_provider_operation_start(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        start: RecoverableProviderOperationStart,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        model_completion_publisher: ModelCompletionPublisher,
+    ) -> ProviderOperationRecoveryResult:
+        """Recover start-only evidence without persisting or replaying a raw request."""
+
+        provider = registered_provider.provider
+        adapter = provider.provider_operations
+        exact_recovery = start.idempotency_support is ProviderOperationStartIdempotencySupport.EXACT
+        if (
+            provider.provider_operation_mode is not ProviderOperationMode.BACKGROUND
+            or not isinstance(adapter, ProviderOperationAdapter)
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation start recovery is unavailable."
+            )
+        if start.provider != registered_provider.name or start.model != session.model:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation start recovery resolved a different provider scope."
+            )
+
+        async def unavailable(
+            reason: ProviderOperationUnavailableReason,
+        ) -> ProviderOperationRecoveryResult:
+            required = _event_with_model_identity_authority(
+                Event(
+                    type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                    session_id=session.id,
+                    interaction_id=start.interaction_id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "provider": registered_provider.name,
+                        "model": session.model,
+                        "step": start.step,
+                        "attempt": start.attempt,
+                        "max_attempts": start.max_attempts,
+                        **start.model_attempt_identity.payload(),
+                        "source_run_epoch": start.source_run_epoch,
+                        "run_epoch": session.run_epoch,
+                        "start_id": start.start_id,
+                        "status": reason.value,
+                        "recovery_reason": reason.value,
+                        "idempotent_start_recovery": exact_recovery,
+                    },
+                ),
+                start.model_attempt_identity,
+            )
+            required = event_with_runtime_payload_authority(required, "start_id")
+            emitted = await self._event_writer.emit(required)
+            return ProviderOperationRecoveryResult(
+                status=ProviderOperationRecoveryStatus.UNAVAILABLE,
+                events=(emitted,),
+                unavailable_reason=reason,
+            )
+
+        if start.idempotency_support is not ProviderOperationStartIdempotencySupport.EXACT:
+            return await unavailable(ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION)
+        if adapter.start_idempotency_support is not ProviderOperationStartIdempotencySupport.EXACT:
+            return await unavailable(ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION)
+        recovery_task = asyncio.current_task()
+        recovery_cancellation_baseline = (
+            0 if recovery_task is None else recovery_task.cancelling()
+        )
+        try:
+            raw_connection = await adapter.recover_start(
+                ProviderOperationStartRecoveryRequest(idempotency_key=start.start_id)
+            )
+        except BaseException as recovery_failure:
+            recovery_failure = _classify_provider_recovery_failure(
+                recovery_failure,
+                cancellation_baseline=recovery_cancellation_baseline,
+                operation="Provider operation start recovery",
+            )
+            if not isinstance(recovery_failure, Exception):
+                raise recovery_failure
+            return await unavailable(ProviderOperationUnavailableReason.UNAVAILABLE)
+        try:
+            connection = copy_provider_operation_connection(raw_connection)
+        except Exception:
+            if type(raw_connection) is ProviderOperationConnection:
+                async with aclosing_provider_stream(raw_connection.events):
+                    pass
+            return await unavailable(ProviderOperationUnavailableReason.MALFORMED)
+
+        operation_event = _event_with_model_identity_authority(
+            Event(
+                id=provider_operation_started_event_id(start.start_id),
+                type=EventType.PROVIDER_OPERATION_STARTED,
+                session_id=session.id,
+                interaction_id=start.interaction_id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "provider": registered_provider.name,
+                    "model": session.model,
+                    "step": start.step,
+                    "attempt": start.attempt,
+                    "max_attempts": start.max_attempts,
+                    **start.model_attempt_identity.payload(),
+                    "source_run_epoch": start.source_run_epoch,
+                    "start_id": start.start_id,
+                    "state_version": connection.state.version,
+                    "operation_id": connection.state.operation_id,
+                    "stream_protocol": connection.state.stream_protocol,
+                    "status": connection.status.value,
+                    "recovery_metadata": connection.state.recovery_metadata.model_dump(
+                        mode="json",
+                        exclude_none=True,
+                    ),
+                    "idempotent_start_recovery": True,
+                },
+            ),
+            start.model_attempt_identity,
+        )
+        operation_event = event_with_runtime_payload_authority(
+            operation_event,
+            "start_id",
+        )
+        try:
+            persisted = await self._event_writer.persist_exact_replay(operation_event)
+            [emitted] = await self._event_writer.fan_out_persisted([persisted])
+        finally:
+            await _close_async_iterator(raw_connection.events)
+        operation = await load_recoverable_provider_operation(
+            self._session_store,
+            stage,
+        )
+        if operation is None:
+            raise ProviderOperationEvidenceError(
+                "Idempotent provider start did not produce recoverable operation evidence."
+            )
+        recovered = await self.recover_provider_operation(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+            recovery_context=model_completion_recovery_context_from_stage(stage),
+            model_completion_publisher=model_completion_publisher,
+        )
+        return ProviderOperationRecoveryResult(
+            status=recovered.status,
+            events=(emitted, *recovered.events),
+            completion_event=recovered.completion_event,
+            unavailable_reason=recovered.unavailable_reason,
+        )
+
     async def recover_provider_operation(
         self,
         *,
@@ -2267,7 +2489,27 @@ class ModelStepExecutor:
                     raise SessionInterruptedByRequest(session.id)
                 recovery_under_cancellation_claim = True
 
-        def recovery_event(event_type: EventType, *, status: str) -> Event:
+        def recovery_event(
+            event_type: EventType,
+            *,
+            status: str,
+            recovery_reason: ProviderOperationUnavailableReason | None = None,
+        ) -> Event:
+            payload = {
+                "provider": registered_provider.name,
+                "model": session.model,
+                "step": operation.step,
+                "attempt": operation.attempt,
+                "max_attempts": operation.max_attempts,
+                **operation.model_attempt_identity.payload(),
+                "source_run_epoch": operation.source_run_epoch,
+                "run_epoch": session.run_epoch,
+                "operation_id": operation.state.operation_id,
+                "stream_protocol": operation.state.stream_protocol,
+                "status": status,
+            }
+            if recovery_reason is not None:
+                payload["recovery_reason"] = recovery_reason.value
             event = _event_with_model_identity_authority(
                 Event(
                     type=event_type,
@@ -2275,19 +2517,7 @@ class ModelStepExecutor:
                     interaction_id=operation.interaction_id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                    payload={
-                        "provider": registered_provider.name,
-                        "model": session.model,
-                        "step": operation.step,
-                        "attempt": operation.attempt,
-                        "max_attempts": operation.max_attempts,
-                        **operation.model_attempt_identity.payload(),
-                        "source_run_epoch": operation.source_run_epoch,
-                        "run_epoch": session.run_epoch,
-                        "operation_id": operation.state.operation_id,
-                        "stream_protocol": operation.state.stream_protocol,
-                        "status": status,
-                    },
+                    payload=payload,
                 ),
                 operation.model_attempt_identity,
             )
@@ -2343,12 +2573,39 @@ class ModelStepExecutor:
                 events=tuple(recovered_events),
             )
 
+        async def unavailable_recovery_result(
+            reason: ProviderOperationUnavailableReason,
+            status: ProviderOperationStatus | str,
+        ) -> ProviderOperationRecoveryResult:
+            await require_recovery_owner()
+            status_value = status.value if isinstance(status, ProviderOperationStatus) else status
+            required = await self._event_writer.emit(
+                recovery_event(
+                    EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                    status=status_value,
+                    recovery_reason=reason,
+                )
+            )
+            recovered_events.append(required)
+            return ProviderOperationRecoveryResult(
+                status=ProviderOperationRecoveryStatus.UNAVAILABLE,
+                events=tuple(recovered_events),
+                unavailable_reason=reason,
+            )
+
         def retain_post_completion_failure(failure: BaseException) -> None:
             nonlocal post_completion_failure
             post_completion_failure = _combine_post_completion_failures(
                 post_completion_failure,
                 failure,
             )
+
+        def recovered_event_failure_reason(
+            failure: Exception,
+        ) -> ProviderOperationUnavailableReason:
+            if isinstance(failure, ModelProviderError):
+                return ProviderOperationUnavailableReason.FAILED
+            return ProviderOperationUnavailableReason.MALFORMED
 
         async def accept_recovered_event(
             raw_event: object,
@@ -2532,49 +2789,127 @@ class ModelStepExecutor:
 
         await require_recovery_owner()
         if operation.accepted_stream_events:
-            raw_connection = await adapter.reconnect(copy_provider_operation_state(operation.state))
+            try:
+                raw_connection = await adapter.reconnect(
+                    copy_provider_operation_state(operation.state)
+                )
+            except BaseException as recovery_failure:
+                recovery_failure = _classify_provider_recovery_failure(
+                    recovery_failure,
+                    cancellation_baseline=recovery_cancellation_baseline,
+                    operation="Provider operation reconnect",
+                )
+                if not isinstance(recovery_failure, Exception):
+                    raise recovery_failure
+                return await unavailable_recovery_result(
+                    ProviderOperationUnavailableReason.UNAVAILABLE,
+                    ProviderOperationStatus.UNAVAILABLE,
+                )
             try:
                 connection = copy_provider_operation_connection(raw_connection)
-            except BaseException:
+            except Exception:
                 if type(raw_connection) is ProviderOperationConnection:
-                    async with aclosing_provider_stream(raw_connection.events):
-                        raise
-                raise
+                    try:
+                        async with aclosing_provider_stream(raw_connection.events):
+                            pass
+                    except Exception:
+                        pass
+                return await unavailable_recovery_result(
+                    ProviderOperationUnavailableReason.MALFORMED,
+                    "malformed",
+                )
+            reconnect_unavailable: (
+                tuple[
+                    ProviderOperationUnavailableReason,
+                    ProviderOperationStatus | str,
+                ]
+                | None
+            ) = None
             try:
                 async with aclosing_provider_stream(connection.events) as reconnect_events:
                     if connection.state != operation.state:
-                        raise RuntimeError(
-                            "Provider reconnection returned a different operation state."
+                        reconnect_unavailable = (
+                            ProviderOperationUnavailableReason.WRONG_PROVIDER,
+                            "wrong_provider",
                         )
-                    recovery_status = connection.status
-                    async for raw_event in reconnect_events:
-                        await require_recovery_owner()
-                        await accept_recovered_event(raw_event, persist_progress=True)
-                        if completed_event is not None:
+                    else:
+                        recovery_status = connection.status
+                        async for raw_event in reconnect_events:
+                            await require_recovery_owner()
+                            try:
+                                await accept_recovered_event(raw_event, persist_progress=True)
+                            except Exception as event_failure:
+                                if completed_event is None:
+                                    reason = recovered_event_failure_reason(event_failure)
+                                    reconnect_unavailable = (reason, reason.value)
+                                else:
+                                    retain_post_completion_failure(event_failure)
+                                break
+                            if completed_event is None:
+                                continue
                             break
             except BaseException as stream_failure:
+                stream_failure = _classify_provider_recovery_failure(
+                    stream_failure,
+                    cancellation_baseline=recovery_cancellation_baseline,
+                    operation="Provider operation recovery stream",
+                )
                 if completed_event is None:
-                    raise
-                retain_post_completion_failure(stream_failure)
+                    if isinstance(stream_failure, Exception):
+                        reconnect_unavailable = (
+                            ProviderOperationUnavailableReason.UNAVAILABLE,
+                            ProviderOperationStatus.UNAVAILABLE,
+                        )
+                    else:
+                        raise
+                else:
+                    retain_post_completion_failure(stream_failure)
+            if reconnect_unavailable is not None and completed_event is None:
+                return await unavailable_recovery_result(*reconnect_unavailable)
         else:
-            snapshot = copy_provider_operation_snapshot(
-                await adapter.retrieve(copy_provider_operation_state(operation.state))
-            )
+            try:
+                raw_snapshot = await adapter.retrieve(
+                    copy_provider_operation_state(operation.state)
+                )
+            except BaseException as recovery_failure:
+                recovery_failure = _classify_provider_recovery_failure(
+                    recovery_failure,
+                    cancellation_baseline=recovery_cancellation_baseline,
+                    operation="Provider operation retrieval",
+                )
+                if not isinstance(recovery_failure, Exception):
+                    raise recovery_failure
+                return await unavailable_recovery_result(
+                    ProviderOperationUnavailableReason.UNAVAILABLE,
+                    ProviderOperationStatus.UNAVAILABLE,
+                )
+            try:
+                snapshot = copy_provider_operation_snapshot(raw_snapshot)
+            except Exception:
+                return await unavailable_recovery_result(
+                    ProviderOperationUnavailableReason.MALFORMED,
+                    "malformed",
+                )
             if snapshot.state != operation.state:
-                raise RuntimeError("Provider operation retrieval returned a different identity.")
+                return await unavailable_recovery_result(
+                    ProviderOperationUnavailableReason.WRONG_PROVIDER,
+                    "wrong_provider",
+                )
             recovery_status = snapshot.status
             if snapshot.status in {
                 ProviderOperationStatus.QUEUED,
                 ProviderOperationStatus.IN_PROGRESS,
             }:
                 return await pending_recovery_result(snapshot.status)
-            try:
-                for raw_event in snapshot.events:
+            for raw_event in snapshot.events:
+                try:
                     await accept_recovered_event(raw_event, persist_progress=False)
-            except BaseException as snapshot_failure:
-                if completed_event is None:
-                    raise
-                retain_post_completion_failure(snapshot_failure)
+                except Exception as snapshot_failure:
+                    if completed_event is None:
+                        reason = recovered_event_failure_reason(snapshot_failure)
+                        return await unavailable_recovery_result(reason, reason.value)
+                    retain_post_completion_failure(snapshot_failure)
+                    break
 
         try:
             await require_recovery_owner()
@@ -2591,7 +2926,10 @@ class ModelStepExecutor:
                 ProviderOperationStatus.IN_PROGRESS,
             }:
                 return await pending_recovery_result(recovery_status)
-            raise RuntimeError("Completed provider operation returned no completed event.")
+            unavailable_reason = provider_operation_unavailable_reason(recovery_status)
+            if unavailable_reason is None:
+                raise RuntimeError("Provider operation returned an unknown terminal status.")
+            return await unavailable_recovery_result(unavailable_reason, recovery_status)
         if recovery_status not in {
             ProviderOperationStatus.QUEUED,
             ProviderOperationStatus.IN_PROGRESS,
@@ -3753,7 +4091,27 @@ class ModelStepExecutor:
                     raise RuntimeError(
                         "Background provider-operation mode requires a ProviderOperationAdapter."
                     )
+                start_idempotency_support = provider_operation_adapter.start_idempotency_support
+                if type(start_idempotency_support) is not ProviderOperationStartIdempotencySupport:
+                    raise TypeError(
+                        "ProviderOperationAdapter.start_idempotency_support must return "
+                        "ProviderOperationStartIdempotencySupport."
+                    )
                 start_id = f"provider-operation:{model_attempt_identity.model_attempt_id}"
+                if completion_dispatch is None:
+                    raise RuntimeError(
+                        "Background provider operations require a durable model-completion stage."
+                    )
+                staged_start = completion_dispatch.stage.intent.get("provider_operation_start")
+                if (
+                    type(staged_start) is not dict
+                    or staged_start.get("schema_version") != 1
+                    or staged_start.get("idempotency_key") != start_id
+                    or staged_start.get("idempotency_support") != start_idempotency_support.value
+                ):
+                    raise RuntimeError(
+                        "Provider-operation start contract changed after durable staging."
+                    )
                 starting_event = _event_with_model_identity_authority(
                     Event(
                         type=EventType.PROVIDER_OPERATION_STARTING,
@@ -3769,6 +4127,7 @@ class ModelStepExecutor:
                             **model_attempt_identity.payload(),
                             "source_run_epoch": session.run_epoch,
                             "start_id": start_id,
+                            "start_idempotency_support": start_idempotency_support.value,
                         },
                     ),
                     model_attempt_identity,
@@ -3802,6 +4161,7 @@ class ModelStepExecutor:
                 ) -> Event:
                     event = _event_with_model_identity_authority(
                         Event(
+                            id=provider_operation_started_event_id(start_id),
                             type=EventType.PROVIDER_OPERATION_STARTED,
                             session_id=session.id,
                             interaction_id=emitted_starting_event.interaction_id,
@@ -3990,10 +4350,6 @@ class ModelStepExecutor:
                     ) from start_validation_error
                 operation_state = provider_operation.state
                 provider_operation_state = operation_state
-                if completion_dispatch is None:
-                    raise RuntimeError(
-                        "Background provider operations require a durable model-completion stage."
-                    )
                 operation_event = operation_event_for(
                     provider_operation.state,
                     provider_operation.status,
@@ -5574,7 +5930,10 @@ class ModelStepRun:
         # physical retention. The separately loaded permanent cursor is the
         # store fence and logical-step identity authority.
         logical_step_id = model_step_identity.model_step_id
-        next_dispatch_ordinal = 0
+        next_dispatch_ordinal = fallback_dispatch_ordinal_from_checkpoint(
+            await self._executor._session_store.load_checkpoint(self._session.id),
+            logical_step_id,
+        )
 
         async def prepare_model_completion_dispatch(
             attempt_model_request: ModelRequest,
@@ -5606,6 +5965,33 @@ class ModelStepRun:
                     raise TypeError(
                         "Model completion recovery context factory returned an invalid value."
                     )
+                provider_operation_start: dict[str, Any] | None = None
+                provider_operation_mode = self._provider.provider_operation_mode
+                if type(provider_operation_mode) is not ProviderOperationMode:
+                    raise TypeError(
+                        "ModelProvider.provider_operation_mode must return a ProviderOperationMode."
+                    )
+                if provider_operation_mode is ProviderOperationMode.BACKGROUND:
+                    operation_adapter = self._provider.provider_operations
+                    if not isinstance(operation_adapter, ProviderOperationAdapter):
+                        raise RuntimeError(
+                            "Background provider-operation mode requires a "
+                            "ProviderOperationAdapter."
+                        )
+                    idempotency_support = operation_adapter.start_idempotency_support
+                    if type(idempotency_support) is not ProviderOperationStartIdempotencySupport:
+                        raise TypeError(
+                            "ProviderOperationAdapter.start_idempotency_support must return "
+                            "ProviderOperationStartIdempotencySupport."
+                        )
+                    idempotency_key = (
+                        f"provider-operation:{pending_model_attempt_identity.model_attempt_id}"
+                    )
+                    provider_operation_start = {
+                        "schema_version": 1,
+                        "idempotency_support": idempotency_support.value,
+                        "idempotency_key": idempotency_key,
+                    }
                 intent = _model_completion_stage_intent(
                     model_attempt_identity=pending_model_attempt_identity,
                     provider_name=self._registered_provider.name,
@@ -5613,6 +5999,7 @@ class ModelStepRun:
                     source_transcript_cursor=source_transcript_cursor,
                     request_fingerprint=request_fingerprint,
                     recovery_context=recovery_context,
+                    provider_operation_start=provider_operation_start,
                 )
                 prepared = await self._executor._session_store.prepare_model_completion_stage(
                     self._session.id,

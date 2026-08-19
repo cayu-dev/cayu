@@ -6,6 +6,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
+
 from cayu import SQLiteSessionStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.cli import main
@@ -138,7 +140,7 @@ def test_session_list_uses_project_target_and_emits_stable_json(
     assert payload == {
         "has_more": False,
         "next_cursor": None,
-        "schema_version": "6",
+        "schema_version": "7",
         "sessions": [
             {
                 "agent": "writer",
@@ -183,6 +185,177 @@ def test_session_list_empty_result_is_successful_json(
     assert payload["sessions"] == []
     assert payload["total_count"] == 0
     assert payload["has_more"] is False
+
+
+def test_session_resolve_provider_operation_posts_fenced_server_request(
+    monkeypatch,
+    capsys,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Client:
+        def __init__(self, **kwargs) -> None:
+            captured["client"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def stream(self, method, url, *, json, headers):
+            captured["request"] = {
+                "method": method,
+                "url": url,
+                "json": json,
+                "headers": headers,
+            }
+            return Response()
+
+    monkeypatch.setattr("cayu.cli.session.httpx.Client", Client)
+    monkeypatch.setenv("CAYU_API_AUTHORIZATION", "Bearer operator-token")
+
+    assert (
+        main(
+            [
+                "session",
+                "resolve-provider-operation",
+                "session_757",
+                "--stage-id",
+                "stage_757",
+                "--run-epoch",
+                "4",
+                "--action",
+                "fallback_retry",
+                "--reason",
+                "Operator accepts duplicate-request risk.",
+                "--metadata",
+                '{"ticket":"INC-757"}',
+                "--server-url",
+                "http://127.0.0.1:8000/cayu",
+                "--mutation-id",
+                "resolution-757",
+            ]
+        )
+        == 0
+    )
+
+    request = captured["request"]
+    assert request == {
+        "method": "POST",
+        "url": "http://127.0.0.1:8000/cayu/api/provider-operations/resolve",
+        "json": {
+            "session_id": "session_757",
+            "stage_id": "stage_757",
+            "expected_run_epoch": 4,
+            "action": "fallback_retry",
+            "reason": "Operator accepts duplicate-request risk.",
+            "metadata": {"ticket": "INC-757"},
+        },
+        "headers": {
+            "Accept": "text/event-stream",
+            "Authorization": "Bearer operator-token",
+            "Cayu-Mutation-ID": "resolution-757",
+        },
+    }
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "schema_version": "7",
+        "accepted": True,
+        "session_id": "session_757",
+        "stage_id": "stage_757",
+        "run_epoch": 4,
+        "action": "fallback_retry",
+        "mutation_id": "resolution-757",
+    }
+
+
+def test_session_resolve_provider_operation_reads_bounded_streamed_error_safely(
+    monkeypatch,
+    capsys,
+) -> None:
+    authorization = "Custom provider-resolution-auth-canary-0123456789"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == authorization
+        return httpx.Response(
+            409,
+            json={
+                "detail": (
+                    "Resolution conflicts with the current run epoch for " + authorization
+                )
+            },
+        )
+
+    transport = httpx.MockTransport(handle)
+    client_type = httpx.Client
+
+    def client(**kwargs):
+        return client_type(transport=transport, **kwargs)
+
+    monkeypatch.setattr("cayu.cli.session.httpx.Client", client)
+    monkeypatch.setenv("CAYU_API_AUTHORIZATION", authorization)
+
+    assert (
+        main(
+            [
+                "session",
+                "resolve-provider-operation",
+                "session_757",
+                "--stage-id",
+                "stage_757",
+                "--run-epoch",
+                "4",
+                "--action",
+                "fail",
+                "--server-url",
+                "http://127.0.0.1:8000",
+            ]
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["error"]["message"] == (
+        "Cayu server returned HTTP 409: "
+        "Resolution conflicts with the current run epoch for [REDACTED]"
+    )
+    assert authorization not in captured.out
+    assert authorization not in captured.err
+    assert "ResponseNotRead" not in captured.out
+
+
+def test_session_resolve_provider_operation_requires_https_outside_loopback(capsys) -> None:
+    assert (
+        main(
+            [
+                "session",
+                "resolve-provider-operation",
+                "session_757",
+                "--stage-id",
+                "stage_757",
+                "--run-epoch",
+                "4",
+                "--action",
+                "fail",
+                "--server-url",
+                "http://cayu.example.com",
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["message"] == "Cayu server URL must use HTTPS outside loopback."
 
 
 def test_session_output_names_a_destination_and_format_is_independent(
@@ -504,6 +677,13 @@ def test_session_show_summarizes_oversized_state_without_printing_content(
         "cancellation_status": "not_requested",
         "accounting_status": "not_applicable",
         "reservation_count": 0,
+        "stage_id": None,
+        "run_epoch": None,
+        "recovery_reason": None,
+        "duplicate_request_risk": False,
+        "allowed_resolutions": [],
+        "resolution_action": None,
+        "resolution_id": None,
     }
 
 
@@ -601,6 +781,13 @@ def test_session_show_reports_reconciled_provider_operation(
         "cancellation_status": "not_requested",
         "accounting_status": "not_applicable",
         "reservation_count": 0,
+        "stage_id": None,
+        "run_epoch": None,
+        "recovery_reason": None,
+        "duplicate_request_risk": False,
+        "allowed_resolutions": [],
+        "resolution_action": None,
+        "resolution_id": None,
     }
 
 
@@ -1342,7 +1529,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "model_call",
         "unmatched_ledger",
     }
-    assert {row["schema_version"] for row in jsonl_rows} == {"6"}
+    assert {row["schema_version"] for row in jsonl_rows} == {"7"}
     aggregate_row = next(row for row in jsonl_rows if row["record_type"] == "aggregate")
     assert aggregate_row["total_tokens"] == "12"
 
@@ -1401,7 +1588,7 @@ def test_session_usage_json_serializes_aggregate_counters_losslessly(
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == "6"
+    assert payload["schema_version"] == "7"
     assert payload["aggregate"]["input_tokens"] == expected
     assert payload["aggregate"]["total_tokens"] == expected
 
@@ -2881,7 +3068,7 @@ def test_session_cli_lists_and_filters_response_scoped_interactions(
         == 0
     )
     listed = json.loads(capsys.readouterr().out)
-    assert listed["schema_version"] == "6"
+    assert listed["schema_version"] == "7"
     assert [item["interaction_id"] for item in listed["interactions"]] == [
         "interaction-b",
         "interaction-a",

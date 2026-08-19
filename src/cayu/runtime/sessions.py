@@ -3443,6 +3443,7 @@ MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE = "cayu.model-completion-stage.ab
 MODEL_COMPLETION_STAGE_SCHEMA_VERSION = 1
 MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY = MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "active"
 MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES = 256 * 1024
+MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES = 16 * 1024
 _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
 _MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS = _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS | {
     "continue"
@@ -3487,6 +3488,23 @@ class ModelCompletionStageRequest(BaseModel):
                 raise ValueError(
                     "intent.recovery_context exceeds the durable byte limit of "
                     f"{MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES}."
+                )
+        provider_start = copied.get("provider_operation_start")
+        if provider_start is not None:
+            if type(provider_start) is not dict:
+                raise ValueError("intent.provider_operation_start must be an object.")
+            if (
+                len(
+                    canonical_durable_json_bytes(
+                        provider_start,
+                        "intent.provider_operation_start",
+                    )
+                )
+                > MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES
+            ):
+                raise ValueError(
+                    "intent.provider_operation_start exceeds the durable byte limit of "
+                    f"{MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES}."
                 )
         return copied
 
@@ -3843,6 +3861,26 @@ class _ModelCompletionStagePromotionContext:
     completion_digest: str
 
 
+class ModelCompletionStageRelease(BaseModel):
+    """Exact active-stage authority released by an auditable external disposition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage_id: str = Field(max_length=256)
+    preparation_digest: str
+
+    @field_validator("stage_id")
+    @classmethod
+    def validate_stage_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "stage_id")
+
+    @field_validator("preparation_digest")
+    @classmethod
+    def validate_preparation_digest(cls, value: str) -> str:
+        _require_raw_sha256_digest(value)
+        return value
+
+
 class SessionOperationPublication(BaseModel):
     """One atomic checkpoint/event publication plus terminal operation records."""
 
@@ -3850,6 +3888,7 @@ class SessionOperationPublication(BaseModel):
 
     checkpoint: dict[str, Any]
     operation_records: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    model_completion_stage_release: ModelCompletionStageRelease | None = None
 
     @field_validator("checkpoint", mode="before")
     @classmethod
@@ -5119,6 +5158,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     PENDING_USER_INPUT = "pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     REPAIRED_WORKSPACE_OBSERVATION = "repaired_workspace_observation"
+    REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
     FINALIZED_INTERRUPT = "finalized_interrupt"
     FAILED = "failed"
@@ -10922,12 +10962,27 @@ class InMemorySessionStore(SessionStore):
                 "operation_records",
             )
             _validate_session_operation_record_keys(copied_records)
+            release = publication.model_completion_stage_release
+            if release is not None:
+                operation_records = self._session_operation_records.get(session_id, {})
+                _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+                    session_id, release.stage_id
+                )
+                _validate_model_completion_stage_release(
+                    session=session,
+                    active_record=operation_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    preparation_record=operation_records.get(preparation_key),
+                    terminal_record=operation_records.get(terminal_key),
+                    release=release,
+                )
             if commit_guard is not None:
                 commit_guard()
             updated = self._append_events_unlocked(session, copied_events)
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             operation_records = self._session_operation_records.setdefault(session_id, {})
             operation_records.update(copied_records)
+            if release is not None:
+                del operation_records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY]
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
@@ -16335,6 +16390,54 @@ def _active_model_completion_stage_record(
     }
     payload["record_digest"] = _canonical_runtime_publication_digest(payload)
     return copy_durable_json_object(payload, "active_model_completion_stage")
+
+
+def _validate_model_completion_stage_release(
+    *,
+    session: Session,
+    active_record: dict[str, Any] | None,
+    preparation_record: dict[str, Any] | None,
+    terminal_record: dict[str, Any] | None,
+    release: ModelCompletionStageRelease,
+) -> _ActiveModelCompletionStageRecord:
+    """Validate exact in-flight stage ownership before a disposition clears it."""
+
+    if type(release) is not ModelCompletionStageRelease:
+        raise TypeError("model_completion_stage_release is invalid.")
+    if active_record is None:
+        raise SessionModelCompletionStageConflict("The model-completion stage is no longer active.")
+    marker = _reconstruct_active_model_completion_stage_record(
+        active_record,
+        session_id=session.id,
+    )
+    if (
+        marker.stage_id != release.stage_id
+        or marker.preparation_digest != release.preparation_digest
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The active model-completion stage changed before external disposition."
+        )
+    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        session.id,
+        release.stage_id,
+    )
+    stage = _reconstruct_model_completion_stage(
+        preparation_record,
+        terminal_record,
+        session_id=session.id,
+        stage_id=release.stage_id,
+        preparation_storage_key=preparation_key,
+        terminal_storage_key=terminal_key,
+    )
+    if (
+        stage is None
+        or stage.state != "in_flight"
+        or stage.preparation_digest != release.preparation_digest
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The model-completion stage became terminal before external disposition."
+        )
+    return marker
 
 
 def _model_completion_stage_abandonment_record(

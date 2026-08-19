@@ -61,6 +61,7 @@ import {
   type RecoveryOutcome,
   type SessionEvent,
   type SessionEventsPage,
+  type SessionState,
   type SessionSummary,
   type SessionTranscriptPage,
 } from "../lib/api"
@@ -80,6 +81,7 @@ import type {
   MutationTransportController,
   MutationTransportSnapshot,
 } from "../lib/mutation-transport.ts"
+import { providerOperationNeedsResolution } from "../lib/provider-operations"
 import {
   isFailureEventType,
   latestFailureEvent,
@@ -132,7 +134,12 @@ import {
 import { cn } from "../lib/utils"
 
 type MutationBrowserModule = typeof import("../lib/mutation-browser")
-type SessionMutationKind = "interrupt" | "resume" | "cascade" | "pending_action"
+type SessionMutationKind =
+  | "interrupt"
+  | "resume"
+  | "cascade"
+  | "pending_action"
+  | "provider_operation"
 
 const INTERRUPTIBLE_SESSION_STATUSES = new Set(["pending", "running"])
 const ACTIVE_SESSION_STATUSES = new Set(["pending", "running", "interrupting"])
@@ -780,6 +787,109 @@ function TranscriptPart({ part }: { part: Record<string, unknown> }) {
   return <PayloadViewer value={part} maxHeight="max-h-48" />
 }
 
+function ProviderOperationResolutionBanner({
+  operation,
+  resolving,
+  unavailableReason,
+  error,
+  onResolve,
+}: {
+  operation: SessionState["provider_operation"]
+  resolving: boolean
+  unavailableReason: string | null
+  error: string | null
+  onResolve: (action: "fallback_retry" | "fail", reason: string) => void
+}) {
+  const [reason, setReason] = useState("")
+  const reasonReady = reason.trim().length > 0
+  const targetReady = operation.stage_id !== null && operation.run_epoch !== null
+  const controlsDisabled = resolving || unavailableReason !== null || !targetReady || !reasonReady
+  const fallbackAllowed = operation.allowed_resolutions?.includes("fallback_retry") ?? false
+  const failAllowed = operation.allowed_resolutions?.includes("fail") ?? false
+  const ambiguous = operation.status === "ambiguous_submission"
+
+  return (
+    <Card
+      className="border-destructive/30 bg-destructive/5"
+      data-testid="provider-operation-resolution"
+    >
+      <CardContent className="space-y-4 p-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="destructive">
+                <AlertTriangle className="mr-1 h-3.5 w-3.5" />
+                {ambiguous ? "Provider submission is ambiguous" : "Provider operation unavailable"}
+              </Badge>
+              {operation.provider && <Badge variant="secondary">{operation.provider}</Badge>}
+              {operation.recovery_reason && (
+                <Badge variant="outline">{operation.recovery_reason.replaceAll("_", " ")}</Badge>
+              )}
+            </div>
+            <p className="mt-2 text-sm font-medium">
+              Cayu stopped instead of silently submitting a replacement model request.
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Retry starts a new model attempt from the last durable Cayu boundary. Fail closes the
+              original attempt and session through the normal durable failure path.
+            </p>
+            {operation.duplicate_request_risk && (
+              <p className="mt-2 text-sm font-medium text-destructive">
+                The provider may already have accepted the original request. Retrying can create a
+                duplicate provider request and cost; confirm that risk before continuing.
+              </p>
+            )}
+            <div className="mt-2 space-y-1 break-all font-mono text-xs text-muted-foreground">
+              <div>stage_id: {operation.stage_id ?? "unavailable"}</div>
+              <div>run_epoch: {operation.run_epoch ?? "unavailable"}</div>
+              {operation.operation_id && <div>operation_id: {operation.operation_id}</div>}
+            </div>
+          </div>
+          <div className="flex shrink-0 flex-wrap gap-2">
+            <Button
+              variant="destructive"
+              disabled={controlsDisabled || !failAllowed}
+              title={unavailableReason ?? undefined}
+              onClick={() => onResolve("fail", reason.trim())}
+            >
+              Fail session
+            </Button>
+            <Button
+              disabled={controlsDisabled || !fallbackAllowed}
+              title={unavailableReason ?? undefined}
+              onClick={() => onResolve("fallback_retry", reason.trim())}
+            >
+              Retry from Cayu boundary
+            </Button>
+          </div>
+        </div>
+        <Textarea
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder="Required operator reason for the durable audit record"
+          rows={2}
+          disabled={resolving || unavailableReason !== null}
+          title={unavailableReason ?? undefined}
+        />
+        {!targetReady && (
+          <p className="text-sm text-destructive">
+            The exact stage or run-epoch fence is unavailable; refresh before resolving.
+          </p>
+        )}
+        {unavailableReason && (
+          <p
+            className="text-sm text-muted-foreground"
+            data-testid="provider-resolution-unavailable"
+          >
+            Provider-operation resolution is unavailable. {unavailableReason}
+          </p>
+        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
+      </CardContent>
+    </Card>
+  )
+}
+
 function PendingActionBanner({
   action,
   resolving,
@@ -1143,6 +1253,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     kind: "mutation",
     mutation: "session_interruption",
   })
+  const providerOperationResolutionCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "provider_operation_resolution",
+  })
   const pendingActionResolutionCapability = useDashboardCapability({
     kind: "mutation",
     mutation: "pending_action_resolution",
@@ -1152,6 +1266,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   )
   const sessionInterruptionUnavailableText = dashboardCapabilityUnavailableText(
     sessionInterruptionCapability,
+  )
+  const providerOperationResolutionUnavailableText = dashboardCapabilityUnavailableText(
+    providerOperationResolutionCapability,
   )
   const pendingActionResolutionUnavailableText = dashboardCapabilityUnavailableText(
     pendingActionResolutionCapability,
@@ -1204,6 +1321,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null)
   const [resolvingAction, setResolvingAction] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [resolvingProviderOperation, setResolvingProviderOperation] = useState(false)
+  const [providerOperationError, setProviderOperationError] = useState<string | null>(null)
   const [eventPinnedToTail, setEventPinnedToTail] = useState(true)
   const [transcriptPinnedToTail, setTranscriptPinnedToTail] = useState(true)
   const [transcriptVisible, setTranscriptVisible] = useState(false)
@@ -1233,6 +1352,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const mutationActive =
     resuming ||
     resolvingAction ||
+    resolvingProviderOperation ||
     retryingCascade ||
     retryingMutationObservation ||
     mutationTransport?.phase === "connecting" ||
@@ -2055,6 +2175,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     } else if (mutationKind === "pending_action") {
       setResolvingAction(false)
       setActionError(null)
+    } else if (mutationKind === "provider_operation") {
+      setResolvingProviderOperation(false)
+      setProviderOperationError(null)
     }
     setRetryingMutationObservation(false)
     setMutationTransport(null)
@@ -2102,8 +2225,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           setResumeError(null)
         } else if (mutationKind === "cascade") {
           setCascadeRetryError(null)
-        } else {
+        } else if (mutationKind === "pending_action") {
           setActionError(null)
+        } else {
+          setProviderOperationError(null)
         }
       }
       await refreshAfterInterrupt()
@@ -2213,6 +2338,55 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
   const finishContinuation = () =>
     Promise.all([refreshSessionReadModels(), pendingActionQuery.refetch()])
+
+  const handleProviderOperationResolution = async (
+    action: "fallback_retry" | "fail",
+    reason: string,
+  ) => {
+    const operation = state?.provider_operation
+    if (!providerOperationResolutionCapability.enabled || resolvingProviderOperation) return
+    if (
+      operation === undefined ||
+      operation.stage_id === null ||
+      operation.run_epoch === null ||
+      !(operation.allowed_resolutions ?? []).includes(action)
+    ) {
+      setProviderOperationError(
+        "The provider-operation stage or run-epoch fence is unavailable. Refresh before resolving.",
+      )
+      return
+    }
+    setResolvingProviderOperation(true)
+    setProviderOperationError(null)
+    try {
+      const snapshot = await observeSessionMutation("provider_operation", (browser, options) =>
+        browser.executeResolveProviderOperationMutation(
+          {
+            session_id: sessionId,
+            stage_id: operation.stage_id as string,
+            expected_run_epoch: operation.run_epoch as number,
+            action,
+            reason,
+          },
+          options,
+        ),
+      )
+      if (snapshot === null) return
+      setResolvingProviderOperation(false)
+      if (snapshot.phase !== "terminal") {
+        setProviderOperationError(
+          mutationTransportErrorMessage(snapshot) ??
+            "The provider-operation resolution outcome is unavailable.",
+        )
+      }
+      await finishContinuation()
+    } catch (error) {
+      setResolvingProviderOperation(false)
+      setProviderOperationError(
+        error instanceof Error ? error.message : "Failed to resolve the provider operation.",
+      )
+    }
+  }
 
   const completeManualRecovery = async (
     execute: (
@@ -2392,6 +2566,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   if (!session) return <div className="text-destructive">Session not found</div>
 
   const stateIsFresh = state !== undefined && !stateRefetchError
+  const providerOperation = state?.provider_operation
+  const showProviderOperationResolution = providerOperationNeedsResolution(providerOperation)
+  const providerResolutionUnavailableText = stateIsFresh
+    ? providerOperationResolutionUnavailableText
+    : "Live session state must be refreshed before a fenced resolution can be submitted."
   const interruptObservationInProgress = sessionMutationKindRef.current === "interrupt"
   const canInterrupt =
     stateIsFresh &&
@@ -2662,6 +2841,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               <Badge variant="secondary">Provider reconnect in progress</Badge>
             ) : state?.provider_operation.status === "provider_operation_reconciled" ? (
               <Badge variant="outline">Provider operation reconciled</Badge>
+            ) : state?.provider_operation.status === "provider_operation_unavailable" ? (
+              <Badge variant="destructive">Provider operation unavailable</Badge>
+            ) : state?.provider_operation.status === "ambiguous_submission" ? (
+              <Badge variant="destructive">Provider submission ambiguous</Badge>
+            ) : state?.provider_operation.status === "fallback_retry" ? (
+              <Badge variant="secondary">Provider fallback retry</Badge>
             ) : state?.provider_operation.status === "synchronous" ? (
               <Badge variant="outline">Synchronous provider</Badge>
             ) : null}
@@ -2795,6 +2980,16 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       />
       {mutationObservationError && (
         <p className="text-sm text-destructive">{mutationObservationError}</p>
+      )}
+
+      {showProviderOperationResolution && providerOperation && (
+        <ProviderOperationResolutionBanner
+          operation={providerOperation}
+          resolving={resolvingProviderOperation || mutationCommandsLocked}
+          unavailableReason={providerResolutionUnavailableText}
+          error={providerOperationError}
+          onResolve={(action, reason) => void handleProviderOperationResolution(action, reason)}
+        />
       )}
 
       {interruptionFinalizing && (

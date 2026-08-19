@@ -191,6 +191,7 @@ _INTERRUPTION_TYPES = frozenset(
     {
         "limit_reached",
         "operator_requested",
+        "provider_operation_unavailable",
         "runtime_interrupted",
         "tool_approval_required",
         "user_input_required",

@@ -1,8 +1,11 @@
 # Session inspection
 
-`cayu session` is the supported read-only interface for diagnosing durable
-sessions. It uses `SessionStore` contracts, so SQLite and PostgreSQL expose the
-same fields without requiring operators to know Cayu table names or JSON paths.
+`cayu session` is the supported interface for diagnosing durable sessions and
+submitting one explicit provider-operation disposition. Inspection uses
+`SessionStore` contracts, so SQLite and PostgreSQL expose the same fields
+without requiring operators to know Cayu table names or JSON paths. The
+resolution command talks to the authenticated Cayu server; it never mutates the
+store directly.
 
 ## Configure the session store
 
@@ -55,8 +58,12 @@ JSONL row also carries the schema version so independently consumed
 `model_call`, `unmatched_ledger`, and `aggregate` records cannot be mistaken for
 the version 1 representation.
 
-Session-inspection CLI schema version `6` extends the bounded
-`provider_operation` object with `reconnect_scheduled`,
+Session-inspection CLI schema version `7` extends the bounded
+`provider_operation` object with `provider_operation_unavailable`,
+`ambiguous_submission`, and `fallback_retry`; a recovery reason; duplicate
+request risk; allowed resolutions; and the exact `stage_id` and `run_epoch`
+needed for a fenced decision. Version `7` retains version `6`'s
+`reconnect_scheduled`,
 `reconnect_in_progress`, and `provider_operation_reconciled` states plus
 bounded cancellation status, accounting status, and reservation count. These
 and `provider_operation_in_progress` include only the provider, operation id,
@@ -79,6 +86,14 @@ cayu session list --status completed --agent reviewer --label tenant=acme
 # pending-action counts.
 cayu session show SESSION_ID
 
+# Submit one explicit disposition through the authenticated server. The full
+# Authorization value is read from CAYU_API_AUTHORIZATION by default.
+export CAYU_API_AUTHORIZATION='Bearer ...'
+cayu session resolve-provider-operation SESSION_ID \
+  --stage-id STAGE_ID --run-epoch RUN_EPOCH \
+  --action fallback_retry --reason 'Duplicate-request risk accepted.' \
+  --server-url https://cayu.example.com
+
 # Newest response-scoped summaries first, using a stable sequence cursor.
 cayu session interactions SESSION_ID --limit 50
 
@@ -99,6 +114,23 @@ cayu session transcript SESSION_ID --offset 0 --limit 100 --sizes
 cayu session transcript SESSION_ID --include-content 4096 --output json
 cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
 ```
+
+`fallback_retry` starts a new model attempt from the last durable Cayu
+boundary; it is not continuation of the unavailable provider operation. When
+`duplicate_request_risk=true`, the provider may already have accepted the old
+request, so the operator owns the decision to accept possible duplicate work
+and cost. Existing budget and run limits can still stop the fallback before
+provider dispatch; that typed interruption completes the accepted disposition.
+An explicit operator interruption before replacement dispatch does the same.
+`fail` closes the original attempt and session through the ordinary
+durable failure path. Both actions are immutable, auditable, run-epoch fenced,
+and reject a stale or conflicting retry. Because actual usage of unavailable
+provider work cannot be proven, both actions conservatively charge any active
+source reservation to its full reserved amount before replacement admission or
+failure terminalization. If a CLI connection is ambiguous,
+reuse the printed `mutation_id` only to observe the same mutation; do not issue
+a second decision. Use HTTPS outside loopback and supply authentication required
+by the deployment.
 
 `events --include-payload` and `transcript --include-content` accept a per-record
 UTF-8 byte ceiling. Transcript content also has a 1 MiB total-output ceiling per

@@ -309,6 +309,7 @@ from cayu.runtime.sessions import (
     _validate_model_completion_stage_for_abandonment,
     _validate_model_completion_stage_preparation_replay,
     _validate_model_completion_stage_publication,
+    _validate_model_completion_stage_release,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
     _validate_profiled_fork_authority,
@@ -12946,6 +12947,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
                     operation_records: dict[str, dict[str, Any]] = {}
+                    model_completion_stage_release = None
                     if operation_transform is not None:
                         await cur.execute(
                             "SELECT record FROM cayu_session_operations "
@@ -12974,6 +12976,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             publication.operation_records,
                             "operation_records",
                         )
+                        model_completion_stage_release = publication.model_completion_stage_release
                         _validate_session_operation_record_keys(operation_records)
                     else:
                         assert checkpoint_transform is not None
@@ -13019,6 +13022,52 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 for key, record in operation_records.items()
                             ],
                         )
+                    if model_completion_stage_release is not None:
+                        _, _, preparation_key, terminal_key = (
+                            _model_completion_stage_storage_identity(
+                                session_id,
+                                model_completion_stage_release.stage_id,
+                            )
+                        )
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (
+                                session_id,
+                                [
+                                    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                                    preparation_key,
+                                    terminal_key,
+                                ],
+                            ),
+                        )
+                        stage_records = {
+                            row[0]: _decode_model_completion_stage_record(row[1])
+                            for row in await cur.fetchall()
+                        }
+                        marker = _validate_model_completion_stage_release(
+                            session=loaded,
+                            active_record=stage_records.get(
+                                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
+                            ),
+                            preparation_record=stage_records.get(preparation_key),
+                            terminal_record=stage_records.get(terminal_key),
+                            release=model_completion_stage_release,
+                        )
+                        await cur.execute(
+                            "DELETE FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s "
+                            "AND record->>'record_digest' = %s",
+                            (
+                                session_id,
+                                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                                marker.record_digest,
+                            ),
+                        )
+                        if cur.rowcount != 1:
+                            raise SessionModelCompletionStageConflict(
+                                "The active model-completion stage changed during disposition."
+                            )
 
                     next_order = order_row[0] - len(copied_events)
                     rows = []

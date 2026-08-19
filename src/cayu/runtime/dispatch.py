@@ -470,6 +470,7 @@ _STALLED_RECOVERED_ACTIONS = {
     IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
     IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,
     IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION,
+    IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION,
     IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
     IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,
     IncompleteSessionRecoveryAction.PENDING_APPROVAL,

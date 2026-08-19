@@ -122,6 +122,7 @@ def _versioned_operation_transform(
             return SessionOperationPublication(
                 checkpoint=versioned,
                 operation_records=publication.operation_records,
+                model_completion_stage_release=(publication.model_completion_stage_release),
             )
         except BaseException:
             checkpoint = None

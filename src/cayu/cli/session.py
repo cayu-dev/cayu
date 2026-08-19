@@ -1,15 +1,21 @@
-"""Bounded read-only inspection of durable Cayu sessions."""
+"""Bounded inspection and explicit recovery of durable Cayu sessions."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
+
+import httpx
 
 from cayu._validation import compact_json_utf8_size
 from cayu.cli._output import add_output_options, output_destination
@@ -49,10 +55,12 @@ from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
 FORMAT_CHOICES = ("json", "table", "jsonl")
-CLI_SCHEMA_VERSION = "6"
+CLI_SCHEMA_VERSION = "7"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
+_MAX_SERVER_ERROR_BODY_BYTES = 8 * 1024
+_MAX_SERVER_ERROR_DETAIL_BYTES = 1024
 _MAX_TRANSCRIPT_SUMMARY_PARTS = 100
 _EVENT_QUERY_PAGE_SIZE = 200
 _USAGE_INSPECTION_PRICING_STATE_KEY = "_cayu_pricing_state"
@@ -64,10 +72,11 @@ def add_session_parser(subparsers: Any) -> None:
 
     session = subparsers.add_parser(
         "session",
-        help="Inspect durable Cayu sessions without mutating storage.",
+        help="Inspect durable sessions and resolve unavailable provider work.",
         description=(
-            "Inspect durable Cayu sessions without mutating storage. "
-            "Start with `cayu session list`; JSON is the default output."
+            "Inspect durable Cayu sessions without mutating storage, or send an explicit "
+            "provider-operation disposition to a running Cayu server. Start with "
+            "`cayu session list`; JSON is the default output."
         ),
     )
     commands = session.add_subparsers(dest="session_command", required=True)
@@ -213,6 +222,49 @@ def add_session_parser(subparsers: Any) -> None:
     )
     add_output_options(transcript_parser, formats=FORMAT_CHOICES)
 
+    resolution_parser = commands.add_parser(
+        "resolve-provider-operation",
+        help="Explicitly retry or fail unavailable provider work.",
+        description=(
+            "Send a run-epoch-fenced fallback_retry or fail disposition to the Cayu "
+            "server. Read stage_id and run_epoch from `cayu session show` or the "
+            "session state API. Authorization is read from CAYU_API_AUTHORIZATION by "
+            "default and is never printed."
+        ),
+    )
+    resolution_parser.add_argument("session_id")
+    resolution_parser.add_argument("--stage-id", required=True)
+    resolution_parser.add_argument("--run-epoch", required=True, type=_nonnegative_int)
+    resolution_parser.add_argument(
+        "--action",
+        choices=("fallback_retry", "fail"),
+        required=True,
+    )
+    resolution_parser.add_argument("--reason")
+    resolution_parser.add_argument(
+        "--metadata",
+        type=_json_object_argument,
+        default=None,
+        metavar="JSON",
+        help="Bounded JSON object recorded with the durable resolution.",
+    )
+    resolution_parser.add_argument(
+        "--server-url",
+        required=True,
+        help="Cayu server root URL, including any mount prefix but excluding /api.",
+    )
+    resolution_parser.add_argument(
+        "--authorization-env",
+        default="CAYU_API_AUTHORIZATION",
+        metavar="NAME",
+        help="Environment variable containing the complete Authorization header value.",
+    )
+    resolution_parser.add_argument(
+        "--mutation-id",
+        help="Stable Cayu-Mutation-ID for correlating an ambiguous SSE reconnect.",
+    )
+    add_output_options(resolution_parser, formats=("json", "table"))
+
 
 def run_session(args: argparse.Namespace) -> int:
     """Resolve a read-only target and dispatch one session-inspection command."""
@@ -227,6 +279,13 @@ def run_session(args: argparse.Namespace) -> int:
 
 def _run_session(args: argparse.Namespace) -> int:
     """Run after the optional output destination owns stdout."""
+
+    if args.session_command == "resolve-provider-operation":
+        try:
+            return _resolve_provider_operation(args)
+        except (ValueError, OSError, RuntimeError) as exc:
+            _render_session_error(_safe_error(str(exc), None), args.output_format)
+            return 1
 
     dsn: str | None = None
     try:
@@ -244,6 +303,126 @@ def _run_session(args: argparse.Namespace) -> int:
         # the CLI concise while preserving the existing DSN scrubbing contract.
         _render_session_error(_safe_error(str(exc), dsn), args.output_format)
         return 1
+
+
+def _resolve_provider_operation(args: argparse.Namespace) -> int:
+    endpoint = _provider_operation_resolution_endpoint(args.server_url)
+    authorization = os.environ.get(args.authorization_env)
+    if authorization is not None and (
+        not authorization.strip()
+        or authorization != authorization.strip()
+        or "\r" in authorization
+        or "\n" in authorization
+    ):
+        raise ValueError(f"{args.authorization_env} contains an invalid Authorization value.")
+    headers = {
+        "Accept": "text/event-stream",
+        "Cayu-Mutation-ID": args.mutation_id or f"cli-provider-resolution-{uuid4().hex}",
+    }
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    payload = {
+        "session_id": args.session_id,
+        "stage_id": args.stage_id,
+        "expected_run_epoch": args.run_epoch,
+        "action": args.action,
+        "reason": args.reason,
+        "metadata": args.metadata or {},
+    }
+    try:
+        with (
+            httpx.Client(follow_redirects=False, timeout=30.0) as client,
+            client.stream(
+                "POST",
+                endpoint,
+                json=payload,
+                headers=headers,
+            ) as response,
+        ):
+            if not 200 <= response.status_code < 300:
+                detail = _safe_server_error_detail(
+                    response,
+                    authorization=authorization,
+                )
+                suffix = f": {detail}" if detail is not None else "."
+                raise RuntimeError(f"Cayu server returned HTTP {response.status_code}{suffix}")
+    except httpx.RequestError:
+        raise RuntimeError("Cayu server is unavailable.") from None
+    _render_detail(
+        args.output_format,
+        {
+            "schema_version": CLI_SCHEMA_VERSION,
+            "accepted": True,
+            "session_id": args.session_id,
+            "stage_id": args.stage_id,
+            "run_epoch": args.run_epoch,
+            "action": args.action,
+            "mutation_id": headers["Cayu-Mutation-ID"],
+        },
+    )
+    return 0
+
+
+def _provider_operation_resolution_endpoint(server_url: str) -> str:
+    parsed = urlsplit(server_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("A canonical HTTP(S) Cayu server URL is required.")
+    hostname = parsed.hostname
+    if parsed.scheme == "http" and not _is_loopback_host(hostname):
+        raise ValueError("Cayu server URL must use HTTPS outside loopback.")
+    path = parsed.path.rstrip("/") + "/api/provider-operations/resolve"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _safe_server_error_detail(
+    response: httpx.Response,
+    *,
+    authorization: str | None,
+) -> str | None:
+    body = bytearray()
+    for chunk in response.iter_bytes(chunk_size=1024):
+        if len(body) + len(chunk) > _MAX_SERVER_ERROR_BODY_BYTES:
+            return None
+        body.extend(chunk)
+    try:
+        value = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if type(value) is not dict:
+        return None
+    detail = value.get("detail")
+    if type(detail) is not str or not detail:
+        return None
+    try:
+        detail_size = len(detail.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+    if detail_size > _MAX_SERVER_ERROR_DETAIL_BYTES:
+        return None
+    if any(ord(character) < 32 and character not in "\t" for character in detail):
+        return None
+    if authorization is not None:
+        detail = detail.replace(authorization, "[REDACTED]")
+    redacted = _redact_sensitive(detail)
+    return redacted if type(redacted) is str else None
 
 
 def _render_session_error(message: str, output_format: str) -> None:
@@ -2255,6 +2434,16 @@ def _nonnegative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be nonnegative.")
+    return parsed
+
+
+def _json_object_argument(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError("metadata must be a JSON object.") from exc
+    if type(parsed) is not dict:
+        raise argparse.ArgumentTypeError("metadata must be a JSON object.")
     return parsed
 
 

@@ -238,6 +238,7 @@ from cayu.runtime.sessions import (
     _validate_model_completion_stage_for_abandonment,
     _validate_model_completion_stage_preparation_replay,
     _validate_model_completion_stage_publication,
+    _validate_model_completion_stage_release,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
     _validate_profiled_fork_authority,
@@ -5874,6 +5875,7 @@ class SQLiteSessionStore(SessionStore):
                     )
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 operation_records: dict[str, dict[str, Any]] = {}
+                model_completion_stage_release = None
                 if operation_transform is not None:
                     operation_row = connection.execute(
                         "SELECT record_json FROM cayu_session_operations "
@@ -5900,6 +5902,7 @@ class SQLiteSessionStore(SessionStore):
                         publication.operation_records,
                         "operation_records",
                     )
+                    model_completion_stage_release = publication.model_completion_stage_release
                     _validate_session_operation_record_keys(operation_records)
                 else:
                     assert checkpoint_transform is not None
@@ -5972,6 +5975,43 @@ class SQLiteSessionStore(SessionStore):
                             for key, record in operation_records.items()
                         ],
                     )
+                if model_completion_stage_release is not None:
+                    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+                        session_id,
+                        model_completion_stage_release.stage_id,
+                    )
+                    stage_rows = connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key IN (?, ?, ?)",
+                        (
+                            session_id,
+                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                            preparation_key,
+                            terminal_key,
+                        ),
+                    ).fetchall()
+                    stage_records = {
+                        row["idempotency_key"]: _decode_model_completion_stage_record(
+                            row["record_json"]
+                        )
+                        for row in stage_rows
+                    }
+                    _validate_model_completion_stage_release(
+                        session=loaded,
+                        active_record=stage_records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                        preparation_record=stage_records.get(preparation_key),
+                        terminal_record=stage_records.get(terminal_key),
+                        release=model_completion_stage_release,
+                    )
+                    deleted = connection.execute(
+                        "DELETE FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    )
+                    if deleted.rowcount != 1:
+                        raise SessionModelCompletionStageConflict(
+                            "The active model-completion stage changed during disposition."
+                        )
                 if event_rows:
                     connection.executemany(
                         """

@@ -1479,6 +1479,18 @@
           "title": "Accounting Status",
           "type": "string"
         },
+        "allowed_resolutions": {
+          "items": {
+            "enum": [
+              "fallback_retry",
+              "fail"
+            ],
+            "type": "string"
+          },
+          "maxItems": 2,
+          "title": "Allowed Resolutions",
+          "type": "array"
+        },
         "cancellation_status": {
           "enum": [
             "not_requested",
@@ -1492,6 +1504,11 @@
           ],
           "title": "Cancellation Status",
           "type": "string"
+        },
+        "duplicate_request_risk": {
+          "default": false,
+          "title": "Duplicate Request Risk",
+          "type": "boolean"
         },
         "operation_id": {
           "anyOf": [
@@ -1517,11 +1534,82 @@
           ],
           "title": "Provider"
         },
+        "recovery_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "failed",
+                "expired",
+                "cancelled",
+                "malformed",
+                "wrong_provider",
+                "unavailable",
+                "ambiguous_submission"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Recovery Reason"
+        },
         "reservation_count": {
           "maximum": 32.0,
           "minimum": 0.0,
           "title": "Reservation Count",
           "type": "integer"
+        },
+        "resolution_action": {
+          "anyOf": [
+            {
+              "enum": [
+                "fallback_retry",
+                "fail"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Resolution Action"
+        },
+        "resolution_id": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Resolution Id"
+        },
+        "run_epoch": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Run Epoch"
+        },
+        "stage_id": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stage Id"
         },
         "status": {
           "enum": [
@@ -1529,7 +1617,10 @@
             "provider_operation_in_progress",
             "reconnect_scheduled",
             "reconnect_in_progress",
-            "provider_operation_reconciled"
+            "provider_operation_reconciled",
+            "provider_operation_unavailable",
+            "ambiguous_submission",
+            "fallback_retry"
           ],
           "title": "Status",
           "type": "string"
@@ -4055,6 +4146,9 @@
         "pending_action_resolution": {
           "$ref": "#/components/schemas/CapabilityOperation"
         },
+        "provider_operation_resolution": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        },
         "session_annotations": {
           "$ref": "#/components/schemas/CapabilityOperation"
         },
@@ -4071,6 +4165,7 @@
       "required": [
         "session_execution",
         "session_interruption",
+        "provider_operation_resolution",
         "pending_action_resolution",
         "session_annotations",
         "task_lifecycle",
@@ -5577,6 +5672,76 @@
         "as_of"
       ],
       "title": "Provenance",
+      "type": "object"
+    },
+    "ProviderOperationResolutionAction": {
+      "description": "Explicit dispositions for a provider operation Cayu cannot continue exactly.",
+      "enum": [
+        "fallback_retry",
+        "fail"
+      ],
+      "title": "ProviderOperationResolutionAction",
+      "type": "string"
+    },
+    "ProviderOperationResolutionBody": {
+      "description": "Explicit retry-or-fail disposition for unavailable provider work.",
+      "properties": {
+        "action": {
+          "$ref": "#/components/schemas/ProviderOperationResolutionAction"
+        },
+        "expected_run_epoch": {
+          "maximum": 9.223372036854776e+18,
+          "minimum": 0.0,
+          "title": "Expected Run Epoch",
+          "type": "integer"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "stage_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Stage Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "stage_id",
+        "expected_run_epoch",
+        "action"
+      ],
+      "title": "ProviderOperationResolutionBody",
       "type": "object"
     },
     "ResolutionActor": {
@@ -10458,6 +10623,86 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/provider-operations/resolve": {
+      "post": {
+        "operation_id": "resolve_provider_operation_api_provider_operations_resolve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ProviderOperationResolutionBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }

@@ -59,6 +59,7 @@ _SNAPSHOT_PATH = Path(__file__).parent / "snapshots" / "openapi-contract-summary
 _STREAMING_ROUTES = {
     "/api/run",
     "/api/resume",
+    "/api/provider-operations/resolve",
     "/api/sessions/{session_id}/compact",
     "/api/sessions/{session_id}/messages",
     "/api/sessions/{session_id}/interrupt",
@@ -236,6 +237,7 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["capabilities"]["mutations"] == {
         "session_execution": {"enabled": True, "unavailable_reason": None},
         "session_interruption": {"enabled": True, "unavailable_reason": None},
+        "provider_operation_resolution": {"enabled": True, "unavailable_reason": None},
         "pending_action_resolution": {"enabled": True, "unavailable_reason": None},
         "session_annotations": {"enabled": True, "unavailable_reason": None},
         "task_lifecycle": {"enabled": False, "unavailable_reason": "not_configured"},

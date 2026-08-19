@@ -2442,6 +2442,33 @@ class RunLimitController:
     ) -> list[Event]:
         """Conservatively settle the original reservations after confirmed cancellation."""
 
+        return await self.reconcile_unavailable_provider_operation_reservations(
+            reservation_ids=reservation_ids,
+            recovery_contexts=recovery_contexts,
+            session=session,
+            provider_name=provider_name,
+            model_attempt_identity=model_attempt_identity,
+            dispatch_id=dispatch_id,
+            request_billing_identity=request_billing_identity,
+            reason="provider operation cancellation confirmed; charged reserved amount",
+            occurred_at=self._clock(),
+        )
+
+    async def reconcile_unavailable_provider_operation_reservations(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        recovery_contexts: tuple[BudgetReservationRecoveryContext, ...],
+        session: Session,
+        provider_name: str,
+        model_attempt_identity: ModelAttemptIdentity,
+        dispatch_id: str,
+        request_billing_identity: BillingIdentity | None,
+        reason: str,
+        occurred_at: datetime,
+    ) -> list[Event]:
+        """Conservatively settle reservations whose provider usage remains unknown."""
+
         reservations = await self._reconstruct_provider_operation_reservations(
             reservation_ids=reservation_ids,
             recovery_contexts=recovery_contexts,
@@ -2459,8 +2486,8 @@ class RunLimitController:
                     record,
                     actual_amount=record.reserved_amount,
                     settlement_kind="conservative",
-                    reason="provider operation cancellation confirmed; charged reserved amount",
-                    occurred_at=self._clock(),
+                    reason=reason,
+                    occurred_at=occurred_at,
                 )
                 reconciliation = await self._commit_expected_reconciliation(
                     reservation,

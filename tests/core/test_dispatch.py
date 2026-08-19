@@ -42,6 +42,7 @@ from cayu.runtime import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     ForkSessionRequest,
+    IncompleteSessionRecoveryAction,
     InMemorySessionStore,
     InMemoryTaskStore,
     InvocationOrigin,
@@ -75,6 +76,7 @@ from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._recovery_coordinator import ModelCompletionBoundaryReconciliation
 from cayu.runtime.approvals import PendingToolCallApproval
 from cayu.runtime.dispatch import (
+    _STALLED_RECOVERED_ACTIONS,
     _dispatch_status_after_event,
     _new_queued_dispatch_envelope,
     _queued_dispatch_task_id,
@@ -3836,6 +3838,13 @@ def test_crashed_queued_run_recovery_preserves_terminal_identity_and_does_not_re
     completed_task = asyncio.run(h.tasks.load_task(submitted.metadata["queue_task_id"]))
     assert completed_task is not None
     assert completed_task.status is TaskStatus.COMPLETED
+
+
+def test_stalled_dispatch_recovery_recognizes_provider_resolution_repair() -> None:
+    assert (
+        IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION
+        in _STALLED_RECOVERED_ACTIONS
+    )
 
 
 def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:

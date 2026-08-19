@@ -22,7 +22,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4, uuid5
 
 from cayu._exception_groups import (
@@ -111,6 +111,14 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
+from cayu.runtime._model_errors import (
+    _FallbackBillingCancellationStateCheckFailed,
+    detach_billing_identity_cancellation_group,
+)
+from cayu.runtime._model_step_executor import (
+    ModelCompletionRecoveryContext,
+    model_completion_recovery_context_from_stage,
+)
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
@@ -182,6 +190,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
+    ModelStepIdentity,
     ToolRoundIdentity,
     copy_tool_round_identity,
 )
@@ -189,15 +198,31 @@ from cayu.runtime.hooks import RuntimeHookPhase
 from cayu.runtime.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
+    InteractionStatus,
+    InteractionSummaryEvidence,
 )
 from cayu.runtime.invocation import SessionExecutionSource, inherited_session_invocation
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
+    ProviderOperationPendingDisposition,
     ProviderOperationRecoveryResult,
     ProviderOperationRecoveryStatus,
+    ProviderOperationResolutionAction,
+    ProviderOperationResolutionRequest,
+    ProviderOperationResolutionResult,
+    ProviderOperationUnavailableReason,
     RecoverableProviderOperation,
+    RecoverableProviderOperationStart,
+    clear_pending_provider_operation_disposition,
+    load_pending_provider_operation_disposition,
     load_recoverable_provider_operation,
+    load_recoverable_provider_operation_start,
+    prepare_provider_operation_resolution_request,
+    provider_operation_duplicate_request_risk,
+    provider_operation_resolution_outcome_event_id,
+    resolve_provider_operation_stage,
+    validate_provider_operation_resolution_outcome_event,
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
@@ -834,6 +859,9 @@ class RecoverySessionRunRequest:
     start_task_on_enter: bool
     release_run_fence_on_exit: bool
     run_limit_accounting: RunLimitAccountingContext | None = None
+    initial_model_step_identity: ModelStepIdentity | None = None
+    initial_model_step_number: int | None = None
+    preserve_failure_until_initial_provider_dispatch: bool = False
 
 
 def _rebound_active_invocation_profile(
@@ -861,6 +889,15 @@ class RecoveryTerminalEventRequest:
     registered_agent: runtime_records.RegisteredAgentState
     registered_environment: runtime_records.RegisteredEnvironment | None
     execution_profile: ExecutionProfileIdentity | None = None
+
+
+@dataclass(frozen=True)
+class ProviderOperationFailureRequest:
+    resolution_event: Event
+    session: Session
+    registered_agent: runtime_records.RegisteredAgentState
+    registered_environment: runtime_records.RegisteredEnvironment | None
+    execution_profile: ExecutionProfileIdentity
 
 
 @dataclass(frozen=True)
@@ -962,6 +999,7 @@ class ModelCompletionBoundaryReconciliation:
         "already_promoted",
         "provider_operation_pending",
         "provider_operation_reconciled",
+        "provider_operation_unavailable",
     ]
     session: Session
     pointer: model_completion_publication.ModelStepPublicationCheckpoint | None = None
@@ -1021,20 +1059,27 @@ class _ManualRecoveryPersistenceReconciliation:
 
 RunSession = Callable[[RecoverySessionRunRequest], AsyncGenerator[Event, None]]
 TerminalEventStream = Callable[[RecoveryTerminalEventRequest], AsyncIterator[Event]]
+ProviderOperationFailureStream = Callable[[ProviderOperationFailureRequest], AsyncIterator[Event]]
 LimitStopEventStream = Callable[[RecoveryLimitStopRequest], AsyncIterator[Event]]
 TaskEventFactory = Callable[[RecoveryTaskEventRequest], Event]
 RegisteredAgentResolver = Callable[[str], runtime_records.RegisteredAgentState]
 RegisteredProviderResolver = Callable[[str], runtime_records.RegisteredProvider]
 RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.RegisteredEnvironment | None]
-ExecutionProfileContinuationValidator = Callable[
-    [
-        Session,
-        dict[str, Any] | None,
-        runtime_records.RegisteredAgentState,
-        runtime_records.RegisteredProvider,
-    ],
-    Awaitable[ActiveInvocationExecutionProfile],
-]
+
+
+class ExecutionProfileContinuationValidator(Protocol):
+    def __call__(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        *,
+        require_open_interaction: bool = True,
+        additional_profile_fingerprints: tuple[str, ...] = (),
+    ) -> Awaitable[ActiveInvocationExecutionProfile]: ...
+
+
 RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterator[Event]]
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
@@ -1057,6 +1102,17 @@ RecoverProviderOperation = Callable[
         Session,
         ModelCompletionStage,
         RecoverableProviderOperation,
+        runtime_records.RegisteredAgentState,
+        runtime_records.RegisteredProvider,
+        runtime_records.RegisteredEnvironment | None,
+    ],
+    Awaitable[ProviderOperationRecoveryResult],
+]
+RecoverProviderOperationStart = Callable[
+    [
+        Session,
+        ModelCompletionStage,
+        RecoverableProviderOperationStart,
         runtime_records.RegisteredAgentState,
         runtime_records.RegisteredProvider,
         runtime_records.RegisteredEnvironment | None,
@@ -1095,6 +1151,7 @@ class RecoveryCoordinator:
         effective_retry_policy: EffectiveRetryPolicy,
         run_session: RunSession,
         emit_terminal_event_with_hooks: TerminalEventStream,
+        fail_provider_operation: ProviderOperationFailureStream,
         stop_session_for_limit_reached: LimitStopEventStream,
         task_event: TaskEventFactory,
         resolve_registered_agent: RegisteredAgentResolver,
@@ -1106,6 +1163,7 @@ class RecoveryCoordinator:
         abandoned_turn_completed: AbandonedTurnCompleted,
         resume_interaction: ResumeInteraction,
         recover_provider_operation: RecoverProviderOperation,
+        recover_provider_operation_start: RecoverProviderOperationStart,
         cancel_provider_operation: CancelProviderOperation,
     ) -> None:
         self._session_store = session_store
@@ -1121,6 +1179,7 @@ class RecoveryCoordinator:
         self._effective_retry_policy = effective_retry_policy
         self._run_session = run_session
         self._emit_terminal_event_with_hooks = emit_terminal_event_with_hooks
+        self._fail_provider_operation = fail_provider_operation
         self._stop_session_for_limit_reached = stop_session_for_limit_reached
         self._task_event = task_event
         self._resolve_registered_agent = resolve_registered_agent
@@ -1132,6 +1191,7 @@ class RecoveryCoordinator:
         self._abandoned_turn_completed = abandoned_turn_completed
         self._resume_interaction = resume_interaction
         self._recover_provider_operation = recover_provider_operation
+        self._recover_provider_operation_start = recover_provider_operation_start
         self._cancel_provider_operation = cancel_provider_operation
         self._workspace_artifact_recovery_operations = BoundedInvocationOperationRegistry(
             max_operations=64
@@ -1142,9 +1202,20 @@ class RecoveryCoordinator:
         stage: ModelCompletionStage,
         *,
         registered_provider: runtime_records.RegisteredProvider | None = None,
-    ) -> tuple[RecoverableProviderOperation, runtime_records.RegisteredProvider] | None:
+    ) -> (
+        tuple[
+            RecoverableProviderOperation | RecoverableProviderOperationStart,
+            runtime_records.RegisteredProvider,
+        ]
+        | None
+    ):
         try:
             operation = await load_recoverable_provider_operation(self._session_store, stage)
+            if operation is None:
+                operation = await load_recoverable_provider_operation_start(
+                    self._session_store,
+                    stage,
+                )
         except ProviderOperationEvidenceError as evidence_error:
             raise ModelCompletionManualRecoveryRequired(
                 "Provider-operation recovery cannot continue because provider output already "
@@ -1245,6 +1316,11 @@ class RecoveryCoordinator:
         if recoverable is None:
             return None
         operation, recovered_provider = recoverable
+        if isinstance(operation, RecoverableProviderOperationStart):
+            # There is no durable provider operation identity to cancel yet.
+            # The normal boundary reconciler may replay an exact-idempotent
+            # start; an unsupported start remains explicitly ambiguous.
+            return None
         if registered_agent is None or registered_provider is None:
             try:
                 registered_agent = self._resolve_registered_agent(session.agent_name)
@@ -1540,6 +1616,7 @@ class RecoveryCoordinator:
             "promoted",
             "already_promoted",
             "provider_operation_pending",
+            "provider_operation_unavailable",
             "provider_operation_reconciled",
         ] = "none"
         recovery_events: tuple[Event, ...] = ()
@@ -1592,19 +1669,37 @@ class RecoveryCoordinator:
                     registered_agent,
                     recovered_provider,
                 )
-                recovered = await self._recover_provider_operation(
-                    session,
-                    stage,
-                    operation,
-                    registered_agent,
-                    recovered_provider,
-                    registered_environment,
-                )
+                if isinstance(operation, RecoverableProviderOperationStart):
+                    recovered = await self._recover_provider_operation_start(
+                        session,
+                        stage,
+                        operation,
+                        registered_agent,
+                        recovered_provider,
+                        registered_environment,
+                    )
+                else:
+                    recovered = await self._recover_provider_operation(
+                        session,
+                        stage,
+                        operation,
+                        registered_agent,
+                        recovered_provider,
+                        registered_environment,
+                    )
                 recovery_events = recovered.events
                 if recovered.status is ProviderOperationRecoveryStatus.PENDING:
                     transcript = await self._session_store.load_transcript(session.id)
                     return ModelCompletionBoundaryReconciliation(
                         state="provider_operation_pending",
+                        session=session,
+                        transcript_cursor=len(transcript),
+                        recovery_events=recovery_events,
+                    )
+                if recovered.status is ProviderOperationRecoveryStatus.UNAVAILABLE:
+                    transcript = await self._session_store.load_transcript(session.id)
+                    return ModelCompletionBoundaryReconciliation(
+                        state="provider_operation_unavailable",
                         session=session,
                         transcript_cursor=len(transcript),
                         recovery_events=recovery_events,
@@ -2542,6 +2637,7 @@ class RecoveryCoordinator:
         from_statuses: set[SessionStatus] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
+        preserve_open_interaction_on_failure: bool = False,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
 
@@ -2552,6 +2648,8 @@ class RecoveryCoordinator:
         arrived, the claim is finalized and released before that cancellation is
         propagated.
         """
+        if type(preserve_open_interaction_on_failure) is not bool:
+            raise TypeError("preserve_open_interaction_on_failure must be a bool.")
         expected_statuses = (
             {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
         )
@@ -2696,9 +2794,9 @@ class RecoveryCoordinator:
             )
         except BaseException as exc:
             try:
-                await _run_recovery_cleanup_steps(
-                    authoritative_failure=exc,
-                    steps=(
+                cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
+                if not preserve_open_interaction_on_failure:
+                    cleanup_steps.append(
                         (
                             "abandoned session finalization",
                             lambda: self.finalize_abandoned_session_by_id(
@@ -2711,46 +2809,9 @@ class RecoveryCoordinator:
                                     else execution_profile_snapshot.profile
                                 ),
                             ),
-                        ),
-                        (
-                            "run fence release",
-                            lambda: (
-                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                                    session_id=session.id,
-                                    execution_profile=(
-                                        None
-                                        if execution_profile_snapshot is None
-                                        else execution_profile_snapshot.profile
-                                    ),
-                                )
-                            ),
-                        ),
-                    ),
-                )
-            finally:
-                _deactivate_session_run_fence(session.id)
-                _deactivate_session_interaction(session.id)
-            raise
-        if cancellation is None:
-            return session, resumed_event
-
-        try:
-            await _run_recovery_cleanup_steps(
-                authoritative_failure=cancellation,
-                steps=(
-                    (
-                        "abandoned session finalization",
-                        lambda: self.finalize_abandoned_session_by_id(
-                            session.id,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            execution_profile=(
-                                None
-                                if execution_profile_snapshot is None
-                                else execution_profile_snapshot.profile
-                            ),
-                        ),
-                    ),
+                        )
+                    )
+                cleanup_steps.append(
                     (
                         "run fence release",
                         lambda: (
@@ -2763,8 +2824,53 @@ class RecoveryCoordinator:
                                 ),
                             )
                         ),
+                    )
+                )
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=exc,
+                    steps=tuple(cleanup_steps),
+                )
+            finally:
+                _deactivate_session_run_fence(session.id)
+                _deactivate_session_interaction(session.id)
+            raise
+        if cancellation is None:
+            return session, resumed_event
+
+        try:
+            cleanup_steps = []
+            if not preserve_open_interaction_on_failure:
+                cleanup_steps.append(
+                    (
+                        "abandoned session finalization",
+                        lambda: self.finalize_abandoned_session_by_id(
+                            session.id,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=(
+                                None
+                                if execution_profile_snapshot is None
+                                else execution_profile_snapshot.profile
+                            ),
+                        ),
+                    )
+                )
+            cleanup_steps.append(
+                (
+                    "run fence release",
+                    lambda: self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                        session_id=session.id,
+                        execution_profile=(
+                            None
+                            if execution_profile_snapshot is None
+                            else execution_profile_snapshot.profile
+                        ),
                     ),
-                ),
+                )
+            )
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=tuple(cleanup_steps),
             )
         finally:
             # Shielded cleanup runs in a copied context. Never leave the caller's
@@ -3191,6 +3297,643 @@ class RecoveryCoordinator:
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
+                execution_profile=execution_profile_snapshot.profile,
+            )
+
+    async def resolve_provider_operation(
+        self,
+        request: ProviderOperationResolutionRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Accept one disposition and drive its durable effect to a recovery boundary."""
+
+        request = prepare_provider_operation_resolution_request(
+            request,
+            redactor=self._secret_redactor,
+        )
+        result = await resolve_provider_operation_stage(
+            self._session_store,
+            request,
+            redactor=self._secret_redactor,
+        )
+        if not result.replayed:
+            await self._event_writer.fan_out_persisted([result.event])
+        yield result.event
+
+        pending_resolution = await load_pending_provider_operation_disposition(
+            self._session_store,
+            request.session_id,
+        )
+        if pending_resolution is None:
+            return
+        pending, durable_result = pending_resolution
+        if durable_result.record.request_digest != result.record.request_digest:
+            raise ProviderOperationEvidenceError(
+                "Pending provider-operation disposition changed after acceptance."
+            )
+        if await self._provider_operation_disposition_execution_started(
+            pending=pending,
+            result=durable_result,
+        ):
+            for settlement_event in await self._settle_provider_operation_disposition_reservations(
+                pending=pending,
+                result=durable_result,
+            ):
+                yield settlement_event
+            return
+        disposition_stream = self._finish_pending_provider_operation_disposition(
+            pending=pending,
+            result=durable_result,
+        )
+        try:
+            try:
+                async for event in disposition_stream:
+                    yield event
+            except (SessionRunFenced, SessionStatusConflict):
+                if not await self._provider_operation_disposition_execution_started(
+                    pending=pending,
+                    result=durable_result,
+                ):
+                    raise
+        finally:
+            await disposition_stream.aclose()
+
+    async def _provider_operation_disposition_execution_started(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        result: ProviderOperationResolutionResult,
+    ) -> bool:
+        """Recognize exact durable progress owned by another disposition caller."""
+
+        session = await self._session_store.load(pending.session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {pending.session_id}")
+        if pending.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            if session.status is not SessionStatus.RUNNING:
+                return False
+            checkpoint = await self._session_store.load_checkpoint(pending.session_id)
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            return bool(
+                active_profile is not None
+                and active_profile.session_id == pending.session_id
+                and active_profile.interaction_id == result.event.interaction_id
+                and active_profile.run_epoch == session.run_epoch
+                and active_profile.profile.fingerprint == pending.execution_profile_fingerprint
+            )
+
+        if session.status is not SessionStatus.FAILED:
+            return False
+        interaction_event_id = provider_operation_resolution_outcome_event_id(
+            result.record.resolution_id,
+            "interaction_failed",
+        )
+        interaction_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=pending.session_id,
+                event_id=interaction_event_id,
+                limit=2,
+            )
+        )
+        if not interaction_records:
+            return False
+        if len(interaction_records) != 1:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation failure has duplicate interaction evidence."
+            )
+        validate_provider_operation_resolution_outcome_event(
+            interaction_records[0].event,
+            resolution_event=result.event,
+            outcome="interaction_failed",
+        )
+        return True
+
+    async def _provider_operation_disposition_effect_is_durable(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        result: ProviderOperationResolutionResult,
+    ) -> bool:
+        if pending.action is ProviderOperationResolutionAction.FAIL:
+            terminal_event_id = provider_operation_resolution_outcome_event_id(
+                result.record.resolution_id,
+                "session_failed",
+            )
+            terminal_records = await self._session_store.query_events(
+                EventQuery(
+                    session_id=pending.session_id,
+                    event_id=terminal_event_id,
+                    limit=2,
+                )
+            )
+            if not terminal_records:
+                return False
+            if len(terminal_records) != 1:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation failure has duplicate terminal evidence."
+                )
+            validate_provider_operation_resolution_outcome_event(
+                terminal_records[0].event,
+                resolution_event=result.event,
+                outcome="session_failed",
+            )
+            for outcome in ("model_error", "interaction_failed"):
+                event_id = provider_operation_resolution_outcome_event_id(
+                    result.record.resolution_id,
+                    outcome,
+                )
+                records = await self._session_store.query_events(
+                    EventQuery(
+                        session_id=pending.session_id,
+                        event_id=event_id,
+                        limit=2,
+                    )
+                )
+                if len(records) != 1:
+                    raise ProviderOperationEvidenceError(
+                        "Provider-operation failure has incomplete durable evidence."
+                    )
+                validate_provider_operation_resolution_outcome_event(
+                    records[0].event,
+                    resolution_event=result.event,
+                    outcome=outcome,
+                )
+            session = await self._session_store.load(pending.session_id)
+            if session is None or session.status is not SessionStatus.FAILED:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation failure conflicts with durable session status."
+                )
+            return True
+
+        if await self._provider_operation_fallback_terminal_outcome_is_durable(
+            pending=pending,
+            result=result,
+        ):
+            return True
+
+        target_ordinal = pending.target_dispatch_ordinal
+        if target_ordinal is None:
+            raise ProviderOperationEvidenceError(
+                "Fallback disposition lost its target dispatch ordinal."
+            )
+        target_stage_id = f"{pending.logical_step_id}:dispatch:{target_ordinal}"
+        target_stage = await self._session_store.load_model_completion_stage(
+            pending.session_id,
+            target_stage_id,
+        )
+        if target_stage is not None:
+            target_context = model_completion_recovery_context_from_stage(target_stage)
+            if (
+                target_stage.logical_step_id != pending.logical_step_id
+                or target_stage.dispatch_ordinal != target_ordinal
+                or target_context is None
+                or target_context.execution_profile_fingerprint
+                != pending.execution_profile_fingerprint
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Fallback disposition target stage has contradictory identity."
+                )
+            return True
+        return False
+
+    async def _provider_operation_fallback_terminal_outcome_is_durable(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        result: ProviderOperationResolutionResult,
+    ) -> bool:
+        """Recognize a typed pre-dispatch stop owned by this disposition."""
+
+        session = await self._session_store.load(pending.session_id)
+        if session is None or session.status is not SessionStatus.INTERRUPTED:
+            return False
+        resolution_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=pending.session_id,
+                event_id=result.event.id,
+                limit=2,
+            )
+        )
+        if len(resolution_records) != 1:
+            raise ProviderOperationEvidenceError(
+                "Fallback terminal outcome has missing or duplicate resolution evidence."
+            )
+        resolution_sequence = resolution_records[0].sequence
+        interaction_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=pending.session_id,
+                interaction_id=result.event.interaction_id,
+                event_type=EventType.INTERACTION_INTERRUPTED,
+                after_sequence=resolution_sequence,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=2,
+            )
+        )
+        terminal_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=pending.session_id,
+                event_type=EventType.SESSION_INTERRUPTED,
+                after_sequence=resolution_sequence,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=2,
+            )
+        )
+        if not interaction_records or not terminal_records:
+            return False
+        if len(interaction_records) != 1 or len(terminal_records) != 1:
+            raise ProviderOperationEvidenceError(
+                "Fallback terminal outcome has contradictory terminal evidence."
+            )
+        try:
+            interaction = InteractionSummaryEvidence.model_validate(
+                interaction_records[0].event.payload
+            )
+        except (TypeError, ValueError):
+            raise ProviderOperationEvidenceError(
+                "Fallback terminal outcome has malformed interaction evidence."
+            ) from None
+        if interaction.status is not InteractionStatus.INTERRUPTED:
+            raise ProviderOperationEvidenceError(
+                "Fallback terminal outcome has contradictory interaction status."
+            )
+        terminal_payload = terminal_records[0].event.payload
+        interruption_type = terminal_payload.get("interruption_type")
+        if interruption_type == "operator_requested":
+            return True
+        if (
+            interruption_type != "limit_reached"
+            and terminal_payload.get("terminal_evidence_repaired") is not True
+        ):
+            return False
+        limit_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=pending.session_id,
+                event_type=EventType.SESSION_LIMIT_REACHED,
+                after_sequence=resolution_sequence,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        return bool(limit_records)
+
+    async def _retire_completed_provider_operation_disposition(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        result: ProviderOperationResolutionResult,
+    ) -> bool:
+        await self._settle_provider_operation_disposition_reservations(
+            pending=pending,
+            result=result,
+        )
+        if not await self._provider_operation_disposition_effect_is_durable(
+            pending=pending,
+            result=result,
+        ):
+            return False
+        await clear_pending_provider_operation_disposition(self._session_store, pending)
+        return True
+
+    async def _settle_provider_operation_disposition_reservations(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        result: ProviderOperationResolutionResult,
+    ) -> tuple[Event, ...]:
+        """Settle the source dispatch before replacement or terminalization."""
+
+        stage = await self._session_store.load_model_completion_stage(
+            pending.session_id,
+            pending.stage_id,
+        )
+        if stage is None:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation disposition lost its source stage."
+            )
+        if not stage.reservation_ids:
+            return ()
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        if recovery_context is None:
+            raise ProviderOperationEvidenceError(
+                "Budgeted provider-operation disposition has no accounting context."
+            )
+        model_attempt_id = stage.intent.get("model_attempt_id")
+        provider_name = stage.intent.get("provider_name")
+        if type(model_attempt_id) is not str or type(provider_name) is not str:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation disposition lost its dispatch identity."
+            )
+        session = await self._session_store.load(pending.session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {pending.session_id}")
+        reason = (
+            "provider operation explicitly failed; usage unknown; charged reserved amount"
+            if pending.action is ProviderOperationResolutionAction.FAIL
+            else (
+                "provider operation fallback accepted; original usage unknown; "
+                "charged reserved amount"
+            )
+        )
+        try:
+            events = await (
+                self._run_limit_controller.reconcile_unavailable_provider_operation_reservations(
+                    reservation_ids=stage.reservation_ids,
+                    recovery_contexts=recovery_context.budget_reservations,
+                    session=session,
+                    provider_name=provider_name,
+                    model_attempt_identity=ModelAttemptIdentity(
+                        model_step_id=stage.logical_step_id,
+                        model_attempt_id=model_attempt_id,
+                    ),
+                    dispatch_id=stage.stage_id,
+                    request_billing_identity=recovery_context.billing_identity,
+                    reason=reason,
+                    occurred_at=result.record.resolved_at,
+                )
+            )
+        except (KeyError, NotImplementedError, TypeError, ValueError) as accounting_error:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation disposition could not reconstruct its original budget "
+                "reservation and pricing context."
+            ) from accounting_error
+        return tuple(events)
+
+    async def _finish_pending_provider_operation_disposition(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        result: ProviderOperationResolutionResult,
+    ) -> AsyncGenerator[Event, None]:
+        """Finish one accepted disposition without replaying its old provider request."""
+
+        for settlement_event in await self._settle_provider_operation_disposition_reservations(
+            pending=pending,
+            result=result,
+        ):
+            yield settlement_event
+
+        if await self._retire_completed_provider_operation_disposition(
+            pending=pending,
+            result=result,
+        ):
+            return
+
+        loaded_session = await self._session_store.load(pending.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {pending.session_id}")
+        if pending.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            if loaded_session.status is not SessionStatus.INTERRUPTED:
+                raise SessionStatusConflict(
+                    "Fallback retry can continue only from an interrupted session."
+                )
+        elif loaded_session.status not in {
+            SessionStatus.INTERRUPTED,
+            SessionStatus.FAILED,
+        }:
+            raise SessionStatusConflict("Fail resolution requires interrupted provider work.")
+        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
+        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        registered_environment = self._resolve_registered_environment(
+            loaded_session.environment_name
+        )
+        checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            loaded_session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+        )
+        if pending.action is ProviderOperationResolutionAction.FAIL:
+            async for event in self._fail_provider_operation(
+                ProviderOperationFailureRequest(
+                    resolution_event=result.event,
+                    session=loaded_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile_snapshot.profile,
+                )
+            ):
+                yield event
+            if not await self._retire_completed_provider_operation_disposition(
+                pending=pending,
+                result=result,
+            ):
+                raise RuntimeError(
+                    "Provider-operation failure disposition has no durable terminal outcome."
+                )
+            return
+
+        stage = await self._session_store.load_model_completion_stage(
+            pending.session_id,
+            pending.stage_id,
+        )
+        if stage is None:
+            raise RuntimeError("Resolved provider-operation stage is missing.")
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        if recovery_context is None:
+            raise RuntimeError(
+                "Provider-operation fallback requires durable model-completion context."
+            )
+        session: Session | None = None
+        fallback_stream: AsyncGenerator[Event, None] | None = None
+        authoritative_failure: BaseException | None = None
+        detached_billing_failure: BaseExceptionGroup | None = None
+        billing_state_check_failure: RuntimeError | None = None
+        try:
+            session, resumed_event = await self._transition_recovery_session_to_running(
+                loaded_session,
+                checkpoint=checkpoint,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile_snapshot=execution_profile_snapshot,
+                preserve_open_interaction_on_failure=True,
+            )
+            if resumed_event is not None:
+                yield resumed_event
+
+            fallback_stream = self._run_pending_provider_operation_fallback(
+                pending=pending,
+                result=result,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                execution_profile_snapshot=execution_profile_snapshot,
+                recovery_context=recovery_context,
+                release_run_fence_on_cleanup=False,
+            )
+            try:
+                async for event in fallback_stream:
+                    yield event
+            finally:
+                await fallback_stream.aclose()
+        except BaseExceptionGroup as exc:
+            detached_billing_failure = detach_billing_identity_cancellation_group(exc)
+            if detached_billing_failure is None:
+                authoritative_failure = exc
+                raise
+            authoritative_failure = detached_billing_failure
+        except _FallbackBillingCancellationStateCheckFailed:
+            billing_state_check_failure = RuntimeError(
+                "Session interruption state check failed after provider billing cancellation"
+            )
+            authoritative_failure = billing_state_check_failure
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            if session is not None:
+                await self._cleanup_entrypoint_handoff(
+                    stream=None,
+                    session_id=session.id,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    authoritative_failure=authoritative_failure,
+                    finalize_abandoned=False,
+                    release_run_fence=True,
+                    execution_profile=execution_profile_snapshot.profile,
+                )
+        if detached_billing_failure is not None:
+            authoritative_failure = None
+            fallback_stream = None
+            del registered_provider, registered_environment
+            raise detached_billing_failure from None
+        if billing_state_check_failure is not None:
+            authoritative_failure = None
+            fallback_stream = None
+            del registered_provider, registered_environment
+            raise billing_state_check_failure from None
+
+    async def _run_pending_provider_operation_fallback(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        result: ProviderOperationResolutionResult,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        recovery_context: ModelCompletionRecoveryContext,
+        release_run_fence_on_cleanup: bool,
+    ) -> AsyncGenerator[Event, None]:
+        """Run the accepted fallback from an already fenced running session."""
+
+        transcript = await self._session_store.load_transcript(session.id)
+        recovery_events = await self._session_store.load_events(session.id)
+        continued_accounting = recovery_context.run_limit_accounting
+        if continued_accounting is not None:
+            continued_accounting = rebase_run_limit_accounting_context(
+                continued_accounting,
+                session_id=session.id,
+                limits=recovery_context.limits,
+                budget_limits=request_budget_limits_for_session(
+                    limits=recovery_context.budget_limits,
+                    agent_name=registered_agent.spec.name,
+                    causal_budget_id=session.causal_budget_id,
+                ),
+                events=recovery_events,
+                reset_run_limits=False,
+                reset_budgets=False,
+                now=self._clock(),
+            )
+        if pending.source_step > recovery_context.max_steps:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation fallback step exceeds its durable run limit."
+            )
+        session_stream = self._run_session(
+            RecoverySessionRunRequest(
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                active_invocation_profile=_rebound_active_invocation_profile(
+                    session,
+                    execution_profile_snapshot,
+                ),
+                messages=transcript,
+                messages_to_append=[],
+                max_steps=recovery_context.max_steps,
+                limits=recovery_context.limits,
+                budget_limits=recovery_context.budget_limits,
+                retry_policy=recovery_context.retry_policy,
+                structured_output=recovery_context.structured_output,
+                thinking=recovery_context.thinking,
+                request_loop_policies=(),
+                request_metadata=recovery_context.request_metadata,
+                task_id=recovery_context.task_id,
+                task_worker_id=None,
+                start_event_type=None,
+                start_event_payload={},
+                start_task_on_enter=False,
+                release_run_fence_on_exit=False,
+                run_limit_accounting=continued_accounting,
+                initial_model_step_identity=ModelStepIdentity(
+                    model_step_id=pending.logical_step_id,
+                ),
+                initial_model_step_number=pending.source_step,
+                preserve_failure_until_initial_provider_dispatch=True,
+            )
+        )
+        authoritative_failure: BaseException | None = None
+        replacement_dispatch_durable = False
+        limit_outcome_started = False
+        try:
+            async for event in session_stream:
+                if event.type is EventType.PROVIDER_OPERATION_STARTING:
+                    if not await self._retire_completed_provider_operation_disposition(
+                        pending=pending,
+                        result=result,
+                    ):
+                        raise RuntimeError(
+                            "Provider-operation fallback started without its exact durable stage."
+                        )
+                    replacement_dispatch_durable = True
+                elif event.type is EventType.SESSION_LIMIT_REACHED:
+                    limit_outcome_started = True
+                yield event
+            if not await self._retire_completed_provider_operation_disposition(
+                pending=pending,
+                result=result,
+            ):
+                raise RuntimeError("Provider-operation fallback has no exact durable target stage.")
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            if (
+                limit_outcome_started
+                and isinstance(authoritative_failure, GeneratorExit)
+                and not replacement_dispatch_durable
+            ):
+                # The limit decision is already durable and cannot lead to
+                # provider dispatch. Finish its typed terminal evidence during
+                # stream cleanup so recovery neither duplicates the limit event
+                # nor mistakes this accepted disposition for pending work.
+                async for _event in session_stream:
+                    pass
+                if not await self._retire_completed_provider_operation_disposition(
+                    pending=pending,
+                    result=result,
+                ):
+                    raise RuntimeError(
+                        "Provider-operation fallback limit has no durable terminal outcome."
+                    )
+            cleanup = (
+                self._cleanup_entrypoint_handoff
+                if release_run_fence_on_cleanup
+                else self._cleanup_recovery_handoff
+            )
+            await cleanup(
+                stream=session_stream,
+                session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=(
+                    replacement_dispatch_durable
+                    and _recovery_abandonment_signal(authoritative_failure) is not None
+                ),
+                release_run_fence=release_run_fence_on_cleanup,
                 execution_profile=execution_profile_snapshot.profile,
             )
 
@@ -9343,11 +10086,64 @@ class RecoveryCoordinator:
         session = await self._session_store.load(request.session_id)
         if session is None:
             raise KeyError(f"Session not found: {request.session_id}") from None
-        return await self._recover_incomplete_session_scoped(
+        recovered = await self._recover_incomplete_session_scoped(
             session=session,
             inactive_before=request.inactive_before,
             reason=request.reason,
             metadata=request.metadata,
+        )
+        return await self._finish_provider_operation_disposition_after_recovery(recovered)
+
+    async def _finish_provider_operation_disposition_after_recovery(
+        self,
+        recovered: IncompleteSessionRecoveryResult,
+    ) -> IncompleteSessionRecoveryResult:
+        pending_resolution = await load_pending_provider_operation_disposition(
+            self._session_store,
+            recovered.session_id,
+        )
+        if pending_resolution is None:
+            return recovered
+        pending, result = pending_resolution
+        if await self._retire_completed_provider_operation_disposition(
+            pending=pending,
+            result=result,
+        ):
+            return recovered
+        session = await self._require_session(recovered.session_id)
+        if (
+            pending.action is ProviderOperationResolutionAction.FALLBACK_RETRY
+            and session.status is not SessionStatus.INTERRUPTED
+        ):
+            return recovered
+
+        disposition_events = [
+            event
+            async for event in self._finish_pending_provider_operation_disposition(
+                pending=pending,
+                result=result,
+            )
+        ]
+        current = await self._require_session(recovered.session_id)
+        retained_actions = tuple(
+            action
+            for action in recovered.actions
+            if action
+            not in {
+                IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,
+                IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,
+            }
+        )
+        return recovered.model_copy(
+            update={
+                "status": current.status,
+                "actions": (
+                    *retained_actions,
+                    IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION,
+                ),
+                "events": (*recovered.events, *disposition_events),
+                "message": "Finished the accepted provider-operation resolution.",
+            }
         )
 
     async def _pending_durable_subagent_recovery_guard(
@@ -9672,6 +10468,7 @@ class RecoveryCoordinator:
                     reason=request.reason,
                     metadata=request.metadata,
                 )
+                result = await self._finish_provider_operation_disposition_after_recovery(result)
                 return result if reconcile_result is None else await reconcile_result(result)
             finally:
                 if after_recovery is not None:
@@ -9746,6 +10543,23 @@ class RecoveryCoordinator:
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
         active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        pending_provider_disposition = await load_pending_provider_operation_disposition(
+            self._session_store,
+            session.id,
+            checkpoint=checkpoint,
+        )
+        pending_provider_disposition_effect_is_durable = False
+        if pending_provider_disposition is not None:
+            (
+                pending_disposition_record,
+                pending_disposition_result,
+            ) = pending_provider_disposition
+            pending_provider_disposition_effect_is_durable = (
+                await self._provider_operation_disposition_effect_is_durable(
+                    pending=pending_disposition_record,
+                    result=pending_disposition_result,
+                )
+            )
         if active_invocation_profile is not None and not (
             active_invocation_execution_profile_matches_session_epoch(
                 active_invocation_profile,
@@ -9803,6 +10617,7 @@ class RecoveryCoordinator:
                 or deferred_input is not None
                 or active_model_completion is not None
                 or bool(workspace_observations)
+                or pending_provider_disposition is not None
             )
             if not terminal_repair and not has_pending_work:
                 if active_invocation_profile is not None and not (
@@ -9884,6 +10699,7 @@ class RecoveryCoordinator:
             and deferred_input is None
             and active_model_completion is None
             and not workspace_observations
+            and pending_provider_disposition is None
             and EXECUTION_PROFILE_METADATA_KEY in session.metadata
         ):
             interaction_records = await self._session_store.query_events(
@@ -9907,6 +10723,7 @@ class RecoveryCoordinator:
             or deferred_input is not None
             or active_model_completion is not None
             or bool(workspace_observations)
+            or pending_provider_disposition is not None
             or active_invocation_profile is not None
             or (
                 not pre_admission_profiled_session
@@ -9916,11 +10733,27 @@ class RecoveryCoordinator:
         )
         execution_profile_snapshot = None
         if requires_execution_profile:
+            pending_disposition = (
+                None if pending_provider_disposition is None else pending_provider_disposition[0]
+            )
             execution_profile_snapshot = await self._validate_execution_profile_continuation(
                 session,
                 checkpoint,
                 registered_agent,
                 registered_provider,
+                require_open_interaction=not (
+                    pending_provider_disposition_effect_is_durable
+                    or (
+                        pending_disposition is not None
+                        and pending_disposition.action is ProviderOperationResolutionAction.FAIL
+                        and session.status is SessionStatus.FAILED
+                    )
+                ),
+                additional_profile_fingerprints=(
+                    ()
+                    if pending_disposition is None
+                    else (pending_disposition.execution_profile_fingerprint,)
+                ),
             )
         claim: _IncompleteRecoveryClaim | None = None
         authoritative_failure: BaseException | None = None
@@ -9965,6 +10798,16 @@ class RecoveryCoordinator:
                     session_id=session.id,
                     claim_id=claim.claim_id,
                     authoritative_failure=authoritative_failure,
+                    release_environment_cleanup=(
+                        pending_provider_disposition is not None
+                        and pending_provider_disposition[0].action
+                        is ProviderOperationResolutionAction.FALLBACK_RETRY
+                    ),
+                    execution_profile=(
+                        None
+                        if execution_profile_snapshot is None
+                        else execution_profile_snapshot.profile
+                    ),
                 )
 
     async def _settle_terminal_invocation_closure_owned(
@@ -10540,11 +11383,19 @@ class RecoveryCoordinator:
         session_id: str,
         claim_id: str,
         authoritative_failure: BaseException | None,
+        release_environment_cleanup: bool = False,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         recovery_run_epoch = _current_session_run_epoch(session_id)
 
         async def release_recovery_run_fence() -> None:
-            await self._session_store.release_run_fence(session_id)
+            if release_environment_cleanup:
+                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                    session_id=session_id,
+                    execution_profile=execution_profile,
+                )
+            else:
+                await self._session_store.release_run_fence(session_id)
             if recovery_run_epoch is not None:
                 self._environment_lifecycle.retire_repaired_run_fence_releases(
                     session_id=session_id,
@@ -12138,6 +12989,110 @@ class RecoveryCoordinator:
         )
         environment_name = _environment_name(registered_environment)
 
+        pending_provider_resolution = await load_pending_provider_operation_disposition(
+            self._session_store,
+            session.id,
+            checkpoint=checkpoint,
+        )
+        if pending_provider_resolution is not None:
+            pending_disposition, resolution_result = pending_provider_resolution
+            if await self._retire_completed_provider_operation_disposition(
+                pending=pending_disposition,
+                result=resolution_result,
+            ):
+                actions.append(
+                    IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION
+                )
+                checkpoint = await self._session_store.load_checkpoint(session.id)
+            elif pending_disposition.action is ProviderOperationResolutionAction.FAIL:
+                if execution_profile_snapshot is None:
+                    raise RuntimeError(
+                        "Provider-operation failure recovery has no execution profile."
+                    )
+                async for event in self._fail_provider_operation(
+                    ProviderOperationFailureRequest(
+                        resolution_event=resolution_result.event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
+                    )
+                ):
+                    events.append(event)
+                if not await self._retire_completed_provider_operation_disposition(
+                    pending=pending_disposition,
+                    result=resolution_result,
+                ):
+                    raise RuntimeError(
+                        "Recovered provider-operation failure has no terminal outcome."
+                    )
+                current = await self._require_session(session.id)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=current.status,
+                    actions=(
+                        IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION,
+                    ),
+                    events=tuple(events),
+                    message="Finished the accepted provider-operation failure.",
+                )
+            elif session.status is SessionStatus.INTERRUPTED:
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    events=tuple(events),
+                    message=(
+                        "Accepted provider-operation fallback is ready for fenced continuation."
+                    ),
+                )
+            elif session.status is SessionStatus.RUNNING:
+                if execution_profile_snapshot is None:
+                    raise RuntimeError(
+                        "Provider-operation fallback recovery has no execution profile."
+                    )
+                source_stage = await self._session_store.load_model_completion_stage(
+                    session.id,
+                    pending_disposition.stage_id,
+                )
+                if source_stage is None:
+                    raise RuntimeError("Resolved provider-operation stage is missing.")
+                recovery_context = model_completion_recovery_context_from_stage(source_stage)
+                if recovery_context is None:
+                    raise RuntimeError(
+                        "Provider-operation fallback requires durable model-completion context."
+                    )
+                interaction_id = await self._activate_latest_open_interaction(session.id)
+                if interaction_id is None:
+                    raise RuntimeError(
+                        "Provider-operation fallback recovery has no open interaction."
+                    )
+                async for event in self._run_pending_provider_operation_fallback(
+                    pending=pending_disposition,
+                    result=resolution_result,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                    execution_profile_snapshot=execution_profile_snapshot,
+                    recovery_context=recovery_context,
+                    release_run_fence_on_cleanup=False,
+                ):
+                    events.append(event)
+                current = await self._require_session(session.id)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=current.status,
+                    actions=(
+                        IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION,
+                    ),
+                    events=tuple(events),
+                    message="Finished the accepted provider-operation fallback.",
+                )
+
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES and (
             await self._terminal_evidence_repair_required(
                 session=session,
@@ -12219,6 +13174,70 @@ class RecoveryCoordinator:
                 message=(
                     "Provider operation is still pending; its exact durable dispatch remains "
                     "eligible for later recovery."
+                ),
+            )
+        if model_boundary.state == "provider_operation_unavailable":
+            if active_model_stage is None:
+                raise RuntimeError(
+                    "Unavailable provider operation has no active model-completion stage."
+                )
+            unavailable_event = next(
+                (
+                    event
+                    for event in reversed(model_boundary.recovery_events)
+                    if event.type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+                ),
+                None,
+            )
+            if unavailable_event is None:
+                raise RuntimeError(
+                    "Unavailable provider operation has no durable recovery evidence."
+                )
+            try:
+                recovery_reason = ProviderOperationUnavailableReason(
+                    unavailable_event.payload.get("recovery_reason")
+                )
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "Unavailable provider operation has malformed recovery evidence."
+                ) from None
+            if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+                session = await self._session_store.transition_status(
+                    session.id,
+                    from_statuses={session.status},
+                    to_status=SessionStatus.INTERRUPTED,
+                )
+            elif session.status is not SessionStatus.INTERRUPTED:
+                raise RuntimeError(
+                    "Unavailable provider operation cannot pause the current session status."
+                )
+            interrupted_event = await self._event_writer.emit(
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session.id,
+                    interaction_id=unavailable_event.interaction_id,
+                    agent_name=session.agent_name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": "provider_operation_unavailable",
+                        "stage_id": active_model_stage.stage.stage_id,
+                        "recovery_reason": recovery_reason.value,
+                        "duplicate_request_risk": provider_operation_duplicate_request_risk(
+                            recovery_reason
+                        ),
+                    },
+                )
+            )
+            events.append(interrupted_event)
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,),
+                events=tuple(events),
+                message=(
+                    "Exact provider continuation is unavailable; explicit fallback retry or "
+                    "failure is required."
                 ),
             )
         if (

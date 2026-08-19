@@ -60,6 +60,7 @@ function capabilities() {
     mutations: {
       session_execution: operation(true),
       session_interruption: operation(false, "unsupported"),
+      provider_operation_resolution: operation(true),
       pending_action_resolution: operation(true),
       session_annotations: operation(true),
       task_lifecycle: operation(false, "not_configured"),

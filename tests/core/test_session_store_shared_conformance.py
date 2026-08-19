@@ -180,10 +180,17 @@ from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
+    ProviderOperationInspectionStatus,
+    ProviderOperationResolutionAction,
+    ProviderOperationResolutionRequest,
     commit_provider_operation_progress,
+    inspect_provider_operation,
+    load_pending_provider_operation_disposition,
+    load_provider_operation_resolution,
     load_recoverable_provider_operation,
     provider_operation_progress_event_id,
     provider_operation_progress_payload,
+    resolve_provider_operation_stage,
 )
 from cayu.runtime.sessions import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
@@ -13206,6 +13213,373 @@ def test_session_store_conformance_provider_progress_event_and_cursor_are_atomic
                 "lo",
             ]
         finally:
+            await store.release_run_fence(session_id)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reconstructs_provider_resolution_after_restart(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "sess_provider_resolution_conformance"
+        interaction_id = "interaction-provider-resolution-conformance"
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="provider-resolution-conformance-interaction-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                ),
+                interaction_source_messages=[],
+            )
+            await store.checkpoint(created.id, {})
+            identity = ModelAttemptIdentity(
+                model_step_id="mstep_" + "c" * 32,
+                model_attempt_id="matt_" + "d" * 32,
+            )
+            stage = (
+                await store.prepare_model_completion_stage(
+                    created.id,
+                    request=ModelCompletionStageRequest(
+                        stage_id=f"{identity.model_step_id}:dispatch:0",
+                        logical_step_id=identity.model_step_id,
+                        dispatch_ordinal=0,
+                        intent={
+                            **identity.payload(),
+                            "provider_name": "conformance-provider",
+                            "requested_model": "conformance-model",
+                            "recovery_context": {
+                                "execution_profile_fingerprint": "e" * 64,
+                            },
+                        },
+                    ),
+                    expected_statuses={created.status},
+                    expected_run_epoch=created.run_epoch,
+                    expected_transcript_cursor=0,
+                )
+            ).stage
+            state = ProviderOperationState(
+                operation_id="provider-resolution-operation",
+                stream_protocol="conformance-v1",
+            )
+            common_payload = {
+                "provider": "conformance-provider",
+                "model": "conformance-model",
+                "step": 1,
+                "attempt": 1,
+                "max_attempts": 1,
+                **identity.payload(),
+            }
+            await store.append_events(
+                created.id,
+                [
+                    Event(
+                        type=EventType.MODEL_STARTED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload=common_payload,
+                    ),
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_STARTING,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload={
+                            **common_payload,
+                            "source_run_epoch": created.run_epoch,
+                            "start_id": f"provider-operation:{identity.model_attempt_id}",
+                            "start_idempotency_support": "unsupported",
+                        },
+                    ),
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_STARTED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload={
+                            **common_payload,
+                            "source_run_epoch": created.run_epoch,
+                            "start_id": f"provider-operation:{identity.model_attempt_id}",
+                            "state_version": state.version,
+                            "operation_id": state.operation_id,
+                            "stream_protocol": state.stream_protocol,
+                            "status": ProviderOperationStatus.UNAVAILABLE.value,
+                            "recovery_metadata": {},
+                        },
+                    ),
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload={
+                            **common_payload,
+                            "source_run_epoch": created.run_epoch,
+                            "run_epoch": created.run_epoch,
+                            "operation_id": state.operation_id,
+                            "stream_protocol": state.stream_protocol,
+                            "status": "unavailable",
+                            "recovery_reason": "unavailable",
+                        },
+                    ),
+                ],
+            )
+            interrupted = await store.transition_status(
+                created.id,
+                from_statuses={created.status},
+                to_status=SessionStatus.INTERRUPTED,
+            )
+            request = ProviderOperationResolutionRequest(
+                session_id=created.id,
+                stage_id=stage.stage_id,
+                expected_run_epoch=interrupted.run_epoch,
+                action=ProviderOperationResolutionAction.FAIL,
+                reason="conformance operator failure",
+            )
+            resolved = await resolve_provider_operation_stage(
+                store,
+                request,
+                redactor=SecretRedactor(),
+            )
+            assert resolved.replayed is False
+            assert await store.load_active_model_completion_stage(created.id) is None
+            pending = await load_pending_provider_operation_disposition(store, created.id)
+            assert pending is not None
+            assert pending[0].resolution_id == resolved.record.resolution_id
+
+            store = await _reopen_store(session_store_case, store)
+            reconstructed = await load_provider_operation_resolution(
+                store,
+                created.id,
+                stage.stage_id,
+            )
+            assert reconstructed is not None
+            assert reconstructed.replayed is True
+            assert reconstructed.record.action is ProviderOperationResolutionAction.FAIL
+            reconstructed_pending = await load_pending_provider_operation_disposition(
+                store,
+                created.id,
+            )
+            assert reconstructed_pending is not None
+            assert reconstructed_pending[0] == pending[0]
+            inspection = await inspect_provider_operation(store, created.id)
+            assert (
+                inspection.status
+                is ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
+            )
+            assert inspection.resolution_action is ProviderOperationResolutionAction.FAIL
+            replay = await resolve_provider_operation_stage(
+                store,
+                request,
+                redactor=SecretRedactor(),
+            )
+            assert replay.replayed is True
+        finally:
+            await store.release_run_fence(session_id)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_provider_resolution_loses_to_terminal_completion(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "sess_provider_resolution_terminal_race"
+        interaction_id = "interaction-provider-resolution-terminal-race"
+        release_resolution = asyncio.Event()
+        resolution_entered = asyncio.Event()
+        resolution_task: asyncio.Task | None = None
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="provider-resolution-terminal-race-interaction-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                ),
+                interaction_source_messages=[],
+            )
+            await store.checkpoint(created.id, {})
+            identity = ModelAttemptIdentity(
+                model_step_id="mstep_" + "4" * 32,
+                model_attempt_id="matt_" + "5" * 32,
+            )
+            intent = {
+                **identity.payload(),
+                "provider_name": "conformance-provider",
+                "requested_model": "conformance-model",
+                "recovery_context": {
+                    "execution_profile_fingerprint": "6" * 64,
+                },
+            }
+            stage = (
+                await store.prepare_model_completion_stage(
+                    created.id,
+                    request=ModelCompletionStageRequest(
+                        stage_id=f"{identity.model_step_id}:dispatch:0",
+                        logical_step_id=identity.model_step_id,
+                        dispatch_ordinal=0,
+                        intent=intent,
+                    ),
+                    expected_statuses={created.status},
+                    expected_run_epoch=created.run_epoch,
+                    expected_transcript_cursor=0,
+                )
+            ).stage
+            common_payload = {
+                "provider": "conformance-provider",
+                "model": "conformance-model",
+                "step": 1,
+                "attempt": 1,
+                "max_attempts": 1,
+                **identity.payload(),
+            }
+            await store.append_events(
+                created.id,
+                [
+                    Event(
+                        type=EventType.MODEL_STARTED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload=common_payload,
+                    ),
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_STARTED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload={
+                            **common_payload,
+                            "source_run_epoch": created.run_epoch,
+                            "start_id": f"provider-operation:{identity.model_attempt_id}",
+                            "state_version": 1,
+                            "operation_id": "provider-resolution-terminal-race-operation",
+                            "stream_protocol": "conformance-v1",
+                            "status": ProviderOperationStatus.UNAVAILABLE.value,
+                            "recovery_metadata": {},
+                        },
+                    ),
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload={
+                            **common_payload,
+                            "source_run_epoch": created.run_epoch,
+                            "run_epoch": created.run_epoch,
+                            "operation_id": "provider-resolution-terminal-race-operation",
+                            "stream_protocol": "conformance-v1",
+                            "status": "unavailable",
+                            "recovery_reason": "unavailable",
+                        },
+                    ),
+                ],
+            )
+            interrupted = await store.transition_status(
+                created.id,
+                from_statuses={created.status},
+                to_status=SessionStatus.INTERRUPTED,
+            )
+            request = ProviderOperationResolutionRequest(
+                session_id=created.id,
+                stage_id=stage.stage_id,
+                expected_run_epoch=interrupted.run_epoch,
+                action=ProviderOperationResolutionAction.FAIL,
+                reason="terminal completion must win the resolution race",
+            )
+            original_publish_session_operation = store.publish_session_operation
+
+            async def publish_after_terminal_completion(*args, **kwargs):
+                resolution_entered.set()
+                await release_resolution.wait()
+                return await original_publish_session_operation(*args, **kwargs)
+
+            monkeypatch.setattr(
+                store,
+                "publish_session_operation",
+                publish_after_terminal_completion,
+            )
+            resolution_task = asyncio.create_task(
+                resolve_provider_operation_stage(
+                    store,
+                    request,
+                    redactor=SecretRedactor(),
+                )
+            )
+            await asyncio.wait_for(resolution_entered.wait(), timeout=5)
+
+            completion = await store.complete_model_completion_stage(
+                created.id,
+                stage_id=stage.stage_id,
+                publication=_assistant_model_completion_publication(
+                    session_id=created.id,
+                    stage_id=stage.stage_id,
+                    logical_step_id=stage.logical_step_id,
+                    intent=intent,
+                    completion_event_id="provider-resolution-terminal-race-completed",
+                    source_transcript_cursor=0,
+                    assistant_message=Message.text("assistant", "terminal completion won"),
+                    event_payload=identity.payload(),
+                ),
+            )
+            assert completion.stage.state == "completed"
+            release_resolution.set()
+
+            with pytest.raises(
+                SessionModelCompletionStageConflict,
+                match="became terminal before external disposition",
+            ):
+                await resolution_task
+            assert (
+                await load_provider_operation_resolution(
+                    store,
+                    created.id,
+                    stage.stage_id,
+                )
+                is None
+            )
+            assert (
+                await load_pending_provider_operation_disposition(
+                    store,
+                    created.id,
+                )
+                is None
+            )
+            active = await store.load_active_model_completion_stage(created.id)
+            assert active is not None
+            assert active.stage.state == "completed"
+            assert not any(
+                event.type is EventType.PROVIDER_OPERATION_RESOLVED
+                for event in await store.load_events(created.id)
+            )
+        finally:
+            release_resolution.set()
+            if resolution_task is not None and not resolution_task.done():
+                resolution_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await resolution_task
             await store.release_run_fence(session_id)
             await _close_store(store)
 

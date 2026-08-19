@@ -38,6 +38,13 @@ class ProviderOperationCancellationSupport(StrEnum):
     SUPPORTED = "supported"
 
 
+class ProviderOperationStartIdempotencySupport(StrEnum):
+    """Whether recovering an accepted start from its key alone is proven exact."""
+
+    UNSUPPORTED = "unsupported"
+    EXACT = "exact"
+
+
 class ProviderOperationStatus(StrEnum):
     """Provider-neutral lifecycle states for reconnectable model work."""
 
@@ -142,7 +149,7 @@ class ProviderOperationState(BaseModel):
 
 @dataclass(frozen=True)
 class ProviderOperationConnection:
-    """A newly started or reconnected operation and its normalized event stream."""
+    """A started, recovered, or reconnected operation and its normalized event stream."""
 
     state: ProviderOperationState
     status: ProviderOperationStatus
@@ -154,6 +161,13 @@ class ProviderOperationStartRequest:
     """One explicitly enabled dispatch with stable provider idempotency authority."""
 
     request: ModelRequest
+    idempotency_key: str
+
+
+@dataclass(frozen=True)
+class ProviderOperationStartRecoveryRequest:
+    """Recover one accepted start from provider-owned idempotency authority alone."""
+
     idempotency_key: str
 
 
@@ -184,6 +198,34 @@ class ProviderOperationAdapter(ABC):
     @abstractmethod
     async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
         """Reconnect to an existing provider-owned stream."""
+
+    @property
+    def start_idempotency_support(self) -> ProviderOperationStartIdempotencySupport:
+        """Advertise exact key-only start recovery only when the provider proves it.
+
+        ``EXACT`` means :meth:`recover_start` can recover the accepted operation
+        from the idempotency key without receiving or durably retaining the raw
+        provider request. Providers that require the request to be submitted again
+        must leave this as ``UNSUPPORTED``.
+        """
+
+        return ProviderOperationStartIdempotencySupport.UNSUPPORTED
+
+    async def recover_start(
+        self,
+        request: ProviderOperationStartRecoveryRequest,
+    ) -> ProviderOperationConnection:
+        """Recover an accepted start by its exact provider idempotency identity.
+
+        Adapters advertising ``EXACT`` must override this method. The default is
+        intentionally unavailable so adding the recovery seam remains compatible
+        with adapters that do not advertise exact start recovery. Implementations
+        must only look up work already accepted under the key; this method must not
+        create or resubmit provider work.
+        """
+
+        del request
+        raise NotImplementedError("Provider operation start recovery is unsupported.")
 
     @property
     def cancellation_support(self) -> ProviderOperationCancellationSupport:
@@ -218,7 +260,7 @@ def copy_provider_operation_connection(
     """Validate a provider-owned connection without consuming its event stream."""
 
     if type(connection) is not ProviderOperationConnection:
-        raise TypeError("Provider operation start must return ProviderOperationConnection.")
+        raise TypeError("Provider operation boundary must return ProviderOperationConnection.")
     if type(connection.status) is not ProviderOperationStatus:
         raise TypeError("Provider operation status must be a ProviderOperationStatus.")
     if not hasattr(connection.events, "__aiter__"):
@@ -258,6 +300,8 @@ __all__ = [
     "ProviderOperationMode",
     "ProviderOperationRecoveryMetadata",
     "ProviderOperationSnapshot",
+    "ProviderOperationStartIdempotencySupport",
+    "ProviderOperationStartRecoveryRequest",
     "ProviderOperationStartRequest",
     "ProviderOperationState",
     "ProviderOperationStatus",

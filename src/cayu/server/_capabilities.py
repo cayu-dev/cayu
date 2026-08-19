@@ -106,6 +106,7 @@ class ControlPlaneCapabilitySnapshot:
             mutations=ControlPlaneMutationCapabilities(
                 session_execution=_operation(True),
                 session_interruption=_operation(True),
+                provider_operation_resolution=_operation(True),
                 pending_action_resolution=_operation(True),
                 session_annotations=_operation(True),
                 task_lifecycle=_operation(self.tasks_configured),

@@ -40,6 +40,7 @@ REQUIRED_TOP_LEVEL_EXPORTS = (
     "OpenAISubscriptionProvider",
     "NativeStructuredOutputSchemaInvalid",
     "NativeStructuredOutputUnsupported",
+    "ProviderOperationStartRecoveryRequest",
     "Runner",
     "Workspace",
     "DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS",

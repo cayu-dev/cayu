@@ -168,6 +168,16 @@ def test_public_auth_helpers_document_tenant_as_provenance_only(public_api) -> N
         ("POST", "/api/sessions/session-1/interrupt", None),
         (
             "POST",
+            "/api/provider-operations/resolve",
+            {
+                "session_id": "session-1",
+                "stage_id": "stage-1",
+                "expected_run_epoch": 0,
+                "action": "fail",
+            },
+        ),
+        (
+            "POST",
             "/api/tool-approvals/resolve",
             {"session_id": "session-1", "approval_id": "approval-1", "decision": "approve"},
         ),
@@ -338,6 +348,16 @@ def test_auth_guards_read_and_contract_routes(
             },
         ),
         ("POST", "/api/sessions/session-1/interrupt", None),
+        (
+            "POST",
+            "/api/provider-operations/resolve",
+            {
+                "session_id": "session-1",
+                "stage_id": "stage-1",
+                "expected_run_epoch": 0,
+                "action": "fail",
+            },
+        ),
         (
             "POST",
             "/api/tool-approvals/resolve",

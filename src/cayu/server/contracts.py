@@ -806,6 +806,7 @@ class ControlPlaneSurfaceCapabilities(ApiBaseModel):
 class ControlPlaneMutationCapabilities(ApiBaseModel):
     session_execution: CapabilityOperation
     session_interruption: CapabilityOperation
+    provider_operation_resolution: CapabilityOperation
     pending_action_resolution: CapabilityOperation
     session_annotations: CapabilityOperation
     task_lifecycle: CapabilityOperation
@@ -1573,10 +1574,34 @@ class ApiProviderOperationInspection(ApiBaseModel):
         "reconnect_scheduled",
         "reconnect_in_progress",
         "provider_operation_reconciled",
+        "provider_operation_unavailable",
+        "ambiguous_submission",
+        "fallback_retry",
     ]
+    stage_id: str | None = Field(default=None, max_length=256)
+    run_epoch: StrictInt | None = Field(default=None, ge=0)
     provider: str | None = Field(default=None, max_length=256)
     operation_id: str | None = Field(default=None, max_length=512)
     stream_protocol: str | None = Field(default=None, max_length=128)
+    recovery_reason: (
+        Literal[
+            "failed",
+            "expired",
+            "cancelled",
+            "malformed",
+            "wrong_provider",
+            "unavailable",
+            "ambiguous_submission",
+        ]
+        | None
+    ) = None
+    duplicate_request_risk: StrictBool = False
+    allowed_resolutions: list[Literal["fallback_retry", "fail"]] = Field(
+        default_factory=list,
+        max_length=2,
+    )
+    resolution_action: Literal["fallback_retry", "fail"] | None = None
+    resolution_id: str | None = Field(default=None, max_length=256)
     cancellation_status: Literal[
         "not_requested",
         "requested",

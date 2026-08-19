@@ -23,6 +23,7 @@ from cayu.providers import (
     ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationSnapshot,
+    ProviderOperationStartIdempotencySupport,
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
@@ -776,6 +777,12 @@ def test_model_provider_defaults_to_no_provider_operation_capability() -> None:
     assert provider.provider_operation_mode is ProviderOperationMode.SYNCHRONOUS
 
 
+def test_provider_operation_adapter_requires_explicit_start_idempotency_support() -> None:
+    adapter = _ReconnectableAdapter()
+
+    assert adapter.start_idempotency_support is ProviderOperationStartIdempotencySupport.UNSUPPORTED
+
+
 def test_capability_support_does_not_enable_background_dispatch() -> None:
     provider = _ReconnectableProvider()
     app = CayuApp(enable_logging=False)
@@ -870,6 +877,7 @@ def test_reconnectable_dispatch_persists_identity_before_model_output() -> None:
     assert stored_start.payload["model_attempt_id"]
     assert stored_start.interaction_id
     assert stored_starting.payload["start_id"] == stored_start.payload["start_id"]
+    assert stored_starting.payload["start_idempotency_support"] == "unsupported"
     assert provider.adapter.start_requests[0].idempotency_key == stored_start.payload["start_id"]
     assert (
         stored_text.payload["provider_operation_progress"]["stream_event"]["recovery_metadata"][
@@ -1328,8 +1336,8 @@ def test_ambiguous_provider_operation_start_is_never_retried() -> None:
 
     assert provider.adapter.start_calls == 1
     assert EventType.MODEL_RETRY not in {event.type for event in events}
-    failed = next(event for event in events if event.type == EventType.SESSION_FAILED)
-    assert failed.payload["error_type"] == "ModelProviderError"
+    interrupted = next(event for event in events if event.type == EventType.SESSION_INTERRUPTED)
+    assert interrupted.payload["recovery_reason"] == "ambiguous_submission"
     stored = asyncio.run(app.session_store.load_events("ambiguous_provider_start"))
     assert sum(event.type == EventType.PROVIDER_OPERATION_STARTING for event in stored) == 1
 
@@ -1743,7 +1751,7 @@ def test_cancellation_during_unsettled_provider_start_is_bounded(
 
     assert cancelled
     assert start_calls == 1
-    assert status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+    assert status is ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION
 
 
 def test_late_successful_start_acknowledgement_cancels_exact_returned_operation(
@@ -1803,7 +1811,7 @@ def test_late_successful_start_acknowledgement_cancels_exact_returned_operation(
             stream_protocol="responses-v1",
         )
     ]
-    assert status is ProviderOperationInspectionStatus.SYNCHRONOUS
+    assert status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
     reconciled = [event for event in stored if event.type == EventType.PROVIDER_OPERATION_STARTED]
     assert len(reconciled) == 1
     assert reconciled[0].payload["operation_id"] == "response_late"
@@ -2088,9 +2096,8 @@ def test_cleanup_failure_does_not_invoke_extension_exception_cause_accessors() -
 
     assert adapter.start_calls == 1
     assert adapter.cancel_calls == 1
-    failed = next(event for event in events if event.type == EventType.SESSION_FAILED)
-    assert failed.payload["error_type"] == "ModelProviderError"
-    assert failed.payload["error_type"] != "RuntimeError"
+    interrupted = next(event for event in events if event.type == EventType.SESSION_INTERRUPTED)
+    assert interrupted.payload["recovery_reason"] == "ambiguous_submission"
 
 
 def test_post_commit_delivery_failure_leaves_operation_recoverable_without_retry() -> None:
@@ -2499,11 +2506,11 @@ def test_operator_inspection_rejects_conflicting_completion_scope(order: str) ->
 @pytest.mark.parametrize(
     ("include_started", "terminal_type", "expected_status"),
     [
-        (False, None, ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS),
+        (False, None, ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION),
         (
             False,
             EventType.MODEL_ERROR,
-            ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS,
+            ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION,
         ),
         (
             True,
@@ -2568,10 +2575,77 @@ def test_operator_inspection_classifies_ambiguous_start_and_terminal_error(
     inspection = asyncio.run(scenario())
 
     assert inspection.status is expected_status
+    if expected_status is ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION:
+        assert inspection.provider == "reconnectable"
+        assert inspection.operation_id is None
+        assert inspection.stream_protocol is None
+        assert inspection.recovery_reason == "ambiguous_submission"
+        assert inspection.duplicate_request_risk is True
+        assert inspection.allowed_resolutions == ("fallback_retry", "fail")
     if expected_status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS:
         assert inspection.provider == "reconnectable"
         assert inspection.operation_id == ("response_a" if include_started else None)
         assert inspection.stream_protocol == ("responses-v1" if include_started else None)
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "recovery_reason", "duplicate_request_risk"),
+    [
+        (ProviderOperationStatus.FAILED, "failed", False),
+        (ProviderOperationStatus.EXPIRED, "expired", False),
+        (ProviderOperationStatus.CANCELLED, "cancelled", False),
+        (ProviderOperationStatus.UNAVAILABLE, "unavailable", True),
+        (ProviderOperationStatus.COMPLETED, "malformed", True),
+    ],
+)
+def test_operator_inspection_exposes_terminal_provider_operation_for_resolution(
+    provider_status: ProviderOperationStatus,
+    recovery_reason: str,
+    duplicate_request_risk: bool,
+) -> None:
+    async def scenario():
+        session_id = f"inspection_{provider_status.value}"
+        app = CayuApp(enable_logging=False)
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                ),
+                _operation_event(operation_id="response_a", session_id=session_id).model_copy(
+                    update={
+                        "payload": {
+                            **_operation_event(
+                                operation_id="response_a",
+                                session_id=session_id,
+                            ).payload,
+                            "status": provider_status.value,
+                        }
+                    },
+                    deep=True,
+                ),
+            ],
+        )
+        return await inspect_provider_operation(app.session_store, session_id)
+
+    inspection = asyncio.run(scenario())
+
+    assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
+    assert inspection.provider == "reconnectable"
+    assert inspection.operation_id == "response_a"
+    assert inspection.recovery_reason == recovery_reason
+    assert inspection.duplicate_request_risk is duplicate_request_risk
+    assert inspection.allowed_resolutions == ("fallback_retry", "fail")
 
 
 def test_operator_inspection_uses_latest_reconnect_transition() -> None:

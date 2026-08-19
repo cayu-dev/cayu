@@ -333,6 +333,7 @@ def test_control_plane_request_ceiling_is_documented_in_openapi() -> None:
         "/api/run",
         "/api/resume",
         "/api/sessions/{session_id}/interrupt",
+        "/api/provider-operations/resolve",
         "/api/tool-approvals/resolve",
         "/api/tool-approvals/recover",
         "/api/tool-rounds/recover",

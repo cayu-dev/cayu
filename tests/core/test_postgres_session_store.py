@@ -33,7 +33,9 @@ from tests.core.test_provider_operation_offline_recovery import (
     assert_offline_provider_operation_recovery,
     assert_offline_provider_operation_reuses_run_limit_accounting,
     assert_pending_provider_operation_later_completes,
+    assert_provider_resolution_process_loss_recovery,
     assert_terminal_session_fails_closed_with_active_provider_operation,
+    stage_provider_resolution_process_loss,
 )
 from tests.core.tool_result_projection_conformance import (
     assert_tool_result_projection_recovery_conformance,
@@ -63,6 +65,7 @@ from cayu.runtime import (
     SessionTopologyQuery,
     TranscriptQuery,
 )
+from cayu.runtime.provider_operations import ProviderOperationResolutionAction
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
@@ -193,6 +196,46 @@ def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
 
 def test_postgres_offline_provider_operation_recovery(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_offline_provider_operation_recovery)
+
+
+@pytest.mark.parametrize(
+    ("action", "after_status_transition"),
+    [
+        (ProviderOperationResolutionAction.FALLBACK_RETRY, False),
+        (ProviderOperationResolutionAction.FALLBACK_RETRY, True),
+        (ProviderOperationResolutionAction.FAIL, False),
+        (ProviderOperationResolutionAction.FAIL, True),
+    ],
+)
+def test_postgres_provider_resolution_process_loss_finishes_disposition(
+    postgres_dsn: str,
+    action: ProviderOperationResolutionAction,
+    after_status_transition: bool,
+) -> None:
+    async def scenario() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            session_id, provider = await stage_provider_resolution_process_loss(
+                store,
+                action=action,
+                after_status_transition=after_status_transition,
+            )
+        finally:
+            await store.close()
+
+        reopened = _new_store(postgres_dsn)
+        try:
+            await assert_provider_resolution_process_loss_recovery(
+                reopened,
+                session_id=session_id,
+                provider=provider,
+                action=action,
+            )
+        finally:
+            await reopened.close()
+
+    asyncio.run(scenario())
 
 
 def test_postgres_terminal_session_fails_closed_with_active_provider_operation(

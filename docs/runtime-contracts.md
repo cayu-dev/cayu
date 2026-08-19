@@ -3544,8 +3544,11 @@ Server contract version 10 adds bounded provider-operation cancellation and
 accounting reconciliation state to session inspection. Server contract version
 11 replaces the independent new-run model override with one exact provider and
 model target. Server contract version 12 makes the exact knowledge revision
-required on entry and chunk projections. Clients generated against contract
-version 1 through 11 must regenerate from the current OpenAPI document.
+required on entry and chunk projections. Server contract version 13 adds typed
+unavailable and ambiguous provider-operation inspection, a run-epoch-fenced
+resolution mutation, and its control-plane capability. Clients generated
+against contract version 1 through 12 must regenerate from the current OpenAPI
+document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
@@ -3564,8 +3567,8 @@ independently from dashboard pricing: a capable session store can provide
 activity and token totals without a default price book, while pricing controls
 only cost estimation. Dashboard mounting is reported independently from its
 access policy. Runtime mutation families—including session execution,
-interruption, annotations, pending-action resolution, task lifecycle, and
-knowledge review—are reported separately so the dashboard can suppress controls
+interruption, provider-operation resolution, annotations, pending-action
+resolution, task lifecycle, and knowledge review—are reported separately so the dashboard can suppress controls
 that cannot work. The fixed
 `configured_store_roles` list names only Cayu roles (`session`, `task`,
 `knowledge`, and `artifact`); it never exposes implementation classes, module
@@ -4095,19 +4098,33 @@ values.
 
 Before external dispatch, Cayu durably commits
 `provider.operation.starting` with a stable, model-attempt-scoped idempotency
-key. The adapter receives that key when it starts the provider operation. Start
+key. The adapter receives that key when it starts the provider operation. An
+adapter declares `ProviderOperationStartIdempotencySupport.EXACT` only when the
+provider contract can recover the accepted operation from that key alone,
+without resubmitting or durably retaining the provider request. Cayu retains
+only the bounded key, support declaration, and request fingerprint with the
+active stage; it never copies the raw request into provider-operation recovery
+state. Process recovery calls the adapter's key-only `recover_start(...)` seam.
+That seam is a lookup of already accepted work and must never create or resubmit
+provider work. A different identity fails closed. Providers that require the
+original request to repeat start must declare `UNSUPPORTED`; that declaration
+never authorizes automatic replay. Start
 then returns a versioned operation identity and a normalized model-event stream;
 Cayu commits `provider.operation.started` for the current session, interaction,
 model step, model attempt, and run epoch before forwarding subsequent model
-output. Any failure after invoking start is treated as an ambiguous external
-outcome and disables automatic model retry. If the second commit fails or is
+output. A failure after invoking a start without proven exact idempotency is an
+`ambiguous_submission` external outcome and disables automatic model retry. If
+the second commit fails or is
 cancelled, Cayu makes one bounded cancellation attempt and preserves the
 original publication failure or cancellation, but only after exact readback
 proves the started identity absent. Once the identity is durable, later event
 fan-out failure leaves the provider operation intact for side-effect delivery
 and provider-operation recovery. A durable starting event without a started
 event is therefore explicit ambiguous-dispatch evidence, not permission to
-submit a second non-idempotent request. Cayu bounds local start and cancellation
+submit a second non-idempotent request or search provider jobs heuristically.
+Providers without the optional background-operation adapter remain on their
+existing synchronous Cayu-boundary behavior and never enter provider-operation
+recovery state. Cayu bounds local start and cancellation
 settlement before releasing run ownership; a timeout remains durable ambiguous
 or uncertain-cleanup evidence, not proof that opaque remote work stopped. Once start has been
 invoked, provider stream errors, transport loss, context overflow, and local
@@ -4217,6 +4234,49 @@ Repeated exact terminal frames converge, and competing owners are separated by
 the run-epoch and model-stage publication fences. Legacy partial output without
 recovery metadata still requires manual reconciliation.
 
+Exact provider continuation also fails closed when retrieval reports `failed`,
+`expired`, or `cancelled`; when a result is malformed or belongs to the wrong
+provider identity; or when the operation/provider API is unavailable. These
+become typed `provider_operation_unavailable` evidence. Cayu does not silently
+submit a replacement. Inspection exposes the bounded recovery reason and the
+allowed `fallback_retry` and `fail` decisions. `fallback_retry` records that
+exact continuation was unavailable, releases only the exact active stage, and
+starts a new model attempt from the last durable Cayu transcript boundary.
+Normal budget and run-limit admission remains authoritative: if it stops the
+fallback before provider dispatch, that complete typed limit interruption is
+the durable disposition outcome rather than a pending or silently retried call.
+An explicit operator interruption durably accepted before replacement dispatch
+similarly supersedes the fallback and becomes its terminal outcome.
+`fail` records the same disposition and terminalizes the original model attempt,
+interaction, and session through their normal durable failure events. Before
+either action terminalizes or admits replacement work, Cayu conservatively
+reconciles every still-active reservation from the unavailable source dispatch
+to its full reserved amount because actual provider usage is unknown. The
+pending disposition remains durable until settlement publication and the
+selected effect are both durable; retry and restart reuse the exact settlement
+identity rather than charging twice.
+
+One immutable resolution record and `provider.operation.resolved` event bind the
+decision to the stage id, expected run epoch, recovery reason, duplicate-request
+risk, operator identity, reason, and bounded metadata. An exact replay returns
+that record; a stale epoch, different action, changed metadata, or superseded
+stage is rejected. The accepting transaction also retains a pending disposition
+owner until fallback dispatch is durably staged or failure terminalization is
+durable. Incomplete-session recovery claims and finishes that exact disposition
+after process loss; it never submits the unavailable operation again. SQLite and
+PostgreSQL reconstruct the same record and pending ownership after process loss.
+`POST /api/provider-operations/resolve`, the bundled dashboard,
+and `cayu session resolve-provider-operation` are equivalent authenticated
+operator surfaces. Ambiguous submission, unavailable retrieval, malformed
+retrieval evidence, or a response bound to the wrong operation identity cannot
+prove that the original work stopped. Their `duplicate_request_risk` is true:
+the provider may still be consuming work or cost, so accepting fallback retry
+is an operator responsibility rather than a retry heuristic. Resolution reason,
+metadata values, and actor fields are workload-secret-redacted before the
+request digest, immutable operation record, event, or side-effect delivery is
+created. Secret-bearing caller-controlled metadata and actor-claim keys are
+rejected before durable acceptance.
+
 Provider-operation reconnection is distinct from Cayu boundary replay. Boundary
 replay redelivers already durable Cayu events and never proves that provider
 work is still running. Reconnection asks the provider about work identified by
@@ -4224,7 +4284,9 @@ the durable operation record. It is also distinct from provider-internal
 process restoration: Cayu does not restore an SDK client, socket, task, or
 worker process. Operator inspection reports `synchronous`,
 `provider_operation_in_progress`, `reconnect_scheduled`,
-`reconnect_in_progress`, or `provider_operation_reconciled` plus bounded
+`reconnect_in_progress`, `provider_operation_reconciled`,
+`provider_operation_unavailable`, `ambiguous_submission`, or `fallback_retry`
+plus bounded
 identity fields, cancellation status, accounting status, and reservation
 count; it never exposes the original request or private recovery metadata.
 For the active stage's bounded reservation set, inspection derives and reads

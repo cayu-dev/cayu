@@ -44,6 +44,7 @@ from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
     ProviderOperationInspectionStatus,
+    ProviderOperationUnavailableReason,
     commit_provider_operation_progress,
     inspect_provider_operation,
     load_recoverable_provider_operation,
@@ -900,7 +901,7 @@ def test_competing_partial_cursor_recovery_workers_publish_once() -> None:
     asyncio.run(scenario())
 
 
-def test_cursor_validation_failure_closes_reconnect_stream() -> None:
+def test_cursor_validation_failure_closes_stream_and_requires_resolution() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
         provider = _ClosingGapProvider()
@@ -914,16 +915,19 @@ def test_cursor_validation_failure_closes_reconnect_stream() -> None:
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        with pytest.raises(ProviderOperationEvidenceError, match="gap"):
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
-                )
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
             )
+        )
 
         assert provider.adapter.reconnect_events is not None
         assert provider.adapter.reconnect_events.closed is True
+        inspection = await inspect_provider_operation(store, session_id)
+        assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
+        assert inspection.recovery_reason is ProviderOperationUnavailableReason.MALFORMED
+        assert inspection.duplicate_request_risk
 
     asyncio.run(scenario())
 
@@ -1106,13 +1110,12 @@ def test_reconnect_adapter_cannot_mutate_runtime_owned_operation_state() -> None
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        with pytest.raises(RuntimeError, match="different operation state"):
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
-                )
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
             )
+        )
 
         assert provider.adapter.reconnect_calls[0].recovery_metadata.opaque == {
             "token": "adapter-mutated"
@@ -1123,6 +1126,9 @@ def test_reconnect_adapter_cannot_mutate_runtime_owned_operation_state() -> None
             "opaque"
         ] == {"token": "after-hel"}
         assert EventType.MODEL_COMPLETED not in {event.type for event in stored}
+        inspection = await inspect_provider_operation(store, session_id)
+        assert inspection.recovery_reason is ProviderOperationUnavailableReason.WRONG_PROVIDER
+        assert inspection.duplicate_request_risk
 
     asyncio.run(scenario())
 
@@ -1152,19 +1158,21 @@ def test_reconnect_rejects_secret_bearing_opaque_state_before_progress_commit(
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        with pytest.raises(ProviderOperationEvidenceError, match="workload secret"):
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
-                )
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
             )
+        )
 
         stored = await store.load_events(session_id)
         assert [
             event.payload["delta"] for event in stored if event.type == EventType.MODEL_TEXT_DELTA
         ] == ["hel"]
         assert secret not in repr(stored)
+        inspection = await inspect_provider_operation(store, session_id)
+        assert inspection.recovery_reason is ProviderOperationUnavailableReason.MALFORMED
+        assert inspection.duplicate_request_risk
 
     asyncio.run(scenario())
 
@@ -1227,19 +1235,21 @@ def test_reconnect_rejects_malformed_output_before_cursor_commit(event_kind: str
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        with pytest.raises(ValueError):
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
-                )
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
             )
+        )
 
         stored = await store.load_events(session_id)
         assert [
             event.payload["delta"] for event in stored if event.type == EventType.MODEL_TEXT_DELTA
         ] == ["hel"]
         assert sum("provider_operation_progress" in event.payload for event in stored) == 1
+        inspection = await inspect_provider_operation(store, session_id)
+        assert inspection.recovery_reason is ProviderOperationUnavailableReason.MALFORMED
+        assert inspection.duplicate_request_risk
 
     asyncio.run(scenario())
 

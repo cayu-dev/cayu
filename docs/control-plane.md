@@ -83,3 +83,13 @@ A completely custom frontend can consume the authenticated API without using Cay
 source. Begin with `GET /api/contract`, honor its capability projection, use the bounded list and
 detail APIs, and fail closed on an unsupported `contract_version`. Authentication,
 authorization, redaction, and capability contracts are identical regardless of frontend.
+
+Provider-operation resolution is an explicit mutation capability. When session
+state reports `provider_operation_unavailable` or `ambiguous_submission`, the
+UI must display the exact `stage_id` and `run_epoch`, recovery reason,
+`duplicate_request_risk`, and server-provided allowed resolutions. Submit only
+`fallback_retry` or `fail` to `POST /api/provider-operations/resolve`. Treat a
+409 as a stale or conflicting durable decision, never as permission to resubmit
+with a guessed provider operation id. The bundled dashboard requires an
+operator reason and warns whenever `duplicate_request_risk=true` that fallback
+can duplicate provider work and cost.

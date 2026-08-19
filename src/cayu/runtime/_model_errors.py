@@ -54,6 +54,10 @@ class _BillingIdentityResolutionCancelled(asyncio.CancelledError):
     """Internal marker carried only until a provider-free public boundary."""
 
 
+class _FallbackBillingCancellationStateCheckFailed(RuntimeError):
+    """Private signal raised after fallback provider state has been released."""
+
+
 def detach_billing_identity_cancellation(
     exc: asyncio.CancelledError,
 ) -> asyncio.CancelledError | None:

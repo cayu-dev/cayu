@@ -112,6 +112,7 @@ from cayu.runtime._model_step_executor import (
     model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._recovery_coordinator import (
+    ProviderOperationFailureRequest,
     RecoveryAbandonedTurnRequest,
     RecoveryCoordinator,
     RecoveryInterruptionRequest,
@@ -213,6 +214,7 @@ from cayu.runtime.event_watchers import (
     run_event_watcher_handler,
 )
 from cayu.runtime.execution_profiles import (
+    ActiveInvocationExecutionProfile,
     ExecutionProfileIdentity,
     ExecutionProfilePolicy,
     active_invocation_execution_profile_from_checkpoint,
@@ -221,6 +223,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
     unavailable_execution_profile_components,
 )
+from cayu.runtime.execution_units import ModelStepIdentity
 from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookPhase,
@@ -241,7 +244,10 @@ from cayu.runtime.mcp_manifest_policy import (
 )
 from cayu.runtime.provider_operations import (
     ProviderOperationRecoveryResult,
+    ProviderOperationResolutionRequest,
     RecoverableProviderOperation,
+    RecoverableProviderOperationStart,
+    copy_provider_operation_resolution_request,
 )
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
@@ -969,20 +975,14 @@ class CayuApp:
             effective_retry_policy=self._effective_retry_policy,
             run_session=self._run_recovery_session,
             emit_terminal_event_with_hooks=self._emit_recovery_terminal_event_with_hooks,
+            fail_provider_operation=self._fail_provider_operation_resolution,
             stop_session_for_limit_reached=self._stop_recovery_session_for_limit_reached,
             task_event=_recovery_task_event,
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_provider=self._get_registered_provider,
             resolve_registered_environment=self._get_registered_environment_for_session,
             validate_execution_profile_continuation=(
-                lambda session, checkpoint, registered_agent, registered_provider: (
-                    self._session_engine.validate_execution_profile_continuation(
-                        session=session,
-                        checkpoint=checkpoint,
-                        registered_agent=registered_agent,
-                        registered_provider=registered_provider,
-                    )
-                )
+                self._validate_execution_profile_continuation_for_recovery
             ),
             interrupt_session_for_recovery=self._interrupt_session_for_recovery,
             pending_session_interrupt_checkpoint=(
@@ -991,6 +991,7 @@ class CayuApp:
             abandoned_turn_completed=self._complete_abandoned_recovery_turn,
             resume_interaction=self._resume_recovery_interaction,
             recover_provider_operation=self._recover_provider_operation,
+            recover_provider_operation_start=self._recover_provider_operation_start,
             cancel_provider_operation=self._cancel_provider_operation,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
@@ -1967,18 +1968,17 @@ class CayuApp:
             )
         )
 
-    async def _recover_provider_operation(
+    def _provider_operation_completion_publisher(
         self,
+        *,
         session: Session,
-        stage: ModelCompletionStage,
-        operation: RecoverableProviderOperation,
         registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-    ) -> ProviderOperationRecoveryResult:
-        recovery_context = model_completion_recovery_context_from_stage(stage)
-        publication_context = recovery_context or ModelCompletionRecoveryContext()
-
+        publication_context: ModelCompletionRecoveryContext,
+    ) -> Callable[
+        [ModelCompletionPublicationRequest],
+        Awaitable[ModelCompletionPublicationResult],
+    ]:
         async def publish(
             publication: ModelCompletionPublicationRequest,
         ) -> ModelCompletionPublicationResult:
@@ -2013,6 +2013,26 @@ class CayuApp:
                 run_limit_accounting=publication_context.run_limit_accounting,
             )
 
+        return publish
+
+    async def _recover_provider_operation(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> ProviderOperationRecoveryResult:
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        publication_context = recovery_context or ModelCompletionRecoveryContext()
+        publish = self._provider_operation_completion_publisher(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            publication_context=publication_context,
+        )
+
         return await self._model_step_executor.recover_provider_operation(
             session=session,
             stage=stage,
@@ -2021,6 +2041,34 @@ class CayuApp:
             registered_provider=registered_provider,
             environment_name=_environment_name(registered_environment),
             recovery_context=recovery_context,
+            model_completion_publisher=publish,
+        )
+
+    async def _recover_provider_operation_start(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        start: RecoverableProviderOperationStart,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> ProviderOperationRecoveryResult:
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        publication_context = recovery_context or ModelCompletionRecoveryContext()
+        publish = self._provider_operation_completion_publisher(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            publication_context=publication_context,
+        )
+
+        return await self._model_step_executor.recover_provider_operation_start(
+            session=session,
+            stage=stage,
+            start=start,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=_environment_name(registered_environment),
             model_completion_publisher=publish,
         )
 
@@ -3589,10 +3637,34 @@ class CayuApp:
             release_run_fence_on_exit=request.release_run_fence_on_exit,
             deliver_queued_input_before_first_step=False,
             run_limit_accounting=request.run_limit_accounting,
+            initial_model_step_identity=request.initial_model_step_identity,
+            initial_model_step_number=request.initial_model_step_number,
+            preserve_failure_until_initial_provider_dispatch=(
+                request.preserve_failure_until_initial_provider_dispatch
+            ),
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
+
+    async def _validate_execution_profile_continuation_for_recovery(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        *,
+        require_open_interaction: bool = True,
+        additional_profile_fingerprints: tuple[str, ...] = (),
+    ) -> ActiveInvocationExecutionProfile:
+        return await self._session_engine.validate_execution_profile_continuation(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            require_open_interaction=require_open_interaction,
+            additional_profile_fingerprints=additional_profile_fingerprints,
+        )
 
     def _emit_recovery_terminal_event_with_hooks(
         self,
@@ -3601,6 +3673,18 @@ class CayuApp:
         return self._emit_terminal_event_with_hooks(
             event=request.event,
             phase=request.phase,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
+        )
+
+    def _fail_provider_operation_resolution(
+        self,
+        request: ProviderOperationFailureRequest,
+    ) -> AsyncIterator[Event]:
+        return self._session_engine.fail_provider_operation_resolution(
+            resolution_event=request.resolution_event,
             session=request.session,
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
@@ -3805,6 +3889,27 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    async def resolve_provider_operation(
+        self,
+        request: ProviderOperationResolutionRequest,
+    ) -> AsyncIterator[Event]:
+        """Resolve unavailable provider work by explicit fallback retry or failure."""
+
+        if type(request) is not ProviderOperationResolutionRequest:
+            raise TypeError(
+                "Runtime provider-operation resolution requires a "
+                "ProviderOperationResolutionRequest."
+            )
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = copy_provider_operation_resolution_request(
+            request,
+            session_id=session_id,
+        )
+        stream = self._recovery_coordinator.resolve_provider_operation(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
     async def _resolve_tool_approval_private(
         self,
         request: ToolApprovalRequest,
@@ -3947,6 +4052,9 @@ class CayuApp:
         release_run_fence_on_exit: bool = True,
         deliver_queued_input_before_first_step: bool = True,
         run_limit_accounting: RunLimitAccountingContext | None = None,
+        initial_model_step_identity: ModelStepIdentity | None = None,
+        initial_model_step_number: int | None = None,
+        preserve_failure_until_initial_provider_dispatch: bool = False,
     ) -> AsyncGenerator[Event, None]:
         stream = self._session_engine._run_session(
             session=session,
@@ -3973,6 +4081,11 @@ class CayuApp:
             release_run_fence_on_exit=release_run_fence_on_exit,
             deliver_queued_input_before_first_step=(deliver_queued_input_before_first_step),
             run_limit_accounting=run_limit_accounting,
+            initial_model_step_identity=initial_model_step_identity,
+            initial_model_step_number=initial_model_step_number,
+            preserve_failure_until_initial_provider_dispatch=(
+                preserve_failure_until_initial_provider_dispatch
+            ),
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

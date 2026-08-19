@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
     copy_durable_json_object,
     copy_json_value,
@@ -162,7 +163,12 @@ from cayu.runtime.invocation import (
     TaskExecutionSource,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
-from cayu.runtime.provider_operations import inspect_provider_operation
+from cayu.runtime.provider_operations import (
+    ProviderOperationResolutionAction,
+    ProviderOperationResolutionRequest,
+    copy_provider_operation_resolution_metadata,
+    inspect_provider_operation,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
@@ -1670,6 +1676,24 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
         if value is None:
             return None
         return copy_request_budget_limits(value)
+
+
+class ProviderOperationResolutionBody(_BoundedControlPlaneMetadataBody):
+    """Explicit retry-or-fail disposition for unavailable provider work."""
+
+    session_id: NonBlankString
+    stage_id: NonBlankString = Field(max_length=256)
+    expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    action: ProviderOperationResolutionAction
+    reason: NonBlankString | None = Field(default=None, max_length=4096)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: Any) -> dict[str, Any]:
+        bounded = _copy_control_plane_metadata(value)
+        return copy_provider_operation_resolution_metadata(bounded)
 
 
 class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
@@ -5321,6 +5345,50 @@ def create_router(
                 mutation_id=mutation_id,
                 mutation_kind="interrupt",
                 session_id=private_session_id,
+            ),
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
+        )
+
+    @bounded_control_plane_router.post(
+        "/provider-operations/resolve",
+        response_class=EventSourceResponse,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
+    )
+    async def resolve_provider_operation(
+        body: ProviderOperationResolutionBody,
+        http_request: Request,
+        auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
+    ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
+        if replay is not None:
+            return replay
+        session_id = await _resolve_public_session_id(body.session_id)
+        if await session_store.load_state(session_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {body.session_id}",
+            )
+        request = ProviderOperationResolutionRequest(
+            session_id=body.session_id,
+            stage_id=body.stage_id,
+            expected_run_epoch=body.expected_run_epoch,
+            action=body.action,
+            reason=body.reason,
+            metadata=body.metadata,
+            resolved_by=_request_resolution_actor(auth_context, body.resolved_by),
+        )
+        return await _accepted_event_stream_response(
+            cayu_app.resolve_provider_operation(request),
+            cayu_app=cayu_app,
+            session_id=session_id,
+            acceptance_callbacks=_mutation_acceptance_callbacks(
+                mutation_id=mutation_id,
+                mutation_kind="provider_operation.resolve",
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )

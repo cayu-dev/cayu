@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
+    copy_durable_json_object,
     require_durable_clean_nonblank,
+    require_durable_nonblank,
 )
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
     ProviderOperationRecoveryMetadata,
+    ProviderOperationStartIdempotencySupport,
     ProviderOperationState,
     ProviderOperationStatus,
     copy_model_stream_event,
@@ -25,16 +29,27 @@ from cayu.providers.operations import (
     PROVIDER_OPERATION_ID_MAX_CHARS,
     PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS,
 )
+from cayu.runtime.approvals import (
+    ResolutionActor,
+    copy_resolution_actor,
+    resolution_actor_payload,
+)
 from cayu.runtime.budgets import budget_settlement_event_id, budget_settlement_id
 from cayu.runtime.execution_units import ModelAttemptIdentity
+from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.runtime.sessions import (
     EventOrder,
     EventQuery,
     ModelCompletionStage,
+    ModelCompletionStageRelease,
     SessionOperationPublication,
+    SessionRunFenced,
+    SessionStatus,
+    SessionStatusConflict,
     SessionStore,
 )
 from cayu.runtime.usage import is_conversational_model_completion_payload
+from cayu.vaults import SecretRedactor
 
 _INSPECTION_ATTEMPT_EVENT_TYPES = (
     EventType.PROVIDER_OPERATION_STARTING,
@@ -58,6 +73,8 @@ _RECOVERY_EVENT_TYPES = frozenset(
     {
         EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
         EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
+        EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+        EventType.PROVIDER_OPERATION_RESOLVED,
         EventType.PROVIDER_OPERATION_RECONCILED,
     }
 )
@@ -80,6 +97,15 @@ _PROVIDER_OPERATION_PROGRESS_RECORD_TYPE = "cayu.provider-operation-progress"
 _PROVIDER_OPERATION_PROGRESS_SCHEMA_VERSION = 1
 _PROVIDER_OPERATION_PROGRESS_KEY_PREFIX = "cayu.provider-operation-progress:v1:"
 _PROVIDER_OPERATION_PROGRESS_PAGE_SIZE = 1000
+_PROVIDER_OPERATION_RESOLUTION_RECORD_TYPE = "cayu.provider-operation-resolution"
+_PROVIDER_OPERATION_RESOLUTION_KEY_PREFIX = "cayu.provider-operation-resolution:v1:"
+_PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY = (
+    "provider_operation_fallback_dispatch_ordinals"
+)
+_PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY = (
+    "provider_operation_pending_resolution_disposition"
+)
+PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES = 16 * 1024
 
 
 class ProviderOperationInspectionStatus(StrEnum):
@@ -88,6 +114,313 @@ class ProviderOperationInspectionStatus(StrEnum):
     RECONNECT_SCHEDULED = "reconnect_scheduled"
     RECONNECT_IN_PROGRESS = "reconnect_in_progress"
     PROVIDER_OPERATION_RECONCILED = "provider_operation_reconciled"
+    PROVIDER_OPERATION_UNAVAILABLE = "provider_operation_unavailable"
+    AMBIGUOUS_SUBMISSION = "ambiguous_submission"
+    FALLBACK_RETRY = "fallback_retry"
+
+
+class ProviderOperationUnavailableReason(StrEnum):
+    """Why exact continuation of one submitted model attempt is unavailable."""
+
+    FAILED = "failed"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+    MALFORMED = "malformed"
+    WRONG_PROVIDER = "wrong_provider"
+    UNAVAILABLE = "unavailable"
+    AMBIGUOUS_SUBMISSION = "ambiguous_submission"
+
+
+class ProviderOperationResolutionAction(StrEnum):
+    """Explicit dispositions for a provider operation Cayu cannot continue exactly."""
+
+    FALLBACK_RETRY = "fallback_retry"
+    FAIL = "fail"
+
+
+def copy_provider_operation_resolution_metadata(value: object) -> dict[str, Any]:
+    """Own and enforce the exact durable metadata ceiling for one resolution."""
+
+    copied = copy_durable_json_object(value, "metadata")
+    if (
+        len(canonical_durable_json_bytes(copied, "metadata"))
+        > PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES
+    ):
+        raise ValueError("Provider-operation resolution metadata is too large.")
+    return copied
+
+
+class ProviderOperationResolutionRequest(BaseModel):
+    """One explicit, run-epoch-fenced disposition of unavailable provider work."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    session_id: str
+    stage_id: str
+    expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    action: ProviderOperationResolutionAction
+    reason: str | None = Field(default=None, max_length=4096)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
+
+    @field_validator("session_id", "stage_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_nonblank(value, "reason")
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def validate_metadata(cls, value: object) -> dict[str, Any]:
+        return copy_provider_operation_resolution_metadata(value)
+
+    @field_validator("resolved_by")
+    @classmethod
+    def validate_resolved_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
+
+
+def copy_provider_operation_resolution_request(
+    request: ProviderOperationResolutionRequest,
+    *,
+    session_id: str | None = None,
+) -> ProviderOperationResolutionRequest:
+    """Own one public resolution request without serializing caller-owned state."""
+
+    if type(request) is not ProviderOperationResolutionRequest:
+        raise TypeError("request must be a ProviderOperationResolutionRequest.")
+    return ProviderOperationResolutionRequest(
+        session_id=request.session_id if session_id is None else session_id,
+        stage_id=request.stage_id,
+        expected_run_epoch=request.expected_run_epoch,
+        action=request.action,
+        reason=request.reason,
+        metadata=copy_provider_operation_resolution_metadata(request.metadata),
+        resolved_by=copy_resolution_actor(request.resolved_by),
+    )
+
+
+def prepare_provider_operation_resolution_request(
+    request: ProviderOperationResolutionRequest,
+    *,
+    redactor: SecretRedactor,
+    session_id: str | None = None,
+) -> ProviderOperationResolutionRequest:
+    """Own and redact one resolution before hashing or durable publication."""
+
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    copied = copy_provider_operation_resolution_request(request, session_id=session_id)
+    redactor.require_no_secret_keys(
+        copied.metadata,
+        field_name="ProviderOperationResolutionRequest.metadata",
+        match_short_substrings=True,
+    )
+    metadata = redactor.redact_json_values(copied.metadata)
+    if type(metadata) is not dict:
+        raise AssertionError("Provider-operation resolution metadata redaction failed.")
+    actor = copy_resolution_actor(copied.resolved_by)
+    if actor is not None:
+        redactor.require_no_secret_keys(
+            actor.claims,
+            field_name="ProviderOperationResolutionRequest.resolved_by.claims",
+            match_short_substrings=True,
+        )
+        claims = redactor.redact_json_values(actor.claims)
+        if type(claims) is not dict:
+            raise AssertionError("Provider-operation actor-claim redaction failed.")
+        actor = ResolutionActor(
+            subject=redactor.redact_text(actor.subject),
+            tenant=(None if actor.tenant is None else redactor.redact_text(actor.tenant)),
+            source=actor.source,
+            claims=claims,
+        )
+    return ProviderOperationResolutionRequest(
+        session_id=copied.session_id,
+        stage_id=copied.stage_id,
+        expected_run_epoch=copied.expected_run_epoch,
+        action=copied.action,
+        reason=(None if copied.reason is None else redactor.redact_text(copied.reason)),
+        metadata=metadata,
+        resolved_by=actor,
+    )
+
+
+class ProviderOperationResolutionRecord(BaseModel):
+    """Immutable audit record for one provider-operation disposition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.provider-operation-resolution"] = (
+        _PROVIDER_OPERATION_RESOLUTION_RECORD_TYPE
+    )
+    schema_version: Literal[1] = 1
+    resolution_id: str
+    session_id: str
+    stage_id: str
+    logical_step_id: str
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    preparation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_attempt_id: str
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    resolved_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    action: ProviderOperationResolutionAction
+    recovery_reason: ProviderOperationUnavailableReason
+    duplicate_request_risk: bool
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: dict[str, Any] | None = None
+    resolved_at: datetime
+    event_id: str
+    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    record_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ProviderOperationPendingDisposition(BaseModel):
+    """Durable retry ownership for one accepted provider-operation resolution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    record_type: Literal["cayu.provider-operation-resolution-disposition"] = (
+        "cayu.provider-operation-resolution-disposition"
+    )
+    schema_version: Literal[1] = 1
+    session_id: str
+    stage_id: str
+    resolution_id: str
+    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    action: ProviderOperationResolutionAction
+    resolved_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    logical_step_id: str
+    source_step: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    source_dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    target_dispatch_ordinal: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    execution_profile_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @field_validator("session_id", "stage_id", "resolution_id", "logical_step_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_target_dispatch(self) -> ProviderOperationPendingDisposition:
+        if self.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            if self.target_dispatch_ordinal != self.source_dispatch_ordinal + 1:
+                raise ValueError(
+                    "Fallback provider-operation disposition has an invalid target ordinal."
+                )
+        elif self.target_dispatch_ordinal is not None:
+            raise ValueError("Fail provider-operation disposition cannot target a dispatch.")
+        return self
+
+
+class ProviderOperationResolutionResult(BaseModel):
+    """A newly committed provider disposition or its exact replay."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record: ProviderOperationResolutionRecord
+    event: Event
+    replayed: bool
+
+
+class ProviderOperationResolutionConflict(RuntimeError):
+    """A provider operation already has a different durable disposition."""
+
+
+class _ProviderOperationResolutionReplay(RuntimeError):
+    pass
+
+
+def _provider_operation_stage_profile_fingerprint(stage: ModelCompletionStage) -> str:
+    """Return the frozen profile authority carried by one durable model stage."""
+
+    raw_recovery_context = stage.intent.get("recovery_context")
+    profile_fingerprint = (
+        None
+        if type(raw_recovery_context) is not dict
+        else raw_recovery_context.get("execution_profile_fingerprint")
+    )
+    if (
+        type(profile_fingerprint) is not str
+        or len(profile_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in profile_fingerprint)
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation stage has no execution-profile authority."
+        )
+    return profile_fingerprint
+
+
+def provider_operation_unavailable_reason(
+    status: ProviderOperationStatus,
+) -> ProviderOperationUnavailableReason | None:
+    """Map a terminal provider status to its bounded unavailable reason."""
+
+    if type(status) is not ProviderOperationStatus:
+        raise TypeError("status must be a ProviderOperationStatus.")
+    return {
+        ProviderOperationStatus.FAILED: ProviderOperationUnavailableReason.FAILED,
+        ProviderOperationStatus.EXPIRED: ProviderOperationUnavailableReason.EXPIRED,
+        ProviderOperationStatus.CANCELLED: ProviderOperationUnavailableReason.CANCELLED,
+        ProviderOperationStatus.UNAVAILABLE: ProviderOperationUnavailableReason.UNAVAILABLE,
+        ProviderOperationStatus.COMPLETED: ProviderOperationUnavailableReason.MALFORMED,
+    }.get(status)
+
+
+def provider_operation_duplicate_request_risk(
+    reason: ProviderOperationUnavailableReason,
+) -> bool:
+    """Return whether fallback may overlap provider work with an unknown outcome."""
+
+    if type(reason) is not ProviderOperationUnavailableReason:
+        raise TypeError("reason must be a ProviderOperationUnavailableReason.")
+    return reason in {
+        ProviderOperationUnavailableReason.MALFORMED,
+        ProviderOperationUnavailableReason.WRONG_PROVIDER,
+        ProviderOperationUnavailableReason.UNAVAILABLE,
+        ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION,
+    }
+
+
+def _parse_provider_operation_resolution_event(
+    event: Event,
+) -> tuple[
+    ProviderOperationResolutionAction,
+    ProviderOperationUnavailableReason,
+    str,
+]:
+    try:
+        resolution_action = ProviderOperationResolutionAction(
+            event.payload.get("resolution_action")
+        )
+        recovery_reason = ProviderOperationUnavailableReason(event.payload.get("recovery_reason"))
+        raw_resolution_id = event.payload.get("resolution_id")
+        if type(raw_resolution_id) is not str:
+            raise ValueError
+        resolution_id = require_durable_clean_nonblank(
+            raw_resolution_id,
+            "resolution_id",
+        )
+    except (TypeError, ValueError):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation resolution evidence is malformed."
+        ) from None
+    return resolution_action, recovery_reason, resolution_id
 
 
 class ProviderOperationCancellationStatus(StrEnum):
@@ -129,6 +462,13 @@ class ProviderOperationInspection(BaseModel):
         ProviderOperationAccountingStatus.NOT_APPLICABLE
     )
     reservation_count: int = Field(default=0, ge=0, le=32)
+    stage_id: str | None = Field(default=None, max_length=256)
+    run_epoch: int | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    recovery_reason: ProviderOperationUnavailableReason | None = None
+    duplicate_request_risk: bool = False
+    allowed_resolutions: tuple[ProviderOperationResolutionAction, ...] = ()
+    resolution_action: ProviderOperationResolutionAction | None = None
+    resolution_id: str | None = Field(default=None, max_length=256)
 
 
 class ProviderOperationEvidenceError(RuntimeError):
@@ -213,11 +553,28 @@ class RecoverableProviderOperation:
     accepted_stream_events: tuple[ModelStreamEvent, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class RecoverableProviderOperationStart:
+    """Durable start-only evidence bound to one active model attempt."""
+
+    interaction_id: str
+    provider: str
+    model: str
+    model_attempt_identity: ModelAttemptIdentity
+    start_id: str
+    idempotency_support: ProviderOperationStartIdempotencySupport
+    step: int
+    attempt: int
+    max_attempts: int
+    source_run_epoch: int
+
+
 class ProviderOperationRecoveryStatus(StrEnum):
     """Outcome of one fenced provider-operation retrieval attempt."""
 
     PENDING = "pending"
     RECONCILED = "reconciled"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,11 +584,15 @@ class ProviderOperationRecoveryResult:
     status: ProviderOperationRecoveryStatus
     events: tuple[Event, ...]
     completion_event: Event | None = None
+    unavailable_reason: ProviderOperationUnavailableReason | None = None
 
 
-def _model_identity(event: Event, *, label: str) -> tuple[object, ...]:
-    values = tuple(event.payload.get(field) for field in _MODEL_IDENTITY_PAYLOAD_FIELDS)
-    step, attempt, max_attempts, model_step_id, model_attempt_id = values
+def _model_identity(event: Event, *, label: str) -> tuple[str, int, int, int, str, str]:
+    step = event.payload.get("step")
+    attempt = event.payload.get("attempt")
+    max_attempts = event.payload.get("max_attempts")
+    model_step_id = event.payload.get("model_step_id")
+    model_attempt_id = event.payload.get("model_attempt_id")
     if (
         event.interaction_id is None
         or type(step) is not int
@@ -246,7 +607,14 @@ def _model_identity(event: Event, *, label: str) -> tuple[object, ...]:
         or not model_attempt_id.strip()
     ):
         raise ProviderOperationEvidenceError(f"{label} identity is malformed.")
-    return (event.interaction_id, *values)
+    return (
+        event.interaction_id,
+        step,
+        attempt,
+        max_attempts,
+        model_step_id,
+        model_attempt_id,
+    )
 
 
 def _provider_scope(event: Event, *, label: str) -> tuple[str, str]:
@@ -868,6 +1236,724 @@ async def load_recoverable_provider_operation(
     )
 
 
+async def load_recoverable_provider_operation_start(
+    session_store: SessionStore,
+    stage: ModelCompletionStage,
+) -> RecoverableProviderOperationStart | None:
+    """Load one start-only attempt as exact-recovery or ambiguous evidence."""
+
+    records = await session_store.query_events(
+        EventQuery(
+            session_id=stage.session_id,
+            event_type=EventType.PROVIDER_OPERATION_STARTING,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=_RECOVERY_EVIDENCE_LIMIT,
+        )
+    )
+    model_attempt_id = stage.intent.get("model_attempt_id")
+    matching = [
+        record.event
+        for record in records
+        if record.event.payload.get("model_step_id") == stage.logical_step_id
+        and record.event.payload.get("model_attempt_id") == model_attempt_id
+    ]
+    if not matching:
+        return None
+    if len(matching) != 1:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation start-only evidence is contradictory."
+        )
+    event = matching[0]
+    try:
+        identity = _model_identity(event, label="Provider-operation starting evidence")
+        provider, model = _provider_scope(
+            event,
+            label="Provider-operation starting evidence",
+        )
+        source_run_epoch = _provider_operation_epoch(
+            event,
+            label="Provider-operation starting evidence",
+        )
+        support = ProviderOperationStartIdempotencySupport(
+            event.payload.get("start_idempotency_support")
+        )
+        raw_start_id = event.payload.get("start_id")
+        if type(raw_start_id) is not str:
+            raise ValueError
+        start_id = require_durable_clean_nonblank(raw_start_id, "start_id")
+    except (ProviderOperationEvidenceError, TypeError, ValueError):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation starting evidence is malformed."
+        ) from None
+    replay = stage.intent.get("provider_operation_start")
+    if type(replay) is not dict:
+        raise ProviderOperationEvidenceError("Provider-operation start intent is malformed.")
+    try:
+        if (
+            replay.get("schema_version") != 1
+            or ProviderOperationStartIdempotencySupport(replay.get("idempotency_support"))
+            is not support
+            or replay.get("idempotency_key") != start_id
+            or set(replay)
+            != {
+                "schema_version",
+                "idempotency_support",
+                "idempotency_key",
+            }
+        ):
+            raise ValueError
+        request_fingerprint = stage.intent.get("request_fingerprint")
+        if (
+            type(request_fingerprint) is not str
+            or len(request_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in request_fingerprint)
+        ):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation start intent is malformed."
+        ) from None
+    interaction_id, step, attempt, max_attempts, model_step_id, parsed_attempt_id = identity
+    if (
+        interaction_id is None
+        or model_step_id != stage.logical_step_id
+        or parsed_attempt_id != model_attempt_id
+        or source_run_epoch != stage.source_run_epoch
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation starting evidence conflicts with its active stage."
+        )
+    return RecoverableProviderOperationStart(
+        interaction_id=interaction_id,
+        provider=provider,
+        model=model,
+        model_attempt_identity=ModelAttemptIdentity(
+            model_step_id=model_step_id,
+            model_attempt_id=parsed_attempt_id,
+        ),
+        start_id=start_id,
+        idempotency_support=support,
+        step=step,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        source_run_epoch=source_run_epoch,
+    )
+
+
+def provider_operation_resolution_storage_key(stage_id: str) -> str:
+    """Return the immutable disposition key for one model-completion stage."""
+
+    stage_id = require_durable_clean_nonblank(stage_id, "stage_id")
+    return _PROVIDER_OPERATION_RESOLUTION_KEY_PREFIX + sha256(stage_id.encode()).hexdigest()
+
+
+def provider_operation_started_event_id(start_id: str) -> str:
+    """Return one stable operation-identity publication event id per start key."""
+
+    start_id = require_durable_clean_nonblank(start_id, "start_id")
+    return f"provider-operation-started:v1:{sha256(start_id.encode()).hexdigest()}"
+
+
+def provider_operation_resolution_outcome_event_id(
+    resolution_id: str,
+    outcome: Literal["model_error", "interaction_failed", "session_failed"],
+) -> str:
+    """Return one stable event identity for fail-resolution terminalization."""
+
+    resolution_id = require_durable_clean_nonblank(resolution_id, "resolution_id")
+    return f"{resolution_id}:{outcome}"
+
+
+def validate_provider_operation_resolution_outcome_event(
+    event: Event,
+    *,
+    resolution_event: Event,
+    outcome: Literal["model_error", "interaction_failed", "session_failed"],
+) -> None:
+    """Require exact durable evidence for one explicit-failure outcome."""
+
+    if resolution_event.type != EventType.PROVIDER_OPERATION_RESOLVED:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation failure outcome has no resolution authority."
+        )
+    resolution_id = resolution_event.payload.get("resolution_id")
+    if type(resolution_id) is not str:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation failure outcome has malformed resolution authority."
+        )
+    expected_type = {
+        "model_error": EventType.MODEL_ERROR,
+        "interaction_failed": EventType.INTERACTION_FAILED,
+        "session_failed": EventType.SESSION_FAILED,
+    }[outcome]
+    expected_interaction_id = (
+        None if outcome == "session_failed" else resolution_event.interaction_id
+    )
+    if (
+        event.id != provider_operation_resolution_outcome_event_id(resolution_id, outcome)
+        or event.type != expected_type
+        or event.session_id != resolution_event.session_id
+        or event.interaction_id != expected_interaction_id
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation failure outcome has contradictory event identity."
+        )
+
+    if outcome == "interaction_failed":
+        try:
+            evidence = InteractionSummaryEvidence.model_validate(event.payload)
+        except (TypeError, ValueError):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation interaction failure evidence is malformed."
+            ) from None
+        if evidence.status is not InteractionStatus.FAILED:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation interaction failure has contradictory status."
+            )
+        return
+
+    for field in (
+        "provider",
+        "model",
+        "step",
+        "attempt",
+        "max_attempts",
+        "model_step_id",
+        "model_attempt_id",
+        "source_run_epoch",
+        "run_epoch",
+        "stage_id",
+        "resolution_id",
+        "resolution_action",
+        "recovery_reason",
+        "duplicate_request_risk",
+        "reason",
+        "metadata",
+        "resolved_by",
+    ):
+        if (
+            field not in event.payload
+            or field not in resolution_event.payload
+            or event.payload[field] != resolution_event.payload[field]
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation failure outcome conflicts with its resolution."
+            )
+    if outcome == "model_error" and (
+        event.payload.get("error_type") != "provider_operation_unavailable"
+        or event.payload.get("stage") != "provider_operation_recovery"
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation model failure has contradictory classification."
+        )
+    if outcome == "session_failed" and (
+        event.payload.get("failure_type") != "provider_operation_unavailable"
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation session failure has contradictory classification."
+        )
+
+
+def provider_operation_resolution_request_digest(
+    request: ProviderOperationResolutionRequest,
+) -> str:
+    """Bind the exact audit-bearing operator request, excluding authorization claims."""
+
+    if type(request) is not ProviderOperationResolutionRequest:
+        raise TypeError("request must be a ProviderOperationResolutionRequest.")
+    material = request.model_dump(mode="json", exclude={"resolved_by"})
+    material["resolved_by"] = resolution_actor_payload(request.resolved_by)
+    return sha256(
+        canonical_durable_json_bytes(material, "provider_operation_resolution_request")
+    ).hexdigest()
+
+
+def fallback_dispatch_ordinal_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    logical_step_id: str,
+) -> int:
+    """Return the durable next ordinal authorized by prior explicit fallback decisions."""
+
+    logical_step_id = require_durable_clean_nonblank(logical_step_id, "logical_step_id")
+    if checkpoint is None:
+        return 0
+    raw = checkpoint.get(_PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY)
+    if raw is None:
+        return 0
+    if type(raw) is not dict:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation fallback ordinal evidence is malformed."
+        )
+    value = raw.get(logical_step_id, 0)
+    if type(value) is not int or not 0 <= value <= MAX_DURABLE_JSON_INTEGER:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation fallback ordinal evidence is malformed."
+        )
+    return value
+
+
+def _resolution_record_digest(payload: dict[str, Any]) -> str:
+    material = {key: value for key, value in payload.items() if key != "record_digest"}
+    return sha256(
+        canonical_durable_json_bytes(material, "provider_operation_resolution_record")
+    ).hexdigest()
+
+
+def _parse_provider_operation_resolution_record(
+    raw: object,
+    *,
+    session_id: str,
+    stage_id: str,
+) -> ProviderOperationResolutionRecord:
+    try:
+        record = ProviderOperationResolutionRecord.model_validate(raw)
+    except (TypeError, ValueError):
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation resolution evidence is malformed."
+        ) from None
+    if record.session_id != session_id or record.stage_id != stage_id:
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation resolution belongs to another stage."
+        )
+    if record.record_digest != _resolution_record_digest(record.model_dump(mode="json")):
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation resolution digest is invalid."
+        )
+    return record
+
+
+async def _load_provider_operation_resolution_event(
+    session_store: SessionStore,
+    record: ProviderOperationResolutionRecord,
+) -> Event:
+    records = await session_store.query_events(
+        EventQuery(session_id=record.session_id, event_id=record.event_id, limit=2)
+    )
+    if len(records) != 1:
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation resolution event is missing or duplicated."
+        )
+    event = records[0].event
+    if (
+        event.type != EventType.PROVIDER_OPERATION_RESOLVED
+        or event.id != record.event_id
+        or event.session_id != record.session_id
+        or any(
+            field not in event.payload
+            for field in (
+                "resolution_id",
+                "stage_id",
+                "model_step_id",
+                "model_attempt_id",
+                "source_run_epoch",
+                "run_epoch",
+                "resolution_action",
+                "recovery_reason",
+                "duplicate_request_risk",
+                "reason",
+                "metadata",
+                "resolved_by",
+            )
+        )
+        or event.payload.get("resolution_id") != record.resolution_id
+        or event.payload.get("stage_id") != record.stage_id
+        or event.payload.get("model_step_id") != record.logical_step_id
+        or event.payload.get("model_attempt_id") != record.model_attempt_id
+        or event.payload.get("source_run_epoch") != record.source_run_epoch
+        or event.payload.get("run_epoch") != record.resolved_run_epoch
+        or event.payload.get("resolution_action") != record.action.value
+        or event.payload.get("recovery_reason") != record.recovery_reason.value
+        or event.payload.get("duplicate_request_risk") != record.duplicate_request_risk
+        or event.payload.get("reason") != record.reason
+        or event.payload.get("metadata") != record.metadata
+        or event.payload.get("resolved_by") != record.resolved_by
+        or event.timestamp != record.resolved_at
+    ):
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation resolution event conflicts with its record."
+        )
+    return event
+
+
+async def load_provider_operation_resolution(
+    session_store: SessionStore,
+    session_id: str,
+    stage_id: str,
+) -> ProviderOperationResolutionResult | None:
+    """Load and verify one immutable provider-operation disposition."""
+
+    storage_key = provider_operation_resolution_storage_key(stage_id)
+    raw = await session_store.load_session_operation(session_id, storage_key)
+    if raw is None:
+        return None
+    record = _parse_provider_operation_resolution_record(
+        raw,
+        session_id=session_id,
+        stage_id=stage_id,
+    )
+    event = await _load_provider_operation_resolution_event(session_store, record)
+    return ProviderOperationResolutionResult(record=record, event=event, replayed=True)
+
+
+def pending_provider_operation_disposition_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> ProviderOperationPendingDisposition | None:
+    """Reconstruct the exact accepted disposition still owned by recovery."""
+
+    if checkpoint is None:
+        return None
+    raw = checkpoint.get(_PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY)
+    if raw is None:
+        return None
+    try:
+        return ProviderOperationPendingDisposition.model_validate(raw)
+    except (TypeError, ValueError):
+        raise ProviderOperationEvidenceError(
+            "Pending provider-operation disposition evidence is malformed."
+        ) from None
+
+
+async def load_pending_provider_operation_disposition(
+    session_store: SessionStore,
+    session_id: str,
+    *,
+    checkpoint: dict[str, Any] | None = None,
+) -> tuple[ProviderOperationPendingDisposition, ProviderOperationResolutionResult] | None:
+    """Load and cross-check pending retry ownership with immutable resolution evidence."""
+
+    session_id = require_durable_clean_nonblank(session_id, "session_id")
+    if checkpoint is None:
+        checkpoint = await session_store.load_checkpoint(session_id)
+    pending = pending_provider_operation_disposition_from_checkpoint(checkpoint)
+    if pending is None:
+        return None
+    if pending.session_id != session_id:
+        raise ProviderOperationEvidenceError(
+            "Pending provider-operation disposition belongs to another session."
+        )
+    resolution = await load_provider_operation_resolution(
+        session_store,
+        session_id,
+        pending.stage_id,
+    )
+    if resolution is None:
+        raise ProviderOperationEvidenceError(
+            "Pending provider-operation disposition has no immutable resolution record."
+        )
+    record = resolution.record
+    if (
+        record.resolution_id != pending.resolution_id
+        or record.request_digest != pending.request_digest
+        or record.action is not pending.action
+        or record.resolved_run_epoch != pending.resolved_run_epoch
+        or record.logical_step_id != pending.logical_step_id
+        or record.dispatch_ordinal != pending.source_dispatch_ordinal
+        or resolution.event.payload.get("step") != pending.source_step
+    ):
+        raise ProviderOperationEvidenceError(
+            "Pending provider-operation disposition conflicts with its resolution record."
+        )
+    stage = await session_store.load_model_completion_stage(session_id, pending.stage_id)
+    if stage is None:
+        raise ProviderOperationEvidenceError(
+            "Pending provider-operation disposition has no source stage."
+        )
+    model_attempt_id = stage.intent.get("model_attempt_id")
+    if (
+        stage.session_id != record.session_id
+        or stage.stage_id != record.stage_id
+        or stage.logical_step_id != record.logical_step_id
+        or stage.dispatch_ordinal != record.dispatch_ordinal
+        or stage.preparation_digest != record.preparation_digest
+        or model_attempt_id != record.model_attempt_id
+        or stage.source_run_epoch != record.source_run_epoch
+        or _provider_operation_stage_profile_fingerprint(stage)
+        != pending.execution_profile_fingerprint
+    ):
+        raise ProviderOperationEvidenceError(
+            "Pending provider-operation disposition conflicts with its source stage."
+        )
+    return pending, resolution
+
+
+async def clear_pending_provider_operation_disposition(
+    session_store: SessionStore,
+    pending: ProviderOperationPendingDisposition,
+) -> None:
+    """Retire exact disposition ownership after its durable effect is reconstructable."""
+
+    if type(pending) is not ProviderOperationPendingDisposition:
+        raise TypeError("pending must be a ProviderOperationPendingDisposition.")
+
+    def clear_marker(
+        _session,
+        checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        current = pending_provider_operation_disposition_from_checkpoint(checkpoint)
+        if current is None:
+            return checkpoint
+        if current != pending:
+            raise ProviderOperationResolutionConflict(
+                "Provider-operation disposition ownership changed before completion."
+            )
+        updated = copy_durable_json_object(checkpoint, "checkpoint")
+        updated.pop(_PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY)
+        return updated
+
+    await session_store.transform_checkpoint(pending.session_id, clear_marker)
+
+
+async def resolve_provider_operation_stage(
+    session_store: SessionStore,
+    request: ProviderOperationResolutionRequest,
+    *,
+    redactor: SecretRedactor,
+) -> ProviderOperationResolutionResult:
+    """Atomically record one disposition and release only its exact active stage."""
+
+    if type(request) is not ProviderOperationResolutionRequest:
+        raise TypeError("request must be a ProviderOperationResolutionRequest.")
+    request = prepare_provider_operation_resolution_request(request, redactor=redactor)
+    request_digest = provider_operation_resolution_request_digest(request)
+    existing = await load_provider_operation_resolution(
+        session_store,
+        request.session_id,
+        request.stage_id,
+    )
+    if existing is not None:
+        if existing.record.request_digest != request_digest:
+            raise ProviderOperationResolutionConflict(
+                "Provider operation was already resolved by a conflicting request."
+            )
+        return existing
+
+    session = await session_store.load(request.session_id)
+    if session is None:
+        raise KeyError(f"Session not found: {request.session_id}")
+    if session.run_epoch != request.expected_run_epoch:
+        raise SessionRunFenced(
+            "Provider-operation resolution run epoch is stale: expected "
+            f"{request.expected_run_epoch}, current {session.run_epoch}."
+        )
+    if session.status is not SessionStatus.INTERRUPTED:
+        raise SessionStatusConflict(
+            "A new provider-operation resolution requires an interrupted session."
+        )
+    active = await session_store.load_active_model_completion_stage(request.session_id)
+    if active is None or active.stage.stage_id != request.stage_id:
+        raise ProviderOperationResolutionConflict(
+            "The requested provider-operation stage is no longer active."
+        )
+    stage = active.stage
+    if stage.state != "in_flight":
+        raise ProviderOperationResolutionConflict(
+            "A completed model-completion stage cannot be resolved as unavailable."
+        )
+    try:
+        profile_fingerprint = _provider_operation_stage_profile_fingerprint(stage)
+    except ProviderOperationEvidenceError as exc:
+        raise ProviderOperationResolutionConflict(str(exc)) from None
+    inspection = await inspect_provider_operation(session_store, request.session_id)
+    if (
+        inspection.status
+        not in {
+            ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE,
+            ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION,
+        }
+        or inspection.recovery_reason is None
+        or request.action not in inspection.allowed_resolutions
+    ):
+        raise ProviderOperationResolutionConflict(
+            "The provider operation does not currently require this resolution."
+        )
+    model_attempt_id = stage.intent.get("model_attempt_id")
+    if type(model_attempt_id) is not str or not model_attempt_id.strip():
+        raise ProviderOperationResolutionConflict(
+            "The active model-completion stage has no model-attempt identity."
+        )
+    model_records = await session_store.query_events(
+        EventQuery(
+            session_id=request.session_id,
+            event_type=EventType.MODEL_STARTED,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    if not model_records:
+        raise ProviderOperationResolutionConflict(
+            "The active model-completion stage has no model-started evidence."
+        )
+    model_event = model_records[0].event
+    model_identity = _model_identity(model_event, label="Provider resolution model evidence")
+    if model_identity[-2:] != (stage.logical_step_id, model_attempt_id):
+        raise ProviderOperationResolutionConflict(
+            "The latest model-attempt evidence belongs to another stage."
+        )
+    resolved_at = datetime.now(UTC)
+    resolution_material = canonical_durable_json_bytes(
+        {"schema_version": 1, "session_id": request.session_id, "stage_id": stage.stage_id},
+        "provider_operation_resolution_identity",
+    )
+    resolution_hash = sha256(resolution_material).hexdigest()
+    resolution_id = f"provider-resolution:v1:{resolution_hash}"
+    event_id = f"provider-resolution-event:v1:{resolution_hash}"
+    step, attempt, max_attempts = model_identity[1:4]
+    event_payload: dict[str, Any] = {
+        "provider": inspection.provider,
+        "model": stage.intent.get("requested_model"),
+        "step": step,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "model_step_id": stage.logical_step_id,
+        "model_attempt_id": model_attempt_id,
+        "source_run_epoch": stage.source_run_epoch,
+        "run_epoch": request.expected_run_epoch,
+        "stage_id": stage.stage_id,
+        "resolution_id": resolution_id,
+        "resolution_action": request.action.value,
+        "recovery_reason": inspection.recovery_reason.value,
+        "duplicate_request_risk": inspection.duplicate_request_risk,
+        "reason": request.reason,
+        "metadata": request.metadata,
+        "resolved_by": resolution_actor_payload(request.resolved_by),
+    }
+    if inspection.operation_id is not None:
+        event_payload["operation_id"] = inspection.operation_id
+    if inspection.stream_protocol is not None:
+        event_payload["stream_protocol"] = inspection.stream_protocol
+    resolution_event = Event(
+        id=event_id,
+        type=EventType.PROVIDER_OPERATION_RESOLVED,
+        session_id=request.session_id,
+        interaction_id=model_event.interaction_id,
+        agent_name=model_event.agent_name,
+        environment_name=model_event.environment_name,
+        timestamp=resolved_at,
+        payload=event_payload,
+    )
+    private_fields = tuple(
+        field for field in ("operation_id", "stream_protocol") if field in event_payload
+    )
+    if private_fields:
+        resolution_event = event_with_runtime_payload_authority(
+            resolution_event,
+            *private_fields,
+        )
+    record_payload = {
+        "record_type": _PROVIDER_OPERATION_RESOLUTION_RECORD_TYPE,
+        "schema_version": 1,
+        "resolution_id": resolution_id,
+        "session_id": request.session_id,
+        "stage_id": stage.stage_id,
+        "logical_step_id": stage.logical_step_id,
+        "dispatch_ordinal": stage.dispatch_ordinal,
+        "preparation_digest": stage.preparation_digest,
+        "model_attempt_id": model_attempt_id,
+        "source_run_epoch": stage.source_run_epoch,
+        "resolved_run_epoch": request.expected_run_epoch,
+        "action": request.action.value,
+        "recovery_reason": inspection.recovery_reason.value,
+        "duplicate_request_risk": inspection.duplicate_request_risk,
+        "reason": request.reason,
+        "metadata": request.metadata,
+        "resolved_by": resolution_actor_payload(request.resolved_by),
+        "resolved_at": resolved_at.isoformat().replace("+00:00", "Z"),
+        "event_id": event_id,
+        "request_digest": request_digest,
+    }
+    record_payload["record_digest"] = _resolution_record_digest(record_payload)
+    record = ProviderOperationResolutionRecord.model_validate(record_payload)
+    pending_disposition = ProviderOperationPendingDisposition(
+        session_id=request.session_id,
+        stage_id=stage.stage_id,
+        resolution_id=resolution_id,
+        request_digest=request_digest,
+        action=request.action,
+        resolved_run_epoch=request.expected_run_epoch,
+        logical_step_id=stage.logical_step_id,
+        source_step=step,
+        source_dispatch_ordinal=stage.dispatch_ordinal,
+        target_dispatch_ordinal=(
+            stage.dispatch_ordinal + 1
+            if request.action is ProviderOperationResolutionAction.FALLBACK_RETRY
+            else None
+        ),
+        execution_profile_fingerprint=profile_fingerprint,
+    )
+    storage_key = provider_operation_resolution_storage_key(stage.stage_id)
+
+    def transform(_session, checkpoint, current_record):
+        if current_record is not None:
+            current = _parse_provider_operation_resolution_record(
+                current_record,
+                session_id=request.session_id,
+                stage_id=request.stage_id,
+            )
+            if current.request_digest != request_digest:
+                raise ProviderOperationResolutionConflict(
+                    "Provider operation was already resolved by a conflicting request."
+                )
+            raise _ProviderOperationResolutionReplay
+        updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+        current_pending = pending_provider_operation_disposition_from_checkpoint(updated)
+        if current_pending is not None and current_pending != pending_disposition:
+            raise ProviderOperationResolutionConflict(
+                "Another provider-operation disposition is still pending."
+            )
+        if request.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            raw_ordinals = updated.get(_PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY, {})
+            if type(raw_ordinals) is not dict:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation fallback ordinal evidence is malformed."
+                )
+            ordinals = copy_durable_json_object(raw_ordinals, "fallback_dispatch_ordinals")
+            current_ordinal = ordinals.get(stage.logical_step_id, 0)
+            if current_ordinal != stage.dispatch_ordinal:
+                raise ProviderOperationResolutionConflict(
+                    "Provider-operation fallback advanced from a stale dispatch ordinal."
+                )
+            ordinals[stage.logical_step_id] = stage.dispatch_ordinal + 1
+            updated[_PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY] = ordinals
+        updated[_PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY] = (
+            pending_disposition.model_dump(mode="json")
+        )
+        return SessionOperationPublication(
+            checkpoint=updated,
+            operation_records={storage_key: record.model_dump(mode="json")},
+            model_completion_stage_release=ModelCompletionStageRelease(
+                stage_id=stage.stage_id,
+                preparation_digest=stage.preparation_digest,
+            ),
+        )
+
+    try:
+        await session_store.publish_session_operation(
+            request.session_id,
+            idempotency_key=storage_key,
+            operation_transform=transform,
+            events=[resolution_event],
+            expected_statuses={SessionStatus.INTERRUPTED},
+            expected_run_epoch=request.expected_run_epoch,
+            expected_transcript_cursor=stage.source_transcript_cursor,
+        )
+    except _ProviderOperationResolutionReplay:
+        replayed = await load_provider_operation_resolution(
+            session_store,
+            request.session_id,
+            request.stage_id,
+        )
+        if replayed is None:
+            raise ProviderOperationResolutionConflict(
+                "Provider-operation resolution replay lost its durable record."
+            ) from None
+        return replayed
+    return ProviderOperationResolutionResult(
+        record=record,
+        event=resolution_event,
+        replayed=False,
+    )
+
+
 async def inspect_provider_operation(
     session_store: SessionStore,
     session_id: str,
@@ -893,6 +1979,22 @@ async def inspect_provider_operation(
         started_record.event,
         label="Latest model-attempt evidence",
     )
+    active_stage = await session_store.load_active_model_completion_stage(session_id)
+    resolution_stage_id: str | None = None
+    resolution_run_epoch: int | None = None
+    if active_stage is not None:
+        active_attempt_id = active_stage.stage.intent.get("model_attempt_id")
+        if (
+            active_stage.stage.logical_step_id == current_identity[-2]
+            and active_attempt_id == current_identity[-1]
+        ):
+            session = await session_store.load(session_id)
+            if session is None:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation active stage has no owning session."
+                )
+            resolution_stage_id = active_stage.stage.stage_id
+            resolution_run_epoch = session.run_epoch
     attempt_records = await session_store.query_events(
         EventQuery(
             session_id=session_id,
@@ -996,7 +2098,15 @@ async def inspect_provider_operation(
         and _model_identity(event, label="Model completion evidence") == current_identity
         for event in owning_events
     )
-    if recovery_events and not operation_events:
+    if (
+        recovery_events
+        and not operation_events
+        and recovery_events[0].type
+        not in {
+            EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+            EventType.PROVIDER_OPERATION_RESOLVED,
+        }
+    ):
         raise ProviderOperationEvidenceError(
             "Provider-operation recovery evidence has no durable operation identity."
         )
@@ -1006,7 +2116,7 @@ async def inspect_provider_operation(
         )
     if not operation_events and not starting_events:
         return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
-    parsed_starting: list[tuple[str, str]] = []
+    parsed_starting: list[tuple[str, str, ProviderOperationStartIdempotencySupport]] = []
     for starting_event in starting_events:
         try:
             raw_provider = starting_event.payload.get("provider")
@@ -1023,11 +2133,17 @@ async def inspect_provider_operation(
             )
             if len(provider) > 256 or len(start_id) > 1024:
                 raise ValueError
+            start_idempotency_support = ProviderOperationStartIdempotencySupport(
+                starting_event.payload.get(
+                    "start_idempotency_support",
+                    ProviderOperationStartIdempotencySupport.UNSUPPORTED.value,
+                )
+            )
         except (TypeError, ValueError):
             raise ProviderOperationEvidenceError(
                 "Provider-operation starting evidence is malformed."
             ) from None
-        parsed_starting.append((provider, start_id))
+        parsed_starting.append((provider, start_id, start_idempotency_support))
     if parsed_starting and any(
         candidate != parsed_starting[0] for candidate in parsed_starting[1:]
     ):
@@ -1035,10 +2151,56 @@ async def inspect_provider_operation(
             "Provider-operation starting evidence is contradictory for the latest model attempt."
         )
     if not operation_events:
-        provider, _start_id = parsed_starting[0]
+        provider, _start_id, _start_support = parsed_starting[0]
+        if recovery_events and recovery_events[0].type == EventType.PROVIDER_OPERATION_RESOLVED:
+            latest_resolution = recovery_events[0]
+            resolution_action, recovery_reason, resolution_id = (
+                _parse_provider_operation_resolution_event(latest_resolution)
+            )
+            return ProviderOperationInspection(
+                status=(
+                    ProviderOperationInspectionStatus.FALLBACK_RETRY
+                    if resolution_action is ProviderOperationResolutionAction.FALLBACK_RETRY
+                    else ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION
+                ),
+                provider=provider,
+                recovery_reason=recovery_reason,
+                duplicate_request_risk=True,
+                resolution_action=resolution_action,
+                resolution_id=resolution_id,
+            )
+        recovery_reason = ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION
+        status = ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION
+        if recovery_events:
+            latest_recovery = recovery_events[0]
+            if latest_recovery.type is not EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
+                raise ProviderOperationEvidenceError(
+                    "Start-only provider-operation recovery evidence is malformed."
+                )
+            try:
+                recovery_reason = ProviderOperationUnavailableReason(
+                    latest_recovery.payload.get("recovery_reason")
+                )
+            except ValueError:
+                raise ProviderOperationEvidenceError(
+                    "Start-only provider-operation recovery reason is malformed."
+                ) from None
+            status = (
+                ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION
+                if recovery_reason is ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION
+                else ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
+            )
         return ProviderOperationInspection(
-            status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS,
+            status=status,
             provider=provider,
+            recovery_reason=recovery_reason,
+            duplicate_request_risk=True,
+            allowed_resolutions=(
+                ProviderOperationResolutionAction.FALLBACK_RETRY,
+                ProviderOperationResolutionAction.FAIL,
+            ),
+            stage_id=resolution_stage_id,
+            run_epoch=resolution_run_epoch,
         )
     parsed_evidence: list[tuple[ProviderOperationState, ProviderOperationStatus, str, str]] = []
     for operation_event in operation_events:
@@ -1071,7 +2233,7 @@ async def inspect_provider_operation(
         raise ProviderOperationEvidenceError(
             "Provider-operation evidence is contradictory for the latest model attempt."
         )
-    if parsed_starting and parsed_starting[0] != (provider, start_id):
+    if parsed_starting and parsed_starting[0][:2] != (provider, start_id):
         raise ProviderOperationEvidenceError(
             "Provider-operation starting and started evidence is contradictory for the latest "
             "model attempt."
@@ -1116,7 +2278,6 @@ async def inspect_provider_operation(
             raise ProviderOperationEvidenceError(
                 "Provider-operation cancellation status conflicts with its event type."
             )
-    active_stage = await session_store.load_active_model_completion_stage(session_id)
     reservation_ids: tuple[str, ...] = ()
     if active_stage is not None:
         active_attempt_id = active_stage.stage.intent.get("model_attempt_id")
@@ -1170,19 +2331,64 @@ async def inspect_provider_operation(
                     "Provider-operation accounting evidence exceeds its bounded reservation set."
                 )
             accounting_status = ProviderOperationAccountingStatus.SETTLED
-    inspection_fields = {
-        "cancellation_status": cancellation_status,
-        "accounting_status": accounting_status,
-        "reservation_count": reservation_count,
-    }
     latest_recovery_type = recovery_events[0].type if recovery_events else None
+    if latest_recovery_type == EventType.PROVIDER_OPERATION_RESOLVED:
+        latest_resolution = recovery_events[0]
+        resolution_action, recovery_reason, resolution_id = (
+            _parse_provider_operation_resolution_event(latest_resolution)
+        )
+        return ProviderOperationInspection(
+            status=(
+                ProviderOperationInspectionStatus.FALLBACK_RETRY
+                if resolution_action is ProviderOperationResolutionAction.FALLBACK_RETRY
+                else ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
+            ),
+            provider=provider,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+            recovery_reason=recovery_reason,
+            duplicate_request_risk=bool(latest_resolution.payload.get("duplicate_request_risk")),
+            resolution_action=resolution_action,
+            resolution_id=resolution_id,
+            cancellation_status=cancellation_status,
+            accounting_status=accounting_status,
+            reservation_count=reservation_count,
+        )
+    if latest_recovery_type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
+        try:
+            recovery_reason = ProviderOperationUnavailableReason(
+                recovery_events[0].payload.get("recovery_reason")
+            )
+        except ValueError:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation recovery evidence has an invalid reason."
+            ) from None
+        return ProviderOperationInspection(
+            status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE,
+            provider=provider,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+            recovery_reason=recovery_reason,
+            duplicate_request_risk=provider_operation_duplicate_request_risk(recovery_reason),
+            allowed_resolutions=(
+                ProviderOperationResolutionAction.FALLBACK_RETRY,
+                ProviderOperationResolutionAction.FAIL,
+            ),
+            stage_id=resolution_stage_id,
+            run_epoch=resolution_run_epoch,
+            cancellation_status=cancellation_status,
+            accounting_status=accounting_status,
+            reservation_count=reservation_count,
+        )
     if terminal_seen or latest_recovery_type == EventType.PROVIDER_OPERATION_RECONCILED:
         return ProviderOperationInspection(
             status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED,
             provider=provider,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
-            **inspection_fields,
+            cancellation_status=cancellation_status,
+            accounting_status=accounting_status,
+            reservation_count=reservation_count,
         )
     if latest_recovery_type == EventType.PROVIDER_OPERATION_RECONNECT_STARTED:
         return ProviderOperationInspection(
@@ -1190,7 +2396,9 @@ async def inspect_provider_operation(
             provider=provider,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
-            **inspection_fields,
+            cancellation_status=cancellation_status,
+            accounting_status=accounting_status,
+            reservation_count=reservation_count,
         )
     if latest_recovery_type == EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED:
         return ProviderOperationInspection(
@@ -1198,28 +2406,76 @@ async def inspect_provider_operation(
             provider=provider,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
-            **inspection_fields,
+            cancellation_status=cancellation_status,
+            accounting_status=accounting_status,
+            reservation_count=reservation_count,
         )
     if status.terminal:
-        return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
+        recovery_reason = provider_operation_unavailable_reason(status)
+        if recovery_reason is None:
+            raise ProviderOperationEvidenceError(
+                "Provider operation has terminal status without completion evidence."
+            )
+        return ProviderOperationInspection(
+            status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE,
+            provider=provider,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+            recovery_reason=recovery_reason,
+            duplicate_request_risk=provider_operation_duplicate_request_risk(recovery_reason),
+            allowed_resolutions=(
+                ProviderOperationResolutionAction.FALLBACK_RETRY,
+                ProviderOperationResolutionAction.FAIL,
+            ),
+            stage_id=resolution_stage_id,
+            run_epoch=resolution_run_epoch,
+            cancellation_status=cancellation_status,
+            accounting_status=accounting_status,
+            reservation_count=reservation_count,
+        )
     return ProviderOperationInspection(
         status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS,
         provider=provider,
         operation_id=state.operation_id,
         stream_protocol=state.stream_protocol,
-        **inspection_fields,
+        cancellation_status=cancellation_status,
+        accounting_status=accounting_status,
+        reservation_count=reservation_count,
     )
 
 
 __all__ = [
+    "PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES",
     "ProviderOperationAccountingStatus",
     "ProviderOperationCancellationStatus",
     "ProviderOperationEvidenceError",
     "ProviderOperationInspection",
     "ProviderOperationInspectionStatus",
+    "ProviderOperationPendingDisposition",
     "ProviderOperationRecoveryResult",
     "ProviderOperationRecoveryStatus",
+    "ProviderOperationResolutionAction",
+    "ProviderOperationResolutionConflict",
+    "ProviderOperationResolutionRecord",
+    "ProviderOperationResolutionRequest",
+    "ProviderOperationResolutionResult",
+    "ProviderOperationUnavailableReason",
     "RecoverableProviderOperation",
+    "RecoverableProviderOperationStart",
+    "clear_pending_provider_operation_disposition",
+    "copy_provider_operation_resolution_metadata",
+    "copy_provider_operation_resolution_request",
     "inspect_provider_operation",
+    "load_pending_provider_operation_disposition",
+    "load_provider_operation_resolution",
     "load_recoverable_provider_operation",
+    "load_recoverable_provider_operation_start",
+    "pending_provider_operation_disposition_from_checkpoint",
+    "prepare_provider_operation_resolution_request",
+    "provider_operation_duplicate_request_risk",
+    "provider_operation_resolution_request_digest",
+    "provider_operation_resolution_storage_key",
+    "provider_operation_unavailable_reason",
+    "resolve_provider_operation_stage",
+    "validate_provider_operation_resolution_outcome_event",
 ]

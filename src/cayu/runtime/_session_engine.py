@@ -149,6 +149,7 @@ from cayu.runtime._interruption_coordinator import (
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._model_errors import (
+    _FallbackBillingCancellationStateCheckFailed,
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
 )
@@ -162,9 +163,11 @@ from cayu.runtime._model_step_executor import (
     ModelStepFlowOutcome,
     ModelStepLimitEvaluationRequest,
     _detach_model_request,
+    _event_with_model_identity_authority,
     _model_request_messages,
     _model_request_tools,
     _session_agent_spec,
+    is_ambiguous_provider_operation_start_error,
     model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._recovery_coordinator import (
@@ -354,6 +357,16 @@ from cayu.runtime.model_steps import (
     StepClassification,
     classify_assistant_step,
     completion_requests_follow_up,
+)
+from cayu.runtime.provider_operations import (
+    _PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY,
+    _PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY,
+    ProviderOperationEvidenceError,
+    ProviderOperationInspectionStatus,
+    inspect_provider_operation,
+    pending_provider_operation_disposition_from_checkpoint,
+    provider_operation_resolution_outcome_event_id,
+    validate_provider_operation_resolution_outcome_event,
 )
 from cayu.runtime.request_footprints import (
     PromptContributionManifest,
@@ -2131,6 +2144,16 @@ def _archive_inactive_session_operation_records(
     return archived
 
 
+def _reject_pending_provider_operation_disposition(
+    checkpoint: dict[str, Any] | None,
+) -> None:
+    if pending_provider_operation_disposition_from_checkpoint(checkpoint) is not None:
+        raise RuntimeError(
+            "Session has an accepted provider-operation resolution pending. "
+            "Recover that disposition before starting other session work."
+        )
+
+
 def _reject_unresumable_session_checkpoint(
     session: Session,
     checkpoint: dict[str, Any] | None,
@@ -2139,6 +2162,7 @@ def _reject_unresumable_session_checkpoint(
     allow_active_operation: bool = False,
 ) -> None:
     _reject_prepared_prompt_transition_intent(checkpoint)
+    _reject_pending_provider_operation_disposition(checkpoint)
     if _initial_transcript_pending_interaction_id(checkpoint) is not None:
         raise RuntimeError(
             "Session setup did not publish its authoritative initial transcript; "
@@ -3030,6 +3054,14 @@ def _replace_checkpoint_preserving_runtime_state(
                 DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
                 "durable_subagent_submissions",
             ),
+            (
+                _PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY,
+                "provider_operation_fallback_dispatch_ordinals",
+            ),
+            (
+                _PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY,
+                "provider_operation_pending_resolution_disposition",
+            ),
         ):
             updated.pop(key, None)
             if current is not None and key in current:
@@ -3600,6 +3632,8 @@ class SessionEngine:
         checkpoint: dict[str, Any] | None,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
+        require_open_interaction: bool = True,
+        additional_profile_fingerprints: tuple[str, ...] = (),
     ) -> ActiveInvocationExecutionProfile:
         """Resolve a recovery continuation against its durable invocation profile."""
 
@@ -3619,19 +3653,22 @@ class SessionEngine:
             runtime_version=_runtime_version(),
             redactor=self._secret_redactor,
             additional_profile_fingerprints=(
-                ()
-                if active_model_completion is None
-                else (
-                    None
-                    if model_completion_context is None
-                    else model_completion_context.execution_profile_fingerprint,
-                )
+                *additional_profile_fingerprints,
+                *(
+                    ()
+                    if active_model_completion is None
+                    else (
+                        None
+                        if model_completion_context is None
+                        else model_completion_context.execution_profile_fingerprint,
+                    )
+                ),
             ),
         )
         snapshot = plan.snapshot
         candidate = plan.candidate_profile
         changed = plan.changed_component_classes
-        if not changed:
+        if not changed and require_open_interaction:
             latest_interactions = await self.session_store.query_events(
                 EventQuery(
                     session_id=session.id,
@@ -3653,6 +3690,9 @@ class SessionEngine:
                 raise RuntimeError(
                     "Active invocation execution profile belongs to another interaction."
                 )
+            return snapshot
+
+        if not changed:
             return snapshot
 
         policy_identity = "cayu:active-invocation-profile:v1"
@@ -4441,6 +4481,13 @@ class SessionEngine:
     ) -> IncompleteSessionRecoveryResult:
         if IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT in result.actions:
             return result
+        if any(
+            event.type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in result.events
+        ):
+            # Exact continuation is paused for an operator decision, not
+            # terminally disposed. Keep the interaction open so the authorized
+            # fallback can resume the same logical model step.
+            return result
         if _current_session_interaction_id(result.session_id) is None:
             return result
         session = await self.session_store.load(result.session_id)
@@ -4585,6 +4632,7 @@ class SessionEngine:
         pending_action_kind: str | None = None,
         recovered_active_through: datetime | None = None,
         observed_at: datetime | None = None,
+        event_id: str | None = None,
     ) -> Event | None:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is None:
@@ -4741,6 +4789,7 @@ class SessionEngine:
                     runtime_authority=self._interaction_lifecycle_publication_authority,
                 ) from exc
             raise
+        event_payload = evidence.model_dump(mode="json")
         event = event_with_runtime_payload_authority(
             Event(
                 type=event_type,
@@ -4749,7 +4798,18 @@ class SessionEngine:
                 timestamp=observed_at,
                 agent_name=agent_name,
                 environment_name=environment_name,
-                payload=evidence.model_dump(mode="json"),
+                payload=event_payload,
+            )
+            if event_id is None
+            else Event(
+                id=event_id,
+                type=event_type,
+                session_id=session.id,
+                interaction_id=interaction_id,
+                timestamp=observed_at,
+                agent_name=agent_name,
+                environment_name=environment_name,
+                payload=event_payload,
             ),
             "start_event_id",
         )
@@ -4757,7 +4817,12 @@ class SessionEngine:
             _clear_session_interaction_recovered_active_through(session.id)
         return event
 
-    async def _failure_interaction_observed_at(self, session: Session) -> datetime | None:
+    async def _failure_interaction_observed_at(
+        self,
+        session: Session,
+        *,
+        observed_at: datetime | None = None,
+    ) -> datetime | None:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is None:
             return None
@@ -4773,7 +4838,8 @@ class SessionEngine:
         if not records:
             return None
         start_evidence = InteractionSummaryEvidence.model_validate(records[0].event.payload)
-        observed_at = self._clock()
+        if observed_at is None:
+            observed_at = self._clock()
         if observed_at < start_evidence.started_at:
             raise _runtime_interaction_lifecycle_publication_rejected(
                 session_id=session.id,
@@ -4817,6 +4883,7 @@ class SessionEngine:
         from_statuses: set[SessionStatus] | None = None,
         recovered_active_through: datetime | None = None,
         observed_at: datetime | None = None,
+        event_id: str | None = None,
     ) -> tuple[Session, Event | None, bool]:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is None:
@@ -4864,6 +4931,7 @@ class SessionEngine:
             pending_action_kind=pending_action_kind,
             recovered_active_through=recovered_active_through,
             observed_at=observed_at,
+            event_id=event_id,
         )
         if event is None:
             loaded = await self.session_store.load(session.id)
@@ -5159,6 +5227,7 @@ class SessionEngine:
         from_statuses: set[SessionStatus] | None = None,
         recovered_active_through: datetime | None = None,
         observed_at: datetime | None = None,
+        event_id: str | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         finalize_unsettled_cancellation: bool = True,
     ) -> tuple[Session, Event | None, bool]:
@@ -5174,6 +5243,7 @@ class SessionEngine:
                 from_statuses=from_statuses,
                 recovered_active_through=recovered_active_through,
                 observed_at=observed_at,
+                event_id=event_id,
             )
         except asyncio.CancelledError as cancellation:
             await self._reconcile_sibling_interaction_transition_cancellation(
@@ -5200,6 +5270,194 @@ class SessionEngine:
             event_type=EventType.INTERACTION_RESUMED,
             status=InteractionStatus.ACTIVE,
         )
+
+    async def fail_provider_operation_resolution(
+        self,
+        *,
+        resolution_event: Event,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity,
+    ) -> AsyncIterator[Event]:
+        """Terminalize one explicit provider failure through normal lifecycle hooks."""
+
+        if resolution_event.type is not EventType.PROVIDER_OPERATION_RESOLVED:
+            raise TypeError("Provider-operation failure requires a resolution event.")
+        if resolution_event.session_id != session.id:
+            raise ValueError("Provider-operation resolution belongs to another session.")
+        resolution_id = resolution_event.payload.get("resolution_id")
+        recovery_reason = resolution_event.payload.get("recovery_reason")
+        if type(resolution_id) is not str or type(recovery_reason) is not str:
+            raise ValueError("Provider-operation resolution evidence is malformed.")
+        try:
+            model_attempt_identity = ModelAttemptIdentity.model_validate(
+                {
+                    "model_step_id": resolution_event.payload.get("model_step_id"),
+                    "model_attempt_id": resolution_event.payload.get("model_attempt_id"),
+                }
+            )
+        except ValidationError:
+            raise ValueError("Provider-operation resolution lost model identity.") from None
+
+        environment_name = _environment_name(registered_environment)
+        common_payload = {
+            key: resolution_event.payload[key]
+            for key in (
+                "provider",
+                "model",
+                "step",
+                "attempt",
+                "max_attempts",
+                "model_step_id",
+                "model_attempt_id",
+                "source_run_epoch",
+                "run_epoch",
+                "stage_id",
+                "resolution_id",
+                "resolution_action",
+                "recovery_reason",
+                "duplicate_request_risk",
+                "reason",
+                "metadata",
+                "resolved_by",
+            )
+        }
+        model_error_id = provider_operation_resolution_outcome_event_id(
+            resolution_id,
+            "model_error",
+        )
+        model_error_records = await self.session_store.query_events(
+            EventQuery(session_id=session.id, event_id=model_error_id, limit=2)
+        )
+        if model_error_records:
+            if len(model_error_records) != 1:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation failure has duplicate model evidence."
+                )
+            validate_provider_operation_resolution_outcome_event(
+                model_error_records[0].event,
+                resolution_event=resolution_event,
+                outcome="model_error",
+            )
+        else:
+            model_error = _event_with_model_identity_authority(
+                Event(
+                    id=model_error_id,
+                    type=EventType.MODEL_ERROR,
+                    session_id=session.id,
+                    interaction_id=resolution_event.interaction_id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    timestamp=resolution_event.timestamp,
+                    payload={
+                        **common_payload,
+                        "error": "Provider operation was explicitly failed after recovery.",
+                        "error_type": "provider_operation_unavailable",
+                        "stage": "provider_operation_recovery",
+                    },
+                ),
+                model_attempt_identity,
+            )
+            yield await self._event_writer.emit(model_error)
+
+        interaction_failed_id = provider_operation_resolution_outcome_event_id(
+            resolution_id,
+            "interaction_failed",
+        )
+        interaction_failed_records = await self.session_store.query_events(
+            EventQuery(session_id=session.id, event_id=interaction_failed_id, limit=2)
+        )
+        transitioned_session = await self.session_store.load(session.id)
+        if transitioned_session is None:
+            raise KeyError(f"Session not found: {session.id}")
+        if interaction_failed_records:
+            if len(interaction_failed_records) != 1:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation failure has duplicate interaction evidence."
+                )
+            validate_provider_operation_resolution_outcome_event(
+                interaction_failed_records[0].event,
+                resolution_event=resolution_event,
+                outcome="interaction_failed",
+            )
+            if transitioned_session.status is not SessionStatus.FAILED:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation interaction failure conflicts with session status."
+                )
+        else:
+            interaction_id = await self._activate_latest_open_interaction(session.id)
+            if interaction_id is None:
+                raise RuntimeError("Provider-operation failure has no open durable interaction.")
+            observed_at = await self._failure_interaction_observed_at(
+                transitioned_session,
+                observed_at=resolution_event.timestamp,
+            )
+            (
+                transitioned_session,
+                interaction_failed_event,
+                _,
+            ) = await self._publish_sibling_interaction_transition(
+                session=transitioned_session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                to_status=SessionStatus.FAILED,
+                from_statuses={SessionStatus.INTERRUPTED},
+                observed_at=observed_at,
+                event_id=interaction_failed_id,
+                execution_profile=execution_profile,
+            )
+            if interaction_failed_event is not None:
+                yield interaction_failed_event
+
+        session_failed_id = provider_operation_resolution_outcome_event_id(
+            resolution_id,
+            "session_failed",
+        )
+        terminal_records = await self.session_store.query_events(
+            EventQuery(session_id=session.id, event_id=session_failed_id, limit=2)
+        )
+        if terminal_records:
+            if len(terminal_records) != 1:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation failure has duplicate session evidence."
+                )
+            validate_provider_operation_resolution_outcome_event(
+                terminal_records[0].event,
+                resolution_event=resolution_event,
+                outcome="session_failed",
+            )
+            if transitioned_session.status is not SessionStatus.FAILED:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation terminal failure conflicts with session status."
+                )
+            _deactivate_session_interaction(session.id)
+            return
+        try:
+            async for terminal_event in self._emit_terminal_event_with_hooks(
+                event=Event(
+                    id=session_failed_id,
+                    type=EventType.SESSION_FAILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    timestamp=resolution_event.timestamp,
+                    payload={
+                        **common_payload,
+                        "failure_type": "provider_operation_unavailable",
+                        "error": "Provider operation was explicitly failed after recovery.",
+                    },
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                session=transitioned_session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+            ):
+                yield terminal_event
+        finally:
+            _deactivate_session_interaction(session.id)
 
     async def _prepare_initial_run(self, request: RunRequest) -> _PreparedInitialRun:
         """Resolve one new-session request without creating or admitting a session."""
@@ -10126,6 +10384,7 @@ class SessionEngine:
                 updated_checkpoint,
                 now=self._clock(),
             )
+            _reject_pending_provider_operation_disposition(updated_checkpoint)
             if _initial_transcript_pending_interaction_id(updated_checkpoint) is not None:
                 raise RuntimeError(
                     "Session setup did not publish its authoritative initial transcript; "
@@ -10693,7 +10952,10 @@ class SessionEngine:
                 and model_boundary.completion_event is not None
             ):
                 yield copy_event(model_boundary.completion_event)
-            if model_boundary.state == "provider_operation_pending":
+            if model_boundary.state in {
+                "provider_operation_pending",
+                "provider_operation_unavailable",
+            }:
                 # A queued dispatch must retain its exact queue/session handoff
                 # until either provider reconciliation publishes the pinned
                 # terminal event or terminal-evidence recovery transfers it to
@@ -12261,6 +12523,9 @@ class SessionEngine:
         deliver_queued_input_before_first_step: bool = True,
         pending_tool_round_source_transcript_cursor: int | None = None,
         run_limit_accounting: RunLimitAccountingContext | None = None,
+        initial_model_step_identity: ModelStepIdentity | None = None,
+        initial_model_step_number: int | None = None,
+        preserve_failure_until_initial_provider_dispatch: bool = False,
     ) -> AsyncGenerator[Event, None]:
         # Deep defense for internal recovery callers. Public entry points
         # validate before claiming mutable session ownership.
@@ -12272,6 +12537,29 @@ class SessionEngine:
         if messages_already_persisted and messages_deferred:
             raise ValueError(
                 "messages_already_persisted and messages_deferred are mutually exclusive."
+            )
+        if (
+            initial_model_step_identity is not None
+            and type(initial_model_step_identity) is not ModelStepIdentity
+        ):
+            raise TypeError("initial_model_step_identity must be a ModelStepIdentity.")
+        if (initial_model_step_identity is None) != (initial_model_step_number is None):
+            raise ValueError(
+                "Initial model-step identity and step number must be supplied together."
+            )
+        if initial_model_step_number is not None and (
+            type(initial_model_step_number) is not int
+            or not 1 <= initial_model_step_number <= max_steps
+        ):
+            raise ValueError("initial_model_step_number is outside this run's step bounds.")
+        if type(preserve_failure_until_initial_provider_dispatch) is not bool:
+            raise TypeError("preserve_failure_until_initial_provider_dispatch must be a bool.")
+        if preserve_failure_until_initial_provider_dispatch and (
+            initial_model_step_identity is None
+        ):
+            raise ValueError(
+                "Initial provider-dispatch failure preservation requires an initial "
+                "model-step identity."
             )
 
         async def materialize_deferred_messages() -> None:
@@ -12391,6 +12679,7 @@ class SessionEngine:
         baseline_events: list[Event] = []
         request_budget_notify_events: list[Event] = []
         close_new_pending_round_on_interrupt = False
+        initial_provider_dispatch_started = False
 
         async def start_linked_task_if_needed(*, only_if_exists: bool = False) -> Event | None:
             nonlocal task_start_attempted, task_started
@@ -12874,11 +13163,16 @@ class SessionEngine:
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )
-            model_steps = () if skip_model_steps else range(1, max_steps + 1)
+            first_model_step = initial_model_step_number or 1
+            model_steps = () if skip_model_steps else range(first_model_step, max_steps + 1)
             for step in model_steps:
-                model_step_identity = new_model_step_identity()
+                model_step_identity = (
+                    initial_model_step_identity
+                    if step == first_model_step and initial_model_step_identity is not None
+                    else new_model_step_identity()
+                )
                 await self._session_control.raise_if_interrupted(session.id)
-                if step == 1 and deliver_queued_input_before_first_step:
+                if step == first_model_step and deliver_queued_input_before_first_step:
                     for event in await self._deliver_queued_session_messages(
                         session_id=session.id,
                         session=session,
@@ -12958,6 +13252,17 @@ class SessionEngine:
                 try:
                     async for event, flow_outcome in model_step_events:
                         if event is not None:
+                            if (
+                                preserve_failure_until_initial_provider_dispatch
+                                and not initial_provider_dispatch_started
+                                and event.type is EventType.PROVIDER_OPERATION_STARTING
+                                and event.payload.get("model_step_id")
+                                == model_step_identity.model_step_id
+                            ):
+                                # The replacement model-completion stage is durable before
+                                # this event is published. From this boundary onward the
+                                # ordinary model/session failure contract owns recovery.
+                                initial_provider_dispatch_started = True
                             yield event
                         if flow_outcome is not None:
                             if model_step_flow_outcome is not None:
@@ -13883,10 +14188,61 @@ class SessionEngine:
                 # committed. Its durable side-effect handoff remains
                 # recoverable, so abandoned-run cleanup must not rewrite it.
                 raise
-            if detach_billing_identity_cancellation(cancellation) is not None:
-                # The outer run boundary owns credential-safe detachment and
-                # environment finalization for billing-hook cancellations.
-                raise
+            billing_identity_cancellation = detach_billing_identity_cancellation(cancellation)
+            if billing_identity_cancellation is not None:
+                if not preserve_failure_until_initial_provider_dispatch:
+                    # The ordinary outer run boundary owns credential-safe
+                    # detachment and environment finalization.
+                    raise
+                # Provider-operation fallback recovery has no equivalent outer
+                # run boundary. Drop provider-bearing locals before fallible
+                # interruption work and surface only a detached cancellation.
+                del provider, registered_provider
+                try:
+                    interruption_requested = await self._session_control.interrupt_requested(
+                        session.id
+                    )
+                except Exception:
+                    raise RuntimeError(
+                        "Session interruption state check failed after provider billing "
+                        "cancellation"
+                    ) from None
+                if interruption_requested:
+                    clear_current_task_cancellation()
+                    try:
+                        await materialize_deferred_messages_after_failure()
+                        interruption_events = []
+                        if close_new_pending_round_on_interrupt:
+                            async for (
+                                event
+                            ) in self._close_durable_pending_tool_round_after_interrupt(
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=execution_profile,
+                            ):
+                                interruption_events.append(event)
+                        async for event in self._handle_session_interrupted(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=environment_name,
+                            execution_profile=execution_profile,
+                            run_started_at=run_started_at,
+                            turn_usage_tracker=turn_usage_tracker,
+                            active_run=active_run,
+                            interaction_transition_failures=tuple(interaction_transition_failures),
+                        ):
+                            interruption_events.append(event)
+                    except Exception:
+                        raise RuntimeError(
+                            "Session interruption transition failed after provider billing "
+                            "cancellation"
+                        ) from None
+                    for event in interruption_events:
+                        yield event
+                    return
+                raise billing_identity_cancellation from None
             if await self._session_control.interrupt_requested(session.id):
                 clear_current_task_cancellation()
                 await materialize_deferred_messages_after_failure()
@@ -13914,6 +14270,14 @@ class SessionEngine:
                 for event in interruption_events:
                     yield event
                 return
+            if (
+                preserve_failure_until_initial_provider_dispatch
+                and not initial_provider_dispatch_started
+            ):
+                # Ordinary caller cancellation does not revoke an accepted
+                # fallback. A positively authenticated interrupt request above
+                # remains authoritative and completes its typed outcome.
+                raise
 
             async def close_cancelled_tool_round() -> None:
                 if not close_new_pending_round_on_interrupt:
@@ -13961,6 +14325,13 @@ class SessionEngine:
                 )
             raise
         except GeneratorExit as abandonment:
+            if (
+                preserve_failure_until_initial_provider_dispatch
+                and not initial_provider_dispatch_started
+            ):
+                # Closing an observer stream is not an operator decision to discard
+                # an already accepted fallback. Its outer owner releases the fence.
+                raise
             # The consumer closed the event stream (client disconnect / abandoned
             # async generator) while the session was still live. Finalize instead of
             # stranding it in RUNNING; an async generator must not yield while
@@ -13994,6 +14365,55 @@ class SessionEngine:
         except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
+            if (
+                preserve_failure_until_initial_provider_dispatch
+                and not initial_provider_dispatch_started
+            ):
+                # An accepted provider-operation fallback remains the durable retry
+                # owner until its replacement dispatch is staged. Do not convert a
+                # setup, request-construction, billing, or store failure into an
+                # unrelated terminal session that the pending disposition cannot
+                # finish after restart.
+                raise
+            ambiguous_provider_start = is_ambiguous_provider_operation_start_error(exc)
+            if not ambiguous_provider_start:
+                provider_operation = await inspect_provider_operation(
+                    self.session_store,
+                    session.id,
+                )
+                ambiguous_provider_start = (
+                    provider_operation.status
+                    is ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION
+                )
+            if ambiguous_provider_start:
+                interrupted_session = await self.session_store.transition_status(
+                    session.id,
+                    from_statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                    to_status=SessionStatus.INTERRUPTED,
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": "provider_operation_unavailable",
+                            "recovery_reason": "ambiguous_submission",
+                            "duplicate_request_risk": True,
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=interrupted_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                ):
+                    yield event
+                interaction_id = _current_session_interaction_id(session.id)
+                if interaction_id is not None:
+                    _mark_session_interaction_settled(session.id, interaction_id)
+                return
             if is_durable_subagent_submission_unsettled(
                 exc,
                 parent_session_id=session.id,
@@ -14149,6 +14569,26 @@ class SessionEngine:
             ):
                 yield event
         except BaseExceptionGroup as failure:
+            if preserve_failure_until_initial_provider_dispatch and (
+                not initial_provider_dispatch_started
+            ):
+                if detach_billing_identity_cancellation_group(failure) is not None:
+                    # The recovery fallback bypasses the ordinary run/resume
+                    # boundary that normally strips provider-bearing traceback
+                    # state from grouped billing cancellation. Drop provider
+                    # registrations before any fallible store access; the recovery
+                    # entrypoint publishes the detached group after this frame exits.
+                    del provider, registered_provider
+                    try:
+                        interruption_requested = await self._session_control.interrupt_requested(
+                            session.id
+                        )
+                    except Exception:
+                        raise _FallbackBillingCancellationStateCheckFailed from None
+                    if not interruption_requested:
+                        raise
+                elif not await self._session_control.interrupt_requested(session.id):
+                    raise
             # ``ExceptionGroup`` is also an ``Exception`` and is handled by
             # the ordinary failure branch above. Only groups carrying a true
             # ``BaseException`` control leaf reach this interruption path.

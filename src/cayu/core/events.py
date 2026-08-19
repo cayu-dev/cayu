@@ -115,6 +115,8 @@ class EventType(StrEnum):
     PROVIDER_OPERATION_CANCEL_RESOLVED = "provider.operation.cancel_resolved"
     PROVIDER_OPERATION_RECONNECT_SCHEDULED = "provider.operation.reconnect_scheduled"
     PROVIDER_OPERATION_RECONNECT_STARTED = "provider.operation.reconnect_started"
+    PROVIDER_OPERATION_RECOVERY_REQUIRED = "provider.operation.recovery_required"
+    PROVIDER_OPERATION_RESOLVED = "provider.operation.resolved"
     PROVIDER_OPERATION_RECONCILED = "provider.operation.reconciled"
     REQUEST_FOOTPRINT_RECORDED = "request.footprint.recorded"
 

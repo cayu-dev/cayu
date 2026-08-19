@@ -3,6 +3,7 @@ import { ApiClientError, fetchSessionEvents, fetchSessionState, throwResponseErr
 import { apiUrl } from "./config.ts"
 import type {
   InterruptSessionBody,
+  ProviderOperationResolutionBody,
   ResumeBody,
   RunBody,
   ToolApprovalBody,
@@ -414,6 +415,18 @@ export function executeInterruptMutation(
     `/sessions/${encodeURIComponent(sessionId)}/interrupt`,
     body,
     sessionId,
+    options,
+  )
+}
+
+export function executeResolveProviderOperationMutation(
+  body: ProviderOperationResolutionBody,
+  options: MutationExecutionOptions = {},
+): Promise<MutationTransportSnapshot> {
+  return executeExistingSessionMutation(
+    "/provider-operations/resolve",
+    body,
+    body.session_id,
     options,
   )
 }

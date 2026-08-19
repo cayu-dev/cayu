@@ -56,7 +56,7 @@ from cayu import (
     WorkspaceBinding,
     default_price_book,
 )
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
 from cayu.core.events import (
@@ -111,6 +111,9 @@ from cayu.runtime._event_projection import (
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.runtime.provider_operations import (
+    PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES,
+)
 from cayu.runtime.sessions import run_request_with_runtime_generated_authority
 from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 from cayu.server import (
@@ -6046,9 +6049,16 @@ def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
     assert body["interruption_cascade"] == "none"
     assert body["provider_operation"] == {
         "status": "synchronous",
+        "stage_id": None,
+        "run_epoch": None,
         "provider": None,
         "operation_id": None,
         "stream_protocol": None,
+        "recovery_reason": None,
+        "duplicate_request_risk": False,
+        "allowed_resolutions": [],
+        "resolution_action": None,
+        "resolution_id": None,
         "cancellation_status": "not_requested",
         "accounting_status": "not_applicable",
         "reservation_count": 0,
@@ -6134,9 +6144,16 @@ def test_server_session_state_exposes_provider_reconnect_in_progress() -> None:
     assert response.status_code == 200
     assert response.json()["provider_operation"] == {
         "status": "reconnect_in_progress",
+        "stage_id": None,
+        "run_epoch": None,
         "provider": "reconnectable",
         "operation_id": "response_123",
         "stream_protocol": "responses-v1",
+        "recovery_reason": None,
+        "duplicate_request_risk": False,
+        "allowed_resolutions": [],
+        "resolution_action": None,
+        "resolution_id": None,
         "cancellation_status": "not_requested",
         "accounting_status": "not_applicable",
         "reservation_count": 0,
@@ -6225,10 +6242,17 @@ def test_server_session_state_keeps_ambiguous_start_and_model_error_visible() ->
 
     assert ambiguous.status_code == 200
     assert ambiguous.json()["provider_operation"] == {
-        "status": "provider_operation_in_progress",
+        "status": "ambiguous_submission",
+        "stage_id": None,
+        "run_epoch": None,
         "provider": "reconnectable",
         "operation_id": None,
         "stream_protocol": None,
+        "recovery_reason": "ambiguous_submission",
+        "duplicate_request_risk": True,
+        "allowed_resolutions": ["fallback_retry", "fail"],
+        "resolution_action": None,
+        "resolution_id": None,
         "cancellation_status": "not_requested",
         "accounting_status": "not_applicable",
         "reservation_count": 0,
@@ -6236,9 +6260,16 @@ def test_server_session_state_keeps_ambiguous_start_and_model_error_visible() ->
     assert model_error.status_code == 200
     assert model_error.json()["provider_operation"] == {
         "status": "provider_operation_in_progress",
+        "stage_id": None,
+        "run_epoch": None,
         "provider": "reconnectable",
         "operation_id": "response_123",
         "stream_protocol": "responses-v1",
+        "recovery_reason": None,
+        "duplicate_request_risk": False,
+        "allowed_resolutions": [],
+        "resolution_action": None,
+        "resolution_id": None,
         "cancellation_status": "not_requested",
         "accounting_status": "not_applicable",
         "reservation_count": 0,
@@ -8163,6 +8194,18 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
     )
     assert (
         client.post(
+            "/api/provider-operations/resolve",
+            json={
+                "session_id": "session_1",
+                "stage_id": " ",
+                "expected_run_epoch": 1,
+                "action": "fallback_retry",
+            },
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
             "/api/tool-approvals/resolve",
             json={
                 "session_id": " ",
@@ -8259,6 +8302,139 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
             ).status_code
             == 422
         )
+
+
+def test_server_resolves_provider_operation_with_bounded_audited_request() -> None:
+    from cayu import ResolutionActorSource
+
+    app = CayuApp()
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="provider_resolution",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(
+            "provider_resolution",
+            SessionStatus.INTERRUPTED,
+        )
+
+    asyncio.run(seed())
+    captured = []
+
+    async def resolve_provider_operation(request):
+        captured.append(request)
+        yield Event(
+            type=EventType.PROVIDER_OPERATION_RESOLVED,
+            session_id=request.session_id,
+            payload={"resolution_action": request.action.value},
+        )
+
+    app.resolve_provider_operation = resolve_provider_operation  # type: ignore[method-assign]
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    with client.stream(
+        "POST",
+        "/api/provider-operations/resolve",
+        json={
+            "session_id": "provider_resolution",
+            "stage_id": "stage_1",
+            "expected_run_epoch": 0,
+            "action": "fail",
+            "reason": "Operator confirmed the provider request cannot be recovered.",
+            "metadata": {"ticket": "INC-757"},
+            "resolved_by": {"subject": "operator-a"},
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.session_id == "provider_resolution"
+    assert request.stage_id == "stage_1"
+    assert request.expected_run_epoch == 0
+    assert request.action.value == "fail"
+    assert request.metadata == {"ticket": "INC-757"}
+    assert request.resolved_by is not None
+    assert request.resolved_by.subject == "operator-a"
+    assert request.resolved_by.source is ResolutionActorSource.REQUEST
+
+
+def test_provider_operation_resolution_endpoint_enforces_runtime_bounds() -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="provider_resolution_bounds",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(
+            "provider_resolution_bounds",
+            SessionStatus.INTERRUPTED,
+        )
+
+    asyncio.run(seed())
+    captured = []
+
+    async def resolve_provider_operation(request):
+        captured.append(request)
+        yield Event(
+            type=EventType.PROVIDER_OPERATION_RESOLVED,
+            session_id=request.session_id,
+            payload={"resolution_action": request.action.value},
+        )
+
+    app.resolve_provider_operation = resolve_provider_operation  # type: ignore[method-assign]
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    metadata_overhead = len(canonical_durable_json_bytes({"note": ""}, "metadata"))
+    value = "x" * (PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES - metadata_overhead)
+    at_limit_metadata = {"note": value}
+    assert (
+        len(canonical_durable_json_bytes(at_limit_metadata, "metadata"))
+        == PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES
+    )
+    base_request = {
+        "session_id": "provider_resolution_bounds",
+        "stage_id": "stage_1",
+        "expected_run_epoch": MAX_DURABLE_JSON_INTEGER,
+        "action": "fail",
+        "metadata": at_limit_metadata,
+    }
+
+    with client.stream(
+        "POST",
+        "/api/provider-operations/resolve",
+        json=base_request,
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    assert len(captured) == 1
+
+    canary = "provider-resolution-boundary-secret"
+    oversized_value = value[: -len(canary)] + canary + "x"
+    metadata_response = client.post(
+        "/api/provider-operations/resolve",
+        json={**base_request, "metadata": {"note": oversized_value}},
+    )
+    assert metadata_response.status_code == 422
+    assert canary not in metadata_response.text
+
+    epoch_response = client.post(
+        "/api/provider-operations/resolve",
+        json={**base_request, "expected_run_epoch": MAX_DURABLE_JSON_INTEGER + 1},
+    )
+    assert epoch_response.status_code == 422
+    assert value[:128] not in epoch_response.text
+    assert len(captured) == 1
 
 
 def test_run_endpoint_passes_retry_policy_to_runtime() -> None:

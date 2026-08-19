@@ -5,6 +5,7 @@ globalThis.window = { __CAYU_DASHBOARD_CONFIG__: { apiBaseUrl: "/control/api" } 
 
 const {
   createMutationBrowserIO,
+  executeResolveProviderOperationMutation,
   executeResumeMutation,
   fetchMutationReplayBaseline,
   MUTATION_SSE_DATA_MAX_BYTES,
@@ -116,6 +117,105 @@ test("browser adapter omits Last-Event-ID only for the initial mutation attempt"
   assert.deepEqual(result, { kind: "closed", accepted: true })
   assert.equal("Last-Event-ID" in headers, false)
   assert.equal(headers["Cayu-Mutation-ID"], MUTATION_ID)
+})
+
+test("provider-operation resolution uses the fenced control-plane mutation route", async () => {
+  let capturedUrl = null
+  let capturedBody = null
+  let durableRecords = []
+  const result = await executeResolveProviderOperationMutation(
+    {
+      session_id: SESSION_ID,
+      stage_id: "stage-757",
+      expected_run_epoch: 4,
+      action: "fail",
+      reason: "Operator chose durable failure.",
+      metadata: {},
+    },
+    {
+      policy: {
+        reconnectInitialDelayMs: 1,
+        reconnectMaxDelayMs: 1,
+        reconnectMaxAttempts: 1,
+        reconnectMaxElapsedMs: 50,
+        connectionTimeoutMs: 50,
+        confirmationTimeoutMs: 50,
+        reconciliationRequestTimeoutMs: 50,
+        fallbackPollIntervalMs: 1,
+        fallbackMaxConsecutiveFailures: 1,
+      },
+      dependencies: {
+        async readSessionEvents(sessionId, query) {
+          const baseline = [{ ...event("event-1"), sequence: 1 }]
+          const records =
+            query.order_by === "sequence_desc"
+              ? baseline
+              : durableRecords.filter((record) => record.sequence > (query.after_sequence ?? 0))
+          return {
+            session_id: sessionId,
+            events: records,
+            order_by: query.order_by ?? "sequence_asc",
+            next_sequence: records.at(-1)?.sequence ?? null,
+            has_more: false,
+            scan_through_sequence: durableRecords.at(-1)?.sequence ?? 1,
+          }
+        },
+        async readSessionState(sessionId) {
+          return {
+            session_id: sessionId,
+            status: "failed",
+            interruption_cascade: "none",
+            updated_at: "2026-07-15T00:00:00Z",
+            last_activity_at: "2026-07-15T00:00:00Z",
+          }
+        },
+        async fetchEventSource(input, init) {
+          capturedUrl = input
+          capturedBody = JSON.parse(init.body)
+          await init.onopen(streamResponse())
+          const providerResolved = event("event-2", "provider.operation.resolved")
+          const acceptance = event("event-3", "server.mutation.accepted", {
+            mutation_id: init.headers["Cayu-Mutation-ID"],
+            mutation_kind: "provider_operation.resolve",
+            accepted_event_id: "event-2",
+            accepted_event_type: "provider.operation.resolved",
+          })
+          const failed = event("event-4", "session.failed")
+          durableRecords = [
+            { ...providerResolved, sequence: 2 },
+            { ...acceptance, sequence: 3 },
+            { ...failed, sequence: 4 },
+          ]
+          init.onmessage({
+            id: `${SESSION_ID}:event-2`,
+            event: "",
+            data: JSON.stringify(providerResolved),
+          })
+          init.onmessage({
+            id: `${SESSION_ID}:event-3`,
+            event: "",
+            data: JSON.stringify(acceptance),
+          })
+          init.onmessage({
+            id: `${SESSION_ID}:event-4`,
+            event: "",
+            data: JSON.stringify(failed),
+          })
+        },
+      },
+    },
+  )
+
+  assert.equal(result.phase, "terminal", JSON.stringify(result))
+  assert.equal(capturedUrl, "/control/api/provider-operations/resolve")
+  assert.deepEqual(capturedBody, {
+    session_id: SESSION_ID,
+    stage_id: "stage-757",
+    expected_run_epoch: 4,
+    action: "fail",
+    reason: "Operator chose durable failure.",
+    metadata: {},
+  })
 })
 
 test("browser adapter preserves typed runtime and observer outcomes", async () => {
