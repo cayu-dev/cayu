@@ -15,7 +15,12 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
-from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
+from cayu.core.events import (
+    Event,
+    EventType,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
@@ -1725,7 +1730,16 @@ async def resolve_provider_operation_stage(
             raise ProviderOperationResolutionConflict(
                 "Provider operation was already resolved by a conflicting request."
             )
+        active = await session_store.load_active_model_completion_stage(request.session_id)
+        if active is not None and active.stage.stage_id == request.stage_id:
+            raise ProviderOperationResolutionConflict(
+                "Existing provider-operation resolution does not prove atomic source-stage release."
+            )
         return existing
+    if not session_store._supports_atomic_model_completion_stage_release_protocol():
+        raise ProviderOperationResolutionConflict(
+            "The session store does not support atomic provider-operation stage release."
+        )
 
     session = await session_store.load(request.session_id)
     if session is None:
@@ -1831,14 +1845,15 @@ async def resolve_provider_operation_stage(
         timestamp=resolved_at,
         payload=event_payload,
     )
-    private_fields = tuple(
-        field for field in ("operation_id", "stream_protocol") if field in event_payload
+    resolution_event = event_with_runtime_payload_authority(
+        resolution_event,
+        "model_attempt_id",
+        "model_step_id",
+        "resolution_id",
+        "stage_id",
+        *(field for field in ("operation_id", "stream_protocol") if field in event_payload),
     )
-    if private_fields:
-        resolution_event = event_with_runtime_payload_authority(
-            resolution_event,
-            *private_fields,
-        )
+    resolution_event = event_with_runtime_generated_id(resolution_event)
     record_payload = {
         "record_type": _PROVIDER_OPERATION_RESOLUTION_RECORD_TYPE,
         "schema_version": 1,

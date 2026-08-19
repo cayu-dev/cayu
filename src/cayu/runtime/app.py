@@ -139,6 +139,7 @@ from cayu.runtime._session_engine import (
     SessionEngine,
     _checkpoint_with_pending_session_interrupt,
     _environment_name,
+    _interaction_transition_replay_failures,
     _replace_checkpoint_preserving_runtime_state,
     _require_native_structured_output_support,
     _task_event,
@@ -1015,6 +1016,7 @@ class CayuApp:
             recover_provider_operation=self._recover_provider_operation,
             recover_provider_operation_start=self._recover_provider_operation_start,
             cancel_provider_operation=self._cancel_provider_operation,
+            interaction_transition_replay_failures=_interaction_transition_replay_failures,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self._runtime_session_store,

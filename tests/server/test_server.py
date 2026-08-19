@@ -16,7 +16,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
@@ -46,7 +46,10 @@ from cayu import (
     LocalArtifactStore,
     Message,
     MessageRole,
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
     SecretRedactor,
+    SQLiteSessionStore,
     Task,
     TaskCreate,
     TaskStatus,
@@ -64,6 +67,7 @@ from cayu.core.events import (
     Event,
     EventType,
     event_with_durable_sequence,
+    event_with_runtime_payload_authority,
 )
 from cayu.core.messages import FilePart, ProviderStatePart
 from cayu.providers import (
@@ -8435,6 +8439,140 @@ def test_provider_operation_resolution_endpoint_enforces_runtime_bounds() -> Non
     assert epoch_response.status_code == 422
     assert value[:128] not in epoch_response.text
     assert len(captured) == 1
+
+
+@pytest.mark.parametrize("secret", ["metadata", "unavailable", "fail"])
+def test_server_projects_provider_recovery_event_contract_with_schema_secret_collision(
+    tmp_path,
+    secret: str,
+) -> None:
+    session_id = "provider-recovery-event-projection"
+    alias_codec = PublicAuthorityAliasCodec(
+        PublicAuthorityAliasKeyring(
+            active_key_id="test",
+            keys={
+                "test": SecretStr(
+                    base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+                )
+            },
+        )
+    )
+    store = SQLiteSessionStore(
+        tmp_path / "provider-recovery-event-projection.sqlite3",
+        public_authority_alias_codec=alias_codec,
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        required = event_with_runtime_payload_authority(
+            Event(
+                type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                session_id=session_id,
+                payload={
+                    "provider": "fake",
+                    "model": "fake-model",
+                    "step": 1,
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "model_step_id": "model-step-private",
+                    "model_attempt_id": "model-attempt-private",
+                    "source_run_epoch": 0,
+                    "run_epoch": 1,
+                    "operation_id": "response-public",
+                    "stream_protocol": "responses-v1",
+                    "status": "unavailable",
+                    "recovery_reason": "unavailable",
+                },
+            ),
+            "model_step_id",
+            "model_attempt_id",
+            "operation_id",
+            "stream_protocol",
+        )
+        resolved = event_with_runtime_payload_authority(
+            Event(
+                type=EventType.PROVIDER_OPERATION_RESOLVED,
+                session_id=session_id,
+                payload={
+                    "provider": "fake",
+                    "model": "fake-model",
+                    "step": 1,
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "model_step_id": "model-step-private",
+                    "model_attempt_id": "model-attempt-private",
+                    "source_run_epoch": 0,
+                    "run_epoch": 1,
+                    "operation_id": "response-public",
+                    "stream_protocol": "responses-v1",
+                    "status": "unavailable",
+                    "stage_id": "stage-private",
+                    "resolution_id": "resolution-private",
+                    "resolution_action": "fail",
+                    "recovery_reason": "unavailable",
+                    "duplicate_request_risk": True,
+                    "reason": "operator decision",
+                    "metadata": {"ticket": "INC-757"},
+                    "resolved_by": {
+                        "source": "request",
+                        "subject": "operator",
+                        "tenant": "tenant-a",
+                    },
+                },
+            ),
+            "model_step_id",
+            "model_attempt_id",
+            "operation_id",
+            "resolution_id",
+            "stage_id",
+            "stream_protocol",
+        )
+        await app._event_writer.emit(required)
+        await app._event_writer.emit(resolved)
+
+    try:
+        asyncio.run(seed())
+        client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+        response = client.get(f"/api/sessions/{session_id}/events?limit=10")
+
+        assert response.status_code == 200
+        events = response.json()["events"]
+        required_payload = events[0]["payload"]
+        resolved_payload = events[1]["payload"]
+        assert required_payload["operation_id"] == "response-public"
+        assert required_payload["stream_protocol"] == "responses-v1"
+        assert required_payload["model_step_id"] == PRIVATE_EVENT_AUTHORITY
+        assert required_payload["model_attempt_id"] == PRIVATE_EVENT_AUTHORITY
+        assert required_payload["status"] == "unavailable"
+        assert required_payload["recovery_reason"] == "unavailable"
+        assert resolved_payload["operation_id"] == "response-public"
+        assert resolved_payload["stream_protocol"] == "responses-v1"
+        assert "stage_id" not in resolved_payload
+        assert "resolution_id" not in resolved_payload
+        assert resolved_payload["status"] == "unavailable"
+        assert resolved_payload["recovery_reason"] == "unavailable"
+        assert resolved_payload["resolution_action"] == "fail"
+        assert resolved_payload["duplicate_request_risk"] is True
+        assert resolved_payload["metadata"] == {"ticket": "INC-757"}
+        assert resolved_payload["resolved_by"] == {
+            "source": "request",
+            "subject": "operator",
+            "tenant": "tenant-a",
+        }
+    finally:
+        asyncio.run(store.close())
 
 
 def test_run_endpoint_passes_retry_policy_to_runtime() -> None:

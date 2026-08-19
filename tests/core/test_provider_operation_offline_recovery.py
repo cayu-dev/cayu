@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 import warnings
 from collections.abc import AsyncIterator
@@ -27,6 +28,7 @@ from cayu.core.billing import BillingIdentity
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import (
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
     ProviderOperationAdapter,
@@ -75,6 +77,7 @@ from cayu.runtime import (
 from cayu.runtime import _model_step_executor as model_step_executor
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._model_errors import _BillingIdentityResolutionCancelled
 from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
@@ -85,6 +88,7 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
@@ -110,7 +114,11 @@ from cayu.runtime.provider_operations import (
     provider_operation_resolution_outcome_event_id,
     resolve_provider_operation_stage,
 )
-from cayu.runtime.sessions import ModelCompletionStageRequest, _deactivate_session_run_fence
+from cayu.runtime.sessions import (
+    ModelCompletionStageRequest,
+    SessionOperationPublication,
+    _deactivate_session_run_fence,
+)
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
@@ -321,6 +329,137 @@ class _IdempotentAmbiguousStartProvider(_OfflineOperationProvider):
 
     def __init__(self) -> None:
         self.adapter = _IdempotentAmbiguousStartAdapter()
+
+
+class _CloseFailingRecoveryEvents:
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+        self.close_calls = 0
+
+    def __aiter__(self) -> _CloseFailingRecoveryEvents:
+        return self
+
+    async def __anext__(self) -> ModelStreamEvent:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        raise self.failure
+
+
+class _YieldThenCloseFailingRecoveryEvents:
+    def __init__(self, event: Any, failure: BaseException) -> None:
+        self.event = event
+        self.failure = failure
+        self.yielded = False
+        self.close_calls = 0
+
+    def __aiter__(self) -> _YieldThenCloseFailingRecoveryEvents:
+        return self
+
+    async def __anext__(self) -> Any:
+        if self.yielded:
+            raise StopAsyncIteration
+        self.yielded = True
+        return self.event
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        raise self.failure
+
+
+class _CloseRecordingRecoveryEvents:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def __aiter__(self) -> _CloseRecordingRecoveryEvents:
+        return self
+
+    async def __anext__(self) -> ModelStreamEvent:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _BlockingRecoveryCloseEvents:
+    def __init__(
+        self,
+        *,
+        suppress_cancellation: bool = False,
+        failure_after_cancellation: BaseException | None = None,
+    ) -> None:
+        self.close_entered = asyncio.Event()
+        self.suppress_cancellation = suppress_cancellation
+        self.failure_after_cancellation = failure_after_cancellation
+        self.cancellation_observed = False
+
+    def __aiter__(self) -> _BlockingRecoveryCloseEvents:
+        return self
+
+    async def __anext__(self) -> ModelStreamEvent:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.close_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancellation_observed = True
+            if self.failure_after_cancellation is not None:
+                raise self.failure_after_cancellation from None
+            if not self.suppress_cancellation:
+                raise
+
+
+def _exception_graph_reference_count(
+    error: BaseException,
+    target: BaseException,
+) -> int:
+    """Count exact references while expanding each exception node once."""
+
+    pending = [error]
+    expanded: set[int] = set()
+    references = 0
+    while pending:
+        candidate = pending.pop()
+        if candidate is target:
+            references += 1
+        candidate_id = id(candidate)
+        if candidate_id in expanded:
+            continue
+        expanded.add(candidate_id)
+        if isinstance(candidate, BaseExceptionGroup):
+            pending.extend(candidate.exceptions)
+        if candidate.__cause__ is not None:
+            pending.append(candidate.__cause__)
+        if candidate.__context__ is not None:
+            pending.append(candidate.__context__)
+    return references
+
+
+def _exception_graph_type_count(
+    error: BaseException,
+    expected_type: type[BaseException],
+) -> int:
+    pending = [error]
+    expanded: set[int] = set()
+    matches = 0
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in expanded:
+            continue
+        expanded.add(candidate_id)
+        if isinstance(candidate, expected_type):
+            matches += 1
+        if isinstance(candidate, BaseExceptionGroup):
+            pending.extend(candidate.exceptions)
+        if candidate.__cause__ is not None:
+            pending.append(candidate.__cause__)
+        elif candidate.__context__ is not None:
+            pending.append(candidate.__context__)
+    return matches
 
 
 class _UnsupportedAmbiguousStartAdapter(_OfflineOperationAdapter):
@@ -1793,9 +1932,772 @@ def test_provider_recovery_treats_child_cancellation_as_unavailable(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("adapter_replaces_cancellation", [False, True])
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    [
+        RuntimeError("provider close failed"),
+        asyncio.CancelledError("provider child cancelled close"),
+    ],
+    ids=["ordinary", "child-cancellation"],
+)
+def test_malformed_start_recovery_preserves_typed_outcome_when_close_fails(
+    cleanup_failure: BaseException,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-malformed-close-" + type(cleanup_failure).__name__
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "recover malformed provider start")],
+                )
+            ):
+                pass
+
+        close_events = _CloseFailingRecoveryEvents(cleanup_failure)
+
+        async def recover_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            connection = ProviderOperationConnection(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.COMPLETED,
+                events=close_events,
+            )
+            object.__setattr__(connection, "status", "malformed")
+            return connection
+
+        provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+        recovery_task = asyncio.create_task(
+            runtime().recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await recovery_task
+
+        assert recovery_task.cancelling() == 0
+        assert not recovery_task.cancelled()
+        assert close_events.close_calls == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        required = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        ]
+        assert len(required) == 1
+        assert required[0].payload["recovery_reason"] == "malformed"
+        cleanup_diagnostic = required[0].payload["provider_cleanup_failure"]
+        assert cleanup_diagnostic["error_type"] == "RuntimeError"
+        assert cleanup_diagnostic["phase"] == "provider_recovery_stream_cleanup"
+        if isinstance(cleanup_failure, RuntimeError):
+            assert cleanup_diagnostic["error"] == "provider close failed"
+        else:
+            assert "without caller cancellation" in cleanup_diagnostic["error"]
+
+    asyncio.run(scenario())
+
+
+def test_malformed_start_recovery_publication_preserves_cleanup_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-malformed-start-publication-failure"
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "recover malformed provider start")],
+                )
+            ):
+                pass
+
+        close_events = _CloseFailingRecoveryEvents(RuntimeError("provider close failed"))
+
+        async def recover_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            connection = ProviderOperationConnection(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.COMPLETED,
+                events=close_events,
+            )
+            object.__setattr__(connection, "status", "malformed")
+            return connection
+
+        provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+        publication_failure = RuntimeError("provider recovery event publication failed")
+        original_emit = model_step_executor.RuntimeEventWriter.emit
+
+        async def fail_recovery_required_publication(
+            writer: model_step_executor.RuntimeEventWriter,
+            event: Event,
+        ) -> Event:
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
+                raise publication_failure
+            return await original_emit(writer, event)
+
+        monkeypatch.setattr(
+            model_step_executor.RuntimeEventWriter,
+            "emit",
+            fail_recovery_required_publication,
+        )
+        with pytest.raises(RuntimeError, match="event publication failed") as raised:
+            await runtime().recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+
+        assert raised.value is publication_failure
+        evidence_type = model_step_executor._ProviderRecoveryRequiredPublicationFailureEvidence
+        assert isinstance(publication_failure.__cause__, BaseExceptionGroup)
+        assert any(
+            isinstance(failure, TypeError) for failure in publication_failure.__cause__.exceptions
+        )
+        [evidence] = [
+            failure
+            for failure in publication_failure.__cause__.exceptions
+            if isinstance(failure, evidence_type)
+        ]
+        assert evidence.recovery_reason is ProviderOperationUnavailableReason.MALFORMED
+        assert close_events.close_calls == 1
+        assert await store.load_active_model_completion_stage(session_id) is not None
+
+    asyncio.run(scenario())
+
+
+def test_malformed_reconnect_preserves_typed_outcome_when_close_is_child_cancelled() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-malformed-reconnect-close"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await _commit_partial_provider_progress(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        close_events = _CloseFailingRecoveryEvents(
+            asyncio.CancelledError("provider child cancelled malformed reconnect close")
+        )
+
+        async def reconnect(
+            state: ProviderOperationState,
+        ) -> ProviderOperationConnection:
+            connection = ProviderOperationConnection(
+                state=state,
+                status=ProviderOperationStatus.IN_PROGRESS,
+                events=close_events,
+            )
+            object.__setattr__(connection, "status", "malformed")
+            return connection
+
+        provider.adapter.reconnect = reconnect  # type: ignore[method-assign]
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        recovery_task = asyncio.create_task(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await recovery_task
+
+        assert recovery_task.cancelling() == 0
+        assert not recovery_task.cancelled()
+        assert close_events.close_calls == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        required = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        ]
+        assert len(required) == 1
+        assert required[0].payload["recovery_reason"] == "malformed"
+        assert required[0].payload["provider_cleanup_failure"]["error_type"] == "RuntimeError"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("stream_event", "cleanup_failure", "expected_reason"),
+    [
+        (
+            object(),
+            RuntimeError("provider close failed after malformed event"),
+            ProviderOperationUnavailableReason.MALFORMED,
+        ),
+        (
+            ModelStreamEvent.error(
+                "provider rejected recovered operation",
+                cause=ModelProviderError(
+                    "provider rejected recovered operation",
+                    provider="offline-operation",
+                    retryable=False,
+                ),
+                recovery_metadata={"cursor": 2},
+            ),
+            asyncio.CancelledError("provider child cancelled close after error event"),
+            ProviderOperationUnavailableReason.FAILED,
+        ),
+    ],
+    ids=["malformed-ordinary-close", "provider-error-child-cancelled-close"],
+)
+def test_reconnect_event_failure_remains_authoritative_when_close_fails(
+    stream_event: Any,
+    cleanup_failure: BaseException,
+    expected_reason: ProviderOperationUnavailableReason,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = f"provider-reconnect-event-close-{expected_reason.value}"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await _commit_partial_provider_progress(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        reconnect_events = _YieldThenCloseFailingRecoveryEvents(
+            stream_event,
+            cleanup_failure,
+        )
+
+        async def reconnect(state: ProviderOperationState) -> ProviderOperationConnection:
+            return ProviderOperationConnection(
+                state=state,
+                status=ProviderOperationStatus.IN_PROGRESS,
+                events=reconnect_events,
+            )
+
+        provider.adapter.reconnect = reconnect  # type: ignore[method-assign]
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        recovery_task = asyncio.create_task(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await recovery_task
+
+        assert recovery_task.cancelling() == 0
+        assert not recovery_task.cancelled()
+        assert reconnect_events.close_calls == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        required = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        ]
+        assert len(required) == 1
+        assert required[0].payload["recovery_reason"] == expected_reason.value
+        cleanup = required[0].payload["provider_cleanup_failure"]
+        assert cleanup["error_type"] == "ProviderStreamCleanupError"
+        assert cleanup["phase"] == "provider_recovery_stream_cleanup"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("commit_before_raise", [False, True], ids=["pre-commit", "ack-loss"])
+@pytest.mark.parametrize(
+    ("stream_event", "expected_reason"),
+    [
+        (object(), ProviderOperationUnavailableReason.MALFORMED),
+        (
+            ModelStreamEvent.error(
+                "provider rejected recovered operation",
+                cause=ModelProviderError(
+                    "provider rejected recovered operation",
+                    provider="offline-operation",
+                    retryable=False,
+                ),
+                recovery_metadata={"cursor": 2},
+            ),
+            ProviderOperationUnavailableReason.FAILED,
+        ),
+    ],
+    ids=["malformed", "provider-failed"],
+)
+def test_recovery_required_publication_preserves_sanitized_cleanup_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    commit_before_raise: bool,
+    stream_event: Any,
+    expected_reason: ProviderOperationUnavailableReason,
+) -> None:
+    async def scenario() -> None:
+        canary = "provider-recovery-close-secret-canary-0123456789"
+        store = InMemorySessionStore()
+        session_id = (
+            f"provider-recovery-required-publication-{expected_reason.value}-{commit_before_raise}"
+        )
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await _commit_partial_provider_progress(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        reconnect_events = _YieldThenCloseFailingRecoveryEvents(
+            stream_event,
+            RuntimeError(canary),
+        )
+
+        async def reconnect(state: ProviderOperationState) -> ProviderOperationConnection:
+            return ProviderOperationConnection(
+                state=state,
+                status=ProviderOperationStatus.IN_PROGRESS,
+                events=reconnect_events,
+            )
+
+        provider.adapter.reconnect = reconnect  # type: ignore[method-assign]
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(canary),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        publication_failure = RuntimeError("provider recovery event publication failed")
+        original_emit = model_step_executor.RuntimeEventWriter.emit
+
+        async def fail_recovery_required_publication(
+            writer: model_step_executor.RuntimeEventWriter,
+            event: Event,
+        ) -> Event:
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
+                if commit_before_raise:
+                    await original_emit(writer, event)
+                raise publication_failure
+            return await original_emit(writer, event)
+
+        monkeypatch.setattr(
+            model_step_executor.RuntimeEventWriter,
+            "emit",
+            fail_recovery_required_publication,
+        )
+        with pytest.raises(RuntimeError, match="event publication failed") as raised:
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+
+        assert raised.value is publication_failure
+        evidence_type = model_step_executor._ProviderRecoveryRequiredPublicationFailureEvidence
+        assert isinstance(publication_failure.__cause__, evidence_type)
+        evidence = publication_failure.__cause__
+        assert evidence.recovery_reason is expected_reason
+        assert evidence.cleanup_diagnostic["error_type"] == "ProviderStreamCleanupError"
+        assert evidence.cleanup_diagnostic["phase"] == "provider_recovery_stream_cleanup"
+        assert _exception_graph_type_count(publication_failure, evidence_type) == 1
+        diagnostics = "\n".join(
+            (
+                "".join(traceback.format_exception(publication_failure)),
+                repr(vars(evidence)),
+            )
+        )
+        assert canary not in diagnostics
+        assert reconnect_events.close_calls == 1
+        required = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        ]
+        assert len(required) == int(commit_before_raise)
+        if required:
+            assert required[0].payload["recovery_reason"] == expected_reason.value
+            assert canary not in repr(required[0].payload)
+        assert await store.load_active_model_completion_stage(session_id) is not None
+
+    asyncio.run(scenario())
+
+
+def test_exact_start_recovery_ignores_child_only_close_cancellation_after_publication(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-start-close-child-cancellation"
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "recover exact provider start")],
+                )
+            ):
+                pass
+
+        close_events = _CloseFailingRecoveryEvents(
+            asyncio.CancelledError("provider child cancelled exact-start close")
+        )
+
+        async def recover_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            return ProviderOperationConnection(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.COMPLETED,
+                events=close_events,
+            )
+
+        provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+        recovery_task = asyncio.create_task(
+            runtime().recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await recovery_task
+
+        assert recovery_task.cancelling() == 0
+        assert not recovery_task.cancelled()
+        assert close_events.close_calls == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        events = await store.load_events(session_id)
+        assert sum(event.type is EventType.PROVIDER_OPERATION_STARTED for event in events) == 1
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+    assert "Provider recovery stream cleanup failed after exact start publication" in caplog.text
+    assert "CancelledError" not in caplog.text
+
+
+@pytest.mark.parametrize("close_suppresses_cancellation", [False, True])
+def test_exact_start_recovery_preserves_real_task_cancellation_during_close(
+    close_suppresses_cancellation: bool,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-start-close-owner-cancellation"
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "cancel exact provider recovery close")],
+                )
+            ):
+                pass
+
+        close_events = _BlockingRecoveryCloseEvents(
+            suppress_cancellation=close_suppresses_cancellation
+        )
+
+        async def recover_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            return ProviderOperationConnection(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.COMPLETED,
+                events=close_events,
+            )
+
+        provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+        recovery_task = asyncio.create_task(
+            runtime().recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await close_events.close_entered.wait()
+        recovery_task.cancel("caller cancelled provider recovery close")
+        with pytest.raises(asyncio.CancelledError):
+            await recovery_task
+
+        assert recovery_task.cancelling() == 1
+        assert recovery_task.cancelled()
+        assert close_events.cancellation_observed
+        events = await store.load_events(session_id)
+        assert sum(event.type is EventType.PROVIDER_OPERATION_STARTED for event in events) == 1
+
+    asyncio.run(scenario())
+
+
+def test_exact_start_recovery_does_not_redeliver_cancellation_from_event_fan_out() -> None:
+    class BlockingProviderStartedSink(EventSink):
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def emit(self, event: Event) -> None:
+            if event.type is not EventType.PROVIDER_OPERATION_STARTED:
+                return
+            self.entered.set()
+            await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        sink = BlockingProviderStartedSink()
+        session_id = "provider-recovery-start-fan-out-owner-cancellation"
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime() -> CayuApp:
+            app = CayuApp(
+                session_store=store,
+                event_sinks=[sink],
+                enable_logging=False,
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "cancel exact recovery fan-out")],
+                )
+            ):
+                pass
+
+        close_events = _CloseRecordingRecoveryEvents()
+
+        async def recover_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            return ProviderOperationConnection(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.COMPLETED,
+                events=close_events,
+            )
+
+        provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+        recovery_task = asyncio.create_task(
+            runtime().recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await sink.entered.wait()
+        recovery_task.cancel("caller cancelled provider recovery fan-out")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await recovery_task
+
+        assert recovery_task.cancelling() == 1
+        assert recovery_task.cancelled()
+        assert close_events.close_calls == 1
+        assert _exception_graph_type_count(raised.value, asyncio.CancelledError) == 1
+
+    asyncio.run(scenario())
+
+
+def test_exact_start_recovery_preserves_publication_and_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-start-publication-cleanup-failures"
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "fail recovery publication and cleanup")],
+                )
+            ):
+                pass
+
+        store_failure = RuntimeError("provider start recovery store failed")
+        publication_failure = RuntimeError("provider start recovery publication failed")
+        publication_failure.__context__ = store_failure
+        cleanup_failure = RuntimeError("provider start recovery cleanup failed")
+        close_events = _CloseFailingRecoveryEvents(cleanup_failure)
+
+        async def recover_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            return ProviderOperationConnection(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.COMPLETED,
+                events=close_events,
+            )
+
+        original_persist = model_step_executor.RuntimeEventWriter.persist_exact_replay
+
+        async def fail_started_publication(writer, event: Event) -> Event:
+            if event.type is EventType.PROVIDER_OPERATION_STARTED:
+                raise publication_failure
+            return await original_persist(writer, event)
+
+        provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            model_step_executor.RuntimeEventWriter,
+            "persist_exact_replay",
+            fail_started_publication,
+        )
+
+        with pytest.raises(RuntimeError, match="publication failed") as raised:
+            await runtime().recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+
+        assert raised.value is publication_failure
+        assert isinstance(publication_failure.__cause__, BaseExceptionGroup)
+        assert publication_failure.__cause__.exceptions == (
+            store_failure,
+            cleanup_failure,
+        )
+        assert publication_failure.__context__ is None
+        assert cleanup_failure.__context__ is None
+        assert _exception_graph_reference_count(publication_failure, store_failure) == 1
+        assert _exception_graph_reference_count(publication_failure, cleanup_failure) == 1
+        assert _exception_graph_reference_count(publication_failure, publication_failure) == 1
+        assert close_events.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_exact_start_recovery_preserves_cleanup_failure_under_caller_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-start-publication-cleanup-cancellation"
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime() -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "cancel failed provider recovery cleanup")],
+                )
+            ):
+                pass
+
+        publication_failure = RuntimeError("provider start recovery publication failed")
+        cleanup_failure = RuntimeError("provider start recovery cleanup failed")
+        close_events = _BlockingRecoveryCloseEvents(failure_after_cancellation=cleanup_failure)
+
+        async def recover_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            return ProviderOperationConnection(
+                state=provider.adapter.state,
+                status=ProviderOperationStatus.COMPLETED,
+                events=close_events,
+            )
+
+        original_persist = model_step_executor.RuntimeEventWriter.persist_exact_replay
+
+        async def fail_started_publication(writer, event: Event) -> Event:
+            if event.type is EventType.PROVIDER_OPERATION_STARTED:
+                raise publication_failure
+            return await original_persist(writer, event)
+
+        provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            model_step_executor.RuntimeEventWriter,
+            "persist_exact_replay",
+            fail_started_publication,
+        )
+        recovery_task = asyncio.create_task(
+            runtime().recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await close_events.close_entered.wait()
+        recovery_task.cancel("cancel provider recovery after publication failure")
+        with pytest.raises(asyncio.CancelledError):
+            await recovery_task
+
+        assert recovery_task.cancelling() == 1
+        assert recovery_task.cancelled()
+        assert publication_failure.__cause__ is cleanup_failure
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "adapter_cancellation_behavior",
+    ["propagate", "replace", "suppress"],
+)
 def test_provider_recovery_preserves_real_task_cancellation(
-    adapter_replaces_cancellation: bool,
+    adapter_cancellation_behavior: str,
 ) -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
@@ -1811,8 +2713,13 @@ def test_provider_recovery_preserves_real_task_cancellation(
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                if adapter_replaces_cancellation:
+                if adapter_cancellation_behavior == "replace":
                     raise RuntimeError("provider replaced caller cancellation") from None
+                if adapter_cancellation_behavior == "suppress":
+                    return ProviderOperationSnapshot(
+                        state=provider.adapter.state,
+                        status=ProviderOperationStatus.IN_PROGRESS,
+                    )
                 raise
             raise AssertionError("cancelled retrieval unexpectedly continued")
 
@@ -1837,9 +2744,289 @@ def test_provider_recovery_preserves_real_task_cancellation(
 
         assert recovery_task.cancelled()
         events = await store.load_events(session_id)
-        assert EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED not in {
-            event.type for event in events
-        }
+        required = [
+            event
+            for event in events
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        ]
+        assert not required, [event.payload for event in required]
+
+    asyncio.run(scenario())
+
+
+def test_provider_reconnect_preserves_cancellation_suppressed_by_adapter_return() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-reconnect-suppressed-owner-cancellation"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        await _commit_partial_provider_progress(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        reconnect_started = asyncio.Event()
+        close_events = _CloseRecordingRecoveryEvents()
+
+        async def reconnect(
+            state: ProviderOperationState,
+        ) -> ProviderOperationConnection:
+            reconnect_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return ProviderOperationConnection(
+                    state=state,
+                    status=ProviderOperationStatus.IN_PROGRESS,
+                    events=close_events,
+                )
+            raise AssertionError("cancelled reconnect unexpectedly continued")
+
+        provider.adapter.reconnect = reconnect  # type: ignore[method-assign]
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        recovery_task = asyncio.create_task(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await reconnect_started.wait()
+
+        recovery_task.cancel("cancel provider reconnect owner")
+        with pytest.raises(asyncio.CancelledError):
+            await recovery_task
+
+        assert recovery_task.cancelling() == 1
+        assert recovery_task.cancelled()
+        assert close_events.close_calls == 1
+        events = await store.load_events(session_id)
+        assert not any(
+            event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entrance", ["recover_start", "reconnect"])
+def test_provider_recovery_preserves_cancellation_before_malformed_return_classification(
+    entrance: str,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = f"provider-recovery-malformed-return-cancellation-{entrance}"
+        adapter_entered = asyncio.Event()
+
+        if entrance == "recover_start":
+            provider: _OfflineOperationProvider = _IdempotentAmbiguousStartProvider()
+
+            def runtime() -> CayuApp:
+                app = CayuApp(session_store=store, enable_logging=False)
+                app.register_provider(provider, default=True)
+                app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+                return app
+
+            with pytest.raises(_SimulatedProcessLoss):
+                async for _event in runtime().run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "recover one malformed provider start")],
+                    )
+                ):
+                    pass
+
+            async def recover_start(
+                _request: ProviderOperationStartRecoveryRequest,
+            ) -> ProviderOperationConnection:
+                adapter_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    return object()  # type: ignore[return-value]
+                raise AssertionError("cancelled start recovery unexpectedly continued")
+
+            provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
+            app = runtime()
+        else:
+            provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+            await _stage_offline_operation(store, session_id=session_id, provider=provider)
+            await _commit_partial_provider_progress(
+                store,
+                session_id=session_id,
+                provider=provider,
+            )
+
+            async def reconnect(
+                _state: ProviderOperationState,
+            ) -> ProviderOperationConnection:
+                adapter_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    return object()  # type: ignore[return-value]
+                raise AssertionError("cancelled reconnect unexpectedly continued")
+
+            provider.adapter.reconnect = reconnect  # type: ignore[method-assign]
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        recovery_task = asyncio.create_task(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await adapter_entered.wait()
+
+        recovery_task.cancel(f"cancel malformed {entrance} owner")
+        with pytest.raises(asyncio.CancelledError):
+            await recovery_task
+
+        assert recovery_task.cancelling() == 1
+        assert recovery_task.cancelled()
+        events = await store.load_events(session_id)
+        assert not any(
+            event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
+        )
+
+    asyncio.run(scenario())
+
+
+def test_provider_recovery_preserves_mixed_failure_sibling_under_caller_cancellation() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-recovery-mixed-owner-cancellation"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        retrieval_started = asyncio.Event()
+        provider_failure = RuntimeError("provider retrieval also failed")
+
+        async def retrieve(
+            _state: ProviderOperationState,
+        ) -> ProviderOperationSnapshot:
+            retrieval_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise BaseExceptionGroup(
+                    "provider mixed recovery failure",
+                    [cancellation, provider_failure],
+                ) from None
+            raise AssertionError("cancelled retrieval unexpectedly continued")
+
+        provider.adapter.retrieve = retrieve  # type: ignore[method-assign]
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        recovery_task = asyncio.create_task(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await retrieval_started.wait()
+
+        recovery_task.cancel("cancel provider recovery with mixed failure")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await recovery_task
+
+        assert recovery_task.cancelling() == 1
+        assert recovery_task.cancelled()
+        assert isinstance(raised.value.__cause__, BaseExceptionGroup)
+        assert _exception_graph_reference_count(raised.value, raised.value) == 1
+        assert _exception_graph_reference_count(raised.value, provider_failure) == 1
+        events = await store.load_events(session_id)
+        assert not any(
+            event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["direct", "grouped"])
+def test_provider_recovery_preserves_fatal_signal_under_caller_cancellation(
+    grouped: bool,
+) -> None:
+    class FatalProviderRecoverySignal(BaseException):
+        pass
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = f"provider-recovery-fatal-owner-cancellation-{grouped}"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.IN_PROGRESS)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        retrieval_started = asyncio.Event()
+        fatal = FatalProviderRecoverySignal("provider recovery fatal signal")
+        provider_cancellations: list[asyncio.CancelledError] = []
+
+        async def retrieve(
+            _state: ProviderOperationState,
+        ) -> ProviderOperationSnapshot:
+            retrieval_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                provider_cancellations.append(cancellation)
+                if grouped:
+                    raise BaseExceptionGroup(
+                        "provider recovery cancellation and fatal signal",
+                        [cancellation, fatal],
+                    ) from None
+                raise fatal from None
+            raise AssertionError("cancelled retrieval unexpectedly continued")
+
+        provider.adapter.retrieve = retrieve  # type: ignore[method-assign]
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        recovery_task = asyncio.create_task(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        )
+        await retrieval_started.wait()
+
+        recovery_task.cancel("cancel provider recovery before fatal signal")
+        with pytest.raises((FatalProviderRecoverySignal, BaseExceptionGroup)) as raised:
+            await recovery_task
+
+        assert recovery_task.cancelling() == 1
+        assert not recovery_task.cancelled()
+        assert len(provider_cancellations) == 1
+        if grouped:
+            assert isinstance(raised.value, BaseExceptionGroup)
+            assert _exception_graph_reference_count(raised.value, fatal) == 1
+            assert (
+                _exception_graph_reference_count(
+                    raised.value,
+                    provider_cancellations[0],
+                )
+                == 1
+            )
+            assert _exception_graph_type_count(raised.value, asyncio.CancelledError) == 2
+        else:
+            assert raised.value is fatal
+            assert isinstance(fatal.__cause__, asyncio.CancelledError)
+            assert fatal.__cause__ is not provider_cancellations[0]
+            assert fatal.__cause__.args == (
+                "cancel provider recovery before fatal signal",
+            )
+        events = await store.load_events(session_id)
+        assert not any(
+            event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
+        )
 
     asyncio.run(scenario())
 
@@ -2752,6 +3939,171 @@ def test_successful_provider_resolution_redacts_audit_fields_before_persistence_
     assert canary not in "\n".join((caplog.text, captured.out, captured.err))
 
 
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "provider",
+        "model_step_id",
+        "model_attempt_id",
+        "stage_id",
+        "resolution_id",
+        "metadata",
+        "resolved_by",
+        "source",
+        "subject",
+        "tenant",
+        "unavailable",
+        "fail",
+    ],
+)
+def test_provider_resolved_event_contract_survives_short_schema_secret_collisions(
+    secret: str,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "evt-schema-contract-757"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(provider, default=True)
+        recovery_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active = await store.load_active_model_completion_stage(session_id)
+        assert interrupted is not None
+        assert active is not None
+
+        sink = InMemoryEventSink()
+        app = CayuApp(
+            session_store=store,
+            event_sinks=[sink],
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        resolution_stream = app.resolve_provider_operation(
+            ProviderOperationResolutionRequest(
+                session_id=session_id,
+                stage_id=active.stage.stage_id,
+                expected_run_epoch=interrupted.run_epoch,
+                action=ProviderOperationResolutionAction.FAIL,
+                metadata={"ticket": "INC-757"},
+                resolved_by=ResolutionActor(
+                    subject="operator",
+                    tenant="tenant-a",
+                ),
+            )
+        )
+        yielded = await anext(resolution_stream)
+        await resolution_stream.aclose()
+        assert yielded.type is EventType.PROVIDER_OPERATION_RESOLVED
+
+        durable_resolved = next(
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.PROVIDER_OPERATION_RESOLVED
+        )
+        public_resolved = next(
+            event for event in sink.events if event.type is EventType.PROVIDER_OPERATION_RESOLVED
+        )
+        assert durable_resolved.payload["stage_id"] == active.stage.stage_id
+        assert durable_resolved.payload["resolution_id"].startswith("provider-resolution:v1:")
+        assert "stage_id" not in public_resolved.payload
+        assert "resolution_id" not in public_resolved.payload
+        assert public_resolved.payload["operation_id"] == provider.adapter.state.operation_id
+        assert public_resolved.payload["stream_protocol"] == (
+            provider.adapter.state.stream_protocol
+        )
+        assert public_resolved.payload["model_step_id"] == PRIVATE_EVENT_AUTHORITY
+        assert public_resolved.payload["model_attempt_id"] == PRIVATE_EVENT_AUTHORITY
+        assert public_resolved.payload["recovery_reason"] == "unavailable"
+        assert public_resolved.payload["resolution_action"] == "fail"
+        assert public_resolved.payload["duplicate_request_risk"] is True
+        assert public_resolved.payload["metadata"] == {"ticket": "INC-757"}
+        assert set(public_resolved.payload["resolved_by"]) == {
+            "source",
+            "subject",
+            "tenant",
+        }
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("secret", ["idempotent_start_recovery", "unavailable"])
+def test_real_provider_recovery_required_event_survives_schema_secret_collision(
+    secret: str,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        sink = InMemoryEventSink()
+        session_id = "evt-recovery-contract-757"
+        provider = _IdempotentAmbiguousStartProvider()
+
+        def runtime(*, with_secret: bool) -> CayuApp:
+            app = CayuApp(
+                session_store=store,
+                event_sinks=[sink] if with_secret else (),
+                secret_redactor=SecretRedactor(secret) if with_secret else None,
+                enable_logging=False,
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app
+
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in runtime(with_secret=False).run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "recover exact provider start")],
+                )
+            ):
+                pass
+
+        async def unavailable_start(
+            _request: ProviderOperationStartRecoveryRequest,
+        ) -> ProviderOperationConnection:
+            raise RuntimeError("provider recovery is temporarily unavailable")
+
+        provider.adapter.recover_start = unavailable_start  # type: ignore[method-assign]
+        app = runtime(with_secret=True)
+
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+
+        durable_required = next(
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        )
+        public_required = next(
+            event
+            for event in sink.events
+            if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED
+        )
+        assert durable_required.payload["recovery_reason"] == "unavailable"
+        assert durable_required.payload["status"] == "unavailable"
+        assert durable_required.payload["idempotent_start_recovery"] is True
+        assert public_required.payload["recovery_reason"] == "unavailable"
+        assert public_required.payload["status"] == "unavailable"
+        assert public_required.payload["idempotent_start_recovery"] is True
+        assert public_required.payload["model_step_id"] == PRIVATE_EVENT_AUTHORITY
+        assert public_required.payload["model_attempt_id"] == PRIVATE_EVENT_AUTHORITY
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("key_location", ["metadata", "actor_claims"])
 def test_provider_resolution_rejects_secret_bearing_audit_keys_before_persistence(
     key_location: str,
@@ -2804,6 +4156,96 @@ def test_provider_resolution_rejects_secret_bearing_audit_keys_before_persistenc
         assert EventType.PROVIDER_OPERATION_RESOLVED not in {
             event.type for event in await store.load_events(session_id)
         }
+
+    asyncio.run(scenario())
+
+
+def test_provider_resolution_rejects_legacy_store_before_any_publication() -> None:
+    class LegacyOperationStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+
+        async def publish_session_operation(
+            self,
+            session_id: str,
+            *,
+            idempotency_key: str,
+            operation_transform,
+            events: list[Event],
+            expected_statuses: set[SessionStatus] | None = None,
+            expected_run_epoch: int | None = None,
+            expected_transcript_cursor: int | None = None,
+        ):
+            self.publication_calls += 1
+
+            def legacy_transform(session, checkpoint, current_record):
+                publication = operation_transform(session, checkpoint, current_record)
+                return SessionOperationPublication(
+                    checkpoint=publication.checkpoint,
+                    operation_records=publication.operation_records,
+                )
+
+            return await super().publish_session_operation(
+                session_id,
+                idempotency_key=idempotency_key,
+                operation_transform=legacy_transform,
+                events=events,
+                expected_statuses=expected_statuses,
+                expected_run_epoch=expected_run_epoch,
+                expected_transcript_cursor=expected_transcript_cursor,
+            )
+
+    async def scenario() -> None:
+        store = LegacyOperationStore()
+        session_id = "provider-resolution-legacy-store"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active_before = await store.load_active_model_completion_stage(session_id)
+        checkpoint_before = await store.load_checkpoint(session_id)
+        events_before = await store.load_events(session_id)
+        assert interrupted is not None
+        assert active_before is not None
+        assert not store._supports_atomic_model_completion_stage_release_protocol()
+
+        with pytest.raises(
+            ProviderOperationResolutionConflict,
+            match="does not support atomic provider-operation stage release",
+        ):
+            _ = [
+                event
+                async for event in app.resolve_provider_operation(
+                    ProviderOperationResolutionRequest(
+                        session_id=session_id,
+                        stage_id=active_before.stage.stage_id,
+                        expected_run_epoch=interrupted.run_epoch,
+                        action=ProviderOperationResolutionAction.FAIL,
+                    )
+                )
+            ]
+
+        assert store.publication_calls == 0
+        assert await store.load_checkpoint(session_id) == checkpoint_before
+        assert await store.load_active_model_completion_stage(session_id) == active_before
+        assert await store.load_events(session_id) == events_before
+        assert (
+            await load_provider_operation_resolution(
+                store,
+                session_id,
+                active_before.stage.stage_id,
+            )
+            is None
+        )
 
     asyncio.run(scenario())
 
@@ -2863,6 +4305,165 @@ def test_explicit_fail_resolution_terminalizes_without_provider_redispatch() -> 
         assert sum(event.type is EventType.MODEL_ERROR for event in stored_events) == 1
         assert sum(event.type is EventType.INTERACTION_FAILED for event in stored_events) == 1
         assert sum(event.type is EventType.SESSION_FAILED for event in stored_events) == 1
+        assert provider.adapter.start_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_existing_provider_resolution_replays_after_store_capability_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-resolution-capability-upgrade-replay"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        await _stage_offline_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active = await store.load_active_model_completion_stage(session_id)
+        assert interrupted is not None
+        assert active is not None
+        request = ProviderOperationResolutionRequest(
+            session_id=session_id,
+            stage_id=active.stage.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+        )
+
+        accepted = [event async for event in app.resolve_provider_operation(request)]
+        monkeypatch.setattr(
+            type(store),
+            "supports_atomic_model_completion_stage_release",
+            False,
+        )
+
+        replayed = [event async for event in app.resolve_provider_operation(request)]
+
+        assert replayed == [accepted[0]]
+        assert provider.adapter.start_calls == 0
+        stored_events = await store.load_events(session_id)
+        assert (
+            sum(event.type is EventType.PROVIDER_OPERATION_RESOLVED for event in stored_events) == 1
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "capability_after_upgrade",
+    [False, True],
+    ids=["unsupported", "supported"],
+)
+def test_legacy_resolution_replay_rejects_an_unreleased_source_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    capability_after_upgrade: bool,
+) -> None:
+    class UnsafeLegacyOperationStore(InMemorySessionStore):
+        supports_atomic_model_completion_stage_release = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+
+        async def publish_session_operation(
+            self,
+            session_id: str,
+            *,
+            idempotency_key: str,
+            operation_transform,
+            events: list[Event],
+            expected_statuses: set[SessionStatus] | None = None,
+            expected_run_epoch: int | None = None,
+            expected_transcript_cursor: int | None = None,
+        ):
+            self.publication_calls += 1
+
+            def legacy_transform(session, checkpoint, current_record):
+                publication = operation_transform(session, checkpoint, current_record)
+                return SessionOperationPublication(
+                    checkpoint=publication.checkpoint,
+                    operation_records=publication.operation_records,
+                )
+
+            return await super().publish_session_operation(
+                session_id,
+                idempotency_key=idempotency_key,
+                operation_transform=legacy_transform,
+                events=events,
+                expected_statuses=expected_statuses,
+                expected_run_epoch=expected_run_epoch,
+                expected_transcript_cursor=expected_transcript_cursor,
+            )
+
+    async def scenario() -> None:
+        store = UnsafeLegacyOperationStore()
+        session_id = "provider-resolution-legacy-unreleased-replay"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active = await store.load_active_model_completion_stage(session_id)
+        assert interrupted is not None
+        assert active is not None
+        request = ProviderOperationResolutionRequest(
+            session_id=session_id,
+            stage_id=active.stage.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+        )
+
+        first = app.resolve_provider_operation(request)
+        accepted = await anext(first)
+        await first.aclose()
+        assert accepted.type is EventType.PROVIDER_OPERATION_RESOLVED
+        assert store.publication_calls == 1
+        assert await store.load_active_model_completion_stage(session_id) == active
+        assert await load_pending_provider_operation_disposition(store, session_id) is not None
+
+        monkeypatch.setattr(
+            type(store),
+            "supports_atomic_model_completion_stage_release",
+            capability_after_upgrade,
+        )
+        assert (
+            store._supports_atomic_model_completion_stage_release_protocol()
+            is capability_after_upgrade
+        )
+        session_before = await store.load(session_id)
+        checkpoint_before = await store.load_checkpoint(session_id)
+        events_before = await store.load_events(session_id)
+
+        with pytest.raises(
+            ProviderOperationResolutionConflict,
+            match="does not prove atomic source-stage release",
+        ):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+
+        assert store.publication_calls == 1
+        assert await store.load(session_id) == session_before
+        assert await store.load_checkpoint(session_id) == checkpoint_before
+        assert await store.load_active_model_completion_stage(session_id) == active
+        assert await store.load_events(session_id) == events_before
         assert provider.adapter.start_calls == 0
 
     asyncio.run(scenario())
@@ -3602,6 +5203,70 @@ def test_concurrent_exact_resolution_replays_one_budget_settlement() -> None:
         assert sum(event.type is EventType.SESSION_FAILED for event in durable) == 1
         assert await load_pending_provider_operation_disposition(store, session_id) is None
         assert provider.adapter.start_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_resolution_does_not_suppress_unrelated_grouped_terminalization_failure() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-resolution-grouped-terminalization-failure"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active = await store.load_active_model_completion_stage(session_id)
+        assert interrupted is not None
+        assert active is not None
+        request = ProviderOperationResolutionRequest(
+            session_id=session_id,
+            stage_id=active.stage.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+        )
+        original_finalize = app._environment_lifecycle.finalize_terminal_event
+        terminalization_failure = ExceptionGroup(
+            "provider resolution terminalization failed",
+            [RuntimeError("environment cleanup failed")],
+        )
+
+        async def fail_terminalization(**_kwargs: Any) -> Any:
+            raise terminalization_failure
+
+        app._environment_lifecycle.finalize_terminal_event = fail_terminalization
+        with pytest.raises(ExceptionGroup) as raised:
+            _ = [event async for event in app.resolve_provider_operation(request)]
+
+        assert raised.value is terminalization_failure
+        failed = await store.load(session_id)
+        assert failed is not None
+        assert failed.status is SessionStatus.FAILED
+        durable = await store.load_events(session_id)
+        assert sum(event.type is EventType.INTERACTION_FAILED for event in durable) == 1
+        assert not any(event.type is EventType.SESSION_FAILED for event in durable)
+        assert await load_pending_provider_operation_disposition(store, session_id) is not None
+
+        app._environment_lifecycle.finalize_terminal_event = original_finalize
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+
+        assert recovered.status is SessionStatus.FAILED
+        repaired = await store.load_events(session_id)
+        assert sum(event.type is EventType.SESSION_FAILED for event in repaired) == 1
+        assert await load_pending_provider_operation_disposition(store, session_id) is None
+        assert provider.adapter.start_calls == 0
 
     asyncio.run(scenario())
 

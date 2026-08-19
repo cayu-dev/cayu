@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator
 
 _BASE_EXCEPTION_CAUSE_DESCRIPTOR = BaseException.__dict__["__cause__"]
 _BASE_EXCEPTION_CONTEXT_DESCRIPTOR = BaseException.__dict__["__context__"]
+_BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR = BaseException.__dict__["__suppress_context__"]
 _BASE_EXCEPTION_GROUP_EXCEPTIONS_DESCRIPTOR = BaseExceptionGroup.__dict__["exceptions"]
 
 
@@ -58,6 +59,18 @@ def exception_context(error: BaseException) -> BaseException | None:
     return value if isinstance(value, BaseException) else None
 
 
+def exception_suppresses_context(error: BaseException) -> bool:
+    """Return whether the base-owned implicit context is hidden from diagnostics."""
+
+    if not isinstance(error, BaseException):
+        return False
+    try:
+        value = _BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR.__get__(error, BaseException)
+    except BaseException:
+        return False
+    return value is True
+
+
 def set_exception_cause(
     error: BaseException,
     cause: BaseException | None,
@@ -70,6 +83,23 @@ def set_exception_cause(
         return False
     try:
         _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__set__(error, cause)
+    except BaseException:
+        return False
+    return True
+
+
+def set_exception_context(
+    error: BaseException,
+    context: BaseException | None,
+) -> bool:
+    """Set the base-owned implicit context without invoking subclass accessors."""
+
+    if not isinstance(error, BaseException):
+        return False
+    if context is not None and not isinstance(context, BaseException):
+        return False
+    try:
+        _BASE_EXCEPTION_CONTEXT_DESCRIPTOR.__set__(error, context)
     except BaseException:
         return False
     return True

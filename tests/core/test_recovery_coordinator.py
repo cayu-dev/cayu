@@ -224,6 +224,158 @@ def test_recovery_cleanup_preserves_ordered_failures_under_cancellation() -> Non
     asyncio.run(scenario())
 
 
+def test_recovery_cleanup_promotes_fatal_failure_from_grouped_cancellation() -> None:
+    class FatalRecoverySignal(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel("cancel grouped recovery")
+        with pytest.raises(asyncio.CancelledError) as delivered:
+            await asyncio.sleep(0)
+        cancellation = delivered.value
+        sibling = RuntimeError("provider recovery also failed")
+        authoritative = BaseExceptionGroup(
+            "grouped recovery cancellation",
+            [cancellation, sibling],
+        )
+        fatal = FatalRecoverySignal("cleanup process control")
+
+        async def fail() -> None:
+            raise fatal
+
+        with pytest.raises(FatalRecoverySignal) as raised:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative,
+                steps=(("fatal cleanup", fail),),
+            )
+
+        assert raised.value is fatal
+        assert fatal.__cause__ is authoritative
+        assert authoritative.exceptions == (cancellation, sibling)
+        assert task.cancelling() == 1
+
+    asyncio.run(scenario())
+
+
+def test_recovery_cleanup_preserves_cancellation_and_cleanup_cause_graphs() -> None:
+    class FatalRecoverySignal(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel("cancel recovery with prior evidence")
+        with pytest.raises(asyncio.CancelledError) as delivered:
+            await asyncio.sleep(0)
+        cancellation = delivered.value
+        prior_cancellation_cause = LookupError("provider publication failed")
+        cancellation.__cause__ = prior_cancellation_cause
+        child_cancellation = asyncio.CancelledError("cleanup child cancelled")
+        fatal = FatalRecoverySignal("cleanup process control")
+        cleanup_group = BaseExceptionGroup(
+            "cleanup cancellation and process control",
+            [child_cancellation, fatal],
+        )
+        prior_cleanup_cause = ValueError("cleanup had prior evidence")
+        cleanup_group.__cause__ = prior_cleanup_cause
+
+        async def fail() -> None:
+            raise cleanup_group
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=(("fatal cleanup", fail),),
+            )
+
+        assert raised.value is cleanup_group
+        assert cancellation.__cause__ is prior_cancellation_cause
+        assert isinstance(cleanup_group.__cause__, BaseExceptionGroup)
+        assert cleanup_group.__cause__.exceptions == (
+            cancellation,
+            prior_cleanup_cause,
+        )
+        assert cleanup_group.exceptions == (child_cancellation, fatal)
+        assert task.cancelling() == 1
+
+    asyncio.run(scenario())
+
+
+def test_recovery_cleanup_preserves_fatal_implicit_context_under_cancellation() -> None:
+    class FatalRecoverySignal(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel("cancel recovery with implicit cleanup context")
+        with pytest.raises(asyncio.CancelledError) as delivered:
+            await asyncio.sleep(0)
+        cancellation = delivered.value
+        prior_cleanup_failure = RuntimeError("provider cleanup failed first")
+        fatal = FatalRecoverySignal("cleanup process control")
+
+        async def fail() -> None:
+            try:
+                raise prior_cleanup_failure
+            except RuntimeError:
+                raise fatal  # noqa: B904 - exercise Python's implicit exception context
+
+        with pytest.raises(FatalRecoverySignal) as raised:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=(("fatal cleanup", fail),),
+            )
+
+        assert raised.value is fatal
+        assert isinstance(fatal.__cause__, BaseExceptionGroup)
+        assert fatal.__cause__.exceptions == (
+            cancellation,
+            prior_cleanup_failure,
+        )
+        assert fatal.__context__ is prior_cleanup_failure
+        assert fatal.__suppress_context__ is True
+        assert task.cancelling() == 1
+
+    asyncio.run(scenario())
+
+
+def test_recovery_cleanup_does_not_treat_hidden_context_as_visible_evidence() -> None:
+    class FatalRecoverySignal(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel("cancel recovery with hidden cleanup context")
+        with pytest.raises(asyncio.CancelledError) as delivered:
+            await asyncio.sleep(0)
+        cancellation = delivered.value
+        fatal = FatalRecoverySignal("cleanup process control")
+
+        async def fail() -> None:
+            try:
+                raise cancellation
+            except asyncio.CancelledError:
+                raise fatal from None
+
+        with pytest.raises(FatalRecoverySignal) as raised:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=(("fatal cleanup", fail),),
+            )
+
+        assert raised.value is fatal
+        assert fatal.__context__ is cancellation
+        assert fatal.__suppress_context__ is True
+        assert fatal.__cause__ is cancellation
+        assert task.cancelling() == 1
+
+    asyncio.run(scenario())
+
+
 def test_recovery_cancellation_generation_ignores_handled_prior_cancel() -> None:
     async def scenario() -> None:
         task = asyncio.current_task()

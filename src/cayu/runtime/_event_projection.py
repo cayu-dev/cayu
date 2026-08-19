@@ -28,10 +28,15 @@ from cayu.core.tools import (
 )
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.providers.base import ModelFinishReason
+from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.runtime.model_steps import StepClassificationType
+from cayu.runtime.provider_operations import (
+    ProviderOperationResolutionAction,
+    ProviderOperationUnavailableReason,
+)
 from cayu.runtime.public_authority import (
     PUBLIC_AUTHORITY_ALIAS_PREFIX,
     PublicAuthorityAliasCodec,
@@ -386,6 +391,16 @@ _REQUEST_BUILTIN_OPTION_CATEGORY_VALUES = frozenset(
         for key in _REQUEST_SAFE_OPTION_KEYS
     }
 )
+_PROVIDER_OPERATION_STATUS_VALUES = frozenset(status.value for status in ProviderOperationStatus)
+_PROVIDER_OPERATION_UNAVAILABLE_REASON_VALUES = frozenset(
+    reason.value for reason in ProviderOperationUnavailableReason
+)
+_PROVIDER_OPERATION_RECOVERY_STATUS_VALUES = (
+    _PROVIDER_OPERATION_STATUS_VALUES | _PROVIDER_OPERATION_UNAVAILABLE_REASON_VALUES
+)
+_PROVIDER_OPERATION_RESOLUTION_ACTION_VALUES = frozenset(
+    action.value for action in ProviderOperationResolutionAction
+)
 _DECLARED_FIXED_CONTROLS: Mapping[
     EventType,
     Mapping[tuple[str, ...], frozenset[Any]],
@@ -437,6 +452,26 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     },
     EventType.MODEL_STARTED: {
         ("purpose",): frozenset({"context_compaction"}),
+    },
+    **{
+        event_type: {("status",): _PROVIDER_OPERATION_STATUS_VALUES}
+        for event_type in {
+            EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+            EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
+            EventType.PROVIDER_OPERATION_RECONCILED,
+        }
+    },
+    EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED: {
+        ("status",): _PROVIDER_OPERATION_RECOVERY_STATUS_VALUES,
+        ("recovery_reason",): _PROVIDER_OPERATION_UNAVAILABLE_REASON_VALUES,
+        ("idempotent_start_recovery",): frozenset({True, False}),
+        ("provider_cleanup_failure", "phase"): frozenset({"provider_recovery_stream_cleanup"}),
+    },
+    EventType.PROVIDER_OPERATION_RESOLVED: {
+        ("status",): _PROVIDER_OPERATION_RECOVERY_STATUS_VALUES,
+        ("recovery_reason",): _PROVIDER_OPERATION_UNAVAILABLE_REASON_VALUES,
+        ("resolution_action",): _PROVIDER_OPERATION_RESOLUTION_ACTION_VALUES,
+        ("duplicate_request_risk",): frozenset({True, False}),
     },
     EventType.REQUEST_FOOTPRINT_RECORDED: {
         ("schema_version",): frozenset({1}),
@@ -1706,6 +1741,51 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         *provider_operation_cancellation_keys,
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
         public_authority_keys={"operation_id", "stream_protocol"},
+    )
+    provider_cleanup_failure_paths = {
+        ("provider_cleanup_failure", field_name)
+        for field_name in {
+            "durable_value_error_code",
+            "durable_value_error_path",
+            "error",
+            "error_type",
+            "phase",
+        }
+    }
+    policies[EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED] = _policy(
+        *provider_operation_recovery_keys,
+        "idempotent_start_recovery",
+        "provider_cleanup_failure",
+        "recovery_reason",
+        "start_id",
+        owned_nested_paths=provider_cleanup_failure_paths,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS
+        | {"operation_id", "start_id", "stream_protocol"},
+        internal_authority_keys={"start_id"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+        untrusted_container_keys={"provider_cleanup_failure"},
+    )
+    policies[EventType.PROVIDER_OPERATION_RESOLVED] = _policy(
+        *provider_operation_recovery_keys,
+        "duplicate_request_risk",
+        "metadata",
+        "reason",
+        "recovery_reason",
+        "resolution_action",
+        "resolution_id",
+        "resolved_by",
+        "stage_id",
+        owned_nested_paths=_resolution_actor_nested_paths("resolved_by"),
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS
+        | {
+            "operation_id",
+            "resolution_id",
+            "stage_id",
+            "stream_protocol",
+        },
+        internal_authority_keys={"resolution_id", "stage_id"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+        untrusted_container_keys={"metadata"},
     )
 
     tool_common = {

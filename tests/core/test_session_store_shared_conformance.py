@@ -43,6 +43,7 @@ from cayu.core import (
     ToolResultPart,
 )
 from cayu.core.billing import BillingIdentity
+from cayu.core.events import event_with_runtime_payload_authority
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
@@ -13280,6 +13281,7 @@ def test_session_store_conformance_reconstructs_provider_resolution_after_restar
         session_id = "sess_provider_resolution_conformance"
         interaction_id = "interaction-provider-resolution-conformance"
         try:
+            assert store._supports_atomic_model_completion_stage_release_protocol()
             created = await store.create(
                 RunRequest(
                     agent_name="assistant",
@@ -13371,20 +13373,26 @@ def test_session_store_conformance_reconstructs_provider_resolution_after_restar
                             "recovery_metadata": {},
                         },
                     ),
-                    Event(
-                        type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
-                        session_id=created.id,
-                        interaction_id=interaction_id,
-                        agent_name="assistant",
-                        payload={
-                            **common_payload,
-                            "source_run_epoch": created.run_epoch,
-                            "run_epoch": created.run_epoch,
-                            "operation_id": state.operation_id,
-                            "stream_protocol": state.stream_protocol,
-                            "status": "unavailable",
-                            "recovery_reason": "unavailable",
-                        },
+                    event_with_runtime_payload_authority(
+                        Event(
+                            type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                            session_id=created.id,
+                            interaction_id=interaction_id,
+                            agent_name="assistant",
+                            payload={
+                                **common_payload,
+                                "source_run_epoch": created.run_epoch,
+                                "run_epoch": created.run_epoch,
+                                "operation_id": state.operation_id,
+                                "stream_protocol": state.stream_protocol,
+                                "status": "unavailable",
+                                "recovery_reason": "unavailable",
+                            },
+                        ),
+                        "model_attempt_id",
+                        "model_step_id",
+                        "operation_id",
+                        "stream_protocol",
                     ),
                 ],
             )
@@ -13533,20 +13541,26 @@ def test_session_store_conformance_provider_resolution_loses_to_terminal_complet
                             "recovery_metadata": {},
                         },
                     ),
-                    Event(
-                        type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
-                        session_id=created.id,
-                        interaction_id=interaction_id,
-                        agent_name="assistant",
-                        payload={
-                            **common_payload,
-                            "source_run_epoch": created.run_epoch,
-                            "run_epoch": created.run_epoch,
-                            "operation_id": "provider-resolution-terminal-race-operation",
-                            "stream_protocol": "conformance-v1",
-                            "status": "unavailable",
-                            "recovery_reason": "unavailable",
-                        },
+                    event_with_runtime_payload_authority(
+                        Event(
+                            type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
+                            session_id=created.id,
+                            interaction_id=interaction_id,
+                            agent_name="assistant",
+                            payload={
+                                **common_payload,
+                                "source_run_epoch": created.run_epoch,
+                                "run_epoch": created.run_epoch,
+                                "operation_id": "provider-resolution-terminal-race-operation",
+                                "stream_protocol": "conformance-v1",
+                                "status": "unavailable",
+                                "recovery_reason": "unavailable",
+                            },
+                        ),
+                        "model_attempt_id",
+                        "model_step_id",
+                        "operation_id",
+                        "stream_protocol",
                     ),
                 ],
             )

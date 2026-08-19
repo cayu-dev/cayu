@@ -1039,6 +1039,7 @@ class SQLiteSessionStore(SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
+    supports_atomic_model_completion_stage_release: ClassVar[bool] = True
 
     def __init__(
         self,

@@ -6498,6 +6498,7 @@ class SessionStore(ABC):
     supports_active_invocation_execution_profiles: ClassVar[bool] = False
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
+    supports_atomic_model_completion_stage_release: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @property
@@ -7167,6 +7168,24 @@ class SessionStore(ABC):
         expected_transcript_cursor: int | None = None,
     ) -> Session:
         """Atomically publish a checkpoint, events, and terminal operation records."""
+
+    def _supports_atomic_model_completion_stage_release_protocol(self) -> bool:
+        """Return whether this exact publication override owns stage release semantics."""
+
+        capability_owner_index = next(
+            index
+            for index, owner in enumerate(type(self).__mro__)
+            if "supports_atomic_model_completion_stage_release" in owner.__dict__
+        )
+        publication_owner_index = next(
+            index
+            for index, owner in enumerate(type(self).__mro__)
+            if "publish_session_operation" in owner.__dict__
+        )
+        return (
+            self.supports_atomic_model_completion_stage_release is True
+            and capability_owner_index <= publication_owner_index
+        )
 
     async def publish_session_operation_guarded(
         self,
@@ -8140,6 +8159,7 @@ class InMemorySessionStore(SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
+    supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
@@ -18258,6 +18278,23 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
         )
     if event_type == EventType.SESSION_FORKED:
         return ("parent_session_id", "source_session_id")
+    if event_type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
+        return (
+            "model_attempt_id",
+            "model_step_id",
+            "operation_id",
+            "start_id",
+            "stream_protocol",
+        )
+    if event_type == EventType.PROVIDER_OPERATION_RESOLVED:
+        return (
+            "model_attempt_id",
+            "model_step_id",
+            "operation_id",
+            "resolution_id",
+            "stage_id",
+            "stream_protocol",
+        )
     return ()
 
 

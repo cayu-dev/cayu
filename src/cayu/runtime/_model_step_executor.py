@@ -27,9 +27,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from cayu._exception_groups import (
     add_exception_note_safely,
     exception_cause,
+    exception_context,
+    exception_group_children,
     exception_tree_contains,
     iter_exception_tree,
     set_exception_cause,
+    set_exception_context,
 )
 from cayu._task_wait import (
     await_shielded_task_outcome,
@@ -119,6 +122,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._completion_projection import portable_model_completion_projection
+from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
@@ -1227,27 +1231,6 @@ def _classify_provider_recovery_failure(
 ) -> BaseException:
     """Keep current caller cancellation distinct from child-only cancellation."""
 
-    task = asyncio.current_task()
-    if task is not None and task.cancelling() > cancellation_baseline:
-        cancellation = _take_model_completion_cancellation(
-            failure,
-            cancellation_baseline=cancellation_baseline,
-        )
-        if cancellation is None:  # pragma: no cover - guarded by the task count
-            raise AssertionError("Provider recovery lost current task cancellation.")
-        if failure is not cancellation and not exception_tree_contains(
-            failure,
-            asyncio.CancelledError,
-        ):
-            set_exception_cause(cancellation, failure)
-        return cancellation
-    cancellations = [
-        candidate
-        for candidate in iter_exception_tree(failure)
-        if isinstance(candidate, asyncio.CancelledError)
-    ]
-    if not cancellations:
-        return failure
     fatal_leaves = [
         candidate
         for candidate in iter_exception_tree(failure)
@@ -1256,10 +1239,365 @@ def _classify_provider_recovery_failure(
     ]
     if fatal_leaves:
         return failure
+    task = asyncio.current_task()
+    if task is not None and task.cancelling() > cancellation_baseline:
+        cancellation = _current_provider_recovery_cancellation(
+            failure,
+            cancellation_baseline=cancellation_baseline,
+        )
+        if cancellation is None:  # pragma: no cover - guarded by the task count
+            raise AssertionError("Provider recovery lost current task cancellation.")
+        secondary = _provider_recovery_failure_without_identity(
+            failure,
+            excluded_identity=id(cancellation),
+        )
+        if secondary is not None and not _attach_provider_recovery_secondary_failure(
+            cancellation,
+            secondary,
+        ):
+            add_exception_note_safely(
+                cancellation,
+                "Provider recovery also reported additional failures that could not be "
+                "attached to caller cancellation.",
+            )
+        return cancellation
+    cancellations = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if isinstance(candidate, asyncio.CancelledError)
+    ]
+    if not cancellations:
+        return failure
     unexpected = unexpected_child_cancellation_error(cancellations[0], operation=operation)
     if failure is not cancellations[0]:
         set_exception_cause(unexpected, failure)
     return unexpected
+
+
+def _raise_pending_provider_recovery_cancellation(*, cancellation_baseline: int) -> None:
+    """Propagate caller cancellation even when a provider await suppressed delivery."""
+
+    cancellation = _current_provider_recovery_cancellation(
+        None,
+        cancellation_baseline=cancellation_baseline,
+    )
+    if cancellation is None:
+        return
+    raise cancellation
+
+
+def _current_provider_recovery_cancellation(
+    failure: BaseException | None,
+    *,
+    cancellation_baseline: int,
+) -> asyncio.CancelledError | None:
+    """Return current cancellation without consuming and re-arming its task request."""
+
+    task = asyncio.current_task()
+    if task is None or task.cancelling() <= cancellation_baseline:
+        return None
+    cancellation = next(
+        (
+            candidate
+            for candidate in (() if failure is None else iter_exception_tree(failure))
+            if isinstance(candidate, asyncio.CancelledError)
+        ),
+        None,
+    )
+    if cancellation is not None:
+        return cancellation
+    cancel_message = getattr(task, "_cancel_message", None)
+    return (
+        asyncio.CancelledError()
+        if cancel_message is None
+        else asyncio.CancelledError(cancel_message)
+    )
+
+
+def _provider_recovery_cleanup_cancellation_baseline(
+    publication_failure: BaseException | None,
+    *,
+    cancellation_baseline: int,
+) -> int:
+    """Ignore one cancellation already delivered by the publication await."""
+
+    task = asyncio.current_task()
+    if (
+        not isinstance(publication_failure, asyncio.CancelledError)
+        or task is None
+        or task.cancelling() <= cancellation_baseline
+    ):
+        return cancellation_baseline
+    return task.cancelling()
+
+
+async def _close_provider_recovery_iterator(
+    iterator: AsyncIterator[Any],
+    *,
+    cancellation_baseline: int,
+    operation: str,
+) -> Exception | None:
+    """Close one provider-owned recovery iterator without forging caller cancellation."""
+
+    try:
+        close = getattr(iterator, "aclose", None)
+        if callable(close):
+            await close()
+    except BaseException as close_failure:
+        classified = _classify_provider_recovery_failure(
+            close_failure,
+            cancellation_baseline=cancellation_baseline,
+            operation=operation,
+        )
+        if not isinstance(classified, Exception):
+            if classified is close_failure:
+                raise
+            raise classified from close_failure
+        return classified
+    _raise_pending_provider_recovery_cancellation(cancellation_baseline=cancellation_baseline)
+    return None
+
+
+def _provider_recovery_cleanup_payload(
+    failure: Exception,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    diagnostic = exception_diagnostic(
+        failure,
+        empty_message="provider recovery stream cleanup failed",
+        nonportable_message=(
+            "Provider recovery stream cleanup failed with a non-portable diagnostic."
+        ),
+        redactor=redactor,
+    )
+    return {
+        **diagnostic.payload_fields(),
+        "phase": "provider_recovery_stream_cleanup",
+    }
+
+
+class _ProviderRecoveryRequiredPublicationFailureEvidence(RuntimeError):
+    """Sanitized cleanup evidence retained when typed publication also fails."""
+
+    def __init__(
+        self,
+        *,
+        recovery_reason: ProviderOperationUnavailableReason,
+        cleanup_diagnostic: dict[str, Any],
+    ) -> None:
+        copied = copy_durable_json_object(cleanup_diagnostic, "cleanup_diagnostic")
+        error_type = copied.get("error_type")
+        if type(error_type) is not str or not error_type.strip():
+            raise ValueError("Provider recovery cleanup diagnostic has no error type.")
+        super().__init__(
+            "Provider recovery stream cleanup failed before "
+            f"{recovery_reason.value} recovery evidence was acknowledged "
+            f"({error_type})."
+        )
+        self.recovery_reason = recovery_reason
+        self.cleanup_diagnostic = copied
+
+
+async def _emit_provider_recovery_required_event(
+    event_writer: RuntimeEventWriter,
+    event: Event,
+    *,
+    recovery_reason: ProviderOperationUnavailableReason,
+    cleanup_failure: Exception | None,
+    redactor: SecretRedactor,
+) -> Event:
+    """Publish typed recovery evidence without losing sanitized cleanup failure."""
+
+    try:
+        return await event_writer.emit(event)
+    except BaseException as publication_failure:
+        if cleanup_failure is None:
+            raise
+        cleanup_evidence = _ProviderRecoveryRequiredPublicationFailureEvidence(
+            recovery_reason=recovery_reason,
+            cleanup_diagnostic=_provider_recovery_cleanup_payload(
+                cleanup_failure,
+                redactor=redactor,
+            ),
+        )
+        if not _attach_provider_recovery_secondary_failure(
+            publication_failure,
+            cleanup_evidence,
+        ):
+            raise BaseExceptionGroup(
+                "Provider recovery evidence publication and stream cleanup both failed.",
+                [publication_failure, cleanup_evidence],
+            ) from None
+        add_exception_note_safely(
+            publication_failure,
+            "Provider recovery-required publication also retained sanitized "
+            f"{recovery_reason.value} stream-cleanup evidence.",
+        )
+        raise
+
+
+def _provider_recovery_failure_without_identity(
+    error: BaseException,
+    *,
+    excluded_identity: int,
+) -> BaseException | None:
+    """Remove one owned failure while retaining ordered non-overlapping subgroups."""
+
+    pending: list[tuple[BaseException, bool]] = [(error, False)]
+    children_by_group: dict[int, tuple[BaseException, ...]] = {}
+    retained_by_identity: dict[int, BaseException | None] = {}
+    while pending:
+        candidate, expanded = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in retained_by_identity:
+            continue
+        if candidate_id == excluded_identity:
+            retained_by_identity[candidate_id] = None
+            continue
+        if not isinstance(candidate, BaseExceptionGroup):
+            retained_by_identity[candidate_id] = candidate
+            continue
+        if expanded:
+            children = children_by_group.pop(candidate_id, ())
+            retained_children = [
+                retained
+                for child in children
+                if (retained := retained_by_identity.get(id(child))) is not None
+            ]
+            if not retained_children:
+                retained_by_identity[candidate_id] = None
+            elif len(retained_children) == len(children) and all(
+                retained is child
+                for retained, child in zip(retained_children, children, strict=True)
+            ):
+                retained_by_identity[candidate_id] = candidate
+            else:
+                retained_by_identity[candidate_id] = BaseExceptionGroup(
+                    "Provider recovery additional non-cancellation failures.",
+                    retained_children,
+                )
+            continue
+        children = exception_group_children(candidate)
+        if children is None:
+            retained_by_identity[candidate_id] = RuntimeError(
+                "Provider recovery received an unreadable exception group."
+            )
+            continue
+        children_by_group[candidate_id] = children
+        pending.append((candidate, True))
+        pending.extend((child, False) for child in reversed(children))
+
+    return retained_by_identity.get(id(error))
+
+
+def _provider_recovery_failure_graph_contains_identity(
+    error: BaseException,
+    *,
+    target_identity: int,
+) -> bool:
+    """Return whether one safe exception graph contains an exact object identity."""
+
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id == target_identity:
+            return True
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(children)
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
+        context = exception_context(candidate)
+        if context is not None:
+            pending.append(context)
+    return False
+
+
+def _detach_provider_recovery_back_edges(
+    error: BaseException,
+    *,
+    target: BaseException,
+) -> bool:
+    """Remove causal links back to a primary error before attaching this graph."""
+
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                if any(child is target for child in children):
+                    return False
+                pending.extend(children)
+        cause = exception_cause(candidate)
+        if cause is target:
+            if not set_exception_cause(candidate, None):
+                return False
+        elif cause is not None:
+            pending.append(cause)
+        context = exception_context(candidate)
+        if context is target:
+            if not set_exception_context(candidate, None):
+                return False
+        elif context is not None:
+            pending.append(context)
+    return True
+
+
+def _attach_provider_recovery_secondary_failure(
+    primary: BaseException,
+    secondary: BaseException,
+) -> bool:
+    """Retain one ordered recovery failure as an acyclic causal graph."""
+
+    if primary is secondary:
+        return True
+    if not _detach_provider_recovery_back_edges(secondary, target=primary):
+        return False
+    if _provider_recovery_failure_graph_contains_identity(
+        secondary,
+        target_identity=id(primary),
+    ):
+        return False
+    prior_cause = exception_cause(primary)
+    prior_context = None if prior_cause is not None else exception_context(primary)
+    prior_failure = prior_cause if prior_cause is not None else prior_context
+    if prior_failure is secondary or (
+        prior_failure is not None
+        and _provider_recovery_failure_graph_contains_identity(
+            prior_failure,
+            target_identity=id(secondary),
+        )
+    ):
+        return True
+    if prior_failure is None or _provider_recovery_failure_graph_contains_identity(
+        secondary,
+        target_identity=id(prior_failure),
+    ):
+        combined = secondary
+    else:
+        combined = BaseExceptionGroup(
+            "Provider recovery publication and stream cleanup both failed.",
+            [prior_failure, secondary],
+        )
+    if not set_exception_cause(primary, combined):
+        return False
+    if prior_context is not None:
+        set_exception_context(primary, None)
+    return True
 
 
 def _take_model_completion_cancellation(
@@ -2270,7 +2608,28 @@ class ModelStepExecutor:
 
         async def unavailable(
             reason: ProviderOperationUnavailableReason,
+            *,
+            cleanup_failure: Exception | None = None,
         ) -> ProviderOperationRecoveryResult:
+            payload: dict[str, Any] = {
+                "provider": registered_provider.name,
+                "model": session.model,
+                "step": start.step,
+                "attempt": start.attempt,
+                "max_attempts": start.max_attempts,
+                **start.model_attempt_identity.payload(),
+                "source_run_epoch": start.source_run_epoch,
+                "run_epoch": session.run_epoch,
+                "start_id": start.start_id,
+                "status": reason.value,
+                "recovery_reason": reason.value,
+                "idempotent_start_recovery": exact_recovery,
+            }
+            if cleanup_failure is not None:
+                payload["provider_cleanup_failure"] = _provider_recovery_cleanup_payload(
+                    cleanup_failure,
+                    redactor=self._secret_redactor,
+                )
             required = _event_with_model_identity_authority(
                 Event(
                     type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
@@ -2278,25 +2637,18 @@ class ModelStepExecutor:
                     interaction_id=start.interaction_id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                    payload={
-                        "provider": registered_provider.name,
-                        "model": session.model,
-                        "step": start.step,
-                        "attempt": start.attempt,
-                        "max_attempts": start.max_attempts,
-                        **start.model_attempt_identity.payload(),
-                        "source_run_epoch": start.source_run_epoch,
-                        "run_epoch": session.run_epoch,
-                        "start_id": start.start_id,
-                        "status": reason.value,
-                        "recovery_reason": reason.value,
-                        "idempotent_start_recovery": exact_recovery,
-                    },
+                    payload=payload,
                 ),
                 start.model_attempt_identity,
             )
             required = event_with_runtime_payload_authority(required, "start_id")
-            emitted = await self._event_writer.emit(required)
+            emitted = await _emit_provider_recovery_required_event(
+                self._event_writer,
+                required,
+                recovery_reason=reason,
+                cleanup_failure=cleanup_failure,
+                redactor=self._secret_redactor,
+            )
             return ProviderOperationRecoveryResult(
                 status=ProviderOperationRecoveryStatus.UNAVAILABLE,
                 events=(emitted,),
@@ -2308,9 +2660,7 @@ class ModelStepExecutor:
         if adapter.start_idempotency_support is not ProviderOperationStartIdempotencySupport.EXACT:
             return await unavailable(ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION)
         recovery_task = asyncio.current_task()
-        recovery_cancellation_baseline = (
-            0 if recovery_task is None else recovery_task.cancelling()
-        )
+        recovery_cancellation_baseline = 0 if recovery_task is None else recovery_task.cancelling()
         try:
             raw_connection = await adapter.recover_start(
                 ProviderOperationStartRecoveryRequest(idempotency_key=start.start_id)
@@ -2326,11 +2676,27 @@ class ModelStepExecutor:
             return await unavailable(ProviderOperationUnavailableReason.UNAVAILABLE)
         try:
             connection = copy_provider_operation_connection(raw_connection)
-        except Exception:
+        except Exception as malformed_failure:
+            cleanup_failure = None
             if type(raw_connection) is ProviderOperationConnection:
-                async with aclosing_provider_stream(raw_connection.events):
-                    pass
-            return await unavailable(ProviderOperationUnavailableReason.MALFORMED)
+                cleanup_failure = await _close_provider_recovery_iterator(
+                    raw_connection.events,
+                    cancellation_baseline=recovery_cancellation_baseline,
+                    operation="Provider operation malformed start recovery stream cleanup",
+                )
+            _raise_pending_provider_recovery_cancellation(
+                cancellation_baseline=recovery_cancellation_baseline
+            )
+            if cleanup_failure is not None:
+                add_exception_note_safely(
+                    malformed_failure,
+                    "Provider recovery stream cleanup also failed with "
+                    f"{type(cleanup_failure).__name__}.",
+                )
+            return await unavailable(
+                ProviderOperationUnavailableReason.MALFORMED,
+                cleanup_failure=cleanup_failure,
+            )
 
         operation_event = _event_with_model_identity_authority(
             Event(
@@ -2366,11 +2732,76 @@ class ModelStepExecutor:
             operation_event,
             "start_id",
         )
+        publication_failure: BaseException | None = None
         try:
             persisted = await self._event_writer.persist_exact_replay(operation_event)
             [emitted] = await self._event_writer.fan_out_persisted([persisted])
+        except BaseException as failure:
+            publication_failure = failure
+            raise
         finally:
-            await _close_async_iterator(raw_connection.events)
+            cleanup_cancellation_baseline = _provider_recovery_cleanup_cancellation_baseline(
+                publication_failure,
+                cancellation_baseline=recovery_cancellation_baseline,
+            )
+            try:
+                cleanup_failure = await _close_provider_recovery_iterator(
+                    raw_connection.events,
+                    cancellation_baseline=cleanup_cancellation_baseline,
+                    operation="Provider operation start recovery stream cleanup",
+                )
+            except BaseException as cleanup_signal:
+                if (
+                    publication_failure is not None
+                    and cleanup_signal is not publication_failure
+                    and not any(
+                        candidate is publication_failure
+                        for candidate in iter_exception_tree(cleanup_signal)
+                    )
+                ):
+                    cleanup_cause = exception_cause(cleanup_signal)
+                    if (
+                        cleanup_cause is not None
+                        and cleanup_cause is not publication_failure
+                        and not _attach_provider_recovery_secondary_failure(
+                            publication_failure,
+                            cleanup_cause,
+                        )
+                    ):
+                        raise BaseExceptionGroup(
+                            "Provider recovery publication and stream cleanup both failed.",
+                            [publication_failure, cleanup_signal],
+                        ) from cleanup_signal
+                    if not set_exception_cause(cleanup_signal, publication_failure):
+                        raise BaseExceptionGroup(
+                            "Provider recovery publication and stream cleanup both failed.",
+                            [publication_failure, cleanup_signal],
+                        ) from cleanup_signal
+                raise
+            if cleanup_failure is not None:
+                diagnostic = _provider_recovery_cleanup_payload(
+                    cleanup_failure,
+                    redactor=self._secret_redactor,
+                )
+                if publication_failure is not None:
+                    if not _attach_provider_recovery_secondary_failure(
+                        publication_failure,
+                        cleanup_failure,
+                    ):
+                        raise BaseExceptionGroup(
+                            "Provider recovery publication and stream cleanup both failed.",
+                            [publication_failure, cleanup_failure],
+                        )
+                    add_exception_note_safely(
+                        publication_failure,
+                        "Provider recovery stream cleanup also failed with "
+                        f"{diagnostic['error_type']}.",
+                    )
+                else:
+                    logger.warning(
+                        "Provider recovery stream cleanup failed after exact start publication: %s",
+                        diagnostic["error_type"],
+                    )
         operation = await load_recoverable_provider_operation(
             self._session_store,
             stage,
@@ -2494,8 +2925,9 @@ class ModelStepExecutor:
             *,
             status: str,
             recovery_reason: ProviderOperationUnavailableReason | None = None,
+            cleanup_failure: Exception | None = None,
         ) -> Event:
-            payload = {
+            payload: dict[str, Any] = {
                 "provider": registered_provider.name,
                 "model": session.model,
                 "step": operation.step,
@@ -2510,6 +2942,11 @@ class ModelStepExecutor:
             }
             if recovery_reason is not None:
                 payload["recovery_reason"] = recovery_reason.value
+            if cleanup_failure is not None:
+                payload["provider_cleanup_failure"] = _provider_recovery_cleanup_payload(
+                    cleanup_failure,
+                    redactor=self._secret_redactor,
+                )
             event = _event_with_model_identity_authority(
                 Event(
                     type=event_type,
@@ -2576,15 +3013,22 @@ class ModelStepExecutor:
         async def unavailable_recovery_result(
             reason: ProviderOperationUnavailableReason,
             status: ProviderOperationStatus | str,
+            *,
+            cleanup_failure: Exception | None = None,
         ) -> ProviderOperationRecoveryResult:
             await require_recovery_owner()
             status_value = status.value if isinstance(status, ProviderOperationStatus) else status
-            required = await self._event_writer.emit(
+            required = await _emit_provider_recovery_required_event(
+                self._event_writer,
                 recovery_event(
                     EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
                     status=status_value,
                     recovery_reason=reason,
-                )
+                    cleanup_failure=cleanup_failure,
+                ),
+                recovery_reason=reason,
+                cleanup_failure=cleanup_failure,
+                redactor=self._secret_redactor,
             )
             recovered_events.append(required)
             return ProviderOperationRecoveryResult(
@@ -2807,16 +3251,43 @@ class ModelStepExecutor:
                 )
             try:
                 connection = copy_provider_operation_connection(raw_connection)
-            except Exception:
+            except Exception as malformed_failure:
+                cleanup_failure = None
                 if type(raw_connection) is ProviderOperationConnection:
-                    try:
-                        async with aclosing_provider_stream(raw_connection.events):
-                            pass
-                    except Exception:
-                        pass
+                    cleanup_failure = await _close_provider_recovery_iterator(
+                        raw_connection.events,
+                        cancellation_baseline=recovery_cancellation_baseline,
+                        operation="Provider operation malformed reconnect stream cleanup",
+                    )
+                _raise_pending_provider_recovery_cancellation(
+                    cancellation_baseline=recovery_cancellation_baseline
+                )
+                if cleanup_failure is not None:
+                    add_exception_note_safely(
+                        malformed_failure,
+                        "Provider recovery stream cleanup also failed with "
+                        f"{type(cleanup_failure).__name__}.",
+                    )
                 return await unavailable_recovery_result(
                     ProviderOperationUnavailableReason.MALFORMED,
                     "malformed",
+                    cleanup_failure=cleanup_failure,
+                )
+            recovery_task = asyncio.current_task()
+            if (
+                recovery_task is not None
+                and recovery_task.cancelling() > recovery_cancellation_baseline
+            ):
+                await _close_provider_recovery_iterator(
+                    connection.events,
+                    cancellation_baseline=recovery_cancellation_baseline,
+                    operation=(
+                        "Provider operation reconnect stream cleanup after suppressed caller "
+                        "cancellation"
+                    ),
+                )
+                raise AssertionError(
+                    "Provider reconnect cleanup returned with caller cancellation pending."
                 )
             reconnect_unavailable: (
                 tuple[
@@ -2825,6 +3296,7 @@ class ModelStepExecutor:
                 ]
                 | None
             ) = None
+            reconnect_cleanup_failure: Exception | None = None
             try:
                 async with aclosing_provider_stream(connection.events) as reconnect_events:
                     if connection.state != operation.state:
@@ -2856,20 +3328,29 @@ class ModelStepExecutor:
                 )
                 if completed_event is None:
                     if isinstance(stream_failure, Exception):
-                        reconnect_unavailable = (
-                            ProviderOperationUnavailableReason.UNAVAILABLE,
-                            ProviderOperationStatus.UNAVAILABLE,
-                        )
+                        if reconnect_unavailable is None:
+                            reconnect_unavailable = (
+                                ProviderOperationUnavailableReason.UNAVAILABLE,
+                                ProviderOperationStatus.UNAVAILABLE,
+                            )
+                        else:
+                            reconnect_cleanup_failure = stream_failure
                     else:
                         raise
                 else:
                     retain_post_completion_failure(stream_failure)
             if reconnect_unavailable is not None and completed_event is None:
-                return await unavailable_recovery_result(*reconnect_unavailable)
+                return await unavailable_recovery_result(
+                    *reconnect_unavailable,
+                    cleanup_failure=reconnect_cleanup_failure,
+                )
         else:
             try:
                 raw_snapshot = await adapter.retrieve(
                     copy_provider_operation_state(operation.state)
+                )
+                _raise_pending_provider_recovery_cancellation(
+                    cancellation_baseline=recovery_cancellation_baseline
                 )
             except BaseException as recovery_failure:
                 recovery_failure = _classify_provider_recovery_failure(

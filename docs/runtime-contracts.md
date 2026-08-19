@@ -4338,6 +4338,13 @@ owner until fallback dispatch is durably staged or failure terminalization is
 durable. Incomplete-session recovery claims and finishes that exact disposition
 after process loss; it never submits the unavailable operation again. SQLite and
 PostgreSQL reconstruct the same record and pending ownership after process loss.
+Provider-operation resolution is available only when the session store explicitly
+advertises `supports_atomic_model_completion_stage_release`. The capability
+requires `publish_session_operation(...)` to validate and release the exact active
+model-completion stage in the same transaction as its checkpoint, resolution
+record, and event. Built-in stores provide that boundary. Custom stores default to
+unsupported and reject resolution before mutation until their exact publication
+override implements and opts into the strengthened contract.
 `POST /api/provider-operations/resolve`, the bundled dashboard,
 and `cayu session resolve-provider-operation` are equivalent authenticated
 operator surfaces. Ambiguous submission, unavailable retrieval, malformed

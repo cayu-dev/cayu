@@ -28,6 +28,9 @@ from uuid import UUID, uuid4, uuid5
 from cayu._exception_groups import (
     add_exception_note_safely,
     exception_cause,
+    exception_context,
+    exception_group_children,
+    exception_suppresses_context,
     iter_exception_tree,
     set_exception_cause,
 )
@@ -760,6 +763,58 @@ def _prepend_exception_cause(error: BaseException, cause: BaseException) -> None
     set_exception_cause(error, cause)
 
 
+def _exception_graph_contains_identity(
+    error: BaseException,
+    target: BaseException,
+) -> bool:
+    """Inspect one base-owned exception graph without invoking extension accessors."""
+
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is target:
+            return True
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(children)
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
+        elif not exception_suppresses_context(candidate):
+            context = exception_context(candidate)
+            if context is not None:
+                pending.append(context)
+    return False
+
+
+def _attach_exception_cause_preserving_graph(
+    error: BaseException,
+    cause: BaseException,
+) -> bool:
+    """Attach one cause without mutating it or discarding either existing graph."""
+
+    if _exception_graph_contains_identity(error, cause):
+        return True
+    existing = exception_cause(error)
+    if existing is None and not exception_suppresses_context(error):
+        existing = exception_context(error)
+    if existing is None:
+        return set_exception_cause(error, cause)
+    if _exception_graph_contains_identity(cause, existing):
+        return set_exception_cause(error, cause)
+    combined = BaseExceptionGroup(
+        "Continuation recovery retained prior and concurrent failure evidence",
+        [cause, existing],
+    )
+    return set_exception_cause(error, combined)
+
+
 async def _run_recovery_cleanup_steps(
     *,
     authoritative_failure: BaseException | None,
@@ -804,6 +859,34 @@ async def _run_recovery_cleanup_steps(
 
     if not cleanup_failures:
         return ()
+    if isinstance(abandonment, asyncio.CancelledError) and authoritative_failure is not None:
+        fatal_cleanup_failures = [
+            failure
+            for _operation, failure in cleanup_failures
+            if any(
+                not isinstance(candidate, BaseExceptionGroup)
+                and not isinstance(candidate, (Exception, asyncio.CancelledError))
+                for candidate in iter_exception_tree(failure)
+            )
+        ]
+        if fatal_cleanup_failures:
+            fatal_failure: BaseException
+            if len(cleanup_failures) == 1:
+                fatal_failure = cleanup_failures[0][1]
+            else:
+                fatal_failure = BaseExceptionGroup(
+                    "Continuation recovery cleanup and process-control failures",
+                    [failure for _operation, failure in cleanup_failures],
+                )
+            if not _attach_exception_cause_preserving_graph(
+                fatal_failure,
+                authoritative_failure,
+            ):
+                fatal_failure = BaseExceptionGroup(
+                    "Continuation recovery cancellation and fatal cleanup failure",
+                    [fatal_failure, authoritative_failure],
+                )
+            raise fatal_failure
     if authoritative_failure is not None and not isinstance(authoritative_failure, GeneratorExit):
         failures = tuple(cleanup_failures)
         for operation, cleanup_failure in cleanup_failures:
@@ -1134,6 +1217,10 @@ CancelProviderOperation = Callable[
     ],
     Awaitable[ProviderOperationSnapshot | None],
 ]
+InteractionTransitionReplayFailures = Callable[
+    [BaseException],
+    tuple[Exception, ...] | None,
+]
 
 
 class RecoveryCoordinator:
@@ -1169,6 +1256,7 @@ class RecoveryCoordinator:
         recover_provider_operation: RecoverProviderOperation,
         recover_provider_operation_start: RecoverProviderOperationStart,
         cancel_provider_operation: CancelProviderOperation,
+        interaction_transition_replay_failures: InteractionTransitionReplayFailures,
     ) -> None:
         self._session_store = session_store
         self._task_store = task_store
@@ -1197,6 +1285,7 @@ class RecoveryCoordinator:
         self._recover_provider_operation = recover_provider_operation
         self._recover_provider_operation_start = recover_provider_operation_start
         self._cancel_provider_operation = cancel_provider_operation
+        self._interaction_transition_replay_failures = interaction_transition_replay_failures
         self._workspace_artifact_recovery_operations = BoundedInvocationOperationRegistry(
             max_operations=64
         )
@@ -3357,6 +3446,14 @@ class RecoveryCoordinator:
             try:
                 async for event in disposition_stream:
                     yield event
+            except ExceptionGroup as replay_failure:
+                if self._interaction_transition_replay_failures(
+                    replay_failure
+                ) is None or not await self._provider_operation_disposition_execution_started(
+                    pending=pending,
+                    result=durable_result,
+                ):
+                    raise
             except (SessionRunFenced, SessionStatusConflict):
                 if not await self._provider_operation_disposition_execution_started(
                     pending=pending,
@@ -11953,9 +12050,20 @@ class RecoveryCoordinator:
         recovery: Callable[[], Awaitable[IncompleteSessionRecoveryResult]],
     ) -> IncompleteSessionRecoveryResult:
         stop_heartbeat = asyncio.Event()
+        recovery_outcome_observed = False
 
-        async def run_recovery() -> IncompleteSessionRecoveryResult:
-            return await recovery()
+        async def run_recovery() -> CapturedAwaitableOutcome[IncompleteSessionRecoveryResult]:
+            return await capture_awaitable_outcome(recovery)
+
+        def recovery_outcome() -> IncompleteSessionRecoveryResult:
+            nonlocal recovery_outcome_observed
+            captured = recovery_task.result()
+            recovery_outcome_observed = True
+            if captured.error is not None:
+                raise captured.error
+            if captured.result is None:
+                raise RuntimeError("Incomplete-session recovery returned no result.")
+            return captured.result
 
         recovery_task = asyncio.create_task(run_recovery())
         heartbeat_task = asyncio.create_task(
@@ -11974,6 +12082,17 @@ class RecoveryCoordinator:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(recovery_task, heartbeat_task, return_exceptions=True)
+            if recovery_outcome_observed or recovery_task.cancelled():
+                return
+            captured = recovery_task.result()
+            if captured.error is None:
+                return
+            if isinstance(captured.error, asyncio.CancelledError):
+                secondary = exception_cause(captured.error)
+                if secondary is not None:
+                    raise secondary
+                return
+            raise captured.error
 
         try:
             done, _pending = await asyncio.wait(
@@ -11987,7 +12106,7 @@ class RecoveryCoordinator:
                         "Incomplete-session recovery claim heartbeat stopped unexpectedly."
                     )
                 raise heartbeat_failure
-            result = recovery_task.result()
+            result = recovery_outcome()
             stop_heartbeat.set()
             await heartbeat_task
             return result
