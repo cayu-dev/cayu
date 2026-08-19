@@ -126,6 +126,18 @@ class ExaWebAdapter:
         ctx: ToolContext,
         request: WebSearchAdapterRequest,
     ) -> ToolResult:
+        if (
+            request.restrictions.include_domains
+            or request.restrictions.exclude_domains
+            or request.restrictions.published_on_or_after is not None
+            or request.restrictions.country is not None
+            or request.restrictions.locale is not None
+            or request.restrictions.content_types
+        ):
+            return _error_result(
+                "unsupported_semantics",
+                "This Exa adapter cannot enforce the configured search restrictions.",
+            )
         contents: dict[str, Any] = {
             "highlights": {
                 "query": request.query,

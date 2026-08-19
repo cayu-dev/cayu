@@ -68,6 +68,7 @@ from cayu.tools.web import (
     WebFetchTool,
     WebSearchAdapter,
     WebSearchAdapterRequest,
+    WebSearchRestrictions,
     WebSearchTool,
 )
 
@@ -126,6 +127,7 @@ __all__ = [
     "WebFetchTool",
     "WebSearchAdapter",
     "WebSearchAdapterRequest",
+    "WebSearchRestrictions",
     "WebSearchTool",
     "WriteFileTool",
     "default_artifact_readers",

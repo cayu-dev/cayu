@@ -29,6 +29,7 @@ from cayu import (
     StaticVault,
     ToolContext,
     WebFetchTool,
+    WebSearchRestrictions,
     WebSearchTool,
 )
 
@@ -1156,6 +1157,21 @@ def test_exa_transport_cancellation_remains_authoritative() -> None:
             await task
 
     asyncio.run(scenario())
+
+
+def test_exa_rejects_search_restrictions_before_credential_access() -> None:
+    proxy = _CredentialProxy()
+
+    result = asyncio.run(
+        WebSearchTool(
+            adapter=ExaWebAdapter(api_key_ref=_API_KEY_REF),
+            restrictions=WebSearchRestrictions(include_domains=("example.com",)),
+        ).run(_context(proxy), {"query": "restricted"})
+    )
+
+    assert result.structured == {"error": "unsupported_semantics"}
+    assert proxy.authorizations == []
+    assert proxy.resolutions == []
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,8 @@ import ipaddress
 import math
 import socket
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from html.parser import HTMLParser
 from typing import Any, Literal, Protocol, runtime_checkable
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
@@ -41,6 +42,7 @@ MAX_WEB_SEARCH_RESULTS = 100
 MAX_WEB_SEARCH_SNIPPET_BYTES = 10 * 1024
 MAX_WEB_SEARCH_TOTAL_SNIPPET_BYTES = 256 * 1024
 MAX_WEB_SEARCH_TIMEOUT_SECONDS = 120.0
+MAX_WEB_SEARCH_CONTENT_TYPES = 32
 _EXTRACTION_CHUNK_BYTES = 16 * 1024
 
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
@@ -134,6 +136,47 @@ class WebFetchAdapterRequest:
 
 
 @dataclass(frozen=True)
+class WebSearchRestrictions:
+    """Application-owned restrictions for provider-backed web search.
+
+    These settings never enter the model-facing tool schema. Adapters must
+    either enforce every non-empty field or return ``unsupported_semantics``;
+    silently broadening a restricted search is not permitted.
+    """
+
+    include_domains: tuple[str, ...] = ()
+    exclude_domains: tuple[str, ...] = ()
+    published_on_or_after: date | None = None
+    country: str | None = None
+    locale: str | None = None
+    content_types: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        include_domains = _web_search_domains(self.include_domains, "include_domains")
+        exclude_domains = _web_search_domains(self.exclude_domains, "exclude_domains")
+        if len(include_domains) + len(exclude_domains) > 200:
+            raise ValueError("search restrictions cannot contain more than 200 domains.")
+        overlap = set(include_domains) & set(exclude_domains)
+        if overlap:
+            raise ValueError("include_domains and exclude_domains must not overlap.")
+        if self.published_on_or_after is not None and type(self.published_on_or_after) is not date:
+            raise TypeError("published_on_or_after must be a date or None.")
+        country = _web_search_optional_code(
+            self.country,
+            "country",
+            exact_length=2,
+            ascii_letters_only=True,
+        )
+        locale = _web_search_optional_code(self.locale, "locale", maximum_length=64)
+        content_types = _web_search_content_types(self.content_types)
+        object.__setattr__(self, "include_domains", include_domains)
+        object.__setattr__(self, "exclude_domains", exclude_domains)
+        object.__setattr__(self, "country", country)
+        object.__setattr__(self, "locale", locale)
+        object.__setattr__(self, "content_types", content_types)
+
+
+@dataclass(frozen=True)
 class WebSearchAdapterRequest:
     """Canonical bounded request passed to a selected web-search adapter."""
 
@@ -142,6 +185,7 @@ class WebSearchAdapterRequest:
     max_snippet_bytes: int
     max_total_snippet_bytes: int
     timeout_seconds: float
+    restrictions: WebSearchRestrictions = field(default_factory=WebSearchRestrictions)
 
 
 @runtime_checkable
@@ -545,6 +589,7 @@ class WebSearchTool(Tool):
         max_snippet_bytes: int = DEFAULT_WEB_SEARCH_MAX_SNIPPET_BYTES,
         max_total_snippet_bytes: int = DEFAULT_WEB_SEARCH_MAX_TOTAL_SNIPPET_BYTES,
         timeout_seconds: float = DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
+        restrictions: WebSearchRestrictions | None = None,
         spec: ToolSpec | None = None,
     ) -> None:
         if not isinstance(adapter, WebSearchAdapter):
@@ -582,6 +627,11 @@ class WebSearchTool(Tool):
             minimum=0.001,
             maximum=MAX_WEB_SEARCH_TIMEOUT_SECONDS,
         )
+        if restrictions is None:
+            restrictions = WebSearchRestrictions()
+        if type(restrictions) is not WebSearchRestrictions:
+            raise TypeError("restrictions must be WebSearchRestrictions or None.")
+        self.restrictions = restrictions
         super().__init__(
             spec
             or _web_search_tool_spec(
@@ -613,6 +663,7 @@ class WebSearchTool(Tool):
                         max_snippet_bytes=self.max_snippet_bytes,
                         max_total_snippet_bytes=self.max_total_snippet_bytes,
                         timeout_seconds=self.timeout_seconds,
+                        restrictions=self.restrictions,
                     ),
                 )
         except TimeoutError:
@@ -890,6 +941,98 @@ def _configuration_float(
     return float(value)
 
 
+def _web_search_domains(value: Any, name: str) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple of domain strings.")
+    if len(value) > 200:
+        raise ValueError(f"{name} cannot contain more than 200 domains.")
+    normalized: list[str] = []
+    for domain in value:
+        if type(domain) is not str or not domain or len(domain) > 253:
+            raise ValueError(f"{name} contains an invalid domain.")
+        suffix = domain.startswith(".")
+        hostname = domain[1:] if suffix else domain
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise ValueError(f"{name} contains an invalid domain.") from exc
+        if (
+            not ascii_hostname
+            or len(ascii_hostname) > 253
+            or ascii_hostname.endswith(".")
+            or any(
+                not label
+                or len(label) > 63
+                or label.startswith("-")
+                or label.endswith("-")
+                or not all(character.isalnum() or character == "-" for character in label)
+                for label in ascii_hostname.split(".")
+            )
+        ):
+            raise ValueError(f"{name} contains an invalid domain.")
+        normalized_domain = f".{ascii_hostname}" if suffix else ascii_hostname
+        if normalized_domain in normalized:
+            raise ValueError(f"{name} must not contain duplicate domains.")
+        normalized.append(normalized_domain)
+    return tuple(normalized)
+
+
+def _web_search_optional_code(
+    value: Any,
+    name: str,
+    *,
+    exact_length: int | None = None,
+    maximum_length: int | None = None,
+    ascii_letters_only: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string or None.")
+    normalized = value.strip().lower()
+    if (
+        not normalized
+        or any(not (character.isalnum() or character in {"-", "_"}) for character in normalized)
+        or (ascii_letters_only and not normalized.isascii())
+        or (ascii_letters_only and not normalized.isalpha())
+        or (exact_length is not None and len(normalized) != exact_length)
+        or (maximum_length is not None and len(normalized) > maximum_length)
+    ):
+        raise ValueError(f"{name} is invalid.")
+    return normalized
+
+
+def _web_search_content_types(value: Any) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError("content_types must be a tuple of media-type strings.")
+    if len(value) > MAX_WEB_SEARCH_CONTENT_TYPES:
+        raise ValueError(
+            f"content_types cannot contain more than {MAX_WEB_SEARCH_CONTENT_TYPES} values."
+        )
+    token_characters = frozenset(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~"
+    )
+    normalized: list[str] = []
+    for content_type in value:
+        if type(content_type) is not str:
+            raise TypeError("content_types must contain only strings.")
+        candidate = content_type.strip().lower()
+        major, separator, minor = candidate.partition("/")
+        if (
+            separator != "/"
+            or not major
+            or not minor
+            or len(candidate) > 255
+            or any(character not in token_characters for character in major)
+            or any(character not in token_characters for character in minor)
+        ):
+            raise ValueError("content_types contains an invalid media type.")
+        if candidate in normalized:
+            raise ValueError("content_types must not contain duplicate media types.")
+        normalized.append(candidate)
+    return tuple(normalized)
+
+
 class _BoundedNormalizedText:
     _LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
@@ -1075,5 +1218,6 @@ __all__ = [
     "WebFetchTool",
     "WebSearchAdapter",
     "WebSearchAdapterRequest",
+    "WebSearchRestrictions",
     "WebSearchTool",
 ]

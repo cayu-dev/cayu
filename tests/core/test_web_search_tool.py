@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 from typing import cast
 
 import pytest
@@ -11,6 +12,7 @@ from cayu import (
     ToolResult,
     WebSearchAdapter,
     WebSearchAdapterRequest,
+    WebSearchRestrictions,
     WebSearchTool,
 )
 
@@ -83,6 +85,34 @@ def test_web_search_exposes_closed_application_bounded_contract() -> None:
         },
         "required": ["query"],
     }
+
+
+def test_web_search_carries_application_owned_restrictions_outside_model_schema() -> None:
+    adapter = _SearchAdapter(ToolResult(content="ok"))
+    restrictions = WebSearchRestrictions(
+        include_domains=("EXAMPLE.COM",),
+        exclude_domains=("docs.example.net",),
+        published_on_or_after=date(2026, 1, 2),
+        country="us",
+        locale="en-US",
+        content_types=("APPLICATION/PDF",),
+    )
+    tool = WebSearchTool(adapter=adapter, restrictions=restrictions)
+
+    result = asyncio.run(
+        tool.run(ToolContext(session_id="sess_restricted_search"), {"query": "cayu"})
+    )
+
+    assert result.content == "ok"
+    assert adapter.calls[0][1].restrictions == WebSearchRestrictions(
+        include_domains=("example.com",),
+        exclude_domains=("docs.example.net",),
+        published_on_or_after=date(2026, 1, 2),
+        country="US",
+        locale="en-US",
+        content_types=("application/pdf",),
+    )
+    assert set(tool.schema["properties"]) == {"query", "num_results"}
 
 
 @pytest.mark.parametrize(
