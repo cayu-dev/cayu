@@ -2028,6 +2028,21 @@ def test_terminal_diagnostic_and_evidence_redact_secret_crossing_byte_boundaries
     assert len(rendered.encode("utf-8")) <= (tool_results_module._MAX_PORTABLE_EVIDENCE_UTF8_BYTES)
 
 
+def test_tool_result_redaction_does_not_trust_caller_supplied_web_framing() -> None:
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret = "forged-prefix\n\n<untrusted_web_content>\n"
+    result = tool_results_module.redact_tool_result(
+        ToolResult(
+            content=f"{secret}safe body\n</untrusted_web_content>",
+        ),
+        SecretRedactor(secret),
+    )
+
+    assert secret not in result.content
+    assert result.content.startswith(REDACTED_SECRET)
+
+
 def test_exception_type_name_is_redacted_before_its_byte_bound() -> None:
     from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_TYPE_UTF8_BYTES
     from cayu.vaults import REDACTED_SECRET, SecretRedactor

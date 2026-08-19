@@ -188,6 +188,12 @@ falls back to the bounded canonical URL rather than invalidating the complete
 result set. Provider scores remain under namespaced provider metadata and never
 replace the portable rank.
 
+Application-owned restrictions can be fixed with `WebSearchRestrictions`.
+They are carried only to the adapter and never added to the model schema. An
+adapter must enforce every configured restriction or return
+`unsupported_semantics`; it cannot silently broaden a domain-, date-, country-,
+locale-, or content-type-restricted search.
+
 The opt-in `ExaWebAdapter` implements both `WebSearchAdapter` and
 `WebFetchAdapter` without an Exa SDK dependency. Selecting it changes
 application wiring, not the model-facing `web_search` or `web_fetch` names and
@@ -258,6 +264,70 @@ rate-limit paths remain distinct; cancellation is never converted into a tool
 error. Exa currently accepts at most 10,000 requested content characters; when
 returned text reaches that request ceiling, `provider_content_limit` makes the
 narrower provider boundary explicit in `truncation_reasons`.
+
+### Parallel Search and Extract
+
+`ParallelAIWebAdapter` implements the same two adapter protocols through
+Parallel's synchronous Search and Extract APIs, also without an additional SDK
+dependency. Replacing Exa requires only application wiring; the agent still
+calls the same tools with the same arguments and receives the same portable
+result fields:
+
+```python
+from datetime import date
+
+from cayu import (
+    ParallelAIWebAdapter,
+    SecretRef,
+    WebFetchTool,
+    WebSearchRestrictions,
+    WebSearchTool,
+)
+
+parallel = ParallelAIWebAdapter(
+    api_key_ref=SecretRef(name="parallel_api_key"),
+    search_mode="advanced",
+    search_location="us",
+    search_objective="Prefer authoritative primary sources.",
+    fetch_objective="Extract the main factual content.",
+    search_fetch_max_age_seconds=3_600,
+    fetch_max_age_seconds=3_600,
+)
+
+tools = [
+    WebSearchTool(
+        adapter=parallel,
+        restrictions=WebSearchRestrictions(
+            include_domains=("example.com", ".gov"),
+            published_on_or_after=date(2025, 1, 1),
+        ),
+    ),
+    WebFetchTool(adapter=parallel),
+]
+```
+
+Configure the environment's vault to map `parallel_api_key` to
+`PARALLEL_API_KEY`, and admit `api.parallel.ai` through its proxy as in the Exa
+example. Search mode, objectives, cache freshness, cache fallback, and response
+ceilings remain application settings. `search_location` maps to Parallel's
+non-binding geo-targeting hint; it is deliberately separate from strict search
+restrictions. Parallel domain and publication-date restrictions are mapped to
+its source policy. Country, locale, and content-type restrictions fail before
+dispatch because Parallel's current Search contract cannot prove them.
+Configured objectives are limited to Parallel's 5,000-character provider
+boundary, and each search query is limited to the provider's separate
+200-character ceiling. A query or fixed-objective/query composition that
+exceeds its boundary fails before credential access or dispatch.
+
+Parallel's ordered excerpts become locally byte-bounded snippets or fetch
+content. Full-content mode is deliberately disabled: an unexpected
+`full_content` response cannot replace the bounded excerpts. Request and session
+IDs, typed SKU usage, and warnings are bounded and retained only under
+`provider_metadata.parallel`. Extract's per-URL error body is never exposed;
+the portable result contains a stable `fetch_failed` code, an optional HTTP
+status, and bounded provider metadata. As with Exa, there is one provider
+request per tool call, no hidden retry, credential values stay behind the
+active proxy, and cancellation remains authoritative.
 
 When search results can flow into sensitive tools, configure `web_search` as a
 taint source alongside `web_fetch`; neither tool silently changes an

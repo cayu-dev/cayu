@@ -4778,20 +4778,40 @@ gating.
 `WebSearchAdapter`. The model supplies only a bounded query and result count;
 the application owns provider selection, modes, credentials, cache policy,
 request limits, per-result snippet bytes, aggregate snippet bytes, and the
-deadline. Portable results use provider order as rank and retain canonical
+deadline. `WebSearchRestrictions` can add application-owned domain,
+publication-date, country, locale, and content-type constraints without
+changing the model schema. An adapter must enforce every non-empty field or
+return `unsupported_semantics`; it cannot silently widen the search. Portable
+results use provider order as rank and retain canonical
 source URLs, titles, bounded snippets, and optional publication times. Provider
 request IDs, warnings, usage, retry hints, and scores remain bounded and
 namespaced rather than becoming portable ranking semantics.
 
-`ExaWebAdapter` is the first hosted implementation of both the search and fetch
-adapter seams. It resolves an application-owned `SecretRef` through the active
+`ExaWebAdapter` and `ParallelAIWebAdapter` are hosted implementations of both the
+search and fetch adapter seams. Each resolves an application-owned `SecretRef`
+through the active
 credential proxy immediately before each request, sends one request without a
-hidden retry loop, and never hands the credential to a runner. Its combined
+hidden retry loop, and never hands the credential to a runner. Exa's combined
 search/content call remains governed by the independent aggregate snippet
 budget. Hosted fetch preserves the existing `web_fetch` fields and fails
 explicitly when Exa changes the final URL without supplying the redirect
 provenance required to represent that change. Exa is opt-in and uses Cayu's
 existing HTTP dependency rather than adding a provider SDK.
+
+Parallel maps the portable query to Search's objective and query fields, and
+maps application-owned domain and date restrictions to its source policy. Its
+`search_location` setting is a non-binding provider geo-targeting hint rather
+than a portable restriction. The current contract cannot prove country,
+locale, or content-type restrictions, so those fail before dispatch. Search
+and Extract excerpt arrays are normalized under Cayu's local byte ceilings.
+Configured objectives respect Parallel's 5,000-character provider boundary;
+queries also respect its separate 200-character ceiling. An oversized query or
+fixed-objective/query composition fails before credential access.
+Extract full-content mode stays disabled and cannot replace bounded excerpts;
+per-URL error bodies are not published. Parallel request/session IDs, typed SKU
+usage, warnings, and retry hints remain bounded and secret-checked under
+`provider_metadata.parallel`. Parallel is likewise opt-in and adds no SDK or
+default-provider dependency.
 
 The default adapter performs direct network I/O from the trusted Cayu application
 process. DNS admission and pinning constrain its destination, but do not provide

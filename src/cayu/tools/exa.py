@@ -415,6 +415,7 @@ def _exa_search_result(
         results=results,
         truncation_reasons=truncation_reasons,
         provider_metadata=provider_metadata,
+        projection_redactor=redactor,
     )
 
 
@@ -569,6 +570,7 @@ def _exa_fetch_result(
         redirects=(),
         truncation_reasons=truncation_reasons,
         provider_metadata=provider_metadata,
+        projection_redactor=redactor,
     )
     return result
 

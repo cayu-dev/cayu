@@ -45,6 +45,7 @@ from cayu.tools.knowledge import (
     RememberKnowledgeTool,
     SearchKnowledgeTool,
 )
+from cayu.tools.parallel import ParallelAIWebAdapter
 from cayu.tools.search import SearchTextTool
 from cayu.tools.subagents import (
     BackgroundSubagentTaskRegistry,
@@ -100,6 +101,7 @@ __all__ = [
     "ListArtifactsTool",
     "ListFilesTool",
     "ListKnowledgeTool",
+    "ParallelAIWebAdapter",
     "PdfArtifactReader",
     "ProcessCommandPolicy",
     "ReadFileOptions",

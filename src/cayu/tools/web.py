@@ -21,6 +21,7 @@ from cayu.egress._resolution import (
     resolve_destination,
     validated_resolved_address,
 )
+from cayu.vaults import SecretRedactor
 
 MAX_WEB_FETCH_URL_LENGTH = 8192
 DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -44,6 +45,8 @@ MAX_WEB_SEARCH_TOTAL_SNIPPET_BYTES = 256 * 1024
 MAX_WEB_SEARCH_TIMEOUT_SECONDS = 120.0
 MAX_WEB_SEARCH_CONTENT_TYPES = 32
 _EXTRACTION_CHUNK_BYTES = 16 * 1024
+_UNTRUSTED_WEB_CONTENT_OPEN = "<untrusted_web_content>\n"
+_UNTRUSTED_WEB_CONTENT_CLOSE = "\n</untrusted_web_content>"
 
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
@@ -683,6 +686,7 @@ def _web_fetch_success_result(
     redirects: Sequence[Mapping[str, Any]],
     truncation_reasons: Sequence[str],
     provider_metadata: Mapping[str, Any] | None = None,
+    projection_redactor: SecretRedactor | None = None,
 ) -> ToolResult:
     truncated = bool(truncation_reasons)
     structured: dict[str, Any] = {
@@ -703,10 +707,6 @@ def _web_fetch_success_result(
     if content:
         projected_parts.append(content)
     projected_content = "\n\n".join(projected_parts)
-    delimited_content = projected_content.replace(
-        "</untrusted_web_content>",
-        "<\\/untrusted_web_content>",
-    )
     trusted_metadata = (
         "Fetched web content:\n"
         f"Representation: {representation}\n"
@@ -714,13 +714,18 @@ def _web_fetch_success_result(
     )
     if truncation_reasons:
         trusted_metadata += f"\nTruncation reasons: {', '.join(truncation_reasons)}"
+    finalized_content = _finalize_web_success_content(
+        trusted_metadata=trusted_metadata,
+        projected_content=projected_content,
+        projection_redactor=projection_redactor,
+    )
+    if finalized_content is None:
+        return _error_result(
+            "secret_exposure_denied",
+            "The provider response could not be published safely.",
+        )
     return ToolResult(
-        content=(
-            f"{trusted_metadata}\n\n"
-            "<untrusted_web_content>\n"
-            f"{delimited_content}\n"
-            "</untrusted_web_content>"
-        ),
+        content=finalized_content,
         structured=structured,
     )
 
@@ -731,6 +736,7 @@ def _web_search_success_result(
     results: Sequence[Mapping[str, Any]],
     truncation_reasons: Sequence[str],
     provider_metadata: Mapping[str, Any],
+    projection_redactor: SecretRedactor | None = None,
 ) -> ToolResult:
     structured_results = [dict(result) for result in results]
     structured = {
@@ -751,10 +757,6 @@ def _web_search_success_result(
             lines.append("\n".join(snippets))
         projected_results.append("\n".join(lines))
     projected_content = "\n\n".join(projected_results) or "No results."
-    delimited_content = projected_content.replace(
-        "</untrusted_web_content>",
-        "<\\/untrusted_web_content>",
-    )
     trusted_metadata = (
         "Web search results:\n"
         f"Query: {query}\n"
@@ -763,15 +765,47 @@ def _web_search_success_result(
     )
     if truncation_reasons:
         trusted_metadata += f"\nTruncation reasons: {', '.join(truncation_reasons)}"
+    finalized_content = _finalize_web_success_content(
+        trusted_metadata=trusted_metadata,
+        projected_content=projected_content,
+        projection_redactor=projection_redactor,
+    )
+    if finalized_content is None:
+        return _error_result(
+            "secret_exposure_denied",
+            "The provider response could not be published safely.",
+        )
     return ToolResult(
-        content=(
-            f"{trusted_metadata}\n\n"
-            "<untrusted_web_content>\n"
-            f"{delimited_content}\n"
-            "</untrusted_web_content>"
-        ),
+        content=finalized_content,
         structured=structured,
     )
+
+
+def _finalize_web_success_content(
+    *,
+    trusted_metadata: str,
+    projected_content: str,
+    projection_redactor: SecretRedactor | None,
+) -> str | None:
+    """Finalize provider output without granting dynamic text framing authority."""
+
+    if projection_redactor is not None:
+        trusted_metadata = projection_redactor.redact_text(trusted_metadata)
+        projected_content = projection_redactor.redact_text(projected_content)
+    delimited_content = projected_content.replace(
+        "</untrusted_web_content>",
+        "<\\/untrusted_web_content>",
+    )
+    trusted_prefix = f"{trusted_metadata}\n\n{_UNTRUSTED_WEB_CONTENT_OPEN}"
+    content = f"{trusted_prefix}{delimited_content}{_UNTRUSTED_WEB_CONTENT_CLOSE}"
+    if projection_redactor is None:
+        return content
+    finalized = projection_redactor.redact_text(content)
+    if not finalized.startswith(trusted_prefix) or not finalized.endswith(
+        _UNTRUSTED_WEB_CONTENT_CLOSE
+    ):
+        return None
+    return finalized
 
 
 def _web_search_arguments(
