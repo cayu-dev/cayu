@@ -13,6 +13,7 @@ import pytest
 import cayu.runtime._invocation_secrets as invocation_secrets
 from cayu._exception_groups import iter_exception_tree
 from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core.events import event_payload_authority_is_runtime_generated
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import RunnerExecutionError, attach_cancellation_artifacts
@@ -32,8 +33,13 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import sessions as sessions_module
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
-from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
+from cayu.runtime._tool_round_executor import (
+    ToolRoundRun,
+    _copy_agent_spec,
+    _ToolRoundPublicationCoordinator,
+)
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
+from cayu.runtime.execution_profiles import build_execution_profile_identity
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.tools._runner import sanitize_runner_failure_group
@@ -193,6 +199,58 @@ def _tool_round_identity() -> ToolRoundIdentity:
         model_attempt_id=f"matt_{'2' * 32}",
         tool_round_id=f"tround_{'3' * 32}",
     )
+
+
+def test_staged_terminal_profile_authority_is_owned_by_the_active_round() -> None:
+    identity = _tool_round_identity()
+    profile = build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version="test",
+        provider_name="fake",
+        model="fake-model",
+        durable_system_prompt="",
+        direct_tools=[],
+    )
+    coordinator = _ToolRoundPublicationCoordinator(
+        session_id="session-staged-profile-authority",
+        tool_round_identity=identity,
+        session_store=InMemorySessionStore(),
+        redactor=SecretRedactor(),
+        execution_profile=profile,
+    )
+    terminal = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="session-staged-profile-authority",
+        payload={
+            **identity.payload(),
+            "tool_call_id": "call_1",
+            "tool_name": "side_effect",
+            "result": ToolResult(content="interrupted", is_error=True).model_dump(),
+        },
+    )
+
+    restored = coordinator.restore_staged_event_authority(terminal)
+
+    assert restored.payload["execution_profile_fingerprint"] == profile.fingerprint
+    assert event_payload_authority_is_runtime_generated(
+        restored,
+        field_name="execution_profile_fingerprint",
+        value=profile.fingerprint,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="conflicts with its execution profile owner",
+    ):
+        coordinator.restore_staged_event_authority(
+            terminal.model_copy(
+                update={
+                    "payload": {
+                        **terminal.payload,
+                        "execution_profile_fingerprint": "0" * 64,
+                    }
+                }
+            )
+        )
 
 
 def test_tool_round_agent_copy_rejects_agent_spec_subclasses() -> None:

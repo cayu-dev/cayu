@@ -25,7 +25,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
-from cayu.core.events import Event, copy_event
+from cayu.core.events import Event, copy_event, event_with_runtime_payload_authority
 from cayu.runtime.approvals import (
     ResolutionActor,
     copy_resolution_actor,
@@ -37,6 +37,7 @@ EXECUTION_PROFILE_SCHEMA_VERSION = 2
 _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
+EXECUTION_PROFILE_FINGERPRINT_FIELD = "execution_profile_fingerprint"
 _EXECUTION_PROFILE_RECORD_TYPE = "cayu.execution-profile"
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_RECORD_TYPE = "cayu.active-invocation-execution-profile"
 EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS = 4096
@@ -88,6 +89,41 @@ def execution_profile_changes_authority(
     """Return whether a difference can change governed execution authority."""
 
     return any(component in _AUTHORITY_COMPONENT_CLASSES for component in component_classes)
+
+
+def event_with_execution_profile_authority(
+    event: Event,
+    profile: ExecutionProfileIdentity | None,
+) -> Event:
+    """Bind runtime evidence to the exact admitted invocation profile."""
+
+    if profile is None:
+        return event
+    if type(profile) is not ExecutionProfileIdentity:
+        raise TypeError("profile must be an ExecutionProfileIdentity or None.")
+    return event_with_execution_profile_fingerprint_authority(event, profile.fingerprint)
+
+
+def event_with_execution_profile_fingerprint_authority(
+    event: Event,
+    fingerprint: str | None,
+) -> Event:
+    """Bind runtime evidence when only a validated profile reference remains."""
+
+    if fingerprint is None:
+        return event
+    if (
+        type(fingerprint) is not str
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError("fingerprint must be a lowercase SHA-256 digest.")
+    payload = dict(event.payload)
+    payload[EXECUTION_PROFILE_FINGERPRINT_FIELD] = fingerprint
+    return event_with_runtime_payload_authority(
+        event.model_copy(update={"payload": payload}),
+        EXECUTION_PROFILE_FINGERPRINT_FIELD,
+    )
 
 
 class ExecutionProfileIdentityAvailability(StrEnum):

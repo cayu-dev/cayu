@@ -1067,7 +1067,10 @@ def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch)
     async def run() -> tuple[Any, list[Event]]:
         factory = _factory(emitter)
         request = EnvironmentFactoryRequest(
-            session_id="sess_1", agent_name="agent", environment_name="egress-env"
+            session_id="sess_1",
+            agent_name="agent",
+            environment_name="egress-env",
+            execution_profile_fingerprint="a" * 64,
         )
         result = await factory.create(request)
         # Drive the session-end teardown hook.
@@ -1104,6 +1107,7 @@ def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch)
     # No real secret in any emitted payload.
     for event in events:
         assert event.agent_name == "agent"
+        assert event.payload["execution_profile_fingerprint"] == "a" * 64
         assert REAL_SECRET not in str(event.payload)
 
 
@@ -8564,6 +8568,7 @@ def test_factory_emits_authorized_and_denied_request_events() -> None:
                 session_id="sess_1",
                 agent_name="agent",
                 environment_name="egress-env",
+                execution_profile_fingerprint="b" * 64,
             )
         )
         binding = result.environment.binding
@@ -8584,6 +8589,7 @@ def test_factory_emits_authorized_and_denied_request_events() -> None:
     assert EventType.EGRESS_REQUEST_AUTHORIZED in types
     assert EventType.EGRESS_REQUEST_DENIED in types
     assert {e.agent_name for e in events} == {"agent"}
+    assert {e.payload.get("execution_profile_fingerprint") for e in events} == {"b" * 64}
 
 
 def test_factory_drains_request_audit_before_revoked_events() -> None:

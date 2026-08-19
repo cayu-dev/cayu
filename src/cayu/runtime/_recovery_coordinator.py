@@ -186,6 +186,8 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_is_released,
     active_invocation_execution_profile_matches_session_epoch,
     checkpoint_with_active_invocation_execution_profile,
+    event_with_execution_profile_authority,
+    event_with_execution_profile_fingerprint_authority,
     execution_profile_from_session_metadata,
 )
 from cayu.runtime.execution_units import (
@@ -288,7 +290,7 @@ from cayu.runtime.user_input import (
     UserInputRecoveryRequest,
     UserInputResponse,
     pending_user_input_from_checkpoint,
-    public_pending_user_input_event_payload,
+    pending_user_input_interruption_payload,
 )
 from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationArtifactState,
@@ -4339,6 +4341,7 @@ class RecoveryCoordinator:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -4359,30 +4362,34 @@ class RecoveryCoordinator:
                 raise factory_resolution.error
             if emit_resume_event:
                 yield await self._event_writer.emit(
-                    event_with_runtime_payload_authority(
-                        Event(
-                            type=EventType.SESSION_RESUMED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload={
-                                **tool_round_identity.payload(),
-                                "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                                "input_id": pending.input_id,
-                                "tool_call_id": pending.tool_call_id,
-                                "resolved_by": resolution_actor_payload(response.resolved_by),
-                            },
+                    event_with_execution_profile_authority(
+                        event_with_runtime_payload_authority(
+                            Event(
+                                type=EventType.SESSION_RESUMED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload={
+                                    **tool_round_identity.payload(),
+                                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                                    "input_id": pending.input_id,
+                                    "tool_call_id": pending.tool_call_id,
+                                    "resolved_by": resolution_actor_payload(response.resolved_by),
+                                },
+                            ),
+                            "model_step_id",
+                            "model_attempt_id",
+                            "tool_round_id",
+                            "input_id",
                         ),
-                        "model_step_id",
-                        "model_attempt_id",
-                        "tool_round_id",
-                        "input_id",
+                        execution_profile_snapshot.profile,
                     )
                 )
             binding_started_event = await self._environment_lifecycle.emit_binding_started(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
             )
             if binding_started_event is not None:
                 yield binding_started_event
@@ -4439,6 +4446,7 @@ class RecoveryCoordinator:
                     tool_round_identity=tool_round_identity,
                     session_store=self._session_store,
                     redactor=base_round_redactor,
+                    execution_profile=execution_profile_snapshot.profile,
                 )
                 if defer_round_terminals
                 else None
@@ -4542,6 +4550,7 @@ class RecoveryCoordinator:
                     recorded_ids=set(recorded_outcomes),
                     pause_payload={"input_id": pending.input_id},
                     idempotency_options={"pause_id": pending.input_id},
+                    execution_profile=execution_profile_snapshot.profile,
                 )
                 if publication_coordinator is not None
                 else set()
@@ -4598,19 +4607,22 @@ class RecoveryCoordinator:
                     if registered_tool is not None:
                         started_payload["effect"] = registered_tool.effect.value
                     yield await self._event_writer.emit(
-                        event_with_runtime_payload_authority(
-                            Event(
-                                type=EventType.TOOL_CALL_STARTED,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                tool_name=tool_call.name,
-                                payload=started_payload,
+                        event_with_execution_profile_authority(
+                            event_with_runtime_payload_authority(
+                                Event(
+                                    type=EventType.TOOL_CALL_STARTED,
+                                    session_id=session.id,
+                                    agent_name=registered_agent.spec.name,
+                                    environment_name=environment_name,
+                                    tool_name=tool_call.name,
+                                    payload=started_payload,
+                                ),
+                                "model_step_id",
+                                "model_attempt_id",
+                                "tool_round_id",
+                                "input_id",
                             ),
-                            "model_step_id",
-                            "model_attempt_id",
-                            "tool_round_id",
-                            "input_id",
+                            execution_profile_snapshot.profile,
                         )
                     )
                     async for (
@@ -4942,7 +4954,7 @@ class RecoveryCoordinator:
                     ),
                     **tool_round_identity.payload(),
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                    "user_input": public_pending_user_input_event_payload(pending),
+                    **pending_user_input_interruption_payload(pending),
                 }
                 if isinstance(exc, approval_support.RoundToolManualRecoveryRequired):
                     payload["manual_recovery_required"] = True
@@ -4955,12 +4967,15 @@ class RecoveryCoordinator:
                 )
                 async for event in self._emit_terminal_event_with_hooks(
                     RecoveryTerminalEventRequest(
-                        event=Event(
-                            type=EventType.SESSION_INTERRUPTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload=payload,
+                        event=event_with_execution_profile_authority(
+                            Event(
+                                type=EventType.SESSION_INTERRUPTED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload=payload,
+                            ),
+                            execution_profile_snapshot.profile,
                         ),
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
@@ -5091,6 +5106,7 @@ class RecoveryCoordinator:
         recorded_ids: set[str],
         pause_payload: dict[str, str],
         idempotency_options: dict[str, str],
+        execution_profile: ExecutionProfileIdentity,
     ) -> set[str]:
         """Close a partially staged continuation without re-executing siblings."""
 
@@ -5131,25 +5147,28 @@ class RecoveryCoordinator:
                 },
                 is_error=True,
             )
-            event = Event(
-                type=EventType.TOOL_CALL_BLOCKED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                tool_name=tool_call.name,
-                payload={
-                    **coordinator.tool_round_identity.payload(),
-                    **pause_payload,
-                    "tool_call_id": tool_call.id,
-                    "idempotency_key": tool_execution.tool_idempotency_key(
-                        session_id=session.id,
-                        tool_round_id=coordinator.tool_round_identity.tool_round_id,
-                        tool_call_id=tool_call.id,
-                        **idempotency_options,
-                    ),
-                    "recovered": True,
-                    "result": result.model_dump(mode="json"),
-                },
+            event = event_with_execution_profile_authority(
+                Event(
+                    type=EventType.TOOL_CALL_BLOCKED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload={
+                        **coordinator.tool_round_identity.payload(),
+                        **pause_payload,
+                        "tool_call_id": tool_call.id,
+                        "idempotency_key": tool_execution.tool_idempotency_key(
+                            session_id=session.id,
+                            tool_round_id=coordinator.tool_round_identity.tool_round_id,
+                            tool_call_id=tool_call.id,
+                            **idempotency_options,
+                        ),
+                        "recovered": True,
+                        "result": result.model_dump(mode="json"),
+                    },
+                ),
+                execution_profile,
             )
             staged_event = await coordinator.stage_terminal(
                 tool_call_id=tool_call.id,
@@ -5476,6 +5495,7 @@ class RecoveryCoordinator:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -5518,6 +5538,15 @@ class RecoveryCoordinator:
                                 **tool_round_identity.payload(),
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": pending_approval.tool_call_id,
+                                **(
+                                    {
+                                        "execution_profile_fingerprint": (
+                                            pending_approval.execution_profile_fingerprint
+                                        )
+                                    }
+                                    if pending_approval.execution_profile_fingerprint is not None
+                                    else {}
+                                ),
                                 "expires_at": expired_at_iso,
                                 "requested_decision": requested_decision.value,
                                 "resolved_by": resolved_by_payload,
@@ -5528,6 +5557,11 @@ class RecoveryCoordinator:
                         "model_attempt_id",
                         "tool_round_id",
                         "approval_id",
+                        *(
+                            ("execution_profile_fingerprint",)
+                            if pending_approval.execution_profile_fingerprint is not None
+                            else ()
+                        ),
                     )
                 )
 
@@ -5541,6 +5575,7 @@ class RecoveryCoordinator:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
             )
             if binding_started_event is not None:
                 yield binding_started_event
@@ -5690,6 +5725,7 @@ class RecoveryCoordinator:
                     tool_round_identity=tool_round_identity,
                     session_store=self._session_store,
                     redactor=base_round_redactor,
+                    execution_profile=execution_profile_snapshot.profile,
                 )
                 if defer_round_terminals
                 else None
@@ -5781,6 +5817,7 @@ class RecoveryCoordinator:
                     recorded_ids=set(recorded_outcomes),
                     pause_payload={"approval_id": pending_approval.approval_id},
                     idempotency_options={"approval_id": pending_approval.approval_id},
+                    execution_profile=execution_profile_snapshot.profile,
                 )
                 if publication_coordinator is not None
                 else set()
@@ -6501,6 +6538,15 @@ class RecoveryCoordinator:
                             **tool_round_identity.payload(),
                             "approval_id": pending_approval.approval_id,
                             "tool_call_id": tool_call.id,
+                            **(
+                                {
+                                    "execution_profile_fingerprint": (
+                                        pending_approval.execution_profile_fingerprint
+                                    )
+                                }
+                                if pending_approval.execution_profile_fingerprint is not None
+                                else {}
+                            ),
                             **_public_resolution_audit_fields(
                                 secret_resolution_scope=(pending_approval.secret_resolution_scope),
                                 reason=reason,
@@ -6514,6 +6560,11 @@ class RecoveryCoordinator:
                     "model_attempt_id",
                     "tool_round_id",
                     "approval_id",
+                    *(
+                        ("execution_profile_fingerprint",)
+                        if pending_approval.execution_profile_fingerprint is not None
+                        else ()
+                    ),
                 )
             )
             persisted = await self._event_writer.persist_exact_replay(intended)
@@ -6555,12 +6606,15 @@ class RecoveryCoordinator:
             return
         async for event in self._emit_terminal_event_with_hooks(
             RecoveryTerminalEventRequest(
-                event=Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=interrupted.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    payload=payload,
+                event=event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=interrupted.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload=payload,
+                    ),
+                    execution_profile,
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=interrupted,
@@ -6686,6 +6740,7 @@ class RecoveryCoordinator:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -6708,20 +6763,23 @@ class RecoveryCoordinator:
                 )
                 async for event in self._emit_terminal_event_with_hooks(
                     RecoveryTerminalEventRequest(
-                        event=Event(
-                            type=EventType.SESSION_INTERRUPTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload={
-                                **tool_round_identity.payload(),
-                                "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                                "user_input": public_pending_user_input_event_payload(pending),
-                                **_environment_factory_resolution_error_payload(
-                                    factory_resolution.error,
-                                    redactor=self._secret_redactor,
-                                ),
-                            },
+                        event=event_with_execution_profile_authority(
+                            Event(
+                                type=EventType.SESSION_INTERRUPTED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload={
+                                    **tool_round_identity.payload(),
+                                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                                    **pending_user_input_interruption_payload(pending),
+                                    **_environment_factory_resolution_error_payload(
+                                        factory_resolution.error,
+                                        redactor=self._secret_redactor,
+                                    ),
+                                },
+                            ),
+                            execution_profile_snapshot.profile,
                         ),
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
@@ -6764,20 +6822,27 @@ class RecoveryCoordinator:
                 result=public_recovered_result,
                 redactor=self._secret_redactor,
             )
+            recovery_tool_event = event_with_execution_profile_authority(
+                recovery_tool_event,
+                execution_profile_snapshot.profile,
+            )
             recovery_event_to_reconcile = recovery_tool_event
             recovery_events = [
-                Event(
-                    type=EventType.SESSION_RESUMED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        **tool_round_identity.payload(),
-                        "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                        "input_id": pending.input_id,
-                        "tool_call_id": pending.tool_call_id,
-                        "resolved_by": resolution_actor_payload(request.resolved_by),
-                    },
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.SESSION_RESUMED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            **tool_round_identity.payload(),
+                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                            "input_id": pending.input_id,
+                            "tool_call_id": pending.tool_call_id,
+                            "resolved_by": resolution_actor_payload(request.resolved_by),
+                        },
+                    ),
+                    execution_profile_snapshot.profile,
                 ),
                 recovery_tool_event,
             ]
@@ -6870,7 +6935,7 @@ class RecoveryCoordinator:
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                            "user_input": public_pending_user_input_event_payload(pending),
+                            **pending_user_input_interruption_payload(pending),
                             "input_id": pending.input_id,
                             "tool_call_id": pending_tool_call.tool_call_id,
                             **persistence_payload,
@@ -7039,6 +7104,7 @@ class RecoveryCoordinator:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -7121,6 +7187,10 @@ class RecoveryCoordinator:
                 ),
                 result=public_recovered_result,
                 redactor=self._secret_redactor,
+            )
+            recovery_tool_event = event_with_execution_profile_authority(
+                recovery_tool_event,
+                execution_profile_snapshot.profile,
             )
             recovery_event_to_reconcile = recovery_tool_event
             recovery_events = [
@@ -8154,6 +8224,7 @@ class RecoveryCoordinator:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -8216,19 +8287,28 @@ class RecoveryCoordinator:
                 result=public_recovered_result,
                 redactor=self._secret_redactor,
             )
+            recovery_tool_event = event_with_execution_profile_authority(
+                recovery_tool_event,
+                execution_profile_snapshot.profile,
+            )
             recovery_event_to_reconcile = recovery_tool_event
             recovery_events = [
-                Event(
-                    type=EventType.SESSION_RESUMED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
-                        "tool_call_id": pending_tool_call.tool_call_id,
-                        "resolved_by": resolution_actor_payload(request.resolved_by),
-                    },
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.SESSION_RESUMED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                            **tool_round_recovery.pending_tool_round_identity(
+                                pending_round
+                            ).payload(),
+                            "tool_call_id": pending_tool_call.tool_call_id,
+                            "resolved_by": resolution_actor_payload(request.resolved_by),
+                        },
+                    ),
+                    execution_profile_snapshot.profile,
                 ),
                 recovery_tool_event,
             ]
@@ -8595,6 +8675,7 @@ class RecoveryCoordinator:
                 source_checkpoint=source_checkpoint,
                 retry_allowed=False,
                 expected_transcript_cursor=expected_transcript_cursor,
+                execution_profile=request.execution_profile,
             ):
                 yield event
             return
@@ -8809,6 +8890,7 @@ class RecoveryCoordinator:
         source_checkpoint: dict[str, Any] | None,
         retry_allowed: bool,
         expected_transcript_cursor: int,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> AsyncGenerator[Event, None]:
         """Rebuild one reserved finalizer round from its durable model output."""
 
@@ -8889,12 +8971,17 @@ class RecoveryCoordinator:
         }
         planned_terminal_events: list[Event] = []
         for expected_outcome in expected_outcomes:
-            expected_event = structured_output_tool_round._structured_output_tool_terminal_event(
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
-                outcome=expected_outcome,
+            expected_event = event_with_execution_profile_authority(
+                structured_output_tool_round._structured_output_tool_terminal_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                        pending_round
+                    ),
+                    outcome=expected_outcome,
+                ),
+                execution_profile,
             )
             recorded_outcome = recorded_outcomes.get(expected_outcome.call.id)
             if recorded_outcome is None:
@@ -9357,6 +9444,7 @@ class RecoveryCoordinator:
                 source_checkpoint=checkpoint,
                 retry_allowed=session.status == SessionStatus.RUNNING,
                 expected_transcript_cursor=expected_transcript_cursor,
+                execution_profile=execution_profile,
             ):
                 yield event
             return
@@ -11025,7 +11113,7 @@ class RecoveryCoordinator:
                 "model_step_id": pending_user_input.model_step_id,
                 "model_attempt_id": pending_user_input.model_attempt_id,
                 "tool_round_id": pending_user_input.tool_round_id,
-                "user_input": public_pending_user_input_event_payload(pending_user_input),
+                **pending_user_input_interruption_payload(pending_user_input),
             }
         elif pending_tool_round is not None and session.status == SessionStatus.INTERRUPTED:
             pending_action_interrupt_payload = {
@@ -11274,6 +11362,14 @@ class RecoveryCoordinator:
                 event,
                 "interruption_request_id",
             )
+        raw_profile_fingerprint = payload.get("execution_profile_fingerprint")
+        if raw_profile_fingerprint is None:
+            profile_fingerprint = None
+        elif type(raw_profile_fingerprint) is str:
+            profile_fingerprint = raw_profile_fingerprint
+        else:
+            raise TypeError("execution_profile_fingerprint must be a string or None.")
+        event = event_with_execution_profile_fingerprint_authority(event, profile_fingerprint)
         return (
             event
             if run_operation is None
@@ -12176,6 +12272,11 @@ class RecoveryCoordinator:
                     _workspace_mutation_incomplete_event(
                         lifecycle=lifecycle,
                         session=session,
+                        execution_profile=(
+                            None
+                            if execution_profile_snapshot is None
+                            else execution_profile_snapshot.profile
+                        ),
                         status=terminal_status,
                         detail_code=terminal_detail,
                     ),
@@ -12229,6 +12330,11 @@ class RecoveryCoordinator:
                 _workspace_mutation_incomplete_event(
                     lifecycle=lifecycle,
                     session=session,
+                    execution_profile=(
+                        None
+                        if execution_profile_snapshot is None
+                        else execution_profile_snapshot.profile
+                    ),
                     status=terminal_status,
                     detail_code=detail_code,
                 ),
@@ -13317,7 +13423,7 @@ class RecoveryCoordinator:
                     "model_attempt_id": pending_user_input.model_attempt_id,
                     "tool_round_id": pending_user_input.tool_round_id,
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                    "user_input": public_pending_user_input_event_payload(pending_user_input),
+                    **pending_user_input_interruption_payload(pending_user_input),
                     "recovered": True,
                     "reason": reason,
                     "metadata": metadata,

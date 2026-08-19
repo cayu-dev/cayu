@@ -111,6 +111,7 @@ from cayu.runners import (
     RunnerCancelledError,
 )
 from cayu.runtime import (
+    EXECUTION_PROFILE_FINGERPRINT_FIELD,
     TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AfterToolCallDecision,
@@ -6790,6 +6791,9 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
 
     assert session is not None
     assert session.environment_name == "dynamic"
+    profile_fingerprint = execution_profiles_module.execution_profile_from_session_metadata(
+        session.metadata
+    ).fingerprint
     assert [event.type for event in events[:3]] == [
         EventType.ENVIRONMENT_FACTORY_STARTED,
         EventType.ENVIRONMENT_FACTORY_COMPLETED,
@@ -6800,6 +6804,7 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
         "requested_environment_name": "dynamic",
         "parent_session_id": None,
         "causal_budget_id": PRIVATE_EVENT_AUTHORITY,
+        "execution_profile_fingerprint": profile_fingerprint,
         "labels": {"project": "alpha"},
     }
     assert events[1].payload == {
@@ -6807,6 +6812,7 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
         "requested_environment_name": "dynamic",
         "parent_session_id": None,
         "causal_budget_id": PRIVATE_EVENT_AUTHORITY,
+        "execution_profile_fingerprint": profile_fingerprint,
         "labels": {"project": "alpha"},
         "environment_name": "dynamic",
         "result_metadata": {"sandbox_id": "sandbox_123"},
@@ -6821,6 +6827,7 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
     assert factory.requests[0].session_id == "sess_factory"
     assert factory.requests[0].agent_name == "assistant"
     assert factory.requests[0].environment_name == "dynamic"
+    assert factory.requests[0].execution_profile_fingerprint == profile_fingerprint
     assert factory.requests[0].operation is EnvironmentFactoryOperation.CREATE
     assert factory.requests[0].labels == {"project": "alpha"}
     assert factory.requests[0].metadata == {"owner": "test"}
@@ -9247,6 +9254,9 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         "binding_generation_id": binding_generation_id,
         "configured_workspace_id": configured_workspace.id,
         "has_configured_runner": False,
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: private_events[0].payload[
+            EXECUTION_PROFILE_FINGERPRINT_FIELD
+        ],
     }
     assert private_events[1].payload == {
         "binding_type": "RecordingWorkspaceBinding",
@@ -9259,6 +9269,9 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         "bound_metadata": {"binding": "recording"},
         "bound_snapshot": None,
         "has_bound_runner": False,
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: private_events[0].payload[
+            EXECUTION_PROFILE_FINGERPRINT_FIELD
+        ],
     }
     assert [event.type for event in events[-3:]] == [
         EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
@@ -9385,9 +9398,14 @@ def test_cayu_app_binding_events_include_workspace_snapshots(tmp_path):
                 messages=[Message.text("user", "run")],
             ),
         )
-        return events, binding, bind_snapshot, final_snapshot
+        session = await store.load("sess_binding_snapshot")
+        assert session is not None
+        profile_fingerprint = execution_profiles_module.execution_profile_from_session_metadata(
+            session.metadata
+        ).fingerprint
+        return events, binding, bind_snapshot, final_snapshot, profile_fingerprint
 
-    events, binding, bind_snapshot, final_snapshot = asyncio.run(run())
+    events, binding, bind_snapshot, final_snapshot, profile_fingerprint = asyncio.run(run())
 
     binding_completed = next(
         event for event in events if event.type == EventType.ENVIRONMENT_BINDING_COMPLETED
@@ -9398,6 +9416,20 @@ def test_cayu_app_binding_events_include_workspace_snapshots(tmp_path):
     finalize_completed = next(
         event for event in events if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
     )
+    binding_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.ENVIRONMENT_BINDING_STARTED,
+            EventType.ENVIRONMENT_BINDING_COMPLETED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+        }
+    ]
+    assert {event.payload.get("execution_profile_fingerprint") for event in binding_events} == {
+        profile_fingerprint
+    }
     assert binding_completed.payload["bound_snapshot"] == {
         "snapshot_id": bind_snapshot.snapshot_id,
         "workspace_id": bind_snapshot.workspace_id,
@@ -26201,6 +26233,9 @@ def test_cayu_app_executes_tool_call_and_records_result():
         "idempotency_key": private_events[3].payload["idempotency_key"],
         "effect": "external",
         "arguments_state": "quarantined",
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: private_events[3].payload[
+            EXECUTION_PROFILE_FINGERPRINT_FIELD
+        ],
         **tool_round_identity_payload(private_events[3]),
     }
     assert private_events[4].payload["tool_round_id"] == private_events[3].payload["tool_round_id"]
@@ -31479,6 +31514,10 @@ def test_cayu_app_recovery_repairs_missing_user_input_terminal_evidence() -> Non
         checkpoint_before = await store.load_checkpoint(session_id)
         assert checkpoint_before is not None
         input_id = checkpoint_before["pending_user_input"]["input_id"]
+        profile_fingerprint = checkpoint_before["pending_user_input"][
+            "execution_profile_fingerprint"
+        ]
+        assert isinstance(profile_fingerprint, str)
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
@@ -31501,7 +31540,15 @@ def test_cayu_app_recovery_repairs_missing_user_input_terminal_evidence() -> Non
         )
         assert len(terminal_records) == 1
         assert terminal_records[0].event.payload["interruption_type"] == "user_input_required"
+        assert (
+            terminal_records[0].event.payload["execution_profile_fingerprint"]
+            == profile_fingerprint
+        )
         assert terminal_records[0].event.payload["user_input"]["input_id"] == input_id
+        assert (
+            "execution_profile_fingerprint" not in terminal_records[0].event.payload["user_input"]
+        )
+        assert recovered.events[0].payload["execution_profile_fingerprint"] == profile_fingerprint
         assert recovered.events[0].payload["user_input"]["input_id"] == public_input_id
         assert checkpoint_after is not None
         assert checkpoint_after["pending_user_input"]["input_id"] == input_id
@@ -33681,6 +33728,9 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
         "reason": "Tool denied by policy: side_effect",
         "metadata": {},
         "arguments_state": "unavailable",
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: private_blocked.payload[
+            EXECUTION_PROFILE_FINGERPRINT_FIELD
+        ],
         "result": {
             "content": "Tool denied by policy: side_effect",
             "structured": {
@@ -39050,6 +39100,9 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
         "tool_call_id": "call_1",
         "idempotency_key": tool.contexts[0].metadata["idempotency_key"],
         "tool_effect": "external",
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: private_tool_started.payload[
+            EXECUTION_PROFILE_FINGERPRINT_FIELD
+        ],
     }
     tool.contexts[0].metadata["tenant"]["id"] = "tool-mutated"
     session = asyncio.run(app.session_store.load("sess_policy_run_metadata"))
@@ -39270,6 +39323,9 @@ def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():
         "tool_call_id": "call_1",
         "idempotency_key": tool.contexts[0].metadata["idempotency_key"],
         "tool_effect": "external",
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: private_tool_started.payload[
+            EXECUTION_PROFILE_FINGERPRINT_FIELD
+        ],
     }
     tool.contexts[0].metadata["resume"]["id"] = "tool-mutated"
     session = asyncio.run(store.load("sess_policy_resume_metadata"))

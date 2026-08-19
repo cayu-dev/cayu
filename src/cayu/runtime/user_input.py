@@ -334,6 +334,7 @@ _RUNTIME_USER_INPUT_IDENTITY_FIELDS = (
     "model_attempt_id",
     "tool_round_id",
 )
+_EXECUTION_PROFILE_FINGERPRINT_FIELD = "execution_profile_fingerprint"
 
 
 def public_pending_user_input_prompt(
@@ -362,6 +363,10 @@ def public_pending_user_input_event_payload(
 
     payload = pending.model_dump(mode="json")
     payload.pop("run_limit_accounting", None)
+    # The profile reference is runtime authority for the enclosing event, not
+    # untrusted pause content. Interruption payloads publish it once at the top
+    # level through ``pending_user_input_interruption_payload``.
+    payload.pop(_EXECUTION_PROFILE_FINGERPRINT_FIELD, None)
     # Staged terminals are private crash-recovery evidence. They are published
     # only through the terminal event boundary after the round-wide secret
     # scope is finalized, never as part of a pending-input representation.
@@ -384,6 +389,21 @@ def public_pending_user_input_event_payload(
     return payload
 
 
+def pending_user_input_interruption_payload(
+    pending: PendingUserInput,
+) -> dict[str, Any]:
+    """Return the bounded public pause descriptor and its profile authority."""
+
+    if type(pending) is not PendingUserInput:
+        raise TypeError("pending must be a PendingUserInput.")
+    payload: dict[str, Any] = {
+        "user_input": public_pending_user_input_event_payload(pending),
+    }
+    if pending.execution_profile_fingerprint is not None:
+        payload[_EXECUTION_PROFILE_FINGERPRINT_FIELD] = pending.execution_profile_fingerprint
+    return payload
+
+
 def event_with_pending_user_input_authority(
     event: Event,
     pending: PendingUserInput,
@@ -397,6 +417,12 @@ def event_with_pending_user_input_authority(
         for field_name in _RUNTIME_USER_INPUT_IDENTITY_FIELDS
         if event.payload.get(field_name) == getattr(pending, field_name)
     )
+    if (
+        pending.execution_profile_fingerprint is not None
+        and event.payload.get(_EXECUTION_PROFILE_FINGERPRINT_FIELD)
+        == pending.execution_profile_fingerprint
+    ):
+        top_level_fields = (*top_level_fields, _EXECUTION_PROFILE_FINGERPRINT_FIELD)
     if top_level_fields:
         event = event_with_runtime_payload_authority(event, *top_level_fields)
     nested = event.payload.get("user_input")

@@ -50,6 +50,7 @@ from cayu.core.events import (
     Event,
     EventType,
     copy_event,
+    event_payload_authority_is_runtime_generated,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
@@ -114,7 +115,12 @@ from cayu.runtime.approvals import (
     copy_pending_tool_approval,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_FINGERPRINT_FIELD,
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -481,11 +487,20 @@ class _ToolRoundPublicationCoordinator:
         tool_round_identity: ToolRoundIdentity,
         session_store: SessionStore,
         redactor: SecretRedactor,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> None:
         self._session_id = require_clean_nonblank(session_id, "session_id")
         self._tool_round_identity = copy_tool_round_identity(tool_round_identity)
         self._session_store = session_store
         self._redactor = redactor
+        if (
+            execution_profile is not None
+            and type(execution_profile) is not ExecutionProfileIdentity
+        ):
+            raise TypeError("execution_profile must be an ExecutionProfileIdentity or None.")
+        self._execution_profile_fingerprint = (
+            None if execution_profile is None else execution_profile.fingerprint
+        )
         self._lock = asyncio.Lock()
 
     @property
@@ -497,10 +512,20 @@ class _ToolRoundPublicationCoordinator:
         return copy_tool_round_identity(self._tool_round_identity)
 
     def restore_staged_event_authority(self, event: Event) -> Event:
-        return restore_staged_terminal_authority(
+        restored = restore_staged_terminal_authority(
             event,
             session_id=self._session_id,
             tool_round_identity=self._tool_round_identity,
+        )
+        observed_fingerprint = restored.payload.get(EXECUTION_PROFILE_FINGERPRINT_FIELD)
+        if (
+            observed_fingerprint is not None
+            and observed_fingerprint != self._execution_profile_fingerprint
+        ):
+            raise RuntimeError("Staged terminal conflicts with its execution profile owner.")
+        return event_with_execution_profile_fingerprint_authority(
+            restored,
+            self._execution_profile_fingerprint,
         )
 
     async def register_redactor(
@@ -1787,7 +1812,7 @@ class ToolRoundExecutor:
                             candidate.add_note(note)
 
             publication_task = asyncio.create_task(
-                record_publication_snapshot(invocation_secret_scope.seal_for_publication())
+                persist_sealed_invocation_evidence(invocation_secret_scope.seal_for_publication())
             )
             publication_outcome = await await_shielded_task_outcome(publication_task)
             publication_error = publication_outcome.error
@@ -1853,13 +1878,16 @@ class ToolRoundExecutor:
                 payload["approval_id"] = approval_id
             if input_id is not None:
                 payload["input_id"] = input_id
-            started = Event(
-                type=EventType.TOOL_CALL_STARTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                tool_name=tool_call.name,
-                payload=payload,
+            started = event_with_execution_profile_authority(
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload=payload,
+                ),
+                execution_profile,
             )
             started_event = await self._event_writer.emit(
                 prepare_runtime_event(
@@ -2181,6 +2209,8 @@ class ToolRoundExecutor:
 
         invocation_secret_scope = invocation_secrets.InvocationSecretTracker(invocation_redactor)
         proxy_authorizations: list[invocation_secrets.ProxyAuthorizationRecord] = []
+        staged_runner_completion_events: list[tuple[Event, int]] = []
+        runner_events: list[Event] = []
         ctx_metadata = tool_execution.context_metadata(
             request_metadata=request_metadata,
             tool_call_id=tool_call.id,
@@ -2191,9 +2221,121 @@ class ToolRoundExecutor:
         )
         if taint_labels:
             ctx_metadata[TAINT_LABELS_METADATA_KEY] = sorted(taint_labels)
+        if execution_profile is not None:
+            ctx_metadata[EXECUTION_PROFILE_FINGERPRINT_FIELD] = execution_profile.fingerprint
 
         def redactor_provider():
             return invocation_secret_scope.redactor
+
+        async def observe_runner_execution(
+            phase: Literal["started", "completed"],
+            payload: dict[str, Any],
+            command_evidence_revision: int,
+        ) -> None:
+            if type(command_evidence_revision) is not int or command_evidence_revision < 0:
+                raise TypeError("Runner command evidence revision must be a non-negative integer.")
+            event = Event(
+                type=(
+                    EventType.RUNNER_EXEC_STARTED
+                    if phase == "started"
+                    else EventType.RUNNER_EXEC_COMPLETED
+                ),
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                tool_name=tool_call.name,
+                payload={
+                    **payload,
+                    "tool_call_id": tool_call.id,
+                    "idempotency_key": idempotency_key,
+                    **identity_payload,
+                    **({"approval_id": approval_id} if approval_id is not None else {}),
+                    **({"input_id": input_id} if input_id is not None else {}),
+                },
+            )
+            event = event_with_execution_profile_authority(event, execution_profile)
+            event = _event_with_tool_round_authority(
+                event,
+                tool_round_identity,
+                *(field for field in ("approval_id", "input_id") if field in event.payload),
+            )
+
+            command = event.payload.get("command")
+            if not isinstance(command, dict) or command.get("kind") not in {
+                "process",
+                "shell",
+            }:
+                raise RuntimeError("Runner command evidence is malformed.")
+            if phase == "started":
+                # A command must not cross the runner boundary until its exact
+                # invocation/profile linkage is durable. Command arguments can
+                # become secret only after dispatch, so the pre-dispatch record
+                # is deliberately content-free instead of being held in memory.
+                event = event.model_copy(
+                    update={
+                        "payload": {
+                            **event.payload,
+                            "command": {
+                                "kind": command["kind"],
+                                "arguments_state": "unavailable",
+                            },
+                        }
+                    },
+                    deep=True,
+                )
+                runner_events.append(
+                    await self._event_writer.emit(
+                        prepare_runtime_event(
+                            event,
+                            redactor=invocation_secret_scope.redactor,
+                        )
+                    )
+                )
+                return
+            staged_runner_completion_events.append((event, command_evidence_revision))
+
+        async def publish_staged_runner_events(
+            snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        ) -> None:
+            """Publish runner completion detail after late secret registration closes."""
+
+            nonlocal staged_runner_completion_events
+            if not staged_runner_completion_events:
+                return
+            final_revision = invocation_secret_scope.snapshot().revision
+            captured_events = staged_runner_completion_events
+            staged_runner_completion_events = []
+            prepared_events: list[Event] = []
+            for event, command_evidence_revision in captured_events:
+                if snapshot.secret_scope_incomplete or command_evidence_revision != final_revision:
+                    command = event.payload.get("command")
+                    if not isinstance(command, dict) or command.get("kind") not in {
+                        "process",
+                        "shell",
+                    }:
+                        raise RuntimeError("Runner command evidence is malformed.")
+                    event = event.model_copy(
+                        update={
+                            "payload": {
+                                **event.payload,
+                                "command": {
+                                    "kind": command["kind"],
+                                    "arguments_state": "unavailable",
+                                },
+                            }
+                        },
+                        deep=True,
+                    )
+                prepared_events.append(prepare_runtime_event(event, redactor=snapshot.redactor))
+            captured_events.clear()
+            for event in prepared_events:
+                runner_events.append(await self._event_writer.emit(event))
+
+        async def persist_sealed_invocation_evidence(
+            snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        ) -> None:
+            await record_publication_snapshot(snapshot)
+            await publish_staged_runner_events(snapshot)
 
         async def persist_resolved_secret_projection(
             snapshot: InvocationRedactorSnapshot,
@@ -2255,6 +2397,8 @@ class ToolRoundExecutor:
                     invocation_secret_scope.record_ambiguous_output_capture
                 ),
                 mutation_owner=workspace_mutation_owner,
+                execution_observer=observe_runner_execution,
+                publish_execution_arguments=registered_tool.publish_arguments,
             ),
             invocation_secret_redactor=redactor_provider,
             invocation_secret_snapshot_provider=invocation_secret_scope.snapshot,
@@ -2545,6 +2689,7 @@ class ToolRoundExecutor:
                             environment_name=environment_name,
                             tool_call=tool_call,
                             tool_round_identity=tool_round_identity,
+                            execution_profile=execution_profile,
                             model_step=model_step,
                             window_id=workspace_window_id,
                             lifecycle=workspace_lifecycle,
@@ -2647,6 +2792,7 @@ class ToolRoundExecutor:
                         _workspace_mutation_incomplete_event(
                             lifecycle=terminal_lifecycle,
                             session=session,
+                            execution_profile=execution_profile,
                             status=(
                                 WorkspaceObservationTerminalStatus.INCOMPLETE
                                 if capture_failure_detail == "receipt_publication_interrupted"
@@ -2720,6 +2866,7 @@ class ToolRoundExecutor:
                     _workspace_mutation_incomplete_event(
                         lifecycle=terminal_lifecycle,
                         session=session,
+                        execution_profile=execution_profile,
                         status=capture.terminal_status,
                         detail_code=capture.terminal_detail_code,
                     ),
@@ -2882,6 +3029,7 @@ class ToolRoundExecutor:
                     tool_call=tool_call,
                     records=proxy_authorizations,
                     tool_round_identity=tool_round_identity,
+                    execution_profile=execution_profile,
                     approval_id=approval_id,
                     input_id=input_id,
                     idempotency_key=idempotency_key,
@@ -2950,7 +3098,7 @@ class ToolRoundExecutor:
                 }
         publication_snapshot = invocation_secret_scope.seal_for_publication()
         await _await_post_tool_operation(
-            record_publication_snapshot(publication_snapshot),
+            persist_sealed_invocation_evidence(publication_snapshot),
             cancellation=post_tool_cancellation,
             restore_cancellation_requests=post_tool_cancellation_requests_consumed,
         )
@@ -3053,6 +3201,8 @@ class ToolRoundExecutor:
                 # telemetry so a later telemetry failure cannot erase the
                 # authoritative tool outcome from the public stream. Receipt
                 # events remain ordered immediately before that terminal.
+                for runner_event in runner_events:
+                    yield runner_event, None
                 for workspace_event in workspace_events:
                     yield workspace_event, None
                 yield published_terminal_event, published_terminal_outcome
@@ -3065,6 +3215,7 @@ class ToolRoundExecutor:
                 tool_call=tool_call,
                 records=proxy_authorizations,
                 tool_round_identity=tool_round_identity,
+                execution_profile=execution_profile,
                 approval_id=approval_id,
                 input_id=input_id,
                 idempotency_key=idempotency_key,
@@ -3138,6 +3289,8 @@ class ToolRoundExecutor:
                 if event[1] is None:
                     continue
                 terminal_recorded = True
+                for runner_event in runner_events:
+                    yield runner_event, None
                 for workspace_event in workspace_events:
                     yield workspace_event, None
                 for proxy_event in proxy_events:
@@ -3146,6 +3299,8 @@ class ToolRoundExecutor:
                     yield terminal_event
                 terminal_events.clear()
             if not terminal_recorded:
+                for runner_event in runner_events:
+                    yield runner_event, None
                 for workspace_event in workspace_events:
                     yield workspace_event, None
                 for proxy_event in proxy_events:
@@ -3236,6 +3391,8 @@ class ToolRoundExecutor:
             if event[1] is None:
                 continue
             terminal_recorded = True
+            for runner_event in runner_events:
+                yield runner_event, None
             for workspace_event in workspace_events:
                 yield workspace_event, None
             for proxy_event in proxy_events:
@@ -3244,6 +3401,8 @@ class ToolRoundExecutor:
                 yield terminal_event
             terminal_events.clear()
         if not terminal_recorded:
+            for runner_event in runner_events:
+                yield runner_event, None
             for workspace_event in workspace_events:
                 yield workspace_event, None
             for proxy_event in proxy_events:
@@ -3614,6 +3773,7 @@ class ToolRoundExecutor:
         tool_call: runtime_records.ToolCallRequest,
         records: list[invocation_secrets.ProxyAuthorizationRecord],
         tool_round_identity: ToolRoundIdentity,
+        execution_profile: ExecutionProfileIdentity | None,
         approval_id: str | None,
         input_id: str | None,
         redactor: SecretRedactor,
@@ -3669,13 +3829,16 @@ class ToolRoundExecutor:
             yield await self._event_writer.emit(
                 prepare_runtime_event(
                     _event_with_tool_round_authority(
-                        Event(
-                            type=EventType.CREDENTIAL_PROXY_CHECKED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=_environment_name(registered_environment),
-                            tool_name=tool_call.name,
-                            payload=payload,
+                        event_with_execution_profile_authority(
+                            Event(
+                                type=EventType.CREDENTIAL_PROXY_CHECKED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=_environment_name(registered_environment),
+                                tool_name=tool_call.name,
+                                payload=payload,
+                            ),
+                            execution_profile,
                         ),
                         tool_round_identity,
                         *(
@@ -3783,6 +3946,7 @@ class ToolRoundExecutor:
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
                             terminal_event=anchor_event,
+                            execution_profile=execution_profile,
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
@@ -3818,6 +3982,7 @@ class ToolRoundExecutor:
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
                                 terminal_event=anchor_event,
+                                execution_profile=execution_profile,
                                 payload={
                                     "tool_name": tool_call.name,
                                     "tool_call_id": tool_call.id,
@@ -3856,6 +4021,7 @@ class ToolRoundExecutor:
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
                             terminal_event=anchor_event,
+                            execution_profile=execution_profile,
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
@@ -3937,6 +4103,7 @@ class ToolRoundExecutor:
             event_payload.pop("effective_arguments", None)
         event_payload.update(resolved_argument_projection.payload_fields())
         event = event.model_copy(update={"payload": event_payload})
+        event = event_with_execution_profile_authority(event, execution_profile)
         hook_tool_call = _project_tool_call_for_hook(
             tool_call,
             argument_projection=resolved_hook_argument_projection,
@@ -4268,6 +4435,7 @@ class ToolRoundExecutor:
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
                             terminal_event=tool_event,
+                            execution_profile=execution_profile,
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
@@ -4317,6 +4485,7 @@ class ToolRoundExecutor:
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
                                 terminal_event=tool_event,
+                                execution_profile=execution_profile,
                                 payload={
                                     "tool_name": tool_call.name,
                                     "tool_call_id": tool_call.id,
@@ -4360,6 +4529,7 @@ class ToolRoundExecutor:
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
                             terminal_event=tool_event,
+                            execution_profile=execution_profile,
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
@@ -4592,19 +4762,22 @@ class ToolRoundRun:
             yield await executor._event_writer.emit(checkpoint_event)
             yield await executor._event_writer.emit(
                 _event_with_tool_round_authority(
-                    Event(
-                        type=EventType.SESSION_AWAITING_USER_INPUT,
-                        session_id=session.id,
-                        agent_name=self._registered_agent.spec.name,
-                        environment_name=self._environment_name,
-                        tool_name=user_input_call.name,
-                        payload={
-                            **tool_round_identity.payload(),
-                            "input_id": pending_input.input_id,
-                            "tool_call_id": pending_input.tool_call_id,
-                            **public_prompt_payload,
-                            "tool_calls": public_pending_input["tool_calls"],
-                        },
+                    event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.SESSION_AWAITING_USER_INPUT,
+                            session_id=session.id,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            tool_name=user_input_call.name,
+                            payload={
+                                **tool_round_identity.payload(),
+                                "input_id": pending_input.input_id,
+                                "tool_call_id": pending_input.tool_call_id,
+                                **public_prompt_payload,
+                                "tool_calls": public_pending_input["tool_calls"],
+                            },
+                        ),
+                        self._execution_profile,
                     ),
                     tool_round_identity,
                     "input_id",
@@ -4635,6 +4808,7 @@ class ToolRoundRun:
                     registered_agent=self._registered_agent,
                     tool_calls=tool_calls,
                 ),
+                execution_profile=self._execution_profile,
             )
             if defer_round_terminals
             else None
@@ -5538,13 +5712,19 @@ class ToolRoundRun:
             **copy_tool_round_identity(tool_round_identity).payload(),
         }
         event = await self._executor._event_writer.emit(
-            Event(
-                type=EventType.TOOL_CALL_FAILED,
-                session_id=self._session.id,
-                agent_name=self._registered_agent.spec.name,
-                environment_name=self._environment_name,
-                tool_name=tool_call.name,
-                payload=payload,
+            _event_with_tool_round_authority(
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.TOOL_CALL_FAILED,
+                        session_id=self._session.id,
+                        agent_name=self._registered_agent.spec.name,
+                        environment_name=self._environment_name,
+                        tool_name=tool_call.name,
+                        payload=payload,
+                    ),
+                    self._execution_profile,
+                ),
+                tool_round_identity,
             )
         )
         return (
@@ -6354,6 +6534,7 @@ async def _record_workspace_mutation_after(
     environment_name: str | None,
     tool_call: runtime_records.ToolCallRequest,
     tool_round_identity: ToolRoundIdentity,
+    execution_profile: ExecutionProfileIdentity | None,
     model_step: int | None,
     window_id: str,
     lifecycle: WorkspaceObservationLifecycle,
@@ -6464,6 +6645,7 @@ async def _record_workspace_mutation_after(
             environment_name=environment_name,
             tool_call=tool_call,
             tool_round_identity=tool_round_identity,
+            execution_profile=execution_profile,
             model_step=model_step,
             window_id=window_id,
             binding_generation_id=lifecycle.binding_generation_id,
@@ -6540,6 +6722,7 @@ async def _record_workspace_mutation_after(
             environment_name=environment_name,
             tool_call=tool_call,
             tool_round_identity=tool_round_identity,
+            execution_profile=execution_profile,
             model_step=model_step,
             window_id=window_id,
             binding_generation_id=lifecycle.binding_generation_id,
@@ -6617,6 +6800,7 @@ async def _record_workspace_mutation_after(
             environment_name=environment_name,
             tool_call=tool_call,
             tool_round_identity=tool_round_identity,
+            execution_profile=execution_profile,
             model_step=model_step,
             window_id=window_id,
             binding_generation_id=lifecycle.binding_generation_id,
@@ -6691,6 +6875,7 @@ def _workspace_revision_observed_event(
     environment_name: str | None,
     tool_call: runtime_records.ToolCallRequest,
     tool_round_identity: ToolRoundIdentity,
+    execution_profile: ExecutionProfileIdentity | None,
     model_step: int | None,
     window_id: str,
     binding_generation_id: str,
@@ -6736,7 +6921,7 @@ def _workspace_revision_observed_event(
         )
     )
     return _event_with_workspace_observation_authority(
-        event,
+        event_with_execution_profile_authority(event, execution_profile),
         tool_round_identity,
         interaction_id,
         "tool_call_id",
@@ -6757,6 +6942,7 @@ def _workspace_mutation_recorded_event(
     environment_name: str | None,
     tool_call: runtime_records.ToolCallRequest,
     tool_round_identity: ToolRoundIdentity,
+    execution_profile: ExecutionProfileIdentity | None,
     model_step: int | None,
     window_id: str,
     binding_generation_id: str,
@@ -6808,7 +6994,7 @@ def _workspace_mutation_recorded_event(
         )
     )
     return _event_with_workspace_observation_authority(
-        event,
+        event_with_execution_profile_authority(event, execution_profile),
         tool_round_identity,
         interaction_id,
         "tool_call_id",
@@ -6830,6 +7016,7 @@ def _workspace_mutation_incomplete_event(
     *,
     lifecycle: WorkspaceObservationLifecycle,
     session: Session,
+    execution_profile: ExecutionProfileIdentity | None,
     status: WorkspaceObservationTerminalStatus,
     detail_code: str | None,
 ) -> Event:
@@ -6914,7 +7101,7 @@ def _workspace_mutation_incomplete_event(
         )
     )
     return _event_with_workspace_observation_authority(
-        event,
+        event_with_execution_profile_authority(event, execution_profile),
         identity,
         lifecycle.interaction_id,
         "tool_call_id",
@@ -7858,17 +8045,21 @@ def _runtime_hook_event(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     terminal_event: Event,
     payload: dict[str, Any],
+    execution_profile: ExecutionProfileIdentity | None = None,
 ) -> Event:
-    return _build_runtime_hook_event(
-        event_type=event_type,
-        hook_name=hook_name,
-        scope=scope,
-        phase=phase,
-        session=session,
-        terminal_event=terminal_event,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        payload=payload,
+    return event_with_execution_profile_authority(
+        _build_runtime_hook_event(
+            event_type=event_type,
+            hook_name=hook_name,
+            scope=scope,
+            phase=phase,
+            session=session,
+            terminal_event=terminal_event,
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            payload=payload,
+        ),
+        execution_profile,
     )
 
 
@@ -8070,7 +8261,17 @@ def _redact_policy_denial_event(
     for key, value in event.payload.items():
         if key == "result":
             continue
-        if key in _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS:
+        if (
+            key == EXECUTION_PROFILE_FINGERPRINT_FIELD
+            and type(value) is str
+            and event_payload_authority_is_runtime_generated(
+                event,
+                field_name=key,
+                value=value,
+            )
+        ):
+            payload[key] = value
+        elif key in _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS:
             payload[key] = copy_json_value(value, key)
         else:
             payload[key] = redactor.redact_json(value)

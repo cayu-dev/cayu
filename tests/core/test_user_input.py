@@ -1163,6 +1163,10 @@ def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
     awaiting = next(e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT)
     private_awaiting = asyncio.run(private_event_for_public_event(store, awaiting))
     private_input_id = private_awaiting.payload["input_id"]
+    active_profile = active_invocation_execution_profile_from_checkpoint(
+        asyncio.run(store.load_checkpoint("s_mixed"))
+    )
+    assert active_profile is not None
     assert [call["tool_call_id"] for call in private_awaiting.payload["tool_calls"]] == [
         "call_1",
         "call_2",
@@ -1178,6 +1182,20 @@ def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
     )
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
     private_resume_events = asyncio.run(private_events_for_public_events(store, resume_events))
+    attributed_events = [
+        event
+        for event in resume_events
+        if event.type
+        in {
+            EventType.SESSION_RESUMED,
+            EventType.TOOL_CALL_STARTED,
+            EventType.TOOL_CALL_COMPLETED,
+        }
+    ]
+    assert attributed_events
+    assert {event.payload.get("execution_profile_fingerprint") for event in attributed_events} == {
+        active_profile.profile.fingerprint
+    }
     sibling_events = [
         event
         for event in private_resume_events

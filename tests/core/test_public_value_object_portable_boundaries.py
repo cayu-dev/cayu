@@ -687,6 +687,18 @@ def test_public_value_object_conformance_covers_every_issue_constructor() -> Non
     assert {case.constructor for case in _CASES} == _EXPECTED_CONSTRUCTORS
 
 
+def test_environment_factory_request_preserves_existing_positional_field_order() -> None:
+    request = EnvironmentFactoryRequest(
+        "session",
+        "agent",
+        "environment",
+        "parent-session",
+    )
+
+    assert request.parent_session_id == "parent-session"
+    assert request.execution_profile_fingerprint is None
+
+
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize(
     ("value", "expected_code"),

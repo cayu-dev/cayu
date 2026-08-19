@@ -161,13 +161,19 @@ credential hostname must reach a private service origin.
 
 ```python
 from cayu import (
-    AgentSpec, CayuApp, EnvironmentSpec, ExecutionRequirements, HttpEgressPolicy,
-    SecretRef, StaticVault, VirtualCredentialSpec, VirtualEgressEnvironmentFactory,
+    AgentSpec, CayuApp, EnvironmentSpec, ExecutionProfileBehaviorIdentity,
+    ExecutionRequirements, HttpEgressPolicy, SecretRef, StaticVault,
+    VirtualCredentialSpec, VirtualEgressEnvironmentFactory,
 )
 from cayu.runtime import VIRTUAL_EGRESS_EVENT_TYPES
 
 app = CayuApp()
 vault = StaticVault({"stripe_test_key": "sk_test_..."})
+egress_identity = ExecutionProfileBehaviorIdentity(
+    name="acme:billing-virtual-egress",
+    behavior_version="1",
+    implementation_version="2026.08.18.1",
+)
 factory = VirtualEgressEnvironmentFactory(
     resolver=vault,                              # resolves the real SecretRef, broker-side only
     policies={"stripe-example": HttpEgressPolicy(
@@ -186,8 +192,13 @@ factory = VirtualEgressEnvironmentFactory(
     event_emitter=app.scoped_event_emitter(
         event_types=VIRTUAL_EGRESS_EVENT_TYPES,
     ),                                          # stream only virtual-egress audit events
+    execution_profile_identity=egress_identity,
 )
-app.register_environment_factory(EnvironmentSpec(name="billing"), factory, default=True)
+app.register_environment_factory(
+    EnvironmentSpec(name="billing", execution_profile_identity=egress_identity),
+    factory,
+    default=True,
+)
 app.register_agent(
     AgentSpec(name="billing-agent", model="claude-sonnet-4-6"),
     execution_requirements=ExecutionRequirements.trusted(),
@@ -197,6 +208,10 @@ app.register_agent(
 Sessions on that environment run in the explicitly selected Docker container
 with `STRIPE_SECRET_KEY` set to the virtual credential; the real key is swapped
 in only by the broker.
+The shared execution-profile declaration makes the configured factory and the
+environment contract comparable across workers without fingerprinting credentials.
+Advance its versions whenever adapter, policy, workspace, runner, or egress
+behavior changes; omit it to keep an opaque configuration process-local.
 Grant revocation is enforced against in-flight broker requests: teardown marks
 the grant revoked, waits for active request leases to drain, and the broker
 re-checks liveness after vault resolution before forwarding upstream.

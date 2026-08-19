@@ -16,7 +16,7 @@ from cayu._validation import (
     require_durable_text,
     safe_durable_value_error_details,
 )
-from cayu.core.events import Event
+from cayu.core.events import Event, event_payload_authority_is_runtime_generated
 from cayu.core.tools import ToolEffect, ToolResult
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._diagnostics import (
@@ -98,6 +98,7 @@ _RUNTIME_TOOL_EVENT_FIXED_FIELDS = frozenset(
         "workspace_mutation_capture_status",
     }
 )
+_EXECUTION_PROFILE_FINGERPRINT_FIELD = "execution_profile_fingerprint"
 _TOOL_EFFECT_VALUES = frozenset(effect.value for effect in ToolEffect)
 
 
@@ -183,17 +184,20 @@ def redact_tool_result_event(
         else redact_tool_result(result_to_redact, redactor)
     )
     linkage_fields = _runtime_tool_event_linkage_fields(event.payload)
+    profile_attribution = _runtime_execution_profile_attribution(event)
     payload_to_redact = {
         key: value
         for key, value in event.payload.items()
         if key != "result"
         and key not in linkage_fields
+        and key not in profile_attribution
         and not (terminal_controls and key in _RUNTIME_TERMINAL_CONTROL_FIELDS)
     }
     payload = redactor.redact_json(payload_to_redact)
     if type(payload) is not dict:
         raise AssertionError("Event payload redaction returned non-object payload.")
     payload.update(linkage_fields)
+    payload.update(profile_attribution)
     if terminal_controls:
         structured = dict(redacted_result.structured or {})
         structured.update(terminal_controls)
@@ -206,6 +210,19 @@ def redact_tool_result_event(
         payload.update(terminal_controls)
     payload["result"] = redacted_result.model_dump()
     return event.model_copy(update={"payload": payload}), redacted_result
+
+
+def _runtime_execution_profile_attribution(event: Event) -> dict[str, str]:
+    """Preserve only the exact profile digest attested by the runtime producer."""
+
+    value = event.payload.get(_EXECUTION_PROFILE_FINGERPRINT_FIELD)
+    if type(value) is not str or not event_payload_authority_is_runtime_generated(
+        event,
+        field_name=_EXECUTION_PROFILE_FINGERPRINT_FIELD,
+        value=value,
+    ):
+        return {}
+    return {_EXECUTION_PROFILE_FINGERPRINT_FIELD: value}
 
 
 def _runtime_tool_event_linkage_fields(payload: dict[str, Any]) -> dict[str, str]:

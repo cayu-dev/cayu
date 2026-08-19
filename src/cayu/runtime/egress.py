@@ -122,6 +122,9 @@ from cayu.runtime._binding_cleanup import (
     binding_finalize_fatal_signal,
     record_binding_finalize_failures,
 )
+from cayu.runtime.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
 from cayu.workspaces import RunnerBoundWorkspace, Workspace
 from cayu.workspaces.revisions import (
@@ -539,6 +542,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             session_id=request.session_id,
             agent_name=request.agent_name,
             environment_name=request.environment_name,
+            execution_profile_fingerprint=request.execution_profile_fingerprint,
         )
         broker = TransparentEgressBroker(
             registry=registry,
@@ -657,6 +661,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 session_id=request.session_id,
                 agent_name=request.agent_name,
                 environment_name=request.environment_name,
+                execution_profile_fingerprint=request.execution_profile_fingerprint,
             )
 
             await self._emit_grant_events(request, grants, runner_kind=runner_kind)
@@ -906,27 +911,33 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             return
         with contextlib.suppress(Exception):
             await self._emitter(
-                Event(
-                    type=EventType.CREDENTIAL_MODE_SELECTED,
-                    session_id=request.session_id,
-                    agent_name=request.agent_name,
-                    environment_name=request.environment_name,
-                    payload={
-                        "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
-                        "runner_kind": runner_kind,
-                        "grant_count": len(grants),
-                        "approved_destination_count": len(self._approved_destinations),
-                    },
+                event_with_execution_profile_fingerprint_authority(
+                    Event(
+                        type=EventType.CREDENTIAL_MODE_SELECTED,
+                        session_id=request.session_id,
+                        agent_name=request.agent_name,
+                        environment_name=request.environment_name,
+                        payload={
+                            "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
+                            "runner_kind": runner_kind,
+                            "grant_count": len(grants),
+                            "approved_destination_count": len(self._approved_destinations),
+                        },
+                    ),
+                    request.execution_profile_fingerprint,
                 )
             )
             for grant in grants:
                 await self._emitter(
-                    Event(
-                        type=EventType.EGRESS_GRANT_MINTED,
-                        session_id=request.session_id,
-                        agent_name=request.agent_name,
-                        environment_name=request.environment_name,
-                        payload=_grant_payload(grant),
+                    event_with_execution_profile_fingerprint_authority(
+                        Event(
+                            type=EventType.EGRESS_GRANT_MINTED,
+                            session_id=request.session_id,
+                            agent_name=request.agent_name,
+                            environment_name=request.environment_name,
+                            payload=_grant_payload(grant),
+                        ),
+                        request.execution_profile_fingerprint,
                     )
                 )
 
@@ -2421,35 +2432,40 @@ class _EgressAuditBridge:
         session_id: str,
         agent_name: str,
         environment_name: str,
+        execution_profile_fingerprint: str | None,
     ) -> None:
         self._loop = loop
         self._emitter = emitter
         self._session_id = session_id
         self._agent_name = agent_name
         self._environment_name = environment_name
+        self._execution_profile_fingerprint = execution_profile_fingerprint
         self._pending: set[concurrent.futures.Future[Event]] = set()
 
     def __call__(self, decision: EgressDecision) -> None:
         if self._emitter is None:
             return
-        event = Event(
-            type=EventType.EGRESS_REQUEST_AUTHORIZED
-            if decision.allowed
-            else EventType.EGRESS_REQUEST_DENIED,
-            session_id=self._session_id,
-            agent_name=self._agent_name,
-            environment_name=self._environment_name,
-            payload={
-                "allowed": decision.allowed,
-                "status_code": decision.status_code,
-                "destination": decision.destination,
-                "method": decision.method,
-                "path": decision.path,
-                "grant_id": decision.grant_id,
-                "policy_name": decision.policy_name,
-                "reason": decision.reason,
-                "authorization_kind": decision.authorization_kind,
-            },
+        event = event_with_execution_profile_fingerprint_authority(
+            Event(
+                type=EventType.EGRESS_REQUEST_AUTHORIZED
+                if decision.allowed
+                else EventType.EGRESS_REQUEST_DENIED,
+                session_id=self._session_id,
+                agent_name=self._agent_name,
+                environment_name=self._environment_name,
+                payload={
+                    "allowed": decision.allowed,
+                    "status_code": decision.status_code,
+                    "destination": decision.destination,
+                    "method": decision.method,
+                    "path": decision.path,
+                    "grant_id": decision.grant_id,
+                    "policy_name": decision.policy_name,
+                    "reason": decision.reason,
+                    "authorization_kind": decision.authorization_kind,
+                },
+            ),
+            self._execution_profile_fingerprint,
         )
         emitter = self._emitter
 
@@ -2501,6 +2517,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
         session_id: str,
         agent_name: str,
         environment_name: str,
+        execution_profile_fingerprint: str | None,
     ) -> None:
         self._inner = inner
         self._runner = runner
@@ -2513,6 +2530,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self._session_id = session_id
         self._agent_name = agent_name
         self._environment_name = environment_name
+        self._execution_profile_fingerprint = execution_profile_fingerprint
         self._revocation_emit_lock = asyncio.Lock()
         self._revocation_emission_attempted_grant_ids: set[str] = set()
         self._unbound_release_settlement_task: asyncio.Task[None] | None = None
@@ -3160,12 +3178,15 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 self._revocation_emission_attempted_grant_ids.add(grant.grant_id)
                 with contextlib.suppress(Exception):
                     await self._emitter(
-                        Event(
-                            type=EventType.EGRESS_GRANT_REVOKED,
-                            session_id=self._session_id,
-                            agent_name=self._agent_name,
-                            environment_name=self._environment_name,
-                            payload=_grant_payload(grant),
+                        event_with_execution_profile_fingerprint_authority(
+                            Event(
+                                type=EventType.EGRESS_GRANT_REVOKED,
+                                session_id=self._session_id,
+                                agent_name=self._agent_name,
+                                environment_name=self._environment_name,
+                                payload=_grant_payload(grant),
+                            ),
+                            self._execution_profile_fingerprint,
                         )
                     )
 

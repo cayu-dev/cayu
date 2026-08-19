@@ -82,6 +82,7 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation_group,
 )
 from cayu.runtime.app import _close_delegated_event_stream
+from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.sessions import runtime_publication_request_digest
 from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationLifecycle,
@@ -1931,9 +1932,12 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
             )
         ]
         durable = await store.query_events(EventQuery(session_id="session-receipt"))
-        return public_events, [record.event for record in durable]
+        session = await store.load("session-receipt")
+        assert session is not None
+        profile = execution_profile_from_session_metadata(session.metadata)
+        return public_events, [record.event for record in durable], profile.fingerprint
 
-    public_events, durable_events = asyncio.run(run())
+    public_events, durable_events, profile_fingerprint = asyncio.run(run())
     receipt_events = [
         event
         for event in durable_events
@@ -1949,6 +1953,33 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
         EventType.WORKSPACE_REVISION_OBSERVED,
         EventType.WORKSPACE_MUTATION_RECORDED,
     ]
+    runner_events = [
+        event
+        for event in durable_events
+        if event.type in {EventType.RUNNER_EXEC_STARTED, EventType.RUNNER_EXEC_COMPLETED}
+    ]
+    assert [event.type for event in runner_events] == [
+        EventType.RUNNER_EXEC_STARTED,
+        EventType.RUNNER_EXEC_COMPLETED,
+    ]
+    attributed_events = [
+        event
+        for event in durable_events
+        if event.type
+        in {
+            EventType.RUNNER_EXEC_STARTED,
+            EventType.RUNNER_EXEC_COMPLETED,
+            EventType.TOOL_CALL_STARTED,
+            EventType.TOOL_CALL_COMPLETED,
+            EventType.WORKSPACE_REVISION_OBSERVED,
+            EventType.WORKSPACE_MUTATION_RECORDED,
+            EventType.WORKSPACE_OBSERVATION_FINALIZED,
+        }
+    ]
+    assert attributed_events
+    assert {event.payload.get("execution_profile_fingerprint") for event in attributed_events} == {
+        profile_fingerprint
+    }
     before, after, receipt = receipt_events
     assert before.payload["phase"] == "before"
     assert after.payload["phase"] == "after"
@@ -6962,6 +6993,9 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
             assert next(iter(observations.values()))["phase"] == checkpoint_phase
         assert first_provider.requests == 1
         assert (tmp_path / "shell.txt").exists() is tool_ran
+        session = await store.load(session_id)
+        assert session is not None
+        profile_fingerprint = execution_profile_from_session_metadata(session.metadata).fingerprint
 
         store.failed = True
         store.hide_workspace_delta = hide_workspace_delta
@@ -7015,6 +7049,7 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
             recoveries,
             [record.event for record in durable],
             await store.load_checkpoint(session_id),
+            profile_fingerprint,
         )
 
     (
@@ -7024,6 +7059,7 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
         recoveries,
         durable_events,
         checkpoint,
+        profile_fingerprint,
     ) = asyncio.run(run())
 
     assert first_provider.requests == 1
@@ -7046,6 +7082,7 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
     ]
     assert len(finalized) == 1
     assert finalized[0].payload["status"] == terminal_status
+    assert finalized[0].payload["execution_profile_fingerprint"] == profile_fingerprint
     terminal_type = EventType.TOOL_CALL_COMPLETED if tool_ran else EventType.TOOL_CALL_FAILED
     terminal = next(event for event in durable_events if event.type == terminal_type)
     if (crash_phase == "delta-publication" and not hide_workspace_delta) or (

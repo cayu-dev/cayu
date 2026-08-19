@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from time import monotonic
+from typing import Any, Literal, NoReturn, cast
 
 from pydantic import ValidationError
 
@@ -17,7 +19,11 @@ from cayu._exception_groups import (
     set_exception_cause,
 )
 from cayu._task_wait import await_shielded_task_outcome
-from cayu._validation import require_durable_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    compact_json_utf8_size,
+    require_durable_nonblank,
+)
 from cayu._workspace_mutation import detached_workspace_mutation_process_signal
 from cayu.environments.admission import ExecutionAdmissionCandidate
 from cayu.runners import (
@@ -81,6 +87,12 @@ _CURRENT_CANCELLATION_GROUP_TOKEN = object()
 _SAFE_RUNNER_CANCELLATION_MESSAGE = "Runner command was cancelled."
 _MAX_RUNNER_CANCELLATION_REASON_BYTES = 2048
 _RUNNER_MUTATION_SETTLEMENT_FOREGROUND_TIMEOUT_SECONDS = 30.0
+_RUNNER_COMMAND_EVIDENCE_MAX_BYTES = 4096
+_RUNNER_COMMAND_EVIDENCE_PREVIEW_MAX_BYTES = 1536
+RunnerExecutionObserver = Callable[
+    [Literal["started", "completed"], dict[str, Any], int],
+    Awaitable[None],
+]
 
 
 class InvocationRunnerHandle:
@@ -88,7 +100,9 @@ class InvocationRunnerHandle:
 
     __slots__ = (
         "__ambiguous_capture_observer",
+        "__execution_observer",
         "__mutation_owner",
+        "__publish_execution_arguments",
         "__redactor_snapshot_provider",
         "__runner",
     )
@@ -100,6 +114,8 @@ class InvocationRunnerHandle:
         redactor_snapshot_provider: Callable[[], Any],
         ambiguous_capture_observer: Callable[[int], None] | None = None,
         mutation_owner: InvocationWorkspaceMutationOwner | None = None,
+        execution_observer: RunnerExecutionObserver | None = None,
+        publish_execution_arguments: bool = True,
     ) -> None:
         if not isinstance(runner, Runner):
             raise TypeError("Invocation runner handle requires a Runner.")
@@ -112,10 +128,16 @@ class InvocationRunnerHandle:
             and type(mutation_owner) is not InvocationWorkspaceMutationOwner
         ):
             raise TypeError("Invocation runner mutation owner is invalid.")
+        if execution_observer is not None and not callable(execution_observer):
+            raise TypeError("execution_observer must be callable or None.")
+        if type(publish_execution_arguments) is not bool:
+            raise TypeError("publish_execution_arguments must be a bool.")
         self.__runner = runner
         self.__redactor_snapshot_provider = redactor_snapshot_provider
         self.__ambiguous_capture_observer = ambiguous_capture_observer
         self.__mutation_owner = mutation_owner
+        self.__execution_observer = execution_observer
+        self.__publish_execution_arguments = publish_execution_arguments
 
     async def preflight_exec(
         self,
@@ -372,12 +394,18 @@ class InvocationRunnerHandle:
             command: ExecCommand = owned_command,
             kwargs: dict[str, Any] = kwargs,
             capture_settlement: bool = self.__mutation_owner is not None,
+            execution_observer: RunnerExecutionObserver | None = self.__execution_observer,
+            publish_execution_arguments: bool = self.__publish_execution_arguments,
+            command_evidence_revision: int = initial_revision,
         ) -> Awaitable[_RunnerDispatchOutcome]:
             return _capture_runner_dispatch_outcome(
                 runner=runner,
                 command=command,
                 kwargs=kwargs,
                 capture_settlement=capture_settlement,
+                execution_observer=execution_observer,
+                publish_execution_arguments=publish_execution_arguments,
+                command_evidence_revision=command_evidence_revision,
             )
 
         operation = None
@@ -699,8 +727,36 @@ async def _capture_runner_dispatch_outcome(
     command: ExecCommand,
     kwargs: dict[str, Any],
     capture_settlement: bool,
+    execution_observer: RunnerExecutionObserver | None,
+    publish_execution_arguments: bool,
+    command_evidence_revision: int,
 ) -> _RunnerDispatchOutcome:
     """Freeze settlement evidence before an extension can mutate its outcome."""
+
+    started_at = monotonic()
+    if type(command_evidence_revision) is not int or command_evidence_revision < 0:
+        raise TypeError("command_evidence_revision must be a non-negative integer.")
+    command_evidence = None
+    if execution_observer is not None:
+        command_evidence = _runner_command_evidence(
+            command,
+            redactor=cast("SecretRedactor", kwargs["redactor"]),
+            publish_arguments=publish_execution_arguments,
+        )
+        try:
+            await execution_observer(
+                "started",
+                {
+                    "adapter": _safe_runner_adapter(runner),
+                    "command": command_evidence,
+                },
+                command_evidence_revision,
+            )
+        except BaseException as error:
+            return _RunnerDispatchOutcome(
+                error=error,
+                settlement="runner_quiescent" if capture_settlement else None,
+            )
 
     result: object | None = None
     error: BaseException | None = None
@@ -709,26 +765,170 @@ async def _capture_runner_dispatch_outcome(
     except BaseException as exc:
         error = exc
 
-    if not capture_settlement:
-        return _RunnerDispatchOutcome(result=result, error=error)
+    settlement = None
+    settlement_error = None
+    if capture_settlement:
+        try:
+            settlement = _invocation_runner_mutation_settlement(
+                operation_started=True,
+                result=result,
+                error=error,
+            )
+        except BaseException as exc:
+            settlement_error = exc
 
-    try:
-        settlement = _invocation_runner_mutation_settlement(
-            operation_started=True,
-            result=result,
-            error=error,
-        )
-    except BaseException as exc:
-        return _RunnerDispatchOutcome(
-            result=result,
-            error=error,
-            settlement_error=exc,
-        )
-    return _RunnerDispatchOutcome(
+    outcome = _RunnerDispatchOutcome(
         result=result,
         error=error,
         settlement=settlement,
+        settlement_error=settlement_error,
     )
+    if execution_observer is None:
+        return outcome
+    if command_evidence is None:  # pragma: no cover - observer construction invariant
+        raise AssertionError("Runner execution observer has no command evidence.")
+    completed_payload: dict[str, Any] = {
+        "adapter": _safe_runner_adapter(runner),
+        "command": command_evidence,
+        "duration_ms": min(
+            MAX_DURABLE_JSON_INTEGER,
+            max(0, int((monotonic() - started_at) * 1000)),
+        ),
+    }
+    if type(result) is ExecResult:
+        completed_payload.update(
+            {
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+            }
+        )
+    if error is not None:
+        completed_payload["error_type"] = (
+            trusted_runner_exception_type_name(error) or "runner_execution_error"
+        )
+    try:
+        await execution_observer(
+            "completed",
+            completed_payload,
+            command_evidence_revision,
+        )
+    except BaseException as observer_error:
+        return _RunnerDispatchOutcome(
+            error=observer_error,
+            settlement=settlement,
+            settlement_error=settlement_error,
+        )
+    return outcome
+
+
+def _runner_command_evidence(
+    command: ExecCommand,
+    *,
+    redactor: SecretRedactor,
+    publish_arguments: bool,
+) -> dict[str, Any]:
+    """Return a secret-safe, byte-bounded command projection for audit events."""
+
+    if type(command) is not ExecCommand:
+        raise TypeError("Runner command evidence requires an ExecCommand.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("Runner command evidence requires a SecretRedactor.")
+    if type(publish_arguments) is not bool:
+        raise TypeError("publish_arguments must be a bool.")
+    if not publish_arguments:
+        return {
+            "kind": command.kind,
+            "arguments_state": "unavailable",
+        }
+
+    source_prefix, source_complete = _runner_command_json_prefix(
+        command,
+        max_bytes=_RUNNER_COMMAND_EVIDENCE_PREVIEW_MAX_BYTES,
+    )
+    preview, redaction_truncated = redactor.redact_utf8_head(
+        source_prefix,
+        max_bytes=_RUNNER_COMMAND_EVIDENCE_PREVIEW_MAX_BYTES,
+        source_complete=source_complete,
+    )
+    truncated = not source_complete or redaction_truncated
+    redacted = REDACTED_SECRET in preview
+    evidence = {
+        "kind": command.kind,
+        "arguments_state": (
+            "redacted_and_truncated"
+            if redacted and truncated
+            else ("redacted" if redacted else ("truncated" if truncated else "available"))
+        ),
+        "preview_format": "exec_command_json_prefix",
+        "preview": preview,
+        "truncated": truncated,
+    }
+    if compact_json_utf8_size(evidence) > _RUNNER_COMMAND_EVIDENCE_MAX_BYTES:
+        raise AssertionError("Runner command evidence exceeded its hard byte bound.")
+    return evidence
+
+
+def _runner_command_json_prefix(
+    command: ExecCommand,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, bool]:
+    """Serialize at most one bounded exact prefix of compact command JSON."""
+
+    if type(command) is not ExecCommand:
+        raise TypeError("Runner command JSON prefix requires an ExecCommand.")
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer.")
+
+    retained = bytearray()
+
+    def append_literal(value: bytes) -> bool:
+        remaining = max_bytes - len(retained)
+        if len(value) <= remaining:
+            retained.extend(value)
+            return True
+        retained.extend(value[:remaining])
+        return False
+
+    def append_text(value: str) -> bool:
+        remaining = max_bytes - len(retained)
+        if remaining <= 0:
+            return False
+        # Every source character occupies at least one serialized byte. Slicing
+        # first therefore keeps the temporary JSON string bounded even when a
+        # command argument itself is arbitrarily large.
+        source_complete = len(value) <= remaining
+        rendered = json.dumps(
+            value if source_complete else value[:remaining],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        serialized_complete = append_literal(rendered)
+        return source_complete and serialized_complete
+
+    if command.kind == "process":
+        if not append_literal(b'{"argv":['):
+            return bytes(retained), False
+        argv = command.argv
+        if argv is None:  # pragma: no cover - ExecCommand shape invariant
+            raise AssertionError("Process command has no argv.")
+        for index, argument in enumerate(argv):
+            if index and not append_literal(b","):
+                return bytes(retained), False
+            if not append_text(argument):
+                return bytes(retained), False
+        complete = append_literal(b'],"kind":"process","shell":null}')
+        return bytes(retained), complete
+
+    if not append_literal(b'{"argv":null,"kind":"shell","shell":'):
+        return bytes(retained), False
+    shell = command.shell
+    if shell is None:  # pragma: no cover - ExecCommand shape invariant
+        raise AssertionError("Shell command has no script.")
+    if not append_text(shell):
+        return bytes(retained), False
+    complete = append_literal(b"}")
+    return bytes(retained), complete
 
 
 async def _run_runner_settlement_call(
@@ -1208,6 +1408,8 @@ def invocation_runner_handle(
     redactor_snapshot_provider: Callable[[], Any],
     ambiguous_capture_observer: Callable[[int], None] | None = None,
     mutation_owner: InvocationWorkspaceMutationOwner | None = None,
+    execution_observer: RunnerExecutionObserver | None = None,
+    publish_execution_arguments: bool = True,
 ) -> InvocationRunnerHandle | None:
     """Build the narrow runtime runner capability for one tool invocation."""
 
@@ -1220,6 +1422,8 @@ def invocation_runner_handle(
         redactor_snapshot_provider=redactor_snapshot_provider,
         ambiguous_capture_observer=ambiguous_capture_observer,
         mutation_owner=mutation_owner,
+        execution_observer=execution_observer,
+        publish_execution_arguments=publish_execution_arguments,
     )
 
 

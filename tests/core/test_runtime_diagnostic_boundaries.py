@@ -8,6 +8,7 @@ import pytest
 from tests.core._workload_secret_support import FakeProvider
 
 from cayu import (
+    EXECUTION_PROFILE_FINGERPRINT_FIELD,
     AgentSpec,
     BoundWorkspace,
     CayuApp,
@@ -1337,6 +1338,7 @@ def test_terminal_hook_nonportable_failure_is_recorded_without_rewriting_session
         "durable_value_error_code": error_code,
         "durable_value_error_path": "$",
         "actions": [],
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: failed.payload[EXECUTION_PROFILE_FINGERPRINT_FIELD],
     }
     assert any(
         event.type == EventType.HOOK_COMPLETED and event.payload["hook_name"] == "LaterHook"

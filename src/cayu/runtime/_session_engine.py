@@ -312,6 +312,7 @@ from cayu.runtime.execution_profiles import (
     changed_execution_profile_components,
     checkpoint_with_active_invocation_execution_profile,
     copy_execution_profile_policy_result,
+    event_with_execution_profile_authority,
     execution_profile_changes_authority,
     execution_profile_decision_payload,
     execution_profile_from_session_metadata,
@@ -530,7 +531,7 @@ from cayu.runtime.usage import (
 from cayu.runtime.user_input import (
     event_with_pending_user_input_authority,
     pending_user_input_from_checkpoint,
-    public_pending_user_input_event_payload,
+    pending_user_input_interruption_payload,
 )
 from cayu.runtime.workspace_observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
@@ -3033,7 +3034,11 @@ def _checkpoint_with_pending_session_interrupt(
     return transform
 
 
-def _runtime_interruption_event(event: Event) -> Event:
+def _runtime_interruption_event(
+    event: Event,
+    *,
+    execution_profile: ExecutionProfileIdentity | None = None,
+) -> Event:
     """Attest runtime-owned interruption identities copied through checkpoints."""
 
     fields = tuple(
@@ -3041,7 +3046,19 @@ def _runtime_interruption_event(event: Event) -> Event:
         for field_name in ("interruption_request_id", "retry_request_id", "attempt_id")
         if type(event.payload.get(field_name)) is str
     )
-    return event_with_runtime_payload_authority(event, *fields)
+    event = event_with_runtime_payload_authority(event, *fields)
+    profile_fingerprint = event.payload.get("execution_profile_fingerprint")
+    if profile_fingerprint is None:
+        return event
+    if execution_profile is None:
+        raise RuntimeError(
+            "An interrupted event references an execution profile without validated authority."
+        )
+    if profile_fingerprint != execution_profile.fingerprint:
+        raise RuntimeError(
+            "An interrupted event references a different execution profile than recovery."
+        )
+    return event_with_execution_profile_authority(event, execution_profile)
 
 
 def _replace_checkpoint_preserving_runtime_state(
@@ -3171,6 +3188,7 @@ def _limit_reached_tool_call_event(
     tool_call_outcome: runtime_records.ToolCallOutcome,
     decision: StopDecision,
     tool_round_identity: ToolRoundIdentity,
+    execution_profile: ExecutionProfileIdentity | None,
     approval_id: str | None = None,
 ) -> Event:
     identity = copy_tool_round_identity(tool_round_identity)
@@ -3190,13 +3208,16 @@ def _limit_reached_tool_call_event(
     }
     if approval_id is not None:
         payload["approval_id"] = approval_id
-    return Event(
-        type=EventType.TOOL_CALL_FAILED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        tool_name=tool_call_outcome.call.name,
-        payload=payload,
+    return event_with_execution_profile_authority(
+        Event(
+            type=EventType.TOOL_CALL_FAILED,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            tool_name=tool_call_outcome.call.name,
+            payload=payload,
+        ),
+        execution_profile,
     )
 
 
@@ -3231,17 +3252,21 @@ def _runtime_hook_event(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     terminal_event: Event,
     payload: dict[str, Any],
+    execution_profile: ExecutionProfileIdentity | None = None,
 ) -> Event:
-    return _build_runtime_hook_event(
-        event_type=event_type,
-        hook_name=hook_name,
-        scope=scope,
-        phase=phase,
-        session=session,
-        terminal_event=terminal_event,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        payload=payload,
+    return event_with_execution_profile_authority(
+        _build_runtime_hook_event(
+            event_type=event_type,
+            hook_name=hook_name,
+            scope=scope,
+            phase=phase,
+            session=session,
+            terminal_event=terminal_event,
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            payload=payload,
+        ),
+        execution_profile,
     )
 
 
@@ -5801,6 +5826,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -12899,6 +12925,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -12929,6 +12956,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             )
             if binding_started_event is not None:
                 yield binding_started_event
@@ -14232,7 +14260,7 @@ class SessionEngine:
                             "model_step_id": exc.pending.model_step_id,
                             "model_attempt_id": exc.pending.model_attempt_id,
                             "tool_round_id": exc.pending.tool_round_id,
-                            "user_input": public_pending_user_input_event_payload(exc.pending),
+                            **pending_user_input_interruption_payload(exc.pending),
                         },
                     ),
                     exc.pending,
@@ -15394,6 +15422,7 @@ class SessionEngine:
                 requested_approval_decision=requested_approval_decision,
                 approval_resolution_request_digest=approval_resolution_request_digest,
                 tool_round_identity=tool_round_identity,
+                execution_profile=execution_profile,
             ):
                 yield event
 
@@ -15624,6 +15653,7 @@ class SessionEngine:
         requested_approval_decision: ToolApprovalDecision | None = None,
         approval_resolution_request_digest: str | None = None,
         tool_round_identity: ToolRoundIdentity | None = None,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> AsyncGenerator[Event, None]:
         if tool_round_identity is None and pending_approval_to_clear is not None:
             tool_round_identity = ToolRoundIdentity(
@@ -15709,6 +15739,7 @@ class SessionEngine:
                 requested_approval_decision=requested_approval_decision,
                 approval_resolution_request_digest=approval_resolution_request_digest,
                 tool_round_identity=tool_round_identity,
+                execution_profile=execution_profile,
             ):
                 yield event
             return
@@ -15768,6 +15799,7 @@ class SessionEngine:
                     tool_call_outcome=skipped_outcome,
                     decision=decision,
                     tool_round_identity=tool_round_identity,
+                    execution_profile=execution_profile,
                 )
             )
 
@@ -15827,6 +15859,7 @@ class SessionEngine:
         requested_approval_decision: ToolApprovalDecision,
         approval_resolution_request_digest: str,
         tool_round_identity: ToolRoundIdentity,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> AsyncGenerator[Event, None]:
         completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
         remaining_tool_calls = [
@@ -15870,6 +15903,7 @@ class SessionEngine:
                     tool_call_outcome=skipped_outcome,
                     decision=decision,
                     tool_round_identity=tool_round_identity,
+                    execution_profile=execution_profile,
                     approval_id=pending_approval_to_clear.approval_id,
                 )
             )
@@ -16633,7 +16667,8 @@ class SessionEngine:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         payload=payload,
-                    )
+                    ),
+                    execution_profile=execution_profile,
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=loaded_interrupted,
@@ -16903,6 +16938,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     terminal_event=terminal_event,
+                    execution_profile=execution_profile,
                     payload={},
                 )
             )
@@ -16933,6 +16969,7 @@ class SessionEngine:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         terminal_event=terminal_event,
+                        execution_profile=execution_profile,
                         payload={
                             **diagnostic.payload_fields(),
                             **_runtime_hook_actions_payload(context),
@@ -16950,6 +16987,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     terminal_event=terminal_event,
+                    execution_profile=execution_profile,
                     payload=_runtime_hook_actions_payload(context),
                 )
             )

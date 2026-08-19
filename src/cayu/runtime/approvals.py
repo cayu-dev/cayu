@@ -615,6 +615,12 @@ class PendingToolApprovalEventView(BaseModel):
     environment_name: str | None = None
     workspace_id: str | None = None
     task_id: str | None = None
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     tool_calls: list[PendingToolCallApprovalEventView]
@@ -714,12 +720,11 @@ class PendingToolApprovalEventView(BaseModel):
             "quarantined" if arguments_quarantined else "finalized"
         )
         payload = pending.model_dump(mode="python")
-        # This is private checkpoint authority, not part of the public event
-        # view. The event carries only the resulting argument availability.
+        # Private execution controls stay out of the public view. The profile
+        # fingerprint is retained because it is redacted invocation evidence.
         payload.pop("publish_arguments", None)
         payload.pop("secret_resolution_scope", None)
         payload.pop("run_limit_accounting", None)
-        payload.pop("execution_profile_fingerprint", None)
         payload["arguments_state"] = state
         payload["arguments"] = None if arguments_quarantined else pending.arguments
         payload["tool_calls"] = [

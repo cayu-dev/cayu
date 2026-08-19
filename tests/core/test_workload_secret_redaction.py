@@ -2293,9 +2293,9 @@ def test_custom_tool_runner_uses_secret_resolved_after_context_creation(tmp_path
                 ExecCommand.process(
                     sys.executable,
                     "-c",
-                    "import os,sys; sys.stdout.write(os.environ['TOKEN'])",
+                    "import sys; sys.stdout.write(sys.argv[1])",
+                    raw_secret,
                 ),
-                env={"TOKEN": raw_secret},
                 output_limit_bytes=16,
             )
             return ToolResult(
@@ -2504,6 +2504,7 @@ def test_runtime_fails_closed_when_secret_resolves_after_bounded_runner_completi
                     sys.executable,
                     "-c",
                     "import os,sys; sys.stdout.write(os.environ['TOKEN'])",
+                    secret,
                 ),
                 env={"TOKEN": secret},
                 output_limit_bytes=16,
@@ -2561,15 +2562,31 @@ def test_runtime_fails_closed_when_secret_resolves_after_bounded_runner_completi
         )
     )
     transcript = asyncio.run(store.load_transcript(session_id))
+    durable_events = asyncio.run(store.load_events(session_id))
     failed = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+    runner_events = [
+        event
+        for event in durable_events
+        if event.type in {EventType.RUNNER_EXEC_STARTED, EventType.RUNNER_EXEC_COMPLETED}
+    ]
     rendered = repr(
         (
             [event.model_dump(mode="json") for event in events],
+            [event.model_dump(mode="json") for event in durable_events],
             [message.model_dump(mode="json") for message in transcript],
             [message.model_dump(mode="json") for message in provider.requests[1].messages],
         )
     )
 
+    assert len(runner_events) == 2
+    assert all(
+        event.payload["command"]
+        == {
+            "kind": "process",
+            "arguments_state": "unavailable",
+        }
+        for event in runner_events
+    )
     assert failed.payload["terminal_outcome"] == "invalid_tool_output"
     assert failed.payload["result"]["is_error"] is True
     assert "late-registered-" not in rendered

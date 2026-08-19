@@ -115,6 +115,92 @@ class _FailingTerminalToolEventStore(InMemorySessionStore):
         await super().append_events(session_id, events)
 
 
+def test_approval_and_tool_evidence_reference_the_admitted_execution_profile() -> None:
+    async def scenario() -> None:
+        session_id = "session-attributed-approval"
+        store = InMemorySessionStore()
+        tool = _RecordingTool()
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call-1",
+                        name=tool.spec.name,
+                        arguments={"value": "record"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[tool],
+            tool_policy=_RequireApprovalPolicy(),
+        )
+
+        paused = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "run the side effect")],
+                )
+            )
+        ]
+        checkpoint = await store.load_checkpoint(session_id)
+        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        assert active is not None
+        fingerprint = active.profile.fingerprint
+        request_event = next(
+            event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        assert request_event.payload["execution_profile_fingerprint"] == fingerprint
+        assert request_event.payload["approval"]["execution_profile_fingerprint"] == fingerprint
+        durable_request_event = next(
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        approval = PendingToolApprovalEventView.from_event(durable_request_event)
+        assert approval.execution_profile_fingerprint == fingerprint
+
+        resumed = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id=session_id,
+                    approval_id=approval.approval_id,
+                    tool_round_id=approval.tool_round_id,
+                    tool_call_id=approval.tool_call_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+        attributed_types = {
+            EventType.SESSION_RESUMED,
+            EventType.TOOL_CALL_APPROVED,
+            EventType.TOOL_CALL_STARTED,
+            EventType.TOOL_CALL_COMPLETED,
+        }
+        attributed = [event for event in resumed if event.type in attributed_types]
+        assert {event.type for event in attributed} == attributed_types, [
+            (event.type, event.payload) for event in resumed
+        ]
+        assert {event.payload.get("execution_profile_fingerprint") for event in attributed} == {
+            fingerprint
+        }
+        assert tool.calls == [{"value": "record"}]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("conflicting_event_type", "expected_error"),
     [

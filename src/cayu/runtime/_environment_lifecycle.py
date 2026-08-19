@@ -112,7 +112,10 @@ from cayu.runtime._environment_allocation import (
     require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+)
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.sessions import (
     CheckpointTransform,
@@ -748,6 +751,7 @@ class EnvironmentLifecycle:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> Event | None:
         """Persist the factory acceptance boundary before provisioning begins."""
 
@@ -761,15 +765,18 @@ class EnvironmentLifecycle:
         environment_name = registered_environment.spec.name
         try:
             return await self._event_writer.emit(
-                Event(
-                    type=EventType.ENVIRONMENT_FACTORY_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=_environment_factory_base_payload(
-                        session=session,
-                        registered_environment=registered_environment,
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.ENVIRONMENT_FACTORY_STARTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=_environment_factory_base_payload(
+                            session=session,
+                            registered_environment=registered_environment,
+                        ),
                     ),
+                    execution_profile,
                 )
             )
         except BaseException:
@@ -849,6 +856,9 @@ class EnvironmentLifecycle:
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
+                execution_profile_fingerprint=(
+                    None if execution_profile is None else execution_profile.fingerprint
+                ),
                 operation=effective_operation,
                 parent_session_id=session.parent_session_id,
                 causal_budget_id=session.causal_budget_id,
@@ -1020,6 +1030,10 @@ class EnvironmentLifecycle:
                     completed_event,
                     "allocation_id",
                 )
+            completed_event = event_with_execution_profile_authority(
+                completed_event,
+                execution_profile,
+            )
             events.append(await self._event_writer.emit(completed_event))
             if result is None:
                 raise RuntimeError("Environment factory did not return an owned result.")
@@ -1154,6 +1168,10 @@ class EnvironmentLifecycle:
                             failed_event,
                             "allocation_id",
                         )
+                    failed_event = event_with_execution_profile_authority(
+                        failed_event,
+                        execution_profile,
+                    )
                     events.append(await self._event_writer.emit(failed_event))
                 except BaseException as publication_error:
                     raise BaseExceptionGroup(
@@ -1227,6 +1245,7 @@ class EnvironmentLifecycle:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> Event | None:
         """Persist the binding acceptance boundary before workspace setup begins."""
 
@@ -1243,19 +1262,22 @@ class EnvironmentLifecycle:
         try:
             return await self._event_writer.emit(
                 _event_with_binding_generation_authority(
-                    Event(
-                        type=EventType.ENVIRONMENT_BINDING_STARTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=_binding_base_payload(
-                            registered_environment,
+                    event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.ENVIRONMENT_BINDING_STARTED,
                             session_id=session.id,
-                            public_authority_alias_codec=(
-                                self._session_store.public_authority_alias_codec
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload=_binding_base_payload(
+                                registered_environment,
+                                session_id=session.id,
+                                public_authority_alias_codec=(
+                                    self._session_store.public_authority_alias_codec
+                                ),
+                                redactor=self._secret_redactor,
                             ),
-                            redactor=self._secret_redactor,
                         ),
+                        execution_profile,
                     )
                 )
             )
@@ -1574,13 +1596,16 @@ class EnvironmentLifecycle:
                     events.append(
                         await self._event_writer.emit(
                             _event_with_binding_generation_authority(
-                                Event(
-                                    type=EventType.ENVIRONMENT_BINDING_FAILED,
-                                    session_id=session.id,
-                                    agent_name=registered_agent.spec.name,
-                                    environment_name=environment_name,
-                                    payload=failure_payload,
-                                )
+                                event_with_execution_profile_authority(
+                                    Event(
+                                        type=EventType.ENVIRONMENT_BINDING_FAILED,
+                                        session_id=session.id,
+                                        agent_name=registered_agent.spec.name,
+                                        environment_name=environment_name,
+                                        payload=failure_payload,
+                                    ),
+                                    execution_profile,
+                                ),
                             )
                         )
                     )
@@ -1639,22 +1664,25 @@ class EnvironmentLifecycle:
         events.append(
             await self._event_writer.emit(
                 _event_with_binding_generation_authority(
-                    Event(
-                        type=EventType.ENVIRONMENT_BINDING_COMPLETED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            **base_payload,
-                            **_bound_workspace_payload(
-                                bound,
-                                registered_environment=registered_environment,
-                                session_id=session.id,
-                                public_authority_alias_codec=(
-                                    self._session_store.public_authority_alias_codec
+                    event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.ENVIRONMENT_BINDING_COMPLETED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload={
+                                **base_payload,
+                                **_bound_workspace_payload(
+                                    bound,
+                                    registered_environment=registered_environment,
+                                    session_id=session.id,
+                                    public_authority_alias_codec=(
+                                        self._session_store.public_authority_alias_codec
+                                    ),
                                 ),
-                            ),
-                        },
+                            },
+                        ),
+                        execution_profile,
                     )
                 )
             )
@@ -1813,6 +1841,7 @@ class EnvironmentLifecycle:
                 event=event,
                 session=session,
                 registered_environment=registered_environment,
+                execution_profile=execution_profile,
             )
         except BaseException as exc:
             if owns_cleanup and setup_owner is not None and setup_owner.cleanup_started:
@@ -1849,8 +1878,11 @@ class EnvironmentLifecycle:
         event: Event,
         session: Session,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None,
     ) -> EnvironmentBindingFinalizeResult:
         setup_owner = self._active_environment_setups.get(session.id)
+        if execution_profile is None and setup_owner is not None:
+            execution_profile = setup_owner.execution_profile
         if setup_owner is not None:
             if setup_owner.cleanup_started:
                 if setup_owner.cleanup_error is not None:
@@ -1932,13 +1964,16 @@ class EnvironmentLifecycle:
             events.append(
                 await self._event_writer.emit(
                     _event_with_binding_generation_authority(
-                        Event(
-                            type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
-                            session_id=session.id,
-                            agent_name=event.agent_name,
-                            environment_name=environment_name,
-                            payload=base_payload,
-                        )
+                        event_with_execution_profile_authority(
+                            Event(
+                                type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+                                session_id=session.id,
+                                agent_name=event.agent_name,
+                                environment_name=environment_name,
+                                payload=base_payload,
+                            ),
+                            execution_profile,
+                        ),
                     )
                 )
             )
@@ -2005,13 +2040,16 @@ class EnvironmentLifecycle:
             if final_revision_payload is not None:
                 error_payload["final_revision"] = final_revision_payload
             pending_failure_event = _event_with_binding_generation_authority(
-                Event(
-                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
-                    session_id=session.id,
-                    agent_name=event.agent_name,
-                    environment_name=environment_name,
-                    payload=error_payload,
-                )
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+                        session_id=session.id,
+                        agent_name=event.agent_name,
+                        environment_name=environment_name,
+                        payload=error_payload,
+                    ),
+                    execution_profile,
+                ),
             )
             if setup_owner is not None:
                 # Retain the stable event identity until persistence or
@@ -2129,27 +2167,30 @@ class EnvironmentLifecycle:
             events.append(
                 await self._event_writer.emit(
                     _event_with_binding_generation_authority(
-                        Event(
-                            type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
-                            session_id=session.id,
-                            agent_name=event.agent_name,
-                            environment_name=environment_name,
-                            payload={
-                                **base_payload,
-                                "final_snapshot": _final_workspace_snapshot_payload(
-                                    final_snapshot,
-                                    registered_environment=registered_environment,
-                                ),
-                                "final_revision": _final_workspace_revision_payload(
-                                    final_revision,
-                                    registered_environment=registered_environment,
-                                    session_id=session.id,
-                                    redactor=self._secret_redactor,
-                                    public_authority_alias_codec=(
-                                        self._session_store.public_authority_alias_codec
+                        event_with_execution_profile_authority(
+                            Event(
+                                type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                                session_id=session.id,
+                                agent_name=event.agent_name,
+                                environment_name=environment_name,
+                                payload={
+                                    **base_payload,
+                                    "final_snapshot": _final_workspace_snapshot_payload(
+                                        final_snapshot,
+                                        registered_environment=registered_environment,
                                     ),
-                                ),
-                            },
+                                    "final_revision": _final_workspace_revision_payload(
+                                        final_revision,
+                                        registered_environment=registered_environment,
+                                        session_id=session.id,
+                                        redactor=self._secret_redactor,
+                                        public_authority_alias_codec=(
+                                            self._session_store.public_authority_alias_codec
+                                        ),
+                                    ),
+                                },
+                            ),
+                            execution_profile,
                         )
                     )
                 )

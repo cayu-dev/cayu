@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import warnings
@@ -22,6 +23,7 @@ import cayu.tools._resources as resources_module
 import cayu.tools._runner as runner_module
 from cayu._exception_groups import iter_exception_tree
 from cayu._task_wait import capture_awaitable_outcome
+from cayu._validation import compact_json_utf8_size
 from cayu._workspace_mutation import (
     WorkspaceMutationProcessFence,
     workspace_mutation_task_settlement_probe,
@@ -643,6 +645,455 @@ class _MisreportedBoundedRunner(Runner):
             stdout_truncated=False,
             stdout_bytes=64,
         )
+
+
+def test_runner_execution_observer_brackets_dispatch_with_bounded_evidence() -> None:
+    observations: list[tuple[str, dict[str, Any]]] = []
+
+    async def observe(
+        phase: str,
+        payload: dict[str, Any],
+        command_evidence_revision: int,
+    ) -> None:
+        assert command_evidence_revision == 0
+        observations.append((phase, payload))
+
+    async def scenario() -> ExecResult:
+        handle = InvocationRunnerHandle(
+            _ImmediateRunner(),
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+            execution_observer=observe,
+        )
+        return await handle.exec(ExecCommand.process("echo", "hello"))
+
+    result = asyncio.run(scenario())
+
+    assert result.stdout == "completed"
+    assert [phase for phase, _payload in observations] == ["started", "completed"]
+    started = observations[0][1]
+    completed = observations[1][1]
+    assert started == {
+        "adapter": "unknown",
+        "command": {
+            "kind": "process",
+            "arguments_state": "available",
+            "preview_format": "exec_command_json_prefix",
+            "preview": '{"argv":["echo","hello"],"kind":"process","shell":null}',
+            "truncated": False,
+        },
+    }
+    assert completed["command"] == started["command"]
+    assert completed["exit_code"] == 0
+    assert completed["timed_out"] is False
+    assert type(completed["duration_ms"]) is int
+    assert "stdout" not in completed
+    assert "stderr" not in completed
+
+
+def test_runner_execution_observer_bounds_and_redacts_command_evidence() -> None:
+    secret = "runner-command-secret-canary-ABCDEFGHIJKLMNOP"
+    observations: list[tuple[str, dict[str, Any]]] = []
+
+    async def observe(
+        phase: str,
+        payload: dict[str, Any],
+        command_evidence_revision: int,
+    ) -> None:
+        assert command_evidence_revision == 0
+        observations.append((phase, payload))
+
+    async def scenario() -> None:
+        handle = InvocationRunnerHandle(
+            _ImmediateRunner(),
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(secret),
+            ),
+            execution_observer=observe,
+        )
+        await handle.exec(
+            ExecCommand.process(
+                "echo",
+                secret,
+                "retained-prefix-" + "x" * 16_000 + "-unretained-tail",
+            )
+        )
+
+    asyncio.run(scenario())
+
+    assert [phase for phase, _payload in observations] == ["started", "completed"]
+    started = observations[0][1]["command"]
+    completed = observations[1][1]["command"]
+    assert started == completed
+    assert started["arguments_state"] == "redacted_and_truncated"
+    assert started["truncated"] is True
+    assert REDACTED_SECRET in started["preview"]
+    assert secret not in started["preview"]
+    assert "unretained-tail" not in started["preview"]
+    assert compact_json_utf8_size(started) <= runner_module._RUNNER_COMMAND_EVIDENCE_MAX_BYTES
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ExecCommand.process("echo", "hello"),
+        ExecCommand.bash("printf 'hello'"),
+    ],
+)
+def test_runner_command_json_prefix_matches_complete_compact_serialization(command) -> None:
+    prefix, complete = runner_module._runner_command_json_prefix(command, max_bytes=4096)
+
+    assert complete is True
+    assert prefix.decode("utf-8") == json.dumps(
+        command.model_dump(mode="json", warnings=False),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def test_runner_command_json_prefix_bounds_escaped_source_without_serializing_all_of_it() -> None:
+    command = ExecCommand.process("echo", '"' * 100_000)
+    prefix, complete = runner_module._runner_command_json_prefix(
+        command,
+        max_bytes=97,
+    )
+
+    assert complete is False
+    assert len(prefix) == 97
+    assert (
+        prefix
+        == json.dumps(
+            command.model_dump(mode="json", warnings=False),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")[:97]
+    )
+
+
+def test_runner_execution_observer_quarantines_unpublished_arguments() -> None:
+    observations: list[tuple[str, dict[str, Any]]] = []
+
+    async def observe(
+        phase: str,
+        payload: dict[str, Any],
+        command_evidence_revision: int,
+    ) -> None:
+        assert command_evidence_revision == 0
+        observations.append((phase, payload))
+
+    async def scenario() -> None:
+        handle = InvocationRunnerHandle(
+            _ImmediateRunner(),
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+            execution_observer=observe,
+            publish_execution_arguments=False,
+        )
+        await handle.exec(ExecCommand.process("echo", "private-command-material"))
+
+    asyncio.run(scenario())
+
+    assert [phase for phase, _payload in observations] == ["started", "completed"]
+    assert observations[0][1]["command"] == {
+        "kind": "process",
+        "arguments_state": "unavailable",
+    }
+    assert observations[1][1]["command"] == observations[0][1]["command"]
+
+
+def test_runtime_runner_events_honor_tool_argument_quarantine() -> None:
+    private_material = "private-runner-command-material"
+
+    class PrivateRunnerTool(Tool):
+        spec = ToolSpec(
+            name="private_runner",
+            description="Run a command without publishing its arguments.",
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+        )
+
+        @property
+        def _publish_arguments(self) -> bool:
+            return False
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.runner is not None
+            result = await ctx.runner.exec(ExecCommand.process("echo", args["value"]))
+            return ToolResult(content=result.stdout)
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call-private-runner",
+                    name="private_runner",
+                    arguments={"value": private_material},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="runner"),
+            runner=_ImmediateRunner(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[PrivateRunnerTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "run privately")],
+            ),
+        )
+    )
+    runner_events = [
+        event
+        for event in events
+        if event.type in {EventType.RUNNER_EXEC_STARTED, EventType.RUNNER_EXEC_COMPLETED}
+    ]
+
+    assert len(runner_events) == 2
+    assert all(
+        event.payload["command"] == {"kind": "process", "arguments_state": "unavailable"}
+        for event in runner_events
+    )
+    assert private_material not in repr(runner_events)
+
+
+def test_runtime_persists_runner_start_before_dispatch_and_seals_completion() -> None:
+    class BlockingAfterRunnerTool(Tool):
+        spec = ToolSpec(
+            name="runner_evidence_fence",
+            description="Keep the invocation open after a runner command.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self, command_completed: asyncio.Event, release: asyncio.Event) -> None:
+            self.command_completed = command_completed
+            self.release = release
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            await ctx.runner.exec(ExecCommand.process("echo", "public-command-material"))
+            self.command_completed.set()
+            await self.release.wait()
+            return ToolResult(content="done")
+
+    async def scenario() -> tuple[list[Any], list[Any]]:
+        store = InMemorySessionStore()
+        command_completed = asyncio.Event()
+        release = asyncio.Event()
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call-runner-evidence-fence",
+                        name="runner_evidence_fence",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="runner"),
+                runner=_ImmediateRunner(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[BlockingAfterRunnerTool(command_completed, release)],
+        )
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="runner-evidence-fence",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await command_completed.wait()
+        events_during_invocation = await store.load_events("runner-evidence-fence")
+        release.set()
+        await run_task
+        durable_events = await store.load_events("runner-evidence-fence")
+        return events_during_invocation, durable_events
+
+    events_during_invocation, durable_events = asyncio.run(scenario())
+    runner_events_during_invocation = [
+        event
+        for event in events_during_invocation
+        if event.type in {EventType.RUNNER_EXEC_STARTED, EventType.RUNNER_EXEC_COMPLETED}
+    ]
+    assert [event.type for event in runner_events_during_invocation] == [
+        EventType.RUNNER_EXEC_STARTED
+    ]
+    assert runner_events_during_invocation[0].payload["command"] == {
+        "kind": "process",
+        "arguments_state": "unavailable",
+    }
+    runner_events = [
+        event
+        for event in durable_events
+        if event.type in {EventType.RUNNER_EXEC_STARTED, EventType.RUNNER_EXEC_COMPLETED}
+    ]
+    assert [event.type for event in runner_events] == [
+        EventType.RUNNER_EXEC_STARTED,
+        EventType.RUNNER_EXEC_COMPLETED,
+    ]
+    assert runner_events[0].payload["command"] == {
+        "kind": "process",
+        "arguments_state": "unavailable",
+    }
+    assert runner_events[1].payload["command"]["arguments_state"] == "available"
+    assert "public-command-material" in runner_events[1].payload["command"]["preview"]
+
+
+def test_runtime_runner_start_persistence_failure_prevents_dispatch() -> None:
+    class RejectRunnerStartStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runner_start_attempts = 0
+
+        async def append_event(self, session_id: str, event) -> None:
+            if event.type is EventType.RUNNER_EXEC_STARTED:
+                self.runner_start_attempts += 1
+                raise RuntimeError("runner start evidence unavailable")
+            await super().append_event(session_id, event)
+
+    class CountingRunner(_ImmediateRunner):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            self.calls += 1
+            return await super().exec(command, **kwargs)
+
+    class RunnerTool(Tool):
+        spec = ToolSpec(
+            name="runner_start_failure",
+            description="Run one command.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            result = await ctx.runner.exec(ExecCommand.process("echo", "blocked"))
+            return ToolResult(content=result.stdout)
+
+    store = RejectRunnerStartStore()
+    runner = CountingRunner()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call-runner-start-failure",
+                    name="runner_start_failure",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="runner"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[RunnerTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "do not dispatch")],
+            ),
+        )
+    )
+
+    assert store.runner_start_attempts == 1
+    assert runner.calls == 0
+    assert not any(
+        event.type in {EventType.RUNNER_EXEC_STARTED, EventType.RUNNER_EXEC_COMPLETED}
+        for event in events
+    )
+
+
+def test_runner_start_evidence_failure_prevents_dispatch() -> None:
+    class CountingRunner(_ImmediateRunner):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            self.calls += 1
+            return await super().exec(command, **kwargs)
+
+    runner = CountingRunner()
+
+    async def reject_start(
+        phase: str,
+        payload: dict[str, Any],
+        command_evidence_revision: int,
+    ) -> None:
+        del phase, payload, command_evidence_revision
+        raise RuntimeError("runner start evidence unavailable")
+
+    async def scenario() -> None:
+        handle = InvocationRunnerHandle(
+            runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+            execution_observer=reject_start,
+        )
+        with pytest.raises(RunnerExecutionError):
+            await handle.exec(ExecCommand.process("echo", "blocked"))
+
+    asyncio.run(scenario())
+    assert runner.calls == 0
 
 
 def test_invocation_runner_handle_hides_invalid_command_input_before_snapshot() -> None:

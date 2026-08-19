@@ -562,6 +562,7 @@ class EnvironmentFactoryRequest:
     execution_requirements: ExecutionRequirements = field(
         default_factory=ExecutionRequirements.trusted
     )
+    execution_profile_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation, EnvironmentFactoryOperation):
@@ -579,6 +580,15 @@ class EnvironmentFactoryRequest:
             "environment_name",
             require_clean_nonblank(self.environment_name, "environment_name"),
         )
+        if self.execution_profile_fingerprint is not None and (
+            type(self.execution_profile_fingerprint) is not str
+            or len(self.execution_profile_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.execution_profile_fingerprint
+            )
+        ):
+            raise ValueError("execution_profile_fingerprint must be a lowercase SHA-256 digest.")
         if self.parent_session_id is not None:
             object.__setattr__(
                 self,
@@ -715,6 +725,7 @@ def copy_environment_factory_request(
         session_id=request.session_id,
         agent_name=request.agent_name,
         environment_name=request.environment_name,
+        execution_profile_fingerprint=request.execution_profile_fingerprint,
         operation=request.operation,
         parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,

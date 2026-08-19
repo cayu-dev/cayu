@@ -281,11 +281,16 @@ retries, restarts, and operator-directed changes.
 
 ### Highlights
 
-- Sessions persist a versioned execution profile covering their model target,
-  provider configuration, tools, approval policy, environment, context policy,
-  and other execution-critical inputs. Ordinary resume fails closed on drift;
-  applications can explicitly inspect and authorize a compatible profile
-  adoption at a safe boundary.
+- Sessions persist a versioned execution profile covering direct tool schemas,
+  application-declared tool implementations, grant baselines, execution
+  policies, invocation-scoped policies, ordered hooks, environment and runner
+  semantics, and effect authority in addition to the runtime, model target, and
+  durable instruction projection. Missing custom identities are explicitly
+  process-local rather than claimed as reproducible. Tool, approval, runner,
+  hook, environment, workspace, credential-proxy, and virtual-egress evidence
+  references the immutable profile that governed it. Ordinary resume fails
+  closed on drift; applications can explicitly inspect and authorize adoption
+  at a safe boundary, while generic compatible reuse cannot change authority.
 - Model targets can change through an atomic durable transition rather than
   mutating live agent configuration. The selected provider and model remain
   attributable through pending work, recovery, forked sessions, and restart.

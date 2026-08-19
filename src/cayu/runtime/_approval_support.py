@@ -88,6 +88,7 @@ _RUNTIME_APPROVAL_IDENTITY_FIELDS = (
     "model_attempt_id",
     "tool_round_id",
 )
+_EXECUTION_PROFILE_FINGERPRINT_FIELD = "execution_profile_fingerprint"
 
 
 def event_with_pending_approval_authority(
@@ -103,6 +104,12 @@ def event_with_pending_approval_authority(
         for field_name in _RUNTIME_APPROVAL_IDENTITY_FIELDS
         if event.payload.get(field_name) == getattr(approval, field_name)
     )
+    if (
+        approval.execution_profile_fingerprint is not None
+        and event.payload.get(_EXECUTION_PROFILE_FINGERPRINT_FIELD)
+        == approval.execution_profile_fingerprint
+    ):
+        top_level_fields = (*top_level_fields, _EXECUTION_PROFILE_FINGERPRINT_FIELD)
     if top_level_fields:
         event = event_with_runtime_payload_authority(event, *top_level_fields)
     nested = event.payload.get("approval")
@@ -376,6 +383,8 @@ def bounded_pending_approval_event_payload(
         if call_metadata.get("metadata_truncated") is True:
             truncated_tool_call_ids.append(pending_call.tool_call_id)
     result: dict[str, Any] = {"approval": payload}
+    if approval.execution_profile_fingerprint is not None:
+        result[_EXECUTION_PROFILE_FINGERPRINT_FIELD] = approval.execution_profile_fingerprint
     if publish_policy_output and bounded.get("metadata_truncated") is True:
         result["approval_metadata_truncated"] = True
     if truncated_tool_call_ids:
@@ -644,6 +653,11 @@ def resumed_event(
             "approval_id": approval.approval_id,
             "tool_call_id": approval.tool_call_id,
             "decision": decision.value,
+            **(
+                {_EXECUTION_PROFILE_FINGERPRINT_FIELD: (approval.execution_profile_fingerprint)}
+                if approval.execution_profile_fingerprint is not None
+                else {}
+            ),
             "resolved_by": resolution_actor_payload(resolved_by),
             "expired": expired,
         },
@@ -654,6 +668,11 @@ def resumed_event(
         "model_attempt_id",
         "tool_round_id",
         "approval_id",
+        *(
+            (_EXECUTION_PROFILE_FINGERPRINT_FIELD,)
+            if approval.execution_profile_fingerprint is not None
+            else ()
+        ),
     )
 
 

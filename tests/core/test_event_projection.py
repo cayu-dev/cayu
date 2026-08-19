@@ -41,6 +41,7 @@ from cayu.runtime._event_projection import (
     REDACTED_CUSTOM_EVENT_TYPE,
     prepare_new_runtime_event,
     private_event_linkage_value,
+    project_persisted_runtime_event,
     public_event_id,
     public_event_linkage_id,
     public_event_sequence,
@@ -66,6 +67,9 @@ from cayu.runtime.budgets import (
     budget_settlement_id,
 )
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
@@ -185,15 +189,59 @@ def test_fingerprint_only_profile_rejection_remains_projectable() -> None:
     assert projected.payload == payload
 
 
+def test_execution_profile_attribution_requires_runtime_or_persisted_authority() -> None:
+    fingerprint = "a" * 64
+    forged = Event(
+        type=EventType.SESSION_AWAITING_USER_INPUT,
+        session_id="profile-attribution",
+        payload={"execution_profile_fingerprint": fingerprint},
+    )
+
+    prepared_forgery = prepare_new_runtime_event(forged, redactor=SecretRedactor())
+    untrusted_projection = project_runtime_event(
+        forged,
+        sequence=1,
+        redactor=SecretRedactor(),
+    )
+
+    assert "execution_profile_fingerprint" not in prepared_forgery.payload
+    assert untrusted_projection.payload["execution_profile_fingerprint"] == PRIVATE_EVENT_AUTHORITY
+
+    attested = event_with_execution_profile_fingerprint_authority(forged, fingerprint)
+    prepared = prepare_new_runtime_event(attested, redactor=SecretRedactor())
+    assert prepared.payload["execution_profile_fingerprint"] == fingerprint
+    assert (
+        project_runtime_event(prepared, sequence=2, redactor=SecretRedactor("a" * 8)).payload[
+            "execution_profile_fingerprint"
+        ]
+        == fingerprint
+    )
+
+    reloaded = Event.model_validate(prepared.model_dump(mode="python"))
+    assert (
+        project_runtime_event(reloaded, sequence=3, redactor=SecretRedactor()).payload[
+            "execution_profile_fingerprint"
+        ]
+        == PRIVATE_EVENT_AUTHORITY
+    )
+    assert (
+        project_persisted_runtime_event(
+            reloaded,
+            sequence=3,
+            redactor=SecretRedactor("a" * 8),
+        ).payload["execution_profile_fingerprint"]
+        == fingerprint
+    )
+
+
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
     assert (
         frozenset(PendingToolCallApproval.model_fields) | {"arguments_state"}
         == event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES
     )
-    assert (
-        frozenset(PendingToolApproval.model_fields)
-        - {"execution_profile_fingerprint", "run_limit_accounting"}
-    ) | {"arguments_state"} == event_projection_module._PENDING_APPROVAL_FIELD_NAMES
+    assert (frozenset(PendingToolApproval.model_fields) - {"run_limit_accounting"}) | {
+        "arguments_state"
+    } == event_projection_module._PENDING_APPROVAL_FIELD_NAMES
     assert (
         frozenset(PendingUserInput.model_fields)
         - {

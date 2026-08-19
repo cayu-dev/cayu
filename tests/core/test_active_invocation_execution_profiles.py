@@ -2734,12 +2734,39 @@ def test_user_input_continuation_rejects_changed_profile_before_provider_work() 
         awaiting = next(
             event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
         )
+        interrupted = next(event for event in paused if event.type is EventType.SESSION_INTERRUPTED)
         checkpoint = await store.load_checkpoint(session_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         pending_input = pending_user_input_from_checkpoint(checkpoint)
         assert active_profile is not None
         assert pending_input is not None
         assert pending_input.execution_profile_fingerprint == active_profile.profile.fingerprint
+        assert (
+            awaiting.payload["execution_profile_fingerprint"] == active_profile.profile.fingerprint
+        )
+        assert (
+            interrupted.payload["execution_profile_fingerprint"]
+            == active_profile.profile.fingerprint
+        )
+        assert "execution_profile_fingerprint" not in interrupted.payload["user_input"]
+        durable_awaiting = next(
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+        durable_interrupted = next(
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.SESSION_INTERRUPTED
+        )
+        assert (
+            durable_awaiting.payload["execution_profile_fingerprint"]
+            == active_profile.profile.fingerprint
+        )
+        assert (
+            durable_interrupted.payload["execution_profile_fingerprint"]
+            == active_profile.profile.fingerprint
+        )
 
         replacement_provider = ScriptedModelProvider(
             [
@@ -3379,6 +3406,27 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
     assert original_hook.after_tool_execution_profiles[0] is model_profiles[0]
     assert original_hook.execution_profiles == [model_profiles[0]]
     assert original_hook.execution_profiles[0] is model_profiles[0]
+    assert model_profiles[0] is not None
+    attributed_event_types = {
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+    }
+    attributed_events = [event for event in events if event.type in attributed_event_types]
+    assert attributed_events
+    assert {event.payload.get("execution_profile_fingerprint") for event in attributed_events} == {
+        model_profiles[0].fingerprint
+    }
+    durable_attributed_events = [
+        event
+        for event in await store.load_events(session_id)
+        if event.type in attributed_event_types
+    ]
+    assert durable_attributed_events
+    assert {
+        event.payload.get("execution_profile_fingerprint") for event in durable_attributed_events
+    } == {model_profiles[0].fingerprint}
     assert len(provider.requests) == 3
     assert replacement_provider.requests == []
 

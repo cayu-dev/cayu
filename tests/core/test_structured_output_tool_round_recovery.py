@@ -463,6 +463,9 @@ def test_incomplete_recovery_atomically_finalizes_valid_structured_output_round(
             EventType.STRUCTURED_OUTPUT_VALIDATED,
         ]
         terminal_event, *auxiliary_events = round_events
+        assert terminal_event.payload["execution_profile_fingerprint"] == (
+            staged.execution_profile.fingerprint
+        )
         assert receipt is not None
         assert receipt.transcript_start_cursor == 2
         assert receipt.transcript_end_cursor == 3
@@ -498,6 +501,8 @@ def test_incomplete_recovery_atomically_finalizes_valid_structured_output_round(
 
 def test_incomplete_recovery_accepts_partial_unavailable_terminal_evidence() -> None:
     async def scenario() -> None:
+        from cayu.runtime.execution_profiles import event_with_execution_profile_authority
+
         store = InMemorySessionStore()
         provider = _RecordingProvider()
         spec = _answer_spec()
@@ -530,8 +535,11 @@ def test_incomplete_recovery_accepts_partial_unavailable_terminal_evidence() -> 
             ),
             outcome=outcome,
         )
-        terminal_event = terminal_event.model_copy(
-            update={"interaction_id": staged.completion_event.interaction_id}
+        terminal_event = event_with_execution_profile_authority(
+            terminal_event.model_copy(
+                update={"interaction_id": staged.completion_event.interaction_id}
+            ),
+            staged.execution_profile,
         )
         assert terminal_event.payload["arguments_state"] == "unavailable"
         assert "arguments" not in terminal_event.payload

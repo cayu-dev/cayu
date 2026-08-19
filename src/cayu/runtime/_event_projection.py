@@ -141,6 +141,7 @@ _MODEL_EXECUTION_AUTHORITY_KEYS = frozenset(
 _TOOL_LINKAGE_AUTHORITY_KEYS = frozenset(
     {
         "approval_id",
+        "execution_profile_fingerprint",
         "idempotency_key",
         "input_id",
         "model_attempt_id",
@@ -150,6 +151,11 @@ _TOOL_LINKAGE_AUTHORITY_KEYS = frozenset(
         "tool_round_id",
     }
 )
+_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS = frozenset({"execution_profile_fingerprint"})
+# Unlike caller-selected public linkage such as a server mutation id, these
+# fields assert which runtime authority governed an effect. They may survive a
+# first write or an untrusted projection only with exact in-process provenance.
+_PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
 _TOOL_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_CALL_STARTED,
@@ -1111,6 +1117,7 @@ _PENDING_APPROVAL_FIELD_NAMES = frozenset(
         "arguments_state",
         "budget_limits",
         "environment_name",
+        "execution_profile_fingerprint",
         "expires_at",
         "limits",
         "max_steps",
@@ -1708,6 +1715,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "arguments",
         "arguments_state",
         "effect",
+        "execution_profile_fingerprint",
         "effective_arguments",
         "expired",
         "idempotency_key",
@@ -1748,6 +1756,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         *tool_common,
         owned_nested_paths=_TOOL_RESULT_NESTED_PATHS | tool_actor_paths,
         authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -1777,6 +1786,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "tool_result_projection",
             owned_nested_paths=_TOOL_EVENT_NESTED_PATHS | tool_actor_paths,
             authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
+            public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
             aliased_authority_keys={
                 "approval_id",
                 "input_id",
@@ -1798,7 +1808,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             },
         )
     workspace_observation_keys = (
-        "binding_generation_id branch detail_code head_revision model_attempt_id model_step model_step_id observer "
+        "binding_generation_id branch detail_code execution_profile_fingerprint head_revision "
+        "model_attempt_id model_step model_step_id observer "
         "manifest_artifact_id manifest_artifact_sha256 manifest_artifact_size_bytes path_scope paths phase "
         "revision session_run_epoch status tool_call_id tool_round_id total_paths window_id "
         "workspace_id artifact_store_id"
@@ -1818,8 +1829,16 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.WORKSPACE_REVISION_OBSERVED] = _observed_policy(
         workspace_observation_keys,
         owned_nested_paths=workspace_path_owned_paths,
-        authority_keys={"manifest_artifact_sha256", "observer"},
-        public_authority_keys={"manifest_artifact_sha256", "observer"},
+        authority_keys={
+            "execution_profile_fingerprint",
+            "manifest_artifact_sha256",
+            "observer",
+        },
+        public_authority_keys={
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+            "manifest_artifact_sha256",
+            "observer",
+        },
         aliased_authority_keys={
             "model_attempt_id",
             "model_step_id",
@@ -1836,17 +1855,19 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.WORKSPACE_MUTATION_RECORDED] = _observed_policy(
         "after_observation_id after_revision before_observation_id before_revision binding_generation_id "
-        "branch_changed detail_code head_changed model_attempt_id model_step model_step_id "
+        "branch_changed detail_code execution_profile_fingerprint head_changed model_attempt_id model_step model_step_id "
         "manifest_artifact_id manifest_artifact_sha256 manifest_artifact_size_bytes observer paths "
         "recovery_run_epoch session_run_epoch status tool_call_id tool_outcome_event_digest tool_outcome_event_id "
         "tool_round_id total_paths window_id workspace_id artifact_store_id",
         owned_nested_paths=workspace_delta_owned_paths,
         authority_keys={
+            "execution_profile_fingerprint",
             "manifest_artifact_sha256",
             "observer",
             "tool_outcome_event_digest",
         },
         public_authority_keys={
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
             "manifest_artifact_sha256",
             "observer",
             "tool_outcome_event_digest",
@@ -1870,7 +1891,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.WORKSPACE_OBSERVATION_FINALIZED] = _observed_policy(
         "after_observation_id before_observation_id binding_generation_id branch_changed detail_code "
-        "failed_artifact_count head_changed "
+        "execution_profile_fingerprint failed_artifact_count head_changed "
         "model_attempt_id model_step model_step_id mutation_event_id paths recovery_run_epoch "
         "referenced_artifact_count "
         "revision_after_artifact_id revision_after_artifact_sha256 "
@@ -1883,6 +1904,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "mutation_event_digest "
         "tool_round_id total_paths window_id workspace_id observer artifact_store_id",
         authority_keys={
+            "execution_profile_fingerprint",
             "mutation_event_digest",
             "observer",
             "revision_after_artifact_sha256",
@@ -1891,6 +1913,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "tool_outcome_event_digest",
         },
         public_authority_keys={
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
             "mutation_event_digest",
             "observer",
             "revision_after_artifact_sha256",
@@ -1926,6 +1949,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "tool_result_projection",
         owned_nested_paths=_TOOL_PROJECTED_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
         authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -1954,6 +1978,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             _TOOL_RESULT_NESTED_PATHS | _APPROVAL_NESTED_SCHEMA_PATHS | tool_actor_paths
         ),
         authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -1970,6 +1995,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.TOOL_CALL_APPROVED] = _policy(
         "approval_id",
+        "execution_profile_fingerprint",
         "reason",
         "resolved_by",
         "tool_call_id",
@@ -1977,11 +2003,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         owned_nested_paths=tool_actor_paths,
         authority_keys={
             "approval_id",
+            "execution_profile_fingerprint",
             "model_attempt_id",
             "model_step_id",
             "tool_call_id",
             "tool_round_id",
         },
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
     )
     policies[EventType.TOOL_CALL_APPROVAL_DENIED] = _policy(
@@ -1992,6 +2020,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "resolved_by",
         owned_nested_paths=_TOOL_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
         authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -2005,6 +2034,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.TOOL_CALL_APPROVAL_EXPIRED] = _policy(
         "approval_id",
+        "execution_profile_fingerprint",
         "expires_at",
         "requested_decision",
         "resolved_by",
@@ -2014,11 +2044,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         owned_nested_paths=(tool_actor_paths | _resolution_actor_nested_paths("triggered_by")),
         authority_keys={
             "approval_id",
+            "execution_profile_fingerprint",
             "model_attempt_id",
             "model_step_id",
             "tool_call_id",
             "tool_round_id",
         },
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
     )
 
@@ -2049,10 +2081,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         internal_authority_keys={"input_contract"},
     )
     policies[EventType.SESSION_RESUMED] = _observed_policy(
-        "agent_name appended_messages approval_id decision dispatch_id expired input_id "
+        "agent_name appended_messages approval_id decision dispatch_id execution_profile_fingerprint expired input_id "
         "interruption_type model_attempt_id model_step_id parent_session_id resolved_by "
         "task_id tool_call_id tool_round_id traceparent tracestate",
         owned_nested_paths=_resolution_actor_nested_paths("resolved_by"),
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.SESSION_COMPLETED] = _observed_policy(
         terminal_finalization_keys,
@@ -2074,7 +2108,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.SESSION_INTERRUPTED] = _observed_policy(
         "abandoned actual approval approval_close_intent approval_id "
         "approval_metadata_truncated cost_summary durable_value_error_code "
-        "durable_value_error_path error error_type input_id interruption_request_id "
+        "durable_value_error_path error error_type execution_profile_fingerprint input_id interruption_request_id "
         "interaction_transition_failures interruption_type limit manual_recovery_persisted "
         "manual_recovery_persistence_unknown manual_recovery_required "
         "manual_recovery_stale_live_failure maximum message metadata model_attempt_id "
@@ -2092,7 +2126,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "tool_call_id",
             "tool_round_id",
         },
-        authority_keys={"session_run_operation_id"},
+        authority_keys={"execution_profile_fingerprint", "session_run_operation_id"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         nested_authority_paths=(
             _APPROVAL_NESTED_AUTHORITY_PATHS | _USER_INPUT_NESTED_AUTHORITY_PATHS
         ),
@@ -2125,8 +2160,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         untrusted_container_keys={"failures"},
     )
     policies[EventType.SESSION_AWAITING_USER_INPUT] = _observed_policy(
-        "input_id model_attempt_id model_step_id options question tool_call_id tool_calls "
-        "tool_round_id",
+        "execution_profile_fingerprint input_id model_attempt_id model_step_id options question "
+        "tool_call_id tool_calls tool_round_id",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={"input_id", "tool_call_id", "tool_round_id"},
         owned_nested_paths={
             ("tool_calls", "*", "arguments_state"),
@@ -2305,17 +2342,31 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.BUDGET_RESERVATION_RELEASED] = settlement_policy
 
     policies[EventType.CREDENTIAL_PROXY_CHECKED] = _observed_policy(
-        "action allowed approval_id credential destination idempotency_key input_id metadata "
+        "action allowed approval_id credential destination execution_profile_fingerprint idempotency_key input_id metadata "
         "model_attempt_id model_step_id reason result_metadata tool_call_id tool_round_id",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"metadata", "result_metadata"},
     )
     policies[EventType.CREDENTIAL_MODE_SELECTED] = _observed_policy(
-        "approved_destination_count credential_mode grant_count runner_kind"
+        "approved_destination_count credential_mode execution_profile_fingerprint grant_count runner_kind",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
-    policies[EventType.EGRESS_GRANT_MINTED] = _observed_policy("grant_id")
-    policies[EventType.EGRESS_GRANT_REVOKED] = _observed_policy("grant_id outcome")
+    policies[EventType.EGRESS_GRANT_MINTED] = _observed_policy(
+        "execution_profile_fingerprint grant_id",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+    )
+    policies[EventType.EGRESS_GRANT_REVOKED] = _observed_policy(
+        "execution_profile_fingerprint grant_id outcome",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+    )
     egress_request_policy = _observed_policy(
-        "action allowed credential destination grant_id metadata reason request_id",
+        "action allowed credential destination execution_profile_fingerprint grant_id metadata reason request_id",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"metadata"},
     )
     policies[EventType.EGRESS_REQUEST_AUTHORIZED] = egress_request_policy
@@ -2425,12 +2476,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     binding_policy = _observed_policy(
         "binding_cleanup binding_generation_id binding_type bound_metadata bound_path bound_snapshot "
         "bound_workspace_id configured_workspace_id environment_factory_release error "
-        "error_type factory_allocation_action failures final_revision final_snapshot has_bound_runner "
+        "error_type execution_profile_fingerprint factory_allocation_action failures final_revision final_snapshot has_bound_runner "
         "has_configured_runner outcome source_workspace_id terminal_outcome",
         owned_nested_paths={
             ("final_revision", "status"),
             ("final_revision", "path_scope"),
         },
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={
             "binding_cleanup",
             "bound_metadata",
@@ -2450,8 +2503,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = binding_policy
     factory_policy = _observed_policy(
         "allocation_id causal_budget_id durable_value_error_code durable_value_error_path "
-        "environment_factory_release environment_name error error_type factory_type labels "
+        "environment_factory_release environment_name error error_type execution_profile_fingerprint factory_type labels "
         "parent_session_id reconnect_metadata requested_environment_name result_metadata",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={
             "environment_factory_release",
             "labels",
@@ -2467,8 +2522,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = factory_policy
 
     hook_policy = _observed_policy(
-        "actions durable_value_error_code durable_value_error_path error error_type hook_name "
+        "actions durable_value_error_code durable_value_error_path error error_type execution_profile_fingerprint hook_name "
         "phase scope terminal_event_id terminal_event_type tool_call_id tool_name",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"actions"},
     )
     for event_type in (
@@ -2503,7 +2560,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         untrusted_container_keys={"results"},
     )
     runner_policy = _observed_policy(
-        "adapter command duration_ms error error_type exit_code timed_out",
+        "adapter approval_id command duration_ms error error_type execution_profile_fingerprint "
+        "exit_code idempotency_key input_id model_attempt_id model_step_id timed_out tool_call_id "
+        "tool_round_id",
+        authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"command"},
     )
     policies[EventType.RUNNER_EXEC_STARTED] = runner_policy
@@ -2651,6 +2712,11 @@ def _prepare_runtime_event(
                 f"event.payload.{key} contains a workload secret and cannot be "
                 "used as exact private recovery state."
             )
+    _remove_unattested_public_authority(
+        event,
+        policy=policy,
+        redacted_payload=redacted_payload,
+    )
     _restore_runtime_payload_authority(
         event,
         policy=policy,
@@ -2943,7 +3009,16 @@ def _project_runtime_event(
         if key in policy.internal_authority_keys:
             redacted_payload.pop(key)
             continue
-        if key in policy.public_authority_keys:
+        if key in policy.public_authority_keys and _public_authority_is_trusted(
+            event,
+            field_name=key,
+            trust_persisted_projection=trust_persisted_projection,
+        ):
+            if key in _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS:
+                # Positive producer/store authority also wins over accidental
+                # workload-secret substring collisions in this content-free
+                # digest, just as it does during first-write preparation.
+                redacted_payload[key] = event.payload[key]
             continue
         redacted_payload[key] = (
             public_event_linkage_id(sequence, key)
@@ -3387,6 +3462,51 @@ def _restore_runtime_payload_authority(
             value=value,
         ):
             redacted_payload[field_name] = value
+
+
+def _remove_unattested_public_authority(
+    event: Event,
+    *,
+    policy: EventPayloadPolicy,
+    redacted_payload: dict[str, Any],
+) -> None:
+    """Drop runtime-attribution claims that lack exact producer provenance."""
+
+    for field_name in policy.public_authority_keys & _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS:
+        if _public_authority_is_trusted(
+            event,
+            field_name=field_name,
+            trust_persisted_projection=False,
+        ):
+            continue
+        redacted_payload.pop(field_name, None)
+
+
+def _public_authority_is_trusted(
+    event: Event,
+    *,
+    field_name: str,
+    trust_persisted_projection: bool,
+) -> bool:
+    """Validate authority fields whose public meaning depends on provenance."""
+
+    if field_name not in _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS:
+        return True
+    value = event.payload.get(field_name)
+    if field_name == "execution_profile_fingerprint" and not (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        return False
+    if trust_persisted_projection:
+        return True
+    assert type(value) is str
+    return event_payload_authority_is_runtime_generated(
+        event,
+        field_name=field_name,
+        value=value,
+    )
 
 
 def _restore_runtime_nested_payload_authority(
