@@ -3470,7 +3470,10 @@ def test_compact_session_claim_blocks_concurrent_resume() -> None:
                 session_id="sess_compact_resume_race",
                 messages=[Message.text("user", "create only")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         transcript = [
             Message.text("user", "old request"),
@@ -6480,7 +6483,10 @@ def test_expired_compaction_claim_does_not_block_fork_or_a_new_key() -> None:
                 session_id="sess_expired_compact_fork",
                 messages=[Message.text("user", "create only")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         transcript = [
             Message.text("user", "old request"),
@@ -6574,7 +6580,10 @@ def test_fork_inherits_compacted_context_without_source_operation_records() -> N
                 session_id="sess_compact_fork_source",
                 messages=[Message.text("user", "create only")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         transcript = [
             Message.text("user", "old request"),

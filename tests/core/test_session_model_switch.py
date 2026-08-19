@@ -23,6 +23,7 @@ from cayu import (
     FileAttachment,
     FileAttachmentKind,
     FilePart,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
     InMemorySessionStore,
     Message,
@@ -64,6 +65,17 @@ from cayu.providers.base import _preflight_provider_portable_messages
 from cayu.runtime import SessionStore
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.approvals import PendingToolCallApproval
+
+
+def _fork_profile_adoption(key: str) -> ExecutionProfileAdoptionIntent:
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key=key,
+        reason="Adopt the explicitly requested child model profile.",
+        requested_by=ResolutionActor(
+            subject="test",
+            source=ResolutionActorSource.SYSTEM,
+        ),
+    )
 
 
 class _NamedProvider(ModelProvider):
@@ -2350,6 +2362,8 @@ def test_same_provider_model_override_fork_preflights_and_projects_transcript() 
                     source_session_id="model-override-fork-source",
                     session_id="model-override-fork-child",
                     model="second-model",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=_fork_profile_adoption("model-override-fork"),
                 )
             )
         )
@@ -2404,6 +2418,8 @@ def test_same_provider_model_override_fork_accepts_an_empty_retained_prefix() ->
                     source_session_id="empty-model-fork-source",
                     session_id="empty-model-fork-child",
                     model="second-model",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=_fork_profile_adoption("empty-model-fork"),
                 )
             )
         )
@@ -2451,6 +2467,8 @@ def test_sqlite_model_override_partial_fork_translates_absolute_retained_cursor(
                     transcript_cursor=4,
                     copy_checkpoint=False,
                     model="second-model",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=_fork_profile_adoption("retained-model-fork"),
                 )
             )
         )
@@ -2510,6 +2528,8 @@ def test_model_override_fork_preflight_failure_does_not_create_child() -> None:
                         source_session_id="rejected-model-fork-source",
                         session_id="rejected-model-fork-child",
                         model="second-model",
+                        execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                        profile_adoption=_fork_profile_adoption("rejected-model-fork"),
                     )
                 )
             )
@@ -2555,6 +2575,8 @@ def test_model_override_fork_checks_workload_secrets_before_provider_preflight()
                         source_session_id="secret-model-fork-source",
                         session_id="secret-model-fork-child",
                         model="second-model",
+                        execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                        profile_adoption=_fork_profile_adoption("secret-model-fork"),
                     )
                 )
             )

@@ -145,6 +145,7 @@ from cayu.runtime.sessions import (
     EventQueryResultTooLarge,
     EventRecord,
     EventSummary,
+    ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
     ForkTranscriptValidator,
     InteractionAttribution,
@@ -165,6 +166,7 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    ProfiledSessionForkResult,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     RunnerObservedEventIdentity,
@@ -174,6 +176,7 @@ from cayu.runtime.sessions import (
     Session,
     SessionAggregateFilter,
     SessionForkActiveModelStageConflict,
+    SessionForkProfileRelationship,
     SessionIdentity,
     SessionInspectionIdentity,
     SessionInvocationSnapshot,
@@ -231,6 +234,7 @@ from cayu.runtime.sessions import (
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
+    _copy_profiled_fork_authority,
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
     _copy_session_event_batch,
@@ -266,6 +270,7 @@ from cayu.runtime.sessions import (
     _PreparedModelCompletionStageAbandonment,
     _PreparedModelCompletionStageTerminal,
     _PreparedRuntimePublication,
+    _profiled_fork_authority_validation_error,
     _project_interruption_cascade_marker_fields,
     _public_authority_alias_store_key,
     _queued_dispatch_terminal_receipts_from_checkpoint,
@@ -305,6 +310,8 @@ from cayu.runtime.sessions import (
     _validate_model_completion_stage_publication,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
+    _validate_profiled_fork_authority,
+    _validate_profiled_fork_checkpoint_result,
     _validate_runner_observed_event_identity_snapshot,
     _validate_runtime_publication_durable_material,
     _validate_runtime_publication_event_references,
@@ -6993,6 +7000,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_execution_profile_admission: ClassVar[bool] = True
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
+    supports_profiled_forks: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -7732,6 +7740,41 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             transcript_validator=transcript_validator,
         )
 
+    async def create_profiled_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
+        expected_source_run_epoch: int,
+        relationship: SessionForkProfileRelationship,
+        events: list[Event],
+        transcript_validator: ForkTranscriptValidator | None = None,
+        checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
+    ) -> ProfiledSessionForkResult:
+        relationship, copied_events = _copy_profiled_fork_authority(
+            fork=fork,
+            relationship=relationship,
+            events=events,
+        )
+        created = await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            system_prompt_replacement=system_prompt_replacement,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=transcript_validator,
+            profile_relationship=relationship,
+            events=copied_events,
+            checkpoint_authority_decoder=checkpoint_authority_decoder,
+        )
+        return ProfiledSessionForkResult(session=created, events=tuple(copied_events))
+
     async def _create_fork(
         self,
         *,
@@ -7743,6 +7786,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         system_prompt_replacement: ForkSystemPromptReplacement | None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator | None,
+        profile_relationship: SessionForkProfileRelationship | None = None,
+        events: list[Event] | None = None,
+        checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
     ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
@@ -7763,6 +7809,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         fork=fork,
                         allowed_statuses=allowed_statuses,
                         expected_source_run_epoch=expected_source_run_epoch,
+                        profile_relationship=profile_relationship,
                     )
                     await cur.execute(
                         "SELECT 1 FROM cayu_session_operations "
@@ -7776,6 +7823,43 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionForkActiveModelStageConflict(
                             "Cannot fork a session while a model-completion stage is active."
                         )
+
+                    source_checkpoint = await self._load_checkpoint(cur, source_session_id)
+                    source_checkpoint_present = source_checkpoint is not None
+                    if profile_relationship is not None:
+                        profile_checkpoint = None
+                        profile_failure: ValueError | None = None
+                        try:
+                            profile_checkpoint = (
+                                source_checkpoint
+                                if checkpoint_authority_decoder is None
+                                else checkpoint_authority_decoder(
+                                    None
+                                    if source_checkpoint is None
+                                    else copy_durable_json_object(
+                                        source_checkpoint,
+                                        "source checkpoint",
+                                    )
+                                )
+                            )
+                            _validate_profiled_fork_authority(
+                                source_session=source_session,
+                                source_checkpoint=profile_checkpoint,
+                                fork=fork,
+                                relationship=profile_relationship,
+                                events=() if events is None else events,
+                                transcript_cursor=transcript_cursor,
+                                checkpoint_transform=checkpoint_transform,
+                                system_prompt_replacement=system_prompt_replacement,
+                                transcript_validator=transcript_validator,
+                            )
+                        except Exception as exc:
+                            profile_failure = _profiled_fork_authority_validation_error(exc)
+                            source_checkpoint = None
+                        finally:
+                            profile_checkpoint = None
+                        if profile_failure is not None:
+                            raise profile_failure from None
 
                     source_transcript_cursor = await _transcript_cursor(cur, source_session_id)
                     if (
@@ -7820,10 +7904,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
                     copied_checkpoint = None
                     if checkpoint_transform is not None:
-                        checkpoint_input = await self._load_checkpoint(
-                            cur,
-                            source_session_id,
-                        )
+                        checkpoint_input = source_checkpoint
                         copied_checkpoint = transform_fork_checkpoint(
                             source_session,
                             checkpoint_input,
@@ -7835,6 +7916,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 copied_checkpoint,
                                 "checkpoint",
                             )
+                    if profile_relationship is not None:
+                        _validate_profiled_fork_checkpoint_result(
+                            relationship=profile_relationship,
+                            source_checkpoint_present=source_checkpoint_present,
+                            copied_checkpoint=copied_checkpoint,
+                        )
 
                     await cur.execute(
                         f"""
@@ -7888,6 +7975,63 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             """,
                             _checkpoint_row_values(fork.id, copied_checkpoint, fork.updated_at),
                         )
+                    if events:
+                        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+                        activity_at = datetime.now(UTC)
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET event_seq = %s, last_activity_at = %s "
+                            "WHERE id = %s",
+                            (len(events), activity_at, fork.id),
+                        )
+                        await self._register_event_public_authorities(cur, fork.id, events)
+                        rows = []
+                        for session_order, event in enumerate(events, start=1):
+                            lookup_key, projection, projection_bytes = (
+                                pending_action_event_storage_values(event)
+                            )
+                            rows.append(
+                                (
+                                    fork.id,
+                                    session_order,
+                                    event.id,
+                                    event.interaction_id,
+                                    str(event.type),
+                                    pg_support.to_utc(event.timestamp),
+                                    event.agent_name,
+                                    event.environment_name,
+                                    event.workflow_name,
+                                    event.tool_name,
+                                    _dumps(event.payload),
+                                    _dumps(event.model_dump(mode="json")),
+                                    lookup_key,
+                                    projection,
+                                    projection_bytes,
+                                )
+                            )
+                        await cur.executemany(
+                            """
+                            INSERT INTO cayu_events (
+                                session_id, session_order, event_id, interaction_id,
+                                event_type, timestamp, agent_name, environment_name,
+                                workflow_name, tool_name, payload, event,
+                                pending_action_lookup_key, pending_action_projection,
+                                pending_action_projection_bytes
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s
+                            )
+                            """,
+                            rows,
+                        )
+                        await self._enqueue_persisted_event_side_effects(
+                            cur,
+                            fork.id,
+                            events,
+                        )
+                    loaded = await self._load(cur, fork.id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {fork.id}")
                 await conn.commit()
             except UniqueViolation as exc:
                 await conn.rollback()
@@ -7896,11 +8040,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await conn.rollback()
                 raise
 
-            async with conn.cursor() as cur:
-                loaded = await self._load(cur, fork.id)
-            await conn.commit()
-            if loaded is None:
-                raise KeyError(f"Session not found: {fork.id}")
             return loaded
 
     async def load(self, session_id: str) -> Session | None:

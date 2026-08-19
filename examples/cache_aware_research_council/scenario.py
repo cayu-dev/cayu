@@ -9,6 +9,7 @@ from typing import Any
 
 from examples._advanced_support import (
     ComparisonSessionEvidence,
+    ExampleForkExecutionProfilePolicy,
     ScenarioResult,
     advanced_run_limits,
     collect_events,
@@ -548,7 +549,11 @@ def _build_app(
     session_store: SessionStore | None = None,
     compact_branch_context: bool = False,
 ) -> CayuApp:
-    app = CayuApp(enable_logging=False, session_store=session_store)
+    app = CayuApp(
+        enable_logging=False,
+        session_store=session_store,
+        execution_profile_policy=ExampleForkExecutionProfilePolicy(),
+    )
     app.register_provider(provider, default=True)
     for name, prompt in prompts.items():
         context_policy = None

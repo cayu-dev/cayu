@@ -4,13 +4,18 @@ import asyncio
 from typing import Any
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
+    ExecutionProfileAdoptionIntent,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
     Message,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
     ScriptedModelProvider,
@@ -144,7 +149,10 @@ def test_agent_override_explains_that_the_source_agent_must_be_registered() -> N
                 session_id="historical-source-session",
                 messages=[Message.text("user", "historical input")],
             ),
-            identity=SessionIdentity(provider_name="scripted", model="scripted-model"),
+            identity=profiled_session_identity(
+                provider_name="scripted",
+                model="scripted-model",
+            ),
         )
         await store.update_status(source.id, SessionStatus.COMPLETED)
 
@@ -164,6 +172,15 @@ def test_agent_override_explains_that_the_source_agent_must_be_registered() -> N
                     source_session_id=source.id,
                     session_id="historical-child",
                     agent_name="current-target",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="missing-source-agent",
+                        reason="Exercise the source-agent validation boundary.",
+                        requested_by=ResolutionActor(
+                            subject="test-caller",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
                 )
             ):
                 pass

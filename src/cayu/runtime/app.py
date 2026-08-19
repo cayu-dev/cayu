@@ -3532,9 +3532,17 @@ class CayuApp:
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ForkSessionRequest:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
-        request = copy_fork_session_request(request)
+        prepared = session_request_boundary.prepare_fork_session_request_with_identity(
+            request,
+            redactor=self._secret_redactor,
+            public_authority_alias_codec=self._public_authority_alias_codec,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+        )
+        del request
         stream = self._session_engine.fork_session(
-            request=request,
+            request=prepared.request,
+            request_sha256=prepared.request_sha256,
+            accepted_request_sha256s=prepared.accepted_request_sha256s,
             store_resolved_source_session_id=store_resolved_source_session_id,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:

@@ -19,6 +19,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.sessions import (
     CheckpointRootFieldGuard,
     CheckpointTransform,
+    ProfiledSessionForkResult,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     RuntimePublicationRequest,
@@ -320,6 +321,31 @@ class _RuntimeCheckpointSessionStore:
                 source_session_id,
                 checkpoint_transform,
             ),
+            **kwargs,
+        )
+
+    async def create_profiled_fork(
+        self,
+        *,
+        source_session_id: str,
+        checkpoint_transform: CheckpointTransform | None,
+        **kwargs: Any,
+    ) -> ProfiledSessionForkResult:
+        def decode_profile_authority(
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            return decode_runtime_checkpoint(
+                checkpoint,
+                session_id=source_session_id,
+            )
+
+        return await self._store.create_profiled_fork(
+            source_session_id=source_session_id,
+            checkpoint_transform=_optional_versioned_checkpoint_transform(
+                source_session_id,
+                checkpoint_transform,
+            ),
+            checkpoint_authority_decoder=decode_profile_authority,
             **kwargs,
         )
 

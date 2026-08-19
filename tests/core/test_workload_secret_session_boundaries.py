@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 from tests._session_provenance import fixture_session_invocation
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._workload_secret_support import (
     FakeProvider,
     collect_events,
@@ -19,6 +20,8 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
+    ExecutionProfileAdoptionIntent,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -51,6 +54,20 @@ from cayu.runtime.sessions import (
 )
 from cayu.storage import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+
+def _current_fork_profile_selection(idempotency_key: str) -> dict[str, object]:
+    return {
+        "execution_profile_selection": ForkExecutionProfileSelection.CURRENT_CHILD,
+        "profile_adoption": ExecutionProfileAdoptionIntent(
+            idempotency_key=idempotency_key,
+            reason="Exercise current-child fork validation.",
+            requested_by=ResolutionActor(
+                subject="test-caller",
+                source=ResolutionActorSource.REQUEST,
+            ),
+        ),
+    }
 
 
 def test_runtime_attested_subagent_lineage_survives_short_secret_collision() -> None:
@@ -404,7 +421,10 @@ def test_public_fork_detaches_resolved_source_from_derived_authority_rejection()
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="source-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="source-model",
+            ),
         )
         await store.append_transcript_messages(
             source.id,
@@ -435,6 +455,7 @@ def test_public_fork_detaches_resolved_source_from_derived_authority_rejection()
                     source_session_id=public_source_id,
                     session_id="fork-child",
                     agent_name="target-agent",
+                    **_current_fork_profile_selection("resolved-source-fork"),
                 ),
             )
 
@@ -494,7 +515,10 @@ def test_fork_rejects_target_agent_derived_secret_before_any_publication(
                 session_id="fork-source",
                 messages=[Message.text("user", "source transcript")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="source-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="source-model",
+            ),
         )
         await store.append_transcript_messages(
             source.id,
@@ -514,6 +538,7 @@ def test_fork_rejects_target_agent_derived_secret_before_any_publication(
                     source_session_id=source.id,
                     session_id="fork-child",
                     agent_name="target-agent",
+                    **_current_fork_profile_selection("derived-model-fork"),
                 ),
             )
 
@@ -561,7 +586,10 @@ def test_fork_rejects_target_agent_provider_secret_before_mismatch_diagnostic() 
                 session_id="provider-fork-source",
                 messages=[Message.text("user", "source")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="source-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="source-model",
+            ),
         )
         await store.update_status(source.id, SessionStatus.COMPLETED)
 
@@ -572,6 +600,7 @@ def test_fork_rejects_target_agent_provider_secret_before_mismatch_diagnostic() 
                     source_session_id=source.id,
                     session_id="provider-fork-child",
                     agent_name="target-agent",
+                    **_current_fork_profile_selection("provider-secret-fork"),
                 ),
             )
 
@@ -594,7 +623,10 @@ def test_same_agent_fork_ignores_unused_changed_provider_pin() -> None:
                 session_id="historical-source",
                 messages=[Message.text("user", "source")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="historical-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="historical-model",
+            ),
         )
         await store.update_status(source.id, SessionStatus.COMPLETED)
         app = CayuApp(
@@ -1053,8 +1085,188 @@ def test_cayu_app_redacts_fork_metadata_before_session_creation() -> None:
     fork = asyncio.run(store.load("sess_fork_redaction_child"))
 
     assert fork is not None
-    assert fork.metadata == {"note": f"contains {REDACTED_SECRET}"}
+    assert fork.metadata["note"] == f"contains {REDACTED_SECRET}"
     assert secret not in str([event.model_dump(mode="json") for event in events])
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_fork_exact_replay_distinguishes_requests_that_redact_identically(
+    store_kind: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    recwarn: pytest.WarningsRecorder,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret_a = "fork-replay-secret-alpha"
+    secret_b = "fork-replay-secret-bravo"
+    keyring = PublicAuthorityAliasKeyring(
+        active_key_id="fork",
+        keys={
+            "fork": SecretStr(
+                base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+            )
+        },
+    )
+    codec = PublicAuthorityAliasCodec(keyring)
+    store = (
+        InMemorySessionStore(public_authority_alias_codec=codec)
+        if store_kind == "memory"
+        else SQLiteSessionStore(
+            tmp_path / "fork-exact-redacted-replay.sqlite",
+            public_authority_alias_codec=codec,
+        )
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor([secret_a, secret_b]),
+        public_authority_alias_keyring=keyring,
+        enable_logging=False,
+    )
+    app.register_provider(
+        FakeProvider(
+            [[ModelStreamEvent.completed({"finish_reason": "stop"})]],
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> tuple[list[Event], list[Event], BaseException]:
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_fork_exact_secret_source",
+                messages=[Message.text("user", "create source")],
+            ),
+        )
+        request = ForkSessionRequest(
+            source_session_id="sess_fork_exact_secret_source",
+            session_id="sess_fork_exact_secret_child",
+            metadata={"note": f"private {secret_a}"},
+        )
+        first = await collect_fork_events(app, request)
+        replay = await collect_fork_events(app, request)
+        with pytest.raises(RuntimeError, match="conflicts with the exact") as exc_info:
+            await collect_fork_events(
+                app,
+                request.model_copy(
+                    update={"metadata": {"note": f"private {secret_b}"}},
+                    deep=True,
+                ),
+            )
+        return first, replay, exc_info.value
+
+    first, replay, conflict = asyncio.run(scenario())
+
+    assert [event.id for event in replay] == [event.id for event in first]
+    child = asyncio.run(store.load("sess_fork_exact_secret_child"))
+    assert child is not None
+    assert child.metadata["note"] == f"private {REDACTED_SECRET}"
+    exposed = str(
+        [
+            [event.model_dump(mode="json") for event in first],
+            [event.model_dump(mode="json") for event in replay],
+            conflict,
+        ]
+    )
+    assert secret_a not in exposed
+    assert secret_b not in exposed
+    captured = capsys.readouterr()
+    diagnostics = [
+        captured.out,
+        captured.err,
+        *(record.getMessage() for record in caplog.records),
+        *(str(warning.message) for warning in recwarn),
+    ]
+    assert all(secret_a not in diagnostic for diagnostic in diagnostics)
+    assert all(secret_b not in diagnostic for diagnostic in diagnostics)
+    close = getattr(store, "close", None)
+    if close is not None:
+        asyncio.run(close())
+
+
+def test_fork_request_rejects_existing_runtime_execution_profile_metadata() -> None:
+    metadata = {"cayu:execution_profile": {"forged": True}}
+    with pytest.raises(ValueError, match="runtime-owned execution-profile authority"):
+        ForkSessionRequest(
+            source_session_id="fork-reserved-profile-source",
+            metadata=metadata,
+        )
+    assert metadata == {"cayu:execution_profile": {"forged": True}}
+
+
+def test_fork_exact_replay_accepts_a_retained_authority_key(tmp_path: Path) -> None:
+    secret = "fork-rotation-secret"
+    first_keyring = PublicAuthorityAliasKeyring(
+        active_key_id="first",
+        keys={
+            "first": SecretStr(
+                base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+            )
+        },
+    )
+    database = tmp_path / "fork-key-rotation.sqlite"
+    request = ForkSessionRequest(
+        source_session_id="fork-key-rotation-source",
+        session_id="fork-key-rotation-child",
+        metadata={"note": f"private {secret}"},
+    )
+
+    async def create() -> list[Event]:
+        store = SQLiteSessionStore(
+            database,
+            public_authority_alias_codec=PublicAuthorityAliasCodec(first_keyring),
+        )
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            public_authority_alias_keyring=first_keyring,
+            enable_logging=False,
+        )
+        app.register_provider(
+            FakeProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]]),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="fork-key-rotation-source",
+                messages=[Message.text("user", "create source")],
+            ),
+        )
+        events = await collect_fork_events(app, request)
+        await store.close()
+        return events
+
+    first = asyncio.run(create())
+    retained_keyring = first_keyring.rotated(
+        active_key_id="second",
+        key=SecretStr(
+            base64.urlsafe_b64encode(bytes(reversed(range(32)))).decode("ascii").rstrip("=")
+        ),
+    )
+
+    async def replay() -> list[Event]:
+        store = SQLiteSessionStore(
+            database,
+            public_authority_alias_codec=PublicAuthorityAliasCodec(retained_keyring),
+        )
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            public_authority_alias_keyring=retained_keyring,
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await collect_fork_events(app, request)
+        await store.close()
+        return events
+
+    replayed = asyncio.run(replay())
+    assert [event.id for event in replayed] == [event.id for event in first]
 
 
 def test_interrupt_redacts_request_before_pending_checkpoint(monkeypatch) -> None:

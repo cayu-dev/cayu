@@ -383,6 +383,11 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     EventType,
     Mapping[tuple[str, ...], frozenset[Any]],
 ] = {
+    EventType.SESSION_FORKED: {
+        ("execution_profile_selection",): frozenset({"inherit_parent", "current_child"}),
+        ("source_status",): _SESSION_STATUS_VALUES,
+        ("system_prompt_policy",): frozenset({"inherit_source", "current_agent"}),
+    },
     EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED: {
         ("transition_event_type",): _INTERACTION_TERMINAL_EVENT_TYPE_VALUES,
     },
@@ -2143,10 +2148,36 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "trigger_estimated_context_tokens",
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
     )
-    policies[EventType.SESSION_FORKED] = _observed_policy(
-        "agent_name causal_budget_id copy_checkpoint environment_name inherited_taint_labels "
-        "model parent_session_id provider_name source_session_id source_status "
-        "transcript_cursor"
+    policies[EventType.SESSION_FORKED] = _policy(
+        "agent_name",
+        "causal_budget_id",
+        "copy_checkpoint",
+        "environment_name",
+        "execution_profile_selection",
+        "fork_request_sha256",
+        "inherited_taint_labels",
+        "model",
+        "parent_session_id",
+        "provider_name",
+        "selected_profile_fingerprint",
+        "source_profile_fingerprint",
+        "source_session_id",
+        "source_status",
+        "system_prompt_policy",
+        "transcript_cursor",
+        authority_keys={
+            "causal_budget_id",
+            "fork_request_sha256",
+            "parent_session_id",
+            "selected_profile_fingerprint",
+            "source_profile_fingerprint",
+            "source_session_id",
+        },
+        internal_authority_keys={
+            "fork_request_sha256",
+            "selected_profile_fingerprint",
+            "source_profile_fingerprint",
+        },
     )
     policies[EventType.SESSION_LIMIT_REACHED] = _observed_policy(
         "actual cost_summary limit maximum message reason usage_summary"

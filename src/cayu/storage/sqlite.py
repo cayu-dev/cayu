@@ -48,6 +48,7 @@ from cayu.runtime.sessions import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
     DELETE_BLOCKED_SESSION_STATUSES,
+    FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INHERIT_INTERACTION,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
@@ -73,6 +74,7 @@ from cayu.runtime.sessions import (
     EventQueryResultTooLarge,
     EventRecord,
     EventSummary,
+    ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
     ForkTranscriptValidator,
     InteractionAttribution,
@@ -93,6 +95,7 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    ProfiledSessionForkResult,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     RunnerObservedEventIdentity,
@@ -102,6 +105,7 @@ from cayu.runtime.sessions import (
     Session,
     SessionAggregateFilter,
     SessionForkActiveModelStageConflict,
+    SessionForkProfileRelationship,
     SessionIdentity,
     SessionInspectionIdentity,
     SessionInvocationSnapshot,
@@ -160,6 +164,7 @@ from cayu.runtime.sessions import (
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
+    _copy_profiled_fork_authority,
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
     _copy_session_event_batch,
@@ -195,6 +200,7 @@ from cayu.runtime.sessions import (
     _PreparedModelCompletionStageAbandonment,
     _PreparedModelCompletionStageTerminal,
     _PreparedRuntimePublication,
+    _profiled_fork_authority_validation_error,
     _project_interruption_cascade_marker_fields,
     _public_authority_alias_store_key,
     _queued_dispatch_terminal_receipts_from_checkpoint,
@@ -234,6 +240,8 @@ from cayu.runtime.sessions import (
     _validate_model_completion_stage_publication,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
+    _validate_profiled_fork_authority,
+    _validate_profiled_fork_checkpoint_result,
     _validate_runner_observed_event_identity_snapshot,
     _validate_runtime_publication_durable_material,
     _validate_runtime_publication_event_references,
@@ -1029,6 +1037,7 @@ class SQLiteSessionStore(SessionStore):
     supports_execution_profile_admission: ClassVar[bool] = True
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
+    supports_profiled_forks: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1823,6 +1832,41 @@ class SQLiteSessionStore(SessionStore):
             transcript_validator=transcript_validator,
         )
 
+    async def create_profiled_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        system_prompt_replacement: ForkSystemPromptReplacement | None = None,
+        expected_source_run_epoch: int,
+        relationship: SessionForkProfileRelationship,
+        events: list[Event],
+        transcript_validator: ForkTranscriptValidator | None = None,
+        checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
+    ) -> ProfiledSessionForkResult:
+        relationship, copied_events = _copy_profiled_fork_authority(
+            fork=fork,
+            relationship=relationship,
+            events=events,
+        )
+        created = await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            system_prompt_replacement=system_prompt_replacement,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=transcript_validator,
+            profile_relationship=relationship,
+            events=copied_events,
+            checkpoint_authority_decoder=checkpoint_authority_decoder,
+        )
+        return ProfiledSessionForkResult(session=created, events=tuple(copied_events))
+
     async def _create_fork(
         self,
         *,
@@ -1834,6 +1878,9 @@ class SQLiteSessionStore(SessionStore):
         system_prompt_replacement: ForkSystemPromptReplacement | None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator | None,
+        profile_relationship: SessionForkProfileRelationship | None = None,
+        events: list[Event] | None = None,
+        checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
     ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
@@ -1854,6 +1901,7 @@ class SQLiteSessionStore(SessionStore):
                     fork=fork,
                     allowed_statuses=allowed_statuses,
                     expected_source_run_epoch=expected_source_run_epoch,
+                    profile_relationship=profile_relationship,
                 )
                 active_stage = self._connection.execute(
                     "SELECT 1 FROM cayu_session_operations "
@@ -1867,6 +1915,42 @@ class SQLiteSessionStore(SessionStore):
                     raise SessionForkActiveModelStageConflict(
                         "Cannot fork a session while a model-completion stage is active."
                     )
+                source_checkpoint = self._load_checkpoint_unlocked(source_session_id)
+                source_checkpoint_present = source_checkpoint is not None
+                if profile_relationship is not None:
+                    profile_checkpoint = None
+                    profile_failure: ValueError | None = None
+                    try:
+                        profile_checkpoint = (
+                            source_checkpoint
+                            if checkpoint_authority_decoder is None
+                            else checkpoint_authority_decoder(
+                                None
+                                if source_checkpoint is None
+                                else copy_durable_json_object(
+                                    source_checkpoint,
+                                    "source checkpoint",
+                                )
+                            )
+                        )
+                        _validate_profiled_fork_authority(
+                            source_session=source_session,
+                            source_checkpoint=profile_checkpoint,
+                            fork=fork,
+                            relationship=profile_relationship,
+                            events=() if events is None else events,
+                            transcript_cursor=transcript_cursor,
+                            checkpoint_transform=checkpoint_transform,
+                            system_prompt_replacement=system_prompt_replacement,
+                            transcript_validator=transcript_validator,
+                        )
+                    except Exception as exc:
+                        profile_failure = _profiled_fork_authority_validation_error(exc)
+                        source_checkpoint = None
+                    finally:
+                        profile_checkpoint = None
+                    if profile_failure is not None:
+                        raise profile_failure from None
                 source_transcript_cursor = _transcript_cursor(
                     self._connection,
                     source_session_id,
@@ -1906,7 +1990,7 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
                 copied_checkpoint = None
                 if checkpoint_transform is not None:
-                    checkpoint_input = self._load_checkpoint_unlocked(source_session_id)
+                    checkpoint_input = source_checkpoint
                     copied_checkpoint = transform_fork_checkpoint(
                         source_session,
                         checkpoint_input,
@@ -1918,6 +2002,12 @@ class SQLiteSessionStore(SessionStore):
                             copied_checkpoint,
                             "checkpoint",
                         )
+                if profile_relationship is not None:
+                    _validate_profiled_fork_checkpoint_result(
+                        relationship=profile_relationship,
+                        source_checkpoint_present=source_checkpoint_present,
+                        copied_checkpoint=copied_checkpoint,
+                    )
 
                 self._connection.execute(
                     """
@@ -1987,6 +2077,48 @@ class SQLiteSessionStore(SessionStore):
                         sqlite_support.checkpoint_row_values(
                             fork.id, copied_checkpoint, fork.updated_at
                         ),
+                    )
+                if events:
+                    from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+                    _touch_session_activity(self._connection, fork.id, datetime.now(UTC))
+                    rows = []
+                    for event in events:
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(event)
+                        )
+                        rows.append(
+                            (
+                                fork.id,
+                                event.id,
+                                event.interaction_id,
+                                str(event.type),
+                                sqlite_support.format_datetime(event.timestamp),
+                                event.agent_name,
+                                event.environment_name,
+                                event.workflow_name,
+                                event.tool_name,
+                                sqlite_support.json_dumps(event.payload),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            )
+                        )
+                    self._connection.executemany(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, event_id, interaction_id, event_type, timestamp,
+                            agent_name, environment_name, workflow_name, tool_name,
+                            payload_json, pending_action_lookup_key,
+                            pending_action_projection_json, pending_action_projection_bytes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                    _enqueue_persisted_event_side_effects(
+                        self._connection,
+                        fork.id,
+                        events,
                     )
                 self._connection.commit()
             except sqlite3.IntegrityError as exc:
@@ -6813,7 +6945,9 @@ class SQLiteSessionStore(SessionStore):
         model-completion stage, pending tool round, or immutable
         runtime-publication receipt, or unacknowledged queued-dispatch terminal
         receipt are retained because deleting their evidence would make exact
-        recovery or receipt replay impossible.
+        recovery or receipt replay impossible. Immutable profiled-fork decision
+        and fork events are likewise retained while their child relationship
+        exists.
         Returns the number of events deleted.
         """
         if not isinstance(before, datetime):
@@ -6884,6 +7018,21 @@ class SQLiteSessionStore(SessionStore):
                           )
                           AND NOT EXISTS (
                               SELECT 1
+                              FROM cayu_sessions AS profiled_fork
+                              WHERE profiled_fork.id = cayu_events.session_id
+                                AND (
+                                    json_extract(
+                                        profiled_fork.metadata_json,
+                                        ?
+                                    ) = cayu_events.event_id
+                                    OR json_extract(
+                                        profiled_fork.metadata_json,
+                                        ?
+                                    ) = cayu_events.event_id
+                                )
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
                               FROM cayu_interaction_latest_events AS latest
                               JOIN cayu_events AS latest_event
                                 ON latest_event.sequence = latest.latest_event_sequence
@@ -6900,6 +7049,8 @@ class SQLiteSessionStore(SessionStore):
                             cutoff,
                             publication_key_pattern,
                             MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                            f'$."{FORK_EXECUTION_PROFILE_METADATA_KEY}".fork_event_id',
+                            f'$."{FORK_EXECUTION_PROFILE_METADATA_KEY}".decision.event_id',
                         ),
                     )
                 else:
@@ -6959,6 +7110,21 @@ class SQLiteSessionStore(SessionStore):
                           )
                           AND NOT EXISTS (
                               SELECT 1
+                              FROM cayu_sessions AS profiled_fork
+                              WHERE profiled_fork.id = cayu_events.session_id
+                                AND (
+                                    json_extract(
+                                        profiled_fork.metadata_json,
+                                        ?
+                                    ) = cayu_events.event_id
+                                    OR json_extract(
+                                        profiled_fork.metadata_json,
+                                        ?
+                                    ) = cayu_events.event_id
+                                )
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
                               FROM cayu_interaction_latest_events AS latest
                               JOIN cayu_events AS latest_event
                                 ON latest_event.sequence = latest.latest_event_sequence
@@ -6976,6 +7142,8 @@ class SQLiteSessionStore(SessionStore):
                             cutoff,
                             publication_key_pattern,
                             MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                            f'$."{FORK_EXECUTION_PROFILE_METADATA_KEY}".fork_event_id',
+                            f'$."{FORK_EXECUTION_PROFILE_METADATA_KEY}".decision.event_id',
                         ),
                     )
             return cursor.rowcount

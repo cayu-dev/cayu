@@ -10,6 +10,7 @@ import logging
 import sys
 import threading
 import time
+import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -42,6 +43,7 @@ from cayu._task_wait import (
     await_shielded_task_outcome,
     capture_awaitable_outcome,
     consume_pending_task_cancellation,
+    restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -106,6 +108,10 @@ from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._binding_cleanup import binding_finalize_explicit_cancellation
+from cayu.runtime._child_session_identity import (
+    ChildSessionKind,
+    generate_child_session_id,
+)
 from cayu.runtime._diagnostics import (
     ExceptionDiagnostic,
     exception_diagnostic,
@@ -301,6 +307,7 @@ from cayu.runtime.execution_profiles import (
     copy_execution_profile_policy_result,
     execution_profile_decision_payload,
     execution_profile_from_session_metadata,
+    execution_profile_session_metadata,
     execution_profile_with_component,
     execution_profile_with_durable_system_projection_digest,
     unavailable_execution_profile_components,
@@ -365,6 +372,7 @@ from cayu.runtime.sessions import (
     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
@@ -374,6 +382,8 @@ from cayu.runtime.sessions import (
     EnqueueSessionMessageResult,
     EventOrder,
     EventQuery,
+    ForkExecutionProfileDecisionRecord,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptPolicy,
     ForkSystemPromptReplacement,
@@ -386,12 +396,14 @@ from cayu.runtime.sessions import (
     InteractionTransitionSpec,
     InterruptSessionRequest,
     ModelTarget,
+    ProfiledSessionForkResult,
     PromptAnatomyTransitionReceipt,
     ResumeRequest,
     RunRequest,
     RuntimePublicationRequest,
     Session,
     SessionForkActiveModelStageConflict,
+    SessionForkProfileRelationship,
     SessionForkSourceNotFound,
     SessionIdentity,
     SessionInvocationAdmission,
@@ -433,9 +445,11 @@ from cayu.runtime.sessions import (
     attribute_events_to_current_interaction,
     bind_runtime_session_create_claim,
     copy_compact_session_request,
+    copy_fork_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
     copy_interaction_transition_spec,
+    copy_profiled_session_fork_result,
     copy_resume_request,
     copy_run_request,
     execution_profile_adoption_request_fingerprint,
@@ -444,11 +458,13 @@ from cayu.runtime.sessions import (
     runtime_prepared_session_authority,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
+    session_fork_profile_relationship,
     session_input_contract_evidence,
     session_input_messages_sha256,
     session_model_projection_cursor,
     session_prompt_anatomy_transition,
     system_prompt_messages_sha256,
+    validate_profiled_fork_evidence,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -853,15 +869,6 @@ async def _reconcile_committed_prompt_transition_intents(
     return reconciled_checkpoint
 
 
-def _fork_session_request_digest(request: ForkSessionRequest) -> str:
-    return hashlib.sha256(
-        canonical_durable_json_bytes(
-            request.model_dump(mode="json"),
-            "fork_session_request",
-        )
-    ).hexdigest()
-
-
 def _prompt_fork_matches_prepared(existing: Session, prepared: Session) -> bool:
     return (
         existing.id,
@@ -899,6 +906,7 @@ class _PromptSuccessionWorkflow:
     """Cohesive durable state and event projection for one prompt succession."""
 
     request: ForkSessionRequest
+    request_sha256: str
     receipt: PromptAnatomyTransitionReceipt
 
     @classmethod
@@ -906,14 +914,19 @@ class _PromptSuccessionWorkflow:
         cls,
         *,
         request: ForkSessionRequest,
+        accepted_request_sha256s: tuple[str, ...],
         descendant: Session,
     ) -> _PromptSuccessionWorkflow:
         receipt = session_prompt_anatomy_transition(descendant)
-        if receipt is None or receipt.request_sha256 != _fork_session_request_digest(request):
+        if receipt is None or receipt.request_sha256 not in accepted_request_sha256s:
             raise RuntimeError(
                 "Existing prompt-anatomy descendant conflicts with the exact request."
             )
-        return cls(request=request, receipt=receipt)
+        return cls(
+            request=request,
+            request_sha256=receipt.request_sha256,
+            receipt=receipt,
+        )
 
     def prepared_intent(
         self,
@@ -970,8 +983,10 @@ class _ForkPromptWorkflow:
     """Own the prompt-policy branch of session forking behind one strategy seam."""
 
     request: ForkSessionRequest
+    request_sha256: str
     prompt_replacement: ForkSystemPromptReplacement | None = None
     child_prompt_messages: tuple[Message, ...] = ()
+    rendered_child_prompt: str | None = None
     prompt_environment_name: str | None = None
     succession: _PromptSuccessionWorkflow | None = None
     intent: _PromptTransitionIntent | None = None
@@ -981,17 +996,14 @@ class _ForkPromptWorkflow:
         cls,
         *,
         request: ForkSessionRequest,
+        request_sha256: str,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_lifecycle: EnvironmentLifecycle,
     ) -> _ForkPromptWorkflow:
-        workflow = cls(request=request)
+        workflow = cls(request=request, request_sha256=request_sha256)
         if request.system_prompt_policy is not ForkSystemPromptPolicy.CURRENT_AGENT:
             return workflow
-        if request.session_id is None:
-            raise ValueError(
-                "Explicit prompt-anatomy succession requires a stable destination session_id."
-            )
         if request.copy_checkpoint:
             raise ValueError(
                 "Explicit prompt-anatomy succession cannot copy checkpoint state; "
@@ -1012,6 +1024,7 @@ class _ForkPromptWorkflow:
                 workspace_instructions=workspace_instructions,
             )
         )
+        workflow.rendered_child_prompt = rendered_child_prompt
         workflow.child_prompt_messages = tuple(
             transcript_helpers.initial_messages(
                 system_prompt=rendered_child_prompt,
@@ -1030,8 +1043,34 @@ class _ForkPromptWorkflow:
         source_projection_cursor: int,
     ) -> bool:
         return (
-            self.prompt_replacement is not None or model_changed or bool(source_projection_cursor)
+            self.prompt_replacement is not None
+            or self.request.transcript_cursor is not None
+            or model_changed
+            or bool(source_projection_cursor)
         )
+
+    def require_inherited_system_projection(
+        self,
+        *,
+        source_messages: list[Message],
+        selected_messages: list[Message],
+    ) -> None:
+        """Keep an inherited profile coherent with the copied transcript."""
+
+        if self.prompt_replacement is not None:
+            return
+        source_system = [
+            message for message in source_messages if message.role is MessageRole.SYSTEM
+        ]
+        selected_system = [
+            message for message in selected_messages if message.role is MessageRole.SYSTEM
+        ]
+        if selected_system != source_system:
+            raise ValueError(
+                "A partial fork that inherits the parent execution profile must retain "
+                "the complete durable system projection. Increase transcript_cursor or "
+                "select the current child prompt explicitly."
+            )
 
     def project_selected_messages(
         self,
@@ -1073,7 +1112,7 @@ class _ForkPromptWorkflow:
         if self.prompt_environment_name is None:
             raise AssertionError("Prompt succession lost its concrete environment identity.")
         receipt = PromptAnatomyTransitionReceipt.create(
-            request_sha256=_fork_session_request_digest(self.request),
+            request_sha256=self.request_sha256,
             source_session_id=source_session.id,
             descendant_session_id=destination_session_id,
             source_status=source_session.status,
@@ -1097,6 +1136,7 @@ class _ForkPromptWorkflow:
         )
         self.succession = _PromptSuccessionWorkflow(
             request=self.request,
+            request_sha256=self.request_sha256,
             receipt=receipt,
         )
         metadata[PROMPT_ANATOMY_TRANSITION_METADATA_KEY] = receipt.model_dump(mode="json")
@@ -1252,6 +1292,11 @@ def _fork_event_with_runtime_authority(event: Event) -> Event:
         "source_session_id",
         "parent_session_id",
         "causal_budget_id",
+        "execution_profile_selection",
+        "selected_profile_fingerprint",
+        "source_profile_fingerprint",
+        "fork_request_sha256",
+        "system_prompt_policy",
     )
 
 
@@ -3656,10 +3701,14 @@ class SessionEngine:
         target_changed: bool,
         target_provider_name: str,
         target_model: str,
+        decision_session: Session | None = None,
+        source_provider_name: str | None = None,
+        source_model: str | None = None,
     ) -> ExecutionProfileDecision:
+        event_session = session if decision_session is None else decision_session
         if not changed_component_classes:
             return _execution_profile_decision_event(
-                session=session,
+                session=event_session,
                 expected_profile=expected_profile,
                 candidate_profile=candidate_profile,
                 changed_component_classes=changed_component_classes,
@@ -3708,7 +3757,7 @@ class SessionEngine:
                     "The configured execution-profile policy identity changed."
                 )
             policy_request = ExecutionProfilePolicyRequest(
-                session_id=session.id,
+                session_id=event_session.id,
                 expected_profile=expected_profile,
                 candidate_profile=candidate_profile,
                 changed_component_classes=changed_component_classes,
@@ -3716,8 +3765,10 @@ class SessionEngine:
                 authority_review_required=(
                     ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
                 ),
-                source_provider_name=session.provider_name,
-                source_model=session.model,
+                source_provider_name=(
+                    session.provider_name if source_provider_name is None else source_provider_name
+                ),
+                source_model=session.model if source_model is None else source_model,
                 target_provider_name=target_provider_name,
                 target_model=target_model,
             )
@@ -3816,7 +3867,7 @@ class SessionEngine:
             kind = ExecutionProfileDecisionKind.REJECTED
 
         return _execution_profile_decision_event(
-            session=session,
+            session=event_session,
             expected_profile=expected_profile,
             candidate_profile=candidate_profile,
             changed_component_classes=changed_component_classes,
@@ -10907,13 +10958,23 @@ class SessionEngine:
         self,
         request: ForkSessionRequest,
         *,
+        request_sha256: str,
+        accepted_request_sha256s: tuple[str, ...],
         store_resolved_source_session_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
-        request = session_request_boundary.prepare_fork_session_request(
-            request,
-            redactor=self._secret_redactor,
-            store_resolved_source_session_id=store_resolved_source_session_id,
-        )
+        request = copy_fork_session_request(request)
+        if (
+            len(request_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in request_sha256)
+            or not accepted_request_sha256s
+            or accepted_request_sha256s[0] != request_sha256
+            or any(
+                len(candidate) != 64
+                or any(character not in "0123456789abcdef" for character in candidate)
+                for candidate in accepted_request_sha256s
+            )
+        ):
+            raise ValueError("Fork request replay identity is invalid.")
         source_session = await self.session_store.load(request.source_session_id)
         if source_session is None:
             raise session_request_boundary.ForkSourceNotFoundError(
@@ -10929,49 +10990,99 @@ class SessionEngine:
         except ValueError:
             del source_session
             raise
-        if (
-            request.system_prompt_policy is ForkSystemPromptPolicy.CURRENT_AGENT
-            and request.session_id is not None
-        ):
-            existing_descendant = await self.session_store.load(request.session_id)
+        fork_request_sha256 = request_sha256
+        runtime_generated_session_id: str | None = None
+        destination_session_id = request.session_id
+        if destination_session_id is None:
+            logical_fork_id = hashlib.sha256(
+                canonical_durable_json_bytes(
+                    request.model_dump(mode="json", warnings=False),
+                    "generated_session_fork_identity",
+                )
+            ).hexdigest()
+            runtime_generated_session_id = generate_child_session_id(
+                kind=ChildSessionKind.SESSION_FORK,
+                parent_session_id=source_session.id,
+                logical_spawn_id=logical_fork_id,
+            )
+            destination_session_id = runtime_generated_session_id
+        if destination_session_id is not None:
+            existing_descendant = await self.session_store.load(destination_session_id)
             if existing_descendant is not None:
-                succession = _PromptSuccessionWorkflow.recover(
-                    request=request,
-                    descendant=existing_descendant,
-                )
-
-                def reconcile_surviving_intent(
-                    _current_source: Session,
-                    source_checkpoint: dict[str, Any] | None,
-                ) -> dict[str, Any] | None:
-                    if source_checkpoint is None:
-                        return None
-                    updated = copy_json_value(source_checkpoint, "checkpoint")
-                    intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
-                        updated,
-                        required=False,
+                relationship: SessionForkProfileRelationship | None = None
+                malformed_relationship = False
+                try:
+                    relationship = session_fork_profile_relationship(existing_descendant)
+                except Exception as exc:
+                    if exc.__traceback__ is not None:
+                        traceback_module.clear_frames(exc.__traceback__)
+                    malformed_relationship = True
+                if (
+                    malformed_relationship
+                    or relationship is None
+                    or relationship.source_session_id != source_session.id
+                    or relationship.request_sha256 not in accepted_request_sha256s
+                ):
+                    existing_descendant = None
+                    relationship = None
+                    raise RuntimeError(
+                        "Existing fork destination conflicts with the exact profiled request."
+                    ) from None
+                evidence_ids = (
+                    [relationship.decision.event_id] if relationship.decision is not None else []
+                ) + [relationship.fork_event_id]
+                persisted_events: list[Event] = []
+                for evidence_id in evidence_ids:
+                    records = await self.session_store.query_events(
+                        EventQuery(
+                            session_id=existing_descendant.id,
+                            event_id=evidence_id,
+                            limit=1,
+                        )
                     )
-                    if intent_ledger.complete_from_receipt(
-                        succession.receipt,
-                        descendant_created_at=existing_descendant.created_at,
-                        completed_at=self._clock(),
-                    ):
-                        intent_ledger.store_in(updated)
-                    return updated
-
-                await self.session_store.publish_checkpoint_and_events(
-                    source_session.id,
-                    checkpoint_transform=reconcile_surviving_intent,
-                    events=[],
+                    if len(records) != 1:
+                        raise RuntimeError(
+                            "Existing profiled fork is missing its durable evidence."
+                        )
+                    persisted_events.append(records[0].event)
+                validate_profiled_fork_evidence(
+                    fork=existing_descendant,
+                    relationship=relationship,
+                    events=persisted_events,
                 )
-                fork_event = self._event_writer.prepare(
-                    _fork_event_with_runtime_authority(
-                        succession.raw_fork_event(existing_descendant)
+                if request.system_prompt_policy is ForkSystemPromptPolicy.CURRENT_AGENT:
+                    succession = _PromptSuccessionWorkflow.recover(
+                        request=request,
+                        accepted_request_sha256s=accepted_request_sha256s,
+                        descendant=existing_descendant,
                     )
-                )
-                persisted = await self._event_writer.persist_exact_replay(fork_event)
-                delivered = await self._event_writer.fan_out_persisted([persisted])
-                yield delivered[0]
+
+                    def reconcile_surviving_intent(
+                        _current_source: Session,
+                        source_checkpoint: dict[str, Any] | None,
+                    ) -> dict[str, Any] | None:
+                        if source_checkpoint is None:
+                            return None
+                        updated = copy_json_value(source_checkpoint, "checkpoint")
+                        intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+                            updated,
+                            required=False,
+                        )
+                        if intent_ledger.complete_from_receipt(
+                            succession.receipt,
+                            descendant_created_at=existing_descendant.created_at,
+                            completed_at=self._clock(),
+                        ):
+                            intent_ledger.store_in(updated)
+                        return updated
+
+                    await self.session_store.publish_checkpoint_and_events(
+                        source_session.id,
+                        checkpoint_transform=reconcile_surviving_intent,
+                        events=[],
+                    )
+                delivered = await self._event_writer.fan_out_persisted(persisted_events)
+                yield delivered[-1]
                 return
         if source_session.status not in _FORKABLE_SESSION_STATUSES:
             raise ValueError(
@@ -10984,8 +11095,21 @@ class SessionEngine:
             )
         if source_session.status == SessionStatus.INTERRUPTED and not request.copy_checkpoint:
             raise ValueError("Interrupted sessions cannot be forked without checkpoint state.")
+        if not self.session_store.supports_profiled_forks:
+            raise RuntimeError("Session store does not support atomic profiled session forks.")
 
-        registered_provider = self._get_registered_provider(source_session.provider_name)
+        source_checkpoint_for_profile = await self.session_store.load_checkpoint(source_session.id)
+        try:
+            (
+                source_profile_source,
+                source_execution_profile,
+                source_active_profile,
+            ) = session_request_boundary.prepare_fork_source_execution_profile(
+                source_session,
+                source_checkpoint_for_profile,
+            )
+        finally:
+            source_checkpoint_for_profile = None
         try:
             source_registered_agent = self._get_registered_agent(source_session.agent_name)
         except KeyError as exc:
@@ -11022,22 +11146,103 @@ class SessionEngine:
             del registered_agent
             agent_name = model = environment_name = ""
             raise
-        if (
-            request.agent_name is not None
-            and registered_agent_provider_name is not None
-            and registered_agent_provider_name != source_session.provider_name
-        ):
-            raise ValueError(
-                "Forking a session to an agent with a different provider is not supported: "
-                f"{registered_agent_provider_name} != {source_session.provider_name}"
-            )
+        registered_provider = self._get_registered_provider(
+            registered_agent_provider_name or source_session.provider_name
+        )
         registered_environment = self._get_registered_environment_for_session(environment_name)
         prompt_workflow = await _ForkPromptWorkflow.prepare(
             request=request,
+            request_sha256=fork_request_sha256,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             environment_lifecycle=self._environment_lifecycle,
         )
+
+        selected_execution_profile = source_execution_profile
+        execution_profile_decision: ExecutionProfileDecision | None = None
+        if request.execution_profile_selection is ForkExecutionProfileSelection.CURRENT_CHILD:
+            candidate_execution_profile = _execution_profile_identity(
+                registered_agent=registered_agent,
+                provider_name=registered_provider.name,
+                model=model,
+                durable_system_prompt=prompt_workflow.rendered_child_prompt,
+            )
+            if (
+                prompt_workflow.rendered_child_prompt is None
+                and request.system_prompt_policy is ForkSystemPromptPolicy.INHERIT_SOURCE
+            ):
+                candidate_execution_profile = execution_profile_with_component(
+                    candidate_execution_profile,
+                    source_execution_profile.component(
+                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                    ),
+                )
+            unavailable_child_components = unavailable_execution_profile_components(
+                candidate_execution_profile
+            )
+            if unavailable_child_components:
+                raise RuntimeError(
+                    "Current-child profile selection has unavailable required components: "
+                    + ", ".join(component.value for component in unavailable_child_components)
+                )
+            decision_session = source_session.model_copy(
+                update={
+                    "id": destination_session_id,
+                    "agent_name": agent_name,
+                    "provider_name": registered_provider.name,
+                    "model": model,
+                    "parent_session_id": source_session.id,
+                    "environment_name": environment_name,
+                    "run_epoch": 0,
+                },
+                deep=True,
+            )
+            changed_profile_components = changed_execution_profile_components(
+                source_execution_profile,
+                candidate_execution_profile,
+            )
+            execution_profile_decision = await self._classify_execution_profile(
+                session=source_session,
+                decision_session=decision_session,
+                expected_profile=source_execution_profile,
+                candidate_profile=candidate_execution_profile,
+                changed_component_classes=changed_profile_components,
+                intent=request.profile_adoption,
+                adoption_request_fingerprint=fork_request_sha256,
+                target_changed=(
+                    registered_provider.name != source_session.provider_name
+                    or model != source_session.model
+                ),
+                target_provider_name=registered_provider.name,
+                target_model=model,
+                source_provider_name=source_session.provider_name,
+                source_model=source_session.model,
+            )
+            if execution_profile_decision.kind in {
+                ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+                ExecutionProfileDecisionKind.REJECTED,
+            }:
+                error_type = (
+                    ExecutionProfileMigrationRequired
+                    if execution_profile_decision.kind
+                    is ExecutionProfileDecisionKind.MIGRATION_REQUIRED
+                    else ExecutionProfileAdoptionRejected
+                )
+                raise error_type(
+                    session_id=destination_session_id,
+                    expected_profile_fingerprint=source_execution_profile.fingerprint,
+                    candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
+                    changed_component_classes=changed_profile_components,
+                )
+            selected_execution_profile = candidate_execution_profile
+
+        if (
+            prompt_workflow.prompt_replacement is not None
+            and registered_provider.name != source_session.provider_name
+        ):
+            raise ValueError(
+                "Prompt-anatomy succession to an agent with a different provider is not supported."
+            )
 
         source_projection_cursor = session_model_projection_cursor(source_session)
         model_changed = model != source_session.model
@@ -11077,6 +11282,19 @@ class SessionEngine:
             selected_messages = [
                 detach_message(record.message) for record in selected_source_records
             ]
+            source_messages = [detach_message(record.message) for record in source_snapshot.records]
+            try:
+                prompt_workflow.require_inherited_system_projection(
+                    source_messages=source_messages,
+                    selected_messages=selected_messages,
+                )
+            except BaseException:
+                selected_source_records.clear()
+                selected_messages.clear()
+                del source_snapshot
+                raise
+            finally:
+                source_messages.clear()
             source_prompt_sha256 = system_prompt_messages_sha256(selected_messages)
             selected_messages, child_prompt_sha256 = prompt_workflow.project_selected_messages(
                 selected_messages,
@@ -11284,12 +11502,6 @@ class SessionEngine:
                 redactor=self._secret_redactor,
             )
 
-        runtime_generated_session_id: str | None = None
-        destination_session_id = request.session_id
-        if destination_session_id is None:
-            runtime_generated_session_id = str(uuid4())
-            destination_session_id = runtime_generated_session_id
-
         inherited_taint_labels = await self._tool_round_executor.prior_taint_labels_for_policy(
             session_id=source_session.id,
             policy=source_registered_agent.tool_policy,
@@ -11375,89 +11587,450 @@ class SessionEngine:
             "causal_budget_id": fork_session.causal_budget_id,
             "transcript_cursor": request.transcript_cursor,
             "copy_checkpoint": request.copy_checkpoint,
+            "system_prompt_policy": request.system_prompt_policy.value,
             "agent_name": fork_session.agent_name,
             "provider_name": fork_session.provider_name,
             "model": fork_session.model,
             "environment_name": fork_session.environment_name,
             "inherited_taint_labels": sorted(inherited_taint_labels),
+            "execution_profile_selection": request.execution_profile_selection.value,
+            "selected_profile_fingerprint": selected_execution_profile.fingerprint,
+            "source_profile_fingerprint": source_execution_profile.fingerprint,
+            "fork_request_sha256": fork_request_sha256,
         }
-        try:
-            if self._secret_redactor.has_values or expected_fork_transcript is not None:
-                created = await self.session_store.create_fork_with_transcript_validation(
+        ordinary_fork_event = event_with_runtime_generated_id(
+            Event(
+                id=(
+                    "fork_"
+                    + hashlib.sha256(
+                        canonical_durable_json_bytes(
+                            {
+                                "child_session_id": fork_session.id,
+                                "request_sha256": fork_request_sha256,
+                            },
+                            "profiled_fork_event",
+                        )
+                    ).hexdigest()
+                ),
+                type=EventType.SESSION_FORKED,
+                session_id=fork_session.id,
+                timestamp=fork_session.created_at,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                payload=fork_event_payload,
+            )
+        )
+        raw_fork_event = prompt_workflow.raw_fork_event(
+            created=fork_session,
+            ordinary_event=ordinary_fork_event,
+        )
+        raw_fork_event = raw_fork_event.model_copy(
+            update={"payload": {**raw_fork_event.payload, **fork_event_payload}},
+            deep=True,
+        )
+        fork_event = self._event_writer.prepare(_fork_event_with_runtime_authority(raw_fork_event))
+        decision_record: ForkExecutionProfileDecisionRecord | None = None
+        prepared_events: list[Event] = []
+        if execution_profile_decision is not None:
+            if execution_profile_decision.actor is None:
+                raise AssertionError("Current-child profile selection lost its actor.")
+            decision_event = self._event_writer.prepare(execution_profile_decision.event)
+            decision_payload = decision_event.payload
+            decision_record = ForkExecutionProfileDecisionRecord.model_validate(
+                {
+                    "kind": execution_profile_decision.kind,
+                    "policy_identity": decision_payload.get("policy_identity"),
+                    "policy_reason": decision_payload.get("policy_reason"),
+                    "authority_decision": execution_profile_decision.authority_decision,
+                    "actor": decision_payload.get("actor"),
+                    "reason": decision_payload.get("reason"),
+                    "idempotency_identity": decision_payload.get("idempotency_identity"),
+                    "adoption_request_fingerprint": fork_request_sha256,
+                    "event_id": decision_event.id,
+                }
+            )
+            prepared_events.append(decision_event)
+        relationship = SessionForkProfileRelationship(
+            request_sha256=fork_request_sha256,
+            source_session_id=source_session.id,
+            child_session_id=fork_session.id,
+            child_agent_name=fork_session.agent_name,
+            child_provider_name=fork_session.provider_name,
+            child_model=fork_session.model,
+            child_environment_name=fork_session.environment_name,
+            source_status=source_session.status,
+            source_run_epoch=source_session.run_epoch,
+            source_profile_source=source_profile_source,
+            source_profile=source_execution_profile,
+            source_active_interaction_id=(
+                None if source_active_profile is None else source_active_profile.interaction_id
+            ),
+            source_active_run_epoch=(
+                None if source_active_profile is None else source_active_profile.run_epoch
+            ),
+            transcript_cursor=request.transcript_cursor,
+            copy_checkpoint=request.copy_checkpoint,
+            system_prompt_policy=request.system_prompt_policy,
+            selection=request.execution_profile_selection,
+            selected_profile=selected_execution_profile,
+            decision=decision_record,
+            fork_event_id=fork_event.id,
+        )
+        authoritative_metadata = copy_json_value(fork_session.metadata, "metadata")
+        authoritative_metadata[EXECUTION_PROFILE_METADATA_KEY] = execution_profile_session_metadata(
+            selected_execution_profile
+        )
+        authoritative_metadata[FORK_EXECUTION_PROFILE_METADATA_KEY] = relationship.model_dump(
+            mode="json"
+        )
+        fork_session = fork_session.model_copy(
+            update={"metadata": authoritative_metadata},
+            deep=True,
+        )
+        prepared_events.append(fork_event)
+
+        async def reconcile_profiled_fork(
+            initial_error: BaseException | None,
+        ) -> tuple[ProfiledSessionForkResult, BaseException | None]:
+            try:
+                existing = await self.session_store.load(fork_session.id)
+                if existing is None or not _prompt_fork_matches_prepared(
+                    existing,
+                    fork_session,
+                ):
+                    if initial_error is not None:
+                        raise initial_error
+                    raise RuntimeError(
+                        "Profiled fork publication returned no authoritative result."
+                    )
+                existing_relationship = session_fork_profile_relationship(existing)
+                if existing_relationship != relationship:
+                    raise RuntimeError("Existing profiled fork conflicts with the exact request.")
+                recovered_events: list[Event] = []
+                for prepared_event in prepared_events:
+                    records = await self.session_store.query_events(
+                        EventQuery(
+                            session_id=existing.id,
+                            event_id=prepared_event.id,
+                            limit=1,
+                        )
+                    )
+                    if len(records) != 1 or records[0].event.model_dump(
+                        mode="json",
+                        exclude={"timestamp"},
+                    ) != prepared_event.model_dump(
+                        mode="json",
+                        exclude={"timestamp"},
+                    ):
+                        raise RuntimeError(
+                            "Existing profiled fork is missing exact durable evidence."
+                        )
+                    recovered_events.append(records[0].event)
+                validate_profiled_fork_evidence(
+                    fork=existing,
+                    relationship=relationship,
+                    events=recovered_events,
+                )
+                recovered = ProfiledSessionForkResult(
+                    session=existing,
+                    events=tuple(recovered_events),
+                )
+                # Lost acknowledgements and malformed ordinary acknowledgements
+                # are repaired by the immutable receipt. Process-control outcomes
+                # remain authoritative even when their durable mutation committed.
+                retained_error = (
+                    initial_error
+                    if initial_error is not None and not isinstance(initial_error, Exception)
+                    else None
+                )
+                return recovered, retained_error
+            except BaseException as reconciliation_error:
+                if initial_error is None or reconciliation_error is initial_error:
+                    raise
+                raise BaseExceptionGroup(
+                    "Profiled fork publication and exact reconciliation failed.",
+                    [initial_error, reconciliation_error],
+                ) from None
+
+        async def publish_or_reconcile_profiled_fork() -> tuple[
+            ProfiledSessionForkResult,
+            BaseException | None,
+        ]:
+            try:
+                raw_result = await self.session_store.create_profiled_fork(
                     source_session_id=source_session.id,
-                    fork=fork_session,
-                    source_statuses=_FORKABLE_SESSION_STATUSES,
+                    fork=fork_session.model_copy(deep=True),
+                    source_statuses=set(_FORKABLE_SESSION_STATUSES),
                     transcript_cursor=request.transcript_cursor,
                     checkpoint_transform=checkpoint_transform,
                     system_prompt_replacement=prompt_workflow.prompt_replacement,
                     expected_source_run_epoch=source_session.run_epoch,
+                    relationship=SessionForkProfileRelationship.model_validate(
+                        relationship.model_dump(mode="json")
+                    ),
+                    events=[copy_event(event) for event in prepared_events],
                     transcript_validator=transcript_validator,
                 )
-            else:
-                created = await self.session_store.create_fork(
-                    source_session_id=source_session.id,
-                    fork=fork_session,
-                    source_statuses=_FORKABLE_SESSION_STATUSES,
-                    transcript_cursor=request.transcript_cursor,
-                    checkpoint_transform=checkpoint_transform,
-                    expected_source_run_epoch=source_session.run_epoch,
+                try:
+                    result = copy_profiled_session_fork_result(raw_result)
+                    if not _prompt_fork_matches_prepared(
+                        result.session,
+                        fork_session,
+                    ):
+                        raise RuntimeError(
+                            "Profiled fork publication returned a different session snapshot."
+                        )
+                    validate_profiled_fork_evidence(
+                        fork=result.session,
+                        relationship=relationship,
+                        events=result.events,
+                    )
+                    return result, None
+                except Exception as invalid_result:
+                    return await reconcile_profiled_fork(invalid_result)
+            except asyncio.CancelledError as child_cancellation:
+                return await reconcile_profiled_fork(
+                    unexpected_child_cancellation_error(
+                        child_cancellation,
+                        operation="Profiled fork durable publication",
+                    )
                 )
-        except SessionForkSourceNotFound:
-            raise session_request_boundary.ForkSourceNotFoundError(
-                "Fork source session was not found."
-            ) from None
-        except SessionForkActiveModelStageConflict:
-            raise session_request_boundary.ForkActiveModelStageError(
-                "Fork source session has an active model-completion stage."
-            ) from None
-        except _ExpiredIncompleteRecoveryClaim as expired_claim:
-            current = await self._require_session(source_session.id)
-            fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
-                session=current,
-                claim_id=expired_claim.claim_id,
+            except BaseException as initial_error:
+                return await reconcile_profiled_fork(initial_error)
+
+        async def await_owned_fork_task(
+            task: asyncio.Task[Any],
+        ) -> tuple[ShieldedTaskOutcome[Any], list[BaseException]]:
+            """Settle one dispatched fork mutation without losing supervisor control."""
+
+            supervisory_controls: list[BaseException] = []
+            while True:
+                try:
+                    return await await_shielded_task_outcome(task), supervisory_controls
+                except asyncio.CancelledError:
+                    # New Task.cancel() delivery is owned by the shield helper. An
+                    # unowned cancellation must retain its normal caller meaning.
+                    raise
+                except BaseException as control:
+                    # Generator/stream abandonment and process control cannot
+                    # orphan a durable mutation. Retain the exact signal until
+                    # the owned task reaches a terminal outcome.
+                    supervisory_controls.append(control)
+
+        publication_task = asyncio.create_task(
+            capture_awaitable_outcome(publish_or_reconcile_profiled_fork),
+            name="cayu-profiled-session-fork-publication",
+        )
+        publication_outcome, publication_controls = await await_owned_fork_task(publication_task)
+        publication_error = publication_outcome.error
+        publication_result = publication_outcome.result
+        if publication_error is None and publication_result is not None:
+            publication_error = publication_result.error
+            publication_value = publication_result.result
+        else:
+            publication_value = None
+        if (
+            isinstance(publication_error, asyncio.CancelledError)
+            and publication_outcome.cancellation is None
+        ):
+            publication_error = unexpected_child_cancellation_error(
+                publication_error,
+                operation="Profiled fork durable publication",
             )
-            if not fenced:
-                raise RuntimeError(
-                    "Expired incomplete-session recovery ownership changed while the fork "
-                    "was fencing it; retry with current session state."
+        if publication_error is not None:
+            if (
+                publication_outcome.cancellation is not None
+                and publication_outcome.cancellation_requests_consumed
+            ):
+                retain_workspace_observation_pending_cancellation_requests(
+                    publication_outcome.cancellation,
+                    publication_outcome.cancellation_requests_consumed,
+                )
+            restore_task_cancellation_requests(publication_outcome.cancellation_requests_consumed)
+            if publication_outcome.cancellation is not None:
+                if isinstance(publication_error, Exception) and not publication_controls:
+                    raise publication_outcome.cancellation from publication_error
+                concurrent_control = BaseExceptionGroup(
+                    "Profiled fork publication failed concurrently with caller cancellation.",
+                    [
+                        publication_error,
+                        *publication_controls,
+                        publication_outcome.cancellation,
+                    ],
+                )
+                retain_workspace_observation_pending_cancellation_requests(
+                    concurrent_control,
+                    publication_outcome.cancellation_requests_consumed,
+                )
+                raise concurrent_control from None
+            if publication_controls:
+                raise BaseExceptionGroup(
+                    "Profiled fork publication failed with concurrent process control.",
+                    [publication_error, *publication_controls],
                 ) from None
-            raise ValueError(
-                "Session fork fenced an expired incomplete-session recovery owner; retry "
-                "with current session state."
-            ) from None
-        except Exception as error:
-            created = await prompt_workflow.recover_created_after_error(
-                session_store=self.session_store,
-                prepared=fork_session,
-                error=error,
+            if isinstance(publication_error, SessionForkSourceNotFound):
+                raise session_request_boundary.ForkSourceNotFoundError(
+                    "Fork source session was not found."
+                ) from None
+            if isinstance(publication_error, SessionForkActiveModelStageConflict):
+                raise session_request_boundary.ForkActiveModelStageError(
+                    "Fork source session has an active model-completion stage."
+                ) from None
+            if isinstance(publication_error, _ExpiredIncompleteRecoveryClaim):
+                current = await self._require_session(source_session.id)
+                fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
+                    session=current,
+                    claim_id=publication_error.claim_id,
+                )
+                if not fenced:
+                    raise RuntimeError(
+                        "Expired incomplete-session recovery ownership changed while the "
+                        "fork was fencing it; retry with current session state."
+                    ) from None
+                raise ValueError(
+                    "Session fork fenced an expired incomplete-session recovery owner; "
+                    "retry with current session state."
+                ) from None
+            raise publication_error
+        if publication_value is None:
+            if (
+                publication_outcome.cancellation is not None
+                and publication_outcome.cancellation_requests_consumed
+            ):
+                retain_workspace_observation_pending_cancellation_requests(
+                    publication_outcome.cancellation,
+                    publication_outcome.cancellation_requests_consumed,
+                )
+            restore_task_cancellation_requests(publication_outcome.cancellation_requests_consumed)
+            missing_result = RuntimeError(
+                "Profiled fork publication returned no authoritative result."
             )
+            if publication_outcome.cancellation is not None:
+                if not publication_controls:
+                    raise publication_outcome.cancellation from missing_result
+                concurrent_control = BaseExceptionGroup(
+                    "Profiled fork publication returned no result with concurrent control.",
+                    [
+                        missing_result,
+                        *publication_controls,
+                        publication_outcome.cancellation,
+                    ],
+                )
+                if publication_outcome.cancellation_requests_consumed:
+                    retain_workspace_observation_pending_cancellation_requests(
+                        concurrent_control,
+                        publication_outcome.cancellation_requests_consumed,
+                    )
+                raise concurrent_control from None
+            if publication_controls:
+                raise BaseExceptionGroup(
+                    "Profiled fork publication returned no result with process control.",
+                    [missing_result, *publication_controls],
+                ) from None
+            raise missing_result
+        profiled_result, post_commit_control = publication_value
+        created = profiled_result.session
         if (
             created.id != fork_session.id
             or created.parent_session_id != fork_session.parent_session_id
             or created.causal_budget_id != fork_session.causal_budget_id
+            or session_fork_profile_relationship(created) != relationship
+            or len(profiled_result.events) != len(prepared_events)
+            or any(
+                stored.model_dump(mode="json", exclude={"timestamp"})
+                != prepared.model_dump(mode="json", exclude={"timestamp"})
+                for stored, prepared in zip(
+                    profiled_result.events,
+                    prepared_events,
+                    strict=True,
+                )
+            )
         ):
             raise RuntimeError("Session store changed prepared fork identity authority.")
-        await prompt_workflow.complete_effect(
-            session_store=self.session_store,
-            source_session_id=source_session.id,
-            created=created,
-            clock=self._clock,
-        )
-        raw_fork_event = prompt_workflow.raw_fork_event(
-            created=created,
-            ordinary_event=Event(
-                type=EventType.SESSION_FORKED,
-                session_id=fork_session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                payload=fork_event_payload,
+        completion_task = asyncio.create_task(
+            capture_awaitable_outcome(
+                lambda: prompt_workflow.complete_effect(
+                    session_store=self.session_store,
+                    source_session_id=source_session.id,
+                    created=created,
+                    clock=self._clock,
+                )
             ),
+            name="cayu-profiled-session-fork-effect-completion",
         )
-        fork_event = self._event_writer.prepare(_fork_event_with_runtime_authority(raw_fork_event))
-        yield await prompt_workflow.publish_event(
-            event_writer=self._event_writer,
-            event=fork_event,
+        completion_outcome, completion_controls = await await_owned_fork_task(completion_task)
+        completion_error = completion_outcome.error
+        if completion_error is None and completion_outcome.result is not None:
+            completion_error = completion_outcome.result.error
+        if (
+            isinstance(completion_error, asyncio.CancelledError)
+            and completion_outcome.cancellation is None
+        ):
+            completion_error = unexpected_child_cancellation_error(
+                completion_error,
+                operation="Profiled fork effect completion",
+            )
+        authoritative_cancellation = (
+            publication_outcome.cancellation or completion_outcome.cancellation
         )
+        cancellation_requests_consumed = (
+            publication_outcome.cancellation_requests_consumed
+            + completion_outcome.cancellation_requests_consumed
+        )
+        concurrent_failures: list[BaseException] = []
+        for failure in (
+            post_commit_control,
+            completion_error,
+            *publication_controls,
+            *completion_controls,
+        ):
+            if isinstance(failure, BaseException):
+                concurrent_failures.append(failure)
+            elif failure is not None:
+                concurrent_failures.append(
+                    RuntimeError("Profiled fork completion returned invalid failure evidence.")
+                )
+        if authoritative_cancellation is not None:
+            if cancellation_requests_consumed:
+                retain_workspace_observation_pending_cancellation_requests(
+                    authoritative_cancellation,
+                    cancellation_requests_consumed,
+                )
+            restore_task_cancellation_requests(cancellation_requests_consumed)
+            ordinary_failures = [
+                failure for failure in concurrent_failures if isinstance(failure, Exception)
+            ]
+            if concurrent_failures and len(ordinary_failures) == len(concurrent_failures):
+                cleanup_failure = (
+                    ordinary_failures[0]
+                    if len(ordinary_failures) == 1
+                    else ExceptionGroup(
+                        "Profiled fork post-commit completion failed.",
+                        ordinary_failures,
+                    )
+                )
+                raise authoritative_cancellation from cleanup_failure
+            if concurrent_failures:
+                concurrent_control = BaseExceptionGroup(
+                    "Profiled fork committed with concurrent process control and cancellation.",
+                    [*concurrent_failures, authoritative_cancellation],
+                )
+                if cancellation_requests_consumed:
+                    retain_workspace_observation_pending_cancellation_requests(
+                        concurrent_control,
+                        cancellation_requests_consumed,
+                    )
+                raise concurrent_control from None
+            raise authoritative_cancellation
+        if concurrent_failures:
+            if len(concurrent_failures) == 1:
+                raise concurrent_failures[0]
+            raise BaseExceptionGroup(
+                "Profiled fork post-commit completion failed.",
+                concurrent_failures,
+            ) from None
+        delivered_events = await self._event_writer.fan_out_persisted(list(profiled_result.events))
+        yield delivered_events[-1]
 
     async def _publish_assistant_model_completion(
         self,

@@ -766,6 +766,31 @@ def execution_profile_from_session_metadata(
     )
 
 
+def execution_profile_baseline_from_session_metadata(
+    metadata: Mapping[str, Any],
+) -> ExecutionProfileIdentity:
+    """Load the immutable creation baseline from one session profile record."""
+
+    raw = metadata.get(EXECUTION_PROFILE_METADATA_KEY)
+    if type(raw) is not dict:
+        raise ValueError("Session has no durable execution-profile identity.")
+    if set(raw) != {"record_type", "schema_version", "baseline", "expected"}:
+        raise ValueError("Session execution-profile metadata is malformed.")
+    if (
+        raw["record_type"] != _EXECUTION_PROFILE_RECORD_TYPE
+        or raw["schema_version"] != EXECUTION_PROFILE_SCHEMA_VERSION
+    ):
+        raise ValueError("Session execution-profile metadata version is unsupported.")
+    # Validate the mutable expectation too. A malformed sibling field must not
+    # be bypassed merely because a caller asks only for the immutable baseline.
+    ExecutionProfileIdentity.model_validate(
+        copy_durable_json_value(raw["expected"], "execution_profile.expected")
+    )
+    return ExecutionProfileIdentity.model_validate(
+        copy_durable_json_value(raw["baseline"], "execution_profile.baseline")
+    )
+
+
 def active_invocation_execution_profile_from_checkpoint(
     checkpoint: Mapping[str, Any] | None,
 ) -> ActiveInvocationExecutionProfile | None:

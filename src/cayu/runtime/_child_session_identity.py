@@ -79,6 +79,7 @@ class ChildSessionKind(StrEnum):
 
     SUBAGENT = "subagent"
     WORKFLOW_STEP = "workflow-step"
+    SESSION_FORK = "session-fork"
 
 
 def child_session_id_prefix(kind: ChildSessionKind) -> str:

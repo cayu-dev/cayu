@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Any, cast
+from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -70,8 +71,10 @@ from cayu.runtime import (
     ContextCompactor,
     EnqueueSessionMessageRequest,
     EventQuery,
+    ExecutionProfileAdoptionIntent,
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
     IncompleteSessionRecoveryAction,
@@ -94,6 +97,7 @@ from cayu.runtime import (
     PublicAuthorityAliasKeyring,
     RequestFootprintConfig,
     ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunLimits,
     RunRequest,
@@ -620,6 +624,15 @@ class _ConformancePartialOverlapCompactor(ContextCompactor):
 
 class _UnusedForkProvider(ModelProvider):
     name = "fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _UnusedNamedForkProvider(ModelProvider):
+    def __init__(self, name: str) -> None:
+        self.name = name
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
@@ -16339,7 +16352,10 @@ def test_session_store_conformance_rejects_unsafe_derived_fork_before_mutation(
                     session_id=source_id,
                     messages=[Message.text("user", "fork")],
                 ),
-                identity=SessionIdentity(provider_name="fake", model="source-model"),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="source-model",
+                ),
             )
             await store.append_transcript_messages(
                 source.id,
@@ -16369,6 +16385,17 @@ def test_session_store_conformance_rejects_unsafe_derived_fork_before_mutation(
                             source_session_id=source.id,
                             session_id=child_id,
                             agent_name="target-agent",
+                            execution_profile_selection=(
+                                ForkExecutionProfileSelection.CURRENT_CHILD
+                            ),
+                            profile_adoption=ExecutionProfileAdoptionIntent(
+                                idempotency_key=f"derived-fork-{store_kind}",
+                                reason="Exercise derived fork authority validation.",
+                                requested_by=ResolutionActor(
+                                    subject="test-caller",
+                                    source=ResolutionActorSource.REQUEST,
+                                ),
+                            ),
                         )
                     )
                 ]
@@ -16383,6 +16410,147 @@ def test_session_store_conformance_rejects_unsafe_derived_fork_before_mutation(
             assert await store.load_transcript(source.id) == transcript_before
             assert await store.load_checkpoint(source.id) == checkpoint_before
             assert await store.load_events(source.id) == events_before
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("profile_mode", ["inherit", "current-model", "current-provider"])
+def test_session_store_conformance_profiled_fork_is_atomic_and_exactly_replayable(
+    session_store_case,
+    profile_mode: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        source_id = f"profiled_fork_source_{profile_mode}_{store_kind}_{uuid4().hex}"
+        child_id = f"profiled_fork_child_{profile_mode}_{store_kind}_{uuid4().hex}"
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "fork source")],
+                ),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                ),
+            )
+            source = await store.update_status(source.id, SessionStatus.COMPLETED)
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            if profile_mode == "current-provider":
+                app.register_provider(_UnusedNamedForkProvider("child-provider"))
+                app.register_agent(
+                    AgentSpec(
+                        name="child-assistant",
+                        provider_name="child-provider",
+                        model="child-model",
+                    )
+                )
+            request = (
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id=child_id,
+                )
+                if profile_mode == "inherit"
+                else ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id=child_id,
+                    agent_name=("child-assistant" if profile_mode == "current-provider" else None),
+                    model=("child-model" if profile_mode == "current-model" else None),
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key=f"profiled-fork-{profile_mode}-{store_kind}",
+                        reason="Select the current child model profile.",
+                        requested_by=ResolutionActor(
+                            subject="test-caller",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+
+            async def collect_fork() -> list[Event]:
+                return [event async for event in app.fork_session(request)]
+
+            first, replay = await asyncio.gather(
+                collect_fork(),
+                collect_fork(),
+            )
+
+            assert [event.type for event in first] == [EventType.SESSION_FORKED]
+            assert [event.id for event in replay] == [event.id for event in first]
+            child = await store.load(child_id)
+            assert child is not None
+            relationship = sessions_module.session_fork_profile_relationship(child)
+            assert relationship is not None
+            assert relationship.source_session_id == source.id
+            if profile_mode == "inherit":
+                assert relationship.selected_profile == relationship.source_profile
+                expected_event_types = [EventType.SESSION_FORKED]
+            else:
+                assert relationship.selected_profile != relationship.source_profile
+                assert relationship.decision is not None
+                if profile_mode == "current-provider":
+                    assert child.provider_name == "child-provider"
+                expected_event_types = [
+                    EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+                    EventType.SESSION_FORKED,
+                ]
+            records = await store.query_events(EventQuery(session_id=child_id, limit=10))
+            assert [record.event.type for record in records] == expected_event_types
+            assert records[-1].event.id == relationship.fork_event_id
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_generated_profiled_fork_is_idempotent(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        source_id = f"generated_profiled_fork_source_{store_kind}_{uuid4().hex}"
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "fork source")],
+                ),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                ),
+            )
+            source = await store.update_status(source.id, SessionStatus.COMPLETED)
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            request = ForkSessionRequest(source_session_id=source.id)
+
+            async def collect_fork() -> list[Event]:
+                return [event async for event in app.fork_session(request)]
+
+            first, replay = await asyncio.gather(collect_fork(), collect_fork())
+
+            assert [event.type for event in first] == [EventType.SESSION_FORKED]
+            assert [event.id for event in replay] == [event.id for event in first]
+            children = (
+                await store.list_sessions(SessionQuery(parent_session_id=source.id, limit=10))
+            ).sessions
+            assert len(children) == 1
+            relationship = sessions_module.session_fork_profile_relationship(children[0])
+            assert relationship is not None
+            assert relationship.source_session_id == source.id
+            records = await store.query_events(EventQuery(session_id=children[0].id, limit=10))
+            assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
         finally:
             await _close_store(store)
 
@@ -16466,7 +16634,10 @@ def test_session_store_conformance_fork_source_provenance_distinguishes_callers(
                     session_id=source_id,
                     messages=[Message.text("user", "source")],
                 ),
-                identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fakemodel",
+                ),
             )
             await store.update_status(source.id, SessionStatus.COMPLETED)
             app = CayuApp(
@@ -16622,7 +16793,10 @@ def test_session_store_conformance_fork_source_deleted_after_initial_load_omits_
                     session_id=source_id,
                     messages=[Message.text("user", "source")],
                 ),
-                identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fakemodel",
+                ),
             )
             await store.update_status(source.id, SessionStatus.COMPLETED)
             await store.append_event(
@@ -16648,7 +16822,7 @@ def test_session_store_conformance_fork_source_deleted_after_initial_load_omits_
                 private_value=source.id,
             )
 
-            original_create_fork = store.create_fork_with_transcript_validation
+            original_create_fork = store.create_profiled_fork
             deleted_after_initial_load = False
 
             async def delete_source_then_create_fork(**kwargs):
@@ -16659,7 +16833,7 @@ def test_session_store_conformance_fork_source_deleted_after_initial_load_omits_
 
             monkeypatch.setattr(
                 store,
-                "create_fork_with_transcript_validation",
+                "create_profiled_fork",
                 delete_source_then_create_fork,
             )
 
@@ -16708,7 +16882,10 @@ def test_session_store_conformance_active_stage_fork_omits_private_source_author
                     session_id=source_id,
                     messages=[Message.text("user", "source")],
                 ),
-                identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fakemodel",
+                ),
             )
             await store.append_transcript_messages(
                 source.id,
@@ -16825,7 +17002,10 @@ def test_session_store_conformance_rejects_fork_with_pending_tool_round(
                     session_id=source_id,
                     messages=[Message.text("user", "perform the effect")],
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                ),
             )
             await store.append_event(
                 source.id,

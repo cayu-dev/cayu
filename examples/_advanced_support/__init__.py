@@ -5,6 +5,7 @@ from examples._advanced_support.costs import (
 from examples._advanced_support.results import ScenarioResult, SessionEvidence
 from examples._advanced_support.runtime import (
     GEMINI_BASE_URL,
+    ExampleForkExecutionProfilePolicy,
     advanced_run_limits,
     collect_events,
     completed_batch,
@@ -23,6 +24,7 @@ from examples._advanced_support.runtime import (
 __all__ = [
     "GEMINI_BASE_URL",
     "ComparisonSessionEvidence",
+    "ExampleForkExecutionProfilePolicy",
     "ScenarioResult",
     "SessionEvidence",
     "advanced_run_limits",

@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from examples._advanced_support import (
+    ExampleForkExecutionProfilePolicy,
     ScenarioResult,
     advanced_run_limits,
     collect_events,
@@ -96,7 +97,10 @@ async def run_scenario(
     mode: str,
     source_context: RepositorySourceContext | None = None,
 ) -> ScenarioResult:
-    app = CayuApp(enable_logging=False)
+    app = CayuApp(
+        enable_logging=False,
+        execution_profile_policy=ExampleForkExecutionProfilePolicy(),
+    )
     app.register_provider(provider, default=True)
     role_prompts = {
         "maintainer-source": "Prepare the issue and repository context.",

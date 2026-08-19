@@ -148,8 +148,15 @@ from cayu.runtime import (
     EventQuery,
     EventRecord,
     EventSink,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptPolicy,
     IncompleteSessionRecoveryAction,
@@ -6422,6 +6429,42 @@ async def collect_interrupt_events(app: CayuApp, request: InterruptSessionReques
 
 async def collect_fork_events(app: CayuApp, request: ForkSessionRequest) -> list[Event]:
     return [event async for event in app.fork_session(request)]
+
+
+def _current_fork_profile_selection(
+    idempotency_key: str,
+) -> dict[str, object]:
+    return {
+        "execution_profile_selection": ForkExecutionProfileSelection.CURRENT_CHILD,
+        "profile_adoption": ExecutionProfileAdoptionIntent(
+            idempotency_key=idempotency_key,
+            reason="Install the explicitly selected current child execution profile.",
+            requested_by=ResolutionActor(
+                subject="test-caller",
+                source=ResolutionActorSource.REQUEST,
+            ),
+        ),
+    }
+
+
+class _AllowForkProfileAdoption(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "test:allow-fork-profile-adoption:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="The test explicitly authorizes the selected child profile.",
+            authority_decision=(
+                ExecutionProfileAuthorityDecision.AUTHORIZED
+                if request.authority_review_required
+                else ExecutionProfileAuthorityDecision.NOT_REQUIRED
+            ),
+        )
 
 
 async def collect_dispatch_events(app: CayuApp, request: DispatchRequest) -> list[Event]:
@@ -16852,7 +16895,10 @@ def test_cayu_app_rejects_completed_session_with_pending_tool_round():
                 session_id="completed_pending_round",
                 messages=[Message.text("user", "hello")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.checkpoint("completed_pending_round", checkpoint)
         await store.update_status("completed_pending_round", SessionStatus.COMPLETED)
@@ -16941,7 +16987,7 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     assert fork.provider_name == source.provider_name == "fake"
     assert fork.model == source.model == "fake-model"
     assert fork.labels == source.labels == {"owner": "org_123", "project": "feature_a"}
-    assert fork.metadata == {"purpose": "alternate path"}
+    assert sessions_module.session_user_metadata(fork.metadata) == {"purpose": "alternate path"}
     fork_checkpoint = asyncio.run(store.load_checkpoint("sess_fork_child"))
     assert fork_checkpoint is not None
     assert fork_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
@@ -17024,7 +17070,11 @@ def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
         ]
     )
     child_store = SQLiteSessionStore(database)
-    child_app = CayuApp(session_store=child_store, enable_logging=False)
+    child_app = CayuApp(
+        session_store=child_store,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+        enable_logging=False,
+    )
     child_app.register_provider(child_provider, default=True)
     child_app.register_environment(
         Environment(
@@ -17048,6 +17098,7 @@ def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
         agent_name="assistant",
         copy_checkpoint=False,
         system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+        **_current_fork_profile_selection("prompt-parent-to-child"),
     )
 
     fork_query_cutoff = datetime.now(UTC)
@@ -17060,7 +17111,10 @@ def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
 
     assert child is not None and source is not None
     assert [event.id for event in replay_events] == [event.id for event in first_events]
-    assert len(asyncio.run(child_store.load_events(child.id))) == 1
+    assert [event.type for event in asyncio.run(child_store.load_events(child.id))] == [
+        EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+        EventType.SESSION_FORKED,
+    ]
     receipt = session_prompt_anatomy_transition(child)
     assert receipt is not None
     assert receipt.source_prompt_sha256 == system_prompt_messages_sha256(source_transcript)
@@ -17147,8 +17201,8 @@ def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -
     class CrashAfterForkStore(InMemorySessionStore):
         crash_after_commit = True
 
-        async def create_fork_with_transcript_validation(self, *args, **kwargs):
-            created = await super().create_fork_with_transcript_validation(*args, **kwargs)
+        async def create_profiled_fork(self, *args, **kwargs):
+            created = await super().create_profiled_fork(*args, **kwargs)
             if self.crash_after_commit:
                 self.crash_after_commit = False
                 raise SystemExit("process died after descendant commit")
@@ -17184,9 +17238,14 @@ def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -
         environment_name="body",
         copy_checkpoint=False,
         system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+        **_current_fork_profile_selection("prompt-crash-child"),
     )
 
-    crashing_app = CayuApp(session_store=store, enable_logging=False)
+    crashing_app = CayuApp(
+        session_store=store,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+        enable_logging=False,
+    )
     crashing_app.register_provider(FakeProvider([]), default=True)
     crashing_app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
     crashing_app.register_agent(
@@ -17195,9 +17254,16 @@ def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -
     with pytest.raises(SystemExit, match="process died"):
         asyncio.run(collect_fork_events(crashing_app, request))
     assert asyncio.run(store.load("sess_prompt_crash_child")) is not None
-    assert asyncio.run(store.load_events("sess_prompt_crash_child")) == []
+    assert [event.type for event in asyncio.run(store.load_events("sess_prompt_crash_child"))] == [
+        EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+        EventType.SESSION_FORKED,
+    ]
 
-    restarted_app = CayuApp(session_store=store, enable_logging=False)
+    restarted_app = CayuApp(
+        session_store=store,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+        enable_logging=False,
+    )
     restarted_app.register_provider(FakeProvider([]), default=True)
     restarted_app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
     restarted_app.register_agent(
@@ -17206,7 +17272,7 @@ def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -
     recovered = asyncio.run(collect_fork_events(restarted_app, request))
 
     assert [event.type for event in recovered] == [EventType.SESSION_FORKED]
-    assert len(asyncio.run(store.load_events("sess_prompt_crash_child"))) == 1
+    assert len(asyncio.run(store.load_events("sess_prompt_crash_child"))) == 2
     completed_checkpoint = asyncio.run(store.load_checkpoint("sess_prompt_crash_parent"))
     assert completed_checkpoint is not None
     completed_intents = completed_checkpoint["prompt_anatomy_transition_intents"]
@@ -17217,8 +17283,8 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
     tmp_path: Path,
 ) -> None:
     class CrashAfterForkStore(SQLiteSessionStore):
-        async def create_fork_with_transcript_validation(self, *args, **kwargs):
-            await super().create_fork_with_transcript_validation(*args, **kwargs)
+        async def create_profiled_fork(self, *args, **kwargs):
+            await super().create_profiled_fork(*args, **kwargs)
             raise SystemExit("process died after descendant commit")
 
     def register_body(
@@ -17263,14 +17329,22 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
             environment_name="body",
             copy_checkpoint=False,
             system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+            **_current_fork_profile_selection("prompt-advanced-child"),
         )
 
-        crashing_app = CayuApp(session_store=store, enable_logging=False)
+        crashing_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowForkProfileAdoption(),
+            enable_logging=False,
+        )
         register_body(crashing_app, FakeProvider([]), system_prompt="child prompt")
         with pytest.raises(SystemExit, match="descendant commit"):
             await collect_fork_events(crashing_app, request)
         assert await store.load("sess_prompt_advanced_child") is not None
-        assert await store.load_events("sess_prompt_advanced_child") == []
+        assert [event.type for event in await store.load_events("sess_prompt_advanced_child")] == [
+            EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+            EventType.SESSION_FORKED,
+        ]
         await store.close()
 
         advanced_store = SQLiteSessionStore(database)
@@ -17295,14 +17369,18 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
         await advanced_store.close()
 
         recovered_store = SQLiteSessionStore(database)
-        recovered_app = CayuApp(session_store=recovered_store, enable_logging=False)
+        recovered_app = CayuApp(
+            session_store=recovered_store,
+            execution_profile_policy=_AllowForkProfileAdoption(),
+            enable_logging=False,
+        )
         register_body(recovered_app, FakeProvider([]), system_prompt="child prompt")
         recovered = await collect_fork_events(recovered_app, request)
 
         child = await recovered_store.load("sess_prompt_advanced_child")
         assert child is not None
         assert [event.type for event in recovered] == [EventType.SESSION_FORKED]
-        assert len(await recovered_store.load_events(child.id)) == 1
+        assert len(await recovered_store.load_events(child.id)) == 2
         assert session_prompt_anatomy_transition(child) is not None
         await recovered_store.close()
 
@@ -17315,11 +17393,11 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
     class CrashBeforeForkStore(SQLiteSessionStore):
         crash_before_commit = True
 
-        async def create_fork_with_transcript_validation(self, *args, **kwargs):
+        async def create_profiled_fork(self, *args, **kwargs):
             if self.crash_before_commit:
                 self.crash_before_commit = False
                 raise SystemExit("process died before descendant commit")
-            return await super().create_fork_with_transcript_validation(*args, **kwargs)
+            return await super().create_profiled_fork(*args, **kwargs)
 
     async def scenario() -> None:
         database = tmp_path / "prompt-intent-recovery.sqlite"
@@ -17330,7 +17408,10 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
                 session_id="sess_prompt_precommit_parent",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_transcript_messages(
             source.id,
@@ -17343,9 +17424,14 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
             environment_name="body",
             copy_checkpoint=False,
             system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+            **_current_fork_profile_selection("prompt-precommit-child"),
         )
 
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowForkProfileAdoption(),
+            enable_logging=False,
+        )
         app.register_provider(FakeProvider([]), default=True)
         app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
         app.register_agent(
@@ -17362,7 +17448,11 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
         await store.close()
 
         reopened = SQLiteSessionStore(database)
-        restarted_app = CayuApp(session_store=reopened, enable_logging=False)
+        restarted_app = CayuApp(
+            session_store=reopened,
+            execution_profile_policy=_AllowForkProfileAdoption(),
+            enable_logging=False,
+        )
         restarted_app.register_provider(FakeProvider([]), default=True)
         restarted_app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
         restarted_app.register_agent(
@@ -17398,9 +17488,9 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
 
 def test_prompt_anatomy_fork_requires_exact_intent_inside_atomic_create() -> None:
     class IntentErasingStore(InMemorySessionStore):
-        async def create_fork_with_transcript_validation(self, *args, **kwargs):
+        async def create_profiled_fork(self, *args, **kwargs):
             await self.checkpoint(kwargs["source_session_id"], {})
-            return await super().create_fork_with_transcript_validation(*args, **kwargs)
+            return await super().create_profiled_fork(*args, **kwargs)
 
     store = IntentErasingStore()
 
@@ -17411,14 +17501,21 @@ def test_prompt_anatomy_fork_requires_exact_intent_inside_atomic_create() -> Non
                 session_id="sess_prompt_intent_parent",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_transcript_messages(
             source.id,
             [Message.text("system", "parent prompt"), Message.text("user", "memory")],
         )
         await store.update_status(source.id, SessionStatus.COMPLETED)
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowForkProfileAdoption(),
+            enable_logging=False,
+        )
         app.register_provider(FakeProvider([]), default=True)
         app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
         app.register_agent(
@@ -17434,6 +17531,7 @@ def test_prompt_anatomy_fork_requires_exact_intent_inside_atomic_create() -> Non
                     environment_name="body",
                     copy_checkpoint=False,
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection("prompt-intent-child"),
                 ),
             )
 
@@ -17451,7 +17549,10 @@ def test_prompt_anatomy_fork_rejects_checkpoint_copy() -> None:
     async def scenario() -> None:
         source = await store.create(
             RunRequest(agent_name="assistant", messages=[]),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(source.id, SessionStatus.COMPLETED)
         with pytest.raises(ValueError, match="cannot copy checkpoint"):
@@ -17461,6 +17562,7 @@ def test_prompt_anatomy_fork_rejects_checkpoint_copy() -> None:
                     source_session_id=source.id,
                     session_id="sess_prompt_checkpoint_child",
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection("prompt-checkpoint-child"),
                 ),
             )
 
@@ -17491,7 +17593,10 @@ def test_prompt_anatomy_fork_requires_concrete_registered_environment(
     async def scenario() -> None:
         source = await store.create(
             RunRequest(agent_name="assistant", messages=[]),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(source.id, SessionStatus.COMPLETED)
 
@@ -17504,6 +17609,7 @@ def test_prompt_anatomy_fork_requires_concrete_registered_environment(
                     environment_name=environment_name,
                     copy_checkpoint=False,
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection(f"prompt-environment-child-{factory_backed}"),
                 ),
             )
 
@@ -17531,7 +17637,10 @@ def test_prompt_anatomy_fork_rejects_live_source_before_effects(
     async def scenario() -> None:
         source = await store.create(
             RunRequest(agent_name="assistant", messages=[]),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(source.id, SessionStatus.RUNNING)
         if status is SessionStatus.INTERRUPTING:
@@ -17546,6 +17655,7 @@ def test_prompt_anatomy_fork_rejects_live_source_before_effects(
                     environment_name="body",
                     copy_checkpoint=False,
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection(f"prompt-live-child-{status.value}"),
                 ),
             )
 
@@ -17559,7 +17669,12 @@ def test_prompt_anatomy_fork_rejects_live_source_before_effects(
 def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
     store = InMemorySessionStore()
     now = datetime(2026, 1, 1, tzinfo=UTC)
-    app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        clock=lambda: now,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+    )
     app.register_provider(FakeProvider([]), default=True)
     app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
     app.register_agent(
@@ -17569,7 +17684,10 @@ def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
     async def scenario() -> None:
         source = await store.create(
             RunRequest(agent_name="assistant", messages=[]),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(source.id, SessionStatus.COMPLETED)
         checkpoint = {
@@ -17591,6 +17709,7 @@ def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
                     environment_name="body",
                     copy_checkpoint=False,
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection("prompt-active-recovery-child"),
                 ),
             )
 
@@ -17643,6 +17762,7 @@ def test_prompt_anatomy_fork_rejects_pending_user_input_before_effects() -> None
                     environment_name="body",
                     copy_checkpoint=False,
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection("prompt-pending-input-child"),
                 ),
             )
 
@@ -17681,7 +17801,10 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
                 session_id="sess_expired_recovery_claim_source",
                 messages=[Message.text("user", "fork me")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         session_id = "sess_expired_recovery_claim_source"
         child_id = f"sess_expired_recovery_claim_child_{copy_checkpoint}"
@@ -17747,7 +17870,9 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
             after_takeover = await store.load(session_id)
             assert after_takeover is not None
             assert after_takeover.run_epoch > stale_epoch
-            assert after_takeover.metadata == {"stale_owner_write_before_atomic_takeover": True}
+            assert sessions_module.session_user_metadata(after_takeover.metadata) == {
+                "stale_owner_write_before_atomic_takeover": True
+            }
             source_checkpoint = await store.load_checkpoint(session_id)
             assert source_checkpoint == {
                 CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -17809,7 +17934,10 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
                 session_id=session_id,
                 messages=[Message.text("user", "fork me")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         completed = await store.update_status(session_id, SessionStatus.COMPLETED)
 
@@ -17933,7 +18061,10 @@ def test_cayu_app_does_not_reconcile_an_ambiguous_takeover_as_a_replacement_owne
                 session_id=session_id,
                 messages=[Message.text("user", "fork me")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(session_id, SessionStatus.COMPLETED)
 
@@ -18019,6 +18150,7 @@ def test_cayu_app_rejects_fork_to_agent_with_different_provider():
                     environment_name="body",
                     copy_checkpoint=False,
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection("fork-provider-child"),
                 ),
             )
         )
@@ -21754,7 +21886,10 @@ def test_pending_interruption_cascade_blocks_resume_and_fork():
                 session_id=session_id,
                 messages=[Message.text("user", "hello")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(session_id, SessionStatus.INTERRUPTED)
         await store.checkpoint(
@@ -22811,7 +22946,9 @@ def test_cayu_app_runtime_hook_can_fork_and_dispatch_followup_work():
     assert child is not None
     assert child.parent_session_id == "sess_hook_source"
     assert child.status == SessionStatus.COMPLETED
-    assert child.metadata == {"purpose": "knowledge_extraction"}
+    assert sessions_module.session_user_metadata(child.metadata) == {
+        "purpose": "knowledge_extraction"
+    }
     task = asyncio.run(tasks.load_task(hook.task_id))
     assert task is not None
     assert task.status == TaskStatus.PENDING
@@ -38285,6 +38422,7 @@ def test_cayu_app_rejects_fork_with_pending_approval_checkpoint():
                     environment_name="body",
                     copy_checkpoint=False,
                     system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection("interrupted-fork-child"),
                 ),
             )
         )

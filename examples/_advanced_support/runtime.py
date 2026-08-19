@@ -12,8 +12,17 @@ from cayu import (
     ChatCompletionsProvider,
     Event,
     EventType,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
     OpenAIProvider,
+    ResolutionActor,
+    ResolutionActorSource,
     RunLimits,
     RuntimeEvidenceAttemptStatus,
     RuntimeEvidenceReport,
@@ -26,6 +35,28 @@ from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+class ExampleForkExecutionProfilePolicy(ExecutionProfilePolicy):
+    """Authorize the explicit, operator-scripted child transitions in examples."""
+
+    @property
+    def identity(self) -> str:
+        return "cayu-example:fork-profile-adoption:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="The example explicitly selected its registered child body.",
+            authority_decision=(
+                ExecutionProfileAuthorityDecision.AUTHORIZED
+                if request.authority_review_required
+                else ExecutionProfileAuthorityDecision.NOT_REQUIRED
+            ),
+        )
 
 
 def advanced_run_limits() -> RunLimits:
@@ -251,6 +282,15 @@ async def fork_session(
                 source_session_id=source_session_id,
                 session_id=session_id,
                 agent_name=agent_name,
+                execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key=f"example-fork:{session_id}",
+                    reason="Use the explicitly selected child agent registration.",
+                    requested_by=ResolutionActor(
+                        subject="example-scenario",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                ),
             )
         )
     )

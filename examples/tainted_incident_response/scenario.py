@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from examples._advanced_support import (
+    ExampleForkExecutionProfilePolicy,
     ScenarioResult,
     advanced_run_limits,
     collect_events,
@@ -406,7 +407,11 @@ def _build_app(
     model: str,
     session_store: SessionStore | None = None,
 ) -> CayuApp:
-    app = CayuApp(enable_logging=False, session_store=session_store)
+    app = CayuApp(
+        enable_logging=False,
+        session_store=session_store,
+        execution_profile_policy=ExampleForkExecutionProfilePolicy(),
+    )
     app.register_provider(provider, default=True)
     taint_policy = TaintAwareToolPolicy(
         taint_sources={"read_untrusted_evidence": {"incident-untrusted"}},

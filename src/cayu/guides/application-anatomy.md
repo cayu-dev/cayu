@@ -57,7 +57,14 @@ When a new agent body must inherit conversation history but install its current
 prompt anatomy, create an explicit descendant instead:
 
 ```python
-from cayu import ForkSessionRequest, ForkSystemPromptPolicy
+from cayu import (
+    ExecutionProfileAdoptionIntent,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    ForkSystemPromptPolicy,
+    ResolutionActor,
+    ResolutionActorSource,
+)
 
 events = [
     event
@@ -68,6 +75,15 @@ events = [
             agent_name="agent-v2",
             copy_checkpoint=False,
             system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+            execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+            profile_adoption=ExecutionProfileAdoptionIntent(
+                idempotency_key="agent-v2-session-profile",
+                reason="Install the registered agent-v2 execution profile.",
+                requested_by=ResolutionActor(
+                    subject="release-operator",
+                    source=ResolutionActorSource.REQUEST,
+                ),
+            ),
         )
     )
 ]
@@ -83,6 +99,13 @@ checkpoint records a durable transition intent, so a process restart can
 continue the exact request. The source transcript stays unchanged. Exact
 retries require the same explicit destination session ID and converge on that
 descendant and receipt.
+
+Selecting `CURRENT_CHILD` is an explicit execution-profile adoption request.
+The application's `ExecutionProfilePolicy` must authorize any changed runtime,
+provider target, tool authority, or durable prompt component before the child is
+created. Omitting `execution_profile_selection` instead inherits the parent's
+effective durable profile and does not consult mutable current registrations to
+choose a different child baseline.
 
 Prompt succession currently requires `copy_checkpoint=False` and a concrete
 registered environment. This is deliberate: a checkpoint or an unmaterialized

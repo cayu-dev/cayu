@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import copy
 import sys
@@ -8,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from pydantic import SecretStr
 from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._execution_unit_fixtures import tool_round_identity
 from tests.core._workload_secret_support import (
@@ -80,6 +82,8 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.storage import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 
@@ -3430,7 +3434,10 @@ def test_cayu_app_refuses_to_fork_legacy_secret_bearing_source_state(
                 labels=({f"owner-{secret}": "unsafe"} if contaminated_state == "labels" else {}),
                 messages=[Message.text("user", "not copied by create")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         if contaminated_state == "transcript":
             await store.append_transcript_messages(
@@ -3494,7 +3501,10 @@ def test_cayu_app_can_fork_without_copying_contaminated_legacy_checkpoint() -> N
                 session_id="sess_legacy_checkpoint_not_copied_source",
                 messages=[Message.text("user", "source")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.checkpoint(
             "sess_legacy_checkpoint_not_copied_source",
@@ -3516,6 +3526,140 @@ def test_cayu_app_can_fork_without_copying_contaminated_legacy_checkpoint() -> N
     asyncio.run(scenario())
 
     assert asyncio.run(store.load_checkpoint("sess_legacy_checkpoint_not_copied_child")) is None
+
+
+def test_fork_profile_resolution_does_not_retain_rejected_checkpoint() -> None:
+    secret = "fork-malformed-profile-checkpoint-secret-canary"
+    source_id = "sess_malformed_profile_checkpoint_source"
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> BaseException:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=source_id,
+                messages=[Message.text("user", "source")],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        await store.checkpoint(
+            source_id,
+            {
+                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                "private_state": secret,
+                "active_invocation_execution_profile": {"malformed": True},
+            },
+        )
+        await store.update_status(source_id, SessionStatus.COMPLETED)
+        with pytest.raises(ValueError, match="durable execution-profile identity") as exc_info:
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id="sess_malformed_profile_checkpoint_child",
+                ),
+            )
+        return exc_info.value
+
+    failure = asyncio.run(scenario())
+
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
+    _assert_cayu_traceback_does_not_retain_text(failure, secret)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_atomic_fork_profile_recheck_does_not_retain_changed_checkpoint(
+    store_kind: str,
+    tmp_path,
+) -> None:
+    secret = f"fork-transactional-profile-secret-{store_kind}"
+    source_id = f"sess_transactional_profile_source_{store_kind}"
+
+    class ConcurrentCheckpointMixin:
+        async def create_profiled_fork(self, *args, **kwargs):
+            await self.checkpoint(
+                source_id,
+                {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                    "private_state": secret,
+                    "active_invocation_execution_profile": {"malformed": True},
+                },
+            )
+            return await super().create_profiled_fork(*args, **kwargs)
+
+    class ConcurrentMemoryStore(ConcurrentCheckpointMixin, InMemorySessionStore):
+        pass
+
+    class ConcurrentSQLiteStore(ConcurrentCheckpointMixin, SQLiteSessionStore):
+        pass
+
+    alias_keyring = PublicAuthorityAliasKeyring(
+        active_key_id="test",
+        keys={
+            "test": SecretStr(
+                base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+            )
+        },
+    )
+    store = (
+        ConcurrentMemoryStore()
+        if store_kind == "memory"
+        else ConcurrentSQLiteStore(
+            tmp_path / "transactional-fork-profile.sqlite",
+            public_authority_alias_codec=PublicAuthorityAliasCodec(alias_keyring),
+        )
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        public_authority_alias_keyring=(alias_keyring if store_kind == "sqlite" else None),
+        enable_logging=False,
+    )
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> BaseException:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=source_id,
+                messages=[Message.text("user", "source")],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        await store.update_status(source_id, SessionStatus.COMPLETED)
+        with pytest.raises(ValueError, match="durable execution-profile identity") as exc_info:
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id=f"sess_transactional_profile_child_{store_kind}",
+                ),
+            )
+        return exc_info.value
+
+    failure = asyncio.run(scenario())
+
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
+    _assert_cayu_traceback_does_not_retain_text(failure, secret)
+    close = getattr(store, "close", None)
+    if close is not None:
+        asyncio.run(close())
 
 
 def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
@@ -3540,7 +3684,10 @@ def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.checkpoint(
             source_id,
@@ -3599,7 +3746,10 @@ def test_fork_failure_does_not_retain_excluded_legacy_checkpoint_secret() -> Non
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
             ),
-            identity=SessionIdentity(provider_name="missing-provider", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="missing-provider",
+                model="fake-model",
+            ),
         )
         await store.checkpoint(source_id, {"legacy_diagnostic": secret})
         await store.update_status(source_id, SessionStatus.COMPLETED)
@@ -3632,12 +3782,12 @@ def test_fork_validates_concurrently_added_transcript_inside_atomic_store_copy()
     child_id = "sess_legacy_concurrent_transcript_child"
 
     class ConcurrentAppendBeforeForkStore(InMemorySessionStore):
-        async def create_fork_with_transcript_validation(self, *args, **kwargs):
+        async def create_profiled_fork(self, *args, **kwargs):
             await self.append_transcript_messages(
                 source_id,
                 [Message.text("user", f"concurrent legacy message {secret}")],
             )
-            return await super().create_fork_with_transcript_validation(*args, **kwargs)
+            return await super().create_profiled_fork(*args, **kwargs)
 
     store = ConcurrentAppendBeforeForkStore()
     app = CayuApp(
@@ -3655,7 +3805,10 @@ def test_fork_validates_concurrently_added_transcript_inside_atomic_store_copy()
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_transcript_messages(
             source_id,
@@ -3704,9 +3857,13 @@ def test_fork_cursor_excluded_secret_is_not_retained_by_later_failure() -> None:
                 RunRequest(
                     agent_name="assistant",
                     session_id=session_id,
+                    metadata=({"legacy_private": secret} if session_id == child_id else {}),
                     messages=[Message.text("user", "source")],
                 ),
-                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                ),
             )
             await store.update_status(session_id, SessionStatus.COMPLETED)
         await store.append_transcript_messages(
@@ -3717,7 +3874,10 @@ def test_fork_cursor_excluded_secret_is_not_retained_by_later_failure() -> None:
             ],
         )
 
-        with pytest.raises(ValueError, match="Session already exists") as exc_info:
+        with pytest.raises(
+            RuntimeError,
+            match="Existing fork destination conflicts",
+        ) as exc_info:
             await collect_fork_events(
                 app,
                 ForkSessionRequest(

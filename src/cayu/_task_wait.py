@@ -80,6 +80,17 @@ def consume_pending_task_cancellation(
     return captured
 
 
+def restore_task_cancellation_requests(count: int) -> None:
+    """Restore shield-consumed requests immediately before control escapes."""
+
+    if type(count) is not int or count < 0:
+        raise ValueError("Consumed cancellation request count must be a non-negative int.")
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        for _request in range(count):
+            current_task.cancel()
+
+
 async def await_shielded_task_outcome(
     task: asyncio.Task[_ResultT],
     *,

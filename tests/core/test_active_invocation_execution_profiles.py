@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
 import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
 
+import cayu.runtime._session_engine as session_engine_module
 from cayu import (
     EXECUTION_PROFILE_METADATA_KEY,
     AgentSpec,
@@ -16,17 +19,24 @@ from cayu import (
     BeforeToolCallHookContext,
     BudgetLimit,
     CayuApp,
+    Environment,
+    EnvironmentSpec,
     Event,
+    EventQuery,
     EventType,
     ExecutionProfileAdoptionIntent,
+    ExecutionProfileAdoptionRejected,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecisionKind,
     ExecutionProfileMismatchError,
     ExecutionProfilePolicy,
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
+    ForkExecutionProfileSelection,
     ForkSessionRequest,
+    ForkSystemPromptPolicy,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -37,6 +47,7 @@ from cayu import (
     Message,
     ModelPrice,
     ModelStreamEvent,
+    ModelTarget,
     PriceBook,
     ResolutionActor,
     ResolutionActorSource,
@@ -49,6 +60,7 @@ from cayu import (
     ScriptedModelProvider,
     SessionIdentity,
     SessionInvocationAdmission,
+    SessionQuery,
     SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
@@ -65,6 +77,8 @@ from cayu import (
     ToolResult,
     ToolSpec,
     UserInputResponse,
+    session_fork_profile_relationship,
+    session_prompt_anatomy_transition,
 )
 from cayu.environments.factory import register_environment_factory_cleanup_retry
 from cayu.providers import (
@@ -91,10 +105,13 @@ from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
+    build_execution_profile_identity,
     checkpoint_with_active_invocation_execution_profile,
+    execution_profile_from_session_metadata,
 )
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.tools.user_input import UserInputTool
+from cayu.vaults import SecretRedactor
 
 
 class RecordingExternalTool(Tool):
@@ -456,7 +473,1356 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
-def test_unprofiled_fork_resume_freezes_profile_through_approval_continuation(
+def test_fork_profile_inheritance_is_atomic_and_exactly_replayable(
+    store_kind: str,
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "fork-profile-inheritance.sqlite")
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("source complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="profile-fork-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+        source = await store.load("profile-fork-source")
+        assert source is not None
+        expected = execution_profile_from_session_metadata(source.metadata)
+        request = ForkSessionRequest(
+            source_session_id=source.id,
+            session_id="profile-fork-child",
+        )
+
+        first, replay = await asyncio.gather(
+            collect(app.fork_session(request)),
+            collect(app.fork_session(request)),
+        )
+
+        assert [event.type for event in first] == [EventType.SESSION_FORKED]
+        assert [event.id for event in replay] == [event.id for event in first]
+        assert first[0].payload["execution_profile_selection"] == "inherit_parent"
+        assert first[0].payload["system_prompt_policy"] == "inherit_source"
+        assert "fork_request_sha256" not in first[0].payload
+        assert "selected_profile_fingerprint" not in first[0].payload
+        assert "source_profile_fingerprint" not in first[0].payload
+        child = await store.load("profile-fork-child")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        assert relationship.selection is ForkExecutionProfileSelection.INHERIT_PARENT
+        assert relationship.source_profile == expected
+        assert relationship.selected_profile == expected
+        assert relationship.decision is None
+        records = await store.query_events(EventQuery(session_id=child.id, limit=10))
+        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+        stored_payload = records[0].event.payload
+        assert stored_payload["fork_request_sha256"] == relationship.request_sha256
+        assert stored_payload["selected_profile_fingerprint"] == expected.fingerprint
+        assert stored_payload["source_profile_fingerprint"] == expected.fingerprint
+        if isinstance(store, SQLiteSessionStore):
+            assert (
+                await store.prune_events(
+                    before=datetime.now(UTC) + timedelta(seconds=1),
+                    session_id=child.id,
+                )
+                == 0
+            )
+            replay_after_pruning = await collect(app.fork_session(request))
+            assert [event.id for event in replay_after_pruning] == [event.id for event in first]
+        await store.delete_session(source.id)
+        surviving_child = await store.load(child.id)
+        assert surviving_child is not None
+        assert surviving_child.parent_session_id is None
+        assert session_fork_profile_relationship(surviving_child) == relationship
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "store_outcome",
+    [
+        "lost_acknowledgement",
+        "malformed_result",
+        "changed_session",
+        "oversized_events",
+    ],
+)
+def test_profiled_fork_reconciles_ambiguous_custom_store_results(
+    store_outcome: str,
+) -> None:
+    class AmbiguousForkStore(InMemorySessionStore):
+        async def create_profiled_fork(self, *args, **kwargs):
+            result = await super().create_profiled_fork(*args, **kwargs)
+            if store_outcome == "lost_acknowledgement":
+                raise ConnectionError("fork acknowledgement was lost")
+            if store_outcome == "malformed_result":
+                return object()
+            if store_outcome == "oversized_events":
+                return result.model_copy(
+                    update={"events": result.events * 3},
+                    deep=True,
+                )
+            return result.model_copy(
+                update={
+                    "session": result.session.model_copy(
+                        update={"status": SessionStatus.RUNNING},
+                        deep=True,
+                    )
+                },
+                deep=True,
+            )
+
+    async def scenario() -> None:
+        store = AmbiguousForkStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"ambiguous-profiled-fork-source-{store_outcome}",
+                messages=[],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        request = ForkSessionRequest(
+            source_session_id=source.id,
+            session_id=f"ambiguous-profiled-fork-child-{store_outcome}",
+        )
+
+        events = await collect(app.fork_session(request))
+        replayed = await collect(app.fork_session(request))
+
+        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        assert [event.id for event in replayed] == [event.id for event in events]
+        child = await store.load(request.session_id or "")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        records = await store.query_events(EventQuery(session_id=child.id, limit=10))
+        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+        assert records[0].event.id == relationship.fork_event_id
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "tampered_control",
+    [
+        "transcript_cursor",
+        "prompt_replacement",
+        "checkpoint_validation",
+        "checkpoint_result",
+        "transcript_validation",
+    ],
+)
+def test_profiled_fork_store_rejects_controls_that_conflict_with_relationship(
+    tampered_control: str,
+) -> None:
+    class TamperingForkStore(InMemorySessionStore):
+        async def create_profiled_fork(self, *args, **kwargs):
+            if tampered_control == "transcript_cursor":
+                kwargs["transcript_cursor"] = 0
+            elif tampered_control == "prompt_replacement":
+                kwargs["system_prompt_replacement"] = object()
+            elif tampered_control == "checkpoint_validation":
+                kwargs["checkpoint_transform"] = None
+            elif tampered_control == "checkpoint_result":
+                kwargs["checkpoint_transform"] = lambda _session, _checkpoint: None
+            else:
+                kwargs["transcript_validator"] = None
+            return await super().create_profiled_fork(*args, **kwargs)
+
+    async def scenario() -> None:
+        store = TamperingForkStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"tampered-fork-source-{tampered_control}",
+                messages=[],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        await store.checkpoint(source.id, {"retained": True})
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        child_id = f"tampered-fork-child-{tampered_control}"
+
+        with pytest.raises(ValueError):
+            await collect(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source.id,
+                        session_id=child_id,
+                    )
+                )
+            )
+
+        assert await store.load(child_id) is None
+        assert await store.load(source.id) == source
+        assert await store.load_checkpoint(source.id) == {"retained": True}
+        assert await store.query_events(EventQuery(session_id=child_id, limit=10)) == []
+
+    asyncio.run(scenario())
+
+
+def test_profiled_fork_store_child_cancellation_is_not_caller_cancellation() -> None:
+    class ChildCancelledForkStore(InMemorySessionStore):
+        async def create_profiled_fork(self, *args, **kwargs):
+            raise asyncio.CancelledError("store child cancelled itself")
+
+    async def scenario() -> None:
+        store = ChildCancelledForkStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="child-cancelled-profiled-fork-source",
+                messages=[],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        current_task = asyncio.current_task()
+        assert current_task is not None
+
+        with pytest.raises(RuntimeError, match="without caller cancellation"):
+            await collect(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source.id,
+                        session_id="child-cancelled-profiled-fork-child",
+                    )
+                )
+            )
+
+        assert current_task.cancelling() == 0
+        assert current_task.cancelled() is False
+        assert await store.load("child-cancelled-profiled-fork-child") is None
+
+    asyncio.run(scenario())
+
+
+def test_profiled_fork_cancellation_waits_for_dispatched_store_mutation() -> None:
+    class CommitThenBlockForkStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.committed = asyncio.Event()
+            self.release_acknowledgement = asyncio.Event()
+
+        async def create_profiled_fork(self, *args, **kwargs):
+            result = await super().create_profiled_fork(*args, **kwargs)
+            self.committed.set()
+            await self.release_acknowledgement.wait()
+            return result
+
+    async def scenario() -> None:
+        store = CommitThenBlockForkStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="cancelled-profiled-fork-source",
+                messages=[],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        request = ForkSessionRequest(
+            source_session_id=source.id,
+            session_id="cancelled-profiled-fork-child",
+        )
+        consumer = asyncio.create_task(
+            collect(app.fork_session(request)),
+            name="profiled-fork-cancellation-consumer",
+        )
+        await store.committed.wait()
+
+        consumer.cancel("stop waiting for the fork")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        assert consumer.cancelling() == 0
+        consumer.cancel("second cancellation while the store is settling")
+        await asyncio.sleep(0)
+        assert consumer.done() is False
+        assert consumer.cancelling() == 0
+        store.release_acknowledgement.set()
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await consumer
+        assert exc_info.value.args == ("stop waiting for the fork",)
+        assert consumer.cancelling() == 2
+        assert consumer.cancelled() is True
+        child = await store.load(request.session_id or "")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        records = await store.query_events(EventQuery(session_id=child.id, limit=10))
+        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+
+        replayed = await collect(app.fork_session(request))
+        assert [event.type for event in replayed] == [EventType.SESSION_FORKED]
+        assert records[0].event.id == relationship.fork_event_id
+
+    asyncio.run(scenario())
+
+
+def test_profiled_fork_supervisory_exit_waits_for_store_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CommitThenBlockForkStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.committed = asyncio.Event()
+            self.release_acknowledgement = asyncio.Event()
+            self.acknowledgement_returned = asyncio.Event()
+
+        async def create_profiled_fork(self, *args, **kwargs):
+            result = await super().create_profiled_fork(*args, **kwargs)
+            self.committed.set()
+            await self.release_acknowledgement.wait()
+            self.acknowledgement_returned.set()
+            return result
+
+    async def scenario() -> None:
+        store = CommitThenBlockForkStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="abandoned-profiled-fork-source",
+                messages=[],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        request = ForkSessionRequest(
+            source_session_id=source.id,
+            session_id="abandoned-profiled-fork-child",
+        )
+        original_wait = session_engine_module.await_shielded_task_outcome
+        supervisory_exit_delivered = False
+
+        async def abandon_once(task, **kwargs):
+            nonlocal supervisory_exit_delivered
+            if (
+                not supervisory_exit_delivered
+                and task.get_name() == "cayu-profiled-session-fork-publication"
+            ):
+                await store.committed.wait()
+                supervisory_exit_delivered = True
+                asyncio.get_running_loop().call_soon(store.release_acknowledgement.set)
+                raise GeneratorExit("abandon fork stream")
+            return await original_wait(task, **kwargs)
+
+        monkeypatch.setattr(
+            session_engine_module,
+            "await_shielded_task_outcome",
+            abandon_once,
+        )
+
+        with pytest.raises(GeneratorExit, match="abandon fork stream"):
+            await collect(app.fork_session(request))
+
+        assert supervisory_exit_delivered is True
+        assert store.acknowledgement_returned.is_set()
+        child = await store.load(request.session_id or "")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        records = await store.query_events(EventQuery(session_id=child.id, limit=10))
+        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+        assert records[0].event.id == relationship.fork_event_id
+
+        replayed = await collect(app.fork_session(request))
+        assert [event.type for event in replayed] == [EventType.SESSION_FORKED]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_fork_current_child_profile_requires_and_records_authorized_adoption(
+    store_kind: str,
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "fork-current-profile.sqlite")
+        )
+        source_provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("source complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(source_provider, default=True)
+        source_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RecordingExternalTool(description="Original tool")],
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="current-profile-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+        source = await store.load("current-profile-source")
+        assert source is not None
+        source_profile = execution_profile_from_session_metadata(source.metadata)
+
+        policy = RecordingAdoptionPolicy()
+        fork_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=policy,
+        )
+        fork_app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        fork_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RecordingExternalTool(description="Authorized replacement tool")],
+        )
+        request = ForkSessionRequest(
+            source_session_id=source.id,
+            session_id="current-profile-child",
+            execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+            profile_adoption=ExecutionProfileAdoptionIntent(
+                idempotency_key="fork-current-profile",
+                reason="Use the current child registration.",
+                requested_by=ResolutionActor(
+                    subject="operator",
+                    source=ResolutionActorSource.REQUEST,
+                ),
+            ),
+        )
+        events = await collect(fork_app.fork_session(request))
+
+        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        child = await store.load("current-profile-child")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        assert relationship.selection is ForkExecutionProfileSelection.CURRENT_CHILD
+        assert relationship.source_profile == source_profile
+        assert relationship.selected_profile != source_profile
+        assert relationship.decision is not None
+        assert relationship.decision.kind is ExecutionProfileDecisionKind.ADOPTED
+        assert relationship.decision.actor.subject == "operator"
+        assert len(policy.requests) == 1
+        parent_after_fork = await store.load(source.id)
+        assert parent_after_fork is not None
+        assert execution_profile_from_session_metadata(parent_after_fork.metadata) == source_profile
+        records = await store.query_events(EventQuery(session_id=child.id, limit=10))
+        assert [record.event.type for record in records] == [
+            EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+            EventType.SESSION_FORKED,
+        ]
+        if isinstance(store, SQLiteSessionStore):
+            assert (
+                await store.prune_events(
+                    before=datetime.now(UTC) + timedelta(seconds=1),
+                    session_id=child.id,
+                )
+                == 0
+            )
+
+        later_policy = RecordingAdoptionPolicy()
+        later_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=later_policy,
+        )
+        later_app.register_provider(
+            ScriptedModelProvider(
+                [
+                    ModelStreamEvent.text_delta("child adopted a later profile"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                name="fake",
+            ),
+            default=True,
+        )
+        later_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RecordingExternalTool(description="Later child-only tool")],
+        )
+        resumed = await collect(
+            later_app.resume(
+                ResumeRequest(
+                    session_id=child.id,
+                    messages=[Message.text("user", "adopt only on the child")],
+                    target=ModelTarget(provider_name="fake", model="later-child-model"),
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="later-child-profile",
+                        reason="Adopt a later profile on the child only.",
+                        requested_by=ResolutionActor(
+                            subject="operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+        assert any(event.type is EventType.SESSION_COMPLETED for event in resumed)
+        parent_after_child_adoption = await store.load(source.id)
+        adopted_child = await store.load(child.id)
+        assert parent_after_child_adoption is not None
+        assert adopted_child is not None
+        assert (
+            execution_profile_from_session_metadata(parent_after_child_adoption.metadata)
+            == source_profile
+        )
+        relationship_after_adoption = session_fork_profile_relationship(adopted_child)
+        assert relationship_after_adoption == relationship
+        assert execution_profile_from_session_metadata(adopted_child.metadata) != (
+            relationship.selected_profile
+        )
+        assert len(later_policy.requests) == 1
+        replay_after_child_adoption = await collect(fork_app.fork_session(request))
+        assert [event.id for event in replay_after_child_adoption] == [event.id for event in events]
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+
+    asyncio.run(scenario())
+
+
+def test_fork_current_child_profile_reviews_a_different_registered_provider() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(
+            ScriptedModelProvider(
+                [
+                    ModelStreamEvent.text_delta("source complete"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                name="source-provider",
+            ),
+            default=True,
+        )
+        source_app.register_agent(
+            AgentSpec(
+                name="source-agent",
+                model="source-model",
+                provider_name="source-provider",
+            )
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="source-agent",
+                    session_id="cross-provider-fork-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+        source = await store.load("cross-provider-fork-source")
+        assert source is not None
+
+        policy = RecordingAdoptionPolicy()
+        fork_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=policy,
+        )
+        fork_app.register_provider(
+            ScriptedModelProvider([], name="source-provider"),
+            default=True,
+        )
+        fork_app.register_provider(
+            ScriptedModelProvider([], name="child-provider"),
+        )
+        fork_app.register_agent(
+            AgentSpec(
+                name="source-agent",
+                model="source-model",
+                provider_name="source-provider",
+            )
+        )
+        fork_app.register_agent(
+            AgentSpec(
+                name="child-agent",
+                model="child-model",
+                provider_name="child-provider",
+            )
+        )
+        events = await collect(
+            fork_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="cross-provider-fork-child",
+                    agent_name="child-agent",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="cross-provider-fork",
+                        reason="Authorize the child provider target.",
+                        requested_by=ResolutionActor(
+                            subject="operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        child = await store.load("cross-provider-fork-child")
+        assert child is not None
+        assert child.provider_name == "child-provider"
+        assert child.model == "child-model"
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        assert relationship.child_provider_name == "child-provider"
+        assert relationship.decision is not None
+        assert len(policy.requests) == 1
+        assert policy.requests[0].source_provider_name == "source-provider"
+        assert policy.requests[0].target_provider_name == "child-provider"
+
+    asyncio.run(scenario())
+
+
+def test_generated_current_prompt_fork_replays_one_stable_descendant() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(
+            ScriptedModelProvider(
+                [
+                    ModelStreamEvent.text_delta("source complete"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                name="fake",
+            ),
+            default=True,
+        )
+        source_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="source prompt",
+            )
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="generated-current-prompt-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+
+        child_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=RecordingAdoptionPolicy(),
+        )
+        child_app.register_provider(
+            ScriptedModelProvider([], name="fake"),
+            default=True,
+        )
+        child_app.register_environment(
+            Environment(EnvironmentSpec(name="body")),
+            default=True,
+        )
+        child_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="child prompt",
+            )
+        )
+        request = ForkSessionRequest(
+            source_session_id="generated-current-prompt-source",
+            agent_name="assistant",
+            environment_name="body",
+            copy_checkpoint=False,
+            system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+            execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+            profile_adoption=ExecutionProfileAdoptionIntent(
+                idempotency_key="generated-current-prompt",
+                reason="Select the current child prompt.",
+                requested_by=ResolutionActor(
+                    subject="operator",
+                    source=ResolutionActorSource.REQUEST,
+                ),
+            ),
+        )
+
+        first, replay = await asyncio.gather(
+            collect(child_app.fork_session(request)),
+            collect(child_app.fork_session(request)),
+        )
+
+        assert [event.type for event in first] == [EventType.SESSION_FORKED]
+        assert [event.id for event in replay] == [event.id for event in first]
+        child_id = first[0].session_id
+        assert child_id is not None
+        children = (
+            await store.list_sessions(
+                SessionQuery(parent_session_id="generated-current-prompt-source", limit=10)
+            )
+        ).sessions
+        assert [child.id for child in children] == [child_id]
+        receipt = session_prompt_anatomy_transition(children[0])
+        assert receipt is not None
+        assert receipt.descendant_session_id == child_id
+
+    asyncio.run(scenario())
+
+
+def test_fork_profile_inheritance_rejects_environment_override() -> None:
+    with pytest.raises(ValueError, match="agent/model/environment overrides"):
+        ForkSessionRequest(
+            source_session_id="fork-environment-source",
+            session_id="fork-environment-child",
+            environment_name="production",
+        )
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_fork_current_child_profile_preserves_an_explicitly_empty_prompt(
+    store_kind: str,
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "fork-empty-current-prompt.sqlite")
+        )
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(
+            ScriptedModelProvider(
+                [
+                    ModelStreamEvent.text_delta("source complete"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                name="fake",
+            ),
+            default=True,
+        )
+        source_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="parent-only system prompt",
+            )
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="empty-prompt-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+
+        policy = RecordingAdoptionPolicy()
+        child_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=policy,
+        )
+        child_app.register_provider(
+            ScriptedModelProvider(
+                [
+                    ModelStreamEvent.text_delta("child complete"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                name="fake",
+            ),
+            default=True,
+        )
+        child_app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+        child_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect(
+            child_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="empty-prompt-source",
+                    session_id="empty-prompt-child",
+                    environment_name="body",
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="fork-empty-current-prompt",
+                        reason="Explicitly remove the parent prompt for the child.",
+                        requested_by=ResolutionActor(
+                            subject="operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        child = await store.load("empty-prompt-child")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        assert len(policy.requests) == 1
+        assert relationship.selected_profile == policy.requests[0].candidate_profile
+        assert relationship.source_profile.component(
+            ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+        ) != relationship.selected_profile.component(
+            ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+        )
+        transcript = await store.load_transcript(child.id)
+        assert all(message.role.value != "system" for message in transcript)
+
+        await store.delete_session("empty-prompt-source")
+        child = await store.load("empty-prompt-child")
+        assert child is not None
+        assert child.parent_session_id is None
+        assert session_prompt_anatomy_transition(child) is not None
+
+        resumed = await collect(
+            child_app.resume(
+                ResumeRequest(
+                    session_id=child.id,
+                    messages=[Message.text("user", "continue without a system prompt")],
+                )
+            )
+        )
+        assert any(event.type is EventType.SESSION_COMPLETED for event in resumed)
+        assert len(policy.requests) == 1
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+
+    asyncio.run(scenario())
+
+
+def test_fork_profile_relationship_uses_redacted_policy_decision_evidence(
+    caplog,
+    capsys,
+) -> None:
+    secret = "fork-policy-private-reason-canary"
+
+    class SecretReasonPolicy(ExecutionProfilePolicy):
+        @property
+        def identity(self) -> str:
+            return "test:fork-secret-reason-policy:v1"
+
+        async def decide(
+            self,
+            request: ExecutionProfilePolicyRequest,
+        ) -> ExecutionProfilePolicyResult:
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason=f"Approved with private policy material {secret}.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("source complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(source_provider, default=True)
+        source_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RecordingExternalTool(description="Original tool")],
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="secret-policy-fork-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+
+        fork_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=SecretReasonPolicy(),
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        fork_app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        fork_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RecordingExternalTool(description="Replacement tool")],
+        )
+        public_events = await collect(
+            fork_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="secret-policy-fork-source",
+                    session_id="secret-policy-fork-child",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="secret-policy-fork",
+                        reason="Adopt the reviewed child profile.",
+                        requested_by=ResolutionActor(
+                            subject="operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        child = await store.load("secret-policy-fork-child")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None and relationship.decision is not None
+        stored_events = await store.load_events(child.id)
+        assert "[REDACTED_SECRET]" in relationship.decision.policy_reason
+        assert secret not in repr(child.metadata)
+        assert secret not in repr(stored_events)
+        assert secret not in repr(public_events)
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always")
+        asyncio.run(scenario())
+
+    captured = capsys.readouterr()
+    assert secret not in caplog.text
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in str(item.message) for item in captured_warnings)
+
+
+def test_fork_profile_rejection_leaves_parent_and_child_store_unchanged() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("source complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(source_provider, default=True)
+        source_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RecordingExternalTool(description="Original tool")],
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="rejected-profile-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+        parent_before = await store.load("rejected-profile-source")
+        assert parent_before is not None
+
+        rejecting_app = CayuApp(session_store=store, enable_logging=False)
+        rejecting_app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        rejecting_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[RecordingExternalTool(description="Broader unapproved tool")],
+        )
+        with pytest.raises(ExecutionProfileAdoptionRejected):
+            await collect(
+                rejecting_app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=parent_before.id,
+                        session_id="rejected-profile-child",
+                        execution_profile_selection=(ForkExecutionProfileSelection.CURRENT_CHILD),
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="rejected-profile-fork",
+                            reason="Attempt an unapproved authority change.",
+                            requested_by=ResolutionActor(
+                                subject="operator",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        assert await store.load("rejected-profile-child") is None
+        assert await store.load(parent_before.id) == parent_before
+
+    asyncio.run(scenario())
+
+
+def test_fork_inheritance_preserves_unavailable_parent_profile_identity() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        unavailable = build_execution_profile_identity(
+            runtime_name="cayu",
+            runtime_version=None,
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            direct_tools=(),
+        )
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="unavailable-profile-source",
+                messages=[],
+            ),
+            identity=SessionIdentity(
+                provider_name="fake",
+                model="fake-model",
+                execution_profile=unavailable,
+            ),
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await collect(
+            app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="unavailable-profile-child",
+                )
+            )
+        )
+        child = await store.load("unavailable-profile-child")
+        assert child is not None
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        assert relationship.source_profile == unavailable
+        assert relationship.selected_profile == unavailable
+
+    asyncio.run(scenario())
+
+
+def test_fork_current_child_rejects_unavailable_identity_before_child_creation(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="unavailable-current-profile-source",
+                messages=[],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingAdoptionPolicy(),
+            enable_logging=False,
+        )
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: None)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Current-child profile selection has unavailable required components: runtime",
+        ):
+            await collect(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source.id,
+                        session_id="unavailable-current-profile-child",
+                        execution_profile_selection=(ForkExecutionProfileSelection.CURRENT_CHILD),
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="unavailable-current-profile",
+                            reason="Exercise unavailable child identity.",
+                            requested_by=ResolutionActor(
+                                subject="operator",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        assert await store.load("unavailable-current-profile-child") is None
+        assert await store.load(source.id) == source
+        assert await store.load_events(source.id) == []
+
+    asyncio.run(scenario())
+
+
+def test_partial_fork_cannot_drop_inherited_durable_system_projection() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("source complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="Durable parent instructions.",
+            )
+        )
+        await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="partial-profile-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+        parent_before = await store.load("partial-profile-source")
+        assert parent_before is not None
+
+        with pytest.raises(
+            ValueError,
+            match="must retain the complete durable system projection",
+        ):
+            await collect(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=parent_before.id,
+                        session_id="partial-profile-child-invalid",
+                        transcript_cursor=0,
+                        copy_checkpoint=False,
+                    )
+                )
+            )
+
+        assert await store.load("partial-profile-child-invalid") is None
+        assert await store.load(parent_before.id) == parent_before
+
+        await collect(
+            app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=parent_before.id,
+                    session_id="partial-profile-child-valid",
+                    transcript_cursor=1,
+                    copy_checkpoint=False,
+                )
+            )
+        )
+        child = await store.load("partial-profile-child-valid")
+        assert child is not None
+        parent_profile = execution_profile_from_session_metadata(parent_before.metadata)
+        assert execution_profile_from_session_metadata(child.metadata) == parent_profile
+        transcript = await store.load_transcript(child.id)
+        assert len(transcript) == 1
+        assert transcript[0].role.value == "system"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
+    store_kind: str,
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "fork-active-parent-profile.sqlite")
+        )
+        tool = RecordingExternalTool(description="Active invocation tool")
+        baseline_identity = profiled_session_identity(
+            provider_name="fake",
+            model="fake-model",
+        )
+        active_identity = profiled_session_identity(
+            provider_name="fake",
+            model="fake-model",
+            direct_tools=(
+                {
+                    "name": tool.spec.name,
+                    "description": tool.spec.description,
+                    "schema": tool.spec.input_schema,
+                    "parallel_safe": tool.spec.parallel_safe,
+                    "effect": tool.spec.effect.value,
+                },
+            ),
+        )
+        baseline = baseline_identity.execution_profile
+        active = active_identity.execution_profile
+        assert baseline is not None
+        assert active is not None
+        assert baseline != active
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"active-parent-source-{store_kind}",
+                messages=[],
+            ),
+            identity=baseline_identity,
+        )
+        source = await store.transition_status(
+            source.id,
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+        )
+        checkpoint = checkpoint_with_active_invocation_execution_profile(
+            {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION},
+            session_id=source.id,
+            interaction_id=f"active-parent-interaction-{store_kind}",
+            run_epoch=source.run_epoch,
+            profile=active,
+        )
+        await store.checkpoint(source.id, checkpoint)
+        source = await store.transition_status(
+            source.id,
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.COMPLETED,
+        )
+
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("child resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+        )
+        child_id = f"active-parent-child-{store_kind}"
+        await collect(
+            app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id=child_id,
+                )
+            )
+        )
+
+        unchanged_parent = await store.load(source.id)
+        child = await store.load(child_id)
+        assert unchanged_parent is not None
+        assert child is not None
+        assert execution_profile_from_session_metadata(unchanged_parent.metadata) == baseline
+        assert execution_profile_from_session_metadata(child.metadata) == active
+        relationship = session_fork_profile_relationship(child)
+        assert relationship is not None
+        assert relationship.source_profile_source.value == "active_invocation"
+        assert relationship.source_profile == active
+        assert relationship.selected_profile == active
+        assert relationship.source_active_interaction_id == (
+            f"active-parent-interaction-{store_kind}"
+        )
+
+        resumed = await collect(
+            app.resume(
+                ResumeRequest(
+                    session_id=child_id,
+                    messages=[Message.text("user", "continue under the child baseline")],
+                )
+            )
+        )
+        assert any(event.type is EventType.SESSION_COMPLETED for event in resumed)
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+
+    asyncio.run(scenario())
+
+
+def test_fork_rejects_missing_parent_profile_before_child_creation() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="missing-parent-profile-source",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        parent_before = await store.load(source.id)
+
+        with pytest.raises(ValueError, match="durable execution-profile identity"):
+            await collect(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source.id,
+                        session_id="missing-parent-profile-child",
+                    )
+                )
+            )
+
+        assert await store.load("missing-parent-profile-child") is None
+        assert await store.load(source.id) == parent_before
+        assert await store.load_events(source.id) == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_profiled_fork_resume_freezes_profile_through_approval_continuation(
     store_kind: str,
     tmp_path,
 ) -> None:
@@ -521,7 +1887,7 @@ def test_unprofiled_fork_resume_freezes_profile_through_approval_continuation(
         )
         child = await store.load(child_id)
         assert child is not None
-        assert EXECUTION_PROFILE_METADATA_KEY not in child.metadata
+        assert EXECUTION_PROFILE_METADATA_KEY in child.metadata
         paused = await collect(
             app.resume(
                 ResumeRequest(

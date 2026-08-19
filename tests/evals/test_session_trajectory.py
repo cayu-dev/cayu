@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core.postgres_contention_support import drop_cayu_tables
 
 from cayu import (
@@ -93,7 +94,10 @@ async def _create_running_session(
             parent_session_id=parent_session_id,
             messages=[user_message],
         ),
-        identity=SessionIdentity(provider_name="fake", model=model),
+        identity=profiled_session_identity(
+            provider_name="fake",
+            model=model,
+        ),
         interaction_started_event=Event(
             id=f"{session_id}-interaction-started",
             type=EventType.INTERACTION_STARTED,

@@ -2,21 +2,36 @@
 
 from __future__ import annotations
 
+import traceback as traceback_module
+from collections.abc import Mapping
+from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
 
+from cayu._validation import canonical_durable_json_bytes
 from cayu.core.messages import Message
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
     redact_untrusted_message_for_boundary,
 )
 from cayu.runtime.approvals import ResolutionActor
-from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
-from cayu.runtime.public_authority import public_authority_alias_is_reserved
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileIdentity,
+)
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    public_authority_alias_is_reserved,
+)
 from cayu.runtime.sessions import (
+    FORK_EXECUTION_PROFILE_METADATA_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
+    ForkExecutionProfileSource,
     ForkSessionRequest,
     InterruptSessionRequest,
     ResumeRequest,
@@ -30,6 +45,7 @@ from cayu.runtime.sessions import (
     copy_resume_request,
     copy_run_request,
     copy_session,
+    effective_fork_source_execution_profile,
     run_request_authority_is_runtime_generated,
     strip_runtime_session_create_claim_before_redaction,
 )
@@ -48,6 +64,57 @@ class ForkSourceNotFoundError(KeyError):
 
 class ForkActiveModelStageError(ValueError):
     """Internal active-stage signal that never embeds private authority."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedForkSessionRequest:
+    """A redacted fork request plus its complete pre-redaction replay identity."""
+
+    request: ForkSessionRequest
+    request_sha256: str
+    accepted_request_sha256s: tuple[str, ...]
+
+
+def prepare_fork_source_execution_profile(
+    source_session: Session,
+    source_checkpoint: Mapping[str, Any] | None,
+) -> tuple[
+    ForkExecutionProfileSource,
+    ExecutionProfileIdentity,
+    ActiveInvocationExecutionProfile | None,
+]:
+    """Resolve profile authority without retaining a rejected checkpoint."""
+
+    resolution: (
+        tuple[
+            ForkExecutionProfileSource,
+            ExecutionProfileIdentity,
+            ActiveInvocationExecutionProfile | None,
+        ]
+        | None
+    ) = None
+    failure: ForkAuthorityError | None = None
+    try:
+        resolution = effective_fork_source_execution_profile(
+            source_session,
+            source_checkpoint,
+        )
+    except Exception as exc:
+        # Durable checkpoints can contain workload-private state outside the
+        # profile record. Strip every unwound parser frame before replacing the
+        # failure so traceback-local capture cannot recover that state.
+        if exc.__traceback__ is not None:
+            traceback_module.clear_frames(exc.__traceback__)
+        failure = ForkAuthorityError(
+            "Source session has no valid durable execution-profile identity."
+        )
+    finally:
+        source_checkpoint = None
+    if failure is not None:
+        raise failure from None
+    if resolution is None:  # pragma: no cover - defensive totality guard
+        raise AssertionError("Fork source profile resolution returned no result.")
+    return resolution
 
 
 def prepare_run_request(
@@ -314,6 +381,26 @@ def prepare_fork_session_request(
                 field_name=field_name,
                 redactor=redactor,
             )
+        profile_adoption = request.profile_adoption
+        if profile_adoption is not None:
+            require_secret_free_session_authority(
+                profile_adoption.idempotency_key,
+                field_name="profile_adoption.idempotency_key",
+                redactor=redactor,
+                authority_kind="durable execution-profile adoption authority",
+            )
+            requested_by = redact_resolution_actor(
+                profile_adoption.requested_by,
+                field_name="profile_adoption.requested_by",
+                redactor=redactor,
+            )
+            if requested_by is None:
+                raise AssertionError("Execution-profile adoption lost its required actor.")
+            profile_adoption = ExecutionProfileAdoptionIntent(
+                idempotency_key=profile_adoption.idempotency_key,
+                reason=redactor.redact_text(profile_adoption.reason),
+                requested_by=requested_by,
+            )
         _require_secret_free_fork_policy_metadata(request.metadata, redactor=redactor)
         return request.model_copy(
             update={
@@ -321,13 +408,65 @@ def prepare_fork_session_request(
                     request.metadata,
                     field_name="metadata",
                     redactor=redactor,
-                )
+                ),
+                "profile_adoption": profile_adoption,
             },
         )
     except ForkAuthorityError:
         raise
     except ValueError as exc:
         raise ForkAuthorityError(str(exc)) from None
+
+
+def prepare_fork_session_request_with_identity(
+    request: ForkSessionRequest,
+    *,
+    redactor: SecretRedactor,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+    store_resolved_source_session_id: str | None = None,
+) -> PreparedForkSessionRequest:
+    """Prepare a fork while binding replay to the complete raw request.
+
+    Descriptive fork metadata and adoption attribution may legitimately contain
+    values that the public durable projection redacts.  Their exact replay
+    identity is therefore derived before redaction.  When secret redaction is
+    configured, the application's durable authority keyring supplies a keyed
+    representation so the digest cannot become an offline secret oracle.
+    Retained keyring entries keep retries valid across key rotation.
+    """
+
+    raw_request: ForkSessionRequest | None = None
+    material = b""
+    aliases: tuple[str, ...] = ()
+    try:
+        raw_request = copy_fork_session_request(request)
+        material = canonical_durable_json_bytes(
+            raw_request.model_dump(mode="json", warnings=False),
+            "fork_session_request",
+        )
+        if public_authority_alias_codec is None:
+            digests = (sha256(material).hexdigest(),)
+        else:
+            aliases = public_authority_alias_codec.aliases(
+                material.decode("utf-8"),
+                field_name="fork_request_digest",
+            )
+            digests = tuple(sha256(alias.encode("ascii")).hexdigest() for alias in aliases)
+        prepared = prepare_fork_session_request(
+            raw_request,
+            redactor=redactor,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+        )
+        return PreparedForkSessionRequest(
+            request=prepared,
+            request_sha256=digests[0],
+            accepted_request_sha256s=digests,
+        )
+    finally:
+        del request
+        raw_request = None
+        material = b""
+        aliases = ()
 
 
 def _require_secret_free_fork_policy_metadata(
@@ -348,6 +487,18 @@ def _require_secret_free_fork_policy_metadata(
         raise ForkAuthorityError(
             f"metadata[{PROMPT_ANATOMY_TRANSITION_METADATA_KEY!r}] is runtime-owned "
             "prompt-transition authority."
+        ) from None
+    if FORK_EXECUTION_PROFILE_METADATA_KEY in metadata:
+        metadata.clear()
+        raise ForkAuthorityError(
+            f"metadata[{FORK_EXECUTION_PROFILE_METADATA_KEY!r}] is runtime-owned "
+            "fork-profile authority."
+        ) from None
+    if EXECUTION_PROFILE_METADATA_KEY in metadata:
+        metadata.clear()
+        raise ForkAuthorityError(
+            f"metadata[{EXECUTION_PROFILE_METADATA_KEY!r}] is runtime-owned "
+            "execution-profile authority."
         ) from None
     try:
         labels = taint_labels_from_metadata(metadata)
