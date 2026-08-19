@@ -241,6 +241,7 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+    _durable_subagent_parent_delete_block_reason,
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
     _initial_transcript_pending_checkpoint,
@@ -6991,6 +6992,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
+    supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -7661,6 +7663,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             ),
                             session.updated_at,
                         )
+                    elif checkpoint_transform is not None:
+                        transformed = checkpoint_transform(session.model_copy(deep=True), None)
+                        if transformed is not None:
+                            await self._upsert_checkpoint(
+                                cur,
+                                session.id,
+                                copy_durable_json_object(transformed, "checkpoint"),
+                                session.updated_at,
+                            )
                 await conn.commit()
             except UniqueViolation as exc:
                 await conn.rollback()
@@ -8019,6 +8030,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise ValueError(
                             f"Cannot delete a session while it is {session.status}; "
                             f"interrupt it first: {session_id}"
+                        )
+                    await cur.execute(
+                        "SELECT id FROM cayu_sessions "
+                        "WHERE parent_session_id = %s "
+                        "AND metadata #>> '{subagent,mode}' = %s "
+                        'ORDER BY id COLLATE "C" LIMIT 1',
+                        (session_id, "durable"),
+                    )
+                    durable_child = await cur.fetchone()
+                    if durable_child is not None:
+                        raise ValueError(
+                            _durable_subagent_parent_delete_block_reason(durable_child[0])
                         )
                     checkpoint = await self._load_checkpoint(cur, session_id)
                     deletion_now = datetime.now(UTC)

@@ -14,6 +14,7 @@ durable lifecycle-event bindings.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -33,6 +34,11 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _transcript as transcript_support
+from cayu.runtime._durable_subagents import (
+    DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY,
+    DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
+    checkpoint_with_compacted_durable_subagent_submissions,
+)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_round_recovery import (
     PENDING_TOOL_ROUND_CHECKPOINT_KEY,
@@ -514,6 +520,11 @@ def _build_tool_round_publication_request(
         durable_events=durable_events,
     )
     checkpoint = checkpoint_without_pending_tool_round(copied_source_checkpoint)
+    checkpoint = checkpoint_with_compacted_durable_subagent_submissions(
+        checkpoint,
+        tool_round_id=copied_pending_round.tool_round_id,
+        committed_handoffs=_committed_durable_subagent_handoffs(evidence),
+    )
     mutation = runtime_publication_checkpoint_mutation(
         copied_source_checkpoint,
         checkpoint,
@@ -523,14 +534,22 @@ def _build_tool_round_publication_request(
         for operation in mutation.operations
         if operation.key == PENDING_TOOL_ROUND_CHECKPOINT_KEY
     ]
+    allowed_compaction_keys = {
+        DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
+        DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY,
+    }
+    unexpected_operations = [
+        operation
+        for operation in mutation.operations
+        if operation.key != PENDING_TOOL_ROUND_CHECKPOINT_KEY
+        and operation.key not in allowed_compaction_keys
+    ]
     if (
-        len(mutation.operations) != 1
-        or len(marker_operations) != 1
+        len(marker_operations) != 1
         or marker_operations[0].action != "delete"
+        or unexpected_operations
     ):
-        raise AssertionError(
-            "Tool-round publication must contain only the exact pending-marker deletion."
-        )
+        raise AssertionError("Tool-round publication contains an unexpected checkpoint mutation.")
 
     marker = copied_source_checkpoint[PENDING_TOOL_ROUND_CHECKPOINT_KEY]
     pending_round_digest = runtime_publication_checkpoint_value_digest(marker)
@@ -591,6 +610,34 @@ def _build_tool_round_publication_request(
         extended_request=copied_extended_request,
     )
     return copied_extended_request, evidence
+
+
+def _committed_durable_subagent_handoffs(
+    evidence: ToolRoundPublicationEvidence,
+) -> dict[str, tuple[str, str]]:
+    """Return exact child/task pairs with positive durable handoff evidence."""
+
+    committed: dict[str, tuple[str, str]] = {}
+    for outcome in evidence.outcomes:
+        structured = outcome.result.structured
+        if not isinstance(structured, Mapping) or structured.get("mode") != "durable":
+            continue
+        child_session_id = structured.get("child_session_id")
+        queue_task_id = structured.get("queue_task_id")
+        if (
+            type(child_session_id) is str
+            and type(queue_task_id) is str
+            and (
+                structured.get("status") == "queued"
+                or (
+                    structured.get("recovered") is True
+                    and structured.get("recovery_reason")
+                    == "pending_tool_round_reattached_subagent"
+                )
+            )
+        ):
+            committed[outcome.call.id] = (child_session_id, queue_task_id)
+    return committed
 
 
 def _validate_lifecycle_event_identity(

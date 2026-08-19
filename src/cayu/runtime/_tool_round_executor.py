@@ -62,6 +62,7 @@ from cayu.core.tools import (
     ToolContext,
     ToolEffect,
     ToolResult,
+    _bind_runtime_tool_invocation_authority,
     _bound_policy_denial_result,
     _bound_policy_denial_text,
 )
@@ -2280,6 +2281,21 @@ class ToolRoundExecutor:
             workspace=raw_workspace,
             artifact_store=raw_artifact_store,
         )
+        if execution_profile is not None:
+            _bind_runtime_tool_invocation_authority(
+                tool_context,
+                parent_task_id=task_id,
+                parent_run_epoch=session.run_epoch,
+                model_step_id=tool_round_identity.model_step_id,
+                model_attempt_id=tool_round_identity.model_attempt_id,
+                tool_round_id=tool_round_identity.tool_round_id,
+                tool_call_id=effective_tool_call.id,
+                tool_name=effective_tool_call.name,
+                idempotency_key=idempotency_key,
+                effective_arguments=effective_tool_call.arguments,
+                execution_profile_fingerprint=execution_profile.fingerprint,
+                secret_publication_sealer=invocation_secret_scope.seal_for_publication,
+            )
         workspace_window_id: str | None = None
         before_workspace_observation: WorkspaceRevisionObservation | None = None
         workspace_lifecycle: WorkspaceObservationLifecycle | None = None

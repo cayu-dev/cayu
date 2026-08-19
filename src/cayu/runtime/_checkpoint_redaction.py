@@ -281,10 +281,56 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "valid",
     "excerpt",
 }
+_DURABLE_SUBAGENT_ROOTS = frozenset(
+    {"durable_subagent_submission_seeds", "durable_subagent_submissions"}
+)
+_DURABLE_SUBAGENT_STRUCTURE_KEYS = frozenset(
+    {
+        "agent_alias",
+        "authority",
+        "causal_budget_id",
+        "child_execution_profile",
+        "child_model",
+        "child_provider_name",
+        "child_session_id",
+        "content",
+        "dispatch_id",
+        "effective_arguments",
+        "failure_code",
+        "idempotency_key",
+        "interaction_started_event_id",
+        "invocation_origin",
+        "labels",
+        "messages",
+        "parent_run_epoch",
+        "parent_session_id",
+        "parent_task_id",
+        "outcome",
+        "queue_task_id",
+        "queue_task_type",
+        "request",
+        "spawn_fingerprint",
+        "task_id",
+        "task_worker_id",
+        "text",
+    }
+)
+_DURABLE_SUBAGENT_SHA256_STRING_FIELDS = frozenset(
+    {
+        "effective_arguments_sha256",
+        "parent_execution_profile_fingerprint",
+        "parent_session_instance_fingerprint",
+        "request_sha256",
+        "receipt_sha256",
+        "seed_sha256",
+        "submission_sha256",
+    }
+)
 _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
     {
         "arguments",
         "dimensions",
+        "effective_arguments",
         "environment_factory_allocation_owner",
         "environment_factory_reconnect",
         "input_schema",
@@ -302,7 +348,14 @@ _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
 # record. Its dynamic key is untrusted, but the record below it resumes the
 # runtime schema. Other dynamic maps, notably environment reconnect metadata,
 # contain arbitrary extension data and must remain untrusted at every depth.
-_DURABLE_SINGLE_LEVEL_TYPED_MAPS = frozenset({"records", "workspace_observations"})
+_DURABLE_SINGLE_LEVEL_TYPED_MAPS = frozenset(
+    {
+        "durable_subagent_submission_seeds",
+        "durable_subagent_submissions",
+        "records",
+        "workspace_observations",
+    }
+)
 _QUARANTINED_ASSISTANT_MESSAGE_KEYS = frozenset({"role", "content"})
 _QUARANTINED_ASSISTANT_MESSAGE_PART_KEYS = frozenset(
     {
@@ -327,6 +380,8 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         "context_compaction",
+        "durable_subagent_submission_seeds",
+        "durable_subagent_submissions",
         "environment_factory_allocation_owner",
         "environment_factory_reconnect",
         "incomplete_session_recovery_claim",
@@ -445,7 +500,9 @@ def durable_value_contains_secret(
             return False
         if (
             path
-            and path[-1] in _DURABLE_SHA256_STRING_FIELDS
+            and (
+                path[-1] in _DURABLE_SHA256_STRING_FIELDS or _is_durable_subagent_sha256_path(path)
+            )
             and _path_has_typed_schema(path[:-1])
             and len(value) == 64
             and all(character in "0123456789abcdef" for character in value)
@@ -472,6 +529,7 @@ def durable_value_contains_secret(
             structural_key = (
                 (
                     key in (_DURABLE_ROOT_STRUCTURE_KEYS if not path else _DURABLE_STRUCTURE_KEYS)
+                    or _is_durable_subagent_structural_key(path, key)
                     or _is_quarantined_assistant_message_structural_key(path, key)
                     or _is_staged_terminal_event_payload(path)
                 )
@@ -542,6 +600,8 @@ def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
     if path and path[0] not in _DURABLE_ROOT_STRUCTURE_KEYS:
         return False
     for index, part in enumerate(path):
+        if index == 0 and part in _DURABLE_SUBAGENT_ROOTS:
+            continue
         if (
             part in _DURABLE_UNTRUSTED_CONTAINERS
             and not (part == "payload" and _is_staged_terminal_event_payload(path[: index + 1]))
@@ -552,12 +612,32 @@ def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
             return False
         if part in _DURABLE_STRUCTURE_KEYS:
             continue
+        if _is_durable_subagent_structural_key(path[:index], part):
+            continue
         if _is_quarantined_assistant_message_structural_key(path[:index], part):
             continue
         if index > 0 and path[index - 1] in _DURABLE_SINGLE_LEVEL_TYPED_MAPS:
             continue
         return False
     return True
+
+
+def _is_durable_subagent_structural_key(path: tuple[str, ...], key: str) -> bool:
+    return (
+        bool(path)
+        and path[0] in _DURABLE_SUBAGENT_ROOTS
+        and (
+            key in _DURABLE_SUBAGENT_STRUCTURE_KEYS or key in _DURABLE_SUBAGENT_SHA256_STRING_FIELDS
+        )
+    )
+
+
+def _is_durable_subagent_sha256_path(path: tuple[str, ...]) -> bool:
+    return (
+        len(path) >= 3
+        and path[0] in _DURABLE_SUBAGENT_ROOTS
+        and path[-1] in _DURABLE_SUBAGENT_SHA256_STRING_FIELDS
+    )
 
 
 def _is_staged_terminal_event_payload(path: tuple[str, ...]) -> bool:

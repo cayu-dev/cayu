@@ -170,6 +170,7 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+    _durable_subagent_parent_delete_block_reason,
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
     _initial_transcript_pending_checkpoint,
@@ -1027,6 +1028,7 @@ class SQLiteSessionStore(SessionStore):
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
+    supports_pending_session_initial_checkpoint: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1743,6 +1745,25 @@ class SQLiteSessionStore(SessionStore):
                                 session.updated_at,
                             ),
                         )
+                    elif checkpoint_transform is not None:
+                        transformed = checkpoint_transform(session.model_copy(deep=True), None)
+                        if transformed is not None:
+                            self._connection.execute(
+                                """
+                                INSERT INTO cayu_checkpoints (
+                                    session_id, state_json, updated_at,
+                                    pending_action_source_bytes,
+                                    pending_action_tool_call_count,
+                                    pending_action_flags,
+                                    pending_action_metrics_ready
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                sqlite_support.checkpoint_row_values(
+                                    session.id,
+                                    copy_durable_json_object(transformed, "checkpoint"),
+                                    session.updated_at,
+                                ),
+                            )
             except sqlite3.IntegrityError as exc:
                 if self._session_exists_unlocked(session.id):
                     raise ValueError(f"Session already exists: {session.id}") from exc
@@ -2109,6 +2130,17 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(
                         f"Cannot delete a session while it is {session.status}; "
                         f"interrupt it first: {session_id}"
+                    )
+                durable_child = self._connection.execute(
+                    "SELECT id FROM cayu_sessions "
+                    "WHERE parent_session_id = ? "
+                    "AND json_extract(metadata_json, '$.subagent.mode') = ? "
+                    "ORDER BY id LIMIT 1",
+                    (session_id, "durable"),
+                ).fetchone()
+                if durable_child is not None:
+                    raise ValueError(
+                        _durable_subagent_parent_delete_block_reason(durable_child["id"])
                     )
                 checkpoint = self._load_checkpoint_unlocked(session_id)
                 deletion_now = datetime.now(UTC)

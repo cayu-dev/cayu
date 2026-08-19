@@ -26862,6 +26862,7 @@ async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
         registered_agent=app._get_registered_agent("parent"),
         tool_round_id=tool_round_id,
         outcomes=[interrupted],
+        source_checkpoint=await store.load_checkpoint(parent.id),
     )
     return outcomes[0].result
 
@@ -26889,7 +26890,29 @@ def test_interrupt_close_ignores_child_from_a_different_round():
     assert "child_session_id" not in result.structured
 
 
-async def _close_interrupted_spawn_and_collect_events(child_status):
+class _CountSplitInterruptionCheckpointReadsStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._children_queried = False
+        self.checkpoint_reads_after_child_query = 0
+
+    async def list_sessions(self, query=None):
+        page = await super().list_sessions(query)
+        if query is not None and query.parent_session_id is not None:
+            self._children_queried = True
+        return page
+
+    async def load_checkpoint(self, session_id):
+        if self._children_queried:
+            self.checkpoint_reads_after_child_query += 1
+        return await super().load_checkpoint(session_id)
+
+
+async def _close_interrupted_spawn_and_collect_events(
+    child_status,
+    *,
+    store: InMemorySessionStore | None = None,
+):
     """Drive coordinator round closure for an interrupted `subagent` spawn whose background child is
     in `child_status`, returning the emitted events. Exercises the event-type derivation on that path."""
     from cayu.runtime import _runtime_records as runtime_records
@@ -26897,7 +26920,7 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
     from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
 
-    store = InMemorySessionStore()
+    store = InMemorySessionStore() if store is None else store
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(FakeProvider([]), default=True)
     subagent_tool = SubagentTool(
@@ -27029,6 +27052,18 @@ def test_interrupt_close_emits_failed_event_for_reattached_interrupted_child():
     assert event.type == EventType.TOOL_CALL_FAILED
     assert event.payload["result"]["is_error"] is True
     assert event.payload["result"]["structured"]["child_session_id"] == "child"
+
+
+def test_interrupt_close_reuses_validated_checkpoint_for_subagent_reattachment():
+    store = _CountSplitInterruptionCheckpointReadsStore()
+
+    spawn_events = asyncio.run(
+        _close_interrupted_spawn_and_collect_events(SessionStatus.INTERRUPTED, store=store)
+    )
+
+    assert len(spawn_events) == 1
+    assert spawn_events[0].payload["result"]["structured"]["child_session_id"] == "child"
+    assert store.checkpoint_reads_after_child_query == 1
 
 
 def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id():

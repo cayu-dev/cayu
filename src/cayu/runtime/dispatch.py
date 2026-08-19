@@ -25,6 +25,13 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._diagnostics import ExceptionDiagnostic
+from cayu.runtime._durable_subagents import (
+    DurableSubagentSubmissionIntent,
+    copy_durable_subagent_submission_intent,
+    durable_dispatch_queue_task_id,
+    is_durable_subagent_authority_rejected,
+    is_durable_subagent_worker_incompatible,
+)
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.execution_profiles import (
@@ -186,7 +193,36 @@ class DispatchRuntime(Protocol):
         """Run dispatched work inline and stream runtime events."""
 
 
-class _DurableDispatchRuntime(DispatchRuntime, Protocol):
+class _SessionInvocationRuntime(Protocol):
+    """Narrow source of authenticated session invocation provenance."""
+
+    async def session_invocation_for_dispatch(
+        self,
+        session_id: str,
+    ) -> SessionInvocationBinding:
+        """Load trusted immutable provenance for a durable dispatch target."""
+
+
+class _PreparedSubagentSubmissionRuntime(_SessionInvocationRuntime, Protocol):
+    """Session-side operations needed to settle prepared queue publication."""
+
+    async def _queued_dispatch_settlement_state(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> _QueuedDispatchSettlement:
+        """Classify exact session-side evidence before task terminalization."""
+
+    async def _acknowledge_queued_dispatch(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+        *,
+        dispatch_status: DispatchStatus,
+        receipt: QueuedDispatchTerminalReceipt | None = None,
+    ) -> None:
+        """Release terminal-evidence retention after queue terminalization."""
+
+
+class _DurableDispatchRuntime(DispatchRuntime, _SessionInvocationRuntime, Protocol):
     """Runtime capabilities required before dispatch data becomes durable."""
 
     def redact_dispatch_request(self, request: DispatchRequest) -> DispatchRequest:
@@ -203,12 +239,6 @@ class _DurableDispatchRuntime(DispatchRuntime, Protocol):
         nonportable_message: str,
     ) -> ExceptionDiagnostic:
         """Snapshot an exception without exposing workload secrets."""
-
-    async def session_invocation_for_dispatch(
-        self,
-        session_id: str,
-    ) -> SessionInvocationBinding:
-        """Load trusted immutable provenance for a durable dispatch target."""
 
 
 _QUEUED_DISPATCH_RECORD_TYPE = "cayu.queued-dispatch"
@@ -248,6 +278,10 @@ class _QueuedDispatchAuthorityRejected(RuntimeError):
     """Permanent rejection proven by the runtime-owned dispatch boundary."""
 
 
+class _PreparedSubagentAlreadyAdmitted(RuntimeError):
+    """Retryable evidence that a prior worker crossed child admission."""
+
+
 class _QueuedDispatchEnvelope(BaseModel):
     """Runtime-owned authority persisted before queued work becomes claimable."""
 
@@ -263,6 +297,8 @@ class _QueuedDispatchEnvelope(BaseModel):
     request: DispatchRequest
     source_profile: ExecutionProfileIdentity
     required_profile: ExecutionProfileIdentity
+    operation_kind: Literal["resume", "prepared_subagent"] = "resume"
+    prepared_subagent: DurableSubagentSubmissionIntent | None = None
 
     @field_validator("queue_task_id", "terminal_event_id")
     @classmethod
@@ -294,8 +330,35 @@ class _QueuedDispatchEnvelope(BaseModel):
             value = value.model_dump(mode="json")
         return ExecutionProfileIdentity.model_validate(value)
 
+    @field_validator("prepared_subagent", mode="before")
+    @classmethod
+    def copy_prepared_subagent(
+        cls,
+        value: object,
+    ) -> DurableSubagentSubmissionIntent | None:
+        if value is None:
+            return None
+        if type(value) is DurableSubagentSubmissionIntent:
+            return copy_durable_subagent_submission_intent(value)
+        return DurableSubagentSubmissionIntent.model_validate(value)
+
     @model_validator(mode="after")
     def validate_authority_tuple(self) -> _QueuedDispatchEnvelope:
+        if self.operation_kind == "resume":
+            if self.prepared_subagent is not None:
+                raise ValueError("Resume dispatch cannot carry prepared-subagent authority.")
+        else:
+            intent = self.prepared_subagent
+            if intent is None:
+                raise ValueError("Prepared-subagent dispatch requires submission authority.")
+            if (
+                self.request != _prepared_subagent_dispatch_request(intent)
+                or self.source_profile != intent.child_execution_profile
+                or self.required_profile != intent.child_execution_profile
+            ):
+                raise ValueError(
+                    "Prepared-subagent dispatch conflicts with its submission authority."
+                )
         request_sha256 = _queued_dispatch_request_sha256(self.request)
         if self.request_sha256 != request_sha256:
             raise ValueError("Queued dispatch request digest does not match its request.")
@@ -400,6 +463,7 @@ class InlineDispatcher(Dispatcher):
 
 
 DEFAULT_DISPATCH_TASK_TYPE = "cayu.dispatch"
+PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX = ".prepared-subagent.v1"
 DISPATCH_CONFLICT_RECOVERY_REASON = "dispatch_conflict_worker_crash_recovery"
 
 _STALLED_RECOVERED_ACTIONS = {
@@ -452,6 +516,13 @@ class TaskStoreDispatcher(Dispatcher):
             )
         self._tasks = task_store
         self._task_type = require_clean_nonblank(task_type, "task_type")
+        if self._task_type.endswith(PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX):
+            raise ValueError("task_type uses the reserved prepared-subagent task-type suffix.")
+        self._prepared_subagent_task_type = require_clean_nonblank(
+            self._task_type + PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
+            "prepared_subagent_task_type",
+        )
+        self._prefer_prepared_subagent_claim = True
         self._lease_seconds = lease_seconds
         # Horizon after which a conflicting live-status session is considered stranded
         # by a crashed worker (defaults to the task lease: a healthy run whose lease
@@ -466,6 +537,36 @@ class TaskStoreDispatcher(Dispatcher):
         self._terminal_receipt_reconciliation_task: asyncio.Task[bool] | None = None
         self._terminal_receipt_reconciliation_generation = 0
         self._startup_terminal_receipt_reconciliation_pending = True
+
+    @property
+    def task_type(self) -> str:
+        """Return the durable queue namespace used by this dispatcher."""
+
+        return self._task_type
+
+    @property
+    def prepared_subagent_task_type(self) -> str:
+        """Return the versioned queue namespace reserved for prepared children."""
+
+        return self._prepared_subagent_task_type
+
+    @property
+    def task_store(self) -> TaskStore:
+        """Return the exact task store that owns this dispatcher's leases."""
+
+        return self._tasks
+
+    def _task_type_for_envelope(self, envelope: _QueuedDispatchEnvelope) -> str:
+        """Bind each envelope protocol to the only namespace allowed to carry it."""
+
+        if type(envelope) is not _QueuedDispatchEnvelope:
+            raise TypeError("Queued dispatch requires an exact envelope.")
+        if envelope.operation_kind == "resume":
+            return self._task_type
+        intent = envelope.prepared_subagent
+        if intent is None or intent.queue_task_type != self._prepared_subagent_task_type:
+            raise ValueError("Prepared subagent dispatch uses an unsupported queue namespace.")
+        return self._prepared_subagent_task_type
 
     async def submit(
         self,
@@ -500,11 +601,11 @@ class TaskStoreDispatcher(Dispatcher):
                 raise TypeError("Queued dispatch settlement returned an invalid record.")
             session_binding = await _load_dispatch_session_invocation(
                 durable_runtime,
-                request.session_id,
+                _queued_dispatch_authority_session_id(envelope),
             )
             _require_dispatch_task_authority(
                 existing,
-                request=envelope.request,
+                envelope=envelope,
                 session_binding=session_binding,
                 task_type=self._task_type,
             )
@@ -542,7 +643,7 @@ class TaskStoreDispatcher(Dispatcher):
                 task_id=queue_task_id,
                 type=self._task_type,
                 parent_task_id=request.task_id,
-                input={"dispatch": envelope.model_dump(mode="json")},
+                input={"dispatch": _queued_dispatch_persisted_envelope(envelope)},
             ),
             source=TaskExecutionSource.TASK_DISPATCH,
             session_invocation=session_binding,
@@ -593,7 +694,7 @@ class TaskStoreDispatcher(Dispatcher):
                 raise TypeError("Queued dispatch settlement returned an invalid record.")
         _require_dispatch_task_authority(
             task,
-            request=request,
+            envelope=envelope,
             session_binding=session_binding,
             task_type=self._task_type,
         )
@@ -607,6 +708,82 @@ class TaskStoreDispatcher(Dispatcher):
             handle_request,
             DispatchStatus.SUBMITTED,
             queue_task_id=task.id,
+            envelope=envelope,
+            idempotent_submission=idempotent_submission,
+        )
+
+    async def _submit_prepared_subagent(
+        self,
+        runtime: _PreparedSubagentSubmissionRuntime,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> DispatchHandle:
+        """Publish one pre-created child through the existing durable task queue."""
+
+        durable_runtime = _require_prepared_subagent_submission_runtime(runtime)
+        envelope = _copy_queued_dispatch_envelope(envelope)
+        intent = envelope.prepared_subagent
+        if envelope.operation_kind != "prepared_subagent" or intent is None:
+            raise ValueError("Prepared subagent submission requires exact queue authority.")
+        prepared_task_type = self._prepared_subagent_task_type
+        if intent.queue_task_type != prepared_task_type:
+            raise ValueError("Durable subagent queue task type conflicts with its dispatcher.")
+        parent_binding = await _load_dispatch_session_invocation(
+            durable_runtime,
+            intent.parent_session_id,
+        )
+        existing = await self._tasks.load_task(intent.queue_task_id)
+        idempotent_submission = existing is not None
+        if existing is None:
+            create_request = task_create_with_runtime_invocation(
+                TaskCreate(
+                    task_id=intent.queue_task_id,
+                    type=prepared_task_type,
+                    parent_task_id=intent.parent_task_id,
+                    input={"dispatch": _queued_dispatch_persisted_envelope(envelope)},
+                ),
+                source=TaskExecutionSource.TASK_DISPATCH,
+                session_invocation=parent_binding,
+            )
+            try:
+                existing = await self._tasks.create_task(create_request)
+            except Exception as publication_failure:
+                try:
+                    existing = await self._tasks.load_task(intent.queue_task_id)
+                except Exception as reconciliation_failure:
+                    publication_failure.add_note(
+                        "Durable subagent task publication reconciliation also failed: "
+                        f"{type(reconciliation_failure).__name__}."
+                    )
+                    raise publication_failure from reconciliation_failure
+                if existing is None:
+                    raise
+                idempotent_submission = True
+        existing_envelope = _existing_queued_dispatch_envelope(
+            existing,
+            task_type=prepared_task_type,
+        )
+        if existing_envelope != envelope:
+            raise RuntimeError("Existing task conflicts with durable subagent authority.")
+        _require_dispatch_task_authority(
+            existing,
+            envelope=envelope,
+            session_binding=parent_binding,
+            task_type=prepared_task_type,
+        )
+        if existing.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            settlement = await durable_runtime._queued_dispatch_settlement_state(envelope)
+            if type(settlement) is not _QueuedDispatchSettlement:
+                raise TypeError("Queued dispatch settlement returned an invalid record.")
+            if settlement.state is _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_DURABLE:
+                await self._acknowledge_terminal_task(durable_runtime, existing, envelope)
+        return self._handle(
+            envelope.request,
+            DispatchStatus.SUBMITTED,
+            queue_task_id=existing.id,
             envelope=envelope,
             idempotent_submission=idempotent_submission,
         )
@@ -641,12 +818,30 @@ class TaskStoreDispatcher(Dispatcher):
                     not reconciliation_complete
                     or reconciliation_generation != self._terminal_receipt_reconciliation_generation
                 )
-        task = await self._tasks.claim_task(
-            worker_id,
-            # FIFO: claim the oldest pending dispatch so steady arrivals can't starve it.
-            TaskQuery(type=self._task_type, order_by=TaskOrder.CREATED_AT_ASC),
-            lease_seconds=self._lease_seconds,
+        preferred_task_type = (
+            self._prepared_subagent_task_type
+            if self._prefer_prepared_subagent_claim
+            else self._task_type
         )
+        alternate_task_type = (
+            self._task_type
+            if self._prefer_prepared_subagent_claim
+            else self._prepared_subagent_task_type
+        )
+        task = None
+        claimed_task_type = preferred_task_type
+        for candidate_task_type in (preferred_task_type, alternate_task_type):
+            task = await self._tasks.claim_task(
+                worker_id,
+                # Each namespace remains FIFO. Alternate successful claims so a
+                # continuously busy queue cannot starve the other protocol.
+                TaskQuery(type=candidate_task_type, order_by=TaskOrder.CREATED_AT_ASC),
+                lease_seconds=self._lease_seconds,
+            )
+            if task is not None:
+                claimed_task_type = candidate_task_type
+                self._prefer_prepared_subagent_claim = candidate_task_type == self._task_type
+                break
         if task is None:
             return None
         # Fail malformed or unauthenticated queue authority terminally rather than letting
@@ -657,9 +852,11 @@ class TaskStoreDispatcher(Dispatcher):
             if type(payload) is not dict:
                 raise ValueError("dispatch task envelope payload is not an object")
             envelope = _QueuedDispatchEnvelope.model_validate(payload)
+            if self._task_type_for_envelope(envelope) != claimed_task_type:
+                raise ValueError("dispatch task protocol conflicts with its queue namespace")
             if not _claimed_task_matches_queued_dispatch(
                 task,
-                task_type=self._task_type,
+                task_type=claimed_task_type,
                 worker_id=worker_id,
                 envelope=envelope,
             ):
@@ -700,7 +897,7 @@ class TaskStoreDispatcher(Dispatcher):
         try:
             session_binding = await _load_dispatch_session_invocation(
                 durable_runtime,
-                request.session_id,
+                _queued_dispatch_authority_session_id(envelope),
             )
         except _QueuedDispatchAuthorityRejected as exc:
             return await self._reject_claimed_dispatch(
@@ -720,9 +917,9 @@ class TaskStoreDispatcher(Dispatcher):
         try:
             _require_dispatch_task_authority(
                 task,
-                request=request,
+                envelope=envelope,
                 session_binding=session_binding,
-                task_type=self._task_type,
+                task_type=claimed_task_type,
             )
         except (TypeError, ValueError) as exc:
             return await self._reject_claimed_dispatch(
@@ -844,6 +1041,45 @@ class TaskStoreDispatcher(Dispatcher):
                     )
                     raise combined_failure from None
                 if settlement.state is _QueuedDispatchSettlementState.NOT_ADMITTED:
+                    if is_durable_subagent_authority_rejected(exc):
+                        return await self._reject_claimed_dispatch(
+                            durable_runtime,
+                            task=task,
+                            worker_id=worker_id,
+                            error=exc,
+                            envelope=envelope,
+                        )
+                    if is_durable_subagent_worker_incompatible(exc):
+                        try:
+                            await self._tasks.release_task(task.id, worker_id)
+                        except TaskClaimLost:
+                            logger.warning(
+                                "dispatch %s lost its lease while requeueing an "
+                                "incompatible prepared-subagent worker",
+                                request.dispatch_id,
+                            )
+                            return self._handle(
+                                request,
+                                DispatchStatus.SUBMITTED,
+                                queue_task_id=task.id,
+                                envelope=envelope,
+                                reclaimed=True,
+                            )
+                        except asyncio.CancelledError as cancellation:
+                            raise cancellation from exc
+                        except Exception as release_error:
+                            raise ExceptionGroup(
+                                "Prepared-subagent worker incompatibility and task "
+                                "release both failed.",
+                                [exc, release_error],
+                            ) from None
+                        return self._handle(
+                            request,
+                            DispatchStatus.SUBMITTED,
+                            queue_task_id=task.id,
+                            envelope=envelope,
+                            requeued=True,
+                        )
                     if isinstance(
                         exc,
                         _ExecutionProfileAdmissionRequestRejected,
@@ -974,7 +1210,7 @@ class TaskStoreDispatcher(Dispatcher):
             try:
                 return _terminal_queued_dispatch_status(
                     current,
-                    task_type=self._task_type,
+                    task_type=self._task_type_for_envelope(envelope),
                     envelope=envelope,
                 )
             except RuntimeError:
@@ -1241,14 +1477,19 @@ class TaskStoreDispatcher(Dispatcher):
                         type(exc).__name__,
                         _safe_runtime_text(durable_runtime, str(exc)),
                     )
-                try:
-                    await self._tasks.reclaim_expired(query=TaskQuery(type=self._task_type))
-                except Exception as exc:
-                    logger.warning(
-                        "dispatch reclaim_expired failed: error_type=%s error=%s",
-                        type(exc).__name__,
-                        _safe_runtime_text(durable_runtime, str(exc)),
-                    )
+                for task_type in (
+                    self._prepared_subagent_task_type,
+                    self._task_type,
+                ):
+                    try:
+                        await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
+                    except Exception as exc:
+                        logger.warning(
+                            "dispatch reclaim_expired failed: task_type=%s error_type=%s error=%s",
+                            task_type,
+                            type(exc).__name__,
+                            _safe_runtime_text(durable_runtime, str(exc)),
+                        )
                 next_reclaim = loop.time() + reclaim_every_s
             try:
                 handle = await self.process_next(runtime, worker_id=worker_id)
@@ -1273,7 +1514,7 @@ class TaskStoreDispatcher(Dispatcher):
 
     async def _acknowledge_terminal_task(
         self,
-        runtime: _ProfiledDispatchRuntime,
+        runtime: _PreparedSubagentSubmissionRuntime,
         task: Task,
         envelope: _QueuedDispatchEnvelope,
         *,
@@ -1282,23 +1523,24 @@ class TaskStoreDispatcher(Dispatcher):
         """Release a session receipt only for an exact durable task outcome."""
 
         try:
+            task_type = self._task_type_for_envelope(envelope)
             settlement = await runtime._queued_dispatch_settlement_state(envelope)
             if type(settlement) is not _QueuedDispatchSettlement:
                 raise TypeError("Queued dispatch settlement returned an invalid record.")
             session_binding = await _load_dispatch_session_invocation(
                 runtime,
-                envelope.request.session_id,
+                _queued_dispatch_authority_session_id(envelope),
             )
             _require_dispatch_task_authority(
                 task,
-                request=envelope.request,
+                envelope=envelope,
                 session_binding=session_binding,
-                task_type=self._task_type,
+                task_type=task_type,
             )
             if task.status is TaskStatus.CANCELLED:
                 if not _task_matches_queued_dispatch(
                     task,
-                    task_type=self._task_type,
+                    task_type=task_type,
                     parent_task_id=envelope.request.task_id,
                     envelope=envelope,
                 ):
@@ -1321,7 +1563,7 @@ class TaskStoreDispatcher(Dispatcher):
             else:
                 dispatch_status = _terminal_queued_dispatch_status(
                     task,
-                    task_type=self._task_type,
+                    task_type=task_type,
                     envelope=envelope,
                 )
                 authoritative_status = dispatch_status
@@ -1440,11 +1682,21 @@ class TaskStoreDispatcher(Dispatcher):
                     continue
                 envelope = _existing_queued_dispatch_envelope(
                     task,
-                    task_type=self._task_type,
+                    task_type=task.type,
                 )
-                if envelope is None or (
-                    receipt.operation_id != envelope.dispatch_operation_id
-                    or receipt.terminal_event_id != envelope.terminal_event_id
+                try:
+                    expected_task_type = (
+                        None if envelope is None else self._task_type_for_envelope(envelope)
+                    )
+                except (TypeError, ValueError):
+                    expected_task_type = None
+                if (
+                    envelope is None
+                    or expected_task_type != task.type
+                    or (
+                        receipt.operation_id != envelope.dispatch_operation_id
+                        or receipt.terminal_event_id != envelope.terminal_event_id
+                    )
                 ):
                     all_receipts_settled = False
                     logger.error(
@@ -1542,7 +1794,7 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
 
 
 async def _load_dispatch_session_invocation(
-    runtime: _DurableDispatchRuntime,
+    runtime: _SessionInvocationRuntime,
     session_id: str,
 ) -> SessionInvocationBinding:
     try:
@@ -1571,7 +1823,7 @@ async def _load_dispatch_session_invocation(
 def _require_dispatch_task_authority(
     task: Task,
     *,
-    request: DispatchRequest,
+    envelope: _QueuedDispatchEnvelope,
     session_binding: SessionInvocationBinding,
     task_type: str,
 ) -> None:
@@ -1579,6 +1831,7 @@ def _require_dispatch_task_authority(
         raise TypeError("Dispatch task authority requires a Task.")
     if task.type != task_type or task.session_id is not None:
         raise ValueError("Dispatch task structural authority conflicts with its queue.")
+    request = envelope.request
     if task.parent_task_id != request.task_id:
         raise ValueError("Dispatch task parent authority conflicts with its request.")
     invocation = task.invocation
@@ -1592,6 +1845,14 @@ def _require_dispatch_task_authority(
         raise ValueError("Dispatch task invocation provenance conflicts with its target session.")
 
 
+def _queued_dispatch_authority_session_id(envelope: _QueuedDispatchEnvelope) -> str:
+    if envelope.operation_kind == "prepared_subagent":
+        if envelope.prepared_subagent is None:
+            raise ValueError("Prepared-subagent dispatch has no submission authority.")
+        return envelope.prepared_subagent.parent_session_id
+    return envelope.request.session_id
+
+
 def _queued_dispatch_request_sha256(request: DispatchRequest) -> str:
     payload = copy_dispatch_request(request).model_dump(mode="json")
     return sha256(canonical_durable_json_bytes(payload, "queued_dispatch.request")).hexdigest()
@@ -1603,15 +1864,10 @@ def _queued_dispatch_task_id(
     task_type: str = DEFAULT_DISPATCH_TASK_TYPE,
 ) -> str:
     request = copy_dispatch_request(request)
-    material = {
-        "schema": "cayu.queued-dispatch-task.v1",
-        "task_type": require_durable_clean_nonblank(task_type, "task_type"),
-        "dispatch_id": request.dispatch_id,
-    }
-    digest = sha256(
-        canonical_durable_json_bytes(material, "queued_dispatch.task_identity")
-    ).hexdigest()
-    return f"cayu-dispatch-{digest}"
+    return durable_dispatch_queue_task_id(
+        task_type=task_type,
+        dispatch_id=request.dispatch_id,
+    )
 
 
 def _queued_dispatch_operation_id(
@@ -1675,6 +1931,62 @@ def _new_queued_dispatch_envelope(
         request=request,
         source_profile=source_profile,
         required_profile=required_profile,
+    )
+
+
+def _new_prepared_subagent_dispatch_envelope(
+    *,
+    intent: DurableSubagentSubmissionIntent,
+    session_instance_fingerprint: str,
+) -> _QueuedDispatchEnvelope:
+    """Build a normal queue envelope whose execution entrance starts a PENDING child."""
+
+    intent = copy_durable_subagent_submission_intent(intent)
+    request = _prepared_subagent_dispatch_request(intent)
+    request_sha256 = _queued_dispatch_request_sha256(request)
+    operation_id = _queued_dispatch_operation_id(
+        queue_task_id=intent.queue_task_id,
+        request=request,
+        request_sha256=request_sha256,
+        session_instance_fingerprint=session_instance_fingerprint,
+        source_profile=intent.child_execution_profile,
+        required_profile=intent.child_execution_profile,
+    )
+    return _QueuedDispatchEnvelope(
+        queue_task_id=intent.queue_task_id,
+        dispatch_operation_id=operation_id,
+        terminal_event_id=_queued_dispatch_terminal_event_id(operation_id),
+        request_sha256=request_sha256,
+        session_instance_fingerprint=session_instance_fingerprint,
+        request=request,
+        source_profile=intent.child_execution_profile,
+        required_profile=intent.child_execution_profile,
+        operation_kind="prepared_subagent",
+        prepared_subagent=intent,
+    )
+
+
+def _prepared_subagent_dispatch_request(
+    intent: DurableSubagentSubmissionIntent,
+) -> DispatchRequest:
+    """Project bounded routing authority while the envelope owns the full intent."""
+
+    intent = copy_durable_subagent_submission_intent(intent)
+    return DispatchRequest(
+        session_id=intent.child_session_id,
+        messages=[Message.text("user", "Prepared durable subagent dispatch.")],
+        dispatch_id=intent.dispatch_id,
+        task_id=intent.parent_task_id,
+        metadata={
+            "durable_subagent": {
+                "record_type": "cayu.durable-subagent-dispatch-reference",
+                "schema_version": 1,
+                "submission_sha256": intent.submission_sha256,
+                "child_session_id": intent.child_session_id,
+                "queue_task_id": intent.queue_task_id,
+            }
+        },
+        max_steps=1,
     )
 
 
@@ -1767,8 +2079,38 @@ def _task_matches_queued_dispatch(
         and task.assigned_agent_name is None
         and task.available_at is None
         and task.metadata == {}
-        and task.input == {"dispatch": envelope.model_dump(mode="json")}
+        and _queued_dispatch_task_input_matches(task.input, envelope)
     )
+
+
+def _queued_dispatch_task_input_matches(
+    task_input: dict[str, Any],
+    envelope: _QueuedDispatchEnvelope,
+) -> bool:
+    """Accept exact current authority and the prior schema-v1 resume representation."""
+
+    if type(task_input) is not dict or set(task_input) != {"dispatch"}:
+        return False
+    raw_envelope = task_input["dispatch"]
+    if type(raw_envelope) is not dict:
+        return False
+    current = envelope.model_dump(mode="json")
+    return raw_envelope == current or raw_envelope == _queued_dispatch_persisted_envelope(envelope)
+
+
+def _queued_dispatch_persisted_envelope(
+    envelope: _QueuedDispatchEnvelope,
+) -> dict[str, Any]:
+    """Keep ordinary resume tasks readable by pre-#213 revision-40 workers."""
+
+    persisted = envelope.model_dump(mode="json")
+    if envelope.operation_kind != "resume" or envelope.prepared_subagent is not None:
+        return persisted
+    return {
+        key: value
+        for key, value in persisted.items()
+        if key not in {"operation_kind", "prepared_subagent"}
+    }
 
 
 def _claimed_task_matches_queued_dispatch(
@@ -2064,6 +2406,25 @@ def _require_profiled_dispatch_runtime(
         if not callable(method):
             raise TypeError(f"Dispatch runtime {method_name} must be callable.")
     return cast("_ProfiledDispatchRuntime", durable_runtime)
+
+
+def _require_prepared_subagent_submission_runtime(
+    runtime: object,
+) -> _PreparedSubagentSubmissionRuntime:
+    """Reject prepared publication without its three narrow session operations."""
+
+    for method_name in (
+        "session_invocation_for_dispatch",
+        "_queued_dispatch_settlement_state",
+        "_acknowledge_queued_dispatch",
+    ):
+        try:
+            method = getattr(runtime, method_name)
+        except (AttributeError, TypeError):
+            raise TypeError(f"Prepared subagent runtime {method_name} must be callable.") from None
+        if not callable(method):
+            raise TypeError(f"Prepared subagent runtime {method_name} must be callable.")
+    return cast("_PreparedSubagentSubmissionRuntime", runtime)
 
 
 def copy_dispatch_handle(handle: DispatchHandle) -> DispatchHandle:

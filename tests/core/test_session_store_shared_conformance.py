@@ -1144,6 +1144,53 @@ def test_session_store_conformance_parent_deletion_preserves_root_invocation(
     asyncio.run(run())
 
 
+def test_session_store_conformance_parent_deletion_rejects_durable_subagent_child(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            parent = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"durable-delete-parent-{session_store_case[0]}",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            child = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"durable-delete-child-{session_store_case[0]}",
+                    parent_session_id=parent.id,
+                    messages=[],
+                    metadata={"subagent": {"mode": "durable"}},
+                ),
+                identity=_identity(),
+            )
+
+            with pytest.raises(
+                ValueError,
+                match="durable subagent child authority still exists",
+            ):
+                await store.delete_session(parent.id)
+
+            retained_parent = await store.load(parent.id)
+            retained_child = await store.load(child.id)
+            assert retained_parent is not None
+            assert retained_child is not None
+            assert retained_child.parent_session_id == parent.id
+
+            await store.delete_session(child.id)
+            await store.delete_session(parent.id)
+            assert await store.load(child.id) is None
+            assert await store.load(parent.id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_reused_root_session_id_cannot_rebind_invocation(
     session_store_case,
 ) -> None:
@@ -14758,6 +14805,53 @@ def test_session_store_conformance_create_atomically_claims_and_admits_first_int
             assert await store.load_checkpoint(session.id) == checkpoint
         finally:
             await store.release_run_fence("sess_atomic_create_interaction")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_create_atomically_stages_pending_checkpoint(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            assert store.supports_pending_session_initial_checkpoint is True
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_atomic_pending_checkpoint",
+                    messages=[Message.text("user", "prepared work")],
+                ),
+                identity=_identity(),
+                checkpoint_transform=lambda current, checkpoint: {
+                    "prepared": current.id,
+                    "prior": checkpoint,
+                },
+            )
+            assert session.status is SessionStatus.PENDING
+            assert session.run_epoch == 0
+            store = await _reopen_store(session_store_case, store)
+            assert await store.load_checkpoint(session.id) == {
+                "prepared": session.id,
+                "prior": None,
+            }
+
+            def reject_create(_current: Session, _checkpoint: dict[str, Any] | None):
+                raise RuntimeError("reject staged checkpoint")
+
+            with pytest.raises(RuntimeError, match="reject staged checkpoint"):
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_failed_atomic_pending_checkpoint",
+                        messages=[],
+                    ),
+                    identity=_identity(),
+                    checkpoint_transform=reject_create,
+                )
+            assert await store.load("sess_failed_atomic_pending_checkpoint") is None
+        finally:
             await _close_store(store)
 
     asyncio.run(run())

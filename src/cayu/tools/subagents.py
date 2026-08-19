@@ -6,10 +6,11 @@ from collections.abc import AsyncIterator, Mapping
 from enum import StrEnum
 from functools import partial
 from hashlib import sha256
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
+from cayu._task_wait import await_shielded_task_outcome, unexpected_child_cancellation_error
 from cayu._validation import (
     _RESERVED_LABEL_PREFIX,
     canonical_durable_json_bytes,
@@ -29,9 +30,24 @@ from cayu.runtime._child_session_identity import (
     ChildSessionRecoveryMatcher,
     generate_child_session_id,
 )
+from cayu.runtime._durable_subagents import (
+    DurableSubagentSubmissionIntent,
+    durable_subagent_submission_committed_during_cancellation,
+    durable_subagent_submission_from_checkpoint,
+    durable_subagent_submission_receipt_from_checkpoint,
+    durable_subagent_submission_seed_from_checkpoint,
+    durable_subagent_submission_unsettled_during_cancellation,
+    is_durable_subagent_preparation_rejected,
+    is_durable_subagent_submission_unsettled,
+    require_durable_subagent_intent_matches_seed,
+    require_durable_subagent_receipt_matches_intent,
+    require_durable_subagent_receipt_matches_seed,
+)
+from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.invocation import (
     SessionExecutionSource,
     SessionInvocation,
+    TaskExecutionSource,
     inherited_session_invocation,
 )
 from cayu.runtime.sessions import (
@@ -47,8 +63,12 @@ from cayu.runtime.sessions import (
     run_request_with_runtime_invocation,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.runtime.tasks import Task, TaskStatus, TaskStore
 from cayu.runtime.tool_policy import metadata_with_taint_labels, taint_labels_from_metadata
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+
+if TYPE_CHECKING:
+    from cayu.runtime.dispatch import DispatchHandle
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +217,7 @@ class SubagentContextMode(StrEnum):
 class SubagentExecutionMode(StrEnum):
     FOREGROUND = "foreground"
     BACKGROUND = "background"
+    DURABLE = "durable"
 
 
 class SubagentSpec(BaseModel):
@@ -246,6 +267,30 @@ class SubagentRuntime(Protocol):
 
     def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
         """Interrupt a child Cayu session and stream interruption events."""
+
+    async def _submit_durable_subagent(
+        self,
+        *,
+        context: ToolContext,
+        request: RunRequest,
+        agent_alias: str,
+        tool_name: str,
+        spawn_fingerprint: str,
+        effective_arguments: dict[str, Any],
+    ) -> DispatchHandle:
+        """Persist one prepared child and task-backed execution handoff."""
+
+    async def _reconcile_durable_subagent(
+        self,
+        *,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        effective_arguments: dict[str, Any],
+    ) -> Session | ToolResult | None:
+        """Finish or reject one marker-backed submission during parent recovery."""
 
 
 class SubagentTool(Tool, ChildSessionRecoveryMatcher):
@@ -415,6 +460,117 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             child_session_id=child_session_id,
             causal_budget_id=causal_budget_id,
         )
+        if spec.mode == SubagentExecutionMode.DURABLE:
+            submission_task = asyncio.create_task(
+                self._runtime._submit_durable_subagent(
+                    context=ctx,
+                    request=request,
+                    agent_alias=agent_alias,
+                    tool_name=self.spec.name,
+                    spawn_fingerprint=spawn_fingerprint,
+                    effective_arguments=args,
+                )
+            )
+            try:
+                submission = await await_shielded_task_outcome(submission_task)
+            except Exception as exc:
+                if is_durable_subagent_submission_unsettled(
+                    exc,
+                    parent_session_id=ctx.session_id,
+                    tool_name=self.spec.name,
+                    idempotency_key=ctx.idempotency_key,
+                ):
+                    raise
+                failure = (
+                    {
+                        "error_type": "DurableSubagentPreparationRejected",
+                        "failure_code": "preparation_rejected",
+                    }
+                    if is_durable_subagent_preparation_rejected(exc)
+                    else {"error_type": type(exc).__name__}
+                )
+                return ToolResult(
+                    content=f"Durable subagent {agent_alias} could not be submitted.",
+                    structured={
+                        **structured,
+                        "status": "submission_failed",
+                        **failure,
+                    },
+                    is_error=True,
+                )
+            if submission.cancellation is not None:
+                if submission.error is None and submission.result is not None:
+                    handle = submission.result
+                    result = _durable_subagent_queued_result(
+                        structured=structured,
+                        agent_alias=agent_alias,
+                        child_session_id=child_session_id,
+                        handle=handle,
+                    )
+                    raise durable_subagent_submission_committed_during_cancellation(
+                        result=result,
+                        cancellation=submission.cancellation,
+                        cancellation_requests_consumed=(submission.cancellation_requests_consumed),
+                    ) from None
+                current_task = asyncio.current_task()
+                if submission.error is not None and is_durable_subagent_submission_unsettled(
+                    submission.error,
+                    parent_session_id=ctx.session_id,
+                    tool_name=self.spec.name,
+                    idempotency_key=ctx.idempotency_key,
+                ):
+                    raise durable_subagent_submission_unsettled_during_cancellation(
+                        unsettled=submission.error,
+                        cancellation=submission.cancellation,
+                        cancellation_requests_consumed=(submission.cancellation_requests_consumed),
+                    ) from None
+                if current_task is not None:
+                    for _ in range(submission.cancellation_requests_consumed):
+                        current_task.cancel()
+                if submission.error is not None:
+                    raise submission.cancellation from submission.error
+                raise submission.cancellation
+            if submission.error is not None:
+                if isinstance(submission.error, asyncio.CancelledError):
+                    raise unexpected_child_cancellation_error(
+                        submission.error,
+                        operation="Durable subagent submission",
+                    ) from submission.error
+                if isinstance(submission.error, Exception):
+                    if is_durable_subagent_submission_unsettled(
+                        submission.error,
+                        parent_session_id=ctx.session_id,
+                        tool_name=self.spec.name,
+                        idempotency_key=ctx.idempotency_key,
+                    ):
+                        raise submission.error
+                    failure = (
+                        {
+                            "error_type": "DurableSubagentPreparationRejected",
+                            "failure_code": "preparation_rejected",
+                        }
+                        if is_durable_subagent_preparation_rejected(submission.error)
+                        else {"error_type": type(submission.error).__name__}
+                    )
+                    return ToolResult(
+                        content=f"Durable subagent {agent_alias} could not be submitted.",
+                        structured={
+                            **structured,
+                            "status": "submission_failed",
+                            **failure,
+                        },
+                        is_error=True,
+                    )
+                raise submission.error
+            handle = submission.result
+            if handle is None:
+                raise RuntimeError("Durable subagent submission returned no dispatch handle.")
+            return _durable_subagent_queued_result(
+                structured=structured,
+                agent_alias=agent_alias,
+                child_session_id=child_session_id,
+                handle=handle,
+            )
         existing_result = await self._existing_child_result(
             child_session_id=child_session_id,
             agent_alias=agent_alias,
@@ -654,9 +810,76 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             and subagent.get("idempotency_key") == idempotency_key
         )
 
+    async def reconcile_recoverable_child(
+        self,
+        child: Session | None,
+        *,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+    ) -> Session | ToolResult | None:
+        if not any(spec.mode is SubagentExecutionMode.DURABLE for spec in self._agents.values()):
+            return child
+        reconciled = await self._runtime._reconcile_durable_subagent(
+            parent_session=parent_session,
+            tool_name=tool_name,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_id,
+            idempotency_key=idempotency_key,
+            effective_arguments=arguments,
+        )
+        return child if reconciled is None else reconciled
+
+    def matches_recoverable_submission(
+        self,
+        *,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+        spawn_fingerprint: str,
+    ) -> bool:
+        del tool_round_id
+        if tool_name != self.spec.name:
+            return False
+        try:
+            agent_alias, task, metadata = _subagent_arguments(arguments)
+        except (TypeError, ValueError):
+            return False
+        spec = self._agents.get(agent_alias)
+        if spec is None or spec.mode is not SubagentExecutionMode.DURABLE:
+            return False
+        child_metadata: dict[str, Any] = {
+            **copy_json_value(spec.metadata, "metadata"),
+            **metadata,
+            "subagent": {
+                "agent": agent_alias,
+                "agent_name": spec.agent_name,
+                "context_mode": spec.context_mode.value,
+                "mode": spec.mode.value,
+                "parent_session_id": parent_session.id,
+                "tool_call_id": tool_call_id,
+                "idempotency_key": idempotency_key,
+            },
+        }
+        return spawn_fingerprint == _subagent_spawn_fingerprint(
+            agent_alias=agent_alias,
+            spec=spec,
+            parent_session_id=parent_session.id,
+            causal_budget_id=parent_session.causal_budget_id,
+            environment_name=parent_session.environment_name,
+            task=task,
+            metadata=child_metadata,
+        )
+
 
 class SubagentResultTool(Tool):
-    """Fetch or wait for background subagent results from durable child sessions."""
+    """Fetch or wait for asynchronous subagent results from durable child sessions."""
 
     def __init__(
         self,
@@ -666,7 +889,12 @@ class SubagentResultTool(Tool):
         description: str | None = None,
         default_timeout_s: float = DEFAULT_SUBAGENT_RESULT_WAIT_TIMEOUT_S,
         background_registry: BackgroundSubagentTaskRegistry | None = None,
+        task_store: TaskStore | None = None,
     ) -> None:
+        if not isinstance(session_store, SessionStore):
+            raise TypeError("SubagentResultTool requires a SessionStore.")
+        if task_store is not None and not isinstance(task_store, TaskStore):
+            raise TypeError("task_store must be a TaskStore.")
         if background_registry is not None and not isinstance(
             background_registry, BackgroundSubagentTaskRegistry
         ):
@@ -679,6 +907,7 @@ class SubagentResultTool(Tool):
                 f"{MAX_SUBAGENT_RESULT_WAIT_TIMEOUT_S:g} seconds."
             )
         self._session_store = session_store
+        self._task_store = task_store
         self._background_registry = (
             background_registry
             if background_registry is not None
@@ -691,20 +920,20 @@ class SubagentResultTool(Tool):
                 effect=ToolEffect.NONE,
                 description=description
                 or (
-                    "Fetch results from background Cayu subagents. Use child_session_id "
-                    "for one child, or all=true to wait for every background subagent "
-                    "started by the current session."
+                    "Fetch results from background or durable Cayu subagents. Use "
+                    "child_session_id for one child, or all=true to wait for every "
+                    "asynchronous subagent started by the current session."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "child_session_id": {
                             "type": "string",
-                            "description": "Background child session id returned by subagent.",
+                            "description": "Asynchronous child session id returned by subagent.",
                         },
                         "all": {
                             "type": "boolean",
-                            "description": "When true, fetch all background subagents for this session.",
+                            "description": "When true, fetch all asynchronous subagents for this session.",
                             "default": False,
                         },
                         "wait": {
@@ -795,6 +1024,7 @@ class SubagentResultTool(Tool):
         child = await _wait_for_subagent_terminal(
             self._session_store,
             loaded_child,
+            task_store=self._task_store,
             wait=wait,
             timeout_s=timeout_s,
         )
@@ -803,6 +1033,7 @@ class SubagentResultTool(Tool):
             child,
             max_chars=max_chars,
             background_failure=self._background_registry.failure(child.id),
+            task_store=self._task_store,
         )
         return _tool_result_from_child_summary(summary)
 
@@ -820,7 +1051,7 @@ class SubagentResultTool(Tool):
         )
         if not children:
             return ToolResult(
-                content="No background subagents were started by this session.",
+                content="No asynchronous subagents were started by this session.",
                 structured={
                     "parent_session_id": ctx.session_id,
                     "children": [],
@@ -831,6 +1062,7 @@ class SubagentResultTool(Tool):
             children = await _wait_for_all_subagents_terminal(
                 self._session_store,
                 children,
+                task_store=self._task_store,
                 timeout_s=timeout_s,
             )
         summaries = [
@@ -839,27 +1071,34 @@ class SubagentResultTool(Tool):
                 child,
                 max_chars=max_chars,
                 background_failure=self._background_registry.failure(child.id),
+                task_store=self._task_store,
             )
             for child in children
         ]
-        lines = ["Background subagent results:"]
+        lines = ["Asynchronous subagent results:"]
         has_error = False
         for summary in summaries:
             status = summary["status"]
             child_id = summary["child_session_id"]
             agent = summary.get("agent") or summary.get("agent_name") or "subagent"
-            if summary["retrieval_status"] == "ready":
-                text = summary["result_text"] or f"Subagent ended with status {status}."
-                lines.append(f"- {agent} ({child_id}, {status}): {text}")
-            elif summary.get("background_failure") is not None:
-                failure = summary["background_failure"]
-                lines.append(
-                    f"- {agent} ({child_id}, {status}): background failure: {failure['error']}"
-                )
-                has_error = True
+            if "task_authority_status" not in summary:
+                if summary["retrieval_status"] == "ready":
+                    text = summary["result_text"] or f"Subagent ended with status {status}."
+                    lines.append(f"- {agent} ({child_id}, {status}): {text}")
+                elif summary.get("background_failure") is not None:
+                    failure = summary["background_failure"]
+                    lines.append(
+                        f"- {agent} ({child_id}, {status}): background failure: {failure['error']}"
+                    )
+                    has_error = True
+                else:
+                    lines.append(f"- {agent} ({child_id}, {status}): still running")
+                rendered_is_error = summary.get("is_error") is True
             else:
-                lines.append(f"- {agent} ({child_id}, {status}): still running")
-            if summary.get("is_error") is True:
+                rendered = _tool_result_from_child_summary(summary)
+                lines.append(f"- {agent} ({child_id}, {status}): {rendered.content}")
+                rendered_is_error = rendered.is_error
+            if rendered_is_error:
                 has_error = True
         return ToolResult(
             content="\n".join(lines),
@@ -896,7 +1135,7 @@ class SubagentResultTool(Tool):
             )
         if not _is_background_subagent_session(child):
             return ToolResult(
-                content=f"Session is not a background subagent child: {child_session_id}",
+                content=f"Session is not an asynchronous subagent child: {child_session_id}",
                 structured={"child_session_id": child_session_id},
                 is_error=True,
             )
@@ -1021,6 +1260,27 @@ def _subagent_result_payload(
     }
 
 
+def _durable_subagent_queued_result(
+    *,
+    structured: dict[str, Any],
+    agent_alias: str,
+    child_session_id: str,
+    handle: DispatchHandle,
+) -> ToolResult:
+    """Return the exact public acknowledgement for one committed durable handoff."""
+
+    return ToolResult(
+        content=f"Subagent {agent_alias} was durably queued as {child_session_id}.",
+        structured={
+            **structured,
+            "status": "queued",
+            "dispatch_id": handle.dispatch_id,
+            "queue_task_id": handle.metadata.get("queue_task_id"),
+            "dispatch_status": handle.status.value,
+        },
+    )
+
+
 def _subagent_spawn_fingerprint(
     *,
     agent_alias: str,
@@ -1123,10 +1383,10 @@ async def _list_background_subagent_children(
 
 def _is_background_subagent_session(session: Session) -> bool:
     subagent = session.metadata.get("subagent")
-    return (
-        isinstance(subagent, dict)
-        and subagent.get("mode") == SubagentExecutionMode.BACKGROUND.value
-    )
+    return isinstance(subagent, dict) and subagent.get("mode") in {
+        SubagentExecutionMode.BACKGROUND.value,
+        SubagentExecutionMode.DURABLE.value,
+    }
 
 
 async def _wait_for_subagent_terminal(
@@ -1135,6 +1395,7 @@ async def _wait_for_subagent_terminal(
     *,
     wait: bool,
     timeout_s: float,
+    task_store: TaskStore | None = None,
 ) -> Session:
     if not wait or child.status in _SUBAGENT_TERMINAL_STATUSES:
         return child
@@ -1143,6 +1404,12 @@ async def _wait_for_subagent_terminal(
     loaded = child
     delay = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
     while loaded.status not in _SUBAGENT_TERMINAL_STATUSES:
+        if await _durable_task_stops_result_wait(session_store, task_store, loaded):
+            refreshed = await session_store.load(loaded.id)
+            if refreshed is None:
+                raise RuntimeError(f"Subagent session disappeared: {loaded.id}")
+            loaded = refreshed
+            return loaded
         now = loop.time()
         if now >= deadline:
             return loaded
@@ -1160,6 +1427,7 @@ async def _wait_for_all_subagents_terminal(
     children: list[Session],
     *,
     timeout_s: float,
+    task_store: TaskStore | None = None,
 ) -> list[Session]:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
@@ -1173,6 +1441,19 @@ async def _wait_for_all_subagents_terminal(
     }
     delay = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
     while pending:
+        for child_id in list(pending):
+            if await _durable_task_stops_result_wait(
+                session_store,
+                task_store,
+                loaded_by_id[child_id],
+            ):
+                refreshed = await session_store.load(child_id)
+                if refreshed is None:
+                    raise RuntimeError(f"Subagent session disappeared: {child_id}")
+                loaded_by_id[child_id] = refreshed
+                pending.discard(child_id)
+        if not pending:
+            break
         now = loop.time()
         if now >= deadline:
             break
@@ -1188,13 +1469,61 @@ async def _wait_for_all_subagents_terminal(
     return list(loaded_by_id.values())
 
 
+async def _durable_task_stops_result_wait(
+    session_store: SessionStore,
+    task_store: TaskStore | None,
+    child: Session,
+) -> bool:
+    """Stop polling once exact queue evidence proves progress is impossible or conflicting."""
+
+    if not isinstance(child, Session):
+        return False
+    task_summary = await _durable_subagent_task_summary(
+        session_store,
+        task_store,
+        child,
+    )
+    authority_status = task_summary.get("task_authority_status")
+    if authority_status in {"malformed", "conflict"}:
+        return True
+    return authority_status == "verified" and task_summary.get("task_status") in {
+        TaskStatus.COMPLETED.value,
+        TaskStatus.FAILED.value,
+        TaskStatus.CANCELLED.value,
+    }
+
+
 async def _summarize_child_session(
     session_store: SessionStore,
     child: Session,
     *,
     max_chars: int,
     background_failure: dict[str, Any] | None = None,
+    task_store: TaskStore | None = None,
 ) -> dict[str, Any]:
+    task_summary = await _durable_subagent_task_summary(
+        session_store,
+        task_store,
+        child,
+    )
+    if task_summary.get("task_authority_status") in {"malformed", "conflict"}:
+        return {
+            "agent": None,
+            "agent_name": child.agent_name,
+            "child_session_id": child.id,
+            "parent_session_id": child.parent_session_id,
+            "causal_budget_id": child.causal_budget_id,
+            "status": child.status.value,
+            "retrieval_status": "authority_conflict",
+            "result_text": "",
+            "result_truncated": False,
+            "events": 0,
+            "terminal_event_type": None,
+            "terminal_payload": None,
+            "background_failure": None,
+            "is_error": True,
+            **task_summary,
+        }
     # Tail-limited retrieval: fetch only the last assistant message and an event
     # summary/outcome instead of reloading the child's full transcript and every
     # event, which scales badly for long-running subagents.
@@ -1213,7 +1542,7 @@ async def _summarize_child_session(
         else None
     )
     ready = child.status in _SUBAGENT_TERMINAL_STATUSES
-    return {
+    summary = {
         "agent": subagent_metadata.get("agent"),
         "agent_name": child.agent_name,
         "child_session_id": child.id,
@@ -1233,6 +1562,227 @@ async def _summarize_child_session(
         ),
         "is_error": child.status in {SessionStatus.FAILED, SessionStatus.INTERRUPTED},
     }
+    summary.update(task_summary)
+    if (
+        task_summary.get("task_authority_status") == "verified"
+        and task_summary.get("task_status") == TaskStatus.COMPLETED.value
+        and not ready
+    ):
+        summary["retrieval_status"] = "queue_conflict"
+        summary["is_error"] = True
+    elif (
+        task_summary.get("task_authority_status") == "verified"
+        and task_summary.get("task_status") in {TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
+        and not ready
+    ):
+        summary["retrieval_status"] = "queue_terminal"
+        summary["is_error"] = True
+    return summary
+
+
+async def _durable_subagent_task_summary(
+    session_store: SessionStore,
+    task_store: TaskStore | None,
+    child: Session,
+) -> dict[str, Any]:
+    """Return bounded queue evidence without trusting child metadata alone."""
+
+    subagent = child.metadata.get("subagent")
+    if not isinstance(subagent, dict) or subagent.get("mode") != "durable":
+        return {}
+    linkage = subagent.get("durable_dispatch")
+    if type(linkage) is not dict:
+        return {"task_authority_status": "malformed", "task_status": None}
+    queue_task_id = linkage.get("queue_task_id")
+    queue_task_type = linkage.get("queue_task_type")
+    dispatch_id = linkage.get("dispatch_id")
+    idempotency_key = subagent.get("idempotency_key")
+    if not all(
+        type(value) is str and value
+        for value in (queue_task_id, queue_task_type, dispatch_id, idempotency_key)
+    ):
+        return {"task_authority_status": "malformed", "task_status": None}
+    base = {
+        "queue_task_id": queue_task_id,
+        "queue_task_type": queue_task_type,
+    }
+    session_authority = await _validated_durable_subagent_session_authority(
+        session_store,
+        child,
+        queue_task_id=queue_task_id,
+        queue_task_type=queue_task_type,
+        dispatch_id=dispatch_id,
+        idempotency_key=idempotency_key,
+    )
+    if session_authority is None:
+        return {**base, "task_authority_status": "conflict", "task_status": None}
+    if task_store is None:
+        return {**base, "task_authority_status": "unavailable", "task_status": None}
+    task = await task_store.load_task(queue_task_id)
+    if task is None:
+        return {**base, "task_authority_status": "missing", "task_status": None}
+    intent, parent = session_authority
+    if not _task_matches_durable_subagent_child(
+        task,
+        child=child,
+        parent=parent,
+        intent=intent,
+        queue_task_id=queue_task_id,
+        queue_task_type=queue_task_type,
+        dispatch_id=dispatch_id,
+        idempotency_key=idempotency_key,
+    ):
+        return {
+            **base,
+            "task_authority_status": "conflict",
+            "task_status": None,
+        }
+    return {
+        **base,
+        "task_authority_status": "verified",
+        "task_status": task.status.value,
+    }
+
+
+async def _validated_durable_subagent_session_authority(
+    session_store: SessionStore,
+    child: Session,
+    *,
+    queue_task_id: str,
+    queue_task_type: str,
+    dispatch_id: str,
+    idempotency_key: str,
+) -> tuple[DurableSubagentSubmissionIntent, Session] | None:
+    try:
+        from cayu.runtime.sessions import _queued_dispatch_session_instance_fingerprint
+
+        parent = await session_store.load(child.parent_session_id or "")
+        if parent is None:
+            return None
+        parent_checkpoint = await session_store.load_checkpoint(parent.id)
+        parent_intent = durable_subagent_submission_from_checkpoint(
+            parent_checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        parent_seed = durable_subagent_submission_seed_from_checkpoint(
+            parent_checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        parent_receipt = durable_subagent_submission_receipt_from_checkpoint(
+            parent_checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        child_checkpoint = await session_store.load_checkpoint(child.id)
+        child_intent = durable_subagent_submission_from_checkpoint(
+            child_checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        if child_intent is None:
+            return None
+        if parent_intent is not None and parent_seed is not None and parent_receipt is None:
+            require_durable_subagent_intent_matches_seed(parent_intent, parent_seed)
+            if child_intent != parent_intent:
+                return None
+        elif parent_intent is None and parent_receipt is not None:
+            require_durable_subagent_receipt_matches_intent(parent_receipt, child_intent)
+            if parent_seed is not None:
+                require_durable_subagent_intent_matches_seed(child_intent, parent_seed)
+                require_durable_subagent_receipt_matches_seed(parent_receipt, parent_seed)
+        else:
+            return None
+        parent_instance_fingerprint = _queued_dispatch_session_instance_fingerprint(parent)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+    subagent = child.metadata.get("subagent")
+    linkage = subagent.get("durable_dispatch") if isinstance(subagent, dict) else None
+    intent = child_intent
+    if not (
+        intent.queue_task_id == queue_task_id
+        and intent.queue_task_type == queue_task_type
+        and intent.child_session_id == child.id
+        and intent.parent_session_id == child.parent_session_id
+        and intent.parent_session_instance_fingerprint == parent_instance_fingerprint
+        and intent.dispatch_id == dispatch_id
+        and intent.idempotency_key == idempotency_key
+        and child.causal_budget_id == intent.causal_budget_id
+        and child.agent_name == intent.agent_name
+        and child.provider_name == intent.child_provider_name
+        and child.model == intent.child_model
+        and child.environment_name == intent.environment_name
+        and execution_profile_from_session_metadata(child.metadata)
+        == intent.child_execution_profile
+        and child.invocation
+        == inherited_session_invocation(
+            parent.invocation,
+            source=SessionExecutionSource.SUBAGENT,
+        )
+        and isinstance(linkage, dict)
+        and linkage.get("parent_task_id") == intent.parent_task_id
+        and linkage.get("parent_run_epoch") == intent.parent_run_epoch
+        and linkage.get("model_step_id") == intent.model_step_id
+        and linkage.get("model_attempt_id") == intent.model_attempt_id
+        and linkage.get("tool_round_id") == intent.tool_round_id
+        and linkage.get("tool_call_id") == intent.tool_call_id
+        and linkage.get("dispatch_id") == intent.dispatch_id
+        and linkage.get("queue_task_id") == intent.queue_task_id
+        and linkage.get("queue_task_type") == intent.queue_task_type
+    ):
+        return None
+    return intent, parent
+
+
+def _task_matches_durable_subagent_child(
+    task: Task,
+    *,
+    child: Session,
+    parent: Session,
+    intent: DurableSubagentSubmissionIntent,
+    queue_task_id: str,
+    queue_task_type: str,
+    dispatch_id: str,
+    idempotency_key: str,
+) -> bool:
+    if (
+        type(task) is not Task
+        or task.id != queue_task_id
+        or task.type != queue_task_type
+        or task.session_id is not None
+    ):
+        return False
+    envelope = task.input.get("dispatch")
+    if type(envelope) is not dict:
+        return False
+    try:
+        from cayu.runtime.dispatch import (
+            _new_prepared_subagent_dispatch_envelope,
+            _QueuedDispatchEnvelope,
+        )
+        from cayu.runtime.sessions import _queued_dispatch_session_instance_fingerprint
+
+        parsed_envelope = _QueuedDispatchEnvelope.model_validate(envelope)
+        expected_envelope = _new_prepared_subagent_dispatch_envelope(
+            intent=intent,
+            session_instance_fingerprint=_queued_dispatch_session_instance_fingerprint(child),
+        )
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        parsed_envelope == expected_envelope
+        and intent.queue_task_id == task.id
+        and intent.queue_task_type == task.type
+        and intent.parent_task_id == task.parent_task_id
+        and intent.dispatch_id == dispatch_id
+        and intent.idempotency_key == idempotency_key
+        and task.invocation.source is TaskExecutionSource.TASK_DISPATCH
+        and task.invocation.origin == child.invocation.origin
+        and task.invocation.root_invocation_id == child.invocation.root_invocation_id
+        and task.invocation.root_session_id == child.invocation.root_session_id
+        and child.invocation
+        == inherited_session_invocation(
+            parent.invocation,
+            source=SessionExecutionSource.SUBAGENT,
+        )
+    )
 
 
 async def _load_last_assistant_text(
@@ -1275,6 +1825,29 @@ async def _load_last_assistant_text(
 
 def _tool_result_from_child_summary(summary: dict[str, Any]) -> ToolResult:
     status = summary["status"]
+    if summary.get("task_authority_status") in {"malformed", "conflict"}:
+        return ToolResult(
+            content="Durable subagent queue evidence conflicts with its child session.",
+            structured=summary,
+            is_error=True,
+        )
+    if summary["retrieval_status"] == "queue_conflict":
+        return ToolResult(
+            content=(
+                "Durable subagent queue completion conflicts with a nonterminal child session."
+            ),
+            structured=summary,
+            is_error=True,
+        )
+    if summary["retrieval_status"] == "queue_terminal":
+        return ToolResult(
+            content=(
+                f"Durable subagent queue work ended with status "
+                f"{summary['task_status']} before its child session became terminal."
+            ),
+            structured=summary,
+            is_error=True,
+        )
     if summary["retrieval_status"] != "ready":
         background_failure = summary.get("background_failure")
         if background_failure is not None:

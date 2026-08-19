@@ -16,6 +16,11 @@ from cayu._validation import (
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.runners import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime._durable_subagents import (
+    durable_subagent_committed_cancellation_outcome,
+    durable_subagent_unsettled_cancellation_outcome,
+    is_durable_subagent_submission_unsettled,
+)
 from cayu.runtime._tool_identity import tool_idempotency_key as tool_idempotency_key
 from cayu.runtime.tool_policy import ToolPolicyResult
 from cayu.tools._runner import (
@@ -236,22 +241,67 @@ async def _run_tool(
         )
         return _execution_outcome(result, controls)
     except Exception as exc:
-        ctx._discard_policy_denials_for(tool)
-        active_redactor = _active_redactor(redactor)
-        diagnostic = tool_results.exception_diagnostic(
+        committed_cancellation = durable_subagent_committed_cancellation_outcome(exc)
+        unsettled_cancellation = durable_subagent_unsettled_cancellation_outcome(exc)
+        if committed_cancellation is not None:
+            committed_result, cancellation, cancellation_requests_consumed = committed_cancellation
+            if timer is not None and timer.expired():
+                # Exactly one cancellation belongs to this expired timeout. A
+                # concurrent caller cancellation must remain authoritative even
+                # though the durable publication committed successfully.
+                external_cancellation_requests = cancellation_requests_consumed - 1
+                if external_cancellation_requests > 0:
+                    if current_task is not None:
+                        for _ in range(external_cancellation_requests):
+                            current_task.cancel()
+                    raise cancellation from None
+                raw_result = committed_result
+            else:
+                if current_task is not None:
+                    for _ in range(cancellation_requests_consumed):
+                        current_task.cancel()
+                raise cancellation from None
+        elif unsettled_cancellation is not None:
+            unsettled, cancellation, cancellation_requests_consumed = unsettled_cancellation
+            if timer is not None and timer.expired():
+                # The timeout owns one consumed cancellation. Preserve any additional
+                # caller cancellation as authoritative; otherwise the recoverable
+                # unsettled publication must escape instead of becoming a terminal
+                # tool-timeout result.
+                external_cancellation_requests = cancellation_requests_consumed - 1
+                if external_cancellation_requests > 0:
+                    if current_task is not None:
+                        for _ in range(external_cancellation_requests):
+                            current_task.cancel()
+                    raise cancellation from unsettled
+                raise unsettled from None
+            if current_task is not None:
+                for _ in range(cancellation_requests_consumed):
+                    current_task.cancel()
+            raise cancellation from unsettled
+        elif is_durable_subagent_submission_unsettled(
             exc,
-            empty_message="tool execution failed",
-            nonportable_message="Tool execution failed with a non-portable diagnostic.",
-            redactor=active_redactor,
-        )
-        result, controls = tool_results.terminal_failure_result(
-            terminal_outcome="tool_execution_error",
-            effect=effect,
-            message=diagnostic.message,
-            diagnostic=diagnostic,
-            redactor=active_redactor,
-        )
-        return _execution_outcome(result, controls)
+            parent_session_id=ctx.session_id,
+            idempotency_key=ctx.idempotency_key,
+        ):
+            raise
+        else:
+            ctx._discard_policy_denials_for(tool)
+            active_redactor = _active_redactor(redactor)
+            diagnostic = tool_results.exception_diagnostic(
+                exc,
+                empty_message="tool execution failed",
+                nonportable_message="Tool execution failed with a non-portable diagnostic.",
+                redactor=active_redactor,
+            )
+            result, controls = tool_results.terminal_failure_result(
+                terminal_outcome="tool_execution_error",
+                effect=effect,
+                message=diagnostic.message,
+                diagnostic=diagnostic,
+                redactor=active_redactor,
+            )
+            return _execution_outcome(result, controls)
 
     if grouped_failure is not None:
         raise grouped_failure

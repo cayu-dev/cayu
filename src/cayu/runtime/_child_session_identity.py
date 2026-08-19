@@ -9,6 +9,7 @@ from uuid import uuid4
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 
 if TYPE_CHECKING:
+    from cayu.core.tools import ToolResult
     from cayu.runtime.invocation import SessionInvocation
     from cayu.runtime.sessions import Session
 
@@ -31,6 +32,46 @@ class ChildSessionRecoveryMatcher(ABC):
         require_fingerprint: bool,
     ) -> bool:
         """Return exact authority evidence for one recovered child candidate."""
+
+    def matches_recoverable_submission(
+        self,
+        *,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+        spawn_fingerprint: str,
+    ) -> bool:
+        """Validate marker-backed effective arguments before creating a missing child."""
+
+        del (
+            parent_session,
+            tool_name,
+            tool_round_id,
+            tool_call_id,
+            idempotency_key,
+            arguments,
+            spawn_fingerprint,
+        )
+        return False
+
+    async def reconcile_recoverable_child(
+        self,
+        child: Session | None,
+        *,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+    ) -> Session | ToolResult | None:
+        """Optionally repair a durable child or settle its rejected submission."""
+
+        del parent_session, tool_name, tool_round_id, tool_call_id, idempotency_key, arguments
+        return child
 
 
 class ChildSessionKind(StrEnum):

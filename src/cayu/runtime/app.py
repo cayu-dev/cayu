@@ -51,6 +51,8 @@ from cayu.core.messages import (
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
     Tool,
+    ToolContext,
+    ToolResult,
     ToolSpec,
 )
 from cayu.environments import (
@@ -72,6 +74,14 @@ from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
+from cayu.runtime._durable_subagent_coordinator import (
+    DurableSubagentCoordinator,
+    DurableSubagentPreparedRun,
+)
+from cayu.runtime._durable_subagents import (
+    DurableSubagentSubmissionIntent,
+    durable_subagent_worker_incompatible,
+)
 from cayu.runtime._environment_lifecycle import (
     DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
     EnvironmentLifecycle,
@@ -1033,6 +1043,23 @@ class CayuApp:
             effective_retry_policy=self._effective_retry_policy,
             execution_profile_policy=execution_profile_policy,
             execution_profile_policy_identity=execution_profile_policy_identity,
+        )
+        self._durable_subagent_coordinator = DurableSubagentCoordinator(
+            session_store=self.session_store,
+            runtime_session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            dispatcher=self.dispatcher,
+            prepare_initial_run=self._prepare_durable_subagent_run,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_provider=self._get_registered_provider,
+            route_registered_provider_for_model=(
+                lambda model: self._route_registered_provider_for_model(model=model)
+            ),
+            resolve_registered_environment=self._get_registered_environment,
+            interrupt_session=self._interrupt_session_private,
+            load_session_invocation=self.session_invocation_for_dispatch,
+            classify_dispatch_settlement=self._queued_dispatch_settlement_state,
+            acknowledge_dispatch=self._acknowledge_queued_dispatch,
         )
 
     def redact_json(self, value: Any) -> Any:
@@ -2333,6 +2360,65 @@ class CayuApp:
             raise KeyError(f"Session not found: {private_session_id}")
         return copy_session_invocation_binding(snapshot)
 
+    async def _prepare_durable_subagent_run(
+        self,
+        request: RunRequest,
+    ) -> DurableSubagentPreparedRun:
+        prepared = await self._session_engine._prepare_initial_run(request)
+        try:
+            return DurableSubagentPreparedRun(
+                request=prepared.request,
+                provider_name=prepared.registered_provider.name,
+                model=prepared.session_identity.model,
+                execution_profile=prepared.execution_profile,
+            )
+        finally:
+            del prepared
+
+    async def _submit_durable_subagent(
+        self,
+        *,
+        context: ToolContext,
+        request: RunRequest,
+        agent_alias: str,
+        tool_name: str,
+        spawn_fingerprint: str,
+        effective_arguments: dict[str, Any],
+    ) -> DispatchHandle:
+        return await self._durable_subagent_coordinator.submit(
+            context=context,
+            request=request,
+            agent_alias=agent_alias,
+            tool_name=tool_name,
+            spawn_fingerprint=spawn_fingerprint,
+            effective_arguments=effective_arguments,
+        )
+
+    async def _ensure_durable_subagent_submission(
+        self,
+        intent: DurableSubagentSubmissionIntent,
+    ) -> tuple[Session, DispatchHandle]:
+        return await self._durable_subagent_coordinator.ensure_submission(intent)
+
+    async def _reconcile_durable_subagent(
+        self,
+        *,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        effective_arguments: dict[str, Any],
+    ) -> Session | ToolResult | None:
+        return await self._durable_subagent_coordinator.reconcile(
+            parent_session=parent_session,
+            tool_name=tool_name,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_id,
+            idempotency_key=idempotency_key,
+            effective_arguments=effective_arguments,
+        )
+
     async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
         if type(request) is not DispatchRequest:
             raise TypeError("Inline dispatch requires a DispatchRequest.")
@@ -2691,6 +2777,10 @@ class CayuApp:
         """Classify the exact event/ownership evidence for one queued operation."""
 
         envelope = _copy_queued_dispatch_envelope(envelope)
+        if envelope.operation_kind == "prepared_subagent":
+            await self._durable_subagent_coordinator.require_prepared_subagent_parent_authority(
+                envelope
+            )
         private_session_id, _ = await self._resolve_public_session_authority(
             envelope.request.session_id
         )
@@ -2843,9 +2933,23 @@ class CayuApp:
             )
             self._get_registered_environment_for_session(session.environment_name)
         except KeyError as exc:
+            if envelope.operation_kind == "prepared_subagent":
+                raise durable_subagent_worker_incompatible() from exc
             raise _QueuedDispatchAuthorityRejected(
                 "Queued dispatch required runtime component is unavailable."
             ) from exc
+
+        if envelope.operation_kind == "prepared_subagent":
+            run_request = self._durable_subagent_coordinator.prepare_queued_child_run(
+                envelope=envelope,
+                session=session,
+                checkpoint=checkpoint,
+            )
+            stream = self._run_private(run_request)
+            async with _close_delegated_event_stream(stream) as owned_stream:
+                async for event in owned_stream:
+                    yield await self._project_emitted_event_for_public_api(event)
+            return
 
         private_request = request.model_copy(
             update={"session_id": private_session_id},

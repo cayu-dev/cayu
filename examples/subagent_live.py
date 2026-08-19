@@ -14,6 +14,7 @@ from cayu import (
     AgentSpec,
     AnthropicProvider,
     CayuApp,
+    InMemoryTaskStore,
     Message,
     OpenAIProvider,
     RunRequest,
@@ -22,6 +23,7 @@ from cayu import (
     SubagentResultTool,
     SubagentSpec,
     SubagentTool,
+    TaskStoreDispatcher,
 )
 
 
@@ -30,7 +32,9 @@ async def main() -> None:
     model = _model(provider_name)
     mode = _mode()
 
-    app = CayuApp()
+    task_store = InMemoryTaskStore() if mode is SubagentExecutionMode.DURABLE else None
+    dispatcher = None if task_store is None else TaskStoreDispatcher(task_store)
+    app = CayuApp() if task_store is None else CayuApp(task_store=task_store, dispatcher=dispatcher)
     if provider_name == "openai":
         if not os.environ.get("OPENAI_API_KEY"):
             print("Set OPENAI_API_KEY or choose CAYU_PROVIDER=anthropic.")
@@ -53,10 +57,11 @@ async def main() -> None:
             )
         },
     )
-    subagent_result = SubagentResultTool(app.session_store)
-    if mode == SubagentExecutionMode.BACKGROUND:
+    subagent_result = SubagentResultTool(app.session_store, task_store=task_store)
+    if mode in {SubagentExecutionMode.BACKGROUND, SubagentExecutionMode.DURABLE}:
+        execution_kind = "durable" if mode is SubagentExecutionMode.DURABLE else "background"
         builder_prompt = (
-            "You are testing Cayu background subagents. Call the subagent tool exactly "
+            f"You are testing Cayu {execution_kind} subagents. Call the subagent tool exactly "
             "once with agent='reviewer' to review the user's plan. The subagent tool "
             "returns a child_session_id immediately. Then call subagent_result with "
             "that child_session_id and wait=true. After subagent_result returns, give "
@@ -96,30 +101,40 @@ async def main() -> None:
     print("subagent_mode", mode)
     print("session_id", session_id)
 
-    async for event in app.run(
-        RunRequest(
-            agent_name="builder",
-            session_id=session_id,
-            causal_budget_id=f"job_{provider_name}_subagent",
-            messages=[
-                Message.text(
-                    "user",
-                    (
-                        "Plan: add a file upload endpoint that stores PDFs, lets the "
-                        "agent inspect them, and summarizes the document for users. "
-                        "Ask the reviewer to review this plan, then answer with the "
-                        "reviewer's most important point."
-                    ),
-                )
-            ],
-        )
-    ):
-        print(
-            event.type,
-            event.session_id,
-            event.tool_name or "-",
-            event.payload,
-        )
+    worker_stop = asyncio.Event()
+    worker = None
+    if mode is SubagentExecutionMode.DURABLE:
+        assert dispatcher is not None
+        worker = asyncio.create_task(_run_durable_worker(app, dispatcher, worker_stop))
+    try:
+        async for event in app.run(
+            RunRequest(
+                agent_name="builder",
+                session_id=session_id,
+                causal_budget_id=f"job_{provider_name}_subagent",
+                messages=[
+                    Message.text(
+                        "user",
+                        (
+                            "Plan: add a file upload endpoint that stores PDFs, lets the "
+                            "agent inspect them, and summarizes the document for users. "
+                            "Ask the reviewer to review this plan, then answer with the "
+                            "reviewer's most important point."
+                        ),
+                    )
+                ],
+            )
+        ):
+            print(
+                event.type,
+                event.session_id,
+                event.tool_name or "-",
+                event.payload,
+            )
+    finally:
+        worker_stop.set()
+        if worker is not None:
+            await worker
 
     children = (
         await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
@@ -141,7 +156,7 @@ async def main() -> None:
         events = await app.session_store.load_events(child.id)
         print("child_event_count", len(events))
 
-    if mode == SubagentExecutionMode.BACKGROUND:
+    if mode in {SubagentExecutionMode.BACKGROUND, SubagentExecutionMode.DURABLE}:
         for _ in range(100):
             children = (
                 await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
@@ -180,9 +195,20 @@ def _model(provider_name: str) -> str:
 
 def _mode() -> SubagentExecutionMode:
     mode = os.environ.get("CAYU_SUBAGENT_MODE", "foreground").strip().lower()
-    if mode not in {"foreground", "background"}:
-        raise RuntimeError("CAYU_SUBAGENT_MODE must be foreground or background.")
+    if mode not in {"foreground", "background", "durable"}:
+        raise RuntimeError("CAYU_SUBAGENT_MODE must be foreground, background, or durable.")
     return SubagentExecutionMode(mode)
+
+
+async def _run_durable_worker(
+    app: CayuApp,
+    dispatcher: TaskStoreDispatcher,
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        handled = await dispatcher.process_next(app, worker_id="subagent-live-worker")
+        if handled is None:
+            await asyncio.sleep(0.05)
 
 
 if __name__ == "__main__":

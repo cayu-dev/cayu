@@ -1371,10 +1371,14 @@ def recovered_subagent_tool_result(
     terminal = status in _SUBAGENT_RECOVERY_TERMINAL_STATUSES
     subagent = child.metadata.get("subagent")
     mode = subagent.get("mode") if isinstance(subagent, dict) else None
+    durable_dispatch = subagent.get("durable_dispatch") if isinstance(subagent, dict) else None
+    queue_task_id = (
+        durable_dispatch.get("queue_task_id") if isinstance(durable_dispatch, dict) else None
+    )
     if terminal:
         retrieval = (
             "Use subagent_result for its full output."
-            if mode == "background"
+            if mode in {"background", "durable"}
             else "Its durable session and transcript remain available for inspection."
         )
         content = (
@@ -1399,6 +1403,7 @@ def recovered_subagent_tool_result(
             "child_session_id": child.id,
             "parent_session_id": child.parent_session_id,
             "mode": mode,
+            **({"queue_task_id": queue_task_id} if isinstance(queue_task_id, str) else {}),
             "status": status.value,
             "outcome_unknown": not terminal,
         },

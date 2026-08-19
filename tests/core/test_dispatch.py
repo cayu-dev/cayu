@@ -382,6 +382,8 @@ def test_submit_enqueues_pending_task_without_running() -> None:
     assert task.session_id is None
     assert task.input["dispatch"]["request"]["session_id"] == "sess_submit"
     assert task.input["dispatch"]["request"]["dispatch_id"] == "d_submit"
+    assert "operation_kind" not in task.input["dispatch"]
+    assert "prepared_subagent" not in task.input["dispatch"]
     assert (
         task.input["dispatch"]["required_profile"]["fingerprint"]
         == (handle.metadata["required_execution_profile_fingerprint"])
@@ -392,6 +394,50 @@ def test_submit_enqueues_pending_task_without_running() -> None:
     assert task.invocation.root_invocation_id == session.invocation.root_invocation_id
     assert task.invocation.root_session_id == session.invocation.root_session_id
     assert task.invocation.source is TaskExecutionSource.TASK_DISPATCH
+
+
+def test_worker_accepts_revision_40_resume_envelope_without_new_default_fields() -> None:
+    h = _build([_batch("first answer"), _batch("queued answer")])
+    session_id = "sess_prior_revision_40_envelope"
+    _create_resumable_session(h.app, session_id)
+
+    async def scenario() -> tuple[DispatchHandle | None, Task]:
+        request = _dispatch_request(session_id, "d_prior_revision_40_envelope")
+        queue_task_id = _queued_dispatch_task_id(request, task_type=_DISPATCH_TASK_TYPE)
+        envelope = await h.app._prepare_queued_dispatch(
+            request,
+            queue_task_id=queue_task_id,
+        )
+        persisted = envelope.model_dump(mode="json")
+        persisted.pop("operation_kind")
+        persisted.pop("prepared_subagent")
+        binding = await h.app.session_invocation_for_dispatch(session_id)
+        await h.tasks.create_task(
+            task_create_with_runtime_invocation(
+                TaskCreate(
+                    task_id=queue_task_id,
+                    type=_DISPATCH_TASK_TYPE,
+                    parent_task_id=request.task_id,
+                    input={"dispatch": persisted},
+                ),
+                source=TaskExecutionSource.TASK_DISPATCH,
+                session_invocation=binding,
+            )
+        )
+        handle = await h.dispatcher.process_next(
+            h.app,
+            worker_id="worker_prior_revision_40_envelope",
+        )
+        task = await h.tasks.load_task(queue_task_id)
+        assert task is not None
+        return handle, task
+
+    handle, task = asyncio.run(scenario())
+
+    assert handle is not None
+    assert handle.status is DispatchStatus.COMPLETED
+    assert task.status is TaskStatus.COMPLETED
+    assert len(h.provider.requests) == 2
 
 
 def test_submit_redacts_workload_secrets_before_durable_dispatch_write() -> None:
@@ -3795,6 +3841,14 @@ def test_crashed_queued_run_recovery_preserves_terminal_identity_and_does_not_re
 def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:
     with pytest.raises(ValueError, match="recover_stalled_sessions_after_seconds"):
         TaskStoreDispatcher(InMemoryTaskStore(), recover_stalled_sessions_after_seconds=-1)
+
+
+def test_prepared_subagent_task_type_suffix_is_reserved() -> None:
+    with pytest.raises(ValueError, match="reserved prepared-subagent task-type suffix"):
+        TaskStoreDispatcher(
+            InMemoryTaskStore(),
+            task_type="acme.dispatch.prepared-subagent.v1",
+        )
 
 
 def test_missing_session_is_rejected_before_queue_publication() -> None:

@@ -85,12 +85,19 @@ def suppress_interruption_cascade() -> Iterator[None]:
 
 def _is_background_subagent_session(session: Session) -> bool:
     subagent = session.metadata.get("subagent")
-    return isinstance(subagent, dict) and subagent.get("mode") == "background"
+    return isinstance(subagent, dict) and subagent.get("mode") in {
+        "background",
+        "durable",
+    }
 
 
 def _is_subagent_session(session: Session) -> bool:
     subagent = session.metadata.get("subagent")
-    return isinstance(subagent, dict) and subagent.get("mode") in {"foreground", "background"}
+    return isinstance(subagent, dict) and subagent.get("mode") in {
+        "foreground",
+        "background",
+        "durable",
+    }
 
 
 def _interruption_cascade_marker_datetime(marker: dict[str, Any], key: str) -> datetime | None:

@@ -705,6 +705,7 @@ SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
 SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
 
 _RUNTIME_SESSION_CREATE_CLAIM_TOKEN = object()
+_RUNTIME_PREPARED_SESSION_AUTHORITY_TOKEN = object()
 _RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN = object()
 _RUNTIME_RESUME_TRANSPORT_METADATA_KEYS = frozenset({"traceparent", "tracestate"})
 
@@ -741,6 +742,34 @@ class _RuntimeSessionCreateClaim:
         # runtime authority. The explicit RunRequest copier authenticates and
         # preserves the original handoff instead.
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimePreparedSessionAuthority:
+    """Process-local proof that a claimed queue task may start one PENDING session."""
+
+    token: object
+    session_id: str
+    queue_task_id: str
+    dispatch_operation_id: str
+    terminal_event_id: str
+    interaction_id: str
+    interaction_started_event_id: str
+    idempotency_key: str
+    submission_sha256: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "session_id",
+            "queue_task_id",
+            "dispatch_operation_id",
+            "terminal_event_id",
+            "interaction_id",
+            "interaction_started_event_id",
+            "idempotency_key",
+            "submission_sha256",
+        ):
+            require_clean_nonblank(getattr(self, field_name), field_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -997,6 +1026,7 @@ class RunRequest(BaseModel):
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
     _runtime_task_invocation: TaskInvocationSnapshot | None = PrivateAttr(default=None)
+    _runtime_prepared_session_authority: object | None = PrivateAttr(default=None)
 
     @field_validator("messages")
     @classmethod
@@ -2274,6 +2304,7 @@ class SessionInvocationAdmission:
     execution_profile_decision: ExecutionProfileDecision | None = None
     expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None
     allow_unprofiled_derived_session: bool = False
+    allow_pending_initial_interaction: bool = False
 
     def __post_init__(self) -> None:
         if type(self.from_statuses) is not frozenset or not self.from_statuses:
@@ -2291,6 +2322,8 @@ class SessionInvocationAdmission:
         )
         if type(self.allow_unprofiled_derived_session) is not bool:
             raise TypeError("allow_unprofiled_derived_session must be a boolean.")
+        if type(self.allow_pending_initial_interaction) is not bool:
+            raise TypeError("allow_pending_initial_interaction must be a boolean.")
         if type(self.interaction_source_messages) is not tuple:
             raise TypeError("interaction_source_messages must be a tuple.")
         object.__setattr__(
@@ -2356,9 +2389,17 @@ class SessionInvocationAdmission:
                 raise ValueError(
                     "An unprofiled derived session cannot carry an execution-profile decision."
                 )
-            if self.defer_interaction_source:
+            if self.defer_interaction_source and not self.allow_pending_initial_interaction:
                 raise ValueError("A new interaction cannot defer its source messages.")
+            if self.allow_pending_initial_interaction and (
+                self.from_statuses != frozenset({SessionStatus.PENDING})
+                or not self.defer_interaction_source
+                or self.execution_profile_decision is not None
+            ):
+                raise ValueError("A prepared initial interaction requires exact PENDING admission.")
             return
+        if self.allow_pending_initial_interaction:
+            raise ValueError("Only a new interaction can admit a prepared PENDING session.")
         if self.allow_unprofiled_derived_session:
             raise ValueError(
                 "Only a new invocation can establish authority for an unprofiled derived session."
@@ -6087,6 +6128,7 @@ class SessionStore(ABC):
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
     supports_execution_profile_admission: ClassVar[bool] = False
     supports_active_invocation_execution_profiles: ClassVar[bool] = False
+    supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @property
@@ -6160,8 +6202,12 @@ class SessionStore(ABC):
         With admission, create the session directly in ``RUNNING``, claim its
         first run epoch, and persist the start event plus deferred source batch
         in the same transaction. Both optional arguments are supplied together.
-        When supplied with an admitted interaction, ``checkpoint_transform``
-        projects the initial authority marker inside that same transaction.
+        ``checkpoint_transform`` projects initial authority inside the same
+        transaction. Without admission, stores that advertise
+        ``supports_pending_session_initial_checkpoint`` invoke it with a
+        ``PENDING`` session and no current checkpoint. Stores that do not
+        advertise that capability must reject such a request before creating
+        the session.
         """
 
     @abstractmethod
@@ -7448,8 +7494,10 @@ class SessionStore(ABC):
 
         Raises ``ValueError`` if the session is in-flight (``RUNNING`` or
         ``INTERRUPTING`` — interrupt it first), has incomplete current-run terminal
-        evidence, or if one of its accepted budget reservations has no fully
-        delivered terminal settlement audit event.
+        evidence, still owns a durable subagent child, or if one of its accepted
+        budget reservations has no fully delivered terminal settlement audit event.
+        Durable subagent children must be settled and deleted before their parent so
+        deletion cannot erase queue-admission authority while child work still exists.
         Idempotent: deleting a session that does not exist is a no-op.
 
         Default raises ``NotImplementedError`` so out-of-tree stores keep working.
@@ -7700,6 +7748,7 @@ class InMemorySessionStore(SessionStore):
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
+    supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
@@ -8244,6 +8293,18 @@ class InMemorySessionStore(SessionStore):
                 metadata=session_metadata_for_creation(request.metadata, identity=identity),
                 run_epoch=1 if admission is not None else 0,
             )
+            pending_checkpoint: _PreparedInMemoryCheckpointStore | None = None
+            if admission is None and checkpoint_transform is not None:
+                transformed = checkpoint_transform(session.model_copy(deep=True), None)
+                if transformed is not None:
+                    copied_checkpoint = copy_durable_json_object(
+                        transformed,
+                        "checkpoint",
+                    )
+                    pending_checkpoint = self._prepare_checkpoint_store_unlocked(
+                        session.id,
+                        copied_checkpoint,
+                    )
             self._register_private_authority_alias_unlocked(
                 session.id,
                 field_name="session_id",
@@ -8283,6 +8344,8 @@ class InMemorySessionStore(SessionStore):
                 )
                 session = self._sessions[session.id]
                 _activate_session_run_fence(session)
+            elif pending_checkpoint is not None:
+                self._apply_checkpoint_store_unlocked(session.id, pending_checkpoint)
             return session.model_copy(deep=True)
 
     async def create_fork(
@@ -8533,6 +8596,12 @@ class InMemorySessionStore(SessionStore):
                     f"Cannot delete a session while it is {session.status}; "
                     f"interrupt it first: {session_id}"
                 )
+            for _, child_id in self._child_session_keys_by_parent.get(session_id, []):
+                child = self._sessions.get(child_id)
+                if child is None or child.parent_session_id != session_id:
+                    raise RuntimeError("Inconsistent in-memory session topology index.")
+                if _is_durable_subagent_child(child):
+                    raise ValueError(_durable_subagent_parent_delete_block_reason(child.id))
             checkpoint = self._checkpoints.get(session_id)
             deletion_now = datetime.now(UTC)
             active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
@@ -12553,7 +12622,65 @@ def copy_run_request(request: RunRequest) -> RunRequest:
             invocation=copy_task_invocation(request._runtime_task_invocation.invocation),
         )
     )
+    prepared_authority = request._runtime_prepared_session_authority
+    copied._runtime_prepared_session_authority = (
+        prepared_authority
+        if type(prepared_authority) is _RuntimePreparedSessionAuthority
+        and prepared_authority.token is _RUNTIME_PREPARED_SESSION_AUTHORITY_TOKEN
+        else None
+    )
     return copied
+
+
+def run_request_with_prepared_session_authority(
+    request: RunRequest,
+    *,
+    session_id: str,
+    queue_task_id: str,
+    dispatch_operation_id: str,
+    terminal_event_id: str,
+    interaction_id: str,
+    interaction_started_event_id: str,
+    idempotency_key: str,
+    submission_sha256: str,
+) -> RunRequest:
+    """Bind a validated claimed queue operation to one pre-created child session."""
+
+    copied = copy_run_request(request)
+    if copied.session_id != session_id:
+        raise ValueError("Prepared session authority conflicts with the run request.")
+    copied._runtime_prepared_session_authority = _RuntimePreparedSessionAuthority(
+        token=_RUNTIME_PREPARED_SESSION_AUTHORITY_TOKEN,
+        session_id=session_id,
+        queue_task_id=queue_task_id,
+        dispatch_operation_id=dispatch_operation_id,
+        terminal_event_id=terminal_event_id,
+        interaction_id=interaction_id,
+        interaction_started_event_id=interaction_started_event_id,
+        idempotency_key=idempotency_key,
+        submission_sha256=submission_sha256,
+    )
+    return copied
+
+
+def runtime_prepared_session_authority(
+    request: RunRequest,
+) -> _RuntimePreparedSessionAuthority | None:
+    """Return authenticated prepared-session authority, clearing malformed copies."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Prepared session authority requires a RunRequest.")
+    authority = request._runtime_prepared_session_authority
+    if authority is None:
+        return None
+    if (
+        type(authority) is not _RuntimePreparedSessionAuthority
+        or authority.token is not _RUNTIME_PREPARED_SESSION_AUTHORITY_TOKEN
+        or authority.session_id != request.session_id
+    ):
+        request._runtime_prepared_session_authority = None
+        return None
+    return authority
 
 
 def run_request_with_runtime_invocation(
@@ -18805,6 +18932,23 @@ _TERMINAL_PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
         _PENDING_TOOL_ROUND_CHECKPOINT_KEY,
     }
 )
+
+
+def _is_durable_subagent_child(session: Session) -> bool:
+    """Return positive runtime metadata evidence for a task-backed subagent child."""
+
+    if type(session) is not Session:
+        raise TypeError("Durable subagent child classification requires an exact session.")
+    subagent = session.metadata.get("subagent")
+    return type(subagent) is dict and subagent.get("mode") == "durable"
+
+
+def _durable_subagent_parent_delete_block_reason(child_session_id: str) -> str:
+    child_session_id = require_clean_nonblank(child_session_id, "child_session_id")
+    return (
+        "Cannot delete a session while durable subagent child authority still exists; "
+        f"settle and delete the child first: {child_session_id}"
+    )
 
 
 def _terminal_publication_delete_block_reason(

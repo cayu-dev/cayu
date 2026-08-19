@@ -88,6 +88,15 @@ from cayu.runtime._diagnostics import (
     task_failure_payload_from_diagnostic,
     task_update_error_payload,
 )
+from cayu.runtime._durable_subagents import (
+    durable_subagent_submission_from_checkpoint,
+    durable_subagent_submission_receipt_from_checkpoint,
+    durable_subagent_submission_seed_from_checkpoint,
+    durable_subagent_submissions_from_checkpoint,
+    require_durable_subagent_intent_matches_seed,
+    require_durable_subagent_receipt_matches_intent,
+    require_durable_subagent_receipt_matches_seed,
+)
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
@@ -155,6 +164,11 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary
+from cayu.runtime.dispatch import (
+    _new_prepared_subagent_dispatch_envelope,
+    _require_dispatch_task_authority,
+    _task_matches_queued_dispatch,
+)
 from cayu.runtime.errors import InteractionLifecyclePublicationRejected
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -176,6 +190,7 @@ from cayu.runtime.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
+from cayu.runtime.invocation import SessionExecutionSource, inherited_session_invocation
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
@@ -222,6 +237,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_run_fence,
     _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
+    _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
     copy_interaction_transition_spec,
@@ -237,7 +253,7 @@ from cayu.runtime.structured_output import (
 from cayu.runtime.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
 )
-from cayu.runtime.tasks import Task, TaskStore
+from cayu.runtime.tasks import Task, TaskStatus, TaskStore
 from cayu.runtime.tool_policy import ToolPolicyDecision
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
@@ -7848,6 +7864,7 @@ class RecoveryCoordinator:
             registered_agent=request.registered_agent,
             tool_round_id=request.tool_round_identity.tool_round_id,
             outcomes=interrupted_results,
+            source_checkpoint=source_checkpoint,
         )
         cancellation_redactors = request.cancellation_redactors_by_id or {}
         interrupted_results = [
@@ -8409,29 +8426,70 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         tool_round_id: str | None,
         outcomes: list[runtime_records.ToolCallOutcome],
+        source_checkpoint: dict[str, Any] | None,
     ) -> list[runtime_records.ToolCallOutcome]:
         """Replace unfinished spawn outcomes with matching durable child references."""
         if tool_round_id is None or not outcomes:
             return outcomes
         children = await self._subagent_children_by_idempotency_key(session.id)
-        if not children:
-            return outcomes
         reattached: list[runtime_records.ToolCallOutcome] = []
         for outcome in outcomes:
-            result = self._reattached_subagent_result(
+            idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=tool_round_id,
+                tool_call_id=outcome.call.id,
+            )
+            marker_backed = (
+                durable_subagent_submission_seed_from_checkpoint(
+                    source_checkpoint,
+                    idempotency_key=idempotency_key,
+                )
+                is not None
+                or durable_subagent_submission_from_checkpoint(
+                    source_checkpoint,
+                    idempotency_key=idempotency_key,
+                )
+                is not None
+                or durable_subagent_submission_receipt_from_checkpoint(
+                    source_checkpoint,
+                    idempotency_key=idempotency_key,
+                )
+                is not None
+            )
+            if idempotency_key not in children and not marker_backed:
+                reattached.append(outcome)
+                continue
+            recovery_arguments = self._subagent_recovery_arguments(
+                checkpoint=source_checkpoint,
+                parent_session=session,
+                tool_name=outcome.call.name,
+                tool_round_id=tool_round_id,
+                tool_call_id=outcome.call.id,
+                idempotency_key=idempotency_key,
+                fallback=outcome.call.arguments,
+            )
+            reconciled_result = await self._reconcile_subagent_child(
                 children,
-                tool_execution.tool_idempotency_key(
-                    session_id=session.id,
-                    tool_round_id=tool_round_id,
-                    tool_call_id=outcome.call.id,
-                ),
+                idempotency_key=idempotency_key,
                 tool_call_id=outcome.call.id,
                 tool_name=outcome.call.name,
                 tool_round_id=tool_round_id,
-                arguments=outcome.call.arguments,
+                arguments=recovery_arguments,
                 parent_session=session,
                 registered_agent=registered_agent,
             )
+            result = reconciled_result
+            if result is None:
+                result = self._reattached_subagent_result(
+                    children,
+                    idempotency_key,
+                    tool_call_id=outcome.call.id,
+                    tool_name=outcome.call.name,
+                    tool_round_id=tool_round_id,
+                    arguments=recovery_arguments,
+                    parent_session=session,
+                    registered_agent=registered_agent,
+                )
             if result is not None and outcome.result.artifacts:
                 result = result.model_copy(
                     update={
@@ -8696,10 +8754,12 @@ class RecoveryCoordinator:
             pending_round=pending_round,
         )
         subagent_children: dict[str, Session | None] = {}
+        subagent_recovery_checkpoint: dict[str, Any] | None = None
         if any(
             recorded_outcomes.get(call.tool_call_id) is None for call in pending_round.tool_calls
         ):
             subagent_children = await self._subagent_children_by_idempotency_key(session.id)
+            subagent_recovery_checkpoint = await self._session_store.load_checkpoint(session.id)
         synthesized_outcomes: list[runtime_records.ToolCallOutcome] = []
         for pending_tool_call in pending_round.tool_calls:
             recorded_outcome = recorded_outcomes.get(pending_tool_call.tool_call_id)
@@ -8716,16 +8776,37 @@ class RecoveryCoordinator:
                 tool_round_id=pending_round.tool_round_id,
                 tool_call_id=pending_tool_call.tool_call_id,
             )
-            result = self._reattached_subagent_result(
+            recovery_arguments = self._subagent_recovery_arguments(
+                checkpoint=subagent_recovery_checkpoint,
+                parent_session=session,
+                tool_name=pending_tool_call.tool_name,
+                tool_round_id=pending_round.tool_round_id,
+                tool_call_id=pending_tool_call.tool_call_id,
+                idempotency_key=expected_idempotency_key,
+                fallback=tool_call.arguments,
+            )
+            reconciled_result = await self._reconcile_subagent_child(
                 subagent_children,
-                expected_idempotency_key,
+                idempotency_key=expected_idempotency_key,
                 tool_call_id=pending_tool_call.tool_call_id,
                 tool_name=pending_tool_call.tool_name,
                 tool_round_id=pending_round.tool_round_id,
-                arguments=tool_call.arguments,
+                arguments=recovery_arguments,
                 parent_session=session,
                 registered_agent=registered_agent,
             )
+            result = reconciled_result
+            if result is None:
+                result = self._reattached_subagent_result(
+                    subagent_children,
+                    expected_idempotency_key,
+                    tool_call_id=pending_tool_call.tool_call_id,
+                    tool_name=pending_tool_call.tool_name,
+                    tool_round_id=pending_round.tool_round_id,
+                    arguments=recovery_arguments,
+                    parent_session=session,
+                    registered_agent=registered_agent,
+                )
             if result is None:
                 result = tool_round_recovery.unknown_recovered_tool_result(
                     pending_tool_call=pending_tool_call,
@@ -9269,6 +9350,150 @@ class RecoveryCoordinator:
             metadata=request.metadata,
         )
 
+    async def _pending_durable_subagent_recovery_guard(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        previous_status: SessionStatus,
+    ) -> IncompleteSessionRecoveryResult | None:
+        """Keep one prepared child under its queue owner instead of abandoning it."""
+
+        if session.status is not SessionStatus.PENDING or session.run_epoch != 0:
+            return None
+        intents = durable_subagent_submissions_from_checkpoint(checkpoint)
+        subagent = session.metadata.get("subagent")
+        if not intents:
+            if type(subagent) is dict and subagent.get("mode") == "durable":
+                raise RuntimeError("Pending durable subagent has no prepared execution intent.")
+            return None
+        if len(intents) != 1:
+            raise RuntimeError("Pending durable subagent has ambiguous execution intents.")
+        intent = intents[0]
+        idempotency_key = intent.idempotency_key
+        if (
+            type(subagent) is not dict
+            or subagent.get("mode") != "durable"
+            or subagent.get("idempotency_key") != idempotency_key
+        ):
+            raise RuntimeError("Pending durable subagent has conflicting spawn metadata.")
+        parent = await self._session_store.load(intent.parent_session_id)
+        if parent is None:
+            raise RuntimeError("Pending durable subagent has no durable parent session.")
+        parent_checkpoint = await self._session_store.load_checkpoint(parent.id)
+        parent_intent = durable_subagent_submission_from_checkpoint(
+            parent_checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        parent_seed = durable_subagent_submission_seed_from_checkpoint(
+            parent_checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        parent_receipt = durable_subagent_submission_receipt_from_checkpoint(
+            parent_checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        if parent_intent is not None and parent_seed is not None and parent_receipt is None:
+            require_durable_subagent_intent_matches_seed(parent_intent, parent_seed)
+            parent_authority_matches = parent_intent == intent
+        elif parent_intent is None and parent_receipt is not None:
+            require_durable_subagent_receipt_matches_intent(parent_receipt, intent)
+            if parent_seed is not None:
+                require_durable_subagent_intent_matches_seed(intent, parent_seed)
+                require_durable_subagent_receipt_matches_seed(parent_receipt, parent_seed)
+            parent_authority_matches = True
+        else:
+            raise RuntimeError(
+                "Pending durable subagent has incomplete parent submission authority."
+            )
+        if (
+            not parent_authority_matches
+            or intent.child_session_id != session.id
+            or intent.parent_session_instance_fingerprint
+            != _queued_dispatch_session_instance_fingerprint(parent)
+            or session.parent_session_id != parent.id
+            or session.causal_budget_id != intent.causal_budget_id
+            or session.agent_name != intent.agent_name
+            or session.provider_name != intent.child_provider_name
+            or session.model != intent.child_model
+            or session.environment_name != intent.environment_name
+            or session.invocation
+            != inherited_session_invocation(
+                parent.invocation,
+                source=SessionExecutionSource.SUBAGENT,
+            )
+            or execution_profile_from_session_metadata(session.metadata)
+            != intent.child_execution_profile
+            or session.metadata.get("subagent") != intent.request.metadata.get("subagent")
+        ):
+            raise RuntimeError(
+                "Pending durable subagent conflicts with its prepared execution authority."
+            )
+
+        if self._task_store is None:
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                events=(),
+                message=(
+                    "Prepared durable subagent requires its task store for reconciliation; "
+                    "generic abandonment recovery skipped."
+                ),
+            )
+        task = await self._task_store.load_task(intent.queue_task_id)
+        if task is None:
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                events=(),
+                message=(
+                    "Prepared durable subagent is awaiting recoverable parent queue "
+                    "publication; generic abandonment recovery skipped."
+                ),
+            )
+        envelope = _new_prepared_subagent_dispatch_envelope(
+            intent=intent,
+            session_instance_fingerprint=_queued_dispatch_session_instance_fingerprint(session),
+        )
+        if not _task_matches_queued_dispatch(
+            task,
+            task_type=intent.queue_task_type,
+            parent_task_id=intent.parent_task_id,
+            envelope=envelope,
+        ):
+            raise RuntimeError("Pending durable subagent queue task has conflicting authority.")
+        parent_binding = await self._session_store.load_invocation_snapshot(parent.id)
+        if parent_binding is None:
+            raise RuntimeError("Pending durable subagent parent invocation is unavailable.")
+        _require_dispatch_task_authority(
+            task,
+            envelope=envelope,
+            session_binding=parent_binding,
+            task_type=intent.queue_task_type,
+        )
+        if task.status is TaskStatus.COMPLETED:
+            raise RuntimeError("Pending durable subagent conflicts with a terminal queue task.")
+        if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            # Exact queue authority proves that no worker can admit this child.
+            # Let ordinary claimed recovery durably close the pristine pending
+            # session rather than preserving it as live work forever.
+            return None
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=previous_status,
+            status=session.status,
+            actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+            events=(),
+            message=(
+                "Prepared durable subagent remains owned by its exact nonterminal queue task; "
+                "generic abandonment recovery skipped."
+            ),
+        )
+
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
@@ -9531,6 +9756,13 @@ class RecoveryCoordinator:
             raise RuntimeError(
                 "Active invocation execution profile does not match the recovery epoch."
             )
+        durable_child_guard = await self._pending_durable_subagent_recovery_guard(
+            session=session,
+            checkpoint=checkpoint,
+            previous_status=previous_status,
+        )
+        if durable_child_guard is not None:
+            return durable_child_guard
         pending_approval = approval_support.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -12007,6 +12239,33 @@ class RecoveryCoordinator:
         ):
             actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
 
+        if (
+            pending_tool_round is not None
+            and pending_approval is None
+            and pending_user_input is None
+        ):
+            pending_durable_children = await self._pending_durable_subagent_children(
+                session=session,
+                checkpoint=checkpoint,
+                pending_round=pending_tool_round,
+                registered_agent=registered_agent,
+            )
+            if pending_durable_children:
+                statuses = sorted({child.status.value for child in pending_durable_children})
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    events=tuple(events),
+                    message=(
+                        "Durable subagent work is still active; the parent tool round "
+                        "remains pending until child completion is durable "
+                        f"(children={len(pending_durable_children)}, "
+                        f"statuses={','.join(statuses)})."
+                    ),
+                )
+
         if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
             if pending_approval is not None:
                 interrupt_payload = {
@@ -12301,6 +12560,159 @@ class RecoveryCoordinator:
                 # whichever child happened to be listed last.
                 children[idempotency_key] = None if idempotency_key in children else child
         return children
+
+    async def _pending_durable_subagent_children(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        pending_round: tool_round_recovery.PendingToolRound,
+        registered_agent: runtime_records.RegisteredAgentState,
+    ) -> tuple[Session, ...]:
+        """Reconcile durable submissions without closing live child work as unknown."""
+
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=session.id,
+            pending_round=pending_round,
+        )
+        recorded_outcomes, _started_ids = tool_round_recovery.recorded_tool_outcomes(
+            events=lifecycle_events,
+            pending_round=pending_round,
+        )
+        children = await self._subagent_children_by_idempotency_key(session.id)
+        pending: list[Session] = []
+        for call in pending_round.tool_calls:
+            if recorded_outcomes.get(call.tool_call_id) is not None:
+                continue
+            idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=pending_round.tool_round_id,
+                tool_call_id=call.tool_call_id,
+            )
+            recovery_arguments = self._subagent_recovery_arguments(
+                checkpoint=checkpoint,
+                parent_session=session,
+                tool_name=call.tool_name,
+                tool_round_id=pending_round.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                idempotency_key=idempotency_key,
+                fallback=call.arguments,
+            )
+            await self._reconcile_subagent_child(
+                children,
+                idempotency_key=idempotency_key,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                tool_round_id=pending_round.tool_round_id,
+                arguments=recovery_arguments,
+                parent_session=session,
+                registered_agent=registered_agent,
+            )
+            child = children.get(idempotency_key)
+            if child is None:
+                continue
+            subagent = child.metadata.get("subagent")
+            if (
+                isinstance(subagent, dict)
+                and subagent.get("mode") == "durable"
+                and child.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES
+            ):
+                pending.append(child.model_copy(deep=True))
+        return tuple(pending)
+
+    @staticmethod
+    def _subagent_recovery_arguments(
+        *,
+        checkpoint: dict[str, Any] | None,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Restore post-hook arguments only from the exact durable spawn seed."""
+
+        seed = durable_subagent_submission_seed_from_checkpoint(
+            checkpoint,
+            idempotency_key=idempotency_key,
+        )
+        if seed is None:
+            intent = durable_subagent_submission_from_checkpoint(
+                checkpoint,
+                idempotency_key=idempotency_key,
+            )
+            if intent is not None:
+                raise RuntimeError(
+                    "Durable subagent submission intent has no effective-argument seed."
+                )
+            copied = copy_json_value(fallback, "subagent_recovery.arguments")
+            if type(copied) is not dict:
+                raise TypeError("Subagent recovery arguments must be an object.")
+            return copied
+        if (
+            seed.parent_session_id != parent_session.id
+            or seed.parent_session_instance_fingerprint
+            != _queued_dispatch_session_instance_fingerprint(parent_session)
+            or seed.tool_name != tool_name
+            or seed.tool_round_id != tool_round_id
+            or seed.tool_call_id != tool_call_id
+            or seed.idempotency_key != idempotency_key
+        ):
+            raise RuntimeError(
+                "Durable subagent effective-argument authority conflicts with its tool call."
+            )
+        copied = copy_json_value(
+            seed.effective_arguments,
+            "durable_subagent_recovery.effective_arguments",
+        )
+        if type(copied) is not dict:
+            raise AssertionError("Durable subagent effective arguments must be an object.")
+        return copied
+
+    @staticmethod
+    async def _reconcile_subagent_child(
+        children: dict[str, Session | None],
+        *,
+        idempotency_key: str,
+        tool_call_id: str,
+        tool_name: str,
+        tool_round_id: str,
+        arguments: dict[str, Any],
+        parent_session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+    ) -> ToolResult | None:
+        if idempotency_key in children and children[idempotency_key] is None:
+            # Multiple children already claim this exact spawn identity. A
+            # repair callback must not erase that contradiction by returning
+            # whichever deterministic child it can load independently.
+            return None
+        registered_tool = registered_agent.tools.get(tool_name)
+        if registered_tool is None or registered_tool.child_session_recovery is None:
+            return None
+        matcher = registered_tool.child_session_recovery
+        reconciled = await matcher.reconcile_recoverable_child(
+            children.get(idempotency_key),
+            parent_session=parent_session,
+            tool_name=tool_name,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_id,
+            idempotency_key=idempotency_key,
+            arguments=copy_json_value(arguments, "subagent_recovery.arguments"),
+        )
+        if reconciled is not None and type(reconciled) not in {Session, ToolResult}:
+            raise TypeError(
+                "Child-session reconciliation must return a Session, ToolResult, or None."
+            )
+        if type(reconciled) is ToolResult:
+            return reconciled.model_copy(deep=True)
+        if type(reconciled) is Session:
+            existing = children.get(idempotency_key)
+            if existing is not None and existing.id != reconciled.id:
+                children[idempotency_key] = None
+            else:
+                children[idempotency_key] = reconciled
+        return None
 
     @staticmethod
     def _reattached_subagent_result(

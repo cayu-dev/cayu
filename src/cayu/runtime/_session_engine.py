@@ -80,6 +80,7 @@ from cayu.core.tools import (
 )
 from cayu.environments import (
     EnvironmentFactoryOperation,
+    WorkspaceInstructions,
 )
 from cayu.providers import (
     ModelProvider,
@@ -110,6 +111,15 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
     task_failure_payload_from_diagnostic,
     task_update_error_payload,
+)
+from cayu.runtime._durable_subagents import (
+    DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY,
+    DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
+    durable_subagent_authority_rejected,
+    durable_subagent_request_sha256,
+    durable_subagent_submission_from_checkpoint,
+    durable_subagent_worker_incompatible,
+    is_durable_subagent_submission_unsettled,
 )
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
@@ -431,6 +441,7 @@ from cayu.runtime.sessions import (
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
     run_request_with_task_invocation,
+    runtime_prepared_session_authority,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     session_input_contract_evidence,
@@ -2578,6 +2589,21 @@ def _require_native_structured_output_support(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedInitialRun:
+    """Validated new-session material frozen before the store creation boundary."""
+
+    request: RunRequest
+    registered_agent: runtime_records.RegisteredAgentState
+    registered_provider: runtime_records.RegisteredProvider
+    registered_environment: runtime_records.RegisteredEnvironment | None
+    workspace_instructions: WorkspaceInstructions | None
+    rendered_system_prompt: str | None
+    prompt_contributions: tuple[Any, ...]
+    execution_profile: ExecutionProfileIdentity
+    session_identity: SessionIdentity
+
+
 def _session_identity(
     *,
     provider_name: str,
@@ -2950,6 +2976,14 @@ def _replace_checkpoint_preserving_runtime_state(
             (
                 _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
                 "incomplete_session_recovery_claim",
+            ),
+            (
+                DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY,
+                "durable_subagent_submission_seeds",
+            ),
+            (
+                DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
+                "durable_subagent_submissions",
             ),
         ):
             updated.pop(key, None)
@@ -4414,8 +4448,11 @@ class SessionEngine:
         agent_name: str,
         environment_name: str | None,
         interaction_id: str,
+        event_id: str | None = None,
     ) -> Event:
-        event_id = str(uuid4())
+        event_id = (
+            str(uuid4()) if event_id is None else require_clean_nonblank(event_id, "event_id")
+        )
         started_at = self._clock()
         evidence = InteractionSummaryEvidence(
             status=InteractionStatus.ACTIVE,
@@ -5107,7 +5144,9 @@ class SessionEngine:
             status=InteractionStatus.ACTIVE,
         )
 
-    async def run(self, request: RunRequest) -> AsyncGenerator[Event, None]:
+    async def _prepare_initial_run(self, request: RunRequest) -> _PreparedInitialRun:
+        """Resolve one new-session request without creating or admitting a session."""
+
         request = session_request_boundary.prepare_run_request(
             request,
             redactor=self._secret_redactor,
@@ -5176,53 +5215,140 @@ class SessionEngine:
         )
         if request.session_id is None:
             request = request.model_copy(update={"session_id": str(uuid4())})
-        session_id = request.session_id
-        if session_id is None:
+        if request.session_id is None:
             raise AssertionError("Run request session identity was not assigned.")
         if request.task_id is not None and self.task_store is not None:
             source_task = await self.task_store.load_invocation_snapshot(request.task_id)
-            if source_task is not None and source_task.session_id in {None, session_id}:
+            if source_task is not None and source_task.session_id in {None, request.session_id}:
                 request = run_request_with_task_invocation(
                     request,
                     source_task,
                 )
-        interaction_id = str(uuid4())
-        interaction_started_event = self._interaction_started_event_from_identity(
-            session_id=session_id,
-            agent_name=registered_agent.spec.name,
-            environment_name=_environment_name(registered_environment),
-            interaction_id=interaction_id,
-        )
         session_identity = _session_identity(
             provider_name=registered_provider.name,
             model=model,
             execution_profile=execution_profile,
         )
-        bind_runtime_session_create_claim(
-            request,
-            identity=session_identity,
-            interaction_started_event=interaction_started_event,
+        return _PreparedInitialRun(
+            request=request,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            workspace_instructions=workspace_instructions,
+            rendered_system_prompt=rendered_system_prompt,
+            prompt_contributions=tuple(prompt_contributions),
+            execution_profile=execution_profile,
+            session_identity=session_identity,
         )
 
-        def freeze_initial_invocation_profile(
-            current_session: Session,
-            checkpoint: dict[str, Any] | None,
-        ) -> dict[str, Any]:
-            return checkpoint_with_active_invocation_execution_profile(
-                checkpoint,
-                session_id=current_session.id,
-                interaction_id=interaction_id,
-                run_epoch=current_session.run_epoch,
-                profile=execution_profile,
+    async def run(self, request: RunRequest) -> AsyncGenerator[Event, None]:
+        prepared = await self._prepare_initial_run(request)
+        request = prepared.request
+        registered_agent = prepared.registered_agent
+        registered_provider = prepared.registered_provider
+        registered_environment = prepared.registered_environment
+        workspace_instructions = prepared.workspace_instructions
+        rendered_system_prompt = prepared.rendered_system_prompt
+        prompt_contributions = list(prepared.prompt_contributions)
+        execution_profile = prepared.execution_profile
+        session_identity = prepared.session_identity
+        # ``prepared`` also retains the registered provider, whose repr may contain
+        # live credentials. Keep the deliberately scoped provider local below as the
+        # sole remaining reference so the existing cancellation cleanup can drop it
+        # before a traceback escapes this frame.
+        del prepared
+        session_id = request.session_id
+        if session_id is None:
+            raise AssertionError("Run request session identity was not assigned.")
+        prepared_session_authority = runtime_prepared_session_authority(request)
+        interaction_id = (
+            str(uuid4())
+            if prepared_session_authority is None
+            else prepared_session_authority.interaction_id
+        )
+        interaction_started_event = self._interaction_started_event_from_identity(
+            session_id=session_id,
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            interaction_id=interaction_id,
+            event_id=(
+                None
+                if prepared_session_authority is None
+                else prepared_session_authority.interaction_started_event_id
+            ),
+        )
+        if prepared_session_authority is None:
+            bind_runtime_session_create_claim(
+                request,
+                identity=session_identity,
+                interaction_started_event=interaction_started_event,
             )
 
-        session = await self.session_store.create(
-            request,
-            identity=session_identity,
-            interaction_started_event=interaction_started_event,
-            interaction_source_messages=request.messages,
-            checkpoint_transform=freeze_initial_invocation_profile,
-        )
+            def freeze_initial_invocation_profile(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                return checkpoint_with_active_invocation_execution_profile(
+                    checkpoint,
+                    session_id=current_session.id,
+                    interaction_id=interaction_id,
+                    run_epoch=current_session.run_epoch,
+                    profile=execution_profile,
+                )
+
+            session = await self.session_store.create(
+                request,
+                identity=session_identity,
+                interaction_started_event=interaction_started_event,
+                interaction_source_messages=request.messages,
+                checkpoint_transform=freeze_initial_invocation_profile,
+            )
+        else:
+
+            def validate_prepared_submission(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                try:
+                    intent = durable_subagent_submission_from_checkpoint(
+                        checkpoint,
+                        idempotency_key=prepared_session_authority.idempotency_key,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise durable_subagent_authority_rejected() from exc
+                if intent is None:
+                    raise durable_subagent_authority_rejected()
+                if intent.child_execution_profile != execution_profile:
+                    raise durable_subagent_worker_incompatible()
+                if (
+                    intent.child_session_id != current_session.id
+                    or intent.queue_task_id != prepared_session_authority.queue_task_id
+                    or intent.submission_sha256 != prepared_session_authority.submission_sha256
+                    or intent.interaction_id != interaction_id
+                    or intent.interaction_started_event_id != interaction_started_event.id
+                    or intent.request_sha256 != durable_subagent_request_sha256(request)
+                ):
+                    raise durable_subagent_authority_rejected()
+                return _checkpoint_with_session_run_operation(
+                    checkpoint=checkpoint,
+                    current_session=current_session,
+                    operation_id=prepared_session_authority.dispatch_operation_id,
+                    terminal_event_id=prepared_session_authority.terminal_event_id,
+                    queue_task_id=prepared_session_authority.queue_task_id,
+                )
+
+            session = await self.session_store.admit_session_invocation(
+                session_id,
+                admission=SessionInvocationAdmission(
+                    from_statuses=frozenset({SessionStatus.PENDING}),
+                    checkpoint_transform=validate_prepared_submission,
+                    execution_profile=execution_profile,
+                    interaction_source_messages=tuple(request.messages),
+                    interaction_started_event=interaction_started_event,
+                    defer_interaction_source=True,
+                    allow_pending_initial_interaction=True,
+                ),
+            )
         _activate_session_interaction(session.id, interaction_id)
         current_task = asyncio.current_task()
         active_factory_run: ActiveSessionRun[SessionUsageTracker] | None = None
@@ -5361,6 +5487,11 @@ class SessionEngine:
         except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
+            if is_durable_subagent_submission_unsettled(
+                exc,
+                parent_session_id=session.id,
+            ):
+                raise
             if _failure_carries_interaction_publication_rejection(
                 exc,
                 session_id=session.id,
@@ -5601,6 +5732,19 @@ class SessionEngine:
                             "prompt_contribution_manifest": (
                                 prompt_contribution_manifest.model_dump(mode="json")
                             )
+                        }
+                    ),
+                    **(
+                        {}
+                        if prepared_session_authority is None
+                        else {
+                            "dispatch_operation_id": (
+                                prepared_session_authority.dispatch_operation_id
+                            ),
+                            "queue_task_id": prepared_session_authority.queue_task_id,
+                            "durable_subagent_submission_sha256": (
+                                prepared_session_authority.submission_sha256
+                            ),
                         }
                     ),
                 },
@@ -10565,6 +10709,11 @@ class SessionEngine:
                 _deactivate_session_interaction(session.id)
             raise
         except Exception as exc:
+            if is_durable_subagent_submission_unsettled(
+                exc,
+                parent_session_id=session.id,
+            ):
+                raise
             try:
                 keep_recovery_interaction_open = False
                 if continuing_recovery_boundary:
@@ -13261,6 +13410,11 @@ class SessionEngine:
         except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
+            if is_durable_subagent_submission_unsettled(
+                exc,
+                parent_session_id=session.id,
+            ):
+                raise
             if _is_interaction_transition_run_fence(exc):
                 raise
             if _is_runtime_interaction_lifecycle_publication_rejection(

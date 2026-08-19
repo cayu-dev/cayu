@@ -77,6 +77,7 @@ CayuApp
   -> EnvironmentLifecycle
   -> ModelStepExecutor
   -> ToolRoundExecutor
+  -> DurableSubagentCoordinator
   -> RecoveryCoordinator
   -> SessionEngine
 ```
@@ -87,6 +88,11 @@ turn completion, and terminal hooks. `RecoveryCoordinator` owns durable paused
 continuations, manual outcome reconciliation, incomplete-session repair, and
 abandoned-run finalization. Model, tool, environment, limit, control, and event
 modules own their complete lower-level behavior slices.
+
+`DurableSubagentCoordinator` owns the staged parent seed, child-session, queue-task,
+receipt, and restart-reconciliation handoff for task-backed subagents. The application
+facade and task dispatcher reach it only through narrow preparation, settlement, and
+acknowledgement operations.
 
 Some collaborators need to call session orchestration but are constructed before
 `SessionEngine`. `CayuApp` supplies those edges as narrow typed callables; the

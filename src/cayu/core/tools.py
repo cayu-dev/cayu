@@ -4,8 +4,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from hashlib import sha256
 from math import isfinite
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from weakref import ReferenceType, ref
 
 from pydantic import (
     BaseModel,
@@ -21,6 +23,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
     freeze_json_value,
@@ -491,6 +494,90 @@ class KnowledgeStoreHandle(Protocol):
     async def list_entries(self, *args: Any, **kwargs: Any) -> Any: ...
 
     async def read_chunks(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeToolInvocationAuthority:
+    parent_task_id: str | None
+    parent_run_epoch: int
+    model_step_id: str
+    model_attempt_id: str
+    tool_round_id: str
+    tool_call_id: str
+    tool_name: str
+    idempotency_key: str
+    effective_arguments_sha256: str
+    execution_profile_fingerprint: str
+    secret_publication_sealer: Callable[[], Any]
+
+
+_RUNTIME_TOOL_INVOCATION_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[Any], _RuntimeToolInvocationAuthority],
+] = {}
+
+
+def _bind_runtime_tool_invocation_authority(
+    context: ToolContext,
+    *,
+    parent_task_id: str | None,
+    parent_run_epoch: int,
+    model_step_id: str,
+    model_attempt_id: str,
+    tool_round_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    idempotency_key: str,
+    effective_arguments: dict[str, Any],
+    execution_profile_fingerprint: str,
+    secret_publication_sealer: Callable[[], Any],
+) -> None:
+    """Bind runtime-only durable tool provenance after hooks finish."""
+
+    if type(context) is not ToolContext:
+        raise TypeError("Runtime tool invocation authority requires a ToolContext.")
+    if not callable(secret_publication_sealer):
+        raise TypeError("Runtime secret publication sealer must be callable.")
+    context_id = id(context)
+    existing = _RUNTIME_TOOL_INVOCATION_AUTHORITIES.get(context_id)
+    if existing is not None and existing[0]() is context:
+        raise RuntimeError("Runtime tool invocation authority is already bound.")
+
+    authority = _RuntimeToolInvocationAuthority(
+        parent_task_id=parent_task_id,
+        parent_run_epoch=parent_run_epoch,
+        model_step_id=model_step_id,
+        model_attempt_id=model_attempt_id,
+        tool_round_id=tool_round_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        idempotency_key=idempotency_key,
+        effective_arguments_sha256=sha256(
+            canonical_durable_json_bytes(effective_arguments, "effective_arguments")
+        ).hexdigest(),
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        secret_publication_sealer=secret_publication_sealer,
+    )
+
+    def discard(expired: ReferenceType[Any]) -> None:
+        registered = _RUNTIME_TOOL_INVOCATION_AUTHORITIES.get(context_id)
+        if registered is not None and registered[0] is expired:
+            _RUNTIME_TOOL_INVOCATION_AUTHORITIES.pop(context_id, None)
+
+    context_reference = ref(context, discard)
+    _RUNTIME_TOOL_INVOCATION_AUTHORITIES[context_id] = (context_reference, authority)
+
+
+def _runtime_tool_invocation_authority(
+    context: ToolContext,
+) -> _RuntimeToolInvocationAuthority | None:
+    registered = _RUNTIME_TOOL_INVOCATION_AUTHORITIES.get(id(context))
+    if registered is None or registered[0]() is not context:
+        return None
+    authority = registered[1]
+    if type(authority) is not _RuntimeToolInvocationAuthority:
+        return None
+    return authority
 
 
 class ToolContext(BaseModel):
