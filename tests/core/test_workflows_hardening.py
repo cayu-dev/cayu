@@ -59,6 +59,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     InvocationOriginTrust,
     ModelPrice,
+    ModelTarget,
     PriceBook,
     RetryPolicy,
     RunLimits,
@@ -2332,7 +2333,10 @@ def test_step_forwards_run_options_and_preserves_owned_lineage():
             step_id="s1",
             prompt="go",
             run_options=StepRunOptions(
-                provider_name="scripted-alt",
+                target=ModelTarget(
+                    provider_name="scripted-alt",
+                    model="scripted-model",
+                ),
                 environment_name="docker",
                 labels={"project": "workflow"},
                 metadata={"purpose": "test"},
@@ -2349,7 +2353,10 @@ def test_step_forwards_run_options_and_preserves_owned_lineage():
 
     request = app.run_requests[-1]
     assert request.session_id == result.session_id
-    assert request.provider_name == "scripted-alt"
+    assert request.target == ModelTarget(
+        provider_name="scripted-alt",
+        model="scripted-model",
+    )
     assert request.environment_name == "docker"
     assert request.labels == {"project": "workflow"}
     assert request.metadata == {"purpose": "test"}

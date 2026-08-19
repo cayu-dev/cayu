@@ -87,6 +87,7 @@ from cayu.runtime import (
     InMemoryEventSink,
     InMemorySessionStore,
     InterruptSessionRequest,
+    ModelTarget,
     PendingActionIssue,
     PendingActionIssueCode,
     PendingActionListResult,
@@ -2448,12 +2449,12 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     captured: list[int] = []
-    captured_models: list[str | None] = []
+    captured_targets: list[ModelTarget | None] = []
     original_run = app.run
 
     def spy_run(request: RunRequest):
         captured.append(request.max_steps)
-        captured_models.append(request.model)
+        captured_targets.append(request.target)
         return original_run(request)
 
     app.run = spy_run  # type: ignore[method-assign]
@@ -2465,13 +2466,23 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
     with client.stream(
         "POST",
         "/api/run",
-        json={"prompt": "hello", "max_steps": 7, "model": "request-model"},
+        json={
+            "prompt": "hello",
+            "max_steps": 7,
+            "target": {
+                "provider_name": "fake",
+                "model": "request-model",
+            },
+        },
     ) as response:
         assert response.status_code == 200
         list(response.iter_lines())
 
     assert captured == [20, 7]
-    assert captured_models == [None, "request-model"]
+    assert captured_targets == [
+        None,
+        ModelTarget(provider_name="fake", model="request-model"),
+    ]
 
 
 def test_server_resume_overrides_max_steps() -> None:
@@ -5663,7 +5674,6 @@ def test_server_projects_session_authority_across_session_and_causal_budget_view
         "/api/run",
         {
             "agent": "assistant",
-            "model": "fakemodel",
             "prompt": "hello",
             "causal_budget_id": "job_shared",
         },
@@ -8128,6 +8138,10 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
 
     assert client.post("/api/run", json={"prompt": " "}).status_code == 422
     assert client.post("/api/run", json={"prompt": "hello", "agent": " "}).status_code == 422
+    assert (
+        client.post("/api/run", json={"prompt": "hello", "model": "removed-model"}).status_code
+        == 422
+    )
     assert (
         client.post("/api/resume", json={"session_id": " ", "prompt": "hello"}).status_code == 422
     )

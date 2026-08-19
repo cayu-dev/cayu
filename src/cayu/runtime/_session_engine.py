@@ -5152,20 +5152,22 @@ class SessionEngine:
             redactor=self._secret_redactor,
         )
         registered_agent = self._get_registered_agent(request.agent_name)
-        # Provider resolution for new sessions: per-run override, then the
-        # agent's pinned provider, then model-pattern routing, then the app
-        # default. Resume/fork keep honoring the provider recorded on the
-        # session.
-        model = request.model or registered_agent.spec.model
-        if request.provider_name is not None or registered_agent.spec.provider_name is not None:
-            registered_provider = self._get_registered_provider(
-                request.provider_name or registered_agent.spec.provider_name
-            )
+        # An explicit target is exact. Otherwise the agent model and optional
+        # provider pin feed the existing routing/default selection.
+        if request.target is not None:
+            model = request.target.model
+            registered_provider = self._get_registered_provider(request.target.provider_name)
         else:
-            registered_provider = (
-                self._route_registered_provider_for_model(model=model)
-                or self._get_registered_provider()
-            )
+            model = registered_agent.spec.model
+            if registered_agent.spec.provider_name is not None:
+                registered_provider = self._get_registered_provider(
+                    registered_agent.spec.provider_name
+                )
+            else:
+                registered_provider = (
+                    self._route_registered_provider_for_model(model=model)
+                    or self._get_registered_provider()
+                )
         for field_name, value in (
             ("agent_name", registered_agent.spec.name),
             ("provider_name", registered_provider.name),

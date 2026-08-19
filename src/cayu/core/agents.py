@@ -30,7 +30,7 @@ class AgentSpec(BaseModel):
     name: str
     model: str
     # Registered provider this agent should run on. Falls back to the app's
-    # default provider when unset; a RunRequest.provider_name overrides both.
+    # default provider when unset; an explicit RunRequest.target overrides both.
     provider_name: str | None = None
     system_prompt: str | None = None
     # Exact registered tool names used by the agent's machine-checkable workflow.

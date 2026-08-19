@@ -38,6 +38,7 @@ from cayu.runtime import (
     BudgetLimit,
     CayuApp,
     IncompleteSessionRecoveryRequest,
+    ModelTarget,
     RetryPolicy,
     RunLimits,
     RunRequest,
@@ -123,7 +124,7 @@ class StepRunOptions(BaseModel):
         extra="forbid", arbitrary_types_allowed=True, hide_input_in_errors=True
     )
 
-    provider_name: str | None = None
+    target: ModelTarget | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -135,7 +136,7 @@ class StepRunOptions(BaseModel):
     task_id: str | None = None
     task_worker_id: str | None = None
 
-    @field_validator("provider_name", "environment_name", "task_id", "task_worker_id")
+    @field_validator("environment_name", "task_id", "task_worker_id")
     @classmethod
     def validate_optional_nonblank(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -754,7 +755,7 @@ async def _run_step(
         messages=run_messages,
         max_steps=opts.max_steps,
         structured_output=spec,
-        provider_name=opts.provider_name,
+        target=opts.target,
         environment_name=opts.environment_name,
         labels=opts.labels,
         metadata=opts.metadata,

@@ -1,4 +1,4 @@
-"""Per-run and per-agent provider selection (agent spec / run request overrides)."""
+"""Initial provider selection from an exact target or agent configuration."""
 
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def test_agent_spec_provider_name_selects_non_default_provider() -> None:
     assert session.provider_name == "other-provider"
 
 
-def test_run_request_provider_name_overrides_agent_spec() -> None:
+def test_run_request_target_selects_exact_provider_and_model() -> None:
     app, default_provider, other_provider = _two_provider_app()
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model", provider_name="default-provider")
@@ -111,7 +111,10 @@ def test_run_request_provider_name_overrides_agent_spec() -> None:
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_provider_request_override",
-                provider_name="other-provider",
+                target=ModelTarget(
+                    provider_name="other-provider",
+                    model="request-model",
+                ),
                 messages=[Message.text("user", "hello")],
             ),
         )
@@ -120,37 +123,28 @@ def test_run_request_provider_name_overrides_agent_spec() -> None:
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert default_provider.requests == []
     assert len(other_provider.requests) == 1
+    assert other_provider.requests[0].model == "request-model"
     session = asyncio.run(app.session_store.load("sess_provider_request_override"))
     assert session is not None
     assert session.provider_name == "other-provider"
-
-
-def test_run_request_model_overrides_agent_default_model() -> None:
-    app, default_provider, _ = _two_provider_app()
-    app.register_agent(AgentSpec(name="assistant", model="agent-model"))
-
-    events = asyncio.run(
-        _collect_run(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_run_model_override",
-                model="request-model",
-                messages=[Message.text("user", "hello")],
-            ),
-        )
-    )
-
-    assert events[-1].type == EventType.SESSION_COMPLETED
-    assert default_provider.requests[0].model == "request-model"
-    session = asyncio.run(app.session_store.load("sess_run_model_override"))
-    assert session is not None
     assert session.model == "request-model"
 
 
-def test_model_pattern_routes_run_request_without_provider_name() -> None:
+@pytest.mark.parametrize("removed_field", ["provider_name", "model"])
+def test_run_request_rejects_removed_split_target_fields(removed_field: str) -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        RunRequest.model_validate(
+            {
+                "agent_name": "assistant",
+                "messages": [Message.text("user", "hello")],
+                removed_field: "legacy-value",
+            }
+        )
+
+
+def test_agent_model_pattern_routes_run_without_explicit_target() -> None:
     app, openai_provider, anthropic_provider = _two_routed_provider_app()
-    app.register_agent(AgentSpec(name="assistant", model="agent-model"))
+    app.register_agent(AgentSpec(name="assistant", model="claude-sonnet-4-6"))
 
     events = asyncio.run(
         _collect_run(
@@ -158,7 +152,6 @@ def test_model_pattern_routes_run_request_without_provider_name() -> None:
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_model_pattern_route",
-                model="claude-sonnet-4-6",
                 messages=[Message.text("user", "hello")],
             ),
         )
@@ -174,7 +167,7 @@ def test_model_pattern_routes_run_request_without_provider_name() -> None:
     assert session.model == "claude-sonnet-4-6"
 
 
-def test_explicit_provider_name_wins_over_model_pattern_route() -> None:
+def test_explicit_target_bypasses_model_pattern_route() -> None:
     app, openai_provider, anthropic_provider = _two_routed_provider_app()
     app.register_agent(AgentSpec(name="assistant", model="agent-model"))
 
@@ -184,8 +177,10 @@ def test_explicit_provider_name_wins_over_model_pattern_route() -> None:
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_model_pattern_explicit_provider",
-                provider_name="openai",
-                model="claude-sonnet-4-6",
+                target=ModelTarget(
+                    provider_name="openai",
+                    model="claude-sonnet-4-6",
+                ),
                 messages=[Message.text("user", "hello")],
             ),
         )
@@ -202,7 +197,9 @@ def test_explicit_provider_name_wins_over_model_pattern_route() -> None:
 
 def test_agent_provider_pin_wins_over_model_pattern_route() -> None:
     app, openai_provider, anthropic_provider = _two_routed_provider_app()
-    app.register_agent(AgentSpec(name="assistant", model="agent-model", provider_name="openai"))
+    app.register_agent(
+        AgentSpec(name="assistant", model="claude-sonnet-4-6", provider_name="openai")
+    )
 
     events = asyncio.run(
         _collect_run(
@@ -210,7 +207,6 @@ def test_agent_provider_pin_wins_over_model_pattern_route() -> None:
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_model_pattern_agent_provider",
-                model="claude-sonnet-4-6",
                 messages=[Message.text("user", "hello")],
             ),
         )
@@ -233,7 +229,7 @@ def test_model_pattern_ambiguity_raises_before_session_creation() -> None:
         model_patterns=["gpt-*"],
     )
     app.register_provider(NamedFakeProvider("second"), model_patterns=["gpt-5*"])
-    app.register_agent(AgentSpec(name="assistant", model="agent-model"))
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.5"))
 
     with pytest.raises(
         ValueError,
@@ -245,7 +241,6 @@ def test_model_pattern_ambiguity_raises_before_session_creation() -> None:
                 RunRequest(
                     agent_name="assistant",
                     session_id="sess_model_pattern_ambiguous",
-                    model="gpt-5.5",
                     messages=[Message.text("user", "hello")],
                 ),
             )
@@ -271,9 +266,9 @@ def test_provider_model_patterns_reject_blank_pattern() -> None:
         app.register_provider(NamedFakeProvider("bad-provider"), model_patterns=[" "])
 
 
-def test_model_without_matching_pattern_uses_default_provider() -> None:
+def test_agent_model_without_matching_pattern_uses_default_provider() -> None:
     app, openai_provider, anthropic_provider = _two_routed_provider_app()
-    app.register_agent(AgentSpec(name="assistant", model="agent-model"))
+    app.register_agent(AgentSpec(name="assistant", model="unknown-model"))
 
     events = asyncio.run(
         _collect_run(
@@ -281,7 +276,6 @@ def test_model_without_matching_pattern_uses_default_provider() -> None:
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_model_pattern_default",
-                model="unknown-model",
                 messages=[Message.text("user", "hello")],
             ),
         )
@@ -296,7 +290,7 @@ def test_model_without_matching_pattern_uses_default_provider() -> None:
     assert session.provider_name == "openai"
 
 
-def test_run_with_unregistered_provider_name_raises_before_session_creation() -> None:
+def test_run_with_unregistered_target_provider_raises_before_session_creation() -> None:
     app, _, _ = _two_provider_app()
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -307,7 +301,10 @@ def test_run_with_unregistered_provider_name_raises_before_session_creation() ->
                 RunRequest(
                     agent_name="assistant",
                     session_id="sess_provider_missing",
-                    provider_name="missing-provider",
+                    target=ModelTarget(
+                        provider_name="missing-provider",
+                        model="fake-model",
+                    ),
                     messages=[Message.text("user", "hello")],
                 ),
             )
@@ -316,10 +313,10 @@ def test_run_with_unregistered_provider_name_raises_before_session_creation() ->
     assert asyncio.run(app.session_store.load("sess_provider_missing")) is None
 
 
-def test_resume_honors_session_provider_not_default() -> None:
+def test_resume_honors_persisted_exact_target() -> None:
     app, default_provider, other_provider = _two_provider_app()
     app.register_agent(
-        AgentSpec(name="assistant", model="fake-model", provider_name="other-provider")
+        AgentSpec(name="assistant", model="agent-model", provider_name="default-provider")
     )
 
     run_events = asyncio.run(
@@ -328,6 +325,10 @@ def test_resume_honors_session_provider_not_default() -> None:
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_provider_resume",
+                target=ModelTarget(
+                    provider_name="other-provider",
+                    model="request-model",
+                ),
                 messages=[Message.text("user", "hello")],
             ),
         )
@@ -347,6 +348,10 @@ def test_resume_honors_session_provider_not_default() -> None:
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
     assert default_provider.requests == []
     assert len(other_provider.requests) == 2
+    assert [request.model for request in other_provider.requests] == [
+        "request-model",
+        "request-model",
+    ]
 
 
 def test_resume_honors_session_provider_not_model_pattern_route() -> None:
@@ -386,30 +391,24 @@ def test_resume_honors_session_provider_not_model_pattern_route() -> None:
     assert session.model == "claude-sonnet-4-6"
 
 
-def test_copy_run_request_preserves_provider_name() -> None:
+def test_copy_run_request_preserves_detached_target() -> None:
     request = RunRequest(
         agent_name="assistant",
-        provider_name="other-provider",
-        model="request-model",
+        target=ModelTarget(
+            provider_name="other-provider",
+            model="request-model",
+        ),
         messages=[Message.text("user", "hello")],
     )
     copied = copy_run_request(request)
-    assert copied.provider_name == "other-provider"
-    assert copied.model == "request-model"
+    assert copied.target == request.target
+    assert copied.target is not request.target
 
 
-def test_blank_provider_names_are_rejected() -> None:
+def test_blank_target_fields_are_rejected() -> None:
     with pytest.raises(ValidationError):
         AgentSpec(name="assistant", model="fake-model", provider_name="   ")
     with pytest.raises(ValidationError):
-        RunRequest(
-            agent_name="assistant",
-            provider_name="",
-            messages=[Message.text("user", "hello")],
-        )
+        ModelTarget(provider_name="", model="fake-model")
     with pytest.raises(ValidationError):
-        RunRequest(
-            agent_name="assistant",
-            model=" ",
-            messages=[Message.text("user", "hello")],
-        )
+        ModelTarget(provider_name="fake", model=" ")

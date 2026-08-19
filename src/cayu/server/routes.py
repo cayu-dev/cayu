@@ -175,6 +175,7 @@ from cayu.runtime.sessions import (
     InterruptSessionRequest,
     LabelSelectorOperator,
     LabelSelectorRequirement,
+    ModelTarget,
     PendingActionKind,
     PendingActionQuery,
     PendingActionRecord,
@@ -1442,7 +1443,7 @@ class RunBody(_BoundedControlPlanePromptBody):
         ),
     )
     agent: NonBlankString = "assistant"
-    model: NonBlankString | None = None
+    target: ModelTarget | None = None
     causal_budget_id: NonBlankString | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
@@ -1454,9 +1455,11 @@ class RunBody(_BoundedControlPlanePromptBody):
 
     @model_validator(mode="before")
     @classmethod
-    def reject_client_invocation_provenance(cls, value: Any) -> Any:
+    def reject_disallowed_fields(cls, value: Any) -> Any:
         if isinstance(value, Mapping) and "invocation_origin" in value:
             raise ValueError("invocation_origin is server-owned at the HTTP run boundary.")
+        if isinstance(value, Mapping) and "model" in value:
+            raise ValueError("model was removed; use target with provider_name and model.")
         return value
 
     @field_validator("budget_limits", mode="before")
@@ -5036,7 +5039,7 @@ def create_router(
         request = RunRequest(
             agent_name=body.agent,
             session_id=session_id,
-            model=body.model,
+            target=body.target,
             causal_budget_id=body.causal_budget_id,
             task_id=task_id,
             labels=body.labels,

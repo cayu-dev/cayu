@@ -4813,6 +4813,26 @@
       "title": "ModelPrice",
       "type": "object"
     },
+    "ModelTarget": {
+      "additionalProperties": false,
+      "description": "An application-selected provider and model pair for one session epoch.",
+      "properties": {
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "provider_name": {
+          "title": "Provider Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_name",
+        "model"
+      ],
+      "title": "ModelTarget",
+      "type": "object"
+    },
     "OperationalSnapshotRequest": {
       "additionalProperties": false,
       "properties": {
@@ -5778,18 +5798,6 @@
           "title": "Max Steps",
           "type": "integer"
         },
-        "model": {
-          "anyOf": [
-            {
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Model"
-        },
         "prompt": {
           "minLength": 1,
           "title": "Prompt",
@@ -5824,6 +5832,16 @@
           "anyOf": [
             {
               "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "target": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ModelTarget"
             },
             {
               "type": "null"
@@ -5972,7 +5990,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "10",
+          "default": "11",
           "title": "Contract Version",
           "type": "string"
         },
@@ -9283,7 +9301,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "10",
+          "default": "11",
           "title": "Contract Version",
           "type": "string"
         }

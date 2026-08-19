@@ -76,8 +76,6 @@ def prepare_run_request(
     for field_name in (
         "agent_name",
         "task_worker_id",
-        "provider_name",
-        "model",
         "environment_name",
     ):
         require_secret_free_session_authority(
@@ -85,6 +83,16 @@ def prepare_run_request(
             field_name=field_name,
             redactor=redactor,
         )
+    if request.target is not None:
+        for field_name, value in (
+            ("target.provider_name", request.target.provider_name),
+            ("target.model", request.target.model),
+        ):
+            require_secret_free_session_authority(
+                value,
+                field_name=field_name,
+                redactor=redactor,
+            )
     for field_name in (
         "session_id",
         "task_id",

@@ -25,7 +25,7 @@ from cayu import (
 from cayu.core.events import Event
 from cayu.core.messages import Message
 from cayu.providers import ModelStreamEvent
-from cayu.runtime import RunRequest, StructuredOutputSpec, StructuredOutputStrategy
+from cayu.runtime import ModelTarget, RunRequest, StructuredOutputSpec, StructuredOutputStrategy
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.workflows import (
     GateOutcome,
@@ -337,7 +337,9 @@ def test_parallel_surfaces_failure_as_stepfailure_and_fails_closed():
                     step_id="good",
                     prompt="x",
                     schema=COUNT_SCHEMA,
-                    run_options=StepRunOptions(provider_name="ok-prov"),
+                    run_options=StepRunOptions(
+                        target=ModelTarget(provider_name="ok-prov", model="scripted-model")
+                    ),
                 ),
                 step(
                     ctx,
@@ -345,7 +347,9 @@ def test_parallel_surfaces_failure_as_stepfailure_and_fails_closed():
                     step_id="bad",
                     prompt="x",
                     schema=COUNT_SCHEMA,
-                    run_options=StepRunOptions(provider_name="fail-prov"),
+                    run_options=StepRunOptions(
+                        target=ModelTarget(provider_name="fail-prov", model="scripted-model")
+                    ),
                 ),
             ]
         )

@@ -3941,6 +3941,22 @@ export type ModelPrice = {
 };
 
 /**
+ * ModelTarget
+ *
+ * An application-selected provider and model pair for one session epoch.
+ */
+export type ModelTarget = {
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+};
+
+/**
  * OperationalSnapshotRequest
  */
 export type OperationalSnapshotRequest = {
@@ -5149,10 +5165,6 @@ export type RunBody = {
      */
     max_steps?: number;
     /**
-     * Model
-     */
-    model?: string | null;
-    /**
      * Prompt
      */
     prompt: string;
@@ -5164,6 +5176,7 @@ export type RunBody = {
      */
     session_id?: string | null;
     structured_output?: StructuredOutputSpec | null;
+    target?: ModelTarget | null;
     thinking?: ThinkingConfig | null;
 };
 

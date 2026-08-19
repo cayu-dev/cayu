@@ -1128,7 +1128,7 @@ and recovery APIs. The optional server exposes the replayable mutation as
 `POST /api/sessions/{session_id}/messages`.
 
 `RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. `RunRequest.task_id` optionally links a session run to an existing task. Reusing `RunRequest.session_id` never resumes an existing session.
-`RunRequest.model` optionally overrides the agent spec model for a new session. New-session provider resolution is: explicit `RunRequest.provider_name`, agent spec `provider_name`, provider `model_patterns`, then the app default provider. `CayuApp.register_provider(..., model_patterns=[...])` accepts shell-style glob patterns such as `gpt-*` or `claude-*`; ambiguous matches fail before session creation. Resume, fork, approval continuation, and recovery keep using the provider recorded on the stored session unless a clean resume explicitly adopts a different `ResumeRequest.target` as described below.
+`RunRequest.target` optionally selects an exact `ModelTarget(provider_name=..., model=...)` for a new session. An explicit target bypasses agent-level provider selection and model-pattern routing. Without one, the agent spec supplies the model and provider resolution is: agent spec `provider_name`, provider `model_patterns`, then the app default provider. `CayuApp.register_provider(..., model_patterns=[...])` accepts shell-style glob patterns such as `gpt-*` or `claude-*`; ambiguous matches fail before session creation. Resume, fork, approval continuation, and recovery keep using the provider recorded on the stored session unless a clean resume explicitly adopts a different `ResumeRequest.target` as described below.
 `RunRequest.environment_name` optionally selects a registered environment. If omitted, the runtime uses only an environment registered with `default=True`. Registration with `default=False` never implicitly selects an environment, including for the first registration. A later `default=True` registration replaces the current application default; a later `default=False` registration does not. If no explicit default exists, simple runs execute without an environment even when named non-default environments are registered.
 Events emitted for an environment-backed run carry `environment_name` as a top-level event identity field, not as payload data. Runtime code owns this field and converts provider stream events before emitting runtime events.
 
@@ -3508,9 +3508,10 @@ result, cancellation, and comparison endpoints. Server contract version 9
 replaces the compatibility-only comparison response with the complete typed
 compatible-result regression projection used by the dashboard and local CI.
 Server contract version 10 adds bounded provider-operation cancellation and
-accounting reconciliation state to session inspection. Clients generated
-against contract version 1 through 9 must regenerate from the current OpenAPI
-document.
+accounting reconciliation state to session inspection. Server contract version
+11 replaces the independent new-run model override with one exact provider and
+model target. Clients generated against contract version 1 through 10 must
+regenerate from the current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.

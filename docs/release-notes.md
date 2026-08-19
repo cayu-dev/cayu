@@ -89,6 +89,18 @@ guard.
 
 ## Unreleased
 
+### New runs use one atomic model target
+
+`RunRequest.target` now accepts an optional exact
+`ModelTarget(provider_name=..., model=...)`. It replaces the independent
+`RunRequest.provider_name` and `RunRequest.model` fields, and the server run
+body likewise replaces `model` with `target`. Update Python callers and
+generated server clients together; the removed fields are rejected rather than
+silently combined. When `target` is absent, Cayu continues to use the agent's
+model and its configured provider or normal model-pattern/default routing.
+The server contract advances from version 10 to version 11 for this breaking
+request-body change.
+
 ### Queued dispatch is bound to durable execution profiles
 
 Queued tasks now retain the target session instance, source and required

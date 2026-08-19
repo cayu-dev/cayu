@@ -980,6 +980,20 @@ def _empty_run_request_authority() -> frozenset[tuple[str, str]]:
     return frozenset()
 
 
+class ModelTarget(BaseModel):
+    """An application-selected provider and model pair for one session epoch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    provider_name: str
+    model: str
+
+    @field_validator("provider_name", "model")
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+
 class RunRequest(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -997,13 +1011,9 @@ class RunRequest(BaseModel):
     causal_budget_id: str | None = None
     task_id: str | None = None
     task_worker_id: str | None = None
-    # Per-run provider override. Resolution order for new sessions:
-    # request.provider_name -> agent spec provider_name -> model-pattern route ->
-    # app default provider.
-    provider_name: str | None = None
-    # Per-run model override for new sessions. Resume keeps the stored execution
-    # target unless ResumeRequest.target is set.
-    model: str | None = None
+    # Exact per-run execution target. When omitted, the agent model and provider
+    # routing/defaults select the initial target.
+    target: ModelTarget | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -1109,8 +1119,6 @@ class RunRequest(BaseModel):
         "causal_budget_id",
         "task_id",
         "task_worker_id",
-        "provider_name",
-        "model",
         "environment_name",
     )
     @classmethod
@@ -1181,20 +1189,6 @@ def session_input_contract_evidence(
         f"v1:{message_start_index}:{len(request.messages)}:{redaction_mode}:"
         f"{output_mode}:sha256:{messages_sha256}"
     )
-
-
-class ModelTarget(BaseModel):
-    """An application-selected provider and model pair for one session epoch."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    provider_name: str
-    model: str
-
-    @field_validator("provider_name", "model")
-    @classmethod
-    def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
 
 
 @dataclass(frozen=True)
@@ -12584,8 +12578,14 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         task_worker_id=request.task_worker_id,
-        provider_name=request.provider_name,
-        model=request.model,
+        target=(
+            None
+            if request.target is None
+            else ModelTarget(
+                provider_name=request.target.provider_name,
+                model=request.target.model,
+            )
+        ),
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),

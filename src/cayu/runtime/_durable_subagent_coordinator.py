@@ -721,18 +721,17 @@ class DurableSubagentCoordinator:
 
         try:
             registered_child = self._get_registered_agent(seed.request.agent_name)
-            child_model = seed.request.model or registered_child.spec.model
-            if (
-                seed.request.provider_name is not None
-                or registered_child.spec.provider_name is not None
-            ):
-                self._get_registered_provider(
-                    seed.request.provider_name or registered_child.spec.provider_name
-                )
+            if seed.request.target is not None:
+                child_model = seed.request.target.model
+                self._get_registered_provider(seed.request.target.provider_name)
             else:
-                self._route_registered_provider_for_model(
-                    model=child_model
-                ) or self._get_registered_provider(None)
+                child_model = registered_child.spec.model
+                if registered_child.spec.provider_name is not None:
+                    self._get_registered_provider(registered_child.spec.provider_name)
+                else:
+                    self._route_registered_provider_for_model(
+                        model=child_model
+                    ) or self._get_registered_provider(None)
             self._get_registered_environment(seed.request.environment_name)
         except (KeyError, RuntimeError, ValueError) as rejection:
             raise durable_subagent_preparation_rejected() from rejection
