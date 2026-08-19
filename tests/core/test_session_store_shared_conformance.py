@@ -72,8 +72,14 @@ from cayu.runtime import (
     EnqueueSessionMessageRequest,
     EventQuery,
     ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecisionKind,
     ExecutionProfileMismatchError,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
@@ -637,6 +643,39 @@ class _UnusedNamedForkProvider(ModelProvider):
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _RejectingPortableForkProvider(_UnusedNamedForkProvider):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.preflight_calls: list[tuple[str, tuple[Message, ...], tuple[dict[str, Any], ...]]] = []
+
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+    ) -> None:
+        self.preflight_calls.append((model, tuple(messages), tuple(tools)))
+        raise ValueError("target provider rejected source history")
+
+
+class _AuthorizeForkProfilePolicy(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "test:store-conformance-fork-authority:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        assert request.authority_review_required is True
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="Authorize the conformance fork profile.",
+            authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+        )
 
 
 class _TransitionReplayConformanceProvider(ModelProvider):
@@ -16416,6 +16455,170 @@ def test_session_store_conformance_rejects_unsafe_derived_fork_before_mutation(
     asyncio.run(run())
 
 
+def test_session_store_conformance_same_model_cross_provider_preflight_is_atomic(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        source_id = f"portable_fork_source_{store_kind}_{uuid4().hex}"
+        child_id = f"portable_fork_child_{store_kind}_{uuid4().hex}"
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="source-agent",
+                    session_id=source_id,
+                    messages=[Message.text("user", "fork source")],
+                ),
+                identity=profiled_session_identity(
+                    provider_name="source-provider",
+                    model="shared-model",
+                ),
+            )
+            await store.append_transcript_messages(
+                source.id,
+                [Message.text("user", "portable history")],
+            )
+            source = await store.update_status(source.id, SessionStatus.COMPLETED)
+            source_before = await store.load(source.id)
+            transcript_before = await store.load_transcript(source.id)
+            events_before = await store.load_events(source.id)
+
+            target_provider = _RejectingPortableForkProvider("target-provider")
+            app = CayuApp(
+                session_store=store,
+                execution_profile_policy=_AuthorizeForkProfilePolicy(),
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedNamedForkProvider("source-provider"), default=True)
+            app.register_provider(target_provider)
+            app.register_agent(
+                AgentSpec(
+                    name="source-agent",
+                    provider_name="source-provider",
+                    model="shared-model",
+                )
+            )
+            app.register_agent(
+                AgentSpec(
+                    name="target-agent",
+                    provider_name="target-provider",
+                    model="shared-model",
+                )
+            )
+
+            with pytest.raises(ValueError, match="target provider rejected source history"):
+                [
+                    event
+                    async for event in app.fork_session(
+                        ForkSessionRequest(
+                            source_session_id=source.id,
+                            session_id=child_id,
+                            agent_name="target-agent",
+                            execution_profile_selection=(
+                                ForkExecutionProfileSelection.CURRENT_CHILD
+                            ),
+                            profile_adoption=ExecutionProfileAdoptionIntent(
+                                idempotency_key=f"portable-fork-{store_kind}",
+                                reason="Authorize the target provider.",
+                                requested_by=ResolutionActor(
+                                    subject="test-caller",
+                                    source=ResolutionActorSource.REQUEST,
+                                ),
+                            ),
+                        )
+                    )
+                ]
+
+            assert len(target_provider.preflight_calls) == 1
+            model, messages, tools = target_provider.preflight_calls[0]
+            assert model == "shared-model"
+            assert list(messages) == transcript_before
+            assert tools == ()
+            assert await store.load(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_events(child_id)
+            assert await store.load(source.id) == source_before
+            assert await store.load_transcript(source.id) == transcript_before
+            assert await store.load_events(source.id) == events_before
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_equal_current_child_authorization_is_replayable(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        source_id = f"equal_profile_fork_source_{store_kind}_{uuid4().hex}"
+        child_id = f"equal_profile_fork_child_{store_kind}_{uuid4().hex}"
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "fork source")],
+                ),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                ),
+            )
+            source = await store.update_status(source.id, SessionStatus.COMPLETED)
+            app = CayuApp(
+                session_store=store,
+                execution_profile_policy=_AuthorizeForkProfilePolicy(),
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            request = ForkSessionRequest(
+                source_session_id=source.id,
+                session_id=child_id,
+                execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key=f"equal-profile-fork-{store_kind}",
+                    reason="Authorize decision-bearing current registrations.",
+                    requested_by=ResolutionActor(
+                        subject="test-caller",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                ),
+            )
+
+            async def collect_fork() -> list[Event]:
+                return [event async for event in app.fork_session(request)]
+
+            first, replay = await asyncio.gather(collect_fork(), collect_fork())
+
+            assert [event.type for event in first] == [EventType.SESSION_FORKED]
+            assert [event.id for event in replay] == [event.id for event in first]
+            child = await store.load(child_id)
+            assert child is not None
+            relationship = sessions_module.session_fork_profile_relationship(child)
+            assert relationship is not None
+            assert relationship.selected_profile == relationship.source_profile
+            assert relationship.decision is not None
+            assert relationship.decision.kind is ExecutionProfileDecisionKind.ADOPTED
+            assert (
+                relationship.decision.authority_decision
+                is ExecutionProfileAuthorityDecision.AUTHORIZED
+            )
+            records = await store.query_events(EventQuery(session_id=child_id, limit=10))
+            assert [record.event.type for record in records] == [
+                EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+                EventType.SESSION_FORKED,
+            ]
+            assert records[-1].event.id == relationship.fork_event_id
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("profile_mode", ["inherit", "current-model", "current-provider"])
 def test_session_store_conformance_profiled_fork_is_atomic_and_exactly_replayable(
     session_store_case,
@@ -16439,7 +16642,11 @@ def test_session_store_conformance_profiled_fork_is_atomic_and_exactly_replayabl
                 ),
             )
             source = await store.update_status(source.id, SessionStatus.COMPLETED)
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = CayuApp(
+                session_store=store,
+                execution_profile_policy=_AuthorizeForkProfilePolicy(),
+                enable_logging=False,
+            )
             app.register_provider(_UnusedForkProvider(), default=True)
             app.register_agent(AgentSpec(name="assistant", model="fake-model"))
             if profile_mode == "current-provider":

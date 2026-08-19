@@ -1996,7 +1996,10 @@ class SessionForkProfileRelationship(BaseModel):
             if self.decision.kind is ExecutionProfileDecisionKind.EXACT_REUSE:
                 if changed:
                     raise ValueError("Exact current-child reuse cannot change profile components.")
-            elif not changed:
+            elif not changed and not (
+                self.decision.kind is ExecutionProfileDecisionKind.ADOPTED
+                and self.decision.authority_decision is ExecutionProfileAuthorityDecision.AUTHORIZED
+            ):
                 raise ValueError(
                     "A non-exact current-child decision requires changed profile components."
                 )

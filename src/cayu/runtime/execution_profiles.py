@@ -192,12 +192,11 @@ class ExecutionProfilePolicyRequest(BaseModel):
         )
         if self.changed_component_classes != expected:
             raise ValueError("changed_component_classes do not match the supplied profiles.")
-        if self.authority_review_required != (
+        if (
             ExecutionProfileComponentClass.DIRECT_TOOLS in expected
+            and not self.authority_review_required
         ):
-            raise ValueError(
-                "authority_review_required does not match the changed profile authority."
-            )
+            raise ValueError("Direct-tool changes require execution-profile authority review.")
         return self
 
 
@@ -300,7 +299,18 @@ class ExecutionProfileDecision(BaseModel):
             raise ValueError("Execution-profile decision changed components are inconsistent.")
         if self.kind is ExecutionProfileDecisionKind.EXACT_REUSE and changed:
             raise ValueError("Exact profile reuse cannot contain changed components.")
-        if self.kind is not ExecutionProfileDecisionKind.EXACT_REUSE and not changed:
+        unmodeled_authority_decision = self.kind in {
+            ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+            ExecutionProfileDecisionKind.REJECTED,
+        } or (
+            self.kind is ExecutionProfileDecisionKind.ADOPTED
+            and self.authority_decision is ExecutionProfileAuthorityDecision.AUTHORIZED
+        )
+        if (
+            self.kind is not ExecutionProfileDecisionKind.EXACT_REUSE
+            and not changed
+            and not unmodeled_authority_decision
+        ):
             raise ValueError("A non-exact profile decision requires changed components.")
         if (
             self.kind is ExecutionProfileDecisionKind.EXACT_REUSE
@@ -479,7 +489,9 @@ class ExecutionProfileMismatchError(RuntimeError):
         self.expected_profile_fingerprint = expected_profile_fingerprint
         self.candidate_profile_fingerprint = candidate_profile_fingerprint
         self.changed_component_classes = changed_component_classes
-        changed = ", ".join(component.value for component in changed_component_classes)
+        changed = ", ".join(component.value for component in changed_component_classes) or (
+            "decision-bearing authority outside the structural profile"
+        )
         super().__init__(self._message(session_id=session_id, changed=changed))
 
     def _message(self, *, session_id: str, changed: str) -> str:

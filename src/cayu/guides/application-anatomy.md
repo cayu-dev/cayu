@@ -97,15 +97,19 @@ and transition identities, plus source/child model identities and the successful
 portability check, never prompt text. Before descendant creation the source
 checkpoint records a durable transition intent, so a process restart can
 continue the exact request. The source transcript stays unchanged. Exact
-retries require the same explicit destination session ID and converge on that
+retries reuse the caller-selected destination ID when supplied; otherwise Cayu
+derives one opaque parent-and-request-scoped ID. Both forms converge on the same
 descendant and receipt.
 
 Selecting `CURRENT_CHILD` is an explicit execution-profile adoption request.
-The application's `ExecutionProfilePolicy` must authorize any changed runtime,
-provider target, tool authority, or durable prompt component before the child is
-created. Omitting `execution_profile_selection` instead inherits the parent's
-effective durable profile and does not consult mutable current registrations to
-choose a different child baseline.
+The application's `ExecutionProfilePolicy` must authorize the current
+registration's decision-bearing authority before the child is created, including
+environment, hooks, tool policy, runner, credential, network, and external-effect
+authority that is not part of the structural profile fingerprint. A provider
+change always projects and preflights the complete portable transcript, even when
+the model name is unchanged. Omitting `execution_profile_selection` instead
+inherits the parent's effective durable profile and does not consult mutable
+current registrations to choose a different child baseline.
 
 Prompt succession currently requires `copy_checkpoint=False` and a concrete
 registered environment. This is deliberate: a checkpoint or an unmaterialized

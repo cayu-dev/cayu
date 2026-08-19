@@ -149,6 +149,7 @@ from cayu.runtime import (
     EventRecord,
     EventSink,
     ExecutionProfileAdoptionIntent,
+    ExecutionProfileAdoptionRejected,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
@@ -17731,7 +17732,11 @@ def test_prompt_anatomy_fork_rejects_pending_user_input_before_effects() -> None
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
-    app = CayuApp(session_store=store, enable_logging=False)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+    )
     app.register_provider(provider, default=True)
     app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
     app.register_agent(
@@ -18110,7 +18115,7 @@ def test_cayu_app_does_not_reconcile_an_ambiguous_takeover_as_a_replacement_owne
     asyncio.run(scenario())
 
 
-def test_cayu_app_rejects_fork_to_agent_with_different_provider():
+def test_cayu_app_requires_authorization_for_fork_to_different_provider():
     class OtherProvider(FakeProvider):
         name = "other"
 
@@ -18139,7 +18144,10 @@ def test_cayu_app_rejects_fork_to_agent_with_different_provider():
         )
     )
 
-    with pytest.raises(ValueError, match="different provider"):
+    with pytest.raises(
+        ExecutionProfileAdoptionRejected,
+        match="provider_target",
+    ):
         asyncio.run(
             collect_fork_events(
                 app,
@@ -38367,7 +38375,10 @@ def test_cayu_app_rejects_fork_with_pending_approval_checkpoint():
             ],
         ]
     )
-    app = CayuApp(session_store=store)
+    app = CayuApp(
+        session_store=store,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+    )
     app.register_provider(provider, default=True)
     app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
     tool = SideEffectTool()

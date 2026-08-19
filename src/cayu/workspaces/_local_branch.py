@@ -7,6 +7,7 @@ import hashlib
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -14,6 +15,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 
@@ -89,6 +91,61 @@ _CleanupPayloadT = TypeVar("_CleanupPayloadT")
 _PathKind = Literal["missing", "file", "directory", "symlink", "special"]
 _SOURCE_MANAGER_LOCK = threading.Lock()
 _ACTIVE_BRANCHES: dict[tuple[object, ...], int] = {}
+_LINUX_IOCTL_READ = 2
+_LINUX_FS_IOC_GETFLAGS_TYPE = ord("f")
+_LINUX_FS_IOC_GETFLAGS_NUMBER = 1
+_LINUX_FS_CASEFOLD_FL = 0x40000000
+_DARWIN_PC_CASE_SENSITIVE = 11
+
+
+class _DirectoryLookupSemantics(Enum):
+    UNKNOWN = "unknown"
+    CASE_SENSITIVE = "case_sensitive"
+    UNICODE_CASEFOLDED = "unicode_casefolded"
+
+
+def _directory_lookup_semantics(root: Path) -> _DirectoryLookupSemantics:
+    """Return per-directory lookup semantics that can differ on one device."""
+
+    if sys.platform == "darwin":
+        try:
+            case_sensitive = os.pathconf(root, _DARWIN_PC_CASE_SENSITIVE)
+        except OSError:
+            return _DirectoryLookupSemantics.UNKNOWN
+        if case_sensitive == 1:
+            return _DirectoryLookupSemantics.CASE_SENSITIVE
+        if case_sensitive == 0:
+            return _DirectoryLookupSemantics.UNICODE_CASEFOLDED
+        return _DirectoryLookupSemantics.UNKNOWN
+    if not sys.platform.startswith("linux"):
+        return _DirectoryLookupSemantics.UNKNOWN
+
+    import array
+    import fcntl
+
+    flags = array.array("L", [0])
+    ioctl_request = (
+        (_LINUX_IOCTL_READ << 30)
+        | (flags.itemsize << 16)
+        | (_LINUX_FS_IOC_GETFLAGS_TYPE << 8)
+        | _LINUX_FS_IOC_GETFLAGS_NUMBER
+    )
+    descriptor = os.open(
+        root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        try:
+            fcntl.ioctl(descriptor, ioctl_request, flags, True)
+        except OSError as error:
+            if error.errno in {errno.EINVAL, errno.ENOTTY, errno.EOPNOTSUPP}:
+                return _DirectoryLookupSemantics.UNKNOWN
+            raise
+    finally:
+        os.close(descriptor)
+    if flags[0] & _LINUX_FS_CASEFOLD_FL:
+        return _DirectoryLookupSemantics.UNICODE_CASEFOLDED
+    return _DirectoryLookupSemantics.CASE_SENSITIVE
 
 
 @dataclass(slots=True)
@@ -255,6 +312,7 @@ class _CapturedBaseline:
     files: dict[str, _FileIdentity]
     directories: frozenset[str]
     root_identity: tuple[int, int]
+    path_semantics: _DirectoryLookupSemantics
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,7 +772,23 @@ def _capture_baseline(
             overlay_root = private_root / "overlay"
             baseline_root.mkdir(mode=0o700)
             overlay_root.mkdir(mode=0o700)
-            files, directories = _copy_regular_tree(root, baseline_root, request.limits)
+            source_semantics = _directory_lookup_semantics(root)
+            private_semantics = tuple(
+                _directory_lookup_semantics(private_directory)
+                for private_directory in (baseline_root, overlay_root)
+            )
+            if source_semantics is _DirectoryLookupSemantics.UNKNOWN or any(
+                semantics is _DirectoryLookupSemantics.UNKNOWN for semantics in private_semantics
+            ):
+                raise _UnsupportedBranch("path_semantics_unavailable")
+            if any(semantics is not source_semantics for semantics in private_semantics):
+                raise _UnsupportedBranch("private_storage_path_semantics_mismatch")
+            files, directories = _copy_regular_tree(
+                root,
+                baseline_root,
+                request.limits,
+                source_semantics=source_semantics,
+            )
             after = root.stat()
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 raise _CreationConflict(
@@ -743,6 +817,7 @@ def _capture_baseline(
                 files=files,
                 directories=frozenset(directories),
                 root_identity=(before.st_dev, before.st_ino),
+                path_semantics=source_semantics,
             )
     except BaseException as error:
         primary_error = error
@@ -762,6 +837,8 @@ def _copy_regular_tree(
     source_root: Path,
     baseline_root: Path,
     limits: WorkspaceBranchLimits,
+    *,
+    source_semantics: _DirectoryLookupSemantics,
 ) -> tuple[dict[str, _FileIdentity], set[str]]:
     root_fd = os.open(
         source_root,
@@ -790,8 +867,19 @@ def _copy_regular_tree(
                         if stat.S_ISLNK(info.st_mode):
                             raise _UnsupportedBranch("source_contains_symlink")
                         if stat.S_ISDIR(info.st_mode):
+                            directory_semantics = _directory_lookup_semantics(source_root / path)
+                            if directory_semantics is _DirectoryLookupSemantics.UNKNOWN:
+                                raise _UnsupportedBranch("path_semantics_unavailable")
+                            if directory_semantics is not source_semantics:
+                                raise _UnsupportedBranch("source_contains_mixed_path_semantics")
                             directories.add(path)
-                            (baseline_root / path).mkdir(mode=0o700, parents=False)
+                            baseline_directory = baseline_root / path
+                            baseline_directory.mkdir(mode=0o700, parents=False)
+                            baseline_semantics = _directory_lookup_semantics(baseline_directory)
+                            if baseline_semantics is _DirectoryLookupSemantics.UNKNOWN:
+                                raise _UnsupportedBranch("path_semantics_unavailable")
+                            if baseline_semantics is not source_semantics:
+                                raise _UnsupportedBranch("private_storage_path_semantics_mismatch")
                             pending_directories.append(path)
                             continue
                         if not stat.S_ISREG(info.st_mode):
@@ -1058,6 +1146,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
         self._baseline = dict(captured.files)
         self._baseline_directories = captured.directories
         self._root_identity = captured.root_identity
+        self._path_semantics = captured.path_semantics
         self._source_key = source_key
         self._capacity_lease = capacity_lease
         self._overlay: dict[str, _FileIdentity] = {}
@@ -1597,6 +1686,58 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 detail_code="affected_path_conflicted",
             ),
         )
+
+        def semantics_changed(path: Path) -> bool:
+            try:
+                semantics = _directory_lookup_semantics(path)
+            except OSError:
+                return True
+            return (
+                semantics is _DirectoryLookupSemantics.UNKNOWN
+                or semantics is not self._path_semantics
+            )
+
+        if any(
+            semantics_changed(path)
+            for path in (self._source.root, self._baseline_root, self._overlay_root)
+        ):
+            conflicts.add(
+                WorkspaceBranchConflict(
+                    path="__path_semantics__",
+                    actual_kind="special",
+                )
+            )
+        overlay_directories = {
+            "/".join(parts[:index])
+            for path in self._overlay
+            for parts in (path.split("/")[:-1],)
+            for index in range(1, len(parts) + 1)
+        }
+        affected_directories = {
+            "/".join(parts[:index])
+            for change in change_set.changes
+            for parts in (change.path.split("/")[:-1],)
+            for index in range(1, len(parts) + 1)
+        }
+        for relative in sorted(self._baseline_directories):
+            if semantics_changed(self._source.root / relative) or semantics_changed(
+                self._baseline_root / relative
+            ):
+                conflicts.add(WorkspaceBranchConflict(path=relative, actual_kind="special"))
+        for relative in sorted(overlay_directories):
+            if semantics_changed(self._overlay_root / relative):
+                conflicts.add(WorkspaceBranchConflict(path=relative, actual_kind="special"))
+        for relative in sorted(affected_directories - self._baseline_directories):
+            source_directory = self._source.root / relative
+            try:
+                source_info = source_directory.stat(follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                conflicts.add(WorkspaceBranchConflict(path=relative, actual_kind="special"))
+                continue
+            if stat.S_ISDIR(source_info.st_mode) and semantics_changed(source_directory):
+                conflicts.add(WorkspaceBranchConflict(path=relative, actual_kind="special"))
         _filesystem_publication_alias_conflicts(
             self._source.root,
             change_set,

@@ -5,6 +5,7 @@ import warnings
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -1132,6 +1133,179 @@ def test_fork_current_child_profile_reviews_a_different_registered_provider() ->
     asyncio.run(scenario())
 
 
+def test_fork_current_child_provider_change_requires_application_policy() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(
+            ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="source-provider",
+            ),
+            default=True,
+        )
+        source_app.register_agent(
+            AgentSpec(
+                name="source-agent",
+                model="shared-model",
+                provider_name="source-provider",
+            )
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="source-agent",
+                    session_id="unreviewed-provider-fork-source",
+                    messages=[Message.text("user", "create source")],
+                )
+            )
+        )
+
+        fork_app = CayuApp(session_store=store, enable_logging=False)
+        fork_app.register_provider(
+            ScriptedModelProvider([], name="source-provider"),
+            default=True,
+        )
+        fork_app.register_provider(ScriptedModelProvider([], name="child-provider"))
+        fork_app.register_agent(
+            AgentSpec(
+                name="source-agent",
+                model="shared-model",
+                provider_name="source-provider",
+            )
+        )
+        fork_app.register_agent(
+            AgentSpec(
+                name="child-agent",
+                model="shared-model",
+                provider_name="child-provider",
+            )
+        )
+
+        with pytest.raises(ExecutionProfileAdoptionRejected):
+            await collect(
+                fork_app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id="unreviewed-provider-fork-source",
+                        session_id="unreviewed-provider-fork-child",
+                        agent_name="child-agent",
+                        execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="unreviewed-provider-fork",
+                            reason="Attempt an unreviewed provider change.",
+                            requested_by=ResolutionActor(
+                                subject="operator",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        assert await store.load("unreviewed-provider-fork-child") is None
+
+    asyncio.run(scenario())
+
+
+def test_fork_same_model_cross_provider_preflights_before_child_creation() -> None:
+    class RejectingPortableProvider(ScriptedModelProvider):
+        def __init__(self) -> None:
+            super().__init__([], name="child-provider")
+            self.preflight_calls = 0
+
+        def preflight_portable_messages(
+            self,
+            *,
+            model: str,
+            messages: list[Message],
+            tools: list[dict[str, Any]],
+        ) -> None:
+            del model, messages, tools
+            self.preflight_calls += 1
+            raise ValueError("target provider rejected source history")
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(
+            ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="source-provider",
+            ),
+            default=True,
+        )
+        source_app.register_agent(
+            AgentSpec(
+                name="source-agent",
+                model="shared-model",
+                provider_name="source-provider",
+            )
+        )
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="source-agent",
+                    session_id="same-model-cross-provider-source",
+                    messages=[Message.text("user", "source history")],
+                )
+            )
+        )
+        source_before = await store.load("same-model-cross-provider-source")
+        assert source_before is not None
+
+        target_provider = RejectingPortableProvider()
+        fork_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=RecordingAdoptionPolicy(),
+        )
+        fork_app.register_provider(
+            ScriptedModelProvider([], name="source-provider"),
+            default=True,
+        )
+        fork_app.register_provider(target_provider)
+        fork_app.register_agent(
+            AgentSpec(
+                name="source-agent",
+                model="shared-model",
+                provider_name="source-provider",
+            )
+        )
+        fork_app.register_agent(
+            AgentSpec(
+                name="child-agent",
+                model="shared-model",
+                provider_name="child-provider",
+            )
+        )
+
+        with pytest.raises(ValueError, match="target provider rejected source history"):
+            await collect(
+                fork_app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source_before.id,
+                        session_id="same-model-cross-provider-child",
+                        agent_name="child-agent",
+                        execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="same-model-cross-provider",
+                            reason="Adopt the reviewed target provider.",
+                            requested_by=ResolutionActor(
+                                subject="operator",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        assert target_provider.preflight_calls == 1
+        assert await store.load("same-model-cross-provider-child") is None
+        assert await store.load(source_before.id) == source_before
+
+    asyncio.run(scenario())
+
+
 def test_generated_current_prompt_fork_replays_one_stable_descendant() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
@@ -1229,6 +1403,143 @@ def test_fork_profile_inheritance_rejects_environment_override() -> None:
             session_id="fork-environment-child",
             environment_name="production",
         )
+
+
+def test_fork_current_child_environment_change_requires_authority_review() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(
+            ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="fake",
+            ),
+            default=True,
+        )
+        source_app.register_environment(
+            Environment(EnvironmentSpec(name="restricted")),
+            default=True,
+        )
+        source_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="fork-environment-authority-source",
+                    environment_name="restricted",
+                    messages=[Message.text("user", "establish restricted authority")],
+                )
+            )
+        )
+
+        policy = RecordingAdoptionPolicy()
+        fork_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=policy,
+        )
+        fork_app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        fork_app.register_environment(
+            Environment(EnvironmentSpec(name="production")),
+            default=True,
+        )
+        fork_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await collect(
+            fork_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="fork-environment-authority-source",
+                    session_id="fork-environment-authority-child",
+                    environment_name="production",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="fork-environment-authority",
+                        reason="Authorize the production environment.",
+                        requested_by=ResolutionActor(
+                            subject="operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        assert len(policy.requests) == 1
+        assert policy.requests[0].authority_review_required is True
+        child = await store.load("fork-environment-authority-child")
+        assert child is not None
+        assert child.environment_name == "production"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("changed_authority", ["hook", "tool_policy"])
+def test_fork_current_child_reviews_decision_bearing_agent_authority(
+    changed_authority: str,
+) -> None:
+    class DenyAllPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            del request
+            return ToolPolicyResult(decision=ToolPolicyDecision.DENY, reason="Denied.")
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app.register_provider(
+            ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="fake",
+            ),
+            default=True,
+        )
+        source_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        source_id = f"fork-agent-authority-source-{changed_authority}"
+        await collect(
+            source_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "establish agent authority")],
+                )
+            )
+        )
+
+        policy = RecordingAdoptionPolicy()
+        fork_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            execution_profile_policy=policy,
+        )
+        fork_app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
+        fork_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            runtime_hooks=(
+                [RecordingCompletionHook("new-hook")] if changed_authority == "hook" else None
+            ),
+            tool_policy=(DenyAllPolicy() if changed_authority == "tool_policy" else None),
+        )
+        await collect(
+            fork_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id=f"fork-agent-authority-child-{changed_authority}",
+                    execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key=f"fork-agent-authority-{changed_authority}",
+                        reason="Authorize the changed agent governance.",
+                        requested_by=ResolutionActor(
+                            subject="operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        assert len(policy.requests) == 1
+        assert policy.requests[0].authority_review_required is True
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])

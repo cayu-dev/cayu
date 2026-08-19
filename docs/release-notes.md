@@ -89,6 +89,14 @@ guard.
 
 ## Unreleased
 
+### Fork and workspace branch authority fails closed
+
+`CURRENT_CHILD` session forks now require an attributable application authority
+decision even when their structural profile fingerprints are equal. Provider
+changes always project and preflight portable history, including same-model
+transitions. Local workspace branches now reject source/private per-directory
+path-semantics mismatches and revalidate those semantics before publication.
+
 ### New runs use one atomic model target
 
 `RunRequest.target` now accepts an optional exact

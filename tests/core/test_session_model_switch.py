@@ -20,6 +20,11 @@ from cayu import (
     EventQuery,
     EventType,
     ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     FileAttachment,
     FileAttachmentKind,
     FilePart,
@@ -76,6 +81,23 @@ def _fork_profile_adoption(key: str) -> ExecutionProfileAdoptionIntent:
             source=ResolutionActorSource.SYSTEM,
         ),
     )
+
+
+class _AuthorizeForkProfilePolicy(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "test:model-switch-fork-authority:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        assert request.authority_review_required is True
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="Authorize the model-switch fork.",
+            authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+        )
 
 
 class _NamedProvider(ModelProvider):
@@ -347,11 +369,15 @@ def _app(
     require_approval: bool = False,
     secret_redactor: SecretRedactor | None = None,
     tool: Tool | None = None,
+    authorize_fork_profiles: bool = False,
 ) -> tuple[CayuApp, SessionStore]:
     session_store = store or InMemorySessionStore()
     app = CayuApp(
         session_store=session_store,
         secret_redactor=secret_redactor,
+        execution_profile_policy=(
+            _AuthorizeForkProfilePolicy() if authorize_fork_profiles else None
+        ),
         enable_logging=False,
     )
     app.register_provider(source, default=True)
@@ -2342,7 +2368,11 @@ def test_same_provider_model_override_fork_preflights_and_projects_transcript() 
             [ModelStreamEvent.text_delta("fork answer"), ModelStreamEvent.completed()],
         ],
     )
-    app, store = _app(source, _NamedProvider("target", []))
+    app, store = _app(
+        source,
+        _NamedProvider("target", []),
+        authorize_fork_profiles=True,
+    )
     asyncio.run(
         _collect(
             app.run(
@@ -2401,7 +2431,11 @@ def test_same_provider_model_override_fork_preflights_and_projects_transcript() 
 def test_same_provider_model_override_fork_accepts_an_empty_retained_prefix() -> None:
     async def run() -> None:
         source = _NamedProvider("source", [])
-        app, store = _app(source, _NamedProvider("target", []))
+        app, store = _app(
+            source,
+            _NamedProvider("target", []),
+            authorize_fork_profiles=True,
+        )
         await store.create(
             RunRequest(
                 agent_name="assistant",
@@ -2443,7 +2477,12 @@ def test_sqlite_model_override_partial_fork_translates_absolute_retained_cursor(
             "source",
             [[ModelStreamEvent.text_delta("fork answer"), ModelStreamEvent.completed()]],
         )
-        app, _ = _app(source, _NamedProvider("target", []), store=store)
+        app, _ = _app(
+            source,
+            _NamedProvider("target", []),
+            store=store,
+            authorize_fork_profiles=True,
+        )
         await store.create(
             RunRequest(
                 agent_name="assistant",
@@ -2507,7 +2546,11 @@ def test_model_override_fork_preflight_failure_does_not_create_child() -> None:
         [[ModelStreamEvent.text_delta("source answer"), ModelStreamEvent.completed()]],
         reject_portable_messages=True,
     )
-    app, store = _app(source, _NamedProvider("target", []))
+    app, store = _app(
+        source,
+        _NamedProvider("target", []),
+        authorize_fork_profiles=True,
+    )
     asyncio.run(
         _collect(
             app.run(
@@ -2548,6 +2591,7 @@ def test_model_override_fork_checks_workload_secrets_before_provider_preflight()
         source,
         _NamedProvider("target", []),
         secret_redactor=SecretRedactor(secret),
+        authorize_fork_profiles=True,
     )
     asyncio.run(
         _collect(

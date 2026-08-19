@@ -176,6 +176,201 @@ def test_local_branch_private_storage_uses_the_source_filesystem_namespace(
     asyncio.run(scenario())
 
 
+def test_local_branch_rejects_mismatched_private_path_semantics_before_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.workspaces._local_branch as branch_module
+
+    source_root = tmp_path / "workspace"
+    source_root.mkdir()
+    source_file = source_root / "source.txt"
+    source_file.write_bytes(b"source")
+    siblings_before = set(tmp_path.iterdir())
+    casefolded = branch_module._DirectoryLookupSemantics.UNICODE_CASEFOLDED
+    case_sensitive = branch_module._DirectoryLookupSemantics.CASE_SENSITIVE
+
+    def mismatched_path_semantics(path: Path):
+        return casefolded if path.samefile(source_root) else case_sensitive
+
+    async def scenario() -> None:
+        source, request = await _source_and_request(source_root)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                branch_module,
+                "_directory_lookup_semantics",
+                mismatched_path_semantics,
+            )
+            result = await source.create_branch(request)
+
+        assert result.status is WorkspaceBranchOutcomeStatus.UNSUPPORTED
+        assert result.branch is None
+        assert result.evidence.detail_code == "private_storage_path_semantics_mismatch"
+        assert source_file.read_bytes() == b"source"
+        assert set(tmp_path.iterdir()) == siblings_before
+
+    asyncio.run(scenario())
+
+
+def test_local_branch_rejects_unknown_path_semantics_before_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.workspaces._local_branch as branch_module
+
+    source_root = tmp_path / "workspace"
+    source_root.mkdir()
+    source_file = source_root / "source.txt"
+    source_file.write_bytes(b"source")
+    siblings_before = set(tmp_path.iterdir())
+
+    async def scenario() -> None:
+        source, request = await _source_and_request(source_root)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                branch_module,
+                "_directory_lookup_semantics",
+                lambda _path: branch_module._DirectoryLookupSemantics.UNKNOWN,
+            )
+            result = await source.create_branch(request)
+
+        assert result.status is WorkspaceBranchOutcomeStatus.UNSUPPORTED
+        assert result.branch is None
+        assert result.evidence.detail_code == "path_semantics_unavailable"
+        assert source_file.read_bytes() == b"source"
+        assert set(tmp_path.iterdir()) == siblings_before
+
+    asyncio.run(scenario())
+
+
+def test_local_branch_rejects_mixed_source_directory_path_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.workspaces._local_branch as branch_module
+
+    source_root = tmp_path / "workspace"
+    nested = source_root / "nested"
+    nested.mkdir(parents=True)
+    nested_file = nested / "source.txt"
+    nested_file.write_bytes(b"source")
+    siblings_before = set(tmp_path.iterdir())
+    casefolded = branch_module._DirectoryLookupSemantics.UNICODE_CASEFOLDED
+    case_sensitive = branch_module._DirectoryLookupSemantics.CASE_SENSITIVE
+
+    def mixed_path_semantics(path: Path):
+        return casefolded if path.samefile(nested) else case_sensitive
+
+    async def scenario() -> None:
+        source, request = await _source_and_request(source_root)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                branch_module,
+                "_directory_lookup_semantics",
+                mixed_path_semantics,
+            )
+            result = await source.create_branch(request)
+
+        assert result.status is WorkspaceBranchOutcomeStatus.UNSUPPORTED
+        assert result.branch is None
+        assert result.evidence.detail_code == "source_contains_mixed_path_semantics"
+        assert nested_file.read_bytes() == b"source"
+        assert set(tmp_path.iterdir()) == siblings_before
+
+    asyncio.run(scenario())
+
+
+def test_local_branch_publication_rejects_source_path_semantics_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.workspaces._local_branch as branch_module
+
+    source_root = tmp_path / "workspace"
+    nested = source_root / "nested"
+    nested.mkdir(parents=True)
+    source_semantics = branch_module._DirectoryLookupSemantics.CASE_SENSITIVE
+
+    def current_path_semantics(path: Path):
+        if path.samefile(nested):
+            return source_semantics
+        return branch_module._DirectoryLookupSemantics.CASE_SENSITIVE
+
+    async def scenario() -> None:
+        nonlocal source_semantics
+
+        source, request = await _source_and_request(source_root)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                branch_module,
+                "_directory_lookup_semantics",
+                current_path_semantics,
+            )
+            branch = await _created_branch(source, request)
+            await branch.write_bytes("nested/branch-only.txt", b"candidate")
+            changes = await branch.changes()
+            source_semantics = branch_module._DirectoryLookupSemantics.UNICODE_CASEFOLDED
+            result = await branch.publish(
+                WorkspaceBranchPublicationRequest(
+                    branch_id=branch.branch_id,
+                    baseline_revision=changes.baseline_revision,
+                    change_set_digest=changes.digest,
+                )
+            )
+
+        assert result.status is WorkspaceBranchOutcomeStatus.CONFLICTED
+        assert not (nested / "branch-only.txt").exists()
+        assert (await branch.rollback()).status is WorkspaceBranchOutcomeStatus.ROLLED_BACK
+
+    asyncio.run(scenario())
+
+
+def test_local_branch_publication_rejects_new_source_parent_semantics_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.workspaces._local_branch as branch_module
+
+    source_root = tmp_path / "workspace"
+    source_root.mkdir()
+    new_source_parent = source_root / "newdir"
+    source_parent_semantics = branch_module._DirectoryLookupSemantics.CASE_SENSITIVE
+
+    def current_path_semantics(path: Path):
+        if new_source_parent.exists() and path.samefile(new_source_parent):
+            return source_parent_semantics
+        return branch_module._DirectoryLookupSemantics.CASE_SENSITIVE
+
+    async def scenario() -> None:
+        nonlocal source_parent_semantics
+
+        source, request = await _source_and_request(source_root)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                branch_module,
+                "_directory_lookup_semantics",
+                current_path_semantics,
+            )
+            branch = await _created_branch(source, request)
+            await branch.write_bytes("newdir/branch-only.txt", b"candidate")
+            changes = await branch.changes()
+            new_source_parent.mkdir()
+            source_parent_semantics = branch_module._DirectoryLookupSemantics.UNICODE_CASEFOLDED
+            result = await branch.publish(
+                WorkspaceBranchPublicationRequest(
+                    branch_id=branch.branch_id,
+                    baseline_revision=changes.baseline_revision,
+                    change_set_digest=changes.digest,
+                )
+            )
+
+        assert result.status is WorkspaceBranchOutcomeStatus.CONFLICTED
+        assert not (new_source_parent / "branch-only.txt").exists()
+        assert (await branch.rollback()).status is WorkspaceBranchOutcomeStatus.ROLLED_BACK
+
+    asyncio.run(scenario())
+
+
 def test_local_branch_passes_ordinary_workspace_conformance(tmp_path: Path) -> None:
     async def scenario() -> None:
         source, request = await _source_and_request(tmp_path)
@@ -1438,6 +1633,50 @@ def test_publication_uses_actual_unicode_filesystem_alias_semantics(tmp_path: Pa
             assert result.status is WorkspaceBranchOutcomeStatus.COMMITTED
             assert (await source.read_bytes(canonical)).content == b"branch"
             assert (await source.read_bytes(alias)).content == b"late-alias"
+
+    asyncio.run(scenario())
+
+
+def test_publication_rejects_branch_only_source_alias_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.workspaces._local_branch as branch_module
+
+    canonical = "Case/branch-only.txt"
+    source_alias = tmp_path / "case" / "source-only.txt"
+
+    async def scenario() -> None:
+        source, request = await _source_and_request(tmp_path)
+        branch = await _created_branch(source, request)
+        await branch.write_bytes(canonical, b"branch")
+        changes = await branch.changes()
+        source_alias.parent.mkdir()
+        source_alias.write_bytes(b"source")
+
+        def injected_alias(root: Path, first: str, second: str) -> bool:
+            assert root.samefile(tmp_path)
+            return {first, second} == {"Case", "case"}
+
+        def reject_source_creation(*_args, **_kwargs) -> None:
+            raise AssertionError("publication began mutating the source")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(branch_module, "_filesystem_paths_alias", injected_alias)
+            scoped.setattr(branch_module, "create_regular", reject_source_creation)
+            result = await branch.publish(
+                WorkspaceBranchPublicationRequest(
+                    branch_id=branch.branch_id,
+                    baseline_revision=changes.baseline_revision,
+                    change_set_digest=changes.digest,
+                )
+            )
+
+        assert result.status is WorkspaceBranchOutcomeStatus.CONFLICTED
+        assert tuple(conflict.path for conflict in result.conflicts) == ("case",)
+        assert source_alias.read_bytes() == b"source"
+        assert not (tmp_path / canonical).exists()
+        assert (await branch.rollback()).status is WorkspaceBranchOutcomeStatus.ROLLED_BACK
 
     asyncio.run(scenario())
 

@@ -1039,13 +1039,13 @@ class _ForkPromptWorkflow:
     def requires_transcript_snapshot(
         self,
         *,
-        model_changed: bool,
+        target_changed: bool,
         source_projection_cursor: int,
     ) -> bool:
         return (
             self.prompt_replacement is not None
             or self.request.transcript_cursor is not None
-            or model_changed
+            or target_changed
             or bool(source_projection_cursor)
         )
 
@@ -1087,8 +1087,8 @@ class _ForkPromptWorkflow:
         projected_interaction_ids.clear()
         return projected, system_prompt_messages_sha256(self.child_prompt_messages)
 
-    def requires_portability_validation(self, *, model_changed: bool) -> bool:
-        return model_changed or self.prompt_replacement is not None
+    def requires_portability_validation(self, *, target_changed: bool) -> bool:
+        return target_changed or self.prompt_replacement is not None
 
     def attach_receipt(
         self,
@@ -3704,9 +3704,10 @@ class SessionEngine:
         decision_session: Session | None = None,
         source_provider_name: str | None = None,
         source_model: str | None = None,
+        force_authority_review: bool = False,
     ) -> ExecutionProfileDecision:
         event_session = session if decision_session is None else decision_session
-        if not changed_component_classes:
+        if not changed_component_classes and not force_authority_review:
             return _execution_profile_decision_event(
                 session=event_session,
                 expected_profile=expected_profile,
@@ -3726,20 +3727,23 @@ class SessionEngine:
         model_target_only = target_changed and changed_component_classes == (
             ExecutionProfileComponentClass.PROVIDER_TARGET,
         )
-        fallback_actor = _model_target_profile_actor() if model_target_only else None
+        built_in_model_target_adoption = model_target_only and not force_authority_review
+        fallback_actor = _model_target_profile_actor() if built_in_model_target_adoption else None
         fallback_reason = (
             "The caller explicitly requested a model-target transition."
-            if model_target_only
+            if built_in_model_target_adoption
             else "The execution profile changed without authorized adoption."
         )
         policy_identity = (
-            _MODEL_TARGET_PROFILE_POLICY_ID if model_target_only else _DEFAULT_PROFILE_POLICY_ID
+            _MODEL_TARGET_PROFILE_POLICY_ID
+            if built_in_model_target_adoption
+            else _DEFAULT_PROFILE_POLICY_ID
         )
         policy_reason = fallback_reason
         authority_decision = ExecutionProfileAuthorityDecision.NOT_REQUIRED
         action = (
             ExecutionProfilePolicyAction.ADOPT
-            if model_target_only
+            if built_in_model_target_adoption
             else ExecutionProfilePolicyAction.REJECT
         )
 
@@ -3763,7 +3767,8 @@ class SessionEngine:
                 changed_component_classes=changed_component_classes,
                 intent=intent,
                 authority_review_required=(
-                    ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
+                    force_authority_review
+                    or ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
                 ),
                 source_provider_name=(
                     session.provider_name if source_provider_name is None else source_provider_name
@@ -3807,7 +3812,8 @@ class SessionEngine:
             authority_decision = result.authority_decision
 
         broadens_authority = (
-            ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
+            force_authority_review
+            or ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
         )
         if action is ExecutionProfilePolicyAction.COMPATIBLE_REUSE:
             changes_persistent_target = (
@@ -11217,6 +11223,7 @@ class SessionEngine:
                 target_model=model,
                 source_provider_name=source_session.provider_name,
                 source_model=source_session.model,
+                force_authority_review=True,
             )
             if execution_profile_decision.kind in {
                 ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
@@ -11246,6 +11253,8 @@ class SessionEngine:
 
         source_projection_cursor = session_model_projection_cursor(source_session)
         model_changed = model != source_session.model
+        provider_changed = registered_provider.name != source_session.provider_name
+        target_changed = model_changed or provider_changed
         expected_fork_transcript: tuple[Message, ...] | None = None
         fork_projection_cursor = 0
         selected_source_cursor = 0
@@ -11253,7 +11262,7 @@ class SessionEngine:
         source_prompt_sha256: str | None = None
         child_prompt_sha256: str | None = None
         if prompt_workflow.requires_transcript_snapshot(
-            model_changed=model_changed,
+            target_changed=target_changed,
             source_projection_cursor=source_projection_cursor,
         ):
             source_snapshot = await self.session_store.load_transcript_snapshot(source_session.id)
@@ -11313,11 +11322,11 @@ class SessionEngine:
                 expected_fork_transcript = None
                 del source_snapshot
                 raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
-            if prompt_workflow.requires_portability_validation(model_changed=model_changed):
+            if prompt_workflow.requires_portability_validation(target_changed=target_changed):
                 portable_projection = None
                 portable_messages: list[Message] = []
                 try:
-                    if model_changed:
+                    if target_changed:
                         portable_projection = model_target.project_portable_transcript(
                             list(expected_fork_transcript)
                         )
@@ -11330,7 +11339,7 @@ class SessionEngine:
                         ]
                     if portable_messages:
                         validate_context_messages(portable_messages)
-                    if model_changed:
+                    if target_changed:
                         hook_tools: list[dict[str, Any]] = []
                         try:
                             hook_tools = _model_request_tools(
