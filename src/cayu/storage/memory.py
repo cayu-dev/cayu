@@ -3,14 +3,17 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from collections import Counter
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from math import sqrt
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from cayu._clock import utc_clock
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -35,8 +38,14 @@ DEFAULT_KNOWLEDGE_NAMESPACE = "default"
 DEFAULT_KNOWLEDGE_KIND = "fact"
 DEFAULT_KNOWLEDGE_LIMIT = 10
 DEFAULT_KNOWLEDGE_MAX_BYTES = 20_000
+MAX_KNOWLEDGE_CHANGE_LIMIT = 1_000
+MAX_KNOWLEDGE_CHANGE_SEQUENCE = 2**63 - 1
+MAX_KNOWLEDGE_CHUNK_ID_BYTES = 512
 MAX_KNOWLEDGE_CHUNK_INDEX = 2**31 - 1
+MAX_KNOWLEDGE_ENTRY_ID_BYTES = 256
 MAX_KNOWLEDGE_REVISION = 2**31 - 1
+MAX_KNOWLEDGE_EVIDENCE_BYTES = DEFAULT_KNOWLEDGE_MAX_BYTES
+MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES = 16_384
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -105,6 +114,26 @@ class KnowledgeSearchMode(StrEnum):
     EXTERNAL = "external"
 
 
+class KnowledgeEvidenceRole(StrEnum):
+    ORIGIN = "origin"
+    SUPPORTING = "supporting"
+
+
+class KnowledgeEvidenceDisposition(StrEnum):
+    LIVE = "live"
+    DETACHED = "detached"
+    RETAINED = "retained"
+
+
+class KnowledgeChangeKind(StrEnum):
+    CREATED = "created"
+    REVISION_APPENDED = "revision_appended"
+    STATUS_TRANSITIONED = "status_transitioned"
+    TOMBSTONED = "tombstoned"
+    HARD_DELETED = "hard_deleted"
+    EXPIRED = "expired"
+
+
 class KnowledgeListGroup(StrEnum):
     KIND = "kind"
     LABEL = "label"
@@ -131,6 +160,14 @@ class KnowledgeChunkConflict(RuntimeError):
         super().__init__("Knowledge chunk identity conflicts with durable state.")
 
 
+class KnowledgeEvidenceConflict(RuntimeError):
+    """A knowledge write conflicts with an occupied global evidence identity."""
+
+    def __init__(self, operation: str) -> None:
+        self.operation = require_clean_nonblank(operation, "operation")
+        super().__init__("Knowledge evidence identity conflicts with durable state.")
+
+
 class KnowledgeRevisionConflict(RuntimeError):
     """A canonical write lost a compare-and-swap race."""
 
@@ -141,7 +178,7 @@ class KnowledgeRevisionConflict(RuntimeError):
         expected_revision: int | None,
         actual_revision: int | None,
     ) -> None:
-        self.entry_id = require_clean_nonblank(entry_id, "entry_id")
+        self.entry_id = _knowledge_entry_id(entry_id)
         if expected_revision is not None:
             _validate_knowledge_revision(expected_revision, "expected_revision")
         if actual_revision is not None:
@@ -152,6 +189,14 @@ class KnowledgeRevisionConflict(RuntimeError):
             f"Knowledge entry {self.entry_id!r} revision conflict: expected "
             f"{self.expected_revision!r}, found {self.actual_revision!r}."
         )
+
+
+class KnowledgeChangeConsumerConflict(RuntimeError):
+    """A knowledge-change consumer or lease fence conflicts with durable state."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge change consumer conflicts with durable state.")
 
 
 class KnowledgeAccessScope(BaseModel):
@@ -309,7 +354,12 @@ class KnowledgeEntry(BaseModel):
     def copy_labels(cls, value) -> dict[str, str]:
         return copy_label_map(value, "labels")
 
-    @field_validator("id", "namespace", "kind", "created_by")
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value, "id")
+
+    @field_validator("namespace", "kind", "created_by")
     @classmethod
     def validate_clean_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
@@ -413,6 +463,30 @@ class _KnowledgeAccessSnapshot(BaseModel):
         return copy_label_map(value, "labels")
 
 
+class _KnowledgeChangeAudience(BaseModel):
+    """One immutable before/after authorization audience for a change."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: Literal["before", "after"]
+    snapshot: _KnowledgeAccessSnapshot
+    requires_include_expired: bool = False
+
+    @field_validator("snapshot", mode="before")
+    @classmethod
+    def copy_snapshot(cls, value: _KnowledgeAccessSnapshot) -> _KnowledgeAccessSnapshot:
+        if type(value) is not _KnowledgeAccessSnapshot:
+            raise TypeError("Knowledge change audiences require an access snapshot.")
+        return value.model_copy(deep=True)
+
+    @field_validator("requires_include_expired", mode="before")
+    @classmethod
+    def validate_requires_include_expired(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`requires_include_expired` must be a boolean.")
+        return value
+
+
 class KnowledgeChunk(BaseModel):
     """Immutable chunk belonging to one exact knowledge revision."""
 
@@ -432,10 +506,15 @@ class KnowledgeChunk(BaseModel):
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_durable_json_object(value, "metadata")
 
-    @field_validator("id", "entry_id")
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _knowledge_chunk_id(value, "id")
+
+    @field_validator("entry_id")
     @classmethod
     def validate_clean_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return _knowledge_entry_id(value, info.field_name)
 
     @field_validator("text")
     @classmethod
@@ -467,6 +546,172 @@ class KnowledgeChunk(BaseModel):
     def validate_entry_revision(cls, value: int) -> int:
         _validate_knowledge_revision(value, "entry_revision")
         return value
+
+
+class KnowledgeEvidence(BaseModel):
+    """Immutable exact source evidence for one knowledge revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    id: str
+    entry_id: str
+    entry_revision: int = 1
+    chunk_id: str | None = None
+    role: KnowledgeEvidenceRole = KnowledgeEvidenceRole.ORIGIN
+    source_type: str
+    source_id: str | None = None
+    source_uri: str | None = None
+    source_revision: str | None = None
+    source_hash: str | None = None
+    locator: dict[str, Any] = Field(default_factory=dict)
+    disposition: KnowledgeEvidenceDisposition = KnowledgeEvidenceDisposition.LIVE
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("id", "source_type")
+    @classmethod
+    def validate_required_identity(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
+        return value
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator(
+        "source_id",
+        "source_uri",
+        "source_revision",
+        "source_hash",
+    )
+    @classmethod
+    def validate_optional_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, info.field_name)
+        limit = 256 if info.field_name == "source_id" else 2048
+        if len(value.encode("utf-8")) > limit:
+            raise ValueError(f"`{info.field_name}` must be at most {limit} UTF-8 bytes.")
+        return value
+
+    @field_validator("chunk_id")
+    @classmethod
+    def validate_chunk_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _knowledge_chunk_id(value)
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
+        return value
+
+    @field_validator("locator", "metadata", mode="before")
+    @classmethod
+    def copy_json_objects(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        copied = copy_durable_json_object(value, info.field_name)
+        if len(canonical_durable_json_bytes(copied, info.field_name)) > (
+            MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES
+        ):
+            raise ValueError(
+                f"`{info.field_name}` must be at most "
+                f"{MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES} canonical UTF-8 bytes."
+            )
+        return copied
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`created_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_stable_source_identity(self) -> KnowledgeEvidence:
+        if self.source_id is None and self.source_uri is None:
+            raise ValueError("Knowledge evidence requires `source_id` or `source_uri`.")
+        if self.source_revision is None and self.source_hash is None:
+            raise ValueError("Knowledge evidence requires `source_revision` or `source_hash`.")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "knowledge evidence",
+                )
+            )
+            > MAX_KNOWLEDGE_EVIDENCE_BYTES
+        ):
+            raise ValueError(
+                f"Knowledge evidence must be at most {MAX_KNOWLEDGE_EVIDENCE_BYTES} "
+                "canonical UTF-8 bytes."
+            )
+        return self
+
+
+class KnowledgeEvidenceResult(BaseModel):
+    """Bounded evidence for one exact authorized knowledge revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    entry_id: str
+    entry_revision: int
+    evidence: list[KnowledgeEvidence] = Field(default_factory=list)
+    truncated: bool = False
+    limit: int
+    max_bytes: int
+    total_evidence_known: int
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
+        return value
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def copy_evidence(cls, value) -> list[KnowledgeEvidence]:
+        return [copy_knowledge_evidence(item) for item in value]
+
+    @field_validator("limit", "max_bytes")
+    @classmethod
+    def validate_limits(cls, value: int, info) -> int:
+        _validate_positive_int(value, info.field_name)
+        return value
+
+    @field_validator("total_evidence_known")
+    @classmethod
+    def validate_total(cls, value: int) -> int:
+        _validate_nonnegative_int(value, "total_evidence_known")
+        return value
+
+    @field_validator("truncated", mode="before")
+    @classmethod
+    def validate_truncated(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`truncated` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_result(self) -> KnowledgeEvidenceResult:
+        if len(self.evidence) > self.limit:
+            raise ValueError("`evidence` cannot contain more records than `limit`.")
+        if self.total_evidence_known < len(self.evidence):
+            raise ValueError("`total_evidence_known` cannot be less than returned evidence.")
+        if self.truncated != (len(self.evidence) < self.total_evidence_known):
+            raise ValueError("`truncated` must reflect omitted evidence.")
+        for item in self.evidence:
+            if item.entry_id != self.entry_id or item.entry_revision != self.entry_revision:
+                raise ValueError("Evidence result contains another entry revision.")
+        return self
 
 
 class KnowledgeQuery(BaseModel):
@@ -939,7 +1184,7 @@ class KnowledgePublicationReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     operation_id: str = Field(max_length=256)
-    entry_id: str = Field(max_length=256)
+    entry_id: str
     entry_revision: int
     expected_revision: int | None
     request_sha256: str
@@ -948,13 +1193,18 @@ class KnowledgePublicationReceipt(BaseModel):
     committed_at: datetime
     replayed: bool = False
 
-    @field_validator("operation_id", "entry_id")
+    @field_validator("operation_id")
     @classmethod
     def validate_clean_ids(cls, value: str, info) -> str:
         value = require_clean_nonblank(value, info.field_name)
         if len(value.encode("utf-8")) > 256:
             raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
         return value
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
 
     @field_validator("request_sha256")
     @classmethod
@@ -1006,6 +1256,255 @@ class KnowledgePublicationReceipt(BaseModel):
         return self
 
 
+class KnowledgeChange(BaseModel):
+    """Metadata-only canonical knowledge mutation published in commit order."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    id: str
+    sequence: int
+    kind: KnowledgeChangeKind
+    entry_id: str
+    entry_revision: int
+    committed_at: datetime
+    operation_id: str | None = None
+
+    @field_validator("id", "operation_id")
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
+        return value
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator("sequence")
+    @classmethod
+    def validate_sequence(cls, value: int) -> int:
+        _validate_knowledge_change_sequence(value, "sequence")
+        if value == 0:
+            raise ValueError("`sequence` must be greater than 0.")
+        return value
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
+        return value
+
+    @field_validator("committed_at")
+    @classmethod
+    def validate_committed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`committed_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+
+class KnowledgeChangeBatch(BaseModel):
+    """One bounded ordered change page and its captured accessible high-water mark."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    changes: list[KnowledgeChange] = Field(default_factory=list)
+    after_sequence: int = 0
+    next_after_sequence: int = 0
+    high_water_sequence: int = 0
+    truncated: bool = False
+    limit: int
+
+    @field_validator("changes", mode="before")
+    @classmethod
+    def copy_changes(cls, value) -> list[KnowledgeChange]:
+        return [copy_knowledge_change(change) for change in value]
+
+    @field_validator("after_sequence", "next_after_sequence", "high_water_sequence")
+    @classmethod
+    def validate_sequences(cls, value: int, info) -> int:
+        _validate_knowledge_change_sequence(value, info.field_name)
+        return value
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, value: int) -> int:
+        _validate_knowledge_change_limit(value)
+        return value
+
+    @field_validator("truncated", mode="before")
+    @classmethod
+    def validate_truncated(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`truncated` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page(self) -> KnowledgeChangeBatch:
+        if len(self.changes) > self.limit:
+            raise ValueError("`changes` cannot contain more records than `limit`.")
+        sequences = [change.sequence for change in self.changes]
+        if sequences != sorted(set(sequences)):
+            raise ValueError("Knowledge changes must have unique increasing sequences.")
+        if any(sequence <= self.after_sequence for sequence in sequences):
+            raise ValueError("Knowledge changes must follow `after_sequence`.")
+        if sequences and sequences[-1] > self.high_water_sequence:
+            raise ValueError("Knowledge changes cannot exceed `high_water_sequence`.")
+        expected_next = (
+            sequences[-1]
+            if self.truncated and sequences
+            else max(self.after_sequence, self.high_water_sequence)
+        )
+        if self.next_after_sequence != expected_next:
+            raise ValueError("`next_after_sequence` does not match the bounded page.")
+        if self.truncated and not sequences:
+            raise ValueError("A truncated knowledge-change page cannot be empty.")
+        return self
+
+
+class KnowledgeChangeClaim(BaseModel):
+    """One fenced at-least-once lease over an ordered knowledge change."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    consumer_id: str
+    worker_id: str
+    claim_id: str
+    change: KnowledgeChange
+    attempt: int
+    claimed_at: datetime
+    lease_expires_at: datetime
+
+    @field_validator("consumer_id", "worker_id", "claim_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
+        return value
+
+    @field_validator("change")
+    @classmethod
+    def copy_change(cls, value: KnowledgeChange) -> KnowledgeChange:
+        return copy_knowledge_change(value)
+
+    @field_validator("attempt")
+    @classmethod
+    def validate_attempt(cls, value: int) -> int:
+        _validate_positive_int(value, "attempt")
+        return value
+
+    @field_validator("claimed_at", "lease_expires_at")
+    @classmethod
+    def validate_datetime(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"`{info.field_name}` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_lease_window(self) -> KnowledgeChangeClaim:
+        if self.lease_expires_at <= self.claimed_at:
+            raise ValueError("`lease_expires_at` must follow `claimed_at`.")
+        return self
+
+
+class KnowledgeChangeConsumerState(BaseModel):
+    """Durable cursor and active lease state for one scope-bound consumer."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    consumer_id: str
+    access_scope_sha256: str
+    cursor_sequence: int = 0
+    pending_change_sequence: int | None = None
+    pending_claim_id: str | None = None
+    pending_worker_id: str | None = None
+    pending_attempt: int = 0
+    claimed_at: datetime | None = None
+    lease_expires_at: datetime | None = None
+    last_acknowledged_claim_id: str | None = None
+    updated_at: datetime
+
+    @field_validator(
+        "consumer_id",
+        "pending_claim_id",
+        "pending_worker_id",
+        "last_acknowledged_claim_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
+        return value
+
+    @field_validator("access_scope_sha256")
+    @classmethod
+    def validate_scope_digest(cls, value: str) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("`access_scope_sha256` must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("cursor_sequence")
+    @classmethod
+    def validate_cursor(cls, value: int) -> int:
+        _validate_knowledge_change_sequence(value, "cursor_sequence")
+        return value
+
+    @field_validator("pending_change_sequence")
+    @classmethod
+    def validate_pending_sequence(cls, value: int | None) -> int | None:
+        if value is not None:
+            _validate_knowledge_change_sequence(value, "pending_change_sequence")
+            if value == 0:
+                raise ValueError("`pending_change_sequence` must be greater than 0.")
+        return value
+
+    @field_validator("pending_attempt")
+    @classmethod
+    def validate_pending_attempt(cls, value: int) -> int:
+        _validate_nonnegative_int(value, "pending_attempt")
+        return value
+
+    @field_validator("claimed_at", "lease_expires_at", "updated_at")
+    @classmethod
+    def validate_datetime(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"`{info.field_name}` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_pending_lease(self) -> KnowledgeChangeConsumerState:
+        pending = (
+            self.pending_change_sequence,
+            self.pending_claim_id,
+            self.pending_worker_id,
+            self.claimed_at,
+            self.lease_expires_at,
+        )
+        if any(value is not None for value in pending) and not all(
+            value is not None for value in pending
+        ):
+            raise ValueError("Knowledge change pending-lease fields must be set together.")
+        if self.pending_change_sequence is not None:
+            if self.pending_change_sequence <= self.cursor_sequence:
+                raise ValueError("A pending change must follow the consumer cursor.")
+            if self.pending_attempt <= 0:
+                raise ValueError("An active knowledge change lease requires a positive attempt.")
+            assert self.claimed_at is not None
+            assert self.lease_expires_at is not None
+            if self.lease_expires_at <= self.claimed_at:
+                raise ValueError("An active knowledge change lease must expire after claim time.")
+        return self
+
+
 class KnowledgeStore(ABC):
     """Searchable knowledge contract."""
 
@@ -1043,6 +1542,7 @@ class KnowledgeStore(ABC):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk] | None = None,
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         """Create revision 1 of a previously unoccupied logical entry id."""
@@ -1054,6 +1554,7 @@ class KnowledgeStore(ABC):
         chunks: list[KnowledgeChunk] | None = None,
         *,
         expected_revision: int,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         """Append exactly one revision using compare-and-swap."""
@@ -1098,15 +1599,16 @@ class KnowledgeStore(ABC):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
         """Publish one create/append exactly once with immutable replay evidence.
 
-        Implementations commit the revision, chunks, current pointer, and receipt
-        atomically. ``expected_revision=None`` creates revision 1; a positive
-        value appends exactly its successor.
+        Implementations commit the revision, chunks, evidence, current pointer,
+        metadata-only change, and receipt atomically. ``expected_revision=None``
+        creates revision 1; a positive value appends exactly its successor.
         Use :func:`prepare_knowledge_publication` to copy and bind the canonical
         authority tuple before entering the store transaction.
         """
@@ -1126,6 +1628,19 @@ class KnowledgeStore(ABC):
         raise NotImplementedError(
             "This KnowledgeStore does not support knowledge publication receipts."
         )
+
+    async def read_evidence(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+        max_records: int = DEFAULT_KNOWLEDGE_LIMIT,
+        max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
+    ) -> KnowledgeEvidenceResult | None:
+        """Read evidence for the current or one exact authorized revision."""
+
+        raise NotImplementedError("This KnowledgeStore does not support knowledge evidence.")
 
     @abstractmethod
     async def read_chunks(
@@ -1159,6 +1674,70 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeListResult:
         """List entries/facets for discovery without requiring a lexical search term."""
 
+    async def read_changes(
+        self,
+        *,
+        after_sequence: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeBatch:
+        """Read one bounded ordered page of accessible canonical changes."""
+
+        raise NotImplementedError("This KnowledgeStore does not support knowledge changes.")
+
+    async def initialize_change_consumer(
+        self,
+        consumer_id: str,
+        *,
+        baseline_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        """Bind a consumer and its cursor to a captured full-scan high-water mark."""
+
+        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
+
+    async def claim_change(
+        self,
+        consumer_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 300.0,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeClaim | None:
+        """Lease the consumer's next accessible change with at-least-once semantics."""
+
+        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
+
+    async def acknowledge_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        """Fenced acknowledgement that advances one consumer cursor."""
+
+        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
+
+    async def release_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        """Release a live claim without advancing its consumer cursor."""
+
+        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
+
+    async def load_change_consumer_state(
+        self,
+        consumer_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState | None:
+        """Load one scope-bound consumer cursor and lease state."""
+
+        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
+
     async def prune_expired(
         self,
         *,
@@ -1184,15 +1763,25 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         entries: list[KnowledgeEntry] | None = None,
         *,
         access_scope: KnowledgeAccessScope | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._default_access_scope = (
             None if access_scope is None else copy_knowledge_access_scope(access_scope)
         )
+        self._clock = utc_clock(clock)
         self._entries: dict[str, dict[int, KnowledgeEntry]] = {}
         self._current_revisions: dict[str, int] = {}
         self._chunks: dict[tuple[str, int], list[KnowledgeChunk]] = {}
+        self._evidence: dict[tuple[str, int], list[KnowledgeEvidence]] = {}
         self._publication_receipts: dict[str, KnowledgePublicationReceipt] = {}
         self._publication_access: dict[str, _KnowledgeAccessSnapshot] = {}
+        self._changes: list[KnowledgeChange] = []
+        self._changes_by_sequence: dict[int, KnowledgeChange] = {}
+        self._change_access: dict[int, tuple[_KnowledgeChangeAudience, ...]] = {}
+        self._revision_change_expiration_access: dict[tuple[str, int], bool] = {}
+        self._next_change_sequence = 1
+        self._change_consumers: dict[str, KnowledgeChangeConsumerState] = {}
+        self._acknowledged_change_claims: dict[tuple[str, str], tuple[str, int]] = {}
         if entries:
             for entry in entries:
                 copied = copy_knowledge_entry(entry)
@@ -1203,12 +1792,16 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 self._entries[copied.id] = {1: copied}
                 self._current_revisions[copied.id] = 1
                 self._chunks[(copied.id, 1)] = [_default_chunk_for_entry(copied)]
+                self._evidence[(copied.id, 1)] = []
+                change = self._prepare_change(copied, kind=KnowledgeChangeKind.CREATED)
+                self._record_change(change, before_entry=None, after_entry=copied)
 
     async def create_entry(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk] | None = None,
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
@@ -1224,14 +1817,28 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 actual_revision=existing.revision,
             )
         copied_chunks = self._revision_chunks(entry, chunks)
+        copied_evidence = _copy_entry_evidence(
+            entry.id,
+            entry.revision,
+            evidence or [],
+            chunks=copied_chunks,
+        )
         self._require_chunk_ids_available(
             copied_chunks,
             access_scope=scope,
             operation="create_entry",
         )
+        self._require_evidence_ids_available(
+            copied_evidence,
+            access_scope=scope,
+            operation="create_entry",
+        )
+        change = self._prepare_change(entry, kind=KnowledgeChangeKind.CREATED)
         self._entries[entry.id] = {1: entry}
         self._current_revisions[entry.id] = 1
         self._chunks[(entry.id, 1)] = copied_chunks
+        self._evidence[(entry.id, 1)] = copied_evidence
+        self._record_change(change, before_entry=None, after_entry=entry)
         return copy_knowledge_entry(entry)
 
     async def append_entry_revision(
@@ -1240,41 +1847,21 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         chunks: list[KnowledgeChunk] | None = None,
         *,
         expected_revision: int,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
-        _validate_revision_append(entry, expected_revision=expected_revision)
-        current = self._current_entry(entry.id)
-        if current is None:
-            raise KnowledgeRevisionConflict(
-                entry.id,
-                expected_revision=expected_revision,
-                actual_revision=None,
-            )
-        _require_knowledge_entry_access(scope, current, operation="append_entry_revision")
-        if current.revision != expected_revision:
-            raise KnowledgeRevisionConflict(
-                entry.id,
-                expected_revision=expected_revision,
-                actual_revision=current.revision,
-            )
-        _validate_revision_successor(current, entry)
-        _require_knowledge_successor_access(
-            scope,
+        return self._append_revision(
             entry,
-            operation="append_entry_revision",
-        )
-        copied_chunks = self._revision_chunks(entry, chunks, previous=current)
-        self._require_chunk_ids_available(
-            copied_chunks,
+            chunks=chunks,
+            evidence=evidence,
+            expected_revision=expected_revision,
             access_scope=scope,
             operation="append_entry_revision",
+            change_kind=KnowledgeChangeKind.REVISION_APPENDED,
+            inherit_evidence=False,
         )
-        self._entries[entry.id][entry.revision] = entry
-        self._chunks[(entry.id, entry.revision)] = copied_chunks
-        self._current_revisions[entry.id] = entry.revision
-        return copy_knowledge_entry(entry)
 
     async def get_entry(
         self,
@@ -1284,7 +1871,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
         if revision is not None:
@@ -1308,7 +1895,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         _validate_knowledge_revision(expected_revision, "expected_revision")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
@@ -1347,10 +1934,19 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 "updated_at": _next_updated_at(entry),
             }
         )
-        return await self.append_entry_revision(
+        return self._append_revision(
             updated,
+            chunks=None,
+            evidence=None,
             expected_revision=expected_revision,
             access_scope=scope,
+            operation="transition_entry_status",
+            change_kind=(
+                KnowledgeChangeKind.TOMBSTONED
+                if to_status is KnowledgeStatus.DELETED
+                else KnowledgeChangeKind.STATUS_TRANSITIONED
+            ),
+            inherit_evidence=True,
         )
 
     async def delete_entry(
@@ -1362,7 +1958,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         hard: bool = False,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         _validate_knowledge_revision(expected_revision, "expected_revision")
         if type(hard) is not bool:
             raise ValueError("`hard` must be a boolean.")
@@ -1377,10 +1973,14 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 actual_revision=entry.revision,
             )
         if hard:
+            change = self._prepare_change(entry, kind=KnowledgeChangeKind.HARD_DELETED)
             self._entries.pop(clean_id, None)
             self._current_revisions.pop(clean_id, None)
             for key in [key for key in self._chunks if key[0] == clean_id]:
                 self._chunks.pop(key, None)
+            for key in [key for key in self._evidence if key[0] == clean_id]:
+                self._evidence.pop(key, None)
+            self._record_change(change, before_entry=entry, after_entry=None)
             return copy_knowledge_entry(entry)
         return await self.transition_entry_status(
             clean_id,
@@ -1397,35 +1997,54 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         now: datetime | None = None,
     ) -> int:
         scope = self._operation_access_scope(access_scope)
-        cutoff = datetime.now(UTC) if now is None else now
-        expired_ids = [
-            entry_id
-            for entry_id in self._entries
-            if (entry := self._current_entry(entry_id)) is not None
-            if entry.expires_at is not None
-            and entry.expires_at <= cutoff
-            and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
+        cutoff = _knowledge_change_now(now)
+        expired_entries = sorted(
+            (
+                entry
+                for entry_id in self._entries
+                if (entry := self._current_entry(entry_id)) is not None
+                if entry.expires_at is not None
+                and entry.expires_at <= cutoff
+                and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
+            ),
+            key=lambda entry: entry.id,
+        )
+        prepared_changes = [
+            (entry, self._prepare_change(entry, kind=KnowledgeChangeKind.EXPIRED))
+            for entry in expired_entries
         ]
-        for entry_id in expired_ids:
+        for entry, change in prepared_changes:
+            entry_id = entry.id
             self._entries.pop(entry_id, None)
             self._current_revisions.pop(entry_id, None)
             for key in [key for key in self._chunks if key[0] == entry_id]:
                 self._chunks.pop(key, None)
-        return len(expired_ids)
+            for key in [key for key in self._evidence if key[0] == entry_id]:
+                self._evidence.pop(key, None)
+            self._record_change(change, before_entry=entry, after_entry=None)
+        return len(expired_entries)
 
     async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
-        operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
+        (
+            operation_id,
+            copied_entry,
+            copied_chunks,
+            copied_evidence,
+            request_sha256,
+        ) = prepare_knowledge_publication(
             entry,
             chunks,
+            evidence=evidence,
             operation_id=operation_id,
             expected_revision=expected_revision,
         )
@@ -1440,6 +2059,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             _validate_knowledge_publication_replay(
                 existing_receipt,
                 entry=copied_entry,
+                chunks=copied_chunks,
+                evidence=copied_evidence,
+                expected_revision=expected_revision,
                 request_sha256=request_sha256,
             )
             return copy_knowledge_publication_receipt(existing_receipt, replayed=True)
@@ -1462,6 +2084,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             access_scope=scope,
             operation="publish_entry_revision",
         )
+        self._require_evidence_ids_available(
+            copied_evidence,
+            access_scope=scope,
+            operation="publish_entry_revision",
+        )
         receipt = KnowledgePublicationReceipt(
             operation_id=operation_id,
             entry_id=copied_entry.id,
@@ -1472,12 +2099,194 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             entry_updated_at=copied_entry.updated_at,
             committed_at=datetime.now(UTC),
         )
+        change = self._prepare_change(
+            copied_entry,
+            kind=(
+                KnowledgeChangeKind.CREATED
+                if existing_entry is None
+                else KnowledgeChangeKind.REVISION_APPENDED
+            ),
+            operation_id=operation_id,
+            committed_at=receipt.committed_at,
+        )
         self._entries.setdefault(copied_entry.id, {})[copied_entry.revision] = copied_entry
         self._chunks[(copied_entry.id, copied_entry.revision)] = copied_chunks
+        self._evidence[(copied_entry.id, copied_entry.revision)] = copied_evidence
         self._current_revisions[copied_entry.id] = copied_entry.revision
         self._publication_receipts[operation_id] = receipt
         self._publication_access[operation_id] = _knowledge_access_snapshot(copied_entry)
+        self._record_change(
+            change,
+            before_entry=existing_entry,
+            after_entry=copied_entry,
+        )
         return copy_knowledge_publication_receipt(receipt)
+
+    def _append_revision(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        chunks: list[KnowledgeChunk] | None,
+        evidence: list[KnowledgeEvidence] | None,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope,
+        operation: str,
+        change_kind: KnowledgeChangeKind,
+        inherit_evidence: bool,
+    ) -> KnowledgeEntry:
+        _validate_revision_append(entry, expected_revision=expected_revision)
+        current = self._current_entry(entry.id)
+        if current is None:
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=None,
+            )
+        _require_knowledge_entry_access(access_scope, current, operation=operation)
+        if current.revision != expected_revision:
+            raise KnowledgeRevisionConflict(
+                entry.id,
+                expected_revision=expected_revision,
+                actual_revision=current.revision,
+            )
+        _validate_revision_successor(current, entry)
+        _require_knowledge_successor_access(access_scope, entry, operation=operation)
+        previous_chunks = self._chunks.get((current.id, current.revision), [])
+        copied_chunks = self._revision_chunks(entry, chunks, previous=current)
+        if inherit_evidence:
+            if evidence is not None:
+                raise ValueError("Lifecycle evidence inheritance cannot accept evidence.")
+            copied_evidence = _copy_evidence_for_revision(
+                self._evidence.get((current.id, current.revision), []),
+                entry=entry,
+                previous_chunks=previous_chunks,
+                chunks=copied_chunks,
+            )
+        else:
+            copied_evidence = _copy_entry_evidence(
+                entry.id,
+                entry.revision,
+                evidence or [],
+                chunks=copied_chunks,
+            )
+        self._require_chunk_ids_available(
+            copied_chunks,
+            access_scope=access_scope,
+            operation=operation,
+        )
+        self._require_evidence_ids_available(
+            copied_evidence,
+            access_scope=access_scope,
+            operation=operation,
+        )
+        change = self._prepare_change(entry, kind=change_kind)
+        self._entries[entry.id][entry.revision] = entry
+        self._chunks[(entry.id, entry.revision)] = copied_chunks
+        self._evidence[(entry.id, entry.revision)] = copied_evidence
+        self._current_revisions[entry.id] = entry.revision
+        self._record_change(change, before_entry=current, after_entry=entry)
+        return copy_knowledge_entry(entry)
+
+    def _require_evidence_ids_available(
+        self,
+        evidence: list[KnowledgeEvidence],
+        *,
+        access_scope: KnowledgeAccessScope,
+        operation: str,
+    ) -> None:
+        proposed_ids = {item.id for item in evidence}
+        occupied_entry_ids = {
+            entry_id
+            for (entry_id, _), stored in self._evidence.items()
+            if any(item.id in proposed_ids for item in stored)
+        }
+        for occupied_entry_id in sorted(occupied_entry_ids):
+            owner = self._current_entry(occupied_entry_id)
+            if owner is None:
+                raise KnowledgeEvidenceConflict(operation)
+            _require_knowledge_entry_access(
+                access_scope,
+                owner,
+                operation=operation,
+            )
+        if occupied_entry_ids:
+            raise KnowledgeEvidenceConflict(operation)
+
+    def _prepare_change(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        kind: KnowledgeChangeKind,
+        operation_id: str | None = None,
+        committed_at: datetime | None = None,
+    ) -> KnowledgeChange:
+        sequence = self._next_change_sequence
+        if sequence > MAX_KNOWLEDGE_CHANGE_SEQUENCE:
+            raise RuntimeError("Knowledge change sequence is exhausted.")
+        self._next_change_sequence += 1
+        return KnowledgeChange(
+            id=f"kchg_{uuid4().hex}",
+            sequence=sequence,
+            kind=kind,
+            entry_id=entry.id,
+            entry_revision=entry.revision,
+            committed_at=(datetime.now(UTC) if committed_at is None else committed_at),
+            operation_id=operation_id,
+        )
+
+    def _record_change(
+        self,
+        change: KnowledgeChange,
+        *,
+        before_entry: KnowledgeEntry | None,
+        after_entry: KnowledgeEntry | None,
+    ) -> None:
+        copied = copy_knowledge_change(change)
+        self._changes.append(copied)
+        self._changes_by_sequence[copied.sequence] = copied
+        self._change_access[change.sequence] = _knowledge_change_audiences(
+            copied,
+            before_entry=before_entry,
+            after_entry=after_entry,
+            before_requires_include_expired=(
+                None
+                if before_entry is None
+                else self._revision_change_expiration_access.get(
+                    (before_entry.id, before_entry.revision)
+                )
+            ),
+        )
+        if after_entry is not None:
+            after_audience = next(
+                audience
+                for audience in self._change_access[change.sequence]
+                if audience.kind == "after"
+            )
+            self._revision_change_expiration_access[(after_entry.id, after_entry.revision)] = (
+                after_audience.requires_include_expired
+            )
+
+    def _change_by_sequence(self, sequence: int) -> KnowledgeChange | None:
+        return self._changes_by_sequence.get(sequence)
+
+    def _accessible_changes(
+        self,
+        scope: KnowledgeAccessScope,
+        *,
+        after_sequence: int,
+        limit: int | None = None,
+    ) -> list[KnowledgeChange]:
+        result: list[KnowledgeChange] = []
+        for change in self._changes:
+            audiences = self._change_access.get(change.sequence, ())
+            if change.sequence <= after_sequence or not any(
+                _knowledge_scope_allows_change_audience(scope, audience) for audience in audiences
+            ):
+                continue
+            result.append(change)
+            if limit is not None and len(result) >= limit:
+                break
+        return result
 
     def _require_chunk_ids_available(
         self,
@@ -1551,6 +2360,320 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_publication_receipt(receipt)
 
+    async def read_evidence(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+        max_records: int = DEFAULT_KNOWLEDGE_LIMIT,
+        max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
+    ) -> KnowledgeEvidenceResult | None:
+        scope = self._operation_access_scope(access_scope)
+        clean_id = _knowledge_entry_id(entry_id)
+        if revision is not None:
+            _validate_knowledge_revision(revision, "revision")
+        _validate_positive_int(max_records, "max_records")
+        _validate_positive_int(max_bytes, "max_bytes")
+        access_now = datetime.now(UTC)
+        if revision is not None:
+            current = self._current_entry(clean_id)
+            if current is None or not _knowledge_scope_allows_entry(
+                scope,
+                current,
+                now=access_now,
+            ):
+                return None
+        entry = self._entry_revision(clean_id, revision)
+        if entry is None or not _knowledge_scope_allows_entry(
+            scope,
+            entry,
+            now=access_now,
+        ):
+            return None
+        stored = self._evidence.get((clean_id, entry.revision), [])
+        selected = _bounded_knowledge_evidence(
+            stored,
+            max_records=max_records,
+            max_bytes=max_bytes,
+        )
+        return KnowledgeEvidenceResult(
+            entry_id=entry.id,
+            entry_revision=entry.revision,
+            evidence=selected,
+            truncated=len(selected) < len(stored),
+            limit=max_records,
+            max_bytes=max_bytes,
+            total_evidence_known=len(stored),
+        )
+
+    async def read_changes(
+        self,
+        *,
+        after_sequence: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeBatch:
+        scope = self._operation_access_scope(access_scope)
+        _validate_knowledge_change_sequence(after_sequence, "after_sequence")
+        _validate_knowledge_change_limit(limit)
+        current_sequence = self._next_change_sequence - 1
+        if after_sequence > current_sequence:
+            raise ValueError(
+                "`after_sequence` cannot exceed the current knowledge change sequence."
+            )
+        selected: list[KnowledgeChange] = []
+        high_water = 0
+        for change in self._changes:
+            audiences = self._change_access.get(change.sequence, ())
+            if not any(
+                _knowledge_scope_allows_change_audience(scope, audience) for audience in audiences
+            ):
+                continue
+            high_water = max(high_water, change.sequence)
+            if change.sequence > after_sequence and len(selected) <= limit:
+                selected.append(change)
+        truncated = len(selected) > limit
+        selected = selected[:limit]
+        next_after = selected[-1].sequence if truncated else max(after_sequence, high_water)
+        return KnowledgeChangeBatch(
+            changes=selected,
+            after_sequence=after_sequence,
+            next_after_sequence=next_after,
+            high_water_sequence=high_water,
+            truncated=truncated,
+            limit=limit,
+        )
+
+    async def claim_change(
+        self,
+        consumer_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 300.0,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeClaim | None:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        worker_id = _knowledge_change_identity(worker_id, "worker_id")
+        lease_seconds = _knowledge_change_lease_seconds(lease_seconds)
+        current_time = self._clock()
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        state = self._change_consumers.get(consumer_id)
+        if state is None:
+            state = KnowledgeChangeConsumerState(
+                consumer_id=consumer_id,
+                access_scope_sha256=scope_sha256,
+                updated_at=current_time,
+            )
+        elif state.access_scope_sha256 != scope_sha256:
+            raise KnowledgeChangeConsumerConflict("access_scope_mismatch")
+
+        if state.pending_change_sequence is not None:
+            stored_change = self._change_by_sequence(state.pending_change_sequence)
+            audiences = self._change_access.get(state.pending_change_sequence, ())
+            still_allowed = stored_change is not None and any(
+                _knowledge_scope_allows_change_audience(scope, audience) for audience in audiences
+            )
+            assert state.lease_expires_at is not None
+            if still_allowed and state.lease_expires_at > current_time:
+                if state.pending_worker_id != worker_id:
+                    self._change_consumers[consumer_id] = state
+                    return None
+                assert state.pending_claim_id is not None
+                assert state.claimed_at is not None
+                claim = KnowledgeChangeClaim(
+                    consumer_id=consumer_id,
+                    worker_id=worker_id,
+                    claim_id=state.pending_claim_id,
+                    change=stored_change,
+                    attempt=state.pending_attempt,
+                    claimed_at=state.claimed_at,
+                    lease_expires_at=state.lease_expires_at,
+                )
+                self._change_consumers[consumer_id] = state
+                return claim
+            state = state.model_copy(
+                update={
+                    "pending_change_sequence": None,
+                    "pending_claim_id": None,
+                    "pending_worker_id": None,
+                    "claimed_at": None,
+                    "lease_expires_at": None,
+                    "pending_attempt": (state.pending_attempt if still_allowed else 0),
+                    "updated_at": current_time,
+                }
+            )
+
+        candidates = self._accessible_changes(
+            scope,
+            after_sequence=state.cursor_sequence,
+            limit=1,
+        )
+        if not candidates:
+            self._change_consumers[consumer_id] = state
+            return None
+        change = candidates[0]
+        claim_id = f"kclaim_{uuid4().hex}"
+        claimed_at = current_time
+        lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
+        attempt = state.pending_attempt + 1
+        state = state.model_copy(
+            update={
+                "pending_change_sequence": change.sequence,
+                "pending_claim_id": claim_id,
+                "pending_worker_id": worker_id,
+                "pending_attempt": attempt,
+                "claimed_at": claimed_at,
+                "lease_expires_at": lease_expires_at,
+                "updated_at": current_time,
+            }
+        )
+        self._change_consumers[consumer_id] = state
+        return KnowledgeChangeClaim(
+            consumer_id=consumer_id,
+            worker_id=worker_id,
+            claim_id=claim_id,
+            change=change,
+            attempt=attempt,
+            claimed_at=claimed_at,
+            lease_expires_at=lease_expires_at,
+        )
+
+    async def initialize_change_consumer(
+        self,
+        consumer_id: str,
+        *,
+        baseline_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        _validate_knowledge_change_sequence(baseline_sequence, "baseline_sequence")
+        current_time = self._clock()
+        current_sequence = self._next_change_sequence - 1
+        if baseline_sequence > current_sequence:
+            raise ValueError(
+                "`baseline_sequence` cannot exceed the current knowledge change sequence."
+            )
+        state = _initialize_knowledge_change_consumer_state(
+            self._change_consumers.get(consumer_id),
+            consumer_id=consumer_id,
+            access_scope_sha256=_knowledge_access_scope_sha256(scope),
+            baseline_sequence=baseline_sequence,
+            now=current_time,
+        )
+        self._change_consumers[consumer_id] = state
+        return copy_knowledge_change_consumer_state(state)
+
+    async def acknowledge_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        claim = copy_knowledge_change_claim(claim)
+        current_time = self._clock()
+        state = self._change_consumers.get(claim.consumer_id)
+        if state is None or state.access_scope_sha256 != _knowledge_access_scope_sha256(scope):
+            raise KnowledgeChangeConsumerConflict("unknown_consumer")
+        claim_sha256 = _knowledge_change_claim_sha256(claim)
+        acknowledged = self._acknowledged_change_claims.get((claim.consumer_id, claim.claim_id))
+        if acknowledged is not None:
+            if acknowledged != (claim_sha256, claim.change.sequence):
+                raise KnowledgeChangeConsumerConflict("stale_claim")
+            if state.cursor_sequence < claim.change.sequence:
+                raise RuntimeError("Knowledge change acknowledgement is ahead of its consumer.")
+            return copy_knowledge_change_consumer_state(state)
+        self._require_live_change_claim(state, claim, now=current_time)
+        state = state.model_copy(
+            update={
+                "cursor_sequence": claim.change.sequence,
+                "pending_change_sequence": None,
+                "pending_claim_id": None,
+                "pending_worker_id": None,
+                "pending_attempt": 0,
+                "claimed_at": None,
+                "lease_expires_at": None,
+                "last_acknowledged_claim_id": claim.claim_id,
+                "updated_at": current_time,
+            }
+        )
+        self._change_consumers[claim.consumer_id] = state
+        self._acknowledged_change_claims[(claim.consumer_id, claim.claim_id)] = (
+            claim_sha256,
+            claim.change.sequence,
+        )
+        return copy_knowledge_change_consumer_state(state)
+
+    async def release_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        claim = copy_knowledge_change_claim(claim)
+        current_time = self._clock()
+        state = self._change_consumers.get(claim.consumer_id)
+        if state is None or state.access_scope_sha256 != _knowledge_access_scope_sha256(scope):
+            raise KnowledgeChangeConsumerConflict("unknown_consumer")
+        self._require_live_change_claim(state, claim, now=current_time)
+        state = state.model_copy(
+            update={
+                "pending_change_sequence": None,
+                "pending_claim_id": None,
+                "pending_worker_id": None,
+                "claimed_at": None,
+                "lease_expires_at": None,
+                "updated_at": current_time,
+            }
+        )
+        self._change_consumers[claim.consumer_id] = state
+        return copy_knowledge_change_consumer_state(state)
+
+    async def load_change_consumer_state(
+        self,
+        consumer_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState | None:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        state = self._change_consumers.get(consumer_id)
+        if state is None:
+            return None
+        if state.access_scope_sha256 != _knowledge_access_scope_sha256(scope):
+            return None
+        return copy_knowledge_change_consumer_state(state)
+
+    def _require_matching_change_claim(
+        self,
+        state: KnowledgeChangeConsumerState,
+        claim: KnowledgeChangeClaim,
+    ) -> None:
+        stored_change = self._change_by_sequence(claim.change.sequence)
+        if (
+            state.pending_change_sequence != claim.change.sequence
+            or state.pending_claim_id != claim.claim_id
+            or state.pending_worker_id != claim.worker_id
+            or state.pending_attempt != claim.attempt
+            or stored_change != claim.change
+        ):
+            raise KnowledgeChangeConsumerConflict("stale_claim")
+
+    def _require_live_change_claim(
+        self,
+        state: KnowledgeChangeConsumerState,
+        claim: KnowledgeChangeClaim,
+        *,
+        now: datetime,
+    ) -> None:
+        self._require_matching_change_claim(state, claim)
+        if state.lease_expires_at is None or state.lease_expires_at <= now:
+            raise KnowledgeChangeConsumerConflict("expired_claim")
+
     async def read_chunks(
         self,
         entry_id: str,
@@ -1563,7 +2686,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
         if revision is not None:
@@ -1746,6 +2869,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         embedding_dimensions: int | None = None,
         entries: list[KnowledgeEntry] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
+        clock: Callable[[], datetime] | None = None,
         hybrid_keyword_weight: float = 0.35,
         semantic_min_score: float = 0.55,
     ) -> None:
@@ -1765,7 +2889,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             "semantic_min_score",
         )
         self._chunk_embeddings: dict[str, _StoredChunkEmbedding] = {}
-        super().__init__(entries, access_scope=access_scope)
+        super().__init__(entries, access_scope=access_scope, clock=clock)
 
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
         return (
@@ -1780,12 +2904,14 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk] | None = None,
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         stored = await super().create_entry(
             entry,
             access_scope=access_scope,
             chunks=chunks,
+            evidence=evidence,
         )
         await self._embed_entry_chunks(stored.id, stored.revision)
         return stored
@@ -1796,6 +2922,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         chunks: list[KnowledgeChunk] | None = None,
         *,
         expected_revision: int,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         stored = await super().append_entry_revision(
@@ -1803,6 +2930,31 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             expected_revision=expected_revision,
             access_scope=access_scope,
             chunks=chunks,
+            evidence=evidence,
+        )
+        await self._embed_entry_chunks(stored.id, stored.revision)
+        self._drop_stale_entry_embeddings(stored.id)
+        return stored
+
+    async def transition_entry_status(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        access_scope: KnowledgeAccessScope | None = None,
+        from_status: KnowledgeStatus,
+        to_status: KnowledgeStatus,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeEntry:
+        stored = await super().transition_entry_status(
+            entry_id,
+            expected_revision=expected_revision,
+            access_scope=access_scope,
+            from_status=from_status,
+            to_status=to_status,
+            expected_namespace=expected_namespace,
+            expected_labels=expected_labels,
         )
         await self._embed_entry_chunks(stored.id, stored.revision)
         self._drop_stale_entry_embeddings(stored.id)
@@ -1833,15 +2985,15 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         now: datetime | None = None,
     ) -> int:
         scope = self._operation_access_scope(access_scope)
-        cutoff = datetime.now(UTC) if now is None else now
-        expired_ids = [
+        cutoff = _knowledge_change_now(now)
+        expired_ids = sorted(
             entry_id
             for entry_id in self._entries
             if (entry := self._current_entry(entry_id)) is not None
             if entry.expires_at is not None
             and entry.expires_at <= cutoff
             and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
-        ]
+        )
         pruned = await super().prune_expired(access_scope=scope, now=cutoff)
         for entry_id in expired_ids:
             self._drop_entry_embeddings(entry_id)
@@ -1852,6 +3004,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
@@ -1859,6 +3012,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         receipt = await super().publish_entry_revision(
             entry,
             chunks,
+            evidence=evidence,
             access_scope=access_scope,
             operation_id=operation_id,
             expected_revision=expected_revision,
@@ -2151,6 +3305,26 @@ def _knowledge_access_snapshot_json(snapshot: _KnowledgeAccessSnapshot) -> str:
     ).decode("utf-8")
 
 
+def _knowledge_access_scope_sha256(scope: KnowledgeAccessScope) -> str:
+    scope = copy_knowledge_access_scope(scope)
+    return sha256(
+        canonical_durable_json_bytes(
+            scope.model_dump(mode="json"),
+            "knowledge change access scope",
+        )
+    ).hexdigest()
+
+
+def _knowledge_change_claim_sha256(claim: KnowledgeChangeClaim) -> str:
+    claim = copy_knowledge_change_claim(claim)
+    return sha256(
+        canonical_durable_json_bytes(
+            claim.model_dump(mode="json"),
+            "knowledge change claim",
+        )
+    ).hexdigest()
+
+
 def _parse_knowledge_access_snapshot_json(value: str) -> _KnowledgeAccessSnapshot:
     if type(value) is not str:
         raise TypeError("Knowledge access snapshot must be JSON text.")
@@ -2162,6 +3336,16 @@ def _knowledge_scope_allows_snapshot(
     snapshot: _KnowledgeAccessSnapshot,
     *,
     now: datetime | None = None,
+) -> bool:
+    if not _knowledge_scope_allows_snapshot_dimensions(scope, snapshot):
+        return False
+    cutoff = datetime.now(UTC) if now is None else now
+    return scope.include_expired or snapshot.expires_at is None or snapshot.expires_at > cutoff
+
+
+def _knowledge_scope_allows_snapshot_dimensions(
+    scope: KnowledgeAccessScope,
+    snapshot: _KnowledgeAccessSnapshot,
 ) -> bool:
     if not scope.allow_all_namespaces and snapshot.namespace not in scope.allowed_namespaces:
         return False
@@ -2177,10 +3361,65 @@ def _knowledge_scope_allows_snapshot(
         return False
     if scope.allowed_source_ids is not None and snapshot.source_id not in scope.allowed_source_ids:
         return False
-    if snapshot.status not in scope.allowed_statuses:
-        return False
-    cutoff = datetime.now(UTC) if now is None else now
-    return scope.include_expired or snapshot.expires_at is None or snapshot.expires_at > cutoff
+    return snapshot.status in scope.allowed_statuses
+
+
+def _knowledge_scope_allows_change_audience(
+    scope: KnowledgeAccessScope,
+    audience: _KnowledgeChangeAudience,
+) -> bool:
+    return (
+        scope.include_expired or not audience.requires_include_expired
+    ) and _knowledge_scope_allows_snapshot_dimensions(scope, audience.snapshot)
+
+
+def _knowledge_change_audiences(
+    change: KnowledgeChange,
+    *,
+    before_entry: KnowledgeEntry | None,
+    after_entry: KnowledgeEntry | None,
+    before_requires_include_expired: bool | None = None,
+) -> tuple[_KnowledgeChangeAudience, ...]:
+    if before_entry is None and after_entry is None:
+        raise ValueError("A knowledge change requires a before or after entry.")
+    if before_entry is not None and before_entry.id != change.entry_id:
+        raise ValueError("Knowledge change before-entry identity does not match the change.")
+    if after_entry is not None and (
+        after_entry.id != change.entry_id or after_entry.revision != change.entry_revision
+    ):
+        raise ValueError("Knowledge change after-entry identity does not match the change.")
+    if after_entry is None and (
+        before_entry is None or before_entry.revision != change.entry_revision
+    ):
+        raise ValueError("Knowledge removal change revision does not match its before entry.")
+
+    audiences: list[_KnowledgeChangeAudience] = []
+    for kind, entry in (("after", after_entry), ("before", before_entry)):
+        if entry is None:
+            continue
+        snapshot = _knowledge_access_snapshot(entry)
+        requires_include_expired = (
+            snapshot.expires_at is not None and snapshot.expires_at <= change.committed_at
+        )
+        if kind == "before" and before_requires_include_expired is not None:
+            # Preserve the expiration audience captured when this exact revision
+            # was published. A slow consumer can then receive its removal signal,
+            # while an entry already expired at publication never widens access.
+            requires_include_expired = before_requires_include_expired
+        if any(
+            existing.snapshot == snapshot
+            and existing.requires_include_expired == requires_include_expired
+            for existing in audiences
+        ):
+            continue
+        audiences.append(
+            _KnowledgeChangeAudience(
+                kind=kind,
+                snapshot=snapshot,
+                requires_include_expired=requires_include_expired,
+            )
+        )
+    return tuple(audiences)
 
 
 def _knowledge_scope_allows_entry(
@@ -2284,6 +3523,63 @@ def copy_knowledge_chunk(chunk: KnowledgeChunk) -> KnowledgeChunk:
     )
 
 
+def copy_knowledge_evidence(evidence: KnowledgeEvidence) -> KnowledgeEvidence:
+    if type(evidence) is not KnowledgeEvidence:
+        raise TypeError("KnowledgeEvidence instances must not be subclasses.")
+    return KnowledgeEvidence(
+        id=evidence.id,
+        entry_id=evidence.entry_id,
+        entry_revision=evidence.entry_revision,
+        chunk_id=evidence.chunk_id,
+        role=evidence.role,
+        source_type=evidence.source_type,
+        source_id=evidence.source_id,
+        source_uri=evidence.source_uri,
+        source_revision=evidence.source_revision,
+        source_hash=evidence.source_hash,
+        locator=copy_durable_json_object(evidence.locator, "locator"),
+        disposition=evidence.disposition,
+        created_at=evidence.created_at,
+        metadata=copy_durable_json_object(evidence.metadata, "metadata"),
+    )
+
+
+def copy_knowledge_change(change: KnowledgeChange) -> KnowledgeChange:
+    if type(change) is not KnowledgeChange:
+        raise TypeError("KnowledgeChange instances must not be subclasses.")
+    return KnowledgeChange(
+        id=change.id,
+        sequence=change.sequence,
+        kind=change.kind,
+        entry_id=change.entry_id,
+        entry_revision=change.entry_revision,
+        committed_at=change.committed_at,
+        operation_id=change.operation_id,
+    )
+
+
+def copy_knowledge_change_claim(claim: KnowledgeChangeClaim) -> KnowledgeChangeClaim:
+    if type(claim) is not KnowledgeChangeClaim:
+        raise TypeError("KnowledgeChangeClaim instances must not be subclasses.")
+    return KnowledgeChangeClaim(
+        consumer_id=claim.consumer_id,
+        worker_id=claim.worker_id,
+        claim_id=claim.claim_id,
+        change=copy_knowledge_change(claim.change),
+        attempt=claim.attempt,
+        claimed_at=claim.claimed_at,
+        lease_expires_at=claim.lease_expires_at,
+    )
+
+
+def copy_knowledge_change_consumer_state(
+    state: KnowledgeChangeConsumerState,
+) -> KnowledgeChangeConsumerState:
+    if type(state) is not KnowledgeChangeConsumerState:
+        raise TypeError("KnowledgeChangeConsumerState instances must not be subclasses.")
+    return KnowledgeChangeConsumerState(**state.model_dump())
+
+
 def copy_knowledge_publication_receipt(
     receipt: KnowledgePublicationReceipt,
     *,
@@ -2308,9 +3604,16 @@ def prepare_knowledge_publication(
     entry: KnowledgeEntry,
     chunks: list[KnowledgeChunk],
     *,
+    evidence: list[KnowledgeEvidence] | None = None,
     operation_id: str,
     expected_revision: int | None = None,
-) -> tuple[str, KnowledgeEntry, list[KnowledgeChunk], str]:
+) -> tuple[
+    str,
+    KnowledgeEntry,
+    list[KnowledgeChunk],
+    list[KnowledgeEvidence],
+    str,
+]:
     """Copy and bind one complete revision-publication authority tuple."""
 
     clean_operation_id = _knowledge_publication_operation_id(operation_id)
@@ -2321,18 +3624,25 @@ def prepare_knowledge_publication(
         copied_entry.revision,
         chunks,
     )
-    request_sha256 = sha256(
-        canonical_durable_json_bytes(
-            {
-                "contract": "cayu-knowledge-revision-publication-v1",
-                "expected_revision": expected_revision,
-                "entry": copied_entry.model_dump(mode="json"),
-                "chunks": [chunk.model_dump(mode="json") for chunk in copied_chunks],
-            },
-            "knowledge publication",
-        )
-    ).hexdigest()
-    return clean_operation_id, copied_entry, copied_chunks, request_sha256
+    copied_evidence = _copy_entry_evidence(
+        copied_entry.id,
+        copied_entry.revision,
+        evidence or [],
+        chunks=copied_chunks,
+    )
+    request_sha256 = _knowledge_publication_request_sha256(
+        copied_entry,
+        copied_chunks,
+        copied_evidence,
+        expected_revision=expected_revision,
+    )
+    return (
+        clean_operation_id,
+        copied_entry,
+        copied_chunks,
+        copied_evidence,
+        request_sha256,
+    )
 
 
 def _knowledge_publication_operation_id(operation_id: str) -> str:
@@ -2346,17 +3656,75 @@ def _validate_knowledge_publication_replay(
     receipt: KnowledgePublicationReceipt,
     *,
     entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    evidence: list[KnowledgeEvidence],
+    expected_revision: int | None,
     request_sha256: str,
 ) -> None:
     receipt = copy_knowledge_publication_receipt(receipt)
+    accepted_request_sha256s = {request_sha256}
+    if not evidence:
+        # Revision 42 receipts bind the same entry-and-chunks authority tuple
+        # under the v1 digest contract. Revision 43 preserves those receipts,
+        # so an exact empty-evidence retry must remain idempotent after migration.
+        # Never permit the weaker digest when the new request carries evidence.
+        accepted_request_sha256s.add(
+            _knowledge_publication_v1_request_sha256(
+                entry,
+                chunks,
+                expected_revision=expected_revision,
+            )
+        )
     if (
         receipt.entry_id != entry.id
         or receipt.entry_revision != entry.revision
-        or receipt.request_sha256 != request_sha256
+        or receipt.request_sha256 not in accepted_request_sha256s
         or receipt.entry_created_at != entry.created_at
         or receipt.entry_updated_at != entry.updated_at
     ):
         raise KnowledgePublicationConflict("operation_mismatch")
+
+
+def _knowledge_publication_request_sha256(
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    evidence: list[KnowledgeEvidence],
+    *,
+    expected_revision: int | None,
+) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-revision-publication-v2",
+                "expected_revision": expected_revision,
+                "entry": entry.model_dump(mode="json"),
+                "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
+                "evidence": [item.model_dump(mode="json") for item in evidence],
+            },
+            "knowledge publication",
+        )
+    ).hexdigest()
+
+
+def _knowledge_publication_v1_request_sha256(
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    *,
+    expected_revision: int | None,
+) -> str:
+    """Reproduce the revision-42 receipt digest for migration-safe replay."""
+
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-revision-publication-v1",
+                "expected_revision": expected_revision,
+                "entry": entry.model_dump(mode="json"),
+                "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
+            },
+            "knowledge publication",
+        )
+    ).hexdigest()
 
 
 def _validate_revision_append(
@@ -2506,6 +3874,90 @@ def _copy_entry_chunks(
     return sorted(copied_chunks, key=lambda chunk: chunk.chunk_index)
 
 
+def _copy_entry_evidence(
+    entry_id: str,
+    entry_revision: int,
+    evidence: list[KnowledgeEvidence],
+    *,
+    chunks: list[KnowledgeChunk],
+) -> list[KnowledgeEvidence]:
+    if type(evidence) is not list:
+        raise ValueError("`evidence` must be a list.")
+    copied = [copy_knowledge_evidence(item) for item in evidence]
+    chunk_ids = {chunk.id for chunk in chunks}
+    seen_ids: set[str] = set()
+    for item in copied:
+        if item.entry_id != entry_id:
+            raise ValueError("Knowledge evidence must belong to the entry.")
+        if item.entry_revision != entry_revision:
+            raise ValueError("Knowledge evidence must belong to the exact entry revision.")
+        if item.chunk_id is not None and item.chunk_id not in chunk_ids:
+            raise ValueError("Knowledge evidence chunk must belong to the exact entry revision.")
+        if item.id in seen_ids:
+            raise ValueError("Knowledge evidence ids must be unique within a revision.")
+        seen_ids.add(item.id)
+    return sorted(copied, key=lambda item: item.id)
+
+
+def _copy_evidence_for_revision(
+    evidence: list[KnowledgeEvidence],
+    *,
+    entry: KnowledgeEntry,
+    previous_chunks: list[KnowledgeChunk],
+    chunks: list[KnowledgeChunk],
+) -> list[KnowledgeEvidence]:
+    previous_indexes = {chunk.id: chunk.chunk_index for chunk in previous_chunks}
+    next_chunks = {chunk.chunk_index: chunk.id for chunk in chunks}
+    copied: list[KnowledgeEvidence] = []
+    for item in evidence:
+        chunk_id: str | None = None
+        if item.chunk_id is not None:
+            chunk_index = previous_indexes.get(item.chunk_id)
+            if chunk_index is None or chunk_index not in next_chunks:
+                raise RuntimeError(
+                    "Stored knowledge evidence references an unavailable source chunk."
+                )
+            chunk_id = next_chunks[chunk_index]
+        evidence_id = (
+            "ke_"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "contract": "cayu-knowledge-evidence-successor-v1",
+                        "source_evidence_id": item.id,
+                        "entry_id": entry.id,
+                        "entry_revision": entry.revision,
+                    },
+                    "knowledge evidence successor identity",
+                )
+            ).hexdigest()
+        )
+        copied.append(
+            KnowledgeEvidence(
+                id=evidence_id,
+                entry_id=entry.id,
+                entry_revision=entry.revision,
+                chunk_id=chunk_id,
+                role=item.role,
+                source_type=item.source_type,
+                source_id=item.source_id,
+                source_uri=item.source_uri,
+                source_revision=item.source_revision,
+                source_hash=item.source_hash,
+                locator=item.locator,
+                disposition=item.disposition,
+                created_at=item.created_at,
+                metadata=item.metadata,
+            )
+        )
+    return _copy_entry_evidence(
+        entry.id,
+        entry.revision,
+        copied,
+        chunks=chunks,
+    )
+
+
 def _copy_chunks_for_revision(
     chunks: list[KnowledgeChunk],
     entry: KnowledgeEntry,
@@ -2581,6 +4033,30 @@ def _bounded_chunks(
             break
         selected.append(copied)
         remaining -= chunk_bytes
+    return selected
+
+
+def _bounded_knowledge_evidence(
+    evidence: list[KnowledgeEvidence],
+    *,
+    max_records: int,
+    max_bytes: int,
+) -> list[KnowledgeEvidence]:
+    _validate_positive_int(max_records, "max_records")
+    _validate_positive_int(max_bytes, "max_bytes")
+    selected: list[KnowledgeEvidence] = []
+    consumed = 0
+    for item in sorted(evidence, key=lambda value: value.id):
+        item_size = len(
+            canonical_durable_json_bytes(
+                item.model_dump(mode="json"),
+                "knowledge evidence",
+            )
+        )
+        if len(selected) >= max_records or consumed + item_size > max_bytes:
+            break
+        selected.append(copy_knowledge_evidence(item))
+        consumed += item_size
     return selected
 
 
@@ -3040,10 +4516,103 @@ def _validate_positive_int(value: int, field_name: str) -> None:
         raise ValueError(f"`{field_name}` must be greater than 0.")
 
 
+def _knowledge_entry_id(value: str, field_name: str = "entry_id") -> str:
+    return _bounded_knowledge_identity(
+        value,
+        field_name,
+        max_bytes=MAX_KNOWLEDGE_ENTRY_ID_BYTES,
+    )
+
+
+def _knowledge_chunk_id(value: str, field_name: str = "chunk_id") -> str:
+    return _bounded_knowledge_identity(
+        value,
+        field_name,
+        max_bytes=MAX_KNOWLEDGE_CHUNK_ID_BYTES,
+    )
+
+
+def _bounded_knowledge_identity(value: str, field_name: str, *, max_bytes: int) -> str:
+    clean = require_clean_nonblank(value, field_name)
+    if len(clean.encode("utf-8")) > max_bytes:
+        raise ValueError(f"`{field_name}` must be at most {max_bytes} UTF-8 bytes.")
+    return clean
+
+
+def _validate_knowledge_change_limit(value: int) -> None:
+    _validate_positive_int(value, "limit")
+    if value > MAX_KNOWLEDGE_CHANGE_LIMIT:
+        raise ValueError(f"`limit` must be less than or equal to {MAX_KNOWLEDGE_CHANGE_LIMIT}.")
+
+
 def _validate_knowledge_revision(value: int, field_name: str) -> None:
     _validate_positive_int(value, field_name)
     if value > MAX_KNOWLEDGE_REVISION:
         raise ValueError(f"`{field_name}` must be at most {MAX_KNOWLEDGE_REVISION}.")
+
+
+def _validate_knowledge_change_sequence(value: int, field_name: str) -> None:
+    _validate_nonnegative_int(value, field_name)
+    if value > MAX_KNOWLEDGE_CHANGE_SEQUENCE:
+        raise ValueError(f"`{field_name}` must be at most {MAX_KNOWLEDGE_CHANGE_SEQUENCE}.")
+
+
+def _knowledge_change_now(value: datetime | None) -> datetime:
+    result = datetime.now(UTC) if value is None else value
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("`now` must be timezone-aware.")
+    return result.astimezone(UTC)
+
+
+def _knowledge_change_lease_seconds(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("`lease_seconds` must be a number.")
+    result = require_finite(float(value), "lease_seconds")
+    if result <= 0.0 or result > 86_400.0:
+        raise ValueError("`lease_seconds` must be greater than 0 and at most 86400.")
+    return result
+
+
+def _knowledge_change_identity(value: str, field_name: str) -> str:
+    clean = require_clean_nonblank(value, field_name)
+    if len(clean.encode("utf-8")) > 256:
+        raise ValueError(f"`{field_name}` must be at most 256 UTF-8 bytes.")
+    return clean
+
+
+def _initialize_knowledge_change_consumer_state(
+    state: KnowledgeChangeConsumerState | None,
+    *,
+    consumer_id: str,
+    access_scope_sha256: str,
+    baseline_sequence: int,
+    now: datetime,
+) -> KnowledgeChangeConsumerState:
+    if state is None:
+        return KnowledgeChangeConsumerState(
+            consumer_id=consumer_id,
+            access_scope_sha256=access_scope_sha256,
+            cursor_sequence=baseline_sequence,
+            updated_at=now,
+        )
+    if state.access_scope_sha256 != access_scope_sha256:
+        raise KnowledgeChangeConsumerConflict("access_scope_mismatch")
+    if state.pending_change_sequence is not None:
+        raise KnowledgeChangeConsumerConflict("consumer_has_active_claim")
+    if state.cursor_sequence >= baseline_sequence:
+        return copy_knowledge_change_consumer_state(state)
+    if (
+        state.cursor_sequence != 0
+        or state.pending_attempt != 0
+        or state.last_acknowledged_claim_id is not None
+    ):
+        raise KnowledgeChangeConsumerConflict("consumer_already_started")
+    return state.model_copy(
+        update={
+            "cursor_sequence": baseline_sequence,
+            "updated_at": now,
+        }
+    )
 
 
 def _validate_nonnegative_float(value: float, field_name: str) -> float:

@@ -2,14 +2,14 @@
 
 This document records the Phase 0 contracts for Cayu's v5.1 long-term-memory
 work and the immutable knowledge-revision core now built on them. Cross-source
-recall, context composition, curation, evidence, and automatic governance remain
-separate layers.
+recall, context composition, curation, and automatic governance remain separate
+layers.
 
 ## Knowledge and memory are different layers
 
 **Knowledge** is durable canonical semantic material: entries, chunks, source
-identity, lifecycle, and immutable revisions, with evidence added by a later
-slice. **Memory** is the larger recall system that can retrieve permitted
+identity, lifecycle, immutable revisions, and revision-bound source evidence.
+**Memory** is the larger recall system that can retrieve permitted
 knowledge, transcript episodes, artifact-derived documents, and other typed
 sources, fuse them, select a bounded context contribution, and record exposure.
 
@@ -85,6 +85,85 @@ idempotency replay remains available after hard deletion without depending on a
 current entry or leaking a different namespace. Database revision 41 is a clean
 break for that projection; existing populated receipt tables are not guessed or
 backfilled.
+
+## Revision-bound evidence and atomic changes
+
+`KnowledgeEvidence` records why one exact knowledge revision exists. Evidence
+is immutable, has a global ID, belongs to an exact entry revision, and may bind
+to one exact chunk from that revision. Its source identity is deliberately
+generic: a source type plus an ID or URI, a source revision or hash, a durable
+locator, an `origin` or `supporting` role, and a `live`, `detached`, or
+`retained` disposition. Locator and metadata objects are bounded durable JSON;
+they do not become provider-specific columns.
+
+Create, append, and owned publication accept `evidence=` and commit the entry,
+chunks, evidence, and metadata-only `KnowledgeChange` atomically. Lifecycle-only
+successors (status transitions and tombstones) inherit evidence under new
+deterministic evidence IDs and rebind chunk evidence by chunk index. A caller
+that materially changes content must supply evidence explicitly; omission means
+the new revision has no evidence. Exact publication replay writes nothing, and
+the publication request digest covers evidence as well as the entry and chunks.
+Receipts preserved from revision 42 remain exactly replayable after migration;
+their entry-and-chunks-only digest is accepted only for an empty-evidence retry.
+
+`read_evidence(...)` applies the same current-plus-historical authorization rule
+as entry and chunk reads and returns a record/byte-bounded result. Evidence IDs
+are global storage identities. An authorized collision raises
+`KnowledgeEvidenceConflict`; a foreign-scope collision raises
+`KnowledgeAccessDenied` without revealing its owner.
+
+Every successful canonical mutation publishes one ordered `KnowledgeChange` in
+the same transaction: create, content revision append, lifecycle transition,
+tombstone, hard delete, or expiration. Changes contain identity, revision,
+kind, operation ID, sequence, and commit time only—never knowledge text,
+evidence locators, or source payloads. Authorization uses immutable before/after
+audiences captured with the mutation. A scope that loses access receives the
+change so it can remove stale derived state, while a scope that gains access can
+materialize the successor. Creation has only an after audience; hard deletion
+and expiration have only a before audience. Expiration eligibility is frozen at
+publication, and removal signals remain visible to scopes that could have
+materialized the entry before expiry, so delayed consumers do not silently lose
+cleanup work. For revision-42 entries without a publication audience, revision
+43's durable migration timestamp supplies that visibility baseline without
+fabricating historical changes.
+
+`read_changes(...)` returns bounded sequence pages with at most
+`MAX_KNOWLEDGE_CHANGE_LIMIT` records and an accessible
+high-water mark that always comes from committed store state, never from the
+caller cursor. A cursor beyond the store's current sequence is rejected; a
+cursor may legitimately exceed one scope's accessible high-water, in which case
+continuation does not move backwards. After a full scan,
+`initialize_change_consumer(...)` binds a
+new consumer cursor to the high-water captured before that scan; the operation
+is idempotent but cannot reset an active or already-started consumer.
+Scope-bound consumers then use `claim_change`, `acknowledge_change`, and
+`release_change` for fenced, leased, at-least-once delivery. A consumer ID is
+permanently bound to the canonical digest of its access scope; concurrent
+workers cannot acknowledge one another's claims, expired or stale claims fail
+closed, and exact acknowledgement replays remain idempotent after later cursor
+progress. Lease eligibility uses a store-owned clock; PostgreSQL uses its
+database clock in production so worker clock skew cannot extend or revive a
+claim. SQLite/PostgreSQL cursor and acknowledgement state survives restart.
+This change stream is canonical mutation publication, not derived-index
+readiness; index workers add their readiness protocol in the following slice.
+
+Evidence prefixes and multi-entry expiration changes use the same scalar
+identity ordering in every built-in backend. SQLite makes its binary collation
+explicit and PostgreSQL uses the portable `C` collation, so bounded reads and
+bulk cleanup do not change with the database locale.
+
+Canonical entry IDs are limited to `MAX_KNOWLEDGE_ENTRY_ID_BYTES` UTF-8 bytes
+and canonical chunk IDs to `MAX_KNOWLEDGE_CHUNK_ID_BYTES`. The same limits apply
+to every receipt, evidence, and change reference, keeping identity behavior and
+indexed storage portable across the in-memory, SQLite, and PostgreSQL backends.
+
+Breaking schema revision 43 installs the evidence, change, and consumer tables
+and the exact chunk-owner key used by evidence foreign keys. The DDL preserves
+revision-42 entries, IDs, revisions, chunks, and receipts that satisfy the
+portable identity bounds; out-of-contract identities are rejected before any
+revision-43 DDL is applied. The migration deliberately does not fabricate
+evidence or historical change events for mutations that happened before
+revision 43.
 
 ## Revision-schema reset policy
 

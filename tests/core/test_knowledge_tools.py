@@ -3566,7 +3566,7 @@ def test_custom_store_can_use_public_knowledge_publication_canonicalizer() -> No
         async def publish_entry_revision(
             self, entry, chunks, *, operation_id, expected_revision=None
         ):
-            operation_id, entry, chunks, request_sha256 = prepare_knowledge_publication(
+            operation_id, entry, chunks, _, request_sha256 = prepare_knowledge_publication(
                 entry,
                 chunks,
                 operation_id=operation_id,
@@ -3642,7 +3642,7 @@ def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() 
             entry.labels["tenant"] = "other"
             entry.metadata["mutated_by_store"] = True
             chunks[0].metadata["mutated_by_store"] = True
-            operation_id, entry, chunks, request_sha256 = prepare_knowledge_publication(
+            operation_id, entry, chunks, _, request_sha256 = prepare_knowledge_publication(
                 entry,
                 chunks,
                 operation_id=operation_id,

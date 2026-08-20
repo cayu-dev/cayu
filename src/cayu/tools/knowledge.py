@@ -1087,7 +1087,7 @@ async def _remember_publish_owned(
     # so in-place adapter normalization cannot redefine the operation Cayu later
     # authenticates from the receipt.
     result = copy_knowledge_index_result(result)
-    _, publication_entry, publication_chunks, _ = prepare_knowledge_publication(
+    _, publication_entry, publication_chunks, _, _ = prepare_knowledge_publication(
         result.entry,
         result.chunks,
         operation_id=operation_id,
@@ -1312,7 +1312,7 @@ async def _remember_observe_owned_publication(
                 receipt_present=True,
                 receipt_incompatible=True,
             )
-        _, expected_entry, _, request_sha256 = prepare_knowledge_publication(
+        _, expected_entry, _, _, request_sha256 = prepare_knowledge_publication(
             result.entry,
             result.chunks,
             operation_id=operation_id,

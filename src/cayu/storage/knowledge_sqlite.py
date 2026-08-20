@@ -26,6 +26,7 @@ from cayu.storage.memory import (
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,
+    KnowledgeEvidence,
     KnowledgeFacet,
     KnowledgeHit,
     KnowledgeListGroup,
@@ -109,8 +110,13 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk] | None = None,
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        if evidence:
+            raise NotImplementedError(
+                "SQLiteKnowledgeStore does not support knowledge evidence yet."
+            )
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=None)
@@ -149,8 +155,13 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         chunks: list[KnowledgeChunk] | None = None,
         *,
         expected_revision: int,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
+        if evidence:
+            raise NotImplementedError(
+                "SQLiteKnowledgeStore does not support knowledge evidence yet."
+            )
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=expected_revision)
@@ -352,17 +363,29 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
-        operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
+        (
+            operation_id,
+            copied_entry,
+            copied_chunks,
+            copied_evidence,
+            request_sha256,
+        ) = prepare_knowledge_publication(
             entry,
             chunks,
+            evidence=evidence,
             operation_id=operation_id,
             expected_revision=expected_revision,
         )
+        if copied_evidence:
+            raise NotImplementedError(
+                "SQLiteKnowledgeStore does not support knowledge evidence yet."
+            )
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
         async with self._lock:
             with sqlite_support._transaction(self._connection):
@@ -374,6 +397,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     _validate_knowledge_publication_replay(
                         existing_receipt,
                         entry=copied_entry,
+                        chunks=copied_chunks,
+                        evidence=copied_evidence,
+                        expected_revision=expected_revision,
                         request_sha256=request_sha256,
                     )
                     return copy_knowledge_publication_receipt(

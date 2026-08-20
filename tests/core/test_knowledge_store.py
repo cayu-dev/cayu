@@ -31,7 +31,11 @@ from cayu.embeddings import (
 )
 from cayu.storage import (
     BUILTIN_KNOWLEDGE_KINDS,
+    MAX_KNOWLEDGE_CHANGE_LIMIT,
+    MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,
+    MAX_KNOWLEDGE_ENTRY_ID_BYTES,
+    MAX_KNOWLEDGE_EVIDENCE_BYTES,
     MAX_KNOWLEDGE_REVISION,
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
@@ -41,6 +45,7 @@ from cayu.storage import (
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,
+    KnowledgeEvidence,
     KnowledgeFacet,
     KnowledgeHit,
     KnowledgeListGroup,
@@ -62,6 +67,104 @@ from cayu.storage.memory import (
 )
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
+
+def test_knowledge_evidence_enforces_utf8_and_total_serialized_byte_limits() -> None:
+    with pytest.raises(ValidationError, match="source_id.*256 UTF-8 bytes"):
+        KnowledgeEvidence(
+            id="evidence-byte-limit",
+            entry_id="entry",
+            source_type="document",
+            source_id="é" * 129,
+            source_revision="1",
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match=rf"at most {MAX_KNOWLEDGE_EVIDENCE_BYTES} canonical UTF-8 bytes",
+    ):
+        KnowledgeEvidence(
+            id="evidence-total-limit",
+            entry_id="entry",
+            source_type="document",
+            source_id="source",
+            source_revision="1",
+            locator={"excerpt": "x" * 10_500},
+            metadata={"context": "y" * 10_500},
+        )
+
+
+def test_knowledge_identities_enforce_portable_utf8_byte_limits() -> None:
+    entry_id = "é" * (MAX_KNOWLEDGE_ENTRY_ID_BYTES // 2)
+    chunk_id = "é" * (MAX_KNOWLEDGE_CHUNK_ID_BYTES // 2)
+    entry = KnowledgeEntry(id=entry_id, text="bounded identity")
+    chunk = KnowledgeChunk(
+        id=chunk_id,
+        entry_id=entry.id,
+        chunk_index=0,
+        text=entry.text,
+    )
+    evidence = KnowledgeEvidence(
+        id="bounded-identity-evidence",
+        entry_id=entry.id,
+        chunk_id=chunk.id,
+        source_type="document",
+        source_id="bounded-source",
+        source_revision="1",
+    )
+
+    assert len(entry.id.encode("utf-8")) == MAX_KNOWLEDGE_ENTRY_ID_BYTES
+    assert len(chunk.id.encode("utf-8")) == MAX_KNOWLEDGE_CHUNK_ID_BYTES
+    assert evidence.entry_id == entry.id
+    assert evidence.chunk_id == chunk.id
+
+    with pytest.raises(
+        ValidationError,
+        match=rf"id.*at most {MAX_KNOWLEDGE_ENTRY_ID_BYTES} UTF-8 bytes",
+    ):
+        KnowledgeEntry(id=entry_id + "x", text="too long")
+    with pytest.raises(
+        ValidationError,
+        match=rf"id.*at most {MAX_KNOWLEDGE_CHUNK_ID_BYTES} UTF-8 bytes",
+    ):
+        KnowledgeChunk(
+            id=chunk_id + "x",
+            entry_id="entry",
+            chunk_index=0,
+            text="too long",
+        )
+    with pytest.raises(
+        ValidationError,
+        match=rf"entry_id.*at most {MAX_KNOWLEDGE_ENTRY_ID_BYTES} UTF-8 bytes",
+    ):
+        KnowledgeEvidence(
+            id="oversized-entry-reference",
+            entry_id=entry_id + "x",
+            source_type="document",
+            source_id="source",
+            source_revision="1",
+        )
+    with pytest.raises(
+        ValidationError,
+        match=rf"chunk_id.*at most {MAX_KNOWLEDGE_CHUNK_ID_BYTES} UTF-8 bytes",
+    ):
+        KnowledgeEvidence(
+            id="oversized-chunk-reference",
+            entry_id="entry",
+            chunk_id=chunk_id + "x",
+            source_type="document",
+            source_id="source",
+            source_revision="1",
+        )
+
+
+def test_knowledge_change_pages_reject_unbounded_record_limits() -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        with pytest.raises(ValueError, match=str(MAX_KNOWLEDGE_CHANGE_LIMIT)):
+            await store.read_changes(limit=MAX_KNOWLEDGE_CHANGE_LIMIT + 1)
+
+    asyncio.run(run())
 
 
 def test_in_memory_knowledge_access_scope_conformance() -> None:
