@@ -290,9 +290,7 @@ def test_session_resolve_provider_operation_reads_bounded_streamed_error_safely(
         return httpx.Response(
             409,
             json={
-                "detail": (
-                    "Resolution conflicts with the current run epoch for " + authorization
-                )
+                "detail": ("Resolution conflicts with the current run epoch for " + authorization)
             },
         )
 

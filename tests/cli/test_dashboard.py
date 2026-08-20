@@ -153,7 +153,7 @@ def test_dashboard_eject_materializes_version_matched_editable_project(
     output = capsys.readouterr().out
     assert f"installed Cayu version: {_version()}" in output
     assert f"dashboard source version: {_version()}" in output
-    assert "dashboard server contract: v12" in output
+    assert "dashboard server contract: v13" in output
     assert f"Project directory: {destination}" in output
     assert f"cd {destination}" not in output
     assert "npm ci" in output

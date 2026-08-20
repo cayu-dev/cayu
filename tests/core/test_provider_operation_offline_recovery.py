@@ -3020,9 +3020,7 @@ def test_provider_recovery_preserves_fatal_signal_under_caller_cancellation(
             assert raised.value is fatal
             assert isinstance(fatal.__cause__, asyncio.CancelledError)
             assert fatal.__cause__ is not provider_cancellations[0]
-            assert fatal.__cause__.args == (
-                "cancel provider recovery before fatal signal",
-            )
+            assert fatal.__cause__.args == ("cancel provider recovery before fatal signal",)
         events = await store.load_events(session_id)
         assert not any(
             event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
