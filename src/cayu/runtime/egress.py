@@ -21,6 +21,7 @@ import tempfile
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, Literal, TypeVar
 
 from cayu._exception_groups import (
@@ -72,6 +73,7 @@ from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
+    ExecutionEnvironmentAuthority,
     evaluate_execution_admission,
 )
 from cayu.environments.base import Environment, EnvironmentSpec
@@ -116,6 +118,7 @@ from cayu.runners.base import (
     runner_pending_command_settlement_cancellation_safe,
     runner_workspace_mutation_settlement,
 )
+from cayu.runners.workloads import BROWSER_FETCH_WORKLOAD_NAME, PINNED_BROWSER_FETCH_WORKLOAD
 from cayu.runtime._binding_cleanup import (
     BindingFinalizeFailure,
     binding_finalize_explicit_cancellation,
@@ -344,6 +347,29 @@ def _reject_replayable_authority(value: Any, *, path: str = "identity") -> None:
             _reject_replayable_authority(item, path=f"{path}[{index}]")
 
 
+def _virtual_egress_environment_authority(
+    identity: ExecutionProfileBehaviorIdentity | None,
+) -> ExecutionEnvironmentAuthority:
+    """Bind one factory instance, or its explicit restart-stable declaration."""
+
+    profile_identity = None
+    if identity is not None:
+        digest = sha256(
+            "\0".join(
+                (
+                    identity.name,
+                    identity.behavior_version,
+                    identity.implementation_version,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        profile_identity = f"profile_{digest}"
+    return ExecutionEnvironmentAuthority(
+        identity=f"process_{secrets.token_hex(24)}",
+        profile_identity=profile_identity,
+    )
+
+
 class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     """Per-session environment factory that enforces virtual egress.
 
@@ -450,12 +476,20 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._execution_profile_identity = copy_execution_profile_behavior_identity(
             execution_profile_identity
         )
+        self._execution_environment_authority = _virtual_egress_environment_authority(
+            self._execution_profile_identity
+        )
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
         """Return the application declaration for this configured egress factory."""
 
         return self._execution_profile_identity
+
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
+        """Return the exact factory authority every managed runner preserves."""
+
+        return self._execution_environment_authority
 
     def execution_admission_candidate(
         self,
@@ -469,6 +503,32 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             candidate=adapter.runner_kind,
             evidence=adapter.execution_capability_evidence(),
         )
+
+    def construction_admission_candidate(self) -> ExecutionAdmissionCandidate:
+        """Declare the selected adapter's pre-create capabilities at app setup."""
+
+        adapter = self._adapter or self._resolve_adapter(None)
+        return ExecutionAdmissionCandidate(
+            candidate=adapter.runner_kind,
+            evidence=adapter.execution_capability_evidence(),
+        )
+
+    def workload_authority(self, name: str):
+        """Bind the built-in Docker factory to its exact selected workload image."""
+
+        if (
+            name != BROWSER_FETCH_WORKLOAD_NAME
+            or self._runner_kind != "docker"
+            or self._image != PINNED_BROWSER_FETCH_WORKLOAD.image
+        ):
+            return None
+        return PINNED_BROWSER_FETCH_WORKLOAD
+
+    @property
+    def configured_artifact_store(self) -> ArtifactStore | None:
+        """Return the stable store copied into every materialized environment."""
+
+        return self._artifact_store
 
     def allocation_scope(
         self,
@@ -642,6 +702,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             managed_runner = _EgressManagedRunner(
                 runner=runner,
                 adapter=adapter,
+                execution_environment_authority=self._execution_environment_authority,
                 egress_binding=binding,
                 ca_dir=ca_dir,
                 authority_revoker=authority_revoker,
@@ -889,7 +950,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 )
         return created
 
-    def _resolve_adapter(self, loop: asyncio.AbstractEventLoop):
+    def _resolve_adapter(self, loop: asyncio.AbstractEventLoop | None):
         if self._adapter_registry is not None:
             return self._adapter_registry.resolve(self._runner_kind)
 
@@ -1195,6 +1256,7 @@ class _EgressManagedRunner(Runner):
         *,
         runner: Runner,
         adapter: SandboxEgressAdapter,
+        execution_environment_authority: ExecutionEnvironmentAuthority,
         egress_binding: EgressBinding,
         ca_dir: str,
         authority_revoker: _EgressAuthorityRevoker,
@@ -1203,8 +1265,13 @@ class _EgressManagedRunner(Runner):
     ) -> None:
         if not isinstance(output_redactor, SecretRedactor):
             raise TypeError("output_redactor must be a SecretRedactor.")
+        if type(execution_environment_authority) is not ExecutionEnvironmentAuthority:
+            raise TypeError(
+                "execution_environment_authority must be an ExecutionEnvironmentAuthority."
+            )
         self._runner = runner
         self._adapter = adapter
+        self._execution_environment_authority = execution_environment_authority
         self._egress_binding = egress_binding
         self._ca_dir = ca_dir
         self._authority_revoker = authority_revoker
@@ -1256,6 +1323,16 @@ class _EgressManagedRunner(Runner):
             candidate=self._adapter.runner_kind,
             evidence=self._adapter.execution_capability_evidence(self._runner),
         )
+
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
+        """Return the factory boundary that owns this managed runner."""
+
+        return self._execution_environment_authority
+
+    def workload_authority(self, name: str):
+        """Forward an exact workload declaration owned by the inner runner."""
+
+        return self._runner.workload_authority(name)
 
     @property
     def closed(self) -> bool:

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
 from cayu.vaults import ResolvedSecret, SecretRef, Vault
+
+if TYPE_CHECKING:
+    from cayu.tools.webbridge import WebBridgeCredentialAuthority
 
 
 class PassthroughProxy(CredentialProxy):
@@ -21,6 +24,16 @@ class PassthroughProxy(CredentialProxy):
         if not isinstance(vault, Vault):
             raise TypeError("PassthroughProxy requires a Vault.")
         self._vault = vault
+
+    def supports_webbridge_credential_authority(
+        self,
+        authority: WebBridgeCredentialAuthority,
+    ) -> bool:
+        """Declare that this trusted proxy can route any validated hosted authority."""
+
+        from cayu.tools.webbridge import WebBridgeCredentialAuthority
+
+        return type(authority) is WebBridgeCredentialAuthority
 
     async def resolve(
         self,
@@ -81,6 +94,18 @@ class AllowlistProxy(CredentialProxy):
     @property
     def allowed_destinations(self) -> tuple[str, ...]:
         return self._allowed_hosts
+
+    def supports_webbridge_credential_authority(
+        self,
+        authority: WebBridgeCredentialAuthority,
+    ) -> bool:
+        """Declare compatibility only when the hosted origin is allowlisted."""
+
+        from cayu.tools.webbridge import WebBridgeCredentialAuthority
+
+        return type(authority) is WebBridgeCredentialAuthority and self._destination_allowed(
+            authority.origin
+        )
 
     async def resolve(
         self,

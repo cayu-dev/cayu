@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import secrets
+import threading
 import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
@@ -49,11 +52,73 @@ from cayu.runners._diagnostics import (
 )
 
 if TYPE_CHECKING:
-    from cayu.environments.admission import ExecutionAdmissionCandidate
+    from cayu.environments.admission import (
+        ExecutionAdmissionCandidate,
+        ExecutionEnvironmentAuthority,
+    )
     from cayu.vaults import SecretRedactor
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
 RunnerSystemExecutionMode = Literal["shared", "separate"]
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerWorkloadAuthority:
+    """Runner-owned identity for one provisioned image workload.
+
+    Higher layers may compare this value with an exact workload they support,
+    but runners never need to import those higher-layer tools to declare what
+    is installed in their selected image.
+    """
+
+    name: str
+    image: str
+    command: tuple[str, ...]
+    protocol_version: str
+    worker_version: str
+    component_versions: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        fields = {
+            "name": self.name,
+            "image": self.image,
+            "protocol_version": self.protocol_version,
+            "worker_version": self.worker_version,
+        }
+        for field_name, value in fields.items():
+            owned = require_durable_clean_nonblank(value, field_name)
+            if len(owned.encode("utf-8")) > 512:
+                raise ValueError(f"{field_name} must not exceed 512 bytes.")
+            object.__setattr__(self, field_name, owned)
+        if type(self.command) is not tuple or not self.command or len(self.command) > 32:
+            raise ValueError("command must contain between 1 and 32 entries.")
+        command = tuple(
+            require_durable_clean_nonblank(entry, f"command[{index}]")
+            for index, entry in enumerate(self.command)
+        )
+        if any(len(entry.encode("utf-8")) > 1024 for entry in command):
+            raise ValueError("command entries must not exceed 1024 bytes.")
+        if type(self.component_versions) is not tuple or len(self.component_versions) > 16:
+            raise ValueError("component_versions must be a tuple with at most 16 entries.")
+        components: list[tuple[str, str]] = []
+        for index, entry in enumerate(self.component_versions):
+            if type(entry) is not tuple or len(entry) != 2:
+                raise ValueError(f"component_versions[{index}] must be a name/version pair.")
+            component_name = require_durable_clean_nonblank(
+                entry[0], f"component_versions[{index}].name"
+            )
+            component_version = require_durable_clean_nonblank(
+                entry[1], f"component_versions[{index}].version"
+            )
+            if any(
+                len(value.encode("utf-8")) > 128 for value in (component_name, component_version)
+            ):
+                raise ValueError("component names and versions must not exceed 128 bytes.")
+            components.append((component_name, component_version))
+        if len({name for name, _ in components}) != len(components):
+            raise ValueError("component_versions must not contain duplicate names.")
+        object.__setattr__(self, "command", command)
+        object.__setattr__(self, "component_versions", tuple(components))
 
 
 class RunnerWorkspaceCapability(ABC):
@@ -719,6 +784,27 @@ class Runner(ABC):
     isolation: str = "unknown"
     default_cwd: str = "/"
     system_execution_mode: RunnerSystemExecutionMode = "shared"
+    _environment_authority_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None:
+        """Return runner-owned authority for an exact provisioned workload."""
+
+        del name
+        return None
+
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
+        """Return the exact environment boundary that owns this runner."""
+
+        from cayu.environments.admission import ExecutionEnvironmentAuthority
+
+        with Runner._environment_authority_lock:
+            authority = vars(self).get("_cayu_execution_environment_authority")
+            if type(authority) is not ExecutionEnvironmentAuthority:
+                authority = ExecutionEnvironmentAuthority(
+                    identity=f"runner_{secrets.token_hex(24)}"
+                )
+                vars(self)["_cayu_execution_environment_authority"] = authority
+        return authority
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:

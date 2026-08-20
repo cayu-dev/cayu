@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from cayu.runners import BROWSER_FETCH_WORKLOAD_NAME, PINNED_BROWSER_FETCH_WORKLOAD
 from cayu.runners._docker_cli import docker_cli_env
 from cayu.runners.base import ExecCommand, ExecResult
 from cayu.runners.docker import (
@@ -29,6 +30,22 @@ def test_require_docker_missing_raises(monkeypatch):
     monkeypatch.setattr("cayu.runners.docker.shutil.which", lambda _name: None)
     with pytest.raises(RuntimeError, match="docker CLI not found"):
         _require_docker(None)
+
+
+def test_docker_runner_declares_browser_workload_only_for_exact_image() -> None:
+    pinned = DockerRunner(
+        "browser",
+        image=PINNED_BROWSER_FETCH_WORKLOAD.image,
+        docker_path="/usr/bin/docker",
+    )
+    other = DockerRunner(
+        "other",
+        image="browser:latest",
+        docker_path="/usr/bin/docker",
+    )
+
+    assert pinned.workload_authority(BROWSER_FETCH_WORKLOAD_NAME) == (PINNED_BROWSER_FETCH_WORKLOAD)
+    assert other.workload_authority(BROWSER_FETCH_WORKLOAD_NAME) is None
 
 
 def test_docker_cli_helper_environment_is_operationally_allowlisted(monkeypatch):

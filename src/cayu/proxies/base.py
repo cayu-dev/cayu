@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
 from cayu.vaults import ResolvedSecret, SecretRef
+
+if TYPE_CHECKING:
+    from cayu.tools.webbridge import WebBridgeCredentialAuthority
 
 
 class ProxyAuthorizationResult(BaseModel):
@@ -48,6 +51,15 @@ class CredentialProxy(ABC):
     without making raw credentials part of model-visible context. Generic
     sandbox command execution is not automatically routed through this contract.
     """
+
+    def supports_webbridge_credential_authority(
+        self,
+        authority: WebBridgeCredentialAuthority,
+    ) -> bool:
+        """Declare side-effect-free compatibility with one hosted WebBridge authority."""
+
+        del authority
+        return False
 
     @abstractmethod
     async def resolve(

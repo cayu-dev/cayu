@@ -26,6 +26,8 @@ corresponding credentials or service.
 - [`stdio_mcp_runtime.py`](stdio_mcp_runtime.py) — an MCP server through Cayu's tool contract.
 - [`custom_runner_tool.py`](custom_runner_tool.py) — a custom tool using the active runner.
 - [`credential_proxy_tool.py`](credential_proxy_tool.py) — scoped credentials at a tool boundary.
+- [`webbridge/`](webbridge/) — explicit local, hosted, and sandboxed web profiles,
+  canonical browse/extract/verify evidence, and external-cron task execution.
 
 ## Execution environments
 

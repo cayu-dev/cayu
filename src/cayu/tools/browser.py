@@ -35,10 +35,19 @@ from cayu.artifacts import (
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
+    ExecutionAdmissionStage,
+    ExecutionEnvironmentAuthority,
     ExecutionRequirements,
     evaluate_execution_admission,
 )
-from cayu.runners import ExecCommand, ExecResult, RunnerExecutionError, RunnerUnavailableError
+from cayu.runners import (
+    PINNED_BROWSER_FETCH_WORKLOAD,
+    ExecCommand,
+    ExecResult,
+    RunnerExecutionError,
+    RunnerUnavailableError,
+    RunnerWorkloadAuthority,
+)
 from cayu.tools.web import (
     MAX_WEB_FETCH_TITLE_BYTES,
     MAX_WEB_FETCH_URL_LENGTH,
@@ -48,14 +57,12 @@ from cayu.tools.web import (
     _web_fetch_success_result,
 )
 
-BROWSER_FETCH_PROTOCOL_VERSION = "cayu.browser-fetch.v3"
-BROWSER_FETCH_WORKER_VERSION = "3"
-BROWSER_FETCH_PLAYWRIGHT_VERSION = "1.62.0"
-DEFAULT_BROWSER_FETCH_WORKER_COMMAND = (
-    "/usr/local/bin/python",
-    "-I",
-    "/opt/cayu-browser/worker.py",
-)
+BROWSER_FETCH_PROTOCOL_VERSION = PINNED_BROWSER_FETCH_WORKLOAD.protocol_version
+BROWSER_FETCH_WORKER_VERSION = PINNED_BROWSER_FETCH_WORKLOAD.worker_version
+BROWSER_FETCH_PLAYWRIGHT_VERSION = dict(PINNED_BROWSER_FETCH_WORKLOAD.component_versions)[
+    "playwright"
+]
+DEFAULT_BROWSER_FETCH_WORKER_COMMAND = PINNED_BROWSER_FETCH_WORKLOAD.command
 DEFAULT_BROWSER_FETCH_MAX_REQUESTS = 128
 MAX_BROWSER_FETCH_MAX_REQUESTS = 512
 DEFAULT_BROWSER_FETCH_MAX_DOM_NODES = 10_000
@@ -138,6 +145,16 @@ _BROWSER_FETCH_ERROR_MESSAGES = {
 @runtime_checkable
 class _AdmissionAwareRunnerHandle(Protocol):
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate | None: ...
+
+
+@runtime_checkable
+class _EnvironmentAuthorityAwareRunnerHandle(Protocol):
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority | None: ...
+
+
+@runtime_checkable
+class _WorkloadAwareRunnerHandle(Protocol):
+    def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None: ...
 
 
 class _BrowserRedirect(BaseModel):
@@ -231,10 +248,18 @@ class BrowserWebFetchAdapter:
         worker_command: Sequence[str] = DEFAULT_BROWSER_FETCH_WORKER_COMMAND,
         max_requests: int = DEFAULT_BROWSER_FETCH_MAX_REQUESTS,
         max_dom_nodes: int = DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
+        expected_runner_candidate: str | None = None,
+        expected_environment_authority: ExecutionEnvironmentAuthority | None = None,
+        expected_workload_authority: RunnerWorkloadAuthority | None = None,
     ) -> None:
         self._worker_command = _browser_worker_command(worker_command)
         self.max_requests = _bounded_max_requests(max_requests)
         self.max_dom_nodes = _bounded_max_dom_nodes(max_dom_nodes)
+        self.expected_runner_candidate = _expected_runner_candidate(expected_runner_candidate)
+        self.expected_environment_authority = _expected_environment_authority(
+            expected_environment_authority
+        )
+        self.expected_workload_authority = _expected_workload_authority(expected_workload_authority)
 
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return material only for Cayu's shipped browser worker."""
@@ -244,7 +269,12 @@ class BrowserWebFetchAdapter:
         worker_argv = self._worker_command.argv
         if worker_argv is None or worker_argv != list(DEFAULT_BROWSER_FETCH_WORKER_COMMAND):
             return None
-        return {
+        if (
+            self.expected_environment_authority is not None
+            and self.expected_environment_authority.profile_identity is None
+        ):
+            return None
+        material: dict[str, object] = {
             "component": "cayu.tools.browser:BrowserWebFetchAdapter",
             "worker_command": {
                 "kind": self._worker_command.kind,
@@ -254,6 +284,17 @@ class BrowserWebFetchAdapter:
             "max_requests": self.max_requests,
             "max_dom_nodes": self.max_dom_nodes,
         }
+        if self.expected_runner_candidate is not None:
+            material["expected_runner_candidate"] = self.expected_runner_candidate
+        if self.expected_environment_authority is not None:
+            material["expected_environment_authority"] = {
+                "profile_identity": self.expected_environment_authority.profile_identity,
+            }
+        if self.expected_workload_authority is not None:
+            material["expected_workload_authority"] = _workload_authority_material(
+                self.expected_workload_authority
+            )
+        return material
 
     async def fetch(
         self,
@@ -284,6 +325,9 @@ class BrowserWebFetchAdapter:
         execution = await _execute_browser_worker(
             ctx,
             worker_command=self._worker_command,
+            expected_runner_candidate=self.expected_runner_candidate,
+            expected_environment_authority=self.expected_environment_authority,
+            expected_workload_authority=self.expected_workload_authority,
             payload=payload,
             timeout_seconds=request.timeout_seconds,
             output_limit=output_limit,
@@ -344,6 +388,10 @@ class ScreenshotPageTool(Tool):
         max_page_width: int = DEFAULT_SCREENSHOT_MAX_PAGE_WIDTH,
         max_page_height: int = DEFAULT_SCREENSHOT_MAX_PAGE_HEIGHT,
         max_page_pixels: int = DEFAULT_SCREENSHOT_MAX_PAGE_PIXELS,
+        expected_runner_candidate: str | None = None,
+        expected_environment_authority: ExecutionEnvironmentAuthority | None = None,
+        expected_workload_authority: RunnerWorkloadAuthority | None = None,
+        expected_artifact_store_id: str | None = None,
         spec: ToolSpec | None = None,
     ) -> None:
         self._worker_command = _browser_worker_command(worker_command)
@@ -400,7 +448,55 @@ class ScreenshotPageTool(Tool):
             raise ValueError("viewport_height cannot exceed max_page_height.")
         if self.viewport_width * self.viewport_height > self.max_page_pixels:
             raise ValueError("The configured viewport exceeds max_page_pixels.")
+        self.expected_runner_candidate = _expected_runner_candidate(expected_runner_candidate)
+        self.expected_environment_authority = _expected_environment_authority(
+            expected_environment_authority
+        )
+        self.expected_workload_authority = _expected_workload_authority(expected_workload_authority)
+        self.expected_artifact_store_id = _expected_artifact_store_id(expected_artifact_store_id)
         super().__init__(spec)
+
+    def _execution_profile_material(self) -> dict[str, object] | None:
+        """Return bounded material only for Cayu's shipped browser worker."""
+
+        worker_argv = self._worker_command.argv
+        if worker_argv is None or worker_argv != list(DEFAULT_BROWSER_FETCH_WORKER_COMMAND):
+            return None
+        if (
+            self.expected_environment_authority is not None
+            and self.expected_environment_authority.profile_identity is None
+        ):
+            return None
+        material: dict[str, object] = {
+            "worker_command": {
+                "kind": self._worker_command.kind,
+                "argv": list(worker_argv),
+                "shell": self._worker_command.shell,
+            },
+            "max_response_bytes": self.max_response_bytes,
+            "timeout_seconds": self.timeout_seconds,
+            "max_redirects": self.max_redirects,
+            "max_requests": self.max_requests,
+            "max_screenshot_bytes": self.max_screenshot_bytes,
+            "viewport_width": self.viewport_width,
+            "viewport_height": self.viewport_height,
+            "max_page_width": self.max_page_width,
+            "max_page_height": self.max_page_height,
+            "max_page_pixels": self.max_page_pixels,
+        }
+        if self.expected_runner_candidate is not None:
+            material["expected_runner_candidate"] = self.expected_runner_candidate
+        if self.expected_environment_authority is not None:
+            material["expected_environment_authority"] = {
+                "profile_identity": self.expected_environment_authority.profile_identity,
+            }
+        if self.expected_workload_authority is not None:
+            material["expected_workload_authority"] = _workload_authority_material(
+                self.expected_workload_authority
+            )
+        if self.expected_artifact_store_id is not None:
+            material["expected_artifact_store_id"] = self.expected_artifact_store_id
+        return material
 
     async def run(self, ctx: ToolContext, args: dict[str, object]) -> ToolResult:
         try:
@@ -415,6 +511,14 @@ class ScreenshotPageTool(Tool):
             return _error_result(
                 "missing_artifact_store",
                 "Screenshot capture requires a configured artifact store.",
+            )
+        if (
+            self.expected_artifact_store_id is not None
+            and artifact_store.id != self.expected_artifact_store_id
+        ):
+            return _error_result(
+                "capability_refused",
+                "The active artifact store does not match the sandboxed WebBridge profile.",
             )
         payload = json.dumps(
             {
@@ -444,6 +548,9 @@ class ScreenshotPageTool(Tool):
         execution = await _execute_browser_worker(
             ctx,
             worker_command=self._worker_command,
+            expected_runner_candidate=self.expected_runner_candidate,
+            expected_environment_authority=self.expected_environment_authority,
+            expected_workload_authority=self.expected_workload_authority,
             payload=payload,
             timeout_seconds=self.timeout_seconds,
             output_limit=_screenshot_output_limit(
@@ -489,6 +596,9 @@ async def _execute_browser_worker(
     ctx: ToolContext,
     *,
     worker_command: ExecCommand,
+    expected_runner_candidate: str | None,
+    expected_environment_authority: ExecutionEnvironmentAuthority | None,
+    expected_workload_authority: RunnerWorkloadAuthority | None,
     payload: str,
     timeout_seconds: float,
     output_limit: int,
@@ -517,6 +627,41 @@ async def _execute_browser_worker(
             "capability_refused",
             _BROWSER_FETCH_ERROR_MESSAGES["capability_refused"],
         )
+    if (
+        expected_runner_candidate is not None
+        and candidate is not None
+        and candidate.candidate != expected_runner_candidate
+    ):
+        return _error_result(
+            "capability_refused",
+            "The active runner does not match the sandboxed WebBridge profile.",
+        )
+    if expected_environment_authority is not None:
+        if not isinstance(runner, _EnvironmentAuthorityAwareRunnerHandle):
+            active_environment_authority = None
+        else:
+            try:
+                active_environment_authority = runner.execution_environment_authority()
+            except Exception:
+                active_environment_authority = None
+        if active_environment_authority != expected_environment_authority:
+            return _error_result(
+                "capability_refused",
+                "The active environment does not match the sandboxed WebBridge profile.",
+            )
+    if expected_workload_authority is not None:
+        if not isinstance(runner, _WorkloadAwareRunnerHandle):
+            active_workload = None
+        else:
+            try:
+                active_workload = runner.workload_authority(expected_workload_authority.name)
+            except Exception:
+                active_workload = None
+        if active_workload != expected_workload_authority:
+            return _error_result(
+                "capability_refused",
+                "The active runner does not provide the sandboxed WebBridge workload.",
+            )
 
     try:
         execution = await runner.exec(
@@ -1127,6 +1272,73 @@ def _bounded_max_dom_nodes(value: int) -> int:
     return value
 
 
+def _expected_runner_candidate(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or not value or len(value) > 96:
+        raise ValueError("expected_runner_candidate must be a bounded capability identity.")
+    if any(
+        not (character.islower() or character.isdigit() or character in "_-") for character in value
+    ):
+        raise ValueError("expected_runner_candidate must be a bounded capability identity.")
+    return value
+
+
+def _expected_environment_authority(
+    value: ExecutionEnvironmentAuthority | None,
+) -> ExecutionEnvironmentAuthority | None:
+    if value is None:
+        return None
+    if type(value) is not ExecutionEnvironmentAuthority:
+        raise TypeError(
+            "expected_environment_authority must be an ExecutionEnvironmentAuthority or None."
+        )
+    return ExecutionEnvironmentAuthority(
+        identity=value.identity,
+        profile_identity=value.profile_identity,
+    )
+
+
+def _expected_workload_authority(
+    value: RunnerWorkloadAuthority | None,
+) -> RunnerWorkloadAuthority | None:
+    if value is None:
+        return None
+    if type(value) is not RunnerWorkloadAuthority:
+        raise TypeError("expected_workload_authority must be RunnerWorkloadAuthority or None.")
+    return RunnerWorkloadAuthority(
+        name=value.name,
+        image=value.image,
+        command=value.command,
+        protocol_version=value.protocol_version,
+        worker_version=value.worker_version,
+        component_versions=value.component_versions,
+    )
+
+
+def _workload_authority_material(
+    value: RunnerWorkloadAuthority | None,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "name": value.name,
+        "image": value.image,
+        "command": list(value.command),
+        "protocol_version": value.protocol_version,
+        "worker_version": value.worker_version,
+        "component_versions": [list(component) for component in value.component_versions],
+    }
+
+
+def _expected_artifact_store_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or not value.strip() or len(value.encode("utf-8")) > 512:
+        raise ValueError("expected_artifact_store_id must be a bounded nonblank string.")
+    return value
+
+
 def _browser_output_limit(request: WebFetchAdapterRequest) -> int:
     # JSON can double quotes, backslashes, and normalized line breaks. Account
     # for four-byte UTF-8 characters in every bounded URL in the redirect
@@ -1140,7 +1352,11 @@ def _browser_output_limit(request: WebFetchAdapterRequest) -> int:
     return 2 * string_bytes + _BROWSER_FETCH_JSON_OVERHEAD_BYTES
 
 
-def _browser_runner_is_admitted(candidate: ExecutionAdmissionCandidate | None) -> bool:
+def _browser_runner_is_admitted(
+    candidate: ExecutionAdmissionCandidate | None,
+    *,
+    stage: ExecutionAdmissionStage = "pre_exposure",
+) -> bool:
     if type(candidate) is not ExecutionAdmissionCandidate:
         return False
     requirements = ExecutionRequirements.trusted(
@@ -1153,6 +1369,7 @@ def _browser_runner_is_admitted(candidate: ExecutionAdmissionCandidate | None) -
         candidate=candidate.candidate,
         requirements=requirements,
         evidence=candidate.evidence,
+        stage=stage,
     )
     return decision.status == "admitted"
 

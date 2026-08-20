@@ -25,7 +25,10 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu._workspace_mutation import detached_workspace_mutation_process_signal
-from cayu.environments.admission import ExecutionAdmissionCandidate
+from cayu.environments.admission import (
+    ExecutionAdmissionCandidate,
+    ExecutionEnvironmentAuthority,
+)
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -35,6 +38,7 @@ from cayu.runners import (
     RunnerCancelledError,
     RunnerExecutionError,
     RunnerUnavailableError,
+    RunnerWorkloadAuthority,
 )
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
@@ -235,6 +239,41 @@ class InvocationRunnerHandle:
             )
         return ExecutionAdmissionCandidate.model_validate(
             candidate.model_dump(mode="python", warnings=False)
+        )
+
+    def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None:
+        """Return detached immutable workload authority without runner ownership."""
+
+        authority = self.__runner.workload_authority(name)
+        if authority is None:
+            return None
+        if type(authority) is not RunnerWorkloadAuthority:
+            raise TypeError(
+                "Runner workload_authority() must return RunnerWorkloadAuthority or None."
+            )
+        return RunnerWorkloadAuthority(
+            name=authority.name,
+            image=authority.image,
+            command=authority.command,
+            protocol_version=authority.protocol_version,
+            worker_version=authority.worker_version,
+            component_versions=authority.component_versions,
+        )
+
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority | None:
+        """Return detached exact environment authority without runner ownership."""
+
+        authority = self.__runner.execution_environment_authority()
+        if authority is None:
+            return None
+        if type(authority) is not ExecutionEnvironmentAuthority:
+            raise TypeError(
+                "Runner execution_environment_authority() must return "
+                "ExecutionEnvironmentAuthority or None."
+            )
+        return ExecutionEnvironmentAuthority(
+            identity=authority.identity,
+            profile_identity=authority.profile_identity,
         )
 
     async def exec(

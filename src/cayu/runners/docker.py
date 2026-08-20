@@ -51,6 +51,7 @@ from cayu.runners.base import (
     attach_cancellation_artifacts,
     copy_exec_command,
 )
+from cayu.runners.workloads import BROWSER_FETCH_WORKLOAD_NAME, PINNED_BROWSER_FETCH_WORKLOAD
 from cayu.vaults import (
     SecretEnv,
     SecretRedactor,
@@ -346,6 +347,7 @@ class DockerRunner(Runner):
             return None
         return {
             "name": self.name,
+            "image": self.image,
             "default_cwd": self.default_cwd,
             "close_action": self.close_action,
             "docker_path": self.docker_path,
@@ -372,11 +374,13 @@ class DockerRunner(Runner):
         allow_raw_secret_env: bool = True,
         env_overlay: Mapping[str, str] | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
+        image: str | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.default_cwd = _validate_guest_cwd(default_cwd)
         self.close_action = _validate_close_action(close_action)
         self.docker_path = _require_docker(docker_path)
+        self.image = None if image is None else require_clean_nonblank(image, "image")
         self.credential_mode = normalize_credential_mode(credential_mode)
         self._allow_raw_secret_env = allow_raw_secret_env
         self.secret_env, self.secret_resolver = normalize_runner_secret_env(
@@ -564,6 +568,7 @@ class DockerRunner(Runner):
             raise
         return cls(
             name,
+            image=image,
             default_cwd=default_cwd,
             close_action=close_action,
             docker_path=docker,
@@ -577,6 +582,13 @@ class DockerRunner(Runner):
             env_overlay=env_overlay,
             docker_cli_env_allowlist=docker_cli_allowlist,
         )
+
+    def workload_authority(self, name: str):
+        """Declare a shipped workload only for its exact selected image."""
+
+        if name != BROWSER_FETCH_WORKLOAD_NAME or self.image != PINNED_BROWSER_FETCH_WORKLOAD.image:
+            return None
+        return PINNED_BROWSER_FETCH_WORKLOAD
 
     async def exec(
         self,

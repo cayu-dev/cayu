@@ -1,4 +1,66 @@
-# Web fetch and hosted search
+# WebBridge: explicit web execution profiles
+
+`WebBridge` is the low-friction construction boundary over Cayu's ordinary web
+tools. The application selects one profile at setup; the model still sees only
+the stable `web_search`, `web_fetch`, and `screenshot_page` schemas supported by
+that profile.
+
+| Profile | Tools | Executes in | Credentials | Isolation and cost |
+| --- | --- | --- | --- | --- |
+| `WebBridge.trusted_local()` | `web_fetch` | trusted Cayu host process | none | DNS/URL admission, not process or network isolation; ordinary host network cost |
+| `WebBridge.hosted(adapter=...)` | adapter-supported `web_search` and/or `web_fetch` | trusted hosted-adapter path | declared `SecretRef` values resolved by the invocation credential proxy | provider request, usage, and cost semantics; no runner/browser authority |
+| `WebBridge.sandboxed_browser(...)` | `web_fetch`, `screenshot_page` | exact admitted runner | none in browser state | brokered egress, confirmed cancellation/cleanup, pinned worker handshake, runner and artifact cost |
+
+Construction fails if the adapter exposes no supported capability, a hosted
+adapter does not declare reference-only credential authority, the sandboxed
+environment lacks a configured artifact store, or the pinned browser image and
+worker do not match the runner-owned workload authority. A static environment
+must already expose admitted runner evidence. An `EnvironmentFactory` instead
+exposes side-effect-free pre-create evidence plus the same workload and artifact
+authority, so a `VirtualEgressEnvironmentFactory` can be assembled during agent
+registration before its per-session runner exists. The sandboxed tools bind the
+configured runner candidate, exact environment/egress authority, workload, and
+artifact-store identity and revalidate all four after the factory materializes the session runner. Browser
+or provider failure, missing capability, and egress denial never cause fallback
+to host-process fetching or another provider.
+
+```python
+from cayu import AgentSpec, WebBridge
+
+bridge = WebBridge.trusted_local()
+app.register_agent(
+    AgentSpec(name="researcher", model="your-model"),
+    tools=bridge.tools,
+    execution_requirements=bridge.execution_requirements,
+)
+```
+
+Changing `bridge` is application configuration; prompts do not choose the
+provider or security profile. See the complete
+[`browse -> extract -> verify`](../examples/webbridge/research.py) and
+[`external cron -> Task -> worker -> agent`](../examples/webbridge/daily_check.py)
+recipes. The [recipe notes](../examples/webbridge/README.md) explain canonical
+source binding, per-page failure isolation, and why recurrence remains owned by
+an external scheduler today.
+
+Hosted adapters implement the runtime-checkable
+`WebBridgeCredentialAuthorityProvider` contract. Its
+`webbridge_credential_authority()` method returns only the provider origin and
+owned `SecretRef` values; it must not resolve credentials or perform I/O.
+`bridge.register_agent(...)` verifies that the selected concrete application
+environment exposes a `CredentialProxy` whose side-effect-free
+`supports_webbridge_credential_authority(...)` declaration accepts that exact
+origin/reference authority. The built-in passthrough and allowlist proxies
+implement this declaration; custom proxies fail closed until they do. For opaque hosted
+adapter code that must resume after process restart, pass an application-owned
+`ExecutionProfileBehaviorIdentity` to `WebBridge.hosted(...)`; that identity is
+frozen into every hosted tool profile. The selected `EnvironmentSpec` also
+needs its own stable execution-profile identity for the complete app profile to
+reconstruct after restart. Hosted tools repeat the compatibility
+check against the active invocation proxy before adapter dispatch, so selecting
+a different environment on `RunRequest` cannot bypass registration.
+
+## Trusted local fetch
 
 `WebFetchTool` is Cayu's low-friction way for an agent running locally to read a
 public HTTPS page. It uses direct HTTP from the Cayu application process. It
@@ -71,6 +133,16 @@ a versioned Playwright/Chromium worker through the current session runner. It
 never falls back to direct host HTTP. The selected environment must provide the
 compatible browser image plus current admission evidence for brokered,
 deny-by-default egress and deterministic command cancellation and cleanup.
+
+Prefer `WebBridge.sandboxed_browser(environment=..., browser_image=...)` for
+application setup. It validates those runner claims and artifact storage before
+agent registration, binds their identities plus the exact environment/factory
+egress authority into the constructed tools, and
+requires the pinned `cayu-browser-fetch:3-playwright-1.62.0` image declaration.
+The versioned worker handshake still verifies protocol, worker, and Playwright
+versions on every dispatch. Browser inspection needs no mutable workspace; the
+profile records `workspace_requirement="none"` instead of silently depending
+on an ambient host directory.
 
 The browser worker returns compact readable `text` for ordinary pages. It
 deterministically selects `accessibility` when links, tables, forms, navigation

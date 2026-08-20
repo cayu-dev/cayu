@@ -24,6 +24,7 @@ from cayu.runners.base import (
     RunnerExecutionError,
     RunnerSystemExecutionMode,
     RunnerUnavailableError,
+    RunnerWorkloadAuthority,
     RunnerWorkspaceCapability,
     attach_cancellation_artifacts,
 )
@@ -63,8 +64,14 @@ from cayu.runners.microsandbox import (
     MicrosandboxWorkspaceCapability,
     MicrosandboxWorkspaceEntry,
 )
+from cayu.runners.workloads import (
+    BROWSER_FETCH_WORKLOAD_NAME,
+    PINNED_BROWSER_FETCH_IMAGE,
+    PINNED_BROWSER_FETCH_WORKLOAD,
+)
 
 __all__ = [
+    "BROWSER_FETCH_WORKLOAD_NAME",
     "DEFAULT_DOCKER_CWD",
     "DEFAULT_DOCKER_IMAGE",
     "DEFAULT_E2B_CWD",
@@ -82,6 +89,8 @@ __all__ = [
     "E2B_SANDBOX_ID_MAX_BYTES",
     "MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS",
     "MICROSANDBOX_NAME_MAX_BYTES",
+    "PINNED_BROWSER_FETCH_IMAGE",
+    "PINNED_BROWSER_FETCH_WORKLOAD",
     "DockerCloseAction",
     "DockerRunner",
     "E2BCloseAction",
@@ -114,6 +123,7 @@ __all__ = [
     "RunnerExecutionError",
     "RunnerSystemExecutionMode",
     "RunnerUnavailableError",
+    "RunnerWorkloadAuthority",
     "RunnerWorkspaceCapability",
     "attach_cancellation_artifacts",
 ]

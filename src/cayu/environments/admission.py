@@ -6,8 +6,17 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
+from cayu._validation import require_durable_clean_nonblank
 from cayu.capabilities import (
     CapabilityClaim,
     CapabilityEvidence,
@@ -182,6 +191,29 @@ class ExecutionAdmissionCandidate(BaseModel):
         if self.evidence.subject != self.candidate:
             raise ValueError("Execution admission evidence must describe its named candidate.")
         return self
+
+
+class ExecutionEnvironmentAuthority(BaseModel):
+    """Opaque identity for one exact environment security boundary.
+
+    Integrations carry this value from side-effect-free construction evidence to
+    the materialized runner. ``identity`` is process-local and binds one concrete
+    factory or runner. ``profile_identity`` exists only when the application has
+    supplied a stable versioned declaration that can be reconstructed after
+    restart; it never replaces the exact live identity used at dispatch.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    identity: str = Field(max_length=96)
+    profile_identity: str | None = Field(default=None, max_length=96)
+
+    @field_validator("identity", "profile_identity")
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class ExecutionEvidenceOverride(BaseModel):

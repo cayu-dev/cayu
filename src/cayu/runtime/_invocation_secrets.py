@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from cayu._exception_state import exception_state, pop_exception_state, set_exception_state
 from cayu._task_wait import unexpected_child_cancellation_error
@@ -34,6 +34,9 @@ from cayu.vaults import (
     copy_resolved_secret,
     copy_secret_ref,
 )
+
+if TYPE_CHECKING:
+    from cayu.tools.webbridge import WebBridgeCredentialAuthority
 
 _CANCELLATION_EVIDENCE_ATTRIBUTE = "_cayu_tool_cancellation_evidence"
 _CANCELLATION_EVIDENCE_TOKEN = object()
@@ -486,6 +489,14 @@ class _TrackingCredentialProxy(CredentialProxy):
         self._tracker = tracker
         self._on_authorize = on_authorize
         self._on_redactor_change = on_redactor_change or _ignore_redactor_change
+
+    def supports_webbridge_credential_authority(
+        self,
+        authority: WebBridgeCredentialAuthority,
+    ) -> bool:
+        """Forward side-effect-free hosted authority compatibility."""
+
+        return self._proxy.supports_webbridge_credential_authority(authority)
 
     async def resolve(
         self,

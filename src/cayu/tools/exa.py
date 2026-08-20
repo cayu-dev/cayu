@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -29,6 +29,9 @@ from cayu.tools.web import (
     _web_search_success_result,
 )
 from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, copy_secret_ref
+
+if TYPE_CHECKING:
+    from cayu.tools.webbridge import WebBridgeCredentialAuthority
 
 DEFAULT_EXA_ORIGIN = "https://api.exa.ai"
 DEFAULT_EXA_SEARCH_TYPE = "auto"
@@ -53,6 +56,26 @@ class _ExaHttpResponse:
     headers: Mapping[str, str]
     body: bytes
     redactor: SecretRedactor
+
+
+@dataclass(frozen=True)
+class _ExaRequestConfiguration:
+    api_key_ref: SecretRef
+    origin: str
+    auth_header: Literal["x-api-key", "authorization"]
+    search_type: Literal[
+        "instant",
+        "fast",
+        "auto",
+        "deep-lite",
+        "deep",
+        "deep-reasoning",
+    ]
+    search_max_age_hours: int | None
+    fetch_max_age_hours: int | None
+    moderation: bool
+    max_provider_response_bytes: int
+    transport: httpx.AsyncBaseTransport | None
 
 
 class _ExaOversizedResponseError(Exception):
@@ -121,6 +144,17 @@ class ExaWebAdapter:
             raise TypeError("transport must be an httpx.AsyncBaseTransport.")
         self._transport = transport
 
+    def webbridge_credential_authority(self) -> WebBridgeCredentialAuthority:
+        """Declare the hosted authority without resolving its secret value."""
+
+        from cayu.tools.webbridge import WebBridgeCredentialAuthority
+
+        return WebBridgeCredentialAuthority(
+            provider="exa",
+            origin=self.origin,
+            secret_refs=(self.api_key_ref,),
+        )
+
     async def search(
         self,
         ctx: ToolContext,
@@ -138,6 +172,13 @@ class ExaWebAdapter:
                 "unsupported_semantics",
                 "This Exa adapter cannot enforce the configured search restrictions.",
             )
+        try:
+            configuration = self._owned_request_configuration()
+        except (TypeError, ValueError):
+            return _error_result(
+                "invalid_adapter_configuration",
+                "The Exa adapter configuration is no longer valid.",
+            )
         contents: dict[str, Any] = {
             "highlights": {
                 "query": request.query,
@@ -149,20 +190,21 @@ class ExaWebAdapter:
         }
         payload: dict[str, Any] = {
             "query": request.query,
-            "type": self.search_type,
+            "type": configuration.search_type,
             "numResults": request.max_results,
-            "moderation": self.moderation,
+            "moderation": configuration.moderation,
             "contents": contents,
         }
-        if self.search_max_age_hours is not None:
-            contents["maxAgeHours"] = self.search_max_age_hours
+        if configuration.search_max_age_hours is not None:
+            contents["maxAgeHours"] = configuration.search_max_age_hours
         response = await self._post_json(
             ctx,
+            configuration=configuration,
             path="/search",
             action="exa.search",
             payload=payload,
             timeout_seconds=request.timeout_seconds,
-            max_response_bytes=self.max_provider_response_bytes,
+            max_response_bytes=configuration.max_provider_response_bytes,
         )
         if isinstance(response, ToolResult):
             return response
@@ -187,6 +229,13 @@ class ExaWebAdapter:
         ctx: ToolContext,
         request: WebFetchAdapterRequest,
     ) -> ToolResult:
+        try:
+            configuration = self._owned_request_configuration()
+        except (TypeError, ValueError):
+            return _error_result(
+                "invalid_adapter_configuration",
+                "The Exa adapter configuration is no longer valid.",
+            )
         if len(request.requested_url) > MAX_EXA_URL_CHARACTERS:
             return _error_result(
                 "unsupported_semantics",
@@ -204,16 +253,17 @@ class ExaWebAdapter:
                 "verbosity": "compact",
             },
         }
-        if self.fetch_max_age_hours is not None:
-            payload["maxAgeHours"] = self.fetch_max_age_hours
+        if configuration.fetch_max_age_hours is not None:
+            payload["maxAgeHours"] = configuration.fetch_max_age_hours
         response = await self._post_json(
             ctx,
+            configuration=configuration,
             path="/contents",
             action="exa.contents",
             payload=payload,
             timeout_seconds=request.timeout_seconds,
             max_response_bytes=min(
-                self.max_provider_response_bytes,
+                configuration.max_provider_response_bytes,
                 request.max_response_bytes,
             ),
         )
@@ -239,6 +289,7 @@ class ExaWebAdapter:
         self,
         ctx: ToolContext,
         *,
+        configuration: _ExaRequestConfiguration,
         path: str,
         action: str,
         payload: Mapping[str, Any],
@@ -253,8 +304,8 @@ class ExaWebAdapter:
             )
         try:
             authorization = await proxy.authorize_request(
-                destination=self.origin,
-                credential=self.api_key_ref,
+                destination=configuration.origin,
+                credential=configuration.api_key_ref,
                 action=action,
                 metadata={"method": "POST", "path": path},
             )
@@ -269,8 +320,8 @@ class ExaWebAdapter:
                     "The credential proxy denied the Exa request.",
                 )
             resolved = await proxy.resolve(
-                self.api_key_ref,
-                scope={"destination": self.origin, "provider": "exa"},
+                configuration.api_key_ref,
+                scope={"destination": configuration.origin, "provider": "exa"},
             )
             if type(resolved) is not ResolvedSecret:
                 return _error_result(
@@ -300,7 +351,7 @@ class ExaWebAdapter:
             "Content-Type": "application/json",
             "User-Agent": "Cayu-Exa-Web/0.1",
         }
-        if self.auth_header == "authorization":
+        if configuration.auth_header == "authorization":
             headers["Authorization"] = f"Bearer {api_key}"
         else:
             headers["x-api-key"] = api_key
@@ -309,9 +360,9 @@ class ExaWebAdapter:
             unsupported_response = False
             async with (
                 httpx.AsyncClient(
-                    base_url=self.origin,
+                    base_url=configuration.origin,
                     timeout=timeout,
-                    transport=self._transport,
+                    transport=configuration.transport,
                     trust_env=False,
                     follow_redirects=False,
                 ) as client,
@@ -368,6 +419,45 @@ class ExaWebAdapter:
         finally:
             api_key = ""
             headers.clear()
+
+    def _owned_request_configuration(self) -> _ExaRequestConfiguration:
+        api_key_ref = self.api_key_ref
+        if type(api_key_ref) is not SecretRef:
+            raise TypeError("api_key_ref must be a SecretRef.")
+        auth_header = self.auth_header
+        if type(auth_header) is not str or auth_header not in _EXA_AUTH_HEADERS:
+            raise ValueError("auth_header must be 'x-api-key' or 'authorization'.")
+        search_type = self.search_type
+        if type(search_type) is not str or search_type not in _EXA_SEARCH_TYPES:
+            raise ValueError("search_type is not supported by this Exa adapter.")
+        moderation = self.moderation
+        if type(moderation) is not bool:
+            raise TypeError("moderation must be a boolean.")
+        transport = self._transport
+        if transport is not None and not isinstance(transport, httpx.AsyncBaseTransport):
+            raise TypeError("transport must be an httpx.AsyncBaseTransport.")
+        return _ExaRequestConfiguration(
+            api_key_ref=copy_secret_ref(api_key_ref),
+            origin=_exa_origin(self.origin),
+            auth_header=auth_header,
+            search_type=search_type,
+            search_max_age_hours=_max_age_hours(
+                self.search_max_age_hours,
+                "search_max_age_hours",
+            ),
+            fetch_max_age_hours=_max_age_hours(
+                self.fetch_max_age_hours,
+                "fetch_max_age_hours",
+            ),
+            moderation=moderation,
+            max_provider_response_bytes=_configuration_int(
+                self.max_provider_response_bytes,
+                "max_provider_response_bytes",
+                minimum=1,
+                maximum=MAX_EXA_PROVIDER_RESPONSE_BYTES,
+            ),
+            transport=transport,
+        )
 
 
 def _exa_search_result(

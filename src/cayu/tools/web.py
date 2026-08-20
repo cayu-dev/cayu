@@ -14,6 +14,7 @@ from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.egress._resolution import (
     InvalidResolvedAddressError,
@@ -372,8 +373,11 @@ class WebFetchTool(Tool):
         max_content_bytes: int = DEFAULT_WEB_FETCH_MAX_CONTENT_BYTES,
         timeout_seconds: float = DEFAULT_WEB_FETCH_TIMEOUT_SECONDS,
         max_redirects: int = DEFAULT_WEB_FETCH_MAX_REDIRECTS,
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         spec: ToolSpec | None = None,
     ) -> None:
+        if spec is not None and execution_profile_identity is not None:
+            raise ValueError("spec and execution_profile_identity cannot be combined.")
         if adapter is not None and not isinstance(adapter, WebFetchAdapter):
             raise TypeError("adapter must implement WebFetchAdapter.")
         if adapter is not None and (resolver is not None or transport is not None):
@@ -405,7 +409,12 @@ class WebFetchTool(Tool):
             minimum=0,
             maximum=MAX_WEB_FETCH_REDIRECTS,
         )
-        super().__init__(spec)
+        effective_spec = spec
+        if effective_spec is None and execution_profile_identity is not None:
+            effective_spec = type(self).spec.model_copy(
+                update={"execution_profile_identity": execution_profile_identity}
+            )
+        super().__init__(effective_spec)
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         try:
@@ -593,8 +602,11 @@ class WebSearchTool(Tool):
         max_total_snippet_bytes: int = DEFAULT_WEB_SEARCH_MAX_TOTAL_SNIPPET_BYTES,
         timeout_seconds: float = DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
         restrictions: WebSearchRestrictions | None = None,
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         spec: ToolSpec | None = None,
     ) -> None:
+        if spec is not None and execution_profile_identity is not None:
+            raise ValueError("spec and execution_profile_identity cannot be combined.")
         if not isinstance(adapter, WebSearchAdapter):
             raise TypeError("adapter must implement WebSearchAdapter.")
         self.adapter = adapter
@@ -635,13 +647,15 @@ class WebSearchTool(Tool):
         if type(restrictions) is not WebSearchRestrictions:
             raise TypeError("restrictions must be WebSearchRestrictions or None.")
         self.restrictions = restrictions
-        super().__init__(
-            spec
-            or _web_search_tool_spec(
-                default_results=self.default_results,
-                max_results=self.max_results,
-            )
+        effective_spec = spec or _web_search_tool_spec(
+            default_results=self.default_results,
+            max_results=self.max_results,
         )
+        if execution_profile_identity is not None:
+            effective_spec = effective_spec.model_copy(
+                update={"execution_profile_identity": execution_profile_identity}
+            )
+        super().__init__(effective_spec)
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         try:

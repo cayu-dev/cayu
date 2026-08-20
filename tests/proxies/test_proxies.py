@@ -4,7 +4,13 @@ import asyncio
 
 import pytest
 
-from cayu import AllowlistProxy, CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
+from cayu import (
+    AllowlistProxy,
+    CredentialProxy,
+    PassthroughProxy,
+    ProxyAuthorizationResult,
+    WebBridgeCredentialAuthority,
+)
 from cayu.core.tools import ToolContext
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
 from cayu.vaults import SecretNotFound, SecretRef, StaticVault
@@ -153,6 +159,31 @@ def test_allowlist_proxy_authorizes_only_listed_destinations() -> None:
     assert apex_of_wildcard.allowed is False
     assert denied.allowed is False
     assert "evil.example.net" in (denied.reason or "")
+
+
+def test_builtin_proxies_declare_webbridge_compatibility_without_resolution() -> None:
+    authority = WebBridgeCredentialAuthority(
+        provider="hosted-provider",
+        origin="https://api.anthropic.com",
+        secret_refs=(SecretRef(name="api_key"),),
+    )
+    vault = StaticVault({})
+
+    assert PassthroughProxy(vault).supports_webbridge_credential_authority(authority) is True
+    assert (
+        AllowlistProxy(
+            vault,
+            allowed_destinations=["api.anthropic.com"],
+        ).supports_webbridge_credential_authority(authority)
+        is True
+    )
+    assert (
+        AllowlistProxy(
+            vault,
+            allowed_destinations=["other.example.com"],
+        ).supports_webbridge_credential_authority(authority)
+        is False
+    )
 
 
 def test_allowlist_proxy_resolve_is_fail_closed_on_destination_scope() -> None:

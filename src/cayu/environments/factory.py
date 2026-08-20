@@ -19,12 +19,15 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
+from cayu.artifacts import ArtifactStore
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
+    ExecutionEnvironmentAuthority,
     ExecutionRequirements,
 )
 from cayu.environments.base import Environment, copy_environment
+from cayu.runners.base import RunnerWorkloadAuthority
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
 ENVIRONMENT_ALLOCATION_INTENT_SCHEMA_VERSION = 1
@@ -681,6 +684,28 @@ class EnvironmentFactory(ABC):
         """
 
         del request
+        return None
+
+    def construction_admission_candidate(self) -> ExecutionAdmissionCandidate | None:
+        """Return side-effect-free configured capability evidence at app setup."""
+
+        return None
+
+    def execution_environment_authority(self) -> ExecutionEnvironmentAuthority | None:
+        """Return the exact security boundary every materialized runner preserves."""
+
+        return None
+
+    def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None:
+        """Return configured authority for a workload every result must preserve."""
+
+        del name
+        return None
+
+    @property
+    def configured_artifact_store(self) -> ArtifactStore | None:
+        """Return the stable artifact store exposed by every factory result."""
+
         return None
 
     def allocation_scope(

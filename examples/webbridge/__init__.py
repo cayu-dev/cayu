@@ -1,0 +1,1 @@
+"""Complete WebBridge application recipes."""

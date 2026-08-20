@@ -72,6 +72,13 @@ from cayu.tools.web import (
     WebSearchRestrictions,
     WebSearchTool,
 )
+from cayu.tools.webbridge import (
+    DEFAULT_WEBBRIDGE_BROWSER_IMAGE,
+    WebBridge,
+    WebBridgeCredentialAuthority,
+    WebBridgeCredentialAuthorityProvider,
+    WebBridgeProfileKind,
+)
 
 __all__ = [
     "BROWSER_FETCH_PLAYWRIGHT_VERSION",
@@ -80,6 +87,7 @@ __all__ = [
     "DEFAULT_BROWSER_FETCH_MAX_DOM_NODES",
     "DEFAULT_BROWSER_FETCH_MAX_REQUESTS",
     "DEFAULT_BROWSER_FETCH_WORKER_COMMAND",
+    "DEFAULT_WEBBRIDGE_BROWSER_IMAGE",
     "MAX_BROWSER_FETCH_MAX_DOM_NODES",
     "MAX_BROWSER_FETCH_MAX_REQUESTS",
     "ArtifactReadRequest",
@@ -120,6 +128,10 @@ __all__ = [
     "SystemWebFetchResolver",
     "TextArtifactReader",
     "UserInputTool",
+    "WebBridge",
+    "WebBridgeCredentialAuthority",
+    "WebBridgeCredentialAuthorityProvider",
+    "WebBridgeProfileKind",
     "WebFetchAdapter",
     "WebFetchAdapterRequest",
     "WebFetchHttpRequest",

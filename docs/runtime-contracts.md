@@ -4813,6 +4813,50 @@ usage, warnings, and retry hints remain bounded and secret-checked under
 `provider_metadata.parallel`. Parallel is likewise opt-in and adds no SDK or
 default-provider dependency.
 
+`WebBridge` is the application-owned assembly boundary for these seams. Its
+three explicit profiles construct only the ordinary tools supported by trusted
+local HTTP, one named hosted adapter, or one admitted sandboxed-browser
+environment. Profile selection never enters model arguments and never creates
+a parallel tool lifecycle. Hosted construction requires the adapter to declare
+bounded reference-only credential authority through the
+`WebBridgeCredentialAuthorityProvider` protocol and does not resolve a secret.
+Its app-owned `register_agent` boundary also requires the selected concrete
+environment to expose a credential proxy whose side-effect-free compatibility
+declaration accepts the adapter's exact origin and secret-reference authority
+before registration, and hosted tools repeat that check against the active
+invocation proxy before adapter dispatch. Opaque hosted
+adapters become restart-reconstructable only when the application supplies an
+explicit `ExecutionProfileBehaviorIdentity` and the selected environment has a
+restart-stable `EnvironmentSpec.execution_profile_identity`.
+Sandboxed construction accepts either a static environment or an environment
+factory. A static environment validates its exact live runner candidate. A
+factory validates side-effect-free pre-create adapter evidence and binds a
+runner-owned exact image/command/protocol workload declaration without creating
+a provider resource. Both paths require brokered egress, confirmed cancellation
+and cleanup, pinned image/worker versions, absence of a workspace requirement,
+and a stable artifact-store identity before returning tools. Runtime dispatch
+revalidates the materialized runner evidence, candidate, exact environment and
+egress authority, and exact workload;
+screenshot publication revalidates the artifact-store identity. Missing or
+failed browser/provider capability never falls back to trusted host HTTP or a
+different provider.
+
+Tool policy authorizes a model call, and URL validation bounds the requested
+destination, but neither is a process or network-isolation boundary. Only the
+selected adapter's execution location and the admitted environment establish
+those properties. Provider costs, browser-runner costs, credentials, egress
+destinations, limits, and recurrence remain application configuration. Web
+tools do not schedule themselves; a recurring application uses an external
+scheduler to idempotently enqueue a `Task`, then a normal task worker runs the
+agent and retains its durable result. The worked daily-check worker recovers a
+pre-attachment redelivery from its deterministic session and, during startup,
+settles terminal ownerless tasks. An abandoned attached task remains fenced to
+its exact session even after its worker lease expires; the application uses the
+normal session recovery or operator continuation APIs to reconcile that session
+instead of treating stale task-list lease evidence as takeover authority or
+returning the task to the fresh-task queue. Nonterminal ownerless tasks likewise
+remain under the session continuation APIs and are not resumed by this sweep.
+
 The default adapter performs direct network I/O from the trusted Cayu application
 process. DNS admission and pinning constrain its destination, but do not provide
 process isolation, browser isolation, or a sandbox network boundary. It does

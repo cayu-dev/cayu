@@ -28,6 +28,9 @@ from cayu import (
     SecretRef,
     StaticVault,
     ToolContext,
+    ToolResult,
+    WebBridge,
+    WebBridgeCredentialAuthority,
     WebFetchTool,
     WebSearchRestrictions,
     WebSearchTool,
@@ -81,6 +84,40 @@ class _CredentialProxy:
     ) -> ResolvedSecret:
         self.resolutions.append((ref, scope))
         return self.resolved
+
+
+class _BlockingCredentialProxy(_CredentialProxy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.authorization_started = asyncio.Event()
+        self.release_authorization = asyncio.Event()
+
+    def supports_webbridge_credential_authority(
+        self,
+        authority: WebBridgeCredentialAuthority,
+    ) -> bool:
+        return authority == WebBridgeCredentialAuthority(
+            provider="exa",
+            origin="https://api.exa.ai",
+            secret_refs=(_API_KEY_REF,),
+        )
+
+    async def authorize_request(
+        self,
+        *,
+        destination: str,
+        credential: SecretRef | None = None,
+        action: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ProxyAuthorizationResult:
+        self.authorization_started.set()
+        await self.release_authorization.wait()
+        return await super().authorize_request(
+            destination=destination,
+            credential=credential,
+            action=action,
+            metadata=metadata,
+        )
 
 
 class _ByteStream(httpx.AsyncByteStream):
@@ -1089,6 +1126,78 @@ def test_exa_requires_active_authorized_credential_authority() -> None:
 
     assert missing.structured == {"error": "credential_authority_unavailable"}
     assert denied.structured == {"error": "credential_denied"}
+
+
+def test_exa_dispatch_owns_configuration_across_credential_await() -> None:
+    async def scenario() -> tuple[
+        ToolResult,
+        _BlockingCredentialProxy,
+        list[httpx.Request],
+    ]:
+        proxy = _BlockingCredentialProxy()
+        original_requests: list[httpx.Request] = []
+
+        def original_handler(request: httpx.Request) -> httpx.Response:
+            original_requests.append(request)
+            return _json_response({"results": []})
+
+        def replacement_handler(request: httpx.Request) -> httpx.Response:
+            del request
+            raise AssertionError("A concurrent mutation must not replace the active transport.")
+
+        adapter = ExaWebAdapter(
+            api_key_ref=_API_KEY_REF,
+            search_type="fast",
+            search_max_age_hours=24,
+            transport=httpx.MockTransport(original_handler),
+        )
+        bridge = WebBridge.hosted(adapter=adapter)
+        task = asyncio.create_task(
+            bridge.tools[0].run(
+                _context(proxy),
+                {"query": "owned configuration"},
+            )
+        )
+        await proxy.authorization_started.wait()
+        adapter.api_key_ref = SecretRef(name="replacement_api_key")
+        adapter.origin = "https://replacement.example"
+        adapter.auth_header = "authorization"
+        adapter.search_type = "deep"
+        adapter.search_max_age_hours = 48
+        adapter.moderation = True
+        adapter.max_provider_response_bytes = 1
+        adapter._transport = httpx.MockTransport(replacement_handler)
+        proxy.release_authorization.set()
+        return await task, proxy, original_requests
+
+    result, proxy, requests = asyncio.run(scenario())
+
+    assert result.is_error is False
+    assert len(requests) == 1
+    assert requests[0].url == "https://api.exa.ai/search"
+    assert requests[0].headers["x-api-key"] == _API_KEY
+    assert "authorization" not in requests[0].headers
+    assert json.loads(requests[0].content) == {
+        "query": "owned configuration",
+        "type": "fast",
+        "numResults": 5,
+        "moderation": False,
+        "contents": {
+            "highlights": {
+                "query": "owned configuration",
+                "maxCharacters": 2_048,
+            },
+            "maxAgeHours": 24,
+        },
+    }
+    assert proxy.authorizations[0]["destination"] == "https://api.exa.ai"
+    assert proxy.authorizations[0]["credential"] == _API_KEY_REF
+    assert proxy.resolutions == [
+        (
+            _API_KEY_REF,
+            {"destination": "https://api.exa.ai", "provider": "exa"},
+        )
+    ]
 
 
 def test_exa_oversized_response_fails_boundedly() -> None:
