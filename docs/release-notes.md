@@ -179,6 +179,11 @@ identity ordering across the in-memory, SQLite, and PostgreSQL backends, so
 bounded results and cleanup publication do not depend on database locale or
 insertion order.
 
+Owned PostgreSQL publication now acquires the global change-sequence lock only
+after entry, chunk, and evidence payloads are written. Unrelated canonical
+writes can proceed while a large payload is staged without weakening atomic
+receipt and outbox publication.
+
 Entry IDs and chunk IDs now have explicit portable UTF-8 byte limits shared by
 canonical models, referenced evidence/receipts/changes, and every built-in
 backend. Revision-43 migration rejects out-of-contract revision-42 identities

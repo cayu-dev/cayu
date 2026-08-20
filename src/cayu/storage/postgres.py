@@ -6311,17 +6311,6 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         access_scope=scope,
                         operation="publish_entry_revision",
                     )
-                    await _lock_knowledge_change_sequence(cur)
-                    receipt = KnowledgePublicationReceipt(
-                        operation_id=operation_id,
-                        entry_id=copied_entry.id,
-                        entry_revision=copied_entry.revision,
-                        expected_revision=expected_revision,
-                        request_sha256=request_sha256,
-                        entry_created_at=copied_entry.created_at,
-                        entry_updated_at=copied_entry.updated_at,
-                        committed_at=datetime.now(UTC),
-                    )
                     if existing_entry is None:
                         await self._insert_entry(cur, copied_entry)
                     else:
@@ -6334,6 +6323,17 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         )
                     await self._insert_chunks(cur, copied_entry, copied_chunks)
                     await self._insert_evidence(cur, copied_evidence)
+                    await _lock_knowledge_change_sequence(cur)
+                    receipt = KnowledgePublicationReceipt(
+                        operation_id=operation_id,
+                        entry_id=copied_entry.id,
+                        entry_revision=copied_entry.revision,
+                        expected_revision=expected_revision,
+                        request_sha256=request_sha256,
+                        entry_created_at=copied_entry.created_at,
+                        entry_updated_at=copied_entry.updated_at,
+                        committed_at=datetime.now(UTC),
+                    )
                     await self._insert_change(
                         cur,
                         before_entry=existing_entry,

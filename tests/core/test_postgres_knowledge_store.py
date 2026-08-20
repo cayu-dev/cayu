@@ -35,6 +35,7 @@ from cayu.storage import (
     KnowledgeChangeKind,
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeEvidence,
     KnowledgeListGroup,
     KnowledgeListQuery,
     KnowledgeQuery,
@@ -259,6 +260,78 @@ def test_postgres_knowledge_store_owned_publication_conformance(postgres_dsn: st
             await assert_concurrent_publication_conformance(store)
             await assert_stale_operation_cannot_replace_newer_publication(store)
         finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_owned_publication_does_not_hold_sequence_lock_while_writing_payload(
+    postgres_dsn: str,
+) -> None:
+    from cayu import PostgresKnowledgeStore
+
+    class BlockingEvidenceStore(PostgresKnowledgeStore):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.evidence_inserted = asyncio.Event()
+            self.release_evidence_insert = asyncio.Event()
+
+        async def _insert_evidence(self, cur, evidence) -> None:
+            await super()._insert_evidence(cur, evidence)
+            if evidence and evidence[0].entry_id == "slow-publication":
+                self.evidence_inserted.set()
+                await self.release_evidence_insert.wait()
+
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        store = BlockingEvidenceStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+        )
+        publication_task = None
+        try:
+            await store.ensure_schema()
+            entry = KnowledgeEntry(id="slow-publication", text="Large owned payload.")
+            publication_task = asyncio.create_task(
+                store.publish_entry_revision(
+                    entry,
+                    [
+                        KnowledgeChunk(
+                            id="slow-publication:r1:0",
+                            entry_id=entry.id,
+                            chunk_index=0,
+                            text=entry.text,
+                        )
+                    ],
+                    evidence=[
+                        KnowledgeEvidence(
+                            id="slow-publication-evidence",
+                            entry_id=entry.id,
+                            source_type="document",
+                            source_id="slow-source",
+                            source_revision="1",
+                        )
+                    ],
+                    operation_id="slow-publication-operation",
+                )
+            )
+            await asyncio.wait_for(store.evidence_inserted.wait(), timeout=2)
+
+            unrelated = await asyncio.wait_for(
+                store.create_entry(
+                    KnowledgeEntry(id="unrelated-publication", text="Independent write.")
+                ),
+                timeout=2,
+            )
+            assert unrelated.id == "unrelated-publication"
+        finally:
+            store.release_evidence_insert.set()
+            if publication_task is not None:
+                await publication_task
             await store.close()
             await _drop_all(postgres_dsn)
 
