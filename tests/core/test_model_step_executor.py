@@ -588,6 +588,7 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
             record_model_completion=record_model_completion,
             prepare_provider_dispatch=prepare_provider_dispatch,
             before_provider_dispatch=before_provider_dispatch,
+            validate_live_model_semantics=lambda: None,
             record_model_attempt_identity=observed_model_attempt_ids.append,
         ):
             if event is not None:

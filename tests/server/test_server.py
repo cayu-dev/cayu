@@ -2514,7 +2514,12 @@ def test_server_resume_overrides_max_steps() -> None:
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
 
-    started = _session_started_event(client, "/api/run", {"prompt": "hello"}, {})
+    started = _session_started_event(
+        client,
+        "/api/run",
+        {"prompt": "hello", "max_steps": 42},
+        {},
+    )
     session_id = started["session_id"]
 
     captured: list[int] = []
@@ -5326,7 +5331,7 @@ def test_server_exposes_session_cost_estimate() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    asyncio.run(
+    run_events = asyncio.run(
         _collect_run(
             app,
             RunRequest(
@@ -5337,6 +5342,7 @@ def test_server_exposes_session_cost_estimate() -> None:
         )
     )
 
+    completed = next(event for event in run_events if event.type is EventType.MODEL_COMPLETED)
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
     response = client.post(
         "/api/sessions/cost_1/cost",
@@ -5359,6 +5365,7 @@ def test_server_exposes_session_cost_estimate() -> None:
         "line_items": [
             {
                 "model_step": 1,
+                "execution_profile_fingerprint": completed.payload["execution_profile_fingerprint"],
                 "provider_name": "fake",
                 "model": "fake-model",
                 "requested_model": "fake-model",
@@ -6961,6 +6968,7 @@ def test_generated_session_and_interaction_aliases_remain_distinct_and_addressab
             RunRequest(
                 agent_name="assistant",
                 messages=[Message.text("user", "first")],
+                max_steps=20,
             ),
         )
         first_session_id = first_session_events[0].session_id
@@ -6980,6 +6988,7 @@ def test_generated_session_and_interaction_aliases_remain_distinct_and_addressab
             RunRequest(
                 agent_name="assistant",
                 messages=[Message.text("user", "other")],
+                max_steps=20,
             ),
         )
         return first_session_id, first_session_events[0].id, second_session_events[0].session_id

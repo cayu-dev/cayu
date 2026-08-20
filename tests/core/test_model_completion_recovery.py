@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
 from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
@@ -70,6 +71,10 @@ from cayu.tools import UserInputTool
 
 class _RecordingProvider(ModelProvider):
     name = "model-completion-recovery"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
 
     def __init__(self, responses: list[list[ModelStreamEvent]] | None = None) -> None:
         self._responses = [] if responses is None else responses
@@ -169,6 +174,7 @@ def _test_execution_profile(
     *,
     provider_name: str,
     tool_name: str | None = None,
+    limits: RunLimits | None = None,
 ) -> ExecutionProfileIdentity:
     tool: Tool | None = None
     if tool_name == _NeverExecutedTool.spec.name:
@@ -178,6 +184,10 @@ def _test_execution_profile(
     elif tool_name is not None:
         raise ValueError(f"Unsupported test tool: {tool_name}")
     profile_app = CayuApp(enable_logging=False)
+    profile_provider = _RecordingProvider()
+    if profile_provider.name != provider_name:
+        raise ValueError(f"Unsupported test provider: {provider_name}")
+    profile_app.register_provider(profile_provider, default=True)
     profile_app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[] if tool is None else [tool],
@@ -191,6 +201,13 @@ def _test_execution_profile(
         durable_system_prompt=None,
         redactor=profile_app._secret_redactor,
         process_identity=profile_app._execution_profile_process_identity,
+        registered_provider=profile_app._providers[provider_name],
+        finalization={
+            "kind": "cayu:model-finalization:v1",
+            "max_steps": 16,
+            "limits": (RunLimits() if limits is None else limits).model_dump(mode="json"),
+            "retry_policy": profile_app._effective_retry_policy(None).model_dump(mode="json"),
+        },
     )
 
 
@@ -355,6 +372,7 @@ async def _stage_completed_model_boundary(
     tool_name: str = "echo",
     tool_call_count: int = 1,
     usage: dict[str, int] | None = None,
+    limits: RunLimits | None = None,
 ) -> _StagedCompletion:
     user_message = Message.text("user", "complete this model step once")
     interaction_id = f"interaction-{session_id}"
@@ -376,6 +394,7 @@ async def _stage_completed_model_boundary(
     execution_profile = _test_execution_profile(
         provider_name=provider_name,
         tool_name=tool_name if with_tool_call else None,
+        limits=limits,
     )
 
     def freeze_initial_invocation_profile(
@@ -399,6 +418,7 @@ async def _stage_completed_model_boundary(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
+            limits=RunLimits() if limits is None else limits,
         ),
         identity=SessionIdentity(
             provider_name=provider_name,
@@ -1747,12 +1767,14 @@ def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence()
         store = _FailApprovalCloseBeforeCommitStore()
         provider = _RecordingProvider()
         tool = _NeverExecutedTool()
+        limits = RunLimits(max_total_tokens=1, scope="session")
         staged = await _stage_completed_model_boundary(
             store,
             session_id="model-recovery-limit-close-precommit",
             provider_name=provider.name,
             with_tool_call=True,
             usage={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+            limits=limits,
         )
         await store.release_run_fence(staged.session.id)
         await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
@@ -1765,6 +1787,7 @@ def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence()
                 ResumeRequest(
                     session_id=staged.session.id,
                     messages=[deferred_message],
+                    limits=limits,
                 )
             )
         ]
@@ -1775,7 +1798,7 @@ def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence()
             tool_round_id=approval.tool_round_id,
             tool_call_id=approval.tool_call_id,
             decision=ToolApprovalDecision.APPROVE,
-            limits=RunLimits(max_total_tokens=1, scope="session"),
+            limits=limits,
         )
         first = [event async for event in app.resolve_tool_approval(request)]
         checkpoint_after_failure = await store.load_checkpoint(staged.session.id)
@@ -1942,12 +1965,14 @@ def test_limit_approval_close_materialization_failure_stays_closed() -> None:
         store = _FailMaterializationStore(failures=1)
         provider = _RecordingProvider()
         tool = _NeverExecutedTool()
+        limits = RunLimits(max_total_tokens=1, scope="session")
         staged = await _stage_completed_model_boundary(
             store,
             session_id="model-recovery-limit-close-materialization",
             provider_name=provider.name,
             with_tool_call=True,
             usage={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+            limits=limits,
         )
         await store.release_run_fence(staged.session.id)
         await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
@@ -1960,6 +1985,7 @@ def test_limit_approval_close_materialization_failure_stays_closed() -> None:
                 ResumeRequest(
                     session_id=staged.session.id,
                     messages=[deferred_message],
+                    limits=limits,
                 )
             )
         ]
@@ -1970,7 +1996,7 @@ def test_limit_approval_close_materialization_failure_stays_closed() -> None:
             tool_round_id=approval.tool_round_id,
             tool_call_id=approval.tool_call_id,
             decision=ToolApprovalDecision.APPROVE,
-            limits=RunLimits(max_total_tokens=1, scope="session"),
+            limits=limits,
         )
         failed_close = [event async for event in app.resolve_tool_approval(request)]
         receipt = await store.load_runtime_publication_receipt(

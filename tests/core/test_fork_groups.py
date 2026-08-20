@@ -17,6 +17,7 @@ from cayu import (
     CayuApp,
     Event,
     EventType,
+    ExecutionProfileMismatchError,
     ForkGroupArtifactReference,
     ForkGroupBranchSpec,
     ForkGroupCheckpointSelector,
@@ -47,6 +48,7 @@ from cayu import (
     ToolSpec,
     session_fork_profile_relationship,
 )
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import TextPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import EventQuery, SessionStatus, SessionUsageSummary
@@ -100,6 +102,14 @@ class _SecretFailingGate(ForkGroupGate):
 
 class _ForkGroupProvider(ModelProvider):
     name = "fork-group-fake"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:fork-group-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     def __init__(
         self,
@@ -402,6 +412,48 @@ def test_run_fork_group_selects_one_tool_free_evaluated_branch() -> None:
         ]
         with pytest.raises(ValidationError, match="frozen"):
             result.dispositions[0].disposition = ForkGroupDisposition.ARCHIVED
+
+    asyncio.run(run())
+
+
+def test_fork_group_branch_admits_only_its_frozen_initial_invocation() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        app = _app(provider)
+        await _source(app)
+        request = _request(group_id="group-frozen-initial-invocation")
+        coordinator = app._fork_group_coordinator
+        prepared = fork_group_runtime._prepare_request(
+            coordinator,
+            request,
+            source_session_id=request.source_session_id,
+        )
+        record = await fork_group_runtime._create_record(coordinator, prepared)
+        branch = prepared.branches[0]
+        assert (
+            await fork_group_runtime._prepare_branch_fork(
+                coordinator,
+                prepared,
+                record.result.source,
+                branch,
+            )
+            is None
+        )
+        frozen = fork_group_runtime._branch_resume_request(prepared, branch)
+        provider_request_count = len(provider.requests)
+
+        with pytest.raises(ExecutionProfileMismatchError):
+            _ = [
+                event
+                async for event in app.resume(
+                    frozen.model_copy(update={"max_steps": frozen.max_steps + 1})
+                )
+            ]
+        assert len(provider.requests) == provider_request_count
+
+        events = [event async for event in app.resume(frozen)]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == provider_request_count + 1
 
     asyncio.run(run())
 

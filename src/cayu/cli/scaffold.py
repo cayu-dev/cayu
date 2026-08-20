@@ -1436,6 +1436,12 @@ def profiled_session_identity(
             loop_policy_identities=engine._loop_policy_execution_profile_identities,
             invocation_loop_policies=invocation_loop_policies,
             invocation_loop_policy_identities=invocation_loop_policy_identities,
+            invocation_loop_policy_instance_identities=(
+                engine._request_loop_policy_instance_identities(
+                    invocation_loop_policies
+                )
+            ),
+            registered_provider=app._providers.get(provider_name),
         ),
     )
 
@@ -1923,8 +1929,7 @@ def test_replacement_worker_settles_terminal_receipt_without_redispatch(
             assert row["status"] == "pending"
             assert json.loads(row["result_receipt"])["result"] == "allow-listed answer"
             connection.execute(
-                "UPDATE product_operations SET execution_claim_expires_at = 0 "
-                "WHERE work_id = ?",
+                "UPDATE product_operations SET execution_claim_expires_at = 0 WHERE work_id = ?",
                 (reservation.operation.work_id,),
             )
 
@@ -2018,8 +2023,7 @@ def test_durable_receipt_and_settlement_acknowledgements_are_reconstructed(
         assert len(provider.requests) == 1
         with store._connect() as connection:
             row = connection.execute(
-                "SELECT status, result, result_receipt FROM product_operations "
-                "WHERE work_id = ?",
+                "SELECT status, result, result_receipt FROM product_operations WHERE work_id = ?",
                 (reservation.operation.work_id,),
             ).fetchone()
         assert row["status"] == "completed"

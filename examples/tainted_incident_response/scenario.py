@@ -19,8 +19,11 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
+    ExecutionProfileAdoptionIntent,
     ExecutionProfileBehaviorIdentity,
     Message,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
     SessionStore,
@@ -217,6 +220,14 @@ async def run_scenario(
                     )
                 ],
                 limits=advanced_run_limits(),
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key="incident-quarantine-invocation-v1",
+                    reason="Adopt the example's bounded quarantine invocation.",
+                    requested_by=ResolutionActor(
+                        subject="example-scenario",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                ),
             )
         )
     )

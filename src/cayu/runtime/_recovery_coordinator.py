@@ -171,6 +171,8 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.budgets import (
     BudgetLimit,
+    BudgetPolicy,
+    copy_budget_policy,
     copy_request_budget_limits,
     request_budget_limits_for_session,
 )
@@ -932,6 +934,7 @@ class RecoverySessionRunRequest:
     max_steps: int
     limits: RunLimits
     budget_limits: tuple[BudgetLimit, ...]
+    budget_policy: BudgetPolicy | None
     retry_policy: RetryPolicy
     structured_output: StructuredOutputSpec | None
     thinking: ThinkingConfig | None
@@ -983,6 +986,7 @@ class ProviderOperationFailureRequest:
     registered_agent: runtime_records.RegisteredAgentState
     registered_environment: runtime_records.RegisteredEnvironment | None
     execution_profile: ExecutionProfileIdentity
+    legacy_resolution_without_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -1142,6 +1146,18 @@ class _ManualRecoveryPersistenceReconciliation:
     cancellation: asyncio.CancelledError | None = None
 
 
+@dataclass(frozen=True)
+class _RecoveryInvocationSemantics:
+    """Exact provider-dispatch semantics reconstructed for one continuation."""
+
+    max_steps: int
+    limits: RunLimits
+    budget_limits: tuple[BudgetLimit, ...]
+    retry_policy: RetryPolicy
+    structured_output: StructuredOutputSpec | None
+    thinking: ThinkingConfig | None
+
+
 RunSession = Callable[[RecoverySessionRunRequest], AsyncGenerator[Event, None]]
 TerminalEventStream = Callable[[RecoveryTerminalEventRequest], AsyncIterator[Event]]
 ProviderOperationFailureStream = Callable[[ProviderOperationFailureRequest], AsyncIterator[Event]]
@@ -1150,6 +1166,7 @@ TaskEventFactory = Callable[[RecoveryTaskEventRequest], Event]
 RegisteredAgentResolver = Callable[[str], runtime_records.RegisteredAgentState]
 RegisteredProviderResolver = Callable[[str], runtime_records.RegisteredProvider]
 RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.RegisteredEnvironment | None]
+BudgetPolicyResolver = Callable[[], BudgetPolicy | None]
 
 
 class ExecutionProfileContinuationValidator(Protocol):
@@ -1162,6 +1179,14 @@ class ExecutionProfileContinuationValidator(Protocol):
         request_loop_policies: tuple[LoopPolicy, ...] | None = None,
         frozen_candidate_profile: ExecutionProfileIdentity | None = None,
         *,
+        budget_policy: BudgetPolicy | None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+        structured_output: StructuredOutputSpec | None = None,
+        thinking: ThinkingConfig | None = None,
+        max_steps: int = 16,
+        limits: RunLimits | None = None,
+        retry_policy: RetryPolicy | None = None,
+        invocation_semantics_available: bool = False,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
     ) -> Awaitable[ActiveInvocationExecutionProfile]: ...
@@ -1248,6 +1273,7 @@ class RecoveryCoordinator:
         resolve_registered_agent: RegisteredAgentResolver,
         resolve_registered_provider: RegisteredProviderResolver,
         resolve_registered_environment: RegisteredEnvironmentResolver,
+        resolve_budget_policy: BudgetPolicyResolver,
         validate_execution_profile_continuation: ExecutionProfileContinuationValidator,
         interrupt_session_for_recovery: RecoveryInterruptionStream,
         pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
@@ -1277,6 +1303,7 @@ class RecoveryCoordinator:
         self._resolve_registered_agent = resolve_registered_agent
         self._resolve_registered_provider = resolve_registered_provider
         self._resolve_registered_environment = resolve_registered_environment
+        self._resolve_budget_policy = resolve_budget_policy
         self._validate_execution_profile_continuation = validate_execution_profile_continuation
         self._interrupt_session_for_recovery = interrupt_session_for_recovery
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
@@ -1433,12 +1460,14 @@ class RecoveryCoordinator:
                 )
             recovered_provider = registered_provider
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
         execution_profile_snapshot = await self._validate_execution_profile_continuation(
             session,
             checkpoint,
             registered_agent,
             recovered_provider,
             None,
+            budget_policy=budget_policy_snapshot,
         )
         cancellation = await self._cancel_provider_operation(
             session,
@@ -1757,12 +1786,14 @@ class RecoveryCoordinator:
                         )
                     recovered_provider = registered_provider
                 checkpoint = await self._session_store.load_checkpoint(session.id)
+                budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
                 await self._validate_execution_profile_continuation(
                     session,
                     checkpoint,
                     registered_agent,
                     recovered_provider,
                     None,
+                    budget_policy=budget_policy_snapshot,
                 )
                 if isinstance(operation, RecoverableProviderOperationStart):
                     recovered = await self._recover_provider_operation_start(
@@ -3000,10 +3031,17 @@ class RecoveryCoordinator:
         # The output-schema contract is fixed by the paused run's provider history; a resolver
         # cannot swap it (a spec matching or absent is fine; a differing one is rejected). Checked
         # before the status transition so it surfaces to the caller rather than being caught by the
-        # resume's failure handler. (thinking is a safe override.)
+        # resume's failure handler. All provider-dispatch semantics are then
+        # compared with the frozen invocation profile before status changes.
         effective_structured_output = _effective_user_input_structured_output(
             structured_output=response.structured_output,
             pending=pending,
+        )
+        invocation_semantics = _effective_user_input_invocation_semantics(
+            response=response,
+            pending=pending,
+            structured_output=effective_structured_output,
+            effective_retry_policy=self._effective_retry_policy,
         )
         require_secret_free_structured_output_spec(
             effective_structured_output,
@@ -3013,12 +3051,21 @@ class RecoveryCoordinator:
 
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
         execution_profile_snapshot = await self._validate_execution_profile_continuation(
             loaded_session,
             checkpoint,
             registered_agent,
             registered_provider,
             response.loop_policies,
+            budget_policy=budget_policy_snapshot,
+            request_budget_limits=invocation_semantics.budget_limits,
+            structured_output=invocation_semantics.structured_output,
+            thinking=invocation_semantics.thinking,
+            max_steps=invocation_semantics.max_steps,
+            limits=invocation_semantics.limits,
+            retry_policy=invocation_semantics.retry_policy,
+            invocation_semantics_available=True,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -3052,6 +3099,7 @@ class RecoveryCoordinator:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             execution_profile_snapshot=execution_profile_snapshot,
+            budget_policy=budget_policy_snapshot,
         )
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -3104,6 +3152,12 @@ class RecoveryCoordinator:
             structured_output=request.structured_output,
             pending=pending,
         )
+        invocation_semantics = _effective_user_input_invocation_semantics(
+            response=request,
+            pending=pending,
+            structured_output=effective_structured_output,
+            effective_retry_policy=self._effective_retry_policy,
+        )
         require_secret_free_structured_output_spec(
             effective_structured_output,
             redactor=self._secret_redactor,
@@ -3116,12 +3170,21 @@ class RecoveryCoordinator:
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
         execution_profile_snapshot = await self._validate_execution_profile_continuation(
             loaded_session,
             checkpoint,
             registered_agent,
             registered_provider,
             request.loop_policies,
+            budget_policy=budget_policy_snapshot,
+            request_budget_limits=invocation_semantics.budget_limits,
+            structured_output=invocation_semantics.structured_output,
+            thinking=invocation_semantics.thinking,
+            max_steps=invocation_semantics.max_steps,
+            limits=invocation_semantics.limits,
+            retry_policy=invocation_semantics.retry_policy,
+            invocation_semantics_available=True,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -3156,6 +3219,7 @@ class RecoveryCoordinator:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             execution_profile_snapshot=execution_profile_snapshot,
+            budget_policy=budget_policy_snapshot,
         )
         authoritative_failure: BaseException | None = None
         try:
@@ -3279,6 +3343,12 @@ class RecoveryCoordinator:
             structured_output=request.structured_output,
             pending_approval=candidate_approval,
         )
+        invocation_semantics = _effective_approval_invocation_semantics(
+            request=request,
+            pending_approval=candidate_approval,
+            structured_output=effective_structured_output,
+            effective_retry_policy=self._effective_retry_policy,
+        )
         require_secret_free_structured_output_spec(
             effective_structured_output,
             redactor=self._secret_redactor,
@@ -3286,12 +3356,21 @@ class RecoveryCoordinator:
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
         execution_profile_snapshot = await self._validate_execution_profile_continuation(
             loaded_session,
             checkpoint,
             registered_agent,
             registered_provider,
             request.loop_policies,
+            budget_policy=budget_policy_snapshot,
+            request_budget_limits=invocation_semantics.budget_limits,
+            structured_output=invocation_semantics.structured_output,
+            thinking=invocation_semantics.thinking,
+            max_steps=invocation_semantics.max_steps,
+            limits=invocation_semantics.limits,
+            retry_policy=invocation_semantics.retry_policy,
+            invocation_semantics_available=True,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -3374,6 +3453,7 @@ class RecoveryCoordinator:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             execution_profile_snapshot=execution_profile_snapshot,
+            budget_policy=budget_policy_snapshot,
             deferred_messages=pending_round.deferred_messages,
             claimed_resolution_intent=claimed_intent,
         )
@@ -3510,6 +3590,7 @@ class RecoveryCoordinator:
             interaction_records[0].event,
             resolution_event=result.event,
             outcome="interaction_failed",
+            expected_execution_profile_fingerprint=pending.execution_profile_fingerprint,
         )
         return True
 
@@ -3541,6 +3622,7 @@ class RecoveryCoordinator:
                 terminal_records[0].event,
                 resolution_event=result.event,
                 outcome="session_failed",
+                expected_execution_profile_fingerprint=pending.execution_profile_fingerprint,
             )
             for outcome in ("model_error", "interaction_failed"):
                 event_id = provider_operation_resolution_outcome_event_id(
@@ -3562,6 +3644,7 @@ class RecoveryCoordinator:
                     records[0].event,
                     resolution_event=result.event,
                     outcome=outcome,
+                    expected_execution_profile_fingerprint=(pending.execution_profile_fingerprint),
                 )
             session = await self._session_store.load(pending.session_id)
             if session is None or session.status is not SessionStatus.FAILED:
@@ -3802,11 +3885,41 @@ class RecoveryCoordinator:
             loaded_session.environment_name
         )
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
+        recovery_context: ModelCompletionRecoveryContext | None = None
+        if pending.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            stage = await self._session_store.load_model_completion_stage(
+                pending.session_id,
+                pending.stage_id,
+            )
+            if stage is None:
+                raise RuntimeError("Resolved provider-operation stage is missing.")
+            recovery_context = model_completion_recovery_context_from_stage(stage)
+            if recovery_context is None:
+                raise RuntimeError(
+                    "Provider-operation fallback requires durable model-completion context."
+                )
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
         execution_profile_snapshot = await self._validate_execution_profile_continuation(
             loaded_session,
             checkpoint,
             registered_agent,
             registered_provider,
+            budget_policy=budget_policy_snapshot,
+            request_budget_limits=(
+                () if recovery_context is None else recovery_context.budget_limits
+            ),
+            structured_output=(
+                None if recovery_context is None else recovery_context.structured_output
+            ),
+            thinking=None if recovery_context is None else recovery_context.thinking,
+            max_steps=(
+                _DEFAULT_APPROVAL_MAX_STEPS
+                if recovery_context is None
+                else recovery_context.max_steps
+            ),
+            limits=None if recovery_context is None else recovery_context.limits,
+            retry_policy=(None if recovery_context is None else recovery_context.retry_policy),
+            invocation_semantics_available=recovery_context is not None,
         )
         if pending.action is ProviderOperationResolutionAction.FAIL:
             async for event in self._fail_provider_operation(
@@ -3816,6 +3929,9 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     execution_profile=execution_profile_snapshot.profile,
+                    legacy_resolution_without_profile=(
+                        result.record.execution_profile_fingerprint is None
+                    ),
                 )
             ):
                 yield event
@@ -3828,13 +3944,6 @@ class RecoveryCoordinator:
                 )
             return
 
-        stage = await self._session_store.load_model_completion_stage(
-            pending.session_id,
-            pending.stage_id,
-        )
-        if stage is None:
-            raise RuntimeError("Resolved provider-operation stage is missing.")
-        recovery_context = model_completion_recovery_context_from_stage(stage)
         if recovery_context is None:
             raise RuntimeError(
                 "Provider-operation fallback requires durable model-completion context."
@@ -3865,6 +3974,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 execution_profile_snapshot=execution_profile_snapshot,
                 recovery_context=recovery_context,
+                budget_policy=budget_policy_snapshot,
                 release_run_fence_on_cleanup=False,
             )
             try:
@@ -3920,6 +4030,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         recovery_context: ModelCompletionRecoveryContext,
+        budget_policy: BudgetPolicy | None,
         release_run_fence_on_cleanup: bool,
     ) -> AsyncGenerator[Event, None]:
         """Run the accepted fallback from an already fenced running session."""
@@ -3961,6 +4072,7 @@ class RecoveryCoordinator:
                 max_steps=recovery_context.max_steps,
                 limits=recovery_context.limits,
                 budget_limits=recovery_context.budget_limits,
+                budget_policy=copy_budget_policy(budget_policy),
                 retry_policy=recovery_context.retry_policy,
                 structured_output=recovery_context.structured_output,
                 thinking=recovery_context.thinking,
@@ -4067,6 +4179,12 @@ class RecoveryCoordinator:
             structured_output=request.structured_output,
             pending_approval=candidate_approval,
         )
+        invocation_semantics = _effective_approval_invocation_semantics(
+            request=request,
+            pending_approval=candidate_approval,
+            structured_output=effective_structured_output,
+            effective_retry_policy=self._effective_retry_policy,
+        )
         require_secret_free_structured_output_spec(
             effective_structured_output,
             redactor=self._secret_redactor,
@@ -4078,12 +4196,21 @@ class RecoveryCoordinator:
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
         execution_profile_snapshot = await self._validate_execution_profile_continuation(
             loaded_session,
             checkpoint,
             registered_agent,
             registered_provider,
             request.loop_policies,
+            budget_policy=budget_policy_snapshot,
+            request_budget_limits=invocation_semantics.budget_limits,
+            structured_output=invocation_semantics.structured_output,
+            thinking=invocation_semantics.thinking,
+            max_steps=invocation_semantics.max_steps,
+            limits=invocation_semantics.limits,
+            retry_policy=invocation_semantics.retry_policy,
+            invocation_semantics_available=True,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -4155,6 +4282,7 @@ class RecoveryCoordinator:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             execution_profile_snapshot=execution_profile_snapshot,
+            budget_policy=budget_policy_snapshot,
             deferred_messages=pending_round.deferred_messages,
             claimed_resolution_intent=claimed_resolution_intent,
         )
@@ -4235,6 +4363,12 @@ class RecoveryCoordinator:
             structured_output=request.structured_output,
             pending_round=pending_round,
         )
+        invocation_semantics = _effective_tool_round_invocation_semantics(
+            request=request,
+            pending_round=pending_round,
+            structured_output=effective_structured_output,
+            effective_retry_policy=self._effective_retry_policy,
+        )
         require_secret_free_structured_output_spec(
             effective_structured_output,
             redactor=self._secret_redactor,
@@ -4251,12 +4385,21 @@ class RecoveryCoordinator:
                 f"Pending tool round belongs to a different agent: {pending_round.agent_name}."
             )
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
         execution_profile_snapshot = await self._validate_execution_profile_continuation(
             loaded_session,
             checkpoint,
             registered_agent,
             registered_provider,
             request.loop_policies,
+            budget_policy=budget_policy_snapshot,
+            request_budget_limits=invocation_semantics.budget_limits,
+            structured_output=invocation_semantics.structured_output,
+            thinking=invocation_semantics.thinking,
+            max_steps=invocation_semantics.max_steps,
+            limits=invocation_semantics.limits,
+            retry_policy=invocation_semantics.retry_policy,
+            invocation_semantics_available=True,
         )
         _require_native_structured_output_support(
             effective_structured_output, registered_provider=registered_provider
@@ -4311,6 +4454,14 @@ class RecoveryCoordinator:
                 registered_provider,
                 request.loop_policies,
                 execution_profile_snapshot.profile,
+                budget_policy=budget_policy_snapshot,
+                request_budget_limits=invocation_semantics.budget_limits,
+                structured_output=invocation_semantics.structured_output,
+                thinking=invocation_semantics.thinking,
+                max_steps=invocation_semantics.max_steps,
+                limits=invocation_semantics.limits,
+                retry_policy=invocation_semantics.retry_policy,
+                invocation_semantics_available=True,
             )
         if self._session_control.has_active_tasks(loaded_session.id):
             raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
@@ -4344,8 +4495,9 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
-                effective_structured_output=effective_structured_output,
+                invocation_semantics=invocation_semantics,
                 execution_profile_snapshot=execution_profile_snapshot,
+                budget_policy=budget_policy_snapshot,
             )
             async for event in recovery_stream:
                 yield event
@@ -4384,6 +4536,7 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
         emit_resume_event: bool = True,
     ) -> AsyncGenerator[Event, None]:
         environment_name = _environment_name(registered_environment)
@@ -4394,27 +4547,21 @@ class RecoveryCoordinator:
         )
         pending_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-        # Restore the original run's config persisted on the pending input; explicit overrides
-        # on the resolution request win. Pending states written before this existed fall back to
-        # the historical defaults.
-        effective_max_steps = _effective_user_input_max_steps(
-            max_steps=response.max_steps,
+        # Restore the original run's config persisted on the pending input. Explicit
+        # values have already been checked against the frozen invocation profile.
+        invocation_semantics = _effective_user_input_invocation_semantics(
+            response=response,
             pending=pending,
-        )
-        effective_limits = _effective_user_input_run_limits(
-            limits=response.limits,
-            pending=pending,
-        )
-        effective_budget_limits = _effective_user_input_budget_limits(
-            budget_limits=response.budget_limits,
-            pending=pending,
-        )
-        effective_retry_policy = self._effective_retry_policy(
-            _effective_user_input_retry_policy(
-                retry_policy=response.retry_policy,
+            structured_output=_effective_user_input_structured_output(
+                structured_output=response.structured_output,
                 pending=pending,
-            )
+            ),
+            effective_retry_policy=self._effective_retry_policy,
         )
+        effective_max_steps = invocation_semantics.max_steps
+        effective_limits = invocation_semantics.limits
+        effective_budget_limits = invocation_semantics.budget_limits
+        effective_retry_policy = invocation_semantics.retry_policy
         continued_run_limit_accounting = pending.run_limit_accounting
         try:
             transcript = await self._session_store.load_transcript(session.id)
@@ -4430,8 +4577,11 @@ class RecoveryCoordinator:
                         causal_budget_id=session.causal_budget_id,
                     ),
                     events=resume_events,
-                    reset_run_limits=response.limits is not None,
-                    reset_budgets=response.budget_limits is not None,
+                    # Profile admission permits only an exact restatement of the
+                    # frozen invocation semantics. It must not reset the durable
+                    # accounting origin merely because the caller restated it.
+                    reset_run_limits=False,
+                    reset_budgets=False,
                     now=self._clock(),
                 )
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
@@ -5007,12 +5157,10 @@ class RecoveryCoordinator:
                     max_steps=effective_max_steps,
                     limits=effective_limits,
                     budget_limits=effective_budget_limits,
+                    budget_policy=copy_budget_policy(budget_policy),
                     retry_policy=effective_retry_policy,
-                    structured_output=_effective_user_input_structured_output(
-                        structured_output=response.structured_output,
-                        pending=pending,
-                    ),
-                    thinking=response.thinking or pending.thinking,
+                    structured_output=invocation_semantics.structured_output,
+                    thinking=invocation_semantics.thinking,
                     request_loop_policies=response.loop_policies,
                     request_metadata=response.metadata,
                     task_id=pending.task_id,
@@ -5412,6 +5560,7 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
         deferred_messages: list[Message] | None = None,
         emit_resume_event: bool = True,
         enforce_expiry: bool = True,
@@ -5434,27 +5583,21 @@ class RecoveryCoordinator:
             if deferred_messages is None
             else [detach_message(message) for message in deferred_messages]
         )
-        # Restore the original run's config persisted on the pending approval;
-        # explicit overrides on the approval request win. Approvals persisted
-        # before this state existed fall back to the historical defaults.
-        effective_max_steps = _effective_approval_max_steps(
-            max_steps=request.max_steps,
+        # Restore the original run's config persisted on the pending approval.
+        # Explicit values have already been checked against the frozen profile.
+        invocation_semantics = _effective_approval_invocation_semantics(
+            request=request,
             pending_approval=pending_approval,
-        )
-        effective_limits = _effective_approval_run_limits(
-            limits=request.limits,
-            pending_approval=pending_approval,
-        )
-        effective_budget_limits = _effective_approval_budget_limits(
-            budget_limits=request.budget_limits,
-            pending_approval=pending_approval,
-        )
-        effective_retry_policy = self._effective_retry_policy(
-            _effective_approval_retry_policy(
-                retry_policy=request.retry_policy,
+            structured_output=_effective_approval_structured_output(
+                structured_output=request.structured_output,
                 pending_approval=pending_approval,
-            )
+            ),
+            effective_retry_policy=self._effective_retry_policy,
         )
+        effective_max_steps = invocation_semantics.max_steps
+        effective_limits = invocation_semantics.limits
+        effective_budget_limits = invocation_semantics.budget_limits
+        effective_retry_policy = invocation_semantics.retry_policy
         continued_run_limit_accounting = pending_approval.run_limit_accounting
         try:
             transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
@@ -5478,8 +5621,11 @@ class RecoveryCoordinator:
                     limits=effective_limits,
                     budget_limits=resolved_budget_limits,
                     events=approval_events,
-                    reset_run_limits=request.limits is not None,
-                    reset_budgets=request.budget_limits is not None,
+                    # Profile admission permits only an exact restatement of the
+                    # frozen invocation semantics. It must not reset the durable
+                    # accounting origin merely because the caller restated it.
+                    reset_run_limits=False,
+                    reset_budgets=False,
                     now=self._clock(),
                 )
             history = approval_support.approval_resolution_history(
@@ -5760,6 +5906,7 @@ class RecoveryCoordinator:
                         model_step_id=tool_round_identity.model_step_id,
                         model_attempt_id=tool_round_identity.model_attempt_id,
                     ),
+                    execution_profile_fingerprint=(execution_profile_snapshot.profile.fingerprint),
                 )
                 for event in limit_evaluation.events:
                     yield event
@@ -6353,17 +6500,10 @@ class RecoveryCoordinator:
                     max_steps=effective_max_steps,
                     limits=effective_limits,
                     budget_limits=effective_budget_limits,
+                    budget_policy=copy_budget_policy(budget_policy),
                     retry_policy=effective_retry_policy,
-                    structured_output=_effective_approval_structured_output(
-                        structured_output=request.structured_output,
-                        pending_approval=pending_approval,
-                    ),
-                    # Restore the original run's thinking config across the approval pause
-                    # (an override on the approval request itself wins).
-                    thinking=_effective_approval_thinking(
-                        thinking=request.thinking,
-                        pending_approval=pending_approval,
-                    ),
+                    structured_output=invocation_semantics.structured_output,
+                    thinking=invocation_semantics.thinking,
                     request_loop_policies=request.loop_policies,
                     request_metadata=request.metadata,
                     task_id=pending_approval.task_id,
@@ -6792,6 +6932,7 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
     ) -> AsyncGenerator[Event, None]:
         tool_round_identity = ToolRoundIdentity(
             tool_round_id=pending.tool_round_id,
@@ -7118,6 +7259,7 @@ class RecoveryCoordinator:
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
                 execution_profile_snapshot=execution_profile_snapshot,
+                budget_policy=budget_policy,
                 emit_resume_event=False,
             )
             async for event in continuation_stream:
@@ -7156,6 +7298,7 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
         deferred_messages: list[Message],
         claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None,
     ) -> AsyncGenerator[Event, None]:
@@ -7481,6 +7624,7 @@ class RecoveryCoordinator:
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
                 execution_profile_snapshot=execution_profile_snapshot,
+                budget_policy=budget_policy,
                 deferred_messages=deferred_messages,
                 emit_resume_event=False,
                 enforce_expiry=False,
@@ -7920,8 +8064,9 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-        effective_structured_output: StructuredOutputSpec | None,
+        invocation_semantics: _RecoveryInvocationSemantics,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
     ) -> AsyncGenerator[Event, None]:
         """Claim one manual recovery durably and stream its owned continuation."""
         caller_runtime_task = asyncio.current_task()
@@ -8014,8 +8159,9 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
-            effective_structured_output=effective_structured_output,
+            invocation_semantics=invocation_semantics,
             execution_profile_snapshot=execution_profile_snapshot,
+            budget_policy=budget_policy,
         )
         deliveries: asyncio.Queue[_ManualRecoveryEventDelivery | _ManualRecoveryStreamOutcome] = (
             asyncio.Queue(maxsize=2)
@@ -8281,8 +8427,9 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-        effective_structured_output: StructuredOutputSpec | None,
+        invocation_semantics: _RecoveryInvocationSemantics,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
     ) -> AsyncGenerator[Event, None]:
         """Persist one operator-verified ordinary tool outcome and continue safely."""
         if run_operation is None:
@@ -8677,6 +8824,23 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
         try:
             transcript = await self._session_store.load_transcript(session.id)
+            continued_run_limit_accounting = pending_round.run_limit_accounting
+            if continued_run_limit_accounting is not None:
+                recovery_events = await self._session_store.load_events(session.id)
+                continued_run_limit_accounting = rebase_run_limit_accounting_context(
+                    continued_run_limit_accounting,
+                    session_id=session.id,
+                    limits=invocation_semantics.limits,
+                    budget_limits=request_budget_limits_for_session(
+                        limits=invocation_semantics.budget_limits,
+                        agent_name=registered_agent.spec.name,
+                        causal_budget_id=session.causal_budget_id,
+                    ),
+                    events=recovery_events,
+                    reset_run_limits=False,
+                    reset_budgets=False,
+                    now=self._clock(),
+                )
             session_stream = self._run_session(
                 RecoverySessionRunRequest(
                     session=session,
@@ -8689,12 +8853,13 @@ class RecoveryCoordinator:
                     ),
                     messages=transcript,
                     messages_to_append=[],
-                    max_steps=request.max_steps or _DEFAULT_APPROVAL_MAX_STEPS,
-                    limits=request.limits or RunLimits(),
-                    budget_limits=request.budget_limits or (),
-                    retry_policy=self._effective_retry_policy(request.retry_policy),
-                    structured_output=effective_structured_output,
-                    thinking=request.thinking,
+                    max_steps=invocation_semantics.max_steps,
+                    limits=invocation_semantics.limits,
+                    budget_limits=invocation_semantics.budget_limits,
+                    budget_policy=copy_budget_policy(budget_policy),
+                    retry_policy=invocation_semantics.retry_policy,
+                    structured_output=invocation_semantics.structured_output,
+                    thinking=invocation_semantics.thinking,
                     request_loop_policies=request.loop_policies,
                     request_metadata=request.metadata,
                     task_id=pending_round.task_id,
@@ -8703,6 +8868,7 @@ class RecoveryCoordinator:
                     start_event_payload={},
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
+                    run_limit_accounting=continued_run_limit_accounting,
                 )
             )
             async for event in session_stream:
@@ -9180,7 +9346,12 @@ class RecoveryCoordinator:
                     tool_round_identity=tool_round_identity,
                 )
             )
-        auxiliary_events = self._event_writer.prepare_many(auxiliary_events)
+        auxiliary_events = self._event_writer.prepare_many(
+            [
+                event_with_execution_profile_authority(event, execution_profile)
+                for event in auxiliary_events
+            ]
+        )
         extension = structured_output_tool_round._StructuredOutputToolRoundPublicationExtension(
             intent={
                 "schema_version": 1,
@@ -10928,7 +11099,9 @@ class RecoveryCoordinator:
             )
         )
         execution_profile_snapshot = None
+        budget_policy_snapshot: BudgetPolicy | None = None
         if requires_execution_profile:
+            budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
             pending_disposition = (
                 None if pending_provider_disposition is None else pending_provider_disposition[0]
             )
@@ -10937,6 +11110,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 registered_agent,
                 registered_provider,
+                budget_policy=budget_policy_snapshot,
                 require_open_interaction=not (
                     pending_provider_disposition_effect_is_durable
                     or (
@@ -10983,6 +11157,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     claim_id=claim.claim_id,
                     execution_profile_snapshot=execution_profile_snapshot,
+                    budget_policy=budget_policy_snapshot,
                 ),
             )
         except BaseException as exc:
@@ -13204,6 +13379,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         claim_id: str,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None,
+        budget_policy: BudgetPolicy | None,
     ) -> IncompleteSessionRecoveryResult:
         actions: list[IncompleteSessionRecoveryAction] = []
         events: list[Event] = []
@@ -13252,6 +13428,9 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
+                        legacy_resolution_without_profile=(
+                            resolution_result.record.execution_profile_fingerprint is None
+                        ),
                     )
                 ):
                     events.append(event)
@@ -13314,6 +13493,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     execution_profile_snapshot=execution_profile_snapshot,
                     recovery_context=recovery_context,
+                    budget_policy=budget_policy,
                     release_run_fence_on_cleanup=False,
                 ):
                     events.append(event)
@@ -14258,14 +14438,47 @@ def _effective_tool_round_structured_output(
     return copy_structured_output_spec(pending_round.structured_output)
 
 
+def _effective_tool_round_invocation_semantics(
+    *,
+    request: ToolRoundRecoveryRequest,
+    pending_round: tool_round_recovery.PendingToolRound,
+    structured_output: StructuredOutputSpec | None,
+    effective_retry_policy: EffectiveRetryPolicy,
+) -> _RecoveryInvocationSemantics:
+    if type(request) is not ToolRoundRecoveryRequest:
+        raise TypeError("Tool-round recovery requires a ToolRoundRecoveryRequest.")
+    if type(pending_round) is not tool_round_recovery.PendingToolRound:
+        raise TypeError("Pending tool round must be a PendingToolRound.")
+    return _RecoveryInvocationSemantics(
+        max_steps=(
+            request.max_steps
+            if request.max_steps is not None
+            else pending_round.max_steps or _DEFAULT_APPROVAL_MAX_STEPS
+        ),
+        limits=copy_run_limits(
+            request.limits if request.limits is not None else pending_round.limits or RunLimits()
+        ),
+        budget_limits=copy_request_budget_limits(
+            request.budget_limits
+            if request.budget_limits is not None
+            else pending_round.budget_limits or ()
+        ),
+        retry_policy=effective_retry_policy(
+            request.retry_policy if request.retry_policy is not None else pending_round.retry_policy
+        ),
+        structured_output=copy_structured_output_spec(structured_output),
+        thinking=request.thinking if request.thinking is not None else pending_round.thinking,
+    )
+
+
 def _effective_user_input_max_steps(
     *,
     max_steps: int | None,
     pending: PendingUserInput,
 ) -> int:
-    # Restore the original run's max_steps on a user-input continuation; an explicit override
-    # on the resolution request wins. Pending states written before run config was checkpointed
-    # fall back to the historical request default.
+    # Restore the original run's max_steps on a user-input continuation. Pending
+    # states written before run config was checkpointed fall back to the historical
+    # request default; profile admission decides whether an explicit value is valid.
     if type(pending) is not PendingUserInput:
         raise TypeError("Pending user input must be a PendingUserInput.")
     if max_steps is not None:
@@ -14321,9 +14534,8 @@ def _effective_user_input_structured_output(
     structured_output: StructuredOutputSpec | None,
     pending: PendingUserInput,
 ) -> StructuredOutputSpec | None:
-    # Mirror _effective_approval_structured_output: inherit the paused run's spec when the resolver
-    # supplies none; adopt the resolver's spec when the run had none; a differing spec is a swap of
-    # the contract fixed by the provider history and is rejected.
+    # Mirror _effective_approval_structured_output: inherit the paused run's spec when
+    # the resolver supplies none; profile admission owns the final equality decision.
     if type(pending) is not PendingUserInput:
         raise TypeError("Pending user input must be a PendingUserInput.")
     if structured_output is None:
@@ -14335,14 +14547,40 @@ def _effective_user_input_structured_output(
     return copy_structured_output_spec(pending.structured_output)
 
 
+def _effective_user_input_invocation_semantics(
+    *,
+    response: UserInputResponse | UserInputRecoveryRequest,
+    pending: PendingUserInput,
+    structured_output: StructuredOutputSpec | None,
+    effective_retry_policy: EffectiveRetryPolicy,
+) -> _RecoveryInvocationSemantics:
+    if type(response) not in (UserInputResponse, UserInputRecoveryRequest):
+        raise TypeError("User-input continuation requires a validated response.")
+    return _RecoveryInvocationSemantics(
+        max_steps=_effective_user_input_max_steps(max_steps=response.max_steps, pending=pending),
+        limits=_effective_user_input_run_limits(limits=response.limits, pending=pending),
+        budget_limits=_effective_user_input_budget_limits(
+            budget_limits=response.budget_limits,
+            pending=pending,
+        ),
+        retry_policy=effective_retry_policy(
+            _effective_user_input_retry_policy(
+                retry_policy=response.retry_policy,
+                pending=pending,
+            )
+        ),
+        structured_output=copy_structured_output_spec(structured_output),
+        thinking=response.thinking if response.thinking is not None else pending.thinking,
+    )
+
+
 def _effective_approval_thinking(
     *,
     thinking: ThinkingConfig | None,
     pending_approval: PendingToolApproval,
 ) -> ThinkingConfig | None:
-    # Restore the original run's thinking config on an approval continuation; a thinking
-    # override on the approval request itself takes precedence. (ThinkingConfig is frozen,
-    # so the reference is safe to reuse.)
+    # Restore the original run's thinking config on an approval continuation. Profile
+    # admission decides whether an explicit value preserves the frozen invocation.
     if type(pending_approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
     if thinking is not None:
@@ -14355,9 +14593,9 @@ def _effective_approval_max_steps(
     max_steps: int | None,
     pending_approval: PendingToolApproval,
 ) -> int:
-    # Restore the original run's max_steps on an approval continuation; an explicit
-    # override on the approval request wins. Approvals persisted before run config
-    # was checkpointed fall back to the historical request default.
+    # Restore the original run's max_steps on an approval continuation. Approvals
+    # persisted before run config was checkpointed fall back to the historical
+    # request default; profile admission validates explicit values.
     if type(pending_approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
     if max_steps is not None:
@@ -14425,6 +14663,42 @@ def _effective_approval_structured_output(
     ):
         raise ValueError("Tool approval structured_output does not match the pending run contract.")
     return copy_structured_output_spec(pending_approval.structured_output)
+
+
+def _effective_approval_invocation_semantics(
+    *,
+    request: ToolApprovalRequest | ToolApprovalRecoveryRequest,
+    pending_approval: PendingToolApproval,
+    structured_output: StructuredOutputSpec | None,
+    effective_retry_policy: EffectiveRetryPolicy,
+) -> _RecoveryInvocationSemantics:
+    if type(request) not in (ToolApprovalRequest, ToolApprovalRecoveryRequest):
+        raise TypeError("Tool-approval continuation requires a validated request.")
+    return _RecoveryInvocationSemantics(
+        max_steps=_effective_approval_max_steps(
+            max_steps=request.max_steps,
+            pending_approval=pending_approval,
+        ),
+        limits=_effective_approval_run_limits(
+            limits=request.limits,
+            pending_approval=pending_approval,
+        ),
+        budget_limits=_effective_approval_budget_limits(
+            budget_limits=request.budget_limits,
+            pending_approval=pending_approval,
+        ),
+        retry_policy=effective_retry_policy(
+            _effective_approval_retry_policy(
+                retry_policy=request.retry_policy,
+                pending_approval=pending_approval,
+            )
+        ),
+        structured_output=copy_structured_output_spec(structured_output),
+        thinking=_effective_approval_thinking(
+            thinking=request.thinking,
+            pending_approval=pending_approval,
+        ),
+    )
 
 
 def _structured_output_specs_equal(

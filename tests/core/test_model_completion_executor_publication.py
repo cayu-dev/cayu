@@ -524,6 +524,7 @@ async def _create_model_run(
         run_started_at=time.monotonic(),
         turn_usage_tracker=None,
         active_run=None,
+        validate_live_model_semantics=lambda: None,
         model_completion_publisher=publisher,
     )
     return run, request, session, user_message

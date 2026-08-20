@@ -319,7 +319,7 @@ def test_prompt_cache_compaction_preserves_prefix_then_bounds_the_delta(tmp_path
         "uncached_input_tokens": 1220,
     }
     cost_report = result.metrics["paired_first_compaction_cost"]
-    assert cost_report["schema_version"] == 1
+    assert cost_report["schema_version"] == 2
     assert cost_report["status"] == "verified"
     assert cost_report["aggregate"]["eligible_pair_ids"] == ["first-prompt-cache-compaction"]
     pair = cost_report["pairs"][0]

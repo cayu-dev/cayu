@@ -9,6 +9,7 @@ from copy import deepcopy
 
 import psycopg
 import pytest
+from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
 from cayu.core import (
     AgentSpec,
@@ -142,6 +143,10 @@ def test_durable_subagent_authority_rejection_requires_runtime_provenance() -> N
 class _DurableSubagentProvider(ModelProvider):
     name = "durable-subagent-test"
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
+
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
 
@@ -185,6 +190,10 @@ class _RecordingPreparedSubagentDispatcher(TaskStoreDispatcher):
 
 class _LargeDurableSubagentProvider(ModelProvider):
     name = "large-durable-subagent-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
 
     def __init__(self, task: str, *, child_count: int = 1) -> None:
         self.task = task
@@ -622,6 +631,10 @@ class _CrashAfterClaimSQLiteTaskStore(SQLiteTaskStore):
 
 class _InterruptibleDurableParentProvider(ModelProvider):
     name = "durable-subagent-interruption-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []

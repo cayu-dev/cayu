@@ -44,7 +44,7 @@ from cayu.runtime.tasks import TaskTopologyQuery
 from cayu.runtime.tool_policy import taint_labels_from_metadata
 from cayu.runtime.usage import AggregateCount, UsageMetrics, usage_metrics_from_event_payload
 
-RUNTIME_EVIDENCE_SCHEMA_VERSION = 1
+RUNTIME_EVIDENCE_SCHEMA_VERSION = 2
 
 _HARD_MAX_SESSIONS = 500
 _HARD_MAX_EVENTS = 100_000
@@ -137,6 +137,7 @@ class RuntimeEvidenceWarningCode(StrEnum):
     MALFORMED_RECEIPT = "malformed_receipt"
     MALFORMED_POLICY_DECISION = "malformed_policy_decision"
     MALFORMED_TAINT_LABELS = "malformed_taint_labels"
+    MALFORMED_EXECUTION_PROFILE = "malformed_execution_profile"
     ORIGIN_EVIDENCE_UNAVAILABLE = "origin_evidence_unavailable"
     TASK_EVIDENCE_UNAVAILABLE = "task_evidence_unavailable"
     TASK_EVIDENCE_PARTIAL = "task_evidence_partial"
@@ -213,7 +214,7 @@ class RuntimeEvidenceError(RuntimeError):
 
 
 class RuntimeEvidenceRequest(BaseModel):
-    """Bounded v1 request for a durable runtime-evidence projection."""
+    """Bounded request for a durable runtime-evidence projection."""
 
     model_config = _MODEL_CONFIG
 
@@ -420,6 +421,11 @@ class RuntimeEvidenceAttempt(BaseModel):
 
     attempt_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     model_step_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        max_length=64,
+        exclude_if=lambda value: value is None,
+    )
     operation: RuntimeEvidenceOperation
     attempt_ordinal: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     provider_name: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
@@ -430,6 +436,15 @@ class RuntimeEvidenceAttempt(BaseModel):
     usage: RuntimeEvidenceUsage | None
     cost: RuntimeEvidenceCost
     source_refs: tuple[RuntimeEvidenceSourceRef, ...]
+
+    @field_validator("execution_profile_fingerprint")
+    @classmethod
+    def validate_execution_profile_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("execution_profile_fingerprint must be a lowercase SHA-256 digest.")
+        return value
 
 
 class RuntimeEvidenceToolCall(BaseModel):
@@ -599,7 +614,7 @@ class RuntimeEvidenceReport(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[1] = RUNTIME_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[2] = RUNTIME_EVIDENCE_SCHEMA_VERSION
     root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     scope: RuntimeEvidenceScope
     sessions: tuple[RuntimeEvidenceSession, ...] = Field(max_length=_HARD_MAX_SESSIONS)
@@ -637,6 +652,8 @@ class _AttemptRecord:
     model_step_id: str | None
     operation: RuntimeEvidenceOperation
     attempt_ordinal: int
+    execution_profile_fingerprint: str | None = None
+    execution_profile_conflict: bool = False
     provider_name: str | None = None
     requested_model: str | None = None
     model: str | None = None
@@ -1727,6 +1744,33 @@ def _project_attempts(
         else:
             builder.operation = operation
         builder.source_refs.append(_source_ref(record))
+        raw_profile_fingerprint = payload.get("execution_profile_fingerprint")
+        profile_fingerprint = _optional_execution_profile_fingerprint(raw_profile_fingerprint)
+        if raw_profile_fingerprint is not None and profile_fingerprint is None:
+            builder.execution_profile_conflict = True
+            builder.execution_profile_fingerprint = None
+            warnings.append(
+                RuntimeEvidenceWarning(
+                    code=RuntimeEvidenceWarningCode.MALFORMED_EXECUTION_PROFILE,
+                    session_id=session.id,
+                    event_id=event.id,
+                    sequence=record.sequence,
+                )
+            )
+        elif profile_fingerprint is not None and not builder.execution_profile_conflict:
+            if builder.execution_profile_fingerprint is None:
+                builder.execution_profile_fingerprint = profile_fingerprint
+            elif builder.execution_profile_fingerprint != profile_fingerprint:
+                builder.execution_profile_conflict = True
+                builder.execution_profile_fingerprint = None
+                warnings.append(
+                    RuntimeEvidenceWarning(
+                        code=RuntimeEvidenceWarningCode.MALFORMED_EXECUTION_PROFILE,
+                        session_id=session.id,
+                        event_id=event.id,
+                        sequence=record.sequence,
+                    )
+                )
         builder.provider_name = builder.provider_name or _optional_text(
             payload.get("provider_name") or payload.get("provider")
         )
@@ -1797,6 +1841,7 @@ def _project_attempts(
             RuntimeEvidenceAttempt(
                 attempt_id=builder.attempt_id,
                 model_step_id=builder.model_step_id,
+                execution_profile_fingerprint=builder.execution_profile_fingerprint,
                 operation=builder.operation,
                 attempt_ordinal=builder.attempt_ordinal,
                 provider_name=builder.provider_name,
@@ -2108,6 +2153,16 @@ def _optional_text(value: object) -> str | None:
         return require_clean_nonblank(value, "evidence identity")
     except ValueError:
         return None
+
+
+def _optional_execution_profile_fingerprint(value: object) -> str | None:
+    if (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        return value
+    return None
 
 
 def _same_session_identity(left: Session, right: Session) -> bool:

@@ -123,6 +123,10 @@ def test_native_structured_output_uses_successful_provider_attempt_identity_afte
     assert all(
         _attempt_identity(event) == _attempt_identity(completed) for event in structured_events
     )
+    assert {
+        event.payload.get("execution_profile_fingerprint")
+        for event in [completed, *structured_events]
+    } == {completed.payload["execution_profile_fingerprint"]}
     assert all("tool_round_id" not in event.payload for event in structured_events)
 
 
@@ -191,3 +195,7 @@ def test_tool_structured_output_repair_preserves_each_completion_round_identity(
         for event in structured_events[3:]
     )
     assert _tool_round_identity(completions[0]) != _tool_round_identity(completions[1])
+    assert {
+        event.payload.get("execution_profile_fingerprint")
+        for event in [*completions, *structured_events]
+    } == {completions[0].payload["execution_profile_fingerprint"]}

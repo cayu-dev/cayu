@@ -42,7 +42,7 @@ from tests.core.tool_result_projection_conformance import (
     assert_tool_result_projection_session_store_conformance,
 )
 
-from cayu import LocalArtifactStore
+from cayu import ExecutionProfileComponentClass, LocalArtifactStore
 from cayu.core import Event, EventType, Message
 from cayu.providers import ProviderOperationStatus
 from cayu.runtime import (
@@ -278,21 +278,26 @@ def test_postgres_offline_provider_operation_reuses_run_limit_accounting(
     _run(postgres_dsn, ops)
 
 
-@pytest.mark.parametrize("override_kind", ["limits", "budget_limits"])
-def test_postgres_offline_field_override_preserves_other_run_accounting(
+@pytest.mark.parametrize("override_kind", ["changed_limits", "same_budget_limits"])
+def test_postgres_offline_field_restatement_obeys_frozen_profile(
     postgres_dsn: str,
     override_kind: str,
 ) -> None:
     async def ops(store) -> None:
         await assert_offline_provider_operation_reuses_run_limit_accounting(
             store,
-            limit_kind="cost" if override_kind == "limits" else "tokens",
+            limit_kind="cost" if override_kind == "changed_limits" else "tokens",
             approval_limits=(
                 RunLimits(max_total_tokens=1_000, scope="run")
-                if override_kind == "limits"
+                if override_kind == "changed_limits"
                 else None
             ),
-            approval_budget_limits=() if override_kind == "budget_limits" else None,
+            approval_budget_limits=(() if override_kind == "same_budget_limits" else None),
+            expected_profile_change=(
+                ExecutionProfileComponentClass.FINALIZATION
+                if override_kind == "changed_limits"
+                else None
+            ),
         )
 
     _run(postgres_dsn, ops)

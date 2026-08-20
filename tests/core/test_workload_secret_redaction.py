@@ -2009,6 +2009,7 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                provider=provider,
             ),
         )
         await store.append_transcript_messages(
@@ -3329,6 +3330,15 @@ def test_legacy_json_schema_keywords_allow_provider_dispatch(
     secret: str,
     legacy_schema: dict[str, Any],
 ) -> None:
+    class LegacySchemaProvider(FakeProvider):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="fixture:legacy-schema",
+                behavior_version="stable",
+                implementation_version="stable",
+            )
+
     class LegacySchemaTool(Tool):
         spec = ToolSpec(
             name="legacy_schema_tool",
@@ -3340,7 +3350,7 @@ def test_legacy_json_schema_keywords_allow_provider_dispatch(
             del ctx, args
             return ToolResult(content="unused")
 
-    provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    provider = LegacySchemaProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
     app = CayuApp(
         secret_redactor=SecretRedactor(secret),
         enable_logging=False,

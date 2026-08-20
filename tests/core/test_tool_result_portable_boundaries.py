@@ -1080,6 +1080,7 @@ def test_cayu_app_does_not_redispatch_after_valid_completion_billing_hook_fails(
         "requested_source_start": 0,
         "error_type": "ModelProviderError",
         "model_step_id": completed.payload["model_step_id"],
+        "execution_profile_fingerprint": completed.payload["execution_profile_fingerprint"],
     }
     assert events[-1].type == EventType.SESSION_FAILED
     assert events[-1].payload["error"] == "Model provider billing identity resolution failed"

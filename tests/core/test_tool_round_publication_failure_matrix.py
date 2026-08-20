@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from typing import Literal
 
 import pytest
+from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
 from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
 from cayu.core.messages import ToolResultPart
@@ -27,6 +28,10 @@ from cayu.runtime.sessions import (
 
 class _TwoCallProvider(ModelProvider):
     name = "tool-round-publication-matrix"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
 
     def __init__(self, responses: list[list[ModelStreamEvent]]) -> None:
         self._responses = responses

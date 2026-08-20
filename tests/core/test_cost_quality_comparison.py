@@ -1111,7 +1111,7 @@ def test_attempt_cost_evidence_is_detached_and_frozen() -> None:
         accepted_cost.total_cost = Decimal("1")
 
 
-def test_schema_v1_minimal_unavailable_report_has_a_locked_json_shape() -> None:
+def test_schema_v2_minimal_unavailable_report_has_a_locked_json_shape() -> None:
     report = compare_paired_cost_quality(
         PairedCostQualityComparisonRequest(
             pairs=(PairedCostQualityPair(pair_id="missing", baseline=None, candidate=None),)
@@ -1119,7 +1119,7 @@ def test_schema_v1_minimal_unavailable_report_has_a_locked_json_shape() -> None:
     )
 
     assert report.model_dump(mode="json") == {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "unavailable",
         "pairs": [
             {
@@ -1183,10 +1183,10 @@ def test_schema_v1_minimal_unavailable_report_has_a_locked_json_shape() -> None:
     }
 
 
-def test_schema_v1_full_verified_report_matches_golden_json() -> None:
+def test_schema_v2_full_verified_report_matches_golden_json() -> None:
     report = compare_paired_cost_quality(
         PairedCostQualityComparisonRequest(pairs=(_fully_attributed_pair(),))
     )
-    golden_path = Path(__file__).parents[1] / "fixtures" / "cost_quality_verified_v1.json"
+    golden_path = Path(__file__).parents[1] / "fixtures" / "cost_quality_verified_v2.json"
 
     assert report.model_dump(mode="json") == json.loads(golden_path.read_text())

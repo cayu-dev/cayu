@@ -55,6 +55,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
     _bind_fork_expected_source_snapshot,
+    _bind_fork_group_initial_invocation,
     session_fork_profile_relationship,
     session_input_messages_sha256,
 )
@@ -762,13 +763,17 @@ def _branch_fork_request(
         if branch.agent_name is None
         else ForkExecutionProfileSelection.CURRENT_CHILD
     )
-    return ForkSessionRequest(
+    fork_request = ForkSessionRequest(
         source_session_id=request.source_session_id,
         session_id=branch.session_id,
         agent_name=branch.agent_name,
         execution_profile_selection=selection,
         profile_adoption=branch.profile_adoption,
         metadata=_branch_metadata(request, branch),
+    )
+    return _bind_fork_group_initial_invocation(
+        fork_request,
+        _branch_resume_request(request, branch),
     )
 
 

@@ -13,6 +13,7 @@ from cayu.artifacts import file_attachment
 from cayu.core import (
     AgentSpec,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     FilePart,
     Message,
     MessageRole,
@@ -80,6 +81,14 @@ class _CapturingCompactor(ContextCompactor):
     def __init__(self, *, fail: bool = False) -> None:
         self.requests: list[CompactionRequest] = []
         self.fail = fail
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:explicit-compaction-capturing-compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     def provider_budget_identity(self, _session) -> None:
         return None

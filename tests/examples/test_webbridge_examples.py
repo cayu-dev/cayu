@@ -196,6 +196,14 @@ class _DailyProvider(ModelProvider):
     def __init__(self) -> None:
         self.requests = 0
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:webbridge_daily_provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
         self.requests += 1

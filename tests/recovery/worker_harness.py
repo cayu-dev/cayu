@@ -465,6 +465,14 @@ class RecoveryHarness:
 class _RecoveryProvider(ModelProvider):
     name = _PROVIDER_NAME
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:recovery-harness-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     def __init__(self, mode: str) -> None:
         self.mode = mode
 

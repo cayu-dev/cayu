@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import warnings
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,12 +21,19 @@ from cayu import (
     BeforeStopContext,
     BeforeStopDecision,
     BrowserWebFetchAdapter,
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservation,
+    CacheBreakpoint,
+    CachePolicy,
     CayuApp,
+    CheckpointCompactionContextPolicy,
     CommandPolicy,
     CommandPolicyDecision,
     CommandPolicyResult,
     CommandRequest,
     DenyPatternRule,
+    DispatchRequest,
     DockerRunner,
     Environment,
     EnvironmentFactory,
@@ -52,12 +60,18 @@ from cayu import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     InMemorySessionStore,
+    KnowledgeInjectionPolicy,
     LocalRunner,
     LoopPolicy,
     Message,
+    MessageWindowContextPolicy,
+    ModelCompactor,
+    ModelPrice,
     ModelTarget,
     ParameterConstrainedToolPolicy,
+    PriceBook,
     ProcessCommandPolicy,
+    PromptCacheCompactor,
     RememberKnowledgePolicy,
     RememberKnowledgeTool,
     RequiredAllowlistRule,
@@ -65,7 +79,10 @@ from cayu import (
     ResolutionActor,
     ResolutionActorSource,
     ResumeRequest,
+    RetryPolicy,
+    RunLimits,
     RunRequest,
+    RuntimeEvidenceRequest,
     RuntimeHook,
     ScriptedModelProvider,
     SearchTextTool,
@@ -78,6 +95,7 @@ from cayu import (
     TaintAwareToolPolicy,
     ThinkingConfig,
     Tool,
+    ToolCallHookContext,
     ToolContext,
     ToolPolicy,
     ToolPolicyDecision,
@@ -85,13 +103,27 @@ from cayu import (
     ToolPolicyResult,
     ToolResult,
     ToolSpec,
+    TranscriptDigestCompactor,
+    UsageTriggeredContextPolicy,
     WebFetchTool,
+    estimate_session_cost,
+    runtime_evidence,
 )
-from cayu.providers import ModelStreamEvent
-from cayu.runtime._event_projection import project_persisted_runtime_event
+from cayu.providers import (
+    AnthropicProvider,
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    OpenAIProvider,
+)
+from cayu.runtime._event_projection import (
+    prepare_new_runtime_event,
+    project_persisted_runtime_event,
+)
 from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     changed_execution_profile_components,
+    event_with_execution_profile_fingerprint_authority,
     execution_profile_from_session_metadata,
     execution_profile_metadata_after_adoption,
     execution_profile_session_metadata,
@@ -169,6 +201,55 @@ class AlternateIdentityConfiguredTool(IdentityConfiguredTool):
 class OpaqueWebFetchAdapter:
     async def fetch(self, ctx: ToolContext, request: object) -> ToolResult:
         return ToolResult(content="not called")
+
+
+class UnversionedProvider(ModelProvider):
+    name = "unversioned"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class IdentityConfiguredProvider(UnversionedProvider):
+    def __init__(self, identity: ExecutionProfileBehaviorIdentity) -> None:
+        super().__init__()
+        self._identity = identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity
+
+
+class IdentityConfiguredCacheProvider(IdentityConfiguredProvider):
+    def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+        raw_policy = request.options.get("cache_policy")
+        if raw_policy is None:
+            return None
+        return CachePolicy.model_validate(raw_policy)
+
+
+class IdentityConfiguredContextPolicy(MessageWindowContextPolicy):
+    def __init__(self, identity: ExecutionProfileBehaviorIdentity) -> None:
+        super().__init__(max_messages=4)
+        self._identity = identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity
+
+
+class IdentityConfiguredContextCompactor(TranscriptDigestCompactor):
+    def __init__(self, identity: ExecutionProfileBehaviorIdentity) -> None:
+        super().__init__(max_summary_chars=4096)
+        self._identity = identity
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return self._identity
 
 
 class IdentityConfiguredEnvironmentFactory(EnvironmentFactory):
@@ -256,15 +337,36 @@ class PreflightRecordingProvider(ScriptedModelProvider):
     def __init__(self) -> None:
         super().__init__(
             [
-                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.text_delta('{"answer":"done"}'),
                 ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"}),
             ],
             name="fake",
         )
         self.native_preflight_calls = 0
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return _test_behavior_identity("preflight-recording-provider")
+
     def preflight_native_structured_output_schema(self, json_schema: dict) -> None:
         self.native_preflight_calls += 1
+
+
+class VersionedScriptedProvider(ScriptedModelProvider):
+    def __init__(self, behavior_version: str) -> None:
+        super().__init__(
+            [ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"})],
+            name="fake",
+        )
+        self._behavior_version = behavior_version
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:versioned-model-provider",
+            behavior_version=self._behavior_version,
+            implementation_version="1",
+        )
 
 
 class RecordingExecutionProfilePolicy(ExecutionProfilePolicy):
@@ -865,6 +967,1132 @@ def test_profile_strengths_report_identity_provenance() -> None:
     )
 
 
+def _profile_price_book(*, rate: str = "1") -> PriceBook:
+    return PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="fake-model",
+                input_per_million=Decimal(rate),
+                output_per_million=Decimal(rate),
+            ),
+        )
+    )
+
+
+def _profile_budget_limit(
+    *,
+    maximum: str = "10",
+    scope: str = "session",
+    reserve: bool = False,
+) -> BudgetLimit:
+    return BudgetLimit(
+        scope=scope,
+        max_estimated_cost=Decimal(maximum),
+        pricing=_profile_price_book(),
+        reservation=(
+            BudgetReservation(max_input_tokens=8, max_output_tokens=8) if reserve else None
+        ),
+    )
+
+
+def _model_semantics_profile(
+    *,
+    context_policy=None,
+    provider: ScriptedModelProvider | None = None,
+    provider_options: dict | None = None,
+    budget_policy: BudgetPolicy | None = None,
+    request_budget_limits: tuple[BudgetLimit, ...] = (),
+    structured_output: StructuredOutputSpec | None = None,
+    thinking: ThinkingConfig | None = None,
+    max_steps: int = 16,
+    limits: RunLimits | None = None,
+    retry_policy: RetryPolicy | None = None,
+) -> ExecutionProfileIdentity:
+    app = CayuApp(budget_policy=budget_policy, enable_logging=False)
+    app.register_provider(_completed_provider() if provider is None else provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            provider_options={} if provider_options is None else provider_options,
+        ),
+        context_policy=context_policy,
+    )
+    return session_engine_module._execution_profile_identity(
+        registered_agent=app._agents["assistant"],
+        provider_name="fake",
+        registered_provider=app._providers["fake"],
+        model="fake-model",
+        durable_system_prompt="private durable instruction sentinel",
+        redactor=app._secret_redactor,
+        process_identity=app._execution_profile_process_identity,
+        budget_policy=app.budget_policy,
+        request_budget_limits=request_budget_limits,
+        causal_budget_id="profile-budget",
+        structured_output=structured_output,
+        thinking=thinking,
+        max_steps=max_steps,
+        limits=limits,
+        retry_policy=retry_policy,
+    )
+
+
+def test_schema_v3_covers_model_decision_semantics_without_raw_material() -> None:
+    context_policy = KnowledgeInjectionPolicy(
+        base_policy=CheckpointCompactionContextPolicy(
+            compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+            max_user_turns=3,
+            compact_after_messages=8,
+        ),
+        max_hits=3,
+        max_bytes=4096,
+    )
+    profile = _model_semantics_profile(
+        context_policy=context_policy,
+        provider_options={"fake": {"temperature": 0.25}},
+        budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+        request_budget_limits=(_profile_budget_limit(),),
+        structured_output=StructuredOutputSpec(
+            json_schema={
+                "type": "object",
+                "properties": {"private_schema_field": {"type": "string"}},
+            },
+            strategy="tool",
+            repair_prompt="private repair instruction sentinel",
+        ),
+        thinking=ThinkingConfig(effort="medium"),
+        max_steps=7,
+        limits=RunLimits(max_total_tokens=1000),
+        retry_policy=RetryPolicy(max_attempts=2),
+    )
+
+    assert profile.schema_version == 3
+    assert {component.component_class for component in profile.components} == set(
+        ExecutionProfileComponentClass
+    )
+    serialized = profile.model_dump_json()
+    assert "private durable instruction sentinel" not in serialized
+    assert "private_schema_field" not in serialized
+    assert "private repair instruction sentinel" not in serialized
+
+
+def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
+    class DeclaredCompactor(TranscriptDigestCompactor):
+        def __init__(self, behavior_version: str) -> None:
+            super().__init__(max_summary_chars=4096)
+            self.behavior_version = behavior_version
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:declared-context-compactor",
+                behavior_version=self.behavior_version,
+                implementation_version="1",
+            )
+
+    compactor = DeclaredCompactor("1")
+    policy = KnowledgeInjectionPolicy(
+        base_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=2,
+        )
+    )
+    first_app = CayuApp(enable_logging=False)
+    first_app.register_provider(_completed_provider(), default=True)
+    first_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    first_profile = session_engine_module._execution_profile_identity(
+        registered_agent=first_app._agents["assistant"],
+        provider_name="fake",
+        registered_provider=first_app._providers["fake"],
+        model="fake-model",
+        durable_system_prompt=None,
+        redactor=first_app._secret_redactor,
+        process_identity=first_app._execution_profile_process_identity,
+    )
+    compactor.behavior_version = "2"
+    repeated_profile = session_engine_module._execution_profile_identity(
+        registered_agent=first_app._agents["assistant"],
+        provider_name="fake",
+        registered_provider=first_app._providers["fake"],
+        model="fake-model",
+        durable_system_prompt=None,
+        redactor=first_app._secret_redactor,
+        process_identity=first_app._execution_profile_process_identity,
+    )
+
+    second_app = CayuApp(enable_logging=False)
+    second_app.register_provider(_completed_provider(), default=True)
+    second_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+    replacement_profile = session_engine_module._execution_profile_identity(
+        registered_agent=second_app._agents["assistant"],
+        provider_name="fake",
+        registered_provider=second_app._providers["fake"],
+        model="fake-model",
+        durable_system_prompt=None,
+        redactor=second_app._secret_redactor,
+        process_identity=second_app._execution_profile_process_identity,
+    )
+
+    component_class = ExecutionProfileComponentClass.CONTEXT_COMPACTION
+    assert (
+        first_profile.component(component_class).strength
+        is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+    )
+    assert first_profile.component(component_class) == repeated_profile.component(component_class)
+    assert first_profile.component(component_class) != replacement_profile.component(
+        component_class
+    )
+
+
+def test_nested_model_compactor_provider_identity_is_copied_at_agent_registration() -> None:
+    provider = VersionedScriptedProvider("1")
+    policy = CheckpointCompactionContextPolicy(
+        compactor=ModelCompactor(provider=provider, model="summary-model"),
+        max_user_turns=2,
+    )
+
+    def registered_profile(app: CayuApp) -> ExecutionProfileIdentity:
+        app.register_provider(_completed_provider(), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=policy,
+        )
+        return session_engine_module._execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            registered_provider=app._providers["fake"],
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+        )
+
+    first_app = CayuApp(enable_logging=False)
+    first_profile = registered_profile(first_app)
+    provider._behavior_version = "2"
+    repeated_profile = session_engine_module._execution_profile_identity(
+        registered_agent=first_app._agents["assistant"],
+        provider_name="fake",
+        registered_provider=first_app._providers["fake"],
+        model="fake-model",
+        durable_system_prompt=None,
+        redactor=first_app._secret_redactor,
+        process_identity=first_app._execution_profile_process_identity,
+    )
+    replacement_profile = registered_profile(CayuApp(enable_logging=False))
+
+    component_class = ExecutionProfileComponentClass.CONTEXT_COMPACTION
+    component = first_profile.component(component_class)
+    assert component.strength is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+    assert component == repeated_profile.component(component_class)
+    assert component != replacement_profile.component(component_class)
+
+
+def test_prompt_cache_compactor_carries_declared_fallback_identity() -> None:
+    class DeclaredFallback(TranscriptDigestCompactor):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("prompt-cache-fallback")
+
+    profile = _model_semantics_profile(
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=PromptCacheCompactor(
+                provider=ScriptedModelProvider([], name="compaction-provider"),
+                fallback_compactor=DeclaredFallback(max_summary_chars=4096),
+            ),
+            max_user_turns=2,
+        )
+    )
+
+    component = profile.component(ExecutionProfileComponentClass.CONTEXT_COMPACTION)
+    assert component.strength is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+
+
+def test_usage_triggered_policy_preserves_nested_application_identity_strength() -> None:
+    class DeclaredContextPolicy(MessageWindowContextPolicy):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("usage-triggered-context")
+
+    profile = _model_semantics_profile(
+        context_policy=UsageTriggeredContextPolicy(
+            base_policy=MessageWindowContextPolicy(max_messages=4),
+            triggered_policy=DeclaredContextPolicy(max_messages=2),
+            min_input_tokens=1,
+        )
+    )
+
+    for component_class in (
+        ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+        ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+    ):
+        assert (
+            profile.component(component_class).strength
+            is ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+        )
+
+
+def test_model_compactor_binds_its_snapshotted_provider_identity() -> None:
+    def profile(provider_name: str) -> ExecutionProfileIdentity:
+        return _model_semantics_profile(
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=ScriptedModelProvider([], name=provider_name),
+                    model="summary-model",
+                ),
+                max_user_turns=2,
+            )
+        )
+
+    first = profile("compaction-a")
+    second = profile("compaction-b")
+
+    component_class = ExecutionProfileComponentClass.CONTEXT_COMPACTION
+    assert first.component(component_class) != second.component(component_class)
+
+
+def _registered_context_profile(app: CayuApp) -> ExecutionProfileIdentity:
+    return session_engine_module._execution_profile_identity(
+        registered_agent=app._agents["assistant"],
+        provider_name="fake",
+        registered_provider=app._providers["fake"],
+        model="fake-model",
+        durable_system_prompt=None,
+        redactor=app._secret_redactor,
+        process_identity=app._execution_profile_process_identity,
+    )
+
+
+def test_private_knowledge_configuration_mutation_changes_process_local_profile() -> None:
+    first_private_namespace = "private-knowledge-namespace-a"
+    second_private_namespace = "private-knowledge-namespace-b"
+    policy = KnowledgeInjectionPolicy(namespace=first_private_namespace, enabled=False)
+    app = CayuApp(enable_logging=False)
+    app.register_provider(_completed_provider(), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    first = _registered_context_profile(app)
+    policy.namespace = second_private_namespace
+    second = _registered_context_profile(app)
+
+    component_class = ExecutionProfileComponentClass.KNOWLEDGE_INJECTION
+    first_component = first.component(component_class)
+    second_component = second.component(component_class)
+    serialized = json.dumps(
+        [first_component.model_dump(mode="json"), second_component.model_dump(mode="json")],
+        sort_keys=True,
+    )
+    assert first_component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert second_component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert first_component != second_component
+    assert first_private_namespace not in serialized
+    assert second_private_namespace not in serialized
+    assert app._execution_profile_process_identity not in serialized
+
+
+@pytest.mark.parametrize("compactor_kind", ["model", "prompt_cache"])
+def test_private_builtin_compactor_mutation_changes_process_local_profile(
+    compactor_kind: str,
+) -> None:
+    first_private_option = "private-compactor-option-a"
+    second_private_option = "private-compactor-option-b"
+    provider = ScriptedModelProvider([], name="compaction-provider")
+    if compactor_kind == "model":
+        compactor = ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            options={"private": first_private_option},
+        )
+    else:
+        compactor = PromptCacheCompactor(
+            provider=provider,
+            options={"private": first_private_option},
+        )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(_completed_provider(), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=2,
+        ),
+    )
+
+    first = _registered_context_profile(app)
+    compactor.options["private"] = second_private_option
+    second = _registered_context_profile(app)
+
+    component_class = ExecutionProfileComponentClass.CONTEXT_COMPACTION
+    first_component = first.component(component_class)
+    second_component = second.component(component_class)
+    serialized = json.dumps(
+        [first_component.model_dump(mode="json"), second_component.model_dump(mode="json")],
+        sort_keys=True,
+    )
+    assert first_component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert second_component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert first_component != second_component
+    assert first_private_option not in serialized
+    assert second_private_option not in serialized
+    assert app._execution_profile_process_identity not in serialized
+
+
+def test_nondefault_checkpoint_summary_prefix_is_private_process_local_material() -> None:
+    summary_prefix = "tenant-a-summary"
+
+    def component_for(app: CayuApp, prefix: str):
+        app.register_provider(_completed_provider(), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(summary_prefix=prefix),
+        )
+        return _registered_context_profile(app).component(
+            ExecutionProfileComponentClass.CONTEXT_SELECTION
+        )
+
+    first_app = CayuApp(enable_logging=False)
+    second_app = CayuApp(enable_logging=False)
+    first = component_for(first_app, summary_prefix)
+    second = component_for(second_app, summary_prefix)
+    default = component_for(
+        CayuApp(enable_logging=False),
+        "Previous session context summary:",
+    )
+    serialized = json.dumps(
+        [first.model_dump(mode="json"), second.model_dump(mode="json")],
+        sort_keys=True,
+    )
+
+    assert first.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert second.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert first != second
+    assert default.strength is ExecutionProfileIdentityStrength.STRUCTURAL
+    assert summary_prefix not in serialized
+    assert first_app._execution_profile_process_identity not in serialized
+    assert second_app._execution_profile_process_identity not in serialized
+
+
+def test_queued_target_profile_uses_durable_request_controls() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="source",
+            ),
+            default=True,
+        )
+        app.register_provider(
+            ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="target",
+            )
+        )
+        app.register_agent(AgentSpec(name="assistant", model="source-model"))
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="queued-target-provider-request-profile",
+                    messages=[Message.text("user", "first")],
+                    thinking=ThinkingConfig(effort="medium"),
+                )
+            )
+        )
+        session = await store.load("queued-target-provider-request-profile")
+        assert session is not None
+        source_profile = execution_profile_from_session_metadata(session.metadata)
+
+        request = DispatchRequest(
+            session_id=session.id,
+            messages=[Message.text("user", "queued")],
+            target=ModelTarget(provider_name="target", model="target-model"),
+            thinking=ThinkingConfig(effort="low"),
+            max_steps=7,
+        )
+        target_profile = app._session_engine._queued_dispatch_required_profile(
+            session=session,
+            source_profile=source_profile,
+            request=request,
+        )
+
+        assert target_profile.component(
+            ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY
+        ) != source_profile.component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+        assert target_profile.component(
+            ExecutionProfileComponentClass.FINALIZATION
+        ) != source_profile.component(ExecutionProfileComponentClass.FINALIZATION)
+        assert target_profile.component(
+            ExecutionProfileComponentClass.PROVIDER_TARGET
+        ) != source_profile.component(ExecutionProfileComponentClass.PROVIDER_TARGET)
+
+    asyncio.run(exercise())
+
+
+def test_scripted_provider_is_structural_only_for_the_exact_builtin_type() -> None:
+    class DerivedScriptedProvider(ScriptedModelProvider):
+        pass
+
+    def provider_component(provider: ModelProvider):
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        return _registered_context_profile(app).component(
+            ExecutionProfileComponentClass.PROVIDER_ADAPTER
+        )
+
+    built_in = _completed_provider()
+    derived = DerivedScriptedProvider([], name="fake")
+
+    assert built_in.execution_profile_identity is None
+    assert derived.execution_profile_identity is None
+    assert provider_component(built_in).strength is ExecutionProfileIdentityStrength.STRUCTURAL
+    assert provider_component(derived).strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+
+
+def test_opaque_provider_options_are_secret_safe_and_content_bound_within_process() -> None:
+    first_secret = "private-provider-option-alpha-canary"
+    second_secret = "private-provider-option-beta-canary"
+    app = CayuApp(
+        secret_redactor=SecretRedactor([first_secret, second_secret]),
+        enable_logging=False,
+    )
+    app.register_provider(_completed_provider(), default=True)
+    app.register_agent(
+        AgentSpec(
+            name="first",
+            model="fake-model",
+            provider_options={
+                "fake": {
+                    "temperature": 0.25,
+                    "private_route": first_secret,
+                }
+            },
+        )
+    )
+    app.register_agent(
+        AgentSpec(
+            name="second",
+            model="fake-model",
+            provider_options={
+                "fake": {
+                    "temperature": 0.25,
+                    "private_route": second_secret,
+                }
+            },
+        )
+    )
+
+    profiles = [
+        session_engine_module._execution_profile_identity(
+            registered_agent=app._agents[agent_name],
+            provider_name="fake",
+            registered_provider=app._providers["fake"],
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+        )
+        for agent_name in ("first", "second")
+    ]
+    components = [
+        profile.component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+        for profile in profiles
+    ]
+    serialized = json.dumps(
+        [profile.model_dump(mode="json") for profile in profiles],
+        sort_keys=True,
+    )
+
+    assert components[0].strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert components[0].fingerprint != components[1].fingerprint
+    assert first_secret not in serialized
+    assert second_secret not in serialized
+    assert app._execution_profile_process_identity not in serialized
+
+
+def test_runtime_owned_private_option_commitments_survive_secret_collision() -> None:
+    process_identity = "fixed-private-options-profile-process-key"
+    first_options = {"fake": {"temperature": 0.25, "private_route": "private-route-alpha"}}
+    second_options = {"fake": {"temperature": 0.25, "private_route": "private-route-beta"}}
+    projected_options = [
+        session_engine_module._execution_profile_provider_options(
+            options,
+            process_identity=process_identity,
+        )[0]
+        for options in (first_options, second_options)
+    ]
+    commitment_secrets = [
+        projected["private_configuration_hmac_sha256"] for projected in projected_options
+    ]
+    app = CayuApp(
+        secret_redactor=SecretRedactor(commitment_secrets),
+        enable_logging=False,
+    )
+    app.register_provider(_completed_provider(), default=True)
+    for name, options in (("first", first_options), ("second", second_options)):
+        app.register_agent(AgentSpec(name=name, model="fake-model", provider_options=options))
+
+    components = [
+        session_engine_module._execution_profile_identity(
+            registered_agent=app._agents[name],
+            provider_name="fake",
+            registered_provider=app._providers["fake"],
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=process_identity,
+        ).component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+        for name in ("first", "second")
+    ]
+    serialized = json.dumps(
+        [component.model_dump(mode="json") for component in components],
+        sort_keys=True,
+    )
+
+    assert components[0].strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert components[0] != components[1]
+    assert "private-route-alpha" not in serialized
+    assert "private-route-beta" not in serialized
+    assert process_identity not in serialized
+
+
+def test_provider_request_profile_uses_only_selected_adapter_effective_options() -> None:
+    inactive_private_option = "inactive-anthropic-route-canary"
+    app = CayuApp(
+        secret_redactor=SecretRedactor([inactive_private_option]),
+        enable_logging=False,
+    )
+    app.register_provider(OpenAIProvider(api_key="test-key"), default=True)
+    option_sets = {
+        "baseline": {
+            "openai": {"metadata": {"route": "primary"}},
+            "anthropic": {"metadata": {"route": "ignored-a"}},
+        },
+        "inactive_changed": {
+            "openai": {"metadata": {"route": "primary"}},
+            "anthropic": {"metadata": {"route": inactive_private_option}},
+        },
+        "active_changed": {
+            "openai": {"metadata": {"route": "secondary"}},
+            "anthropic": {"metadata": {"route": "ignored-a"}},
+        },
+    }
+    for name, options in option_sets.items():
+        app.register_agent(AgentSpec(name=name, model="openai-test", provider_options=options))
+
+    components = {
+        name: session_engine_module._execution_profile_identity(
+            registered_agent=app._agents[name],
+            provider_name="openai",
+            registered_provider=app._providers["openai"],
+            model="openai-test",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+        ).component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+        for name in option_sets
+    }
+    serialized = json.dumps(
+        [component.model_dump(mode="json") for component in components.values()],
+        sort_keys=True,
+    )
+
+    assert components["baseline"] == components["inactive_changed"]
+    assert components["baseline"] != components["active_changed"]
+    assert inactive_private_option not in serialized
+
+
+def test_effective_cache_policy_change_rejects_resume_before_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        requests: list[ModelRequest] = []
+
+        async def stream(
+            _provider: AnthropicProvider,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            requests.append(request)
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+        monkeypatch.setattr(AnthropicProvider, "stream", stream)
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(
+            AnthropicProvider(
+                api_key="test-key",
+                cache_policy=CachePolicy(
+                    breakpoints=(CacheBreakpoint.SYSTEM_PROMPT,),
+                    ttl="standard",
+                ),
+            ),
+            default=True,
+        )
+        original_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="claude-test",
+                provider_options={
+                    "cache_policy": {
+                        "breakpoints": [CacheBreakpoint.SYSTEM_PROMPT.value],
+                        "ttl": "standard",
+                    }
+                },
+            )
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-cache-policy",
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        assert len(requests) == 1
+
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(
+            AnthropicProvider(
+                api_key="test-key",
+                cache_policy=CachePolicy(
+                    breakpoints=(CacheBreakpoint.SYSTEM_PROMPT,),
+                    ttl="standard",
+                ),
+            ),
+            default=True,
+        )
+        replacement_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="claude-test",
+                provider_options={
+                    "cache_policy": {
+                        "breakpoints": [CacheBreakpoint.SYSTEM_PROMPT.value],
+                        "ttl": "extended",
+                    }
+                },
+            )
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as raised:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id="execution-profile-cache-policy",
+                        messages=[Message.text("user", "second")],
+                    )
+                )
+            )
+
+        assert raised.value.changed_component_classes == (
+            ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+        )
+        assert len(requests) == 1
+
+    asyncio.run(exercise())
+
+
+def test_anthropic_cache_override_changes_effective_provider_request_profile() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        AnthropicProvider(
+            api_key="test-key",
+            cache_policy=CachePolicy(
+                breakpoints=(CacheBreakpoint.SYSTEM_PROMPT,),
+                ttl="standard",
+            ),
+        ),
+        default=True,
+    )
+    for name, ttl in (("standard", "standard"), ("extended", "extended")):
+        app.register_agent(
+            AgentSpec(
+                name=name,
+                model="claude-test",
+                provider_options={"cache_policy": {"ttl": ttl}},
+            )
+        )
+
+    components = [
+        session_engine_module._execution_profile_identity(
+            registered_agent=app._agents[name],
+            provider_name="anthropic",
+            registered_provider=app._providers["anthropic"],
+            model="claude-test",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+        ).component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+        for name in ("standard", "extended")
+    ]
+
+    assert components[0].strength is ExecutionProfileIdentityStrength.STRUCTURAL
+    assert components[1].strength is ExecutionProfileIdentityStrength.STRUCTURAL
+    assert components[0] != components[1]
+
+
+def test_custom_provider_cache_options_are_private_process_local_material() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        IdentityConfiguredCacheProvider(_test_behavior_identity("custom-cache-provider")),
+        default=True,
+    )
+    for name, ttl in (("first", "standard"), ("second", "extended")):
+        app.register_agent(
+            AgentSpec(
+                name=name,
+                model="custom-cache-model",
+                provider_options={
+                    "cache_policy": {
+                        "breakpoints": [CacheBreakpoint.SYSTEM_PROMPT.value],
+                        "ttl": ttl,
+                    }
+                },
+            )
+        )
+
+    components = [
+        session_engine_module._execution_profile_identity(
+            registered_agent=app._agents[name],
+            provider_name="unversioned",
+            registered_provider=app._providers["unversioned"],
+            model="custom-cache-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+        ).component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+        for name in ("first", "second")
+    ]
+    serialized = json.dumps(
+        [component.model_dump(mode="json") for component in components],
+        sort_keys=True,
+    )
+
+    assert components[0].strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert components[1].strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert components[0] != components[1]
+    assert '"ttl": "standard"' not in serialized
+    assert '"ttl": "extended"' not in serialized
+
+
+def test_custom_provider_cache_policy_change_rejects_resume_before_dispatch() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        identity = _test_behavior_identity("custom-cache-provider")
+        original_provider = IdentityConfiguredCacheProvider(identity)
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(original_provider, default=True)
+        original_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="custom-cache-model",
+                provider_options={
+                    "cache_policy": {
+                        "breakpoints": [CacheBreakpoint.SYSTEM_PROMPT.value],
+                        "ttl": "standard",
+                    }
+                },
+            )
+        )
+
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-custom-cache-policy",
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        assert len(original_provider.requests) == 1
+
+        replacement_provider = IdentityConfiguredCacheProvider(identity)
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(replacement_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="custom-cache-model",
+                provider_options={
+                    "cache_policy": {
+                        "breakpoints": [CacheBreakpoint.SYSTEM_PROMPT.value],
+                        "ttl": "extended",
+                    }
+                },
+            )
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as raised:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id="execution-profile-custom-cache-policy",
+                        messages=[Message.text("user", "second")],
+                    )
+                )
+            )
+
+        assert raised.value.changed_component_classes == (
+            ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+        )
+        assert replacement_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_runtime_owned_private_context_commitments_survive_secret_collision() -> None:
+    process_identity = "fixed-private-context-profile-process-key"
+    policies = [
+        KnowledgeInjectionPolicy(namespace=namespace, enabled=False)
+        for namespace in ("private-namespace-alpha", "private-namespace-beta")
+    ]
+    commitment_secrets = []
+    for policy in policies:
+        projected = execution_profile_admission._cayu_context_policy_material(
+            policy,
+            behavior_identities={id(policy): None, id(policy.base_policy): None},
+            process_identity=process_identity,
+        )
+        assert projected is not None
+        commitment = projected.knowledge["configuration_hmac_sha256"]
+        assert type(commitment) is str
+        commitment_secrets.append(commitment)
+    app = CayuApp(
+        secret_redactor=SecretRedactor(commitment_secrets),
+        enable_logging=False,
+    )
+    app.register_provider(_completed_provider(), default=True)
+    for name, policy in zip(("first", "second"), policies, strict=True):
+        app.register_agent(
+            AgentSpec(name=name, model="fake-model"),
+            context_policy=policy,
+        )
+
+    components = [
+        session_engine_module._execution_profile_identity(
+            registered_agent=app._agents[name],
+            provider_name="fake",
+            registered_provider=app._providers["fake"],
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=process_identity,
+        ).component(ExecutionProfileComponentClass.KNOWLEDGE_INJECTION)
+        for name in ("first", "second")
+    ]
+    serialized = json.dumps(
+        [component.model_dump(mode="json") for component in components],
+        sort_keys=True,
+    )
+
+    assert components[0].strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert components[0] != components[1]
+    assert "private-namespace-alpha" not in serialized
+    assert "private-namespace-beta" not in serialized
+    assert process_identity not in serialized
+
+
+def test_each_model_semantics_component_changes_independently() -> None:
+    baseline = _model_semantics_profile(
+        context_policy=KnowledgeInjectionPolicy(
+            base_policy=CheckpointCompactionContextPolicy(
+                compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                max_user_turns=3,
+                compact_after_messages=8,
+            ),
+            max_hits=3,
+        ),
+        provider_options={"fake": {"temperature": 0.25}},
+        budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+        request_budget_limits=(_profile_budget_limit(),),
+        structured_output=StructuredOutputSpec(
+            json_schema={"type": "object"},
+            strategy="tool",
+        ),
+        max_steps=7,
+    )
+    variants = {
+        ExecutionProfileComponentClass.CONTEXT_SELECTION: _model_semantics_profile(
+            context_policy=MessageWindowContextPolicy(max_messages=4),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=3,
+            ),
+            provider_options={"fake": {"temperature": 0.5}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=3,
+            ),
+            provider=VersionedScriptedProvider("2"),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=4,
+            ),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.CONTEXT_COMPACTION: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=5000),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=3,
+            ),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=3,
+            ),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(maximum="11", scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=3,
+            ),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(maximum="11"),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=3,
+            ),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "array"}, strategy="tool"),
+            max_steps=7,
+        ),
+        ExecutionProfileComponentClass.FINALIZATION: _model_semantics_profile(
+            context_policy=KnowledgeInjectionPolicy(
+                base_policy=CheckpointCompactionContextPolicy(
+                    compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                    max_user_turns=3,
+                    compact_after_messages=8,
+                ),
+                max_hits=3,
+            ),
+            provider_options={"fake": {"temperature": 0.25}},
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
+            request_budget_limits=(_profile_budget_limit(),),
+            structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
+            max_steps=8,
+        ),
+    }
+
+    for component_class, variant in variants.items():
+        assert baseline.component(component_class) != variant.component(component_class)
+
+
+def test_live_state_profile_component_records_explicit_absence_and_future_change() -> None:
+    baseline = build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version="1",
+        provider_name="fake",
+        model="fake-model",
+        durable_system_prompt=None,
+        direct_tools=[],
+    )
+    projected = build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version="1",
+        provider_name="fake",
+        model="fake-model",
+        durable_system_prompt=None,
+        direct_tools=[],
+        live_state_projection={
+            "kind": "runtime-state-snapshot",
+            "version": 1,
+            "policy": "bounded",
+        },
+    )
+
+    component_class = ExecutionProfileComponentClass.LIVE_STATE_PROJECTION
+    assert baseline.component(component_class).availability is (
+        ExecutionProfileIdentityAvailability.AVAILABLE
+    )
+    assert baseline.component(component_class) != projected.component(component_class)
+    assert changed_execution_profile_components(baseline, projected) == (component_class,)
+
+
 def test_cayu_profile_material_extractors_require_exact_registered_types(tmp_path: Path) -> None:
     class DerivedSearchTextTool(SearchTextTool):
         pass
@@ -905,6 +2133,11 @@ def test_cayu_profile_material_extractors_require_exact_registered_types(tmp_pat
         "environment_runner",
         "factory_spec",
         "environment_factory",
+        "provider",
+        "context_policy",
+        "context_compactor",
+        "model_compactor_provider",
+        "prompt_cache_fallback",
     ],
 )
 def test_app_rejects_workload_secrets_in_behavior_identity_registrations(
@@ -977,6 +2210,40 @@ def test_app_rejects_workload_secrets_in_behavior_identity_registrations(
                         runner=IdentityConfiguredRunner(tmp_path, identity),
                     )
                 )
+            elif registration_kind == "provider":
+                app.register_provider(IdentityConfiguredProvider(identity))
+            elif registration_kind == "context_policy":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    context_policy=IdentityConfiguredContextPolicy(identity),
+                )
+            elif registration_kind == "context_compactor":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    context_policy=CheckpointCompactionContextPolicy(
+                        compactor=IdentityConfiguredContextCompactor(identity),
+                    ),
+                )
+            elif registration_kind == "model_compactor_provider":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    context_policy=CheckpointCompactionContextPolicy(
+                        compactor=ModelCompactor(
+                            provider=IdentityConfiguredProvider(identity),
+                            model="summary-model",
+                        ),
+                    ),
+                )
+            elif registration_kind == "prompt_cache_fallback":
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    context_policy=CheckpointCompactionContextPolicy(
+                        compactor=PromptCacheCompactor(
+                            provider=ScriptedModelProvider([], name="cache-provider"),
+                            fallback_compactor=IdentityConfiguredContextCompactor(identity),
+                        ),
+                    ),
+                )
             elif registration_kind == "factory_spec":
                 app.register_environment_factory(
                     EnvironmentSpec(
@@ -994,6 +2261,7 @@ def test_app_rejects_workload_secrets_in_behavior_identity_registrations(
 
         assert app.list_agents() == ()
         assert app.list_environments() == ()
+        assert app.list_providers() == ()
 
     assert secret not in str(caught.value)
     assert secret not in repr(caught.value)
@@ -1303,6 +2571,52 @@ def test_unversioned_custom_tool_identity_is_scoped_to_one_app_instance() -> Non
             ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
         )
         assert restarted_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_unversioned_provider_identity_is_scoped_to_one_app_instance() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-process-local-provider"
+        store = InMemorySessionStore()
+        provider = UnversionedProvider()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(provider, default=True)
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        original = await store.load(session_id)
+        assert original is not None
+        adapter = execution_profile_from_session_metadata(original.metadata).component(
+            ExecutionProfileComponentClass.PROVIDER_ADAPTER
+        )
+        assert adapter.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(provider, default=True)
+        replacement_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "second")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        )
+        assert len(provider.requests) == 1
 
     asyncio.run(exercise())
 
@@ -4044,6 +5358,724 @@ def test_changed_tool_profile_rejects_before_replacement_provider_preflight() ->
 
         assert replacement_provider.native_preflight_calls == 0
         assert replacement_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_context_profile_drift_rejects_before_dispatch_and_explicit_adoption_can_authorize() -> (
+    None
+):
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="Preserve this durable system instruction.",
+            ),
+            context_policy=MessageWindowContextPolicy(max_messages=4),
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-context-adoption",
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        original_session = await store.load("execution-profile-context-adoption")
+        assert original_session is not None
+        original_profile = execution_profile_from_session_metadata(original_session.metadata)
+
+        rejected_provider = _completed_provider()
+        rejected_app = CayuApp(session_store=store, enable_logging=False)
+        rejected_app.register_provider(rejected_provider, default=True)
+        rejected_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="A changed live prompt must not replace durable history.",
+            ),
+            context_policy=MessageWindowContextPolicy(max_messages=5),
+        )
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                rejected_app.resume(
+                    ResumeRequest(
+                        session_id="execution-profile-context-adoption",
+                        messages=[Message.text("user", "second")],
+                    )
+                )
+            )
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        )
+        assert rejected_provider.requests == []
+
+        policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="Reviewed context-policy migration.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        )
+        adopted_provider = _completed_provider()
+        adopted_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=policy,
+            enable_logging=False,
+        )
+        adopted_app.register_provider(adopted_provider, default=True)
+        adopted_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="A changed live prompt must not replace durable history.",
+            ),
+            context_policy=MessageWindowContextPolicy(max_messages=5),
+        )
+        events = await _collect(
+            adopted_app.resume(
+                ResumeRequest(
+                    session_id="execution-profile-context-adoption",
+                    messages=[Message.text("user", "second")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="adopt-context-policy-v1",
+                        reason="Adopt the reviewed context policy.",
+                        requested_by=ResolutionActor(
+                            subject="maintainer",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+        decision = next(
+            event for event in events if event.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+        )
+        assert decision.payload["decision"] == ExecutionProfileDecisionKind.ADOPTED
+        assert decision.payload["changed_component_classes"] == ["context_selection"]
+        assert len(adopted_provider.requests) == 1
+        adopted_session = await store.load("execution-profile-context-adoption")
+        assert adopted_session is not None
+        adopted_profile = execution_profile_from_session_metadata(adopted_session.metadata)
+        assert adopted_profile.component(
+            ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+        ) == original_profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION)
+
+    asyncio.run(exercise())
+
+
+def test_live_context_policy_mutation_between_model_steps_rejects_before_redispatch() -> None:
+    class MutateContextPolicyTool(Tool):
+        def __init__(self, policy: MessageWindowContextPolicy) -> None:
+            self._policy = policy
+            self.spec = ToolSpec(
+                name="mutate_context_policy",
+                description="Mutate the registered context policy.",
+                input_schema={"type": "object", "properties": {}},
+                execution_profile_identity=_test_behavior_identity("mutate-context-policy-tool"),
+            )
+            super().__init__()
+            self.calls = 0
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            self.calls += 1
+            self._policy.max_messages = 2
+            return ToolResult(content="mutated")
+
+    async def exercise() -> None:
+        policy = MessageWindowContextPolicy(max_messages=4)
+        tool = MutateContextPolicyTool(policy)
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_mutate_policy",
+                        name=tool.spec.name,
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed(
+                        {"finish_reason": "tool_calls", "model": "fake-model"}
+                    ),
+                ],
+                [
+                    ModelStreamEvent.text_delta("must not dispatch"),
+                    ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"}),
+                ],
+            ],
+            name="fake",
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+            context_policy=policy,
+        )
+
+        events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="live-context-policy-mutation",
+                    messages=[Message.text("user", "mutate then continue")],
+                )
+            )
+        )
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert failed.payload["error_type"] == "ExecutionProfileMismatchError"
+        assert "context_selection" in failed.payload["error"]
+        assert tool.calls == 1
+        assert len(provider.requests) == 1
+
+    asyncio.run(exercise())
+
+
+def test_live_provider_mutation_from_hook_rejects_before_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProviderMutatingHook(RuntimeHook):
+        def __init__(self, provider: OpenAIProvider) -> None:
+            self._provider = provider
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("provider-mutating-hook")
+
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
+            del context
+            self._provider.base_url = "https://changed.example.test/v1"
+
+    async def exercise() -> None:
+        dispatched: list[ModelRequest] = []
+
+        async def unexpected_stream(
+            provider: OpenAIProvider,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del provider
+            dispatched.append(request)
+            if len(dispatched) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_stable_tool",
+                    name="stable_tool",
+                    arguments={},
+                )
+                yield ModelStreamEvent.completed(
+                    {"finish_reason": "tool_calls", "model": "gpt-test"}
+                )
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop", "model": "gpt-test"})
+
+        monkeypatch.setattr(OpenAIProvider, "stream", unexpected_stream)
+        provider = OpenAIProvider(api_key="test-key")
+        tool = RecordingTool("stable_tool")
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="gpt-test"),
+            tools=[tool],
+            runtime_hooks=[ProviderMutatingHook(provider)],
+        )
+
+        events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="live-provider-mutation-before-dispatch",
+                    messages=[Message.text("user", "do not dispatch")],
+                )
+            )
+        )
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert failed.payload["error_type"] == "ExecutionProfileMismatchError"
+        assert "provider_adapter" in failed.payload["error"]
+        assert tool.calls == [{}]
+        assert len(dispatched) == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("change_kind", "expected_component"),
+    [
+        ("provider_options", ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY),
+        ("knowledge", ExecutionProfileComponentClass.KNOWLEDGE_INJECTION),
+        ("compaction", ExecutionProfileComponentClass.CONTEXT_COMPACTION),
+        ("application_budget", ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY),
+        ("invocation_budget", ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY),
+        ("structured_output", ExecutionProfileComponentClass.STRUCTURED_OUTPUT),
+        ("finalization", ExecutionProfileComponentClass.FINALIZATION),
+    ],
+)
+def test_model_semantics_drift_rejects_before_replacement_provider_dispatch(
+    change_kind: str,
+    expected_component: ExecutionProfileComponentClass,
+) -> None:
+    async def exercise() -> None:
+        session_id = f"execution-profile-model-semantics-{change_kind}"
+        store = InMemorySessionStore()
+        first_budget = (
+            BudgetPolicy(limits=(_profile_budget_limit(maximum="10", scope="app"),))
+            if change_kind == "application_budget"
+            else None
+        )
+        first_provider = (
+            PreflightRecordingProvider()
+            if change_kind == "structured_output"
+            else _completed_provider()
+        )
+        first_context = (
+            CheckpointCompactionContextPolicy(
+                compactor=TranscriptDigestCompactor(max_summary_chars=4096),
+                compact_after_messages=100,
+            )
+            if change_kind == "compaction"
+            else (
+                KnowledgeInjectionPolicy(enabled=False, max_hits=3)
+                if change_kind == "knowledge"
+                else None
+            )
+        )
+        first_options = {"fake": {"temperature": 0.25}} if change_kind == "provider_options" else {}
+        first_app = CayuApp(
+            session_store=store,
+            budget_policy=first_budget,
+            enable_logging=False,
+        )
+        first_app.register_provider(first_provider, default=True)
+        first_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                provider_options=first_options,
+            ),
+            context_policy=first_context,
+        )
+        run_options = {}
+        if change_kind == "invocation_budget":
+            run_options["budget_limits"] = (_profile_budget_limit(maximum="10"),)
+        elif change_kind == "structured_output":
+            run_options["structured_output"] = StructuredOutputSpec(
+                strategy="native",
+                json_schema={"type": "object"},
+            )
+        elif change_kind == "finalization":
+            run_options["max_steps"] = 16
+        await _collect(
+            first_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                    **run_options,
+                )
+            )
+        )
+
+        replacement_budget = (
+            BudgetPolicy(limits=(_profile_budget_limit(maximum="11", scope="app"),))
+            if change_kind == "application_budget"
+            else None
+        )
+        replacement_provider = (
+            PreflightRecordingProvider()
+            if change_kind == "structured_output"
+            else _completed_provider()
+        )
+        replacement_context = (
+            CheckpointCompactionContextPolicy(
+                compactor=TranscriptDigestCompactor(max_summary_chars=5000),
+                compact_after_messages=100,
+            )
+            if change_kind == "compaction"
+            else (
+                KnowledgeInjectionPolicy(enabled=False, max_hits=4)
+                if change_kind == "knowledge"
+                else None
+            )
+        )
+        replacement_options = (
+            {"fake": {"temperature": 0.5}} if change_kind == "provider_options" else {}
+        )
+        replacement_app = CayuApp(
+            session_store=store,
+            budget_policy=replacement_budget,
+            enable_logging=False,
+        )
+        replacement_app.register_provider(replacement_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                provider_options=replacement_options,
+            ),
+            context_policy=replacement_context,
+        )
+        resume_options = {}
+        if change_kind == "invocation_budget":
+            resume_options["budget_limits"] = (_profile_budget_limit(maximum="11"),)
+        elif change_kind == "structured_output":
+            resume_options["structured_output"] = StructuredOutputSpec(
+                strategy="native",
+                json_schema={"type": "array"},
+            )
+        elif change_kind == "finalization":
+            resume_options["max_steps"] = 17
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "second")],
+                        **resume_options,
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (expected_component,)
+        assert replacement_provider.requests == []
+        if isinstance(replacement_provider, PreflightRecordingProvider):
+            assert replacement_provider.native_preflight_calls == 0
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("entrypoint", ["run", "resume"])
+def test_application_budget_profile_and_dispatch_share_one_pre_yield_snapshot(
+    entrypoint: str,
+) -> None:
+    async def exercise() -> None:
+        session_id = f"execution-profile-budget-snapshot-{entrypoint}"
+        store = InMemorySessionStore()
+        provider = _completed_provider()
+        original_limit = _profile_budget_limit(
+            maximum="10",
+            scope="app",
+            reserve=True,
+        )
+        replacement_limit = _profile_budget_limit(
+            maximum="11",
+            scope="app",
+            reserve=True,
+        )
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(limits=(original_limit,)),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        if entrypoint == "resume":
+            await _collect(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "first")],
+                    )
+                )
+            )
+            stream = app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "second")],
+                )
+            )
+        else:
+            stream = app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+
+        interaction_started = await anext(stream)
+        assert interaction_started.type is EventType.INTERACTION_STARTED
+        assert app.budget_policy is not None
+        app.budget_policy.limits = (replacement_limit,)
+        remaining = [event async for event in stream]
+
+        budget_events = [event for event in remaining if event.type is EventType.BUDGET_CHECKED]
+        assert budget_events
+        assert {event.payload["maximum"] for event in budget_events} == {"10"}
+        session = await store.load(session_id)
+        assert session is not None
+        profile = execution_profile_from_session_metadata(session.metadata)
+        assert {event.payload["execution_profile_fingerprint"] for event in budget_events} == {
+            profile.fingerprint
+        }
+
+    asyncio.run(exercise())
+
+
+def test_model_attempt_footprint_usage_cost_and_evidence_share_governing_profile() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "model": "fake-model",
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                            "total_tokens": 3,
+                        },
+                    }
+                ),
+            ],
+            name="fake",
+        )
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app", reserve=True),)),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-model-evidence",
+                    messages=[Message.text("user", "attribute this request")],
+                )
+            )
+        )
+
+        session = await store.load("execution-profile-model-evidence")
+        assert session is not None
+        profile = execution_profile_from_session_metadata(session.metadata)
+        events = await store.load_events(session.id)
+        governed = [
+            event
+            for event in events
+            if event.type
+            in {
+                EventType.REQUEST_FOOTPRINT_RECORDED,
+                EventType.MODEL_STARTED,
+                EventType.MODEL_COMPLETED,
+            }
+        ]
+        assert {event.payload.get("execution_profile_fingerprint") for event in governed} == {
+            profile.fingerprint
+        }
+        budget_events = [
+            event
+            for event in events
+            if event.type
+            in {
+                EventType.BUDGET_CHECKED,
+                EventType.BUDGET_RESERVED,
+                EventType.BUDGET_RECONCILED,
+            }
+        ]
+        assert {event.type for event in budget_events} == {
+            EventType.BUDGET_CHECKED,
+            EventType.BUDGET_RESERVED,
+            EventType.BUDGET_RECONCILED,
+        }
+        assert {event.payload.get("execution_profile_fingerprint") for event in budget_events} == {
+            profile.fingerprint
+        }
+        footprint = next(
+            event for event in governed if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        )
+        assert footprint.payload["schema_version"] == 2
+
+        pricing = _profile_price_book()
+        cost = estimate_session_cost(session_id=session.id, events=events, pricing=pricing)
+        assert cost.line_items[0].execution_profile_fingerprint == profile.fingerprint
+        evidence = await runtime_evidence(
+            app,
+            RuntimeEvidenceRequest(root_session_id=session.id, max_sessions=10, max_events=100),
+        )
+        assert evidence.sessions[0].attempts[0].execution_profile_fingerprint == (
+            profile.fingerprint
+        )
+
+    asyncio.run(exercise())
+
+
+def test_runtime_generated_model_profile_survives_exact_workload_secret_collision() -> None:
+    async def exercise() -> None:
+        baseline_app = CayuApp(enable_logging=False)
+        baseline_app.register_provider(_completed_provider(), default=True)
+        baseline_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        baseline_profile = session_engine_module._execution_profile_identity(
+            registered_agent=baseline_app._agents["assistant"],
+            provider_name="fake",
+            registered_provider=baseline_app._providers["fake"],
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=baseline_app._secret_redactor,
+            process_identity=baseline_app._execution_profile_process_identity,
+        )
+        with pytest.raises(ValueError, match="contains a workload secret"):
+            prepare_new_runtime_event(
+                Event(
+                    type=EventType.MODEL_STARTED,
+                    session_id="untrusted-profile-authority",
+                    payload={
+                        "execution_profile_fingerprint": baseline_profile.fingerprint,
+                    },
+                ),
+                redactor=SecretRedactor(baseline_profile.fingerprint),
+            )
+        checkpoint_event = event_with_execution_profile_fingerprint_authority(
+            Event(
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id="trusted-profile-checkpoint",
+                payload={"checkpoint": "context_compacted"},
+            ),
+            baseline_profile.fingerprint,
+        )
+        prepared_checkpoint = prepare_new_runtime_event(
+            checkpoint_event,
+            redactor=SecretRedactor(baseline_profile.fingerprint),
+        )
+        projected_checkpoint = project_persisted_runtime_event(
+            prepared_checkpoint,
+            sequence=1,
+            redactor=SecretRedactor(baseline_profile.fingerprint),
+        )
+        assert (
+            prepared_checkpoint.payload["execution_profile_fingerprint"]
+            == baseline_profile.fingerprint
+        )
+        assert (
+            projected_checkpoint.payload["execution_profile_fingerprint"]
+            == baseline_profile.fingerprint
+        )
+        with pytest.raises(ValueError, match="contains a workload secret"):
+            prepare_new_runtime_event(
+                Event(
+                    type=EventType.SESSION_CHECKPOINTED,
+                    session_id="untrusted-profile-checkpoint",
+                    payload={
+                        "checkpoint": "context_compacted",
+                        "execution_profile_fingerprint": baseline_profile.fingerprint,
+                    },
+                ),
+                redactor=SecretRedactor(baseline_profile.fingerprint),
+            )
+
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(baseline_profile.fingerprint),
+            enable_logging=False,
+        )
+        app.register_provider(_completed_provider(), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        public_events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-secret-collision",
+                    messages=[Message.text("user", "attribute this request")],
+                )
+            )
+        )
+        session = await store.load("execution-profile-secret-collision")
+        assert session is not None
+        admitted_profile = execution_profile_from_session_metadata(session.metadata)
+        assert admitted_profile == baseline_profile
+        private_events = await store.load_events(session.id)
+        governed_types = {
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
+            EventType.MODEL_COMPLETED,
+        }
+        for events in (public_events, private_events):
+            governed = [event for event in events if event.type in governed_types]
+            assert {event.type for event in governed} == governed_types, [
+                (event.type, event.payload) for event in events
+            ]
+            assert {event.payload.get("execution_profile_fingerprint") for event in governed} == {
+                baseline_profile.fingerprint
+            }
+
+    asyncio.run(exercise())
+
+
+def test_model_retry_and_each_attempt_share_the_frozen_governing_profile() -> None:
+    class RetryProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return _test_behavior_identity("retry-provider")
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.error("OpenAI API request failed with HTTP 429: rate limit")
+                return
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "model": "fake-model",
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 1,
+                        "total_tokens": 3,
+                    },
+                }
+            )
+
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        provider = RetryProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="execution-profile-retry-attribution",
+                    messages=[Message.text("user", "retry this request")],
+                    retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+                )
+            )
+        )
+
+        session = await store.load("execution-profile-retry-attribution")
+        assert session is not None
+        profile = execution_profile_from_session_metadata(session.metadata)
+        events = await store.load_events(session.id)
+        governed_types = {
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
+            EventType.MODEL_ERROR,
+            EventType.MODEL_RETRY,
+            EventType.MODEL_ATTEMPT_DISCARDED,
+            EventType.MODEL_COMPLETED,
+        }
+        governed = [event for event in events if event.type in governed_types]
+
+        assert [event.type for event in governed].count(EventType.MODEL_STARTED) == 2
+        assert [event.type for event in governed].count(EventType.REQUEST_FOOTPRINT_RECORDED) == 2
+        assert {event.type for event in governed} == governed_types
+        assert {event.payload.get("execution_profile_fingerprint") for event in governed} == {
+            profile.fingerprint
+        }
 
     asyncio.run(exercise())
 

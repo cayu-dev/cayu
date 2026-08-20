@@ -8,7 +8,10 @@ from copy import deepcopy
 from typing import Any
 
 import pytest
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    profiled_session_identity,
+    versioned_test_provider_identity,
+)
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
@@ -22,6 +25,8 @@ from cayu import (
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileBehaviorIdentity,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
     ExecutionProfilePolicy,
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyRequest,
@@ -102,6 +107,10 @@ class _AuthorizeForkProfilePolicy(ExecutionProfilePolicy):
 
 
 class _NamedProvider(ModelProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
+
     def __init__(
         self,
         name: str,
@@ -148,6 +157,11 @@ class _NamedProvider(ModelProvider):
             yield event
 
 
+class _ModelAwareOptionsProvider(_NamedProvider):
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return {"test": {"effective_model": request.model}}
+
+
 class _InheritedTextOnlyProvider(ModelProvider):
     name = "text-only"
 
@@ -166,6 +180,10 @@ class _InheritedTextOnlyProvider(ModelProvider):
 
 
 class _CapabilityProvider(ModelProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
+
     def __init__(
         self,
         *,
@@ -354,6 +372,7 @@ def _profiled_source_identity(
     return profiled_session_identity(
         provider_name="source",
         model="source-model",
+        provider=_NamedProvider("source", []),
         tools=[direct_tool],
         tool_policy=(AlwaysRequireApprovalToolPolicy() if require_approval else None),
     )
@@ -390,6 +409,64 @@ def _app(
         tool_policy=(AlwaysRequireApprovalToolPolicy() if require_approval else None),
     )
     return app, session_store
+
+
+def test_same_provider_model_target_does_not_adopt_changed_request_policy() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _ModelAwareOptionsProvider(
+            "source",
+            [
+                [ModelStreamEvent.text_delta("initial"), ModelStreamEvent.completed()],
+                [
+                    ModelStreamEvent.text_delta("must not dispatch"),
+                    ModelStreamEvent.completed(),
+                ],
+            ],
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="source-model"))
+        session_id = "same-provider-target-request-policy-change"
+
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "switch model")],
+                        target=ModelTarget(
+                            provider_name=provider.name,
+                            model="upgraded-model",
+                        ),
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+            ExecutionProfileComponentClass.PROVIDER_TARGET,
+        )
+        assert len(provider.requests) == 1
+        decisions = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_EXECUTION_PROFILE_REJECTED,
+            )
+        )
+        assert len(decisions) == 1
+
+    asyncio.run(scenario())
 
 
 def test_cross_provider_resume_durably_projects_opaque_state() -> None:
@@ -1426,6 +1503,7 @@ def test_model_switch_atomically_rejects_a_concurrent_pending_tool_round() -> No
                     ResumeRequest(
                         session_id="switch-pending-round-race",
                         messages=[Message.text("user", "switch")],
+                        max_steps=1,
                         target=ModelTarget(
                             provider_name="target",
                             model="target-model",
@@ -1677,7 +1755,7 @@ def test_model_switch_preflights_generated_structured_output_instruction() -> No
         supports_file_attachments=True,
         supports_system_messages=False,
     )
-    app, store = _app(source, target)
+    app, store = _app(source, target, authorize_fork_profiles=True)
     asyncio.run(
         _collect(
             app.run(
@@ -1708,6 +1786,7 @@ def test_model_switch_preflights_generated_structured_output_instruction() -> No
                         structured_output=StructuredOutputSpec(
                             json_schema={"type": "object"},
                         ),
+                        profile_adoption=_fork_profile_adoption("structured-output-model-switch"),
                     )
                 )
             )

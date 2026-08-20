@@ -51,7 +51,8 @@ from cayu.runtime.context import (
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
-REQUEST_FOOTPRINT_SCHEMA_VERSION = 1
+REQUEST_FOOTPRINT_SCHEMA_VERSION = 2
+PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION = 1
 REQUEST_FOOTPRINT_CANONICALIZATION_VERSION = 1
 _HMAC_CONTEXT = b"cayu.request-footprint"
 _KEY_ID_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
@@ -360,7 +361,7 @@ class PromptContributionManifest(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != REQUEST_FOOTPRINT_SCHEMA_VERSION:
+        if type(value) is not int or value != PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION:
             raise ValueError("Prompt contribution schema_version must be the integer 1.")
         return value
 
@@ -403,7 +404,8 @@ class RequestFootprint(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
+    execution_profile_fingerprint: str | None = None
     observation_id: str
     provider_name: str
     model: str
@@ -430,8 +432,17 @@ class RequestFootprint(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != REQUEST_FOOTPRINT_SCHEMA_VERSION:
-            raise ValueError("Request footprint schema_version must be the integer 1.")
+        if type(value) is not int or value not in (1, REQUEST_FOOTPRINT_SCHEMA_VERSION):
+            raise ValueError("Request footprint schema_version must be integer 1 or 2.")
+        return value
+
+    @field_validator("execution_profile_fingerprint")
+    @classmethod
+    def validate_execution_profile_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("execution_profile_fingerprint must be a lowercase SHA-256 digest.")
         return value
 
     @field_validator("observation_id", "provider_name", "model")
@@ -473,6 +484,10 @@ class RequestFootprint(BaseModel):
 
     @model_validator(mode="after")
     def validate_attempt(self) -> RequestFootprint:
+        if self.schema_version == 1 and self.execution_profile_fingerprint is not None:
+            raise ValueError("Request footprint schema v1 cannot carry an execution profile.")
+        if self.schema_version >= 2 and self.execution_profile_fingerprint is None:
+            raise ValueError("Request footprint schema v2 requires an execution profile.")
         if self.attempt > self.max_attempts:
             raise ValueError("attempt cannot exceed max_attempts.")
         if (self.operation_id is None) != (self.attempt_id is None):
@@ -520,6 +535,7 @@ def analyze_request_footprint(
     structured_output_instruction: str | None = None,
     operation_id: str | None = None,
     operation_attempt_id: str | None = None,
+    execution_profile_fingerprint: str | None = None,
 ) -> RequestFootprint:
     """Analyze one detached request with the provider's effective cache policy."""
 
@@ -561,6 +577,7 @@ def analyze_request_footprint(
         structured_output_instruction=structured_output_instruction,
         operation_id=operation_id,
         operation_attempt_id=operation_attempt_id,
+        execution_profile_fingerprint=execution_profile_fingerprint,
     )
 
 
@@ -622,6 +639,7 @@ def build_request_footprint(
     structured_output_instruction: str | None = None,
     operation_id: str | None = None,
     operation_attempt_id: str | None = None,
+    execution_profile_fingerprint: str | None = None,
 ) -> RequestFootprint:
     """Analyze one final provider-neutral request without retaining its content."""
 
@@ -669,6 +687,12 @@ def build_request_footprint(
         )
     if structured_output_instruction is not None and type(structured_output_instruction) is not str:
         raise TypeError("structured_output_instruction must be a string or None.")
+    if execution_profile_fingerprint is not None and (
+        type(execution_profile_fingerprint) is not str
+        or len(execution_profile_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in execution_profile_fingerprint)
+    ):
+        raise ValueError("execution_profile_fingerprint must be a lowercase SHA-256 digest.")
 
     resolved_attachments = resolved_file_attachments_from_options(model_request.options)
     attachment_occurrences = _attachment_occurrences(
@@ -859,7 +883,10 @@ def build_request_footprint(
         ),
     )
     return RequestFootprint(
-        schema_version=REQUEST_FOOTPRINT_SCHEMA_VERSION,
+        schema_version=(
+            REQUEST_FOOTPRINT_SCHEMA_VERSION if execution_profile_fingerprint is not None else 1
+        ),
+        execution_profile_fingerprint=execution_profile_fingerprint,
         observation_id=observation_id,
         provider_name=provider_name,
         model=model_request.model,
@@ -921,7 +948,7 @@ def build_prompt_contribution_manifest(
         raise ValueError("A rendered system prompt requires at least one contribution.")
     system_payloads = [Message.text("system", rendered_system_prompt).model_dump(mode="json")]
     return PromptContributionManifest(
-        schema_version=REQUEST_FOOTPRINT_SCHEMA_VERSION,
+        schema_version=PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION,
         system=RequestComponentFootprint(count=1, size=_request_size(system_payloads)),
         system_fingerprint=_fingerprint(
             system_payloads,

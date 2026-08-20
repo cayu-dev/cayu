@@ -140,6 +140,7 @@ class _ToolEventBoundary:
 
 _MODEL_EXECUTION_AUTHORITY_KEYS = frozenset(
     {
+        "execution_profile_fingerprint",
         "model_attempt_id",
         "model_step_id",
         "tool_round_id",
@@ -525,7 +526,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("duplicate_request_risk",): frozenset({True, False}),
     },
     EventType.REQUEST_FOOTPRINT_RECORDED: {
-        ("schema_version",): frozenset({1}),
+        ("schema_version",): frozenset({1, 2}),
         ("request_variant",): _REQUEST_VARIANT_VALUES,
         ("messages", "groups", "*", "role"): _REQUEST_MESSAGE_ROLE_VALUES,
         ("messages", "groups", "*", "part_type"): _REQUEST_MESSAGE_PART_TYPE_VALUES,
@@ -1557,19 +1558,22 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = interaction_summary
 
     model_started = _observed_policy(
-        "actor attempt attempt_id compactor instruction_digest instruction_present max_attempts "
+        "actor attempt attempt_id compactor execution_profile_fingerprint instruction_digest instruction_present max_attempts "
         "mode model model_attempt_id model_step_id operation_id provider purpose reason request_id "
         "source_run_epoch source_transcript_cursor step",
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.MODEL_STARTED] = model_started
     policies[EventType.REQUEST_FOOTPRINT_RECORDED] = _observed_policy(
-        "attempt attempt_id attachments cache_breakpoints component_tokens context_pressure "
+        "attempt attempt_id attachments cache_breakpoints component_tokens context_pressure execution_profile_fingerprint "
         "fingerprints max_attempts messages model model_attempt_id model_step_id observation_id "
         "operation_id options provider_name prompt_contributions request_variant schema_version "
         "step structured_output tools total",
         owned_nested_paths=_REQUEST_FOOTPRINT_NESTED_PATHS,
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     model_delta = _policy(
         "attempt",
@@ -1580,6 +1584,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "step",
         "provider_operation_progress",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         internal_keys={"provider_operation_progress"},
         exact_internal_keys={"provider_operation_progress"},
     )
@@ -1651,6 +1656,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             }
         ),
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         internal_keys={"provider_operation_progress"},
         exact_internal_keys={"provider_operation_progress"},
         nested_authority_paths=_MODEL_BUDGET_SETTLEMENT_AUTHORITY_PATHS,
@@ -1688,6 +1694,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         *model_failure_keys,
         "provider_operation_progress",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         internal_keys={"provider_operation_progress"},
         exact_internal_keys={"provider_operation_progress"},
     )
@@ -1698,6 +1705,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "next_attempt",
         "reason",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.MODEL_ATTEMPT_DISCARDED] = _policy(
         "attempt",
@@ -1711,6 +1719,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "status_code",
         "step",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     provider_operation_starting_keys = (
         "attempt",
@@ -1726,6 +1735,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.PROVIDER_OPERATION_STARTING] = _policy(
         *provider_operation_starting_keys,
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"start_id"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         internal_authority_keys={"start_id"},
     )
     policies[EventType.PROVIDER_OPERATION_STARTED] = _policy(
@@ -1746,7 +1756,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS
         | {"operation_id", "start_id", "stream_protocol"},
         internal_authority_keys={"start_id"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
         internal_keys={"recovery_metadata"},
         exact_internal_keys={"recovery_metadata"},
     )
@@ -1761,7 +1775,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "step",
         "stream_protocol",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
         internal_keys={"provider_operation_progress"},
         exact_internal_keys={"provider_operation_progress"},
     )
@@ -1782,17 +1800,29 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED] = _policy(
         *provider_operation_recovery_keys,
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
     )
     policies[EventType.PROVIDER_OPERATION_RECONNECT_STARTED] = _policy(
         *provider_operation_recovery_keys,
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
     )
     policies[EventType.PROVIDER_OPERATION_RECONCILED] = _policy(
         *provider_operation_recovery_keys,
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
     )
     provider_operation_cancellation_keys = (
         *provider_operation_recovery_keys,
@@ -1803,12 +1833,20 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.PROVIDER_OPERATION_CANCEL_REQUESTED] = _policy(
         *provider_operation_cancellation_keys,
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
     )
     policies[EventType.PROVIDER_OPERATION_CANCEL_RESOLVED] = _policy(
         *provider_operation_cancellation_keys,
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
     )
     provider_cleanup_failure_paths = {
         ("provider_cleanup_failure", field_name)
@@ -1830,7 +1868,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS
         | {"operation_id", "start_id", "stream_protocol"},
         internal_authority_keys={"start_id"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
         untrusted_container_keys={"provider_cleanup_failure"},
     )
     policies[EventType.PROVIDER_OPERATION_RESOLVED] = _policy(
@@ -1852,7 +1894,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "stream_protocol",
         },
         internal_authority_keys={"resolution_id", "stage_id"},
-        public_authority_keys={"operation_id", "stream_protocol"},
+        public_authority_keys={
+            "operation_id",
+            "stream_protocol",
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        },
         untrusted_container_keys={"metadata"},
     )
 
@@ -2442,7 +2488,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.SESSION_CHECKPOINTED] = _observed_policy(
         "actor approval_id attempt_id calls checkpoint cleared compacted_transcript_cursor "
         "compactor estimated_context_input_tokens estimated_context_window_tokens "
-        "estimated_delta_input_tokens input_id instruction_digest instruction_present "
+        "estimated_delta_input_tokens execution_profile_fingerprint input_id instruction_digest instruction_present "
         "last_input_tokens last_total_tokens last_transcript_cursor min_input_tokens "
         "min_total_tokens mode model_attempt_id model_step_id "
         "newly_compacted_message_count operation_id "
@@ -2451,6 +2497,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "reserved_output_tokens result_transcript_cursor source_run_epoch "
         "source_transcript_cursor tool_call_id tool_round_id "
         "trigger_estimated_context_tokens",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
     )
     policies[EventType.SESSION_FORKED] = _policy(
@@ -2573,7 +2621,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
 
     budget_common = (
         "accepted action actor actual attempt_id budget_limit_id compactor cost_summary "
-        "currency instruction_digest instruction_present key limit_reached maximum message "
+        "currency execution_profile_fingerprint instruction_digest instruction_present key limit_reached maximum message "
         "mode model_attempt_id model_step_id model_steps operation_id reason request_id "
         "requested scope source_run_epoch source_transcript_cursor unpriced_model_steps "
         "window window_details"
@@ -2585,11 +2633,15 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     ):
         policies[event_type] = _observed_policy(
             budget_common,
+            authority_keys={"execution_profile_fingerprint"},
+            public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
             owned_nested_paths=_resolution_actor_nested_paths("actor"),
         )
     policies[EventType.BUDGET_RESERVED] = _observed_policy(
         budget_common
         + " agent_name billing_identity model provider_name reservation_id session_id",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         owned_nested_paths=(
             _resolution_actor_nested_paths("actor")
             | _billing_identity_schema_paths(("billing_identity",))
@@ -2601,7 +2653,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         },
     )
     settlement_policy = _observed_policy(
-        "actor actual_amount attempt_id billing_identity budget_limit_id compactor "
+        "actor actual_amount attempt_id billing_identity budget_limit_id compactor execution_profile_fingerprint "
         "instruction_digest instruction_present interaction_id mode model_attempt_id "
         "model_step_id operation_id pricing reason released_amount request_id reservation_id "
         "reserved_amount settled_at_unix_us settlement_id settlement_kind source_run_epoch "
@@ -2609,6 +2661,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         owned_nested_paths=(
             _resolution_actor_nested_paths("actor") | _BUDGET_RECONCILIATION_NESTED_PATHS
         ),
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_paths=_BUDGET_RECONCILIATION_UNTRUSTED_PATHS,
     )
     policies[EventType.BUDGET_RECONCILED] = settlement_policy
@@ -2673,8 +2727,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = task_policy
 
     structured_policy = _observed_policy(
-        "attempt errors max_retries model_attempt_id model_step_id name output step strategy "
-        "tool_round_id valid",
+        "attempt errors execution_profile_fingerprint max_retries model_attempt_id model_step_id "
+        "name output step strategy tool_round_id valid",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"errors", "output"},
     )
     for event_type in (
@@ -2688,11 +2744,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     compaction_policy = _observed_policy(
         "actor attempt_id bounded_input checkpoint chunk_count chunk_mode "
         "compacted_transcript_cursor compaction_failed compactor coverage_mode error_type "
+        "execution_profile_fingerprint "
         "instruction_digest instruction_present mode model_step_id "
         "newly_compacted_message_count operation_id previous_compacted_transcript_cursor "
         "reason recent_message_count represented_message_count represented_source_end "
         "represented_source_start request_id requested_source_end requested_source_start "
         "result_transcript_cursor source_run_epoch source_transcript_cursor summary_chars",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
     )
     for event_type in (
@@ -2704,28 +2763,38 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
 
     count_policy = _observed_policy(
         "attempt count durable_value_error_code durable_value_path error error_type "
+        "execution_profile_fingerprint "
         "max_attempts messages model model_attempt_id model_step_id observation_id options "
         "provider step tools",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"messages", "options", "tools"},
     )
     policies[EventType.CONTEXT_COUNTED] = count_policy
     policies[EventType.CONTEXT_COUNT_FAILED] = count_policy
     pressure_policy = _observed_policy(
-        "attempt estimate max_attempts messages model model_attempt_id model_step_id "
+        "attempt estimate execution_profile_fingerprint max_attempts messages model model_attempt_id model_step_id "
         "observation_id options provider step tools",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"messages", "options", "tools"},
     )
     policies[EventType.CONTEXT_PRESSURE_ESTIMATED] = pressure_policy
     reconciliation_policy = _observed_policy(
-        "actual_input_tokens attempt delta_tokens max_attempts model model_attempt_id "
+        "actual_input_tokens attempt delta_tokens execution_profile_fingerprint max_attempts model model_attempt_id "
         "model_step_id observation_id pre_call_count pre_call_estimate provider reconciled "
-        "relative_error step"
+        "relative_error step",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.CONTEXT_COUNT_RECONCILED] = reconciliation_policy
     policies[EventType.CONTEXT_PRESSURE_RECONCILED] = reconciliation_policy
     overflow_policy = _observed_policy(
-        "error error_type model_attempt_id model_step_id original_message_count phase policy "
-        "provider provider_error_code recovery_message_count status_code step"
+        "error error_type execution_profile_fingerprint model_attempt_id model_step_id "
+        "original_message_count phase policy provider provider_error_code "
+        "recovery_message_count status_code step",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.CONTEXT_OVERFLOW_DETECTED] = overflow_policy
     policies[EventType.CONTEXT_OVERFLOW_RECOVERING] = overflow_policy
@@ -2733,9 +2802,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
 
     knowledge_policy = _observed_policy(
         "anchor_transcript_index candidate_count durable_value_error_code "
-        "durable_value_error_path error error_type format hit_count injected_bytes "
+        "durable_value_error_path error error_type execution_profile_fingerprint format hit_count injected_bytes "
         "manifest_truncated model_step_id policy projection query query_chars sources "
         "total_hits_known truncated",
+        authority_keys={"execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"sources"},
     )
     for event_type in (
@@ -3650,15 +3721,17 @@ def _reject_secret_authority_values(
                     "be used as durable event authority."
                 )
             continue
-        # Workspace-observer producers attest ``observer`` only when the
-        # lifecycle carries structural ``runtime_builtin`` provenance.  That
-        # positive evidence must win over an accidental exact collision with a
-        # workload secret; configured observers are deliberately not attested
-        # and continue through the ordinary secret-admission checks below.
-        if field_name == "observer" and event_payload_authority_is_runtime_generated(
-            event,
-            field_name=field_name,
-            value=value,
+        # Structurally trusted observer/profile producers attest their exact
+        # runtime-generated authority. That positive evidence must win over an
+        # accidental exact collision with a workload secret; caller-controlled
+        # values are not attested and continue through the ordinary admission
+        # checks below.
+        if field_name in {"observer", "execution_profile_fingerprint"} and (
+            event_payload_authority_is_runtime_generated(
+                event,
+                field_name=field_name,
+                value=value,
+            )
         ):
             continue
         if redactor.is_exact_secret(value):

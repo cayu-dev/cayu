@@ -4281,6 +4281,18 @@
           "title": "Currency",
           "type": "string"
         },
+        "execution_profile_fingerprint": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Execution Profile Fingerprint"
+        },
         "input_cost": {
           "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Input Cost",
@@ -7747,7 +7759,7 @@
       "type": "object"
     },
     "ToolApprovalBody": {
-      "description": "Body for resolving a pending tool approval.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run inherits the original run's configuration\npersisted on the pending approval. Explicit values override it.",
+      "description": "Body for resolving a pending tool approval.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run inherits the original run's configuration\npersisted on the pending approval. Explicit values are accepted only when\nthey preserve the invocation's frozen execution profile.",
       "properties": {
         "approval_id": {
           "minLength": 1,
@@ -7886,7 +7898,7 @@
       "type": "string"
     },
     "ToolApprovalRecoveryBody": {
-      "description": "Body for recovering an approved tool call with an unknown result.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run inherits the original run's configuration\npersisted on the pending approval. Explicit values override it.",
+      "description": "Body for recovering an approved tool call with an unknown result.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run inherits the original run's configuration\npersisted on the pending approval. Explicit values are accepted only when\nthey preserve the invocation's frozen execution profile.",
       "properties": {
         "approval_id": {
           "minLength": 1,
@@ -8051,7 +8063,7 @@
       "type": "string"
     },
     "ToolRoundRecoveryBody": {
-      "description": "Body for recovering a crashed ordinary tool call with an operator outcome.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run applies the runtime defaults (a pending tool\nround persists no run configuration). Explicit values override them.",
+      "description": "Body for recovering a crashed ordinary tool call with an operator outcome.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``, which restores the configuration persisted with the pending\ntool round. An explicit value is accepted only when it preserves the\ninvocation's frozen execution profile.",
       "properties": {
         "artifacts": {
           "items": {
@@ -9142,7 +9154,7 @@
       "type": "object"
     },
     "UserInputRecoveryBody": {
-      "description": "Body for recovering a user-input round stuck on ``manual_recovery_required``.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the\nresumed run inherits the original run's configuration persisted on the pending user input.",
+      "description": "Body for recovering a user-input round stuck on ``manual_recovery_required``.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the\nresumed run inherits the original run's configuration persisted on the pending user input.\nExplicit values are accepted only when they preserve the invocation's frozen execution\nprofile.",
       "properties": {
         "answer": {
           "minLength": 1,
@@ -9299,7 +9311,7 @@
       "type": "object"
     },
     "UserInputResolveBody": {
-      "description": "Body for answering a session paused by ``ask_user``.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the\nresumed run inherits the original run's configuration persisted on the pending user input.",
+      "description": "Body for answering a session paused by ``ask_user``.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the\nresumed run inherits the original run's configuration persisted on the pending user input.\nExplicit values are accepted only when they preserve the invocation's frozen execution\nprofile.",
       "properties": {
         "answer": {
           "minLength": 1,

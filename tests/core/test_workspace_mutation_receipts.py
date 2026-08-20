@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -184,7 +185,13 @@ def test_workspace_observer_authority_matching_requires_equal_provenance(
     )
 
 
-class _ScriptedProvider(ModelProvider):
+class _VersionedWorkspaceTestProvider(ModelProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
+
+
+class _ScriptedProvider(_VersionedWorkspaceTestProvider):
     name = "scripted"
 
     def __init__(self) -> None:
@@ -211,7 +218,7 @@ class _ScriptedProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class _BulkProvider(ModelProvider):
+class _BulkProvider(_VersionedWorkspaceTestProvider):
     name = "bulk"
 
     def __init__(self) -> None:
@@ -228,7 +235,7 @@ class _BulkProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class _CancelProvider(ModelProvider):
+class _CancelProvider(_VersionedWorkspaceTestProvider):
     name = "cancel"
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -241,7 +248,7 @@ class _CancelProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
 
-class _SingleToolProvider(ModelProvider):
+class _SingleToolProvider(_VersionedWorkspaceTestProvider):
     name = "single-workspace-tool"
 
     def __init__(self, *, tool_name: str, arguments: dict) -> None:
@@ -340,7 +347,7 @@ class _CompletionThenSingleToolProvider(_SingleToolProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class _DetachedRunnerThenFollowingProvider(ModelProvider):
+class _DetachedRunnerThenFollowingProvider(_VersionedWorkspaceTestProvider):
     name = "detached-runner-then-following"
 
     def __init__(self) -> None:
@@ -387,7 +394,7 @@ class _AwaitedRunnerThenFollowingProvider(_DetachedRunnerThenFollowingProvider):
             yield event
 
 
-class _AwaitedRunnerAndFollowingProvider(ModelProvider):
+class _AwaitedRunnerAndFollowingProvider(_VersionedWorkspaceTestProvider):
     name = "awaited-runner-and-following"
 
     def __init__(self) -> None:
@@ -413,7 +420,7 @@ class _AwaitedRunnerAndFollowingProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class _PreDispatchRunnerReuseProvider(ModelProvider):
+class _PreDispatchRunnerReuseProvider(_VersionedWorkspaceTestProvider):
     name = "pre-dispatch-runner-reuse"
 
     def __init__(self) -> None:
@@ -434,7 +441,7 @@ class _PreDispatchRunnerReuseProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class _ConcurrentFactoryMutationProvider(ModelProvider):
+class _ConcurrentFactoryMutationProvider(_VersionedWorkspaceTestProvider):
     name = "concurrent-factory-mutation"
 
     def __init__(self) -> None:
@@ -455,7 +462,7 @@ class _ConcurrentFactoryMutationProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class _SiblingSecretProvider(ModelProvider):
+class _SiblingSecretProvider(_VersionedWorkspaceTestProvider):
     name = "sibling-secret"
 
     def __init__(self, secret_path: str) -> None:
@@ -483,7 +490,7 @@ class _SiblingSecretProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class _UserInputThenMutationProvider(ModelProvider):
+class _UserInputThenMutationProvider(_VersionedWorkspaceTestProvider):
     name = "user-input-mutation"
 
     def __init__(self) -> None:
@@ -5566,6 +5573,15 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
     git("add", "README.md")
     git("commit", "-m", "baseline")
 
+    class DigitSafeBulkProvider(_BulkProvider):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="fixture:workspace-mutation:bulk",
+                behavior_version="stable",
+                implementation_version="stable",
+            )
+
     async def run():
         store = InMemorySessionStore()
         artifacts = LocalArtifactStore(artifact_root, store_id="artifact-store")
@@ -5577,7 +5593,7 @@ def test_large_workspace_receipt_uses_integrity_checked_artifact_reference(tmp_p
             # those identities admissible without trusting configured input.
             secret_redactor=SecretRedactor(["workspace-secret-value", *"0123456789"]),
         )
-        app.register_provider(_BulkProvider(), default=True)
+        app.register_provider(DigitSafeBulkProvider(), default=True)
         app.register_environment(
             Environment(
                 _portable_environment_spec("local"),

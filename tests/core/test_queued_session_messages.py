@@ -5,17 +5,35 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    profiled_session_identity,
+    versioned_test_provider_identity,
+)
 
-from cayu.core import AgentSpec, Event, EventType, Message, MessageRole
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    MessageRole,
+)
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     EnqueueSessionMessageRequest,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     InMemorySessionStore,
     InterruptSessionRequest,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
@@ -34,7 +52,30 @@ from cayu.tools.user_input import UserInputTool
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
-class BlockingTwoTurnProvider(ModelProvider):
+class _ReconstructableQueuedProvider(ModelProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
+
+
+class _AuthorizeQueuedContinuationPolicy(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "tests:queued-continuation-authority:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        assert request.authority_review_required is True
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="Authorize the larger model-step limit for queued continuation.",
+            authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+        )
+
+
+class BlockingTwoTurnProvider(_ReconstructableQueuedProvider):
     name = "blocking-two-turn"
 
     def __init__(self) -> None:
@@ -54,7 +95,7 @@ class BlockingTwoTurnProvider(ModelProvider):
         yield ModelStreamEvent.completed({})
 
 
-class RecordingOneShotProvider(ModelProvider):
+class RecordingOneShotProvider(_ReconstructableQueuedProvider):
     name = "recording-one-shot"
 
     def __init__(self) -> None:
@@ -66,7 +107,7 @@ class RecordingOneShotProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class ToolRoundProvider(ModelProvider):
+class ToolRoundProvider(_ReconstructableQueuedProvider):
     name = "tool-round"
 
     def __init__(self) -> None:
@@ -89,7 +130,7 @@ class ToolRoundProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class BlockingApprovalProvider(ModelProvider):
+class BlockingApprovalProvider(_ReconstructableQueuedProvider):
     name = "blocking-approval"
 
     def __init__(self) -> None:
@@ -116,7 +157,7 @@ class BlockingApprovalProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-class BlockingUserInputProvider(ModelProvider):
+class BlockingUserInputProvider(_ReconstructableQueuedProvider):
     name = "blocking-user-input"
 
     def __init__(self) -> None:
@@ -954,7 +995,11 @@ def test_queued_message_at_model_step_limit_interrupts_and_survives_resume() -> 
     async def run() -> None:
         store = InMemorySessionStore()
         provider = BlockingTwoTurnProvider()
-        controller = CayuApp(session_store=store, enable_logging=False)
+        controller = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AuthorizeQueuedContinuationPolicy(),
+            enable_logging=False,
+        )
         controller.register_provider(provider)
         controller.register_agent(AgentSpec(name="assistant", model="fake-model"))
         accepting_process = CayuApp(session_store=store, enable_logging=False)
@@ -1001,6 +1046,15 @@ def test_queued_message_at_model_step_limit_interrupts_and_survives_resume() -> 
                 ResumeRequest(
                     session_id="sess_queue_step_limit",
                     messages=[Message.text("user", "resume")],
+                    max_steps=2,
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="queued-step-limit-continuation-v1",
+                        reason="Continue the queued message with one additional model step.",
+                        requested_by=ResolutionActor(
+                            subject="test",
+                            source=ResolutionActorSource.SYSTEM,
+                        ),
+                    ),
                 )
             )
         ]
@@ -1052,6 +1106,7 @@ def test_enqueue_replay_and_conflict_are_deterministic() -> None:
 def test_queued_message_survives_interruption_and_is_delivered_on_resume() -> None:
     async def run() -> None:
         store = InMemorySessionStore()
+        provider = RecordingOneShotProvider()
         await store.create(
             RunRequest(
                 agent_name="assistant",
@@ -1061,6 +1116,7 @@ def test_queued_message_survives_interruption_and_is_delivered_on_resume() -> No
             identity=profiled_session_identity(
                 provider_name="recording-one-shot",
                 model="fake-model",
+                provider=provider,
             ),
         )
         accepting_process = CayuApp(session_store=store, enable_logging=False)
@@ -1078,7 +1134,6 @@ def test_queued_message_survives_interruption_and_is_delivered_on_resume() -> No
             to_status=SessionStatus.INTERRUPTED,
         )
 
-        provider = RecordingOneShotProvider()
         recovering_process = CayuApp(session_store=store, enable_logging=False)
         recovering_process.register_provider(provider)
         recovering_process.register_agent(AgentSpec(name="assistant", model="fake-model"))

@@ -17,7 +17,14 @@ from tests.core._workload_secret_support import (
     collect_resume_events,
 )
 
-from cayu.core import AgentSpec, Event, EventType, Message, ToolResultPart
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    ToolResultPart,
+)
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelStreamEvent
 from cayu.runtime import (
@@ -446,6 +453,14 @@ def test_pending_tool_round_materialization_reapplies_secret_redaction() -> None
         def __init__(self) -> None:
             self.requests: list[ContextRequest] = []
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:tool-round-materialization-context-policy",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def build(self, request: ContextRequest) -> list[Message]:
             self.requests.append(request)
             return request.messages
@@ -466,11 +481,13 @@ def test_pending_tool_round_materialization_reapplies_secret_redaction() -> None
                 ]
             ]
         )
+        context_policy = RecordingContextPolicy()
         initial_app = CayuApp(session_store=store, enable_logging=False)
         initial_app.register_provider(initial_provider, default=True)
         initial_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[SideEffectTool()],
+            context_policy=context_policy,
         )
         initial_events = await collect_events(
             initial_app,
@@ -481,6 +498,7 @@ def test_pending_tool_round_materialization_reapplies_secret_redaction() -> None
             ),
         )
         assert initial_events[-1].type is EventType.SESSION_FAILED
+        context_policy.requests.clear()
 
         resumed_provider = FakeProvider(
             [
@@ -490,7 +508,6 @@ def test_pending_tool_round_materialization_reapplies_secret_redaction() -> None
                 ]
             ]
         )
-        context_policy = RecordingContextPolicy()
         resumed_app = CayuApp(
             session_store=store,
             secret_redactor=SecretRedactor(secret),

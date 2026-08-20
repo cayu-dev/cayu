@@ -2714,6 +2714,10 @@ export type CostLineItem = {
      */
     currency: string;
     /**
+     * Execution Profile Fingerprint
+     */
+    execution_profile_fingerprint?: string | null;
+    /**
      * Input Cost
      */
     input_cost: string;
@@ -6313,7 +6317,8 @@ export type TieredPricing = {
  *
  * ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
  * to ``None``: the resumed run inherits the original run's configuration
- * persisted on the pending approval. Explicit values override it.
+ * persisted on the pending approval. Explicit values are accepted only when
+ * they preserve the invocation's frozen execution profile.
  */
 export type ToolApprovalBody = {
     /**
@@ -6370,7 +6375,8 @@ export type ToolApprovalDecision = 'approve' | 'deny';
  *
  * ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
  * to ``None``: the resumed run inherits the original run's configuration
- * persisted on the pending approval. Explicit values override it.
+ * persisted on the pending approval. Explicit values are accepted only when
+ * they preserve the invocation's frozen execution profile.
  */
 export type ToolApprovalRecoveryBody = {
     /**
@@ -6540,8 +6546,9 @@ export type ToolResultProjectionPolicyManifest = {
  * Body for recovering a crashed ordinary tool call with an operator outcome.
  *
  * ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
- * to ``None``: the resumed run applies the runtime defaults (a pending tool
- * round persists no run configuration). Explicit values override them.
+ * to ``None``, which restores the configuration persisted with the pending
+ * tool round. An explicit value is accepted only when it preserves the
+ * invocation's frozen execution profile.
  */
 export type ToolRoundRecoveryBody = {
     /**
@@ -7197,6 +7204,8 @@ export type UsageUnpricedReason = {
  *
  * ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
  * resumed run inherits the original run's configuration persisted on the pending user input.
+ * Explicit values are accepted only when they preserve the invocation's frozen execution
+ * profile.
  */
 export type UserInputRecoveryBody = {
     /**
@@ -7264,6 +7273,8 @@ export type UserInputRecoveryBody = {
  *
  * ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
  * resumed run inherits the original run's configuration persisted on the pending user input.
+ * Explicit values are accepted only when they preserve the invocation's frozen execution
+ * profile.
  */
 export type UserInputResolveBody = {
     /**

@@ -589,6 +589,18 @@ class OtherProvider(FakeProvider):
     name = "other"
 
 
+class VersionedFakeProvider(FakeProvider):
+    """Opaque fake whose request behavior is stable across test app instances."""
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:runtime:versioned-fake-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+
 class NativeStructuredOutputFakeProvider(FakeProvider):
     supports_native_structured_output = True
 
@@ -1776,7 +1788,12 @@ def test_request_footprint_is_default_on_before_model_start_without_provider_cou
     assert provider.count_requests == []
 
     footprint = events[footprint_index].payload
-    assert footprint["schema_version"] == 1
+    assert footprint["schema_version"] == 2
+    assert footprint["execution_profile_fingerprint"] == next(
+        event.payload["execution_profile_fingerprint"]
+        for event in events
+        if event.type is EventType.MODEL_STARTED
+    )
     assert footprint["provider_name"] == "fake"
     assert footprint["model"] == "fake-model"
     assert footprint["step"] == 1
@@ -2451,6 +2468,37 @@ def test_request_footprint_records_model_backed_compaction_dispatch(
         if event.type == EventType.MODEL_STARTED
         and event.payload["provider"] == "compaction-provider"
     )
+    session = asyncio.run(request_footprint_session_store.load("sess_request_footprint_compaction"))
+    assert session is not None
+    profile_fingerprint = execution_profiles_module.execution_profile_from_session_metadata(
+        session.metadata
+    ).fingerprint
+    governed_compaction_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.CONTEXT_COMPACTION_COMPLETED,
+            EventType.SESSION_CHECKPOINTED,
+        }
+        or (
+            event.type
+            in {
+                EventType.REQUEST_FOOTPRINT_RECORDED,
+                EventType.MODEL_STARTED,
+                EventType.MODEL_COMPLETED,
+            }
+            and (
+                event.payload.get("request_variant") == "context_compaction"
+                or event.payload.get("provider") == "compaction-provider"
+            )
+        )
+    ]
+    assert governed_compaction_events
+    assert {
+        event.payload.get("execution_profile_fingerprint") for event in governed_compaction_events
+    } == {profile_fingerprint}
     assert events.index(compaction_footprint) < events.index(compaction_started)
     assert (
         compaction_started.payload["model_step_id"]
@@ -2690,7 +2738,7 @@ def test_request_footprint_survives_sqlite_reconstruction(
 
     expected_identity, reconstructed = asyncio.run(run())
 
-    assert reconstructed.schema_version == 1
+    assert reconstructed.schema_version == 2
     assert reconstructed.fingerprints.provider_neutral_request.canonicalization_version == 1
     assert reconstructed.fingerprints.provider_neutral_request.value == expected_identity
     assert reconstructed.fingerprints.provider_neutral_request.availability == (
@@ -5228,6 +5276,7 @@ def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoi
     assert events[5].payload == {
         "checkpoint": "context_compaction",
         "compacted_transcript_cursor": 2,
+        "execution_profile_fingerprint": events[1].payload["execution_profile_fingerprint"],
         "previous_compacted_transcript_cursor": 0,
         "newly_compacted_message_count": 2,
         "recent_message_count": 1,
@@ -10745,7 +10794,9 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert provider.requests[0].tools == []
 
     records = asyncio.run(store.query_events(EventQuery(session_id="sess_text")))
-    projected = [app.project_event_record_for_exposure(record).event for record in records]
+    projected = [
+        app._project_persisted_event_record_for_exposure(record).event for record in records
+    ]
     assert _without_interaction_lifecycle(sink.events) == _without_interaction_lifecycle(projected)
     session = asyncio.run(store.load("sess_text"))
 
@@ -11053,15 +11104,41 @@ def test_cayu_app_request_notify_budget_dedupes_during_tool_round():
 def test_cayu_app_request_session_budget_uses_rolling_window():
     async def run():
         store = InMemorySessionStore()
+        rolling_limit = fake_budget_limit(
+            "0.50",
+            window=BudgetWindow.rolling(seconds=60),
+        )
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("new answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000,
+                        },
+                    }
+                ),
+            ]
+        )
+        app = CayuApp(session_store=store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         await store.create(
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_rolling_request_budget",
                 messages=[Message.text("user", "old")],
+                budget_limits=(rolling_limit,),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                request_budget_limits=(rolling_limit,),
+                causal_budget_id="sess_rolling_request_budget",
+                app=app,
             ),
         )
         await store.append_event(
@@ -11083,36 +11160,12 @@ def test_cayu_app_request_session_budget_uses_rolling_window():
         )
         await store.update_status("sess_rolling_request_budget", SessionStatus.COMPLETED)
 
-        provider = FakeProvider(
-            [
-                ModelStreamEvent.text_delta("new answer"),
-                ModelStreamEvent.completed(
-                    {
-                        "finish_reason": "stop",
-                        "usage": {
-                            "input_tokens": 1_000,
-                            "output_tokens": 0,
-                            "total_tokens": 1_000,
-                        },
-                    }
-                ),
-            ]
-        )
-        app = CayuApp(session_store=store)
-        app.register_provider(provider, default=True)
-        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
         events = await collect_resume_events(
             app,
             ResumeRequest(
                 session_id="sess_rolling_request_budget",
                 messages=[Message.text("user", "continue")],
-                budget_limits=(
-                    fake_budget_limit(
-                        "0.50",
-                        window=BudgetWindow.rolling(seconds=60),
-                    ),
-                ),
+                budget_limits=(rolling_limit,),
             ),
         )
         session = await store.load("sess_rolling_request_budget")
@@ -11732,6 +11785,7 @@ def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
+    limits = RunLimits(max_total_tokens=10, scope="session")
     asyncio.run(
         collect_events(
             app,
@@ -11739,6 +11793,7 @@ def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
                 agent_name="assistant",
                 session_id="sess_resume_limit",
                 messages=[Message.text("user", "first")],
+                limits=limits,
             ),
         )
     )
@@ -11749,7 +11804,7 @@ def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
             ResumeRequest(
                 session_id="sess_resume_limit",
                 messages=[Message.text("user", "second")],
-                limits=RunLimits(max_total_tokens=10, scope="session"),
+                limits=limits,
             ),
         )
     )
@@ -11804,6 +11859,7 @@ def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
+    limits = RunLimits(max_total_tokens=10, scope="run")
     asyncio.run(
         collect_events(
             app,
@@ -11811,6 +11867,7 @@ def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
                 agent_name="assistant",
                 session_id="sess_run_scope",
                 messages=[Message.text("user", "first")],
+                limits=limits,
             ),
         )
     )
@@ -11824,7 +11881,7 @@ def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
             ResumeRequest(
                 session_id="sess_run_scope",
                 messages=[Message.text("user", "second")],
-                limits=RunLimits(max_total_tokens=10, scope="run"),
+                limits=limits,
             ),
         )
     )
@@ -11876,6 +11933,7 @@ def test_cayu_app_default_scope_resume_ignores_prior_session_usage():
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
+    limits = RunLimits(max_total_tokens=10)
     asyncio.run(
         collect_events(
             app,
@@ -11883,6 +11941,7 @@ def test_cayu_app_default_scope_resume_ignores_prior_session_usage():
                 agent_name="assistant",
                 session_id="sess_default_scope",
                 messages=[Message.text("user", "first")],
+                limits=limits,
             ),
         )
     )
@@ -11896,7 +11955,7 @@ def test_cayu_app_default_scope_resume_ignores_prior_session_usage():
             ResumeRequest(
                 session_id="sess_default_scope",
                 messages=[Message.text("user", "second")],
-                limits=RunLimits(max_total_tokens=10),
+                limits=limits,
             ),
         )
     )
@@ -11929,6 +11988,7 @@ def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
+    limits = RunLimits(max_elapsed_seconds=60, scope="session")
     asyncio.run(
         collect_events(
             app,
@@ -11936,6 +11996,7 @@ def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
                 agent_name="assistant",
                 session_id="sess_session_elapsed",
                 messages=[Message.text("user", "first")],
+                limits=limits,
             ),
         )
     )
@@ -11949,7 +12010,7 @@ def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
             ResumeRequest(
                 session_id="sess_session_elapsed",
                 messages=[Message.text("user", "second")],
-                limits=RunLimits(max_elapsed_seconds=60, scope="session"),
+                limits=limits,
             ),
         )
     )
@@ -16822,6 +16883,7 @@ def test_cayu_app_run_scoped_budget_limit_ignores_prior_session_cost():
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
+    run_budget = fake_budget_limit("0.002", scope="run")
     asyncio.run(
         collect_events(
             app,
@@ -16829,6 +16891,7 @@ def test_cayu_app_run_scoped_budget_limit_ignores_prior_session_cost():
                 agent_name="assistant",
                 session_id="sess_run_scope_cost",
                 messages=[Message.text("user", "first")],
+                budget_limits=(run_budget,),
             ),
         )
     )
@@ -16839,7 +16902,7 @@ def test_cayu_app_run_scoped_budget_limit_ignores_prior_session_cost():
             ResumeRequest(
                 session_id="sess_run_scope_cost",
                 messages=[Message.text("user", "second")],
-                budget_limits=(fake_budget_limit("0.002", scope="run"),),
+                budget_limits=(run_budget,),
             ),
         )
     )
@@ -17016,6 +17079,7 @@ def test_cayu_app_rejects_completed_session_with_pending_tool_round():
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         await store.checkpoint("completed_pending_round", checkpoint)
@@ -17435,7 +17499,7 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
         parent_app = CayuApp(session_store=store, enable_logging=False)
         register_body(
             parent_app,
-            FakeProvider(
+            VersionedFakeProvider(
                 [
                     ModelStreamEvent.text_delta("first memory"),
                     ModelStreamEvent.completed({"finish_reason": "stop"}),
@@ -17467,7 +17531,7 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
             execution_profile_policy=_AllowForkProfileAdoption(),
             enable_logging=False,
         )
-        register_body(crashing_app, FakeProvider([]), system_prompt="child prompt")
+        register_body(crashing_app, VersionedFakeProvider([]), system_prompt="child prompt")
         with pytest.raises(SystemExit, match="descendant commit"):
             await collect_fork_events(crashing_app, request)
         assert await store.load("sess_prompt_advanced_child") is not None
@@ -17481,7 +17545,7 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
         advanced_app = CayuApp(session_store=advanced_store, enable_logging=False)
         register_body(
             advanced_app,
-            FakeProvider(
+            VersionedFakeProvider(
                 [
                     ModelStreamEvent.text_delta("second memory"),
                     ModelStreamEvent.completed({"finish_reason": "stop"}),
@@ -17504,7 +17568,7 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
             execution_profile_policy=_AllowForkProfileAdoption(),
             enable_logging=False,
         )
-        register_body(recovered_app, FakeProvider([]), system_prompt="child prompt")
+        register_body(recovered_app, VersionedFakeProvider([]), system_prompt="child prompt")
         recovered = await collect_fork_events(recovered_app, request)
 
         child = await recovered_store.load("sess_prompt_advanced_child")
@@ -24656,12 +24720,20 @@ def test_cayu_app_resume_uses_stored_provider_and_model_identity():
         def __init__(self) -> None:
             self.requests: list[ContextRequest] = []
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:runtime:stored-model-recording-context",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def build(self, request: ContextRequest) -> list[Message]:
             self.requests.append(request)
             return request.messages
 
     store = InMemorySessionStore()
-    initial_provider = FakeProvider(
+    initial_provider = VersionedFakeProvider(
         [
             ModelStreamEvent.text_delta("first answer"),
             ModelStreamEvent.completed({"finish_reason": "stop"}),
@@ -24669,7 +24741,10 @@ def test_cayu_app_resume_uses_stored_provider_and_model_identity():
     )
     initial_app = CayuApp(session_store=store)
     initial_app.register_provider(initial_provider, default=True)
-    initial_app.register_agent(AgentSpec(name="assistant", model="stored-model"))
+    initial_app.register_agent(
+        AgentSpec(name="assistant", model="stored-model"),
+        context_policy=RecordingPolicy(),
+    )
 
     asyncio.run(
         collect_events(
@@ -24682,7 +24757,7 @@ def test_cayu_app_resume_uses_stored_provider_and_model_identity():
         )
     )
 
-    resume_provider = FakeProvider(
+    resume_provider = VersionedFakeProvider(
         [
             ModelStreamEvent.text_delta("second answer"),
             ModelStreamEvent.completed({"finish_reason": "stop"}),
@@ -24834,6 +24909,7 @@ def test_cayu_app_resume_releases_run_fence_when_setup_is_cancelled():
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         await store.update_status("sess_resume_setup_cancel", SessionStatus.INTERRUPTED)
@@ -24954,6 +25030,7 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         await store.update_status("sess_broken_transcript", SessionStatus.COMPLETED)
@@ -25764,6 +25841,7 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
         "max_attempts": 2,
         "model_step_id": events[1].payload["model_step_id"],
         "model_attempt_id": events[1].payload["model_attempt_id"],
+        "execution_profile_fingerprint": events[1].payload["execution_profile_fingerprint"],
     }
     retry = events[4]
     assert retry.payload["reason"] == "connection"
@@ -25780,6 +25858,7 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
         "max_attempts": 2,
         "model_step_id": events[6].payload["model_step_id"],
         "model_attempt_id": events[6].payload["model_attempt_id"],
+        "execution_profile_fingerprint": events[6].payload["execution_profile_fingerprint"],
     }
     assert private_events[1].payload["model_step_id"] == private_events[6].payload["model_step_id"]
     assert (
@@ -25848,6 +25927,7 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         "max_attempts": 2,
         "model_step_id": events[1].payload["model_step_id"],
         "model_attempt_id": events[1].payload["model_attempt_id"],
+        "execution_profile_fingerprint": events[1].payload["execution_profile_fingerprint"],
     }
     assert events[3].payload["attempt"] == 1
     assert events[3].payload["max_attempts"] == 2
@@ -25861,6 +25941,7 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         "max_attempts": 2,
         "model_step_id": events[6].payload["model_step_id"],
         "model_attempt_id": events[6].payload["model_attempt_id"],
+        "execution_profile_fingerprint": events[6].payload["execution_profile_fingerprint"],
     }
     assert private_events[1].payload["model_step_id"] == private_events[6].payload["model_step_id"]
     assert (
@@ -25930,6 +26011,7 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "max_attempts": 2,
         "model_step_id": events[1].payload["model_step_id"],
         "model_attempt_id": events[1].payload["model_attempt_id"],
+        "execution_profile_fingerprint": events[1].payload["execution_profile_fingerprint"],
     }
     assert events[4].payload["attempt"] == 1
     assert events[4].payload["reason"] == "timeout"
@@ -25941,6 +26023,7 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "max_attempts": 2,
         "model_step_id": events[5].payload["model_step_id"],
         "model_attempt_id": events[5].payload["model_attempt_id"],
+        "execution_profile_fingerprint": events[5].payload["execution_profile_fingerprint"],
     }
     assert private_events[1].payload["model_step_id"] == private_events[5].payload["model_step_id"]
     assert (
@@ -26932,7 +27015,10 @@ def _recover_parent(
         parent_identity = profiled_session_identity(
             provider_name="fake",
             model="fake-model",
+            agent_name="parent",
             tools=[subagent_tool],
+            causal_budget_id="parent",
+            app=app,
         )
         await _seed_crashed_spawn_parent(
             store,
@@ -27474,6 +27560,8 @@ def _crashed_tool_round_app(
     secret_redactor: SecretRedactor | None = None,
     environment: Environment | None = None,
     provider_capture: list[FakeProvider] | None = None,
+    limits: RunLimits | None = None,
+    continuation_events: list[ModelStreamEvent] | None = None,
 ) -> tuple[CayuApp, FailingTerminalToolEventStore, SideEffectTool, dict]:
     """Run a session whose only tool call starts but records no terminal event.
 
@@ -27482,16 +27570,20 @@ def _crashed_tool_round_app(
     """
     store = store if store is not None else FailingTerminalToolEventStore()
     tool = SideEffectTool()
-    provider = FakeProvider(
+    provider = VersionedFakeProvider(
         [
             [
                 ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
             ],
-            [
-                ModelStreamEvent.text_delta("recovered"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ],
+            (
+                [
+                    ModelStreamEvent.text_delta("recovered"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+                if continuation_events is None
+                else continuation_events
+            ),
         ]
     )
     if provider_capture is not None:
@@ -27513,6 +27605,7 @@ def _crashed_tool_round_app(
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "use the tool")],
+                limits=RunLimits() if limits is None else limits,
             ),
         )
     )
@@ -27567,6 +27660,75 @@ def test_tool_round_recovery_rejects_profile_drift_before_provider_preflight() -
         )
 
     assert provider.preflight_schemas == []
+
+
+def test_tool_round_recovery_rejects_changed_finalization_before_provider_dispatch() -> None:
+    session_id = "sess_tool_round_finalization_before_provider_dispatch"
+    providers: list[FakeProvider] = []
+    app, store, _tool, checkpoint = _crashed_tool_round_app(
+        session_id,
+        provider_capture=providers,
+    )
+    before = asyncio.run(store.load(session_id))
+    assert before is not None
+    assert len(providers) == 1
+    initial_request_count = len(providers[0].requests)
+
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            collect_tool_round_recovery_events(
+                app,
+                ToolRoundRecoveryRequest(
+                    session_id=session_id,
+                    round_id=checkpoint["pending_tool_round"]["tool_round_id"],
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="verified externally",
+                    max_steps=17,
+                ),
+            )
+        )
+
+    assert caught.value.changed_component_classes == (ExecutionProfileComponentClass.FINALIZATION,)
+    assert len(providers[0].requests) == initial_request_count
+    after = asyncio.run(store.load(session_id))
+    assert after is not None
+    assert after.status is before.status
+    assert after.run_epoch == before.run_epoch
+
+
+def test_tool_round_recovery_restores_original_run_limit_accounting() -> None:
+    session_id = "sess_tool_round_recovery_restores_run_limits"
+    providers: list[FakeProvider] = []
+    app, _store, tool, checkpoint = _crashed_tool_round_app(
+        session_id,
+        provider_capture=providers,
+        limits=RunLimits(max_tool_calls=1, scope="run"),
+        continuation_events=[
+            ModelStreamEvent.tool_call(id="call_2", name="side_effect", arguments={}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ],
+    )
+
+    events = asyncio.run(
+        collect_tool_round_recovery_events(
+            app,
+            ToolRoundRecoveryRequest(
+                session_id=session_id,
+                round_id=checkpoint["pending_tool_round"]["tool_round_id"],
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="verified externally",
+            ),
+        )
+    )
+
+    limit_event = next(event for event in events if event.type is EventType.SESSION_LIMIT_REACHED)
+    assert limit_event.payload["limit"] == "tool_calls"
+    assert limit_event.payload["actual"] == 2
+    assert tool.calls == [{}]
+    assert len(providers) == 1
+    assert len(providers[0].requests) == 2
 
 
 def test_command_policy_block_is_replayed_without_runner_execution_after_round_close_crash():
@@ -28002,13 +28164,17 @@ def test_manual_tool_round_recovery_repairs_missing_prior_terminal_evidence(
 ) -> None:
     session_id = "sess_tool_round_manual_missing_prior_terminal"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
-    profile_resolutions = 0
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
+    resolved_profile_fingerprints: list[str] = []
     original_profile_resolver = execution_profile_admission.resolve_execution_profile_identity
 
     def count_profile_resolution(*args, **kwargs):
-        nonlocal profile_resolutions
-        profile_resolutions += 1
-        return original_profile_resolver(*args, **kwargs)
+        resolved = original_profile_resolver(*args, **kwargs)
+        resolved_profile_fingerprints.append(resolved.fingerprint)
+        return resolved
 
     monkeypatch.setattr(
         execution_profile_admission,
@@ -28082,7 +28248,8 @@ def test_manual_tool_round_recovery_repairs_missing_prior_terminal_evidence(
         )
     )
 
-    assert profile_resolutions == 1
+    assert resolved_profile_fingerprints
+    assert set(resolved_profile_fingerprints) == {active_profile.profile.fingerprint}
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert [record.event.type for record in terminal_records] == [
         EventType.SESSION_FAILED,
@@ -29780,7 +29947,7 @@ def test_cayu_app_recover_tool_round_serializes_across_apps(
     )
     round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
-    provider_b = FakeProvider([])
+    provider_b = VersionedFakeProvider([])
     tool_b = SideEffectTool()
     app_b = CayuApp(session_store=store, enable_logging=False, clock=clock)
     app_b.register_provider(provider_b, default=True)
@@ -30384,7 +30551,7 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
     del app
     round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
-    provider = FakeProvider(
+    provider = VersionedFakeProvider(
         [
             ModelStreamEvent.text_delta("continued from durable recovery"),
             ModelStreamEvent.completed({"finish_reason": "stop"}),
@@ -30537,11 +30704,11 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
     asyncio.run(run())
 
 
-def test_cayu_app_recover_tool_round_rejects_native_structured_output_preflight():
+def test_cayu_app_recover_tool_round_rejects_structured_output_profile_drift():
     session_id = "sess_tool_round_manual_preflight"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
 
-    with pytest.raises(ValueError, match="Native structured output is not supported"):
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
         asyncio.run(
             collect_tool_round_recovery_events(
                 app,
@@ -30558,7 +30725,10 @@ def test_cayu_app_recover_tool_round_rejects_native_structured_output_preflight(
                 ),
             )
         )
-    # The preflight fires before any status transition.
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+    )
+    # Profile admission fires before provider preflight or any status transition.
     session = asyncio.run(store.load(session_id))
     assert session is not None and session.status == SessionStatus.FAILED
     assert tool.calls == [{}]
@@ -31252,6 +31422,7 @@ def test_cayu_app_resume_repairs_missing_initial_run_terminal_evidence() -> None
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         await store.append_transcript_messages(
@@ -31697,6 +31868,7 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         await store.update_status(session_id, SessionStatus.COMPLETED)
@@ -31803,6 +31975,7 @@ def test_cayu_app_resume_reconciles_terminal_event_before_replacing_run_marker()
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         await store.update_status(session_id, SessionStatus.COMPLETED)
@@ -31995,6 +32168,7 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         await store.update_status(session_id, SessionStatus.INTERRUPTED)
@@ -32748,7 +32922,7 @@ def test_planned_unregistered_call_rejects_registration_drift_before_recovery():
         store = FailingAfterPendingToolRoundCheckpointStore()
         first_app = CayuApp(session_store=store, enable_logging=False)
         first_app.register_provider(
-            FakeProvider(
+            VersionedFakeProvider(
                 [
                     ModelStreamEvent.tool_call(
                         id="call_late",
@@ -32788,7 +32962,7 @@ def test_planned_unregistered_call_rejects_registration_drift_before_recovery():
 
         tool = SideEffectTool()
         recovery_app = CayuApp(session_store=store, enable_logging=False)
-        recovery_app.register_provider(FakeProvider([]), default=True)
+        recovery_app.register_provider(VersionedFakeProvider([]), default=True)
         recovery_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[tool],
@@ -32856,7 +33030,7 @@ def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
         hook = RecoveryHook()
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(
-            FakeProvider(
+            VersionedFakeProvider(
                 [
                     [
                         ModelStreamEvent.tool_call(
@@ -32876,7 +33050,7 @@ def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
             runtime_hooks=[hook],
         )
         second_app = CayuApp(session_store=store, enable_logging=False)
-        second_app.register_provider(FakeProvider([]), default=True)
+        second_app.register_provider(VersionedFakeProvider([]), default=True)
         second_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[SideEffectTool()],
@@ -33010,7 +33184,7 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
         hook = BlockingRecoveryHook()
         app = CayuApp(session_store=store, enable_logging=False, clock=clock)
         app.register_provider(
-            FakeProvider(
+            VersionedFakeProvider(
                 [
                     [
                         ModelStreamEvent.tool_call(
@@ -33030,7 +33204,7 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
             runtime_hooks=[hook],
         )
         second_app = CayuApp(session_store=store, enable_logging=False, clock=clock)
-        second_app.register_provider(FakeProvider([]), default=True)
+        second_app.register_provider(VersionedFakeProvider([]), default=True)
         second_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[SideEffectTool()],
@@ -36925,7 +37099,7 @@ def test_cayu_app_rejects_conflicting_structured_output_on_tool_approval():
     assert tool.calls == []
 
 
-def test_cayu_app_budget_limit_stops_approval_before_tool_side_effects():
+def test_cayu_app_rejects_budget_limit_drift_before_approval_side_effects():
     store = InMemorySessionStore()
     tool = SideEffectTool()
     provider = FakeProvider(
@@ -36974,42 +37148,37 @@ def test_cayu_app_budget_limit_stops_approval_before_tool_side_effects():
     approval = interrupt_events[4].payload["approval"]
     approval_id = approval["approval_id"]
 
-    events = asyncio.run(
-        collect_tool_approval_events(
-            app,
-            ToolApprovalRequest(
-                session_id="sess_tool_approval_cost_limit",
-                approval_id=approval_id,
-                tool_round_id=approval["tool_round_id"],
-                tool_call_id=approval["tool_call_id"],
-                decision=ToolApprovalDecision.APPROVE,
-                budget_limits=(fake_budget_limit("0.002"),),
-            ),
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id="sess_tool_approval_cost_limit",
+                    approval_id=approval_id,
+                    tool_round_id=approval["tool_round_id"],
+                    tool_call_id=approval["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                    budget_limits=(fake_budget_limit("0.002"),),
+                ),
+            )
         )
-    )
 
-    assert [event.type for event in events] == [
-        EventType.SESSION_RESUMED,
-        EventType.SESSION_LIMIT_REACHED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.SESSION_CHECKPOINTED,
-        EventType.SESSION_INTERRUPTED,
-    ]
-    assert events[1].payload["limit"] == "estimated_cost"
-    assert events[2].payload["reason"] == "limit_reached"
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+    )
     assert tool.calls == []
     assert len(provider.requests) == 1
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_tool_approval_cost_limit"))
-    assert_only_model_step_publication_checkpoint(checkpoint)
+    assert checkpoint is not None and "pending_tool_approval" in checkpoint
     transcript = asyncio.run(store.load_transcript("sess_tool_approval_cost_limit"))
-    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    assert [message.role for message in transcript] == ["user"]
     session = asyncio.run(store.load("sess_tool_approval_cost_limit"))
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
 
 
-def test_cayu_app_approval_limit_counts_only_executable_pending_tools():
+def test_cayu_app_rejects_limit_drift_with_one_executable_pending_tool():
     store = InMemorySessionStore()
     side_effect = SideEffectTool()
     provider = FakeProvider(
@@ -37053,47 +37222,24 @@ def test_cayu_app_approval_limit_counts_only_executable_pending_tools():
     )
     approval = interrupt_events[4].payload["approval"]
 
-    events = asyncio.run(
-        collect_tool_approval_events(
-            app,
-            ToolApprovalRequest(
-                session_id="sess_approval_limit_executable_only",
-                approval_id=approval["approval_id"],
-                tool_round_id=approval["tool_round_id"],
-                tool_call_id=approval["tool_call_id"],
-                decision=ToolApprovalDecision.APPROVE,
-                limits=RunLimits(max_tool_calls=1),
-            ),
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id="sess_approval_limit_executable_only",
+                    approval_id=approval["approval_id"],
+                    tool_round_id=approval["tool_round_id"],
+                    tool_call_id=approval["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                    limits=RunLimits(max_tool_calls=1),
+                ),
+            )
         )
-    )
 
-    assert [event.type for event in events] == [
-        EventType.SESSION_RESUMED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVED,
-        EventType.TOOL_CALL_STARTED,
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.SESSION_CHECKPOINTED,
-        EventType.MODEL_STARTED,
-        EventType.MODEL_TEXT_DELTA,
-        EventType.MODEL_COMPLETED,
-        EventType.TURN_COMPLETED,
-        EventType.SESSION_COMPLETED,
-    ]
-    assert EventType.SESSION_LIMIT_REACHED not in [event.type for event in events]
-    assert side_effect.calls == [{"value": "second"}]
-    assert_only_model_step_publication_checkpoint(
-        asyncio.run(store.load_checkpoint("sess_approval_limit_executable_only"))
-    )
-
-    tool_result_message = provider.requests[1].messages[-1]
-    assert tool_result_message.role == "tool"
-    assert [part.tool_call_id for part in tool_result_message.content] == [
-        "call_1",
-        "call_2",
-    ]
-    assert tool_result_message.content[0].is_error is True
-    assert tool_result_message.content[1].content == "recorded"
+    assert caught.value.changed_component_classes == (ExecutionProfileComponentClass.FINALIZATION,)
+    assert side_effect.calls == []
+    assert len(provider.requests) == 1
 
 
 def test_cayu_app_resolves_approved_multi_tool_round_in_order():
@@ -37750,7 +37896,7 @@ def test_tool_approval_close_acknowledgement_loss_replays_exact_receipt():
     asyncio.run(run())
 
 
-def test_cayu_app_approval_limit_replays_recorded_tool_outcomes_before_stopping():
+def test_cayu_app_approval_retry_rejects_budget_drift_after_recorded_tool_outcome():
     store = FailingApprovalCloseStore()
     tool = SideEffectTool()
     provider = FakeProvider(
@@ -37820,36 +37966,34 @@ def test_cayu_app_approval_limit_replays_recorded_tool_outcomes_before_stopping(
     ]
     assert tool.calls == [{"value": "secret"}]
 
-    retry_events = asyncio.run(
-        collect_tool_approval_events(
-            app,
-            ToolApprovalRequest(
-                session_id="sess_approval_recorded_outcome_limit",
-                approval_id=approval_id,
-                tool_round_id=approval_event.payload["tool_round_id"],
-                tool_call_id=approval_event.payload["tool_call_id"],
-                decision=ToolApprovalDecision.APPROVE,
-                budget_limits=(fake_budget_limit("0.001"),),
-            ),
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id="sess_approval_recorded_outcome_limit",
+                    approval_id=approval_id,
+                    tool_round_id=approval_event.payload["tool_round_id"],
+                    tool_call_id=approval_event.payload["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                    budget_limits=(fake_budget_limit("0.001"),),
+                ),
+            )
         )
-    )
 
-    assert [event.type for event in retry_events] == [
-        EventType.SESSION_RESUMED,
-        EventType.SESSION_LIMIT_REACHED,
-        EventType.SESSION_CHECKPOINTED,
-        EventType.SESSION_INTERRUPTED,
-    ]
-    assert retry_events[1].payload["limit"] == "estimated_cost"
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+    )
     assert tool.calls == [{"value": "secret"}]
     assert len(provider.requests) == 1
-    assert_only_model_step_publication_checkpoint(
-        asyncio.run(store.load_checkpoint("sess_approval_recorded_outcome_limit"))
-    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_approval_recorded_outcome_limit"))
+    assert checkpoint is not None
+    assert "pending_tool_approval" in checkpoint
+    assert "pending_tool_round" in checkpoint
 
     transcript = asyncio.run(store.load_transcript("sess_approval_recorded_outcome_limit"))
-    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
-    assert transcript[-1].content[0].content == "recorded"
+    assert [message.role for message in transcript] == ["user"]
+    assert sum(event.type == EventType.TOOL_CALL_COMPLETED for event in events) == 1
 
 
 def test_cayu_app_rejects_denial_retry_after_approved_tool_executed():
@@ -41428,6 +41572,9 @@ def test_usage_triggered_context_policy_stays_triggered_after_previous_actual_us
     )
     assert checkpoint_events[0].payload == {
         "checkpoint": "usage_triggered_context",
+        "execution_profile_fingerprint": second_model_started.payload[
+            "execution_profile_fingerprint"
+        ],
         "min_input_tokens": 50,
         "min_total_tokens": None,
         "last_input_tokens": 100,
@@ -41730,6 +41877,7 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         "max_attempts": 1,
         "model_step_id": first_started.payload["model_step_id"],
         "model_attempt_id": first_started.payload["model_attempt_id"],
+        "execution_profile_fingerprint": first_started.payload["execution_profile_fingerprint"],
     }
     detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
     assert detected.payload == {
@@ -41743,6 +41891,7 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         "provider_error_code": "context_length_exceeded",
         "model_step_id": first_started.payload["model_step_id"],
         "model_attempt_id": first_started.payload["model_attempt_id"],
+        "execution_profile_fingerprint": first_started.payload["execution_profile_fingerprint"],
     }
     recovering = next(
         event for event in events if event.type == EventType.CONTEXT_OVERFLOW_RECOVERING
@@ -41754,6 +41903,7 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         "policy": "RecentTurnsContextPolicy",
         "model_step_id": first_started.payload["model_step_id"],
         "model_attempt_id": first_started.payload["model_attempt_id"],
+        "execution_profile_fingerprint": first_started.payload["execution_profile_fingerprint"],
     }
     transcript = asyncio.run(app.session_store.load_transcript("context_overflow_recovery"))
     assert [message.content[0].text for message in transcript if message.role == "user"] == [
@@ -41830,6 +41980,7 @@ def test_context_overflow_recovery_from_error_stream_event():
         "provider_error_code": "context_length_exceeded",
         "model_step_id": first_started.payload["model_step_id"],
         "model_attempt_id": first_started.payload["model_attempt_id"],
+        "execution_profile_fingerprint": first_started.payload["execution_profile_fingerprint"],
     }
 
 
@@ -42412,6 +42563,7 @@ def test_context_overflow_policy_fails_cleanly_when_recovery_overflows():
         "recovery_message_count": 1,
         "model_step_id": recovery_started.payload["model_step_id"],
         "model_attempt_id": recovery_started.payload["model_attempt_id"],
+        "execution_profile_fingerprint": recovery_started.payload["execution_profile_fingerprint"],
     }
     assert events[-1].type == EventType.SESSION_FAILED
 
@@ -45414,6 +45566,7 @@ def test_automatic_compaction_lost_checkpoint_ack_reconciles_effective_transform
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         transcript = [
@@ -47218,6 +47371,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
     ]
     assert events[1].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[4].payload["execution_profile_fingerprint"],
         "compactor": "RecordingCompactor",
         "compacted_transcript_cursor": 5,
         "previous_compacted_transcript_cursor": 1,
@@ -47234,6 +47388,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
     }
     assert events[2].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[4].payload["execution_profile_fingerprint"],
         "compactor": "RecordingCompactor",
         "compacted_transcript_cursor": 5,
         "previous_compacted_transcript_cursor": 1,
@@ -47255,6 +47410,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
     assert "summary" not in events[2].payload
     assert events[3].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[4].payload["execution_profile_fingerprint"],
         "compacted_transcript_cursor": 5,
         "previous_compacted_transcript_cursor": 1,
         "newly_compacted_message_count": 4,
@@ -47365,6 +47521,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
     assert compactor_provider.requests[0].options == {"anthropic": {"max_tokens": 512}}
     assert events[1].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[6].payload["execution_profile_fingerprint"],
         "compactor": "ModelCompactor",
         "compacted_transcript_cursor": 2,
         "previous_compacted_transcript_cursor": 0,
@@ -47389,9 +47546,11 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "compactor": "ModelCompactor",
         "model_step_id": events[6].payload["model_step_id"],
         "model_attempt_id": events[3].payload["model_attempt_id"],
+        "execution_profile_fingerprint": events[6].payload["execution_profile_fingerprint"],
     }
     assert events[4].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[6].payload["execution_profile_fingerprint"],
         "compactor": "ModelCompactor",
         "compacted_transcript_cursor": 2,
         "previous_compacted_transcript_cursor": 0,
@@ -47658,13 +47817,18 @@ def test_resume_after_compaction_limit_stop_uses_latest_agent_completion_for_con
         min_total_tokens=15,
         sticky=False,
     )
-    app = CayuApp(session_store=store, enable_logging=False)
+    app = CayuApp(
+        session_store=store,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+        enable_logging=False,
+    )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         context_policy=policy,
     )
     session_id = "sess_resume_after_compaction_limit_stop"
+    limits = RunLimits(max_total_tokens=15, scope="run")
 
     first_events = asyncio.run(
         collect_events(
@@ -47673,6 +47837,7 @@ def test_resume_after_compaction_limit_stop_uses_latest_agent_completion_for_con
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "first request")],
+                limits=limits,
             ),
         )
     )
@@ -47682,7 +47847,7 @@ def test_resume_after_compaction_limit_stop_uses_latest_agent_completion_for_con
             ResumeRequest(
                 session_id=session_id,
                 messages=[Message.text("user", "second request")],
-                limits=RunLimits(max_total_tokens=15, scope="run"),
+                limits=limits,
             ),
         )
     )
@@ -47699,6 +47864,14 @@ def test_resume_after_compaction_limit_stop_uses_latest_agent_completion_for_con
             ResumeRequest(
                 session_id=session_id,
                 messages=[Message.text("user", "third request")],
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key="resume-after-compaction-limit-stop",
+                    reason="The operator authorizes a fresh run without the prior run limit.",
+                    requested_by=ResolutionActor(
+                        subject="test-operator",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                ),
             ),
         )
     )
@@ -51163,6 +51336,7 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
     ]
     assert events[2].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[1].payload["execution_profile_fingerprint"],
         "compactor": "FailingCompactor",
         "compacted_transcript_cursor": 0,
         "previous_compacted_transcript_cursor": 0,
@@ -51286,6 +51460,7 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
     )
@@ -51343,6 +51518,7 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
     assert compactor.requests[0].existing_summary is None
     assert events[3].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[4].payload["execution_profile_fingerprint"],
         "compacted_transcript_cursor": 3,
         "previous_compacted_transcript_cursor": 0,
         "newly_compacted_message_count": 3,
@@ -51381,6 +51557,7 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
     )
@@ -51438,6 +51615,7 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
     assert compactor.requests[0].existing_summary is None
     assert events[3].payload == {
         "checkpoint": "context_compaction",
+        "execution_profile_fingerprint": events[4].payload["execution_profile_fingerprint"],
         "compacted_transcript_cursor": 3,
         "previous_compacted_transcript_cursor": 0,
         "newly_compacted_message_count": 3,
@@ -54981,7 +55159,7 @@ def test_cayu_app_rejects_native_structured_output_on_model_routed_provider():
     assert routed.requests == []
 
 
-def test_cayu_app_resume_rejects_native_structured_output_for_unsupported_provider():
+def test_cayu_app_resume_rejects_new_native_structured_output_as_profile_drift():
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
@@ -55004,7 +55182,7 @@ def test_cayu_app_resume_rejects_native_structured_output_for_unsupported_provid
         )
     )
 
-    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake"):
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
         asyncio.run(
             collect_resume_events(
                 app,
@@ -55015,6 +55193,9 @@ def test_cayu_app_resume_rejects_native_structured_output_for_unsupported_provid
                 ),
             )
         )
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+    )
 
     # Checked before the status transition: the session stays resumable.
     session = asyncio.run(store.load("sess_native_resume"))
@@ -55060,9 +55241,8 @@ def test_cayu_app_rejects_native_structured_output_on_tool_approval():
     )
     approval_id = approval_event.payload["approval"]["approval_id"]
 
-    # The paused run had no spec, so the resolver's NATIVE spec would be
-    # adopted — and must be rejected before the status transition.
-    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake"):
+    # A paused invocation cannot adopt a new output contract implicitly.
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
         asyncio.run(
             collect_tool_approval_events(
                 app,
@@ -55076,6 +55256,9 @@ def test_cayu_app_rejects_native_structured_output_on_tool_approval():
                 ),
             )
         )
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+    )
 
     session = asyncio.run(store.load("sess_native_tool_approval"))
     assert session is not None
@@ -55120,7 +55303,7 @@ def test_cayu_app_rejects_native_structured_output_on_tool_approval_recovery():
     )
     approval_id = approval_event.payload["approval"]["approval_id"]
 
-    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake"):
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
         asyncio.run(
             collect_tool_approval_recovery_events(
                 app,
@@ -55135,6 +55318,9 @@ def test_cayu_app_rejects_native_structured_output_on_tool_approval_recovery():
                 ),
             )
         )
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+    )
 
     session = asyncio.run(store.load("sess_native_approval_recovery"))
     assert session is not None
@@ -55224,12 +55410,24 @@ def test_cayu_app_rejects_openai_native_schema_before_first_model_call():
 
 
 def test_cayu_app_rejects_invalid_native_structured_output_schema_on_tool_approval():
-    # Composition: the resolver adopts the effective spec from the pending
-    # checkpoint, and the provider schema preflight must run on THAT spec
-    # before the status transition — not just on the run() request path.
+    # The resolver restores the effective spec from the pending checkpoint and
+    # reruns provider preflight before transitioning the session.
+    class ApprovalSchemaProvider(NativeStructuredOutputFakeProvider):
+        def __init__(self, events: list[ModelStreamEvent] | list[list[ModelStreamEvent]]) -> None:
+            super().__init__(events)
+            self.reject_schema = False
+
+        def preflight_native_structured_output_schema(
+            self,
+            json_schema: dict[str, Any],
+        ) -> None:
+            del json_schema
+            if self.reject_schema:
+                raise NativeStructuredOutputSchemaInvalid("$: rejected by provider preflight.")
+
     store = InMemorySessionStore()
     tool = SideEffectTool()
-    provider = SchemaRejectingProvider(
+    provider = ApprovalSchemaProvider(
         [
             [
                 ModelStreamEvent.tool_call(
@@ -55256,6 +55454,7 @@ def test_cayu_app_rejects_invalid_native_structured_output_schema_on_tool_approv
                 agent_name="assistant",
                 session_id="sess_native_schema_tool_approval",
                 messages=[Message.text("user", "use the tool")],
+                structured_output=_native_answer_spec(),
             ),
         )
     )
@@ -55264,8 +55463,7 @@ def test_cayu_app_rejects_invalid_native_structured_output_schema_on_tool_approv
     )
     approval_id = approval_event.payload["approval"]["approval_id"]
 
-    # The paused run had no spec, so the resolver's NATIVE spec would be
-    # adopted — and its schema must be rejected before the status transition.
+    provider.reject_schema = True
     with pytest.raises(NativeStructuredOutputSchemaInvalid, match="rejected by provider preflight"):
         asyncio.run(
             collect_tool_approval_events(
@@ -55276,7 +55474,6 @@ def test_cayu_app_rejects_invalid_native_structured_output_schema_on_tool_approv
                     tool_round_id=approval_event.payload["tool_round_id"],
                     tool_call_id=approval_event.payload["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
-                    structured_output=_native_answer_spec(),
                 ),
             )
         )
@@ -60033,7 +60230,10 @@ def _run_config_approval_app() -> tuple[InMemorySessionStore, SideEffectTool, Ca
     return store, tool, app
 
 
-def test_cayu_app_resolving_tool_approval_restores_original_run_limits():
+@pytest.mark.parametrize("restate_configuration", [False, True])
+def test_cayu_app_resolving_tool_approval_restores_original_run_limits(
+    restate_configuration: bool,
+):
     store, tool, app = _run_config_approval_app()
     session_id = "sess_approval_restores_run_config"
 
@@ -60071,6 +60271,11 @@ def test_cayu_app_resolving_tool_approval_restores_original_run_limits():
                 tool_round_id=pending["tool_round_id"],
                 tool_call_id=pending["tool_call_id"],
                 decision=ToolApprovalDecision.APPROVE,
+                max_steps=7 if restate_configuration else None,
+                limits=(
+                    RunLimits(max_tool_calls=1, scope="session") if restate_configuration else None
+                ),
+                retry_policy=(RetryPolicy(max_attempts=3) if restate_configuration else None),
             ),
         )
     )
@@ -60083,7 +60288,7 @@ def test_cayu_app_resolving_tool_approval_restores_original_run_limits():
     assert session.status == SessionStatus.INTERRUPTED
 
 
-def test_cayu_app_tool_approval_explicit_limits_override_persisted_run_config():
+def test_cayu_app_tool_approval_rejects_explicit_limits_drift_before_dispatch():
     store, tool, app = _run_config_approval_app()
     session_id = "sess_approval_override_run_config"
 
@@ -60102,20 +60307,21 @@ def test_cayu_app_tool_approval_explicit_limits_override_persisted_run_config():
     assert checkpoint is not None
     pending = checkpoint["pending_tool_approval"]
 
-    # An explicit limits override on the approval request wins over the
-    # persisted run config, so the session runs to completion.
-    events = asyncio.run(
-        collect_tool_approval_events(
-            app,
-            ToolApprovalRequest(
-                session_id=session_id,
-                approval_id=pending["approval_id"],
-                tool_round_id=pending["tool_round_id"],
-                tool_call_id=pending["tool_call_id"],
-                decision=ToolApprovalDecision.APPROVE,
-                limits=RunLimits(),
-            ),
+    # A changed limit is a changed finalization profile and must be rejected
+    # before the approved tool or a follow-up provider request can run.
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id=session_id,
+                    approval_id=pending["approval_id"],
+                    tool_round_id=pending["tool_round_id"],
+                    tool_call_id=pending["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                    limits=RunLimits(),
+                ),
+            )
         )
-    )
-    assert tool.calls == [{"value": "secret"}]
-    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert caught.value.changed_component_classes == (ExecutionProfileComponentClass.FINALIZATION,)
+    assert tool.calls == []

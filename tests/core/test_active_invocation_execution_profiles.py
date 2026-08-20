@@ -19,7 +19,13 @@ from cayu import (
     BeforeStopDecision,
     BeforeToolCallHookContext,
     BudgetLimit,
+    BudgetPolicy,
     CayuApp,
+    CheckpointCompactionContextPolicy,
+    ContextCountingConfig,
+    ContextCountingMode,
+    ContextPolicy,
+    ContextRequest,
     Environment,
     EnvironmentSpec,
     Event,
@@ -48,6 +54,8 @@ from cayu import (
     LocalWorkspace,
     LoopPolicy,
     Message,
+    MessageWindowContextPolicy,
+    ModelCompactor,
     ModelPrice,
     ModelStreamEvent,
     ModelTarget,
@@ -79,6 +87,7 @@ from cayu import (
     ToolPolicyResult,
     ToolResult,
     ToolSpec,
+    UsageTriggeredContextPolicy,
     UserInputResponse,
     session_fork_profile_relationship,
     session_prompt_anatomy_transition,
@@ -380,6 +389,14 @@ class BlockingBackgroundProvider(ModelProvider):
         self.adapter = adapter
 
     @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:blocking-background-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    @property
     def provider_operation_mode(self) -> ProviderOperationMode:
         return ProviderOperationMode.BACKGROUND
 
@@ -503,6 +520,7 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             max_steps=1,
             limits=RunLimits(),
             budget_limits=(),
+            budget_policy=None,
             retry_policy=RetryPolicy(),
             structured_output=None,
             thinking=None,
@@ -521,6 +539,96 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             match="active invocation|checkpoint schema|newer root checkpoint",
         ):
             await collect(app._run_recovery_session(request))
+
+    asyncio.run(scenario())
+
+
+def test_user_input_recovery_dispatch_reuses_its_validated_budget_snapshot() -> None:
+    async def scenario() -> None:
+        def budget_limit(maximum: str) -> BudgetLimit:
+            return BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal(maximum),
+                pricing=PriceBook(
+                    prices=(
+                        ModelPrice.fixed(
+                            provider_name="fake",
+                            model="fake-model",
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("1"),
+                        ),
+                    )
+                ),
+                action="notify",
+            )
+
+        session_id = "recovery-budget-policy-snapshot"
+        original_limit = budget_limit("10")
+        replacement_limit = budget_limit("11")
+        store = InMemorySessionStore()
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call-input",
+                        name="ask_user",
+                        arguments={"question": "Continue?"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("continued"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ],
+            name="fake",
+        )
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(limits=(original_limit,)),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool()],
+        )
+        paused = await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "ask")],
+                )
+            )
+        )
+        awaiting = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+
+        continuation = app.resolve_user_input(
+            UserInputResponse(
+                session_id=session_id,
+                input_id=awaiting.payload["input_id"],
+                answer="yes",
+            )
+        )
+        first_continuation_event = await anext(continuation)
+        assert first_continuation_event.type is EventType.INTERACTION_RESUMED
+        active_profile = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert active_profile is not None
+        assert app.budget_policy is not None
+        app.budget_policy.limits = (replacement_limit,)
+        remaining = [event async for event in continuation]
+
+        checks = [event for event in remaining if event.type is EventType.BUDGET_CHECKED]
+        assert checks
+        assert {event.payload["maximum"] for event in checks} == {"10"}
+        assert {event.payload["execution_profile_fingerprint"] for event in checks} == {
+            active_profile.profile.fingerprint
+        }
 
     asyncio.run(scenario())
 
@@ -3533,6 +3641,251 @@ def test_provider_retry_keeps_process_local_resolution_after_mutation_in_postgre
             )
         finally:
             await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_automatic_compaction_retry_rejects_live_provider_drift_before_dispatch(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        compaction_provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("must not dispatch"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ],
+            name="compaction-provider",
+        )
+        consume_batch = compaction_provider._consume_batch
+
+        def consume_then_mutate(request: ModelRequest) -> tuple[ModelStreamEvent, ...]:
+            batch = consume_batch(request)
+            if len(compaction_provider.requests) == 1:
+                monkeypatch.setattr(compaction_provider, "_operation_adapter", object())
+                raise ModelProviderError(
+                    "compactor overloaded",
+                    provider=compaction_provider.name,
+                    status_code=503,
+                    retryable=True,
+                )
+            return batch
+
+        monkeypatch.setattr(compaction_provider, "_consume_batch", consume_then_mutate)
+        runtime_provider = ScriptedModelProvider(
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+            name="fake",
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="runtime-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                    retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        events = await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-compaction-live-provider-drift",
+                    messages=[
+                        Message.text("user", "old request"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current request"),
+                    ],
+                )
+            )
+        )
+        compaction_failure = next(
+            event for event in events if event.type is EventType.CONTEXT_COMPACTION_FAILED
+        )
+        assert compaction_failure.payload["error_type"] == "ExecutionProfileMismatchError"
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert len(compaction_provider.requests) == 1
+        assert runtime_provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_observe_counting_rejects_live_provider_drift_before_remote_count(monkeypatch) -> None:
+    async def scenario() -> None:
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        drift_provider = ScriptedModelProvider(
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+            name="drift-source",
+            background=True,
+        )
+        count_calls = 0
+
+        async def count_input_tokens(request: ModelRequest) -> None:
+            nonlocal count_calls
+            del request
+            count_calls += 1
+
+        monkeypatch.setattr(provider, "count_input_tokens", count_input_tokens)
+        app = CayuApp(
+            context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events: list[Event] = []
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="observe-counting-live-provider-drift",
+                messages=[Message.text("user", "count this request")],
+            )
+        ):
+            events.append(event)
+            if event.type is EventType.CONTEXT_PRESSURE_ESTIMATED:
+                provider._operation_adapter = drift_provider._operation_adapter
+
+        assert any(event.type is EventType.CONTEXT_PRESSURE_ESTIMATED for event in events)
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert events[-1].payload["error_type"] == "ExecutionProfileMismatchError"
+        assert count_calls == 0
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_context_policy_counting_rejects_live_provider_drift_before_remote_count(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        drift_provider = ScriptedModelProvider(
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+            name="drift-source",
+            background=True,
+        )
+        count_calls = 0
+
+        async def count_input_tokens(request: ModelRequest) -> None:
+            nonlocal count_calls
+            del request
+            count_calls += 1
+
+        monkeypatch.setattr(provider, "count_input_tokens", count_input_tokens)
+
+        class MutatingBasePolicy(ContextPolicy):
+            @property
+            def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+                return ExecutionProfileBehaviorIdentity(
+                    name="tests:mutating-token-count-base-policy",
+                    behavior_version="1",
+                    implementation_version="1",
+                )
+
+            async def build(self, request: ContextRequest) -> list[Message]:
+                provider._operation_adapter = drift_provider._operation_adapter
+                return list(request.messages)
+
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=UsageTriggeredContextPolicy(
+                base_policy=MutatingBasePolicy(),
+                triggered_policy=MessageWindowContextPolicy(max_messages=1),
+                trigger_estimated_context_tokens=1,
+                verify_estimate_with_provider_count=True,
+            ),
+        )
+
+        events = await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="context-policy-counting-live-provider-drift",
+                    messages=[Message.text("user", "count this context")],
+                )
+            )
+        )
+
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert events[-1].payload["error_type"] == "ExecutionProfileMismatchError"
+        assert count_calls == 0
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_context_policy_counting_treats_provider_mismatch_as_optional_failure(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("completed under the admitted profile"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        count_calls = 0
+
+        async def count_input_tokens(request: ModelRequest) -> None:
+            nonlocal count_calls
+            del request
+            count_calls += 1
+            raise ExecutionProfileMismatchError(
+                session_id="provider-owned-count-error",
+                expected_profile_fingerprint="a" * 64,
+                candidate_profile_fingerprint="b" * 64,
+                changed_component_classes=(ExecutionProfileComponentClass.PROVIDER_ADAPTER,),
+            )
+
+        monkeypatch.setattr(provider, "count_input_tokens", count_input_tokens)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=UsageTriggeredContextPolicy(
+                triggered_policy=MessageWindowContextPolicy(max_messages=1),
+                trigger_estimated_context_tokens=1,
+                verify_estimate_with_provider_count=True,
+            ),
+        )
+
+        events = await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="context-policy-provider-owned-count-error",
+                    messages=[Message.text("user", "use the optional counter")],
+                )
+            )
+        )
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert count_calls == 1
+        assert len(provider.requests) == 1
 
     asyncio.run(scenario())
 

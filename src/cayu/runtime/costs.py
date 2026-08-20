@@ -824,6 +824,11 @@ class CostLineItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_step: StrictInt = Field(ge=1)
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        max_length=64,
+        exclude_if=lambda value: value is None,
+    )
     provider_name: str | None = None
     requested_model: str | None = None
     model: str | None = None
@@ -874,6 +879,7 @@ class CostLineItem(BaseModel):
         return revalidate_model_input(value, BillingIdentity, Provenance)
 
     @field_validator(
+        "execution_profile_fingerprint",
         "provider_name",
         "requested_model",
         "model",
@@ -886,6 +892,12 @@ class CostLineItem(BaseModel):
     def validate_optional_strings(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
+        if info.field_name == "execution_profile_fingerprint":
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(
+                    "execution_profile_fingerprint must be a lowercase SHA-256 digest."
+                )
+            return value
         return require_clean_nonblank(value, info.field_name)
 
 
@@ -1048,6 +1060,9 @@ def _estimate_session_cost(
             continue
         model_step += 1
         metrics = _cost_usage_metrics_from_event_payload(event.payload)
+        execution_profile_fingerprint = _optional_execution_profile_fingerprint(
+            event.payload.get("execution_profile_fingerprint")
+        )
         if metrics is None:
             line_items.append(
                 _unpriced_line_item(
@@ -1055,6 +1070,7 @@ def _estimate_session_cost(
                     provider_name=_optional_nonblank(event.payload.get("provider_name")),
                     requested_model=_optional_nonblank(event.payload.get("requested_model")),
                     model=_optional_nonblank(event.payload.get("model")),
+                    execution_profile_fingerprint=execution_profile_fingerprint,
                     currency=currency,
                     reason=_missing_usage_pricing_reason(event.payload),
                     billing_identity=_optional_billing_identity(
@@ -1070,6 +1086,7 @@ def _estimate_session_cost(
                 pricing=pricing,
                 currency=currency,
                 effective_on=_effective_date(event.timestamp),
+                execution_profile_fingerprint=execution_profile_fingerprint,
             )
         )
 
@@ -1338,6 +1355,7 @@ def _cost_line_item(
     currency: str,
     effective_on: date,
     price_resolution: _PriceResolution | None = None,
+    execution_profile_fingerprint: str | None = None,
 ) -> CostLineItem:
     resolution = price_resolution or _resolve_price(
         metrics=metrics,
@@ -1354,6 +1372,7 @@ def _cost_line_item(
             reason=resolution.missing_reason or "no matching model pricing",
             metrics=metrics,
             billing_identity=metrics.billing_identity,
+            execution_profile_fingerprint=execution_profile_fingerprint,
         )
     price = resolution.resolved
 
@@ -1367,6 +1386,7 @@ def _cost_line_item(
             reason=f"pricing currency {price.currency} does not match requested {currency}",
             metrics=metrics,
             billing_identity=metrics.billing_identity,
+            execution_profile_fingerprint=execution_profile_fingerprint,
         )
 
     uncached_input_tokens = metrics.cache.uncached_input_tokens
@@ -1406,12 +1426,14 @@ def _cost_line_item(
                 reason=ttl_resolution,
                 metrics=metrics,
                 billing_identity=metrics.billing_identity,
+                execution_profile_fingerprint=execution_profile_fingerprint,
             )
         cache_write_cost = ttl_resolution
     total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost
 
     return CostLineItem(
         model_step=model_step,
+        execution_profile_fingerprint=execution_profile_fingerprint,
         provider_name=metrics.provider_name,
         requested_model=metrics.requested_model,
         model=metrics.model,
@@ -1451,9 +1473,11 @@ def _unpriced_line_item(
     metrics: UsageMetrics | None = None,
     requested_model: str | None = None,
     billing_identity: BillingIdentity | None = None,
+    execution_profile_fingerprint: str | None = None,
 ) -> CostLineItem:
     return CostLineItem(
         model_step=model_step,
+        execution_profile_fingerprint=execution_profile_fingerprint,
         provider_name=provider_name,
         requested_model=requested_model,
         model=model,
@@ -1581,6 +1605,16 @@ def _optional_nonblank(value: object) -> str | None:
         return require_durable_clean_nonblank(value, "cost identity")
     except ValueError:
         return None
+
+
+def _optional_execution_profile_fingerprint(value: object) -> str | None:
+    if (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        return value
+    return None
 
 
 def _optional_billing_identity(value: object) -> BillingIdentity | None:

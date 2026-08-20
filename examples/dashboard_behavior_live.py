@@ -40,6 +40,8 @@ from cayu import (
     MessageRole,
     ModelPrice,
     PriceBook,
+    RetryPolicy,
+    RunLimits,
     RunRequest,
     SQLiteEvalStore,
     TaskCreate,
@@ -325,6 +327,7 @@ def _profiled_session_identity(
     *,
     provider_name: str,
     model: str,
+    max_steps: int,
 ) -> SessionIdentity:
     """Build the exact profile used by low-level resumable dashboard fixtures."""
 
@@ -348,6 +351,13 @@ def _profiled_session_identity(
             runtime_hooks=engine._runtime_hooks,
             loop_policies=engine._loop_policies,
             loop_policy_identities=engine._loop_policy_execution_profile_identities,
+            registered_provider=app._providers.get(provider_name),
+            finalization={
+                "kind": "cayu:model-finalization:v1",
+                "max_steps": max_steps,
+                "limits": RunLimits().model_dump(mode="json"),
+                "retry_policy": RetryPolicy().model_dump(mode="json"),
+            },
         ),
     )
 
@@ -527,6 +537,7 @@ async def _seed_app() -> tuple[
         app,
         provider_name=PROVIDER_NAME,
         model=MODEL_NAME,
+        max_steps=20,
     )
     await store.create(
         RunRequest(
@@ -538,6 +549,7 @@ async def _seed_app() -> tuple[
                 "cayu:dashboard_fixture": {"marker": "runtime-dashboard-marker"},
             },
             messages=[Message.text("user", "Show the dashboard contract session.")],
+            max_steps=20,
         ),
         identity=contract_session_identity,
     )
@@ -697,6 +709,7 @@ async def _seed_app() -> tuple[
                 environment_name=environment_name,
                 labels=labels or {},
                 messages=[Message.text("user", prompt)],
+                max_steps=20,
             ),
             identity=contract_session_identity,
         )
@@ -729,6 +742,7 @@ async def _seed_app() -> tuple[
                 agent_name=AGENT_NAME,
                 session_id=session_id,
                 messages=[Message.text("user", "Wait for a dashboard interruption.")],
+                max_steps=20,
             ),
             identity=contract_session_identity,
         )

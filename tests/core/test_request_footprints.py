@@ -144,11 +144,13 @@ def _build(
     )
 
 
-@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 2])
-def test_request_footprint_versions_require_exact_integer_one(invalid_version: object) -> None:
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 3])
+def test_request_footprint_versions_require_supported_exact_integers(
+    invalid_version: object,
+) -> None:
     footprint_payload = _build(_request()).model_dump(mode="python")
     footprint_payload["schema_version"] = invalid_version
-    with pytest.raises(ValidationError, match="schema_version must be the integer 1"):
+    with pytest.raises(ValidationError, match="schema_version must be integer 1 or 2"):
         RequestFootprint.model_validate(footprint_payload)
 
     fingerprint_payload = _build(
@@ -174,6 +176,34 @@ def test_request_footprint_versions_require_exact_integer_one(invalid_version: o
     manifest_payload["schema_version"] = invalid_version
     with pytest.raises(ValidationError, match="schema_version must be the integer 1"):
         type(manifest).model_validate(manifest_payload)
+
+
+def test_request_footprint_v2_requires_and_retains_its_governing_profile() -> None:
+    fingerprint = "a" * 64
+    footprint = build_request_footprint(
+        _request(),
+        provider_name="fake",
+        step=1,
+        attempt=1,
+        max_attempts=1,
+        request_variant=RequestVariant.INITIAL,
+        observation_id="profile-linked-footprint",
+        model_step_id="mstep_00000000000000000000000000000001",
+        model_attempt_id="matt_00000000000000000000000000000001",
+        execution_profile_fingerprint=fingerprint,
+    )
+
+    assert footprint.schema_version == 2
+    assert footprint.execution_profile_fingerprint == fingerprint
+    missing_profile = footprint.model_dump(mode="python")
+    missing_profile["execution_profile_fingerprint"] = None
+    with pytest.raises(ValidationError, match="schema v2 requires an execution profile"):
+        RequestFootprint.model_validate(missing_profile)
+
+    legacy_with_profile = footprint.model_dump(mode="python")
+    legacy_with_profile["schema_version"] = 1
+    with pytest.raises(ValidationError, match="schema v1 cannot carry an execution profile"):
+        RequestFootprint.model_validate(legacy_with_profile)
 
 
 def test_request_footprint_versions_are_required() -> None:

@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from tests.core._execution_profile_fixtures import profiled_session_identity
 
 import cayu.runtime._run_limits as run_limits_module
+import cayu.runtime._session_engine as session_engine_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import (
     AgentSpec,
@@ -122,6 +122,33 @@ def _reserved_limit(maximum: str) -> BudgetLimit:
             max_input_tokens=1_000_000,
             max_output_tokens=0,
         ),
+    )
+
+
+def _profiled_identity_for_app(
+    app: CayuApp,
+    *,
+    session_id: str,
+    limits: RunLimits,
+) -> SessionIdentity:
+    registered_agent = app._agents["assistant"]
+    registered_provider = app._providers["fake"]
+    profile = session_engine_module._execution_profile_identity(
+        registered_agent=registered_agent,
+        provider_name=registered_provider.name,
+        registered_provider=registered_provider,
+        model="fake-model",
+        durable_system_prompt=None,
+        redactor=app._secret_redactor,
+        process_identity=app._execution_profile_process_identity,
+        budget_policy=app.budget_policy,
+        causal_budget_id=session_id,
+        limits=limits,
+    )
+    return session_engine_module._session_identity(
+        provider_name="fake",
+        model="fake-model",
+        execution_profile=profile,
     )
 
 
@@ -524,15 +551,20 @@ def test_session_run_limit_publishes_usage_beyond_int64_without_provider_call() 
     expected = maximum * 2
 
     async def scenario():
+        limits = RunLimits(
+            max_total_tokens=maximum,
+            scope="session",
+        )
         await store.create(
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_aggregate_run_limit",
                 messages=[Message.text("user", "initial")],
             ),
-            identity=profiled_session_identity(
-                provider_name="fake",
-                model="fake-model",
+            identity=_profiled_identity_for_app(
+                app,
+                session_id="sess_aggregate_run_limit",
+                limits=limits,
             ),
         )
         await store.append_events(
@@ -559,10 +591,7 @@ def test_session_run_limit_publishes_usage_beyond_int64_without_provider_call() 
                 ResumeRequest(
                     session_id="sess_aggregate_run_limit",
                     messages=[Message.text("user", "do not dispatch")],
-                    limits=RunLimits(
-                        max_total_tokens=maximum,
-                        scope="session",
-                    ),
+                    limits=limits,
                 )
             )
         ]
@@ -685,15 +714,17 @@ def test_cayu_app_session_elapsed_limit_uses_injected_clock_before_provider_disp
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     async def scenario():
+        limits = RunLimits(max_elapsed_seconds=1, scope="session")
         session = await store.create(
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_app_elapsed_clock",
                 messages=[Message.text("user", "initial")],
             ),
-            identity=profiled_session_identity(
-                provider_name="fake",
-                model="fake-model",
+            identity=_profiled_identity_for_app(
+                app,
+                session_id="sess_app_elapsed_clock",
+                limits=limits,
             ),
         )
         store._sessions[session.id].created_at = injected_now - timedelta(seconds=2)
@@ -705,7 +736,7 @@ def test_cayu_app_session_elapsed_limit_uses_injected_clock_before_provider_disp
                 ResumeRequest(
                     session_id=session.id,
                     messages=[Message.text("user", "do not dispatch")],
-                    limits=RunLimits(max_elapsed_seconds=1, scope="session"),
+                    limits=limits,
                 )
             )
         ]

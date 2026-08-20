@@ -3889,6 +3889,7 @@ def test_mid_round_limit_publishes_completed_stage_before_interrupting(monkeypat
                 ResumeRequest(
                     session_id="stage-before-limit",
                     messages=[Message.text("user", "continue")],
+                    limits=RunLimits(max_elapsed_seconds=1),
                 )
             )
         ]

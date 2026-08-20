@@ -84,6 +84,9 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary, estimate_session_cost
+from cayu.runtime.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
@@ -116,6 +119,7 @@ def _event_with_budget_authority(
     event: Event,
     *,
     execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
+    execution_profile_fingerprint: str | None = None,
     additional_fields: Collection[str] = (),
 ) -> Event:
     """Attest runtime-owned accounting linkage at the budget control boundary."""
@@ -134,7 +138,13 @@ def _event_with_budget_authority(
         for field_name, value in identity_payload.items()
         if event.payload.get(field_name) == value
     )
-    return event_with_runtime_payload_authority(event, *dict.fromkeys(fields)) if fields else event
+    attributed = (
+        event_with_runtime_payload_authority(event, *dict.fromkeys(fields)) if fields else event
+    )
+    return event_with_execution_profile_fingerprint_authority(
+        attributed,
+        execution_profile_fingerprint,
+    )
 
 
 UNKNOWN_POST_DISPATCH_BUDGET_REASON = (
@@ -417,6 +427,8 @@ def _validate_ledger_settlement_record(
         "model_step_id",
         "model_attempt_id",
     ]
+    if "execution_profile_fingerprint" in event.payload:
+        payload_fields.append("execution_profile_fingerprint")
     if event.interaction_id is not None:
         if event.payload.get("interaction_id") != event.interaction_id:
             raise RuntimeError("Budget ledger settlement event changed its interaction identity.")
@@ -518,6 +530,8 @@ def _validate_ledger_reconciliation(
         or reconciliation.budget_limit_id != record.budget_limit_id
         or reconciliation.model_step_id != record.model_step_id
         or reconciliation.model_attempt_id != record.model_attempt_id
+        or reconciliation.execution_profile_fingerprint
+        != record.settlement_event_payload.get("execution_profile_fingerprint")
         or reconciliation.reserved_amount != record.reserved_amount
         or reconciliation.status != expected_status
         or reconciliation.actual_amount != expected_actual_amount
@@ -546,7 +560,13 @@ def _publication_safe_reconciliation(
     prepared_event = prepare_event(raw_settlement.event)
     reconciliation_payload = budget_reconciliation_payload(reconciliation)
     prepared_payload = {key: prepared_event.payload[key] for key in reconciliation_payload}
-    prepared_reconciliation = budget_reconciliation_from_payload(prepared_payload)
+    prepared_profile_fingerprint = prepared_event.payload.get("execution_profile_fingerprint")
+    if prepared_profile_fingerprint != reconciliation.execution_profile_fingerprint:
+        raise RuntimeError("Budget settlement publication changed its execution profile.")
+    prepared_reconciliation = budget_reconciliation_from_payload(prepared_payload).model_copy(
+        update={"execution_profile_fingerprint": prepared_profile_fingerprint},
+        deep=True,
+    )
     prepared_settlement = _budget_settlement_record(
         reservation.record,
         prepared_reconciliation,
@@ -1243,6 +1263,7 @@ class RunLimitController:
         model: str | None = None,
         additional_usage_events: list[Event] | None = None,
         execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
+        execution_profile_fingerprint: str | None = None,
     ) -> LimitEvaluation:
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -1397,6 +1418,7 @@ class RunLimitController:
                         environment_name=environment_name,
                         check=budget_outcome.check,
                         execution_identity=execution_identity,
+                        execution_profile_fingerprint=execution_profile_fingerprint,
                     )
                     emitted_events.append(event)
                     if budget_notify_events is not None:
@@ -1427,6 +1449,7 @@ class RunLimitController:
         model: str | None = None,
         additional_usage_events: list[Event] | None = None,
         execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
+        execution_profile_fingerprint: str | None = None,
     ) -> BudgetEvaluation:
         limits = budget_limits_for_session(
             policy=budget_policy,
@@ -1480,6 +1503,7 @@ class RunLimitController:
                                 },
                             ),
                             execution_identity=execution_identity,
+                            execution_profile_fingerprint=execution_profile_fingerprint,
                             additional_fields=("budget_limit_id",),
                         )
                     )
@@ -1495,6 +1519,7 @@ class RunLimitController:
                             environment_name=environment_name,
                             check=check,
                             execution_identity=execution_identity,
+                            execution_profile_fingerprint=execution_profile_fingerprint,
                         )
                     )
                 continue
@@ -1548,6 +1573,7 @@ class RunLimitController:
         environment_name: str | None,
         check: BudgetCheck,
         execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
+        execution_profile_fingerprint: str | None = None,
     ) -> Event:
         return await self._event_writer.emit(
             _event_with_budget_authority(
@@ -1562,6 +1588,7 @@ class RunLimitController:
                     },
                 ),
                 execution_identity=execution_identity,
+                execution_profile_fingerprint=execution_profile_fingerprint,
                 additional_fields=("budget_limit_id",),
             )
         )
@@ -1577,6 +1604,7 @@ class RunLimitController:
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
         billing_identity: BillingIdentity | None = None,
+        execution_profile_fingerprint: str | None = None,
         existing_reservation_ids: Collection[str] = (),
         reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
     ) -> BudgetReservationSetup:
@@ -1601,6 +1629,11 @@ class RunLimitController:
             session_id=session.id,
             agent_name=agent_name,
             environment_name=environment_name,
+            payload=(
+                {}
+                if execution_profile_fingerprint is None
+                else {"execution_profile_fingerprint": execution_profile_fingerprint}
+            ),
         )
         identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         try:
@@ -1721,6 +1754,7 @@ class RunLimitController:
                 reservation_event = _event_with_budget_authority(
                     reservation_event,
                     execution_identity=model_attempt_identity,
+                    execution_profile_fingerprint=execution_profile_fingerprint,
                     additional_fields=(
                         "budget_limit_id",
                         "reservation_id",
@@ -2901,6 +2935,7 @@ class RunLimitController:
         authoritative_failure_types: tuple[type[BaseException], ...],
         billing_identity: BillingIdentity | None = None,
         pricing_provider_name: str | None = None,
+        execution_profile_fingerprint: str | None = None,
         reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
         before_provider_dispatch: Callable[[], Awaitable[None]] | None = None,
     ) -> (
@@ -2964,6 +2999,7 @@ class RunLimitController:
                             payload=budget_reservation_payload(failure),
                         ),
                         execution_identity=model_attempt_identity,
+                        execution_profile_fingerprint=execution_profile_fingerprint,
                         additional_fields=("budget_limit_id",),
                     )
                 )
@@ -2984,6 +3020,7 @@ class RunLimitController:
                 model_attempt_identity=model_attempt_identity,
                 environment_name=environment_name,
                 billing_identity=billing_identity,
+                execution_profile_fingerprint=execution_profile_fingerprint,
                 reservation_identity_guard=identity_guard,
                 rejection_release_reason="reservation failed",
                 accepted_record_error=(
@@ -3310,6 +3347,7 @@ class RunLimitController:
         model_attempt_identity: ModelAttemptIdentity,
         environment_name: str | None = None,
         settlement_event_payload: dict[str, object] | None = None,
+        execution_profile_fingerprint: str | None = None,
         rejection_release_reason: str,
         accepted_record_error: str,
         reservation_event_factory: Callable[[BudgetReservationResult], Event] | None = None,
@@ -3332,12 +3370,23 @@ class RunLimitController:
         events: list[Event] = []
         releases: list[BudgetReconciliation] = []
         expected_billing_identity = copy_billing_identity(billing_identity)
+        profile_settlement_payload = copy_durable_json_object(
+            settlement_event_payload or {},
+            "settlement_event_payload",
+        )
+        if execution_profile_fingerprint is not None:
+            existing_fingerprint = profile_settlement_payload.get("execution_profile_fingerprint")
+            if existing_fingerprint not in {None, execution_profile_fingerprint}:
+                raise ValueError("Settlement event payload conflicts with its execution profile.")
+            profile_settlement_payload["execution_profile_fingerprint"] = (
+                execution_profile_fingerprint
+            )
         expected_settlement_event_payload = _interaction_bound_settlement_event_payload(
             self._event_writer,
             session_id=session_id,
             agent_name=agent_name,
             environment_name=environment_name,
-            payload=settlement_event_payload,
+            payload=profile_settlement_payload,
         )
         identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         if reservation_event_factory is None:
@@ -3485,6 +3534,7 @@ class RunLimitController:
                 reservation_event = _event_with_budget_authority(
                     reservation_event,
                     execution_identity=model_attempt_identity,
+                    execution_profile_fingerprint=execution_profile_fingerprint,
                     additional_fields=(
                         "budget_limit_id",
                         "reservation_id",
@@ -3707,6 +3757,7 @@ class RunLimitGate:
         budget_notify_events: list[Event],
         run_budget_authorities: Mapping[str, RunBudgetAccountingAuthority] | None = None,
         pricing_provider_name: str | None = None,
+        execution_profile_fingerprint: str | None = None,
     ) -> None:
         self._controller = controller
         self._session = session
@@ -3720,6 +3771,7 @@ class RunLimitGate:
         self._run_budget_authorities = run_budget_authorities
         self._budget_notify_events = budget_notify_events
         self._pricing_provider_name = pricing_provider_name
+        self._execution_profile_fingerprint = execution_profile_fingerprint
         self._usage_tracker = controller.usage_tracker(session.id)
 
     async def evaluate_limits(
@@ -3751,6 +3803,7 @@ class RunLimitGate:
             model=model,
             additional_usage_events=additional_usage_events,
             execution_identity=execution_identity,
+            execution_profile_fingerprint=self._execution_profile_fingerprint,
         )
 
     async def evaluate_budget(
@@ -3773,6 +3826,7 @@ class RunLimitGate:
             model=model,
             additional_usage_events=additional_usage_events,
             execution_identity=execution_identity,
+            execution_profile_fingerprint=self._execution_profile_fingerprint,
         )
 
     def has_run_limits(self) -> bool:

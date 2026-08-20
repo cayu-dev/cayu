@@ -34,7 +34,6 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
-    NativeStructuredOutputUnsupported,
     ResumeRequest,
     RetryPolicy,
     RunLimits,
@@ -972,7 +971,10 @@ def _run_config_app() -> tuple[CayuApp, InMemorySessionStore, _EchoTool]:
     return app, store, echo
 
 
-def test_resolve_user_input_restores_original_run_configuration() -> None:
+@pytest.mark.parametrize("restate_configuration", [False, True])
+def test_resolve_user_input_restores_original_run_configuration(
+    restate_configuration: bool,
+) -> None:
     app, store, echo = _run_config_app()
     session_id = "s_input_restores_run_config"
 
@@ -1008,6 +1010,13 @@ def test_resolve_user_input_restores_original_run_configuration() -> None:
                     session_id=session_id,
                     input_id=input_id,
                     answer="yes",
+                    max_steps=7 if restate_configuration else None,
+                    limits=(
+                        RunLimits(max_tool_calls=1, scope="session")
+                        if restate_configuration
+                        else None
+                    ),
+                    retry_policy=(RetryPolicy(max_attempts=3) if restate_configuration else None),
                 )
             )
         )
@@ -1022,8 +1031,8 @@ def test_resolve_user_input_restores_original_run_configuration() -> None:
     assert session.status == SessionStatus.INTERRUPTED
 
 
-def test_resolve_user_input_explicit_limits_override_persisted_configuration() -> None:
-    app, _store, echo = _run_config_app()
+def test_resolve_user_input_rejects_explicit_limits_drift_before_dispatch() -> None:
+    app, store, echo = _run_config_app()
     session_id = "s_input_overrides_run_config"
 
     pause_events = asyncio.run(
@@ -1041,25 +1050,32 @@ def test_resolve_user_input_explicit_limits_override_persisted_configuration() -
         event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
     ).payload["input_id"]
 
-    events = asyncio.run(
-        _drain(
-            app.resolve_user_input(
-                UserInputResponse(
-                    session_id=session_id,
-                    input_id=input_id,
-                    answer="yes",
-                    limits=RunLimits(),
+    before = asyncio.run(store.load(session_id))
+    assert before is not None
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="yes",
+                        limits=RunLimits(),
+                    )
                 )
             )
         )
-    )
 
-    assert "after input" in echo.metadata_by_text
-    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert caught.value.changed_component_classes == (ExecutionProfileComponentClass.FINALIZATION,)
+    assert echo.metadata_by_text == {}
+    after = asyncio.run(store.load(session_id))
+    assert after is not None
+    assert after.status is before.status
+    assert after.run_epoch == before.run_epoch
 
 
 @pytest.mark.parametrize("override_kind", ["limits", "budget_limits"])
-def test_resolve_user_input_field_override_preserves_other_run_accounting(
+def test_resolve_user_input_rejects_limit_or_budget_drift_before_dispatch(
     override_kind: str,
 ) -> None:
     store = InMemorySessionStore()
@@ -1098,7 +1114,7 @@ def test_resolve_user_input_field_override_preserves_other_run_accounting(
                     if override_kind == "limits"
                     else RunLimits(max_total_tokens=10, scope="run")
                 ),
-                budget_limits=(cost_limit,) if override_kind == "limits" else (),
+                budget_limits=(cost_limit,),
             ),
         )
     )
@@ -1106,32 +1122,31 @@ def test_resolve_user_input_field_override_preserves_other_run_accounting(
         event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
     ).payload["input_id"]
 
-    events = asyncio.run(
-        _drain(
-            app.resolve_user_input(
-                UserInputResponse(
-                    session_id=session_id,
-                    input_id=input_id,
-                    answer="yes",
-                    limits=(
-                        RunLimits(max_total_tokens=1_000, scope="run")
-                        if override_kind == "limits"
-                        else None
-                    ),
-                    budget_limits=() if override_kind == "budget_limits" else None,
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
+        asyncio.run(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="yes",
+                        limits=(
+                            RunLimits(max_total_tokens=1_000, scope="run")
+                            if override_kind == "limits"
+                            else None
+                        ),
+                        budget_limits=() if override_kind == "budget_limits" else None,
+                    )
                 )
             )
         )
-    )
 
-    limit_event = next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED)
-    if override_kind == "limits":
-        assert limit_event.payload["limit"] == "estimated_cost"
-        assert limit_event.payload["actual"] == "0.000011"
-    else:
-        assert limit_event.payload["limit"] == "total_tokens"
-        assert limit_event.payload["actual"] == 11
-    assert len(provider.requests) == 2
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.FINALIZATION
+        if override_kind == "limits"
+        else ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+    )
+    assert len(provider.requests) == 1
     assert echo.metadata_by_text == {}
 
 
@@ -1300,6 +1315,7 @@ def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() 
     assert caught.value.changed_component_classes == (
         ExecutionProfileComponentClass.DIRECT_TOOLS,
         ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
         ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
         ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
     )
@@ -1627,9 +1643,8 @@ def test_resolve_user_input_rejects_secret_structured_output_before_transition()
 
 
 def test_resolve_user_input_rejects_native_structured_output_for_unsupported_provider() -> None:
-    # The paused run had no spec, so the resolver's NATIVE spec would be adopted —
-    # and must be rejected before the status transition (the fake provider does
-    # not support native structured output), leaving the pause resolvable.
+    # The paused run had no spec, so supplying a NATIVE spec is execution-profile
+    # drift and must be rejected before provider capability checks or status change.
     app, store = _build([("call_1", "ask_user", {"question": "q"})])
     pause = asyncio.run(
         _collect(
@@ -1644,7 +1659,7 @@ def test_resolve_user_input_rejects_native_structured_output_for_unsupported_pro
     awaiting = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT)
     input_id = awaiting.payload["input_id"]
 
-    with pytest.raises(NativeStructuredOutputUnsupported):
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
         asyncio.run(
             _drain(
                 app.resolve_user_input(
@@ -1660,6 +1675,9 @@ def test_resolve_user_input_rejects_native_structured_output_for_unsupported_pro
                 )
             )
         )
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+    )
 
     session = asyncio.run(store.load("s_native"))
     assert session is not None
@@ -1850,9 +1868,8 @@ def test_retry_after_crashed_sibling_flags_manual_recovery_not_re_execute() -> N
 
 
 def test_recover_user_input_rejects_native_structured_output_for_unsupported_provider() -> None:
-    # The manual-recovery entrance must apply the same pre-transition gate as the
-    # other five: an unsupported NATIVE spec raises before the session leaves
-    # INTERRUPTED, instead of resuming and failing mid-run via the backstop.
+    # Manual recovery applies the same frozen-profile gate: a newly supplied
+    # NATIVE contract is rejected before capability checks or status transition.
     store = InMemorySessionStore()
     counting = _CountingTool()
     app = CayuApp(session_store=store, enable_logging=False)
@@ -1898,7 +1915,7 @@ def test_recover_user_input_rejects_native_structured_output_for_unsupported_pro
     )
     assert stuck[-1].payload.get("manual_recovery_required") is True
 
-    with pytest.raises(NativeStructuredOutputUnsupported):
+    with pytest.raises(ExecutionProfileMismatchError) as caught:
         asyncio.run(
             _drain(
                 app.recover_user_input(
@@ -1917,6 +1934,9 @@ def test_recover_user_input_rejects_native_structured_output_for_unsupported_pro
                 )
             )
         )
+    assert caught.value.changed_component_classes == (
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+    )
 
     session = asyncio.run(store.load("s_rec_native"))
     assert session is not None

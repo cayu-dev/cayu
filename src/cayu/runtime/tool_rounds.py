@@ -31,8 +31,9 @@ class ToolRoundRecoveryRequest(BaseModel):
     operator supplies the externally verified COMPLETED/FAILED outcome as
     evidence; Cayu persists it as the call's terminal result and never re-runs
     the tool. ``max_steps``, ``limits``, ``budget_limits``, and
-    ``retry_policy`` default to ``None``, which applies the runtime defaults
-    for the resumed run (the pending tool round persists no run configuration).
+    ``retry_policy`` default to ``None``, which restores the configuration
+    persisted with the pending tool round. An explicit value is accepted only
+    when it preserves the invocation's frozen execution profile.
     """
 
     model_config = ConfigDict(

@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -57,6 +57,14 @@ class _CompletedProvider(ModelProvider):
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:model_budget_settlement_provider",
+            behavior_version="one",
+            implementation_version="one",
+        )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(request)
@@ -196,6 +204,17 @@ class _MutatedSettlementPageLedger(InMemoryBudgetLedger):
         if settlements:
             settlements[0].event.payload["actual_amount"] = "999"
         return settlements
+
+
+class _MutatedSettlementProfileLedger(InMemoryBudgetLedger):
+    async def load_settlement(self, settlement_id):
+        settlement = await super().load_settlement(settlement_id)
+        if settlement is not None and "execution_profile_fingerprint" in settlement.event.payload:
+            original = settlement.event.payload["execution_profile_fingerprint"]
+            settlement.event.payload["execution_profile_fingerprint"] = (
+                "0" * 64 if original != "0" * 64 else "1" * 64
+            )
+        return settlement
 
 
 def _budget_policy(
@@ -1074,7 +1093,11 @@ def test_exact_event_replay_handles_lost_session_store_acknowledgement() -> None
 
 @pytest.mark.parametrize(
     "ledger_type",
-    [_MutatedSettlementLoadLedger, _MutatedSettlementAcknowledgementLedger],
+    [
+        _MutatedSettlementLoadLedger,
+        _MutatedSettlementAcknowledgementLedger,
+        _MutatedSettlementProfileLedger,
+    ],
 )
 def test_runtime_revalidates_custom_ledger_settlements_before_publication(
     ledger_type,
@@ -1102,6 +1125,8 @@ def test_runtime_revalidates_custom_ledger_settlements_before_publication(
         assert all(event.payload.get("actual_amount") != "999" for event in persisted)
         committed = next(iter(ledger._settlements.values()))
         assert committed.event.payload["actual_amount"] == "0.000037"
+        if ledger_type is _MutatedSettlementProfileLedger:
+            assert persisted == []
 
     asyncio.run(scenario())
 

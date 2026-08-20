@@ -158,7 +158,7 @@ def test_adapter_emits_public_verified_report_and_retains_distinct_valid_tiers()
         price_book=_price_book(),
     )
 
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
     assert report["status"] == "verified"
     pair = report["pairs"][0]
     assert pair["baseline_cost"] == "0.0003"

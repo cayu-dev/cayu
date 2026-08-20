@@ -1652,7 +1652,8 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
     to ``None``: the resumed run inherits the original run's configuration
-    persisted on the pending approval. Explicit values override it.
+    persisted on the pending approval. Explicit values are accepted only when
+    they preserve the invocation's frozen execution profile.
     """
 
     session_id: NonBlankString
@@ -1701,7 +1702,8 @@ class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
     to ``None``: the resumed run inherits the original run's configuration
-    persisted on the pending approval. Explicit values override it.
+    persisted on the pending approval. Explicit values are accepted only when
+    they preserve the invocation's frozen execution profile.
     """
 
     session_id: NonBlankString
@@ -1734,8 +1736,9 @@ class ToolRoundRecoveryBody(_BoundedControlPlaneMetadataBody):
     """Body for recovering a crashed ordinary tool call with an operator outcome.
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
-    to ``None``: the resumed run applies the runtime defaults (a pending tool
-    round persists no run configuration). Explicit values override them.
+    to ``None``, which restores the configuration persisted with the pending
+    tool round. An explicit value is accepted only when it preserves the
+    invocation's frozen execution profile.
     """
 
     session_id: NonBlankString
@@ -1768,6 +1771,8 @@ class UserInputResolveBody(_BoundedControlPlaneMetadataBody):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
     resumed run inherits the original run's configuration persisted on the pending user input.
+    Explicit values are accepted only when they preserve the invocation's frozen execution
+    profile.
     """
 
     session_id: NonBlankString
@@ -1797,6 +1802,8 @@ class UserInputRecoveryBody(_BoundedControlPlaneMetadataBody):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
     resumed run inherits the original run's configuration persisted on the pending user input.
+    Explicit values are accepted only when they preserve the invocation's frozen execution
+    profile.
     """
 
     session_id: NonBlankString

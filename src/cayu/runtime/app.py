@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import mimetypes
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -45,7 +45,10 @@ from cayu.core.events import (
     event_with_durable_sequence,
     validate_public_custom_event_type,
 )
-from cayu.core.execution_identity import copy_execution_profile_behavior_identity
+from cayu.core.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -1014,6 +1017,7 @@ class CayuApp:
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_provider=self._get_registered_provider,
             resolve_registered_environment=self._get_registered_environment_for_session,
+            resolve_budget_policy=lambda: self.budget_policy,
             validate_execution_profile_continuation=(
                 self._validate_execution_profile_continuation_for_recovery
             ),
@@ -1663,7 +1667,23 @@ class CayuApp:
             tools=MappingProxyType(tools_by_name),
             tool_capabilities=tool_capabilities,
             context_policy=stored_context_policy,
+            context_policy_execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    stored_context_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="context_policy.execution_profile_identity",
+                )
+            ),
             context_overflow_policy=stored_context_overflow_policy,
+            context_overflow_policy_execution_profile_identity=(
+                None
+                if stored_context_overflow_policy is None
+                else copy_secret_free_execution_profile_behavior_identity(
+                    stored_context_overflow_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="context_overflow_policy.execution_profile_identity",
+                )
+            ),
             tool_policy=stored_tool_policy,
             tool_policy_execution_profile_identity=(
                 copy_secret_free_execution_profile_behavior_identity(
@@ -1683,6 +1703,13 @@ class CayuApp:
                 for index, policy in enumerate(stored_loop_policies)
             ),
             execution_requirements=stored_execution_requirements,
+            context_behavior_execution_profile_identities=(
+                _snapshot_context_behavior_execution_profile_identities(
+                    stored_context_policy,
+                    stored_context_overflow_policy,
+                    redactor=self._secret_redactor,
+                )
+            ),
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
@@ -1723,6 +1750,7 @@ class CayuApp:
                     "Fork-group evaluator registration is not structurally isolated."
                 )
             return synthetic_agent_name
+        evaluator_context_policy = DefaultContextPolicy()
         self._agents[synthetic_agent_name] = runtime_records.RegisteredAgentState(
             spec=original.spec.model_copy(
                 update={
@@ -1735,14 +1763,29 @@ class CayuApp:
             ),
             tools=MappingProxyType({}),
             tool_capabilities=(),
-            context_policy=DefaultContextPolicy(),
+            context_policy=evaluator_context_policy,
+            context_policy_execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    evaluator_context_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="context_policy.execution_profile_identity",
+                )
+            ),
             context_overflow_policy=None,
+            context_overflow_policy_execution_profile_identity=None,
             tool_policy=AllowAllToolPolicy(),
             tool_policy_execution_profile_identity=None,
             runtime_hooks=(),
             loop_policies=(),
             loop_policy_execution_profile_identities=(),
             execution_requirements=ExecutionRequirements.trusted(),
+            context_behavior_execution_profile_identities=(
+                _snapshot_context_behavior_execution_profile_identities(
+                    evaluator_context_policy,
+                    None,
+                    redactor=self._secret_redactor,
+                )
+            ),
             registration_source=original.registration_source,
             registration_symbol=original.registration_symbol,
         )
@@ -1786,6 +1829,13 @@ class CayuApp:
         self._providers[provider_name] = runtime_records.RegisteredProvider(
             name=provider_name,
             provider=provider,
+            execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    provider.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="provider.execution_profile_identity",
+                )
+            ),
             model_patterns=stored_model_patterns,
             registration_source=registration_source,
             registration_symbol=registration_symbol,
@@ -2790,10 +2840,10 @@ class CayuApp:
                     "A live session has no durable active invocation execution profile."
                 )
             source_profile = execution_profile_from_session_metadata(session.metadata)
-        required_profile = source_profile
-        target_changed = request.target is not None and (
-            request.target.provider_name != session.provider_name
-            or request.target.model != session.model
+        durable_request = self.redact_dispatch_request(request)
+        target_changed = durable_request.target is not None and (
+            durable_request.target.provider_name != session.provider_name
+            or durable_request.target.model != session.model
         )
         if target_changed:
             if continues_active_invocation:
@@ -2802,10 +2852,12 @@ class CayuApp:
                     "recovery is pending."
                 )
             source_profile = execution_profile_from_session_metadata(session.metadata)
-            required_profile = self._session_engine._queued_dispatch_target_profile(
+        required_profile = source_profile
+        if not continues_active_invocation:
+            required_profile = self._session_engine._queued_dispatch_required_profile(
                 session=session,
                 source_profile=source_profile,
-                target=request.target,
+                request=durable_request,
             )
         unavailable = set(unavailable_execution_profile_components(source_profile))
         unavailable.update(unavailable_execution_profile_components(required_profile))
@@ -2818,19 +2870,18 @@ class CayuApp:
                 )
             )
         if (
-            request.structured_output is not None
-            and request.structured_output.strategy is StructuredOutputStrategy.NATIVE
+            durable_request.structured_output is not None
+            and durable_request.structured_output.strategy is StructuredOutputStrategy.NATIVE
         ):
             registered_provider = self._get_registered_provider(
-                request.target.provider_name
-                if request.target is not None
+                durable_request.target.provider_name
+                if durable_request.target is not None
                 else session.provider_name
             )
             _require_native_structured_output_support(
-                request.structured_output,
+                durable_request.structured_output,
                 registered_provider=registered_provider,
             )
-        durable_request = self.redact_dispatch_request(request)
         return _new_queued_dispatch_envelope(
             queue_task_id=queue_task_id,
             request=durable_request,
@@ -3824,6 +3875,7 @@ class CayuApp:
             max_steps=request.max_steps,
             limits=request.limits,
             budget_limits=request.budget_limits,
+            budget_policy=copy_budget_policy(request.budget_policy),
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
             thinking=request.thinking,
@@ -3856,6 +3908,14 @@ class CayuApp:
         request_loop_policies: tuple[LoopPolicy, ...] | None = None,
         frozen_candidate_profile: ExecutionProfileIdentity | None = None,
         *,
+        budget_policy: BudgetPolicy | None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+        structured_output: StructuredOutputSpec | None = None,
+        thinking: ThinkingConfig | None = None,
+        max_steps: int = 16,
+        limits: RunLimits | None = None,
+        retry_policy: RetryPolicy | None = None,
+        invocation_semantics_available: bool = False,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
     ) -> ActiveInvocationExecutionProfile:
@@ -3865,6 +3925,14 @@ class CayuApp:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             request_loop_policies=request_loop_policies,
+            budget_policy=copy_budget_policy(budget_policy),
+            request_budget_limits=request_budget_limits,
+            structured_output=structured_output,
+            thinking=thinking,
+            max_steps=max_steps,
+            limits=limits,
+            retry_policy=retry_policy,
+            invocation_semantics_available=invocation_semantics_available,
             frozen_candidate_profile=frozen_candidate_profile,
             require_open_interaction=require_open_interaction,
             additional_profile_fingerprints=additional_profile_fingerprints,
@@ -3893,6 +3961,7 @@ class CayuApp:
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             execution_profile=request.execution_profile,
+            legacy_resolution_without_profile=request.legacy_resolution_without_profile,
         )
 
     def _stop_recovery_session_for_limit_reached(
@@ -4243,6 +4312,7 @@ class CayuApp:
         max_steps: int,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
+        budget_policy: BudgetPolicy | None,
         retry_policy: RetryPolicy,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
@@ -4271,6 +4341,7 @@ class CayuApp:
             max_steps=max_steps,
             limits=limits,
             budget_limits=budget_limits,
+            budget_policy=budget_policy,
             retry_policy=retry_policy,
             structured_output=structured_output,
             thinking=thinking,
@@ -4692,6 +4763,83 @@ def _validate_optional_positive_seconds(value: float | None, field_name: str) ->
     if not isfinite(value) or value <= 0:
         raise ValueError(f"{field_name} must be greater than zero.")
     return float(value)
+
+
+def _snapshot_context_behavior_execution_profile_identities(
+    context_policy: ContextPolicy,
+    context_overflow_policy: ContextPolicy | None,
+    *,
+    redactor: SecretRedactor,
+) -> Mapping[int, ExecutionProfileBehaviorIdentity | None]:
+    """Copy declarations reachable through Cayu-owned context wrappers."""
+
+    from cayu.runtime.context import (
+        CheckpointCompactionContextPolicy,
+        KnowledgeInjectionPolicy,
+        ModelCompactor,
+        PromptCacheCompactor,
+        UsageTriggeredContextPolicy,
+    )
+
+    snapshots: dict[int, ExecutionProfileBehaviorIdentity | None] = {}
+
+    def visit(policy: ContextPolicy, *, field_name: str) -> None:
+        policy_id = id(policy)
+        if policy_id in snapshots:
+            return
+        snapshots[policy_id] = copy_secret_free_execution_profile_behavior_identity(
+            policy.execution_profile_identity,
+            redactor=redactor,
+            field_name=f"{field_name}.execution_profile_identity",
+        )
+        if type(policy) is KnowledgeInjectionPolicy:
+            visit(policy.base_policy, field_name=f"{field_name}.base_policy")
+            return
+        if type(policy) is UsageTriggeredContextPolicy:
+            visit(policy.base_policy, field_name=f"{field_name}.base_policy")
+            visit(policy.triggered_policy, field_name=f"{field_name}.triggered_policy")
+            return
+        if type(policy) is not CheckpointCompactionContextPolicy:
+            return
+
+        visit_compactor(
+            policy.compactor,
+            field_name=f"{field_name}.compactor",
+        )
+
+    def visit_compactor(compactor: object, *, field_name: str) -> None:
+        compactor_id = id(compactor)
+        if compactor_id in snapshots:
+            return
+        snapshots[compactor_id] = copy_secret_free_execution_profile_behavior_identity(
+            getattr(compactor, "execution_profile_identity", None),
+            redactor=redactor,
+            field_name=f"{field_name}.execution_profile_identity",
+        )
+        if type(compactor) is ModelCompactor:
+            provider = compactor.provider
+            snapshots[id(provider)] = copy_secret_free_execution_profile_behavior_identity(
+                provider.execution_profile_identity,
+                redactor=redactor,
+                field_name=f"{field_name}.provider.execution_profile_identity",
+            )
+            return
+        if type(compactor) is PromptCacheCompactor:
+            provider = compactor.provider
+            snapshots[id(provider)] = copy_secret_free_execution_profile_behavior_identity(
+                provider.execution_profile_identity,
+                redactor=redactor,
+                field_name=f"{field_name}.provider.execution_profile_identity",
+            )
+            visit_compactor(
+                compactor._fallback,
+                field_name=f"{field_name}.fallback_compactor",
+            )
+
+    visit(context_policy, field_name="context_policy")
+    if context_overflow_policy is not None:
+        visit(context_overflow_policy, field_name="context_overflow_policy")
+    return MappingProxyType(snapshots)
 
 
 def _validate_provider_model_patterns(value: Iterable[str] | None) -> tuple[str, ...]:

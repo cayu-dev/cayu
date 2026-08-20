@@ -14,8 +14,10 @@ from pydantic import ValidationError
 from tests.core._execution_profile_fixtures import profiled_session_identity
 
 import cayu.runtime._session_engine as session_engine_module
+from cayu import ScriptedModelProvider
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.providers import (
     ModelProvider,
     ModelProviderError,
@@ -39,6 +41,8 @@ from cayu.runtime import (
     ContextRequest,
     EventQuery,
     EventSink,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
     ForkSessionRequest,
     InMemoryBudgetLedger,
     InMemoryEventSink,
@@ -80,6 +84,14 @@ class RecordingCompactor(ContextCompactor):
 
     def provider_budget_identity(self, _session) -> None:
         return None
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:recording-context-compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.requests.append(request)
@@ -1439,6 +1451,96 @@ def test_compact_session_invalid_usage_fails_closed_on_next_strict_budget_check(
     asyncio.run(run())
 
 
+def test_explicit_compaction_retry_rejects_live_provider_drift_before_dispatch(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("must not dispatch"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ],
+            name="compaction-provider",
+        )
+        consume_batch = provider._consume_batch
+
+        def consume_then_mutate(request: ModelRequest) -> tuple[ModelStreamEvent, ...]:
+            batch = consume_batch(request)
+            if len(provider.requests) == 1:
+                monkeypatch.setattr(provider, "_operation_adapter", object())
+                raise ModelProviderError(
+                    "compactor overloaded",
+                    provider=provider.name,
+                    status_code=503,
+                    retryable=True,
+                )
+            return batch
+
+        monkeypatch.setattr(provider, "_consume_batch", consume_then_mutate)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=provider,
+                    model="summary-model",
+                    retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+                ),
+                max_user_turns=1,
+            ),
+        )
+        session_id = "explicit-compaction-live-provider-drift"
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        await store.append_transcript_messages(session_id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+
+        with pytest.raises(ContextBuildError) as caught:
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=session_id,
+                    idempotency_key="explicit-live-provider-drift",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
+
+        profile_mismatch = caught.value.__cause__
+        assert isinstance(profile_mismatch, ExecutionProfileMismatchError)
+        assert profile_mismatch.changed_component_classes == (
+            ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+        )
+        assert len(provider.requests) == 1
+        compaction_completions = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(compaction_completions) == 1
+        assert compaction_completions[0].payload["compaction_outcome"] == "provider_error"
+
+    asyncio.run(scenario())
+
+
 def test_explicit_compaction_lost_completion_ack_is_restart_safe() -> None:
     class LostCompletionAcknowledgementStore(InMemorySessionStore):
         def __init__(self) -> None:
@@ -1806,6 +1908,14 @@ class OverlappingCompactor(ModelCompactor):
         self.started = provider.started
         self.release = provider.release
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:overlapping-model-compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
 
 class OverlappingCompactionProvider(ModelProvider):
     name = "overlap-compactor"
@@ -1832,6 +1942,14 @@ class OverlappingCompactionProvider(ModelProvider):
 
 class CompletingProvider(ModelProvider):
     name = "fake"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:completing-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def stream(self, request: ModelRequest):
         yield ModelStreamEvent.text_delta("done")
@@ -2251,6 +2369,70 @@ def test_compact_session_preserves_transcript_and_replays_original_outcome() -> 
             assert event.payload["reason"] == "application_requested"
 
     asyncio.run(run())
+
+
+def test_compact_session_instructions_change_the_governing_profile_without_publication() -> None:
+    async def run() -> tuple[list[Event], list[Event]]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RecordingCompactor(),
+                max_user_turns=1,
+                compact_after_messages=100,
+            ),
+        )
+
+        async def compact(session_id: str, instructions: str) -> list[Event]:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            transcript = [
+                Message.text("user", "old request"),
+                Message.text("assistant", "old answer"),
+                Message.text("user", "current request"),
+            ]
+            await store.append_transcript_messages(created.id, transcript)
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            return [
+                event
+                async for event in app.compact_session(
+                    CompactSessionRequest(
+                        session_id=created.id,
+                        idempotency_key=f"compact-{session_id}",
+                        expected_run_epoch=completed.run_epoch,
+                        expected_transcript_cursor=len(transcript),
+                        instructions=instructions,
+                    )
+                )
+            ]
+
+        return (
+            await compact("sess_compaction_profile_a", "Preserve decisions."),
+            await compact("sess_compaction_profile_b", "Preserve file names."),
+        )
+
+    first, second = asyncio.run(run())
+
+    first_profiles = {event.payload.get("execution_profile_fingerprint") for event in first}
+    second_profiles = {event.payload.get("execution_profile_fingerprint") for event in second}
+    assert len(first_profiles) == 1
+    assert len(second_profiles) == 1
+    assert None not in first_profiles
+    assert None not in second_profiles
+    assert first_profiles != second_profiles
+    assert (
+        first[0].payload["instruction_digest"] == hashlib.sha256(b"Preserve decisions.").hexdigest()
+    )
+    serialized = str([event.model_dump(mode="json") for event in (*first, *second)])
+    assert "Preserve decisions." not in serialized
+    assert "Preserve file names." not in serialized
 
 
 def test_compact_session_redacts_instructions_before_provider_and_durable_boundaries() -> None:
@@ -2752,6 +2934,7 @@ def test_compact_session_replays_original_outcome_after_session_advances() -> No
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         transcript = [
@@ -3473,6 +3656,7 @@ def test_compact_session_claim_blocks_concurrent_resume() -> None:
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         transcript = [
@@ -6347,6 +6531,7 @@ def test_expired_compaction_claim_does_not_block_resume() -> None:
         accepted_at = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
         store = InMemorySessionStore()
         first_app = CayuApp(session_store=store, enable_logging=False, clock=lambda: accepted_at)
+        first_app.register_provider(CompletingProvider())
         first_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=CheckpointCompactionContextPolicy(
@@ -6364,6 +6549,7 @@ def test_expired_compaction_claim_does_not_block_resume() -> None:
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=first_app,
             ),
         )
         transcript = [
@@ -6470,6 +6656,7 @@ def test_expired_compaction_claim_does_not_block_fork_or_a_new_key() -> None:
         accepted_at = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
         store = InMemorySessionStore()
         first_app = CayuApp(session_store=store, enable_logging=False, clock=lambda: accepted_at)
+        first_app.register_provider(CompletingProvider())
         first_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=CheckpointCompactionContextPolicy(
@@ -6486,6 +6673,7 @@ def test_expired_compaction_claim_does_not_block_fork_or_a_new_key() -> None:
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=first_app,
             ),
         )
         transcript = [
@@ -6583,6 +6771,7 @@ def test_fork_inherits_compacted_context_without_source_operation_records() -> N
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
+                app=app,
             ),
         )
         transcript = [
@@ -8598,6 +8787,11 @@ def test_compact_session_applies_app_policy_and_reserves_before_provider_work() 
         ]
         assert provider.calls == 0
         assert all(event.payload["operation_id"] for event in events[1:])
+        profile_fingerprints = {
+            event.payload.get("execution_profile_fingerprint") for event in events
+        }
+        assert None not in profile_fingerprints
+        assert len(profile_fingerprints) == 1
 
     asyncio.run(run())
 

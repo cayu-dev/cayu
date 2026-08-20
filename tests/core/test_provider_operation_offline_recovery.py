@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
@@ -50,6 +50,8 @@ from cayu.runtime import (
     BudgetPolicy,
     BudgetReservation,
     CayuApp,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -59,6 +61,7 @@ from cayu.runtime import (
     InteractionStatus,
     InteractionSummaryEvidence,
     InterruptSessionRequest,
+    MessageWindowContextPolicy,
     ResolutionActor,
     ResumeRequest,
     RetryPolicy,
@@ -105,6 +108,8 @@ from cayu.runtime.provider_operations import (
     ProviderOperationResolutionConflict,
     ProviderOperationResolutionRequest,
     ProviderOperationUnavailableReason,
+    _parse_provider_operation_resolution_record,
+    _resolution_record_digest,
     commit_provider_operation_progress,
     inspect_provider_operation,
     load_pending_provider_operation_disposition,
@@ -231,6 +236,14 @@ class _OfflineOperationProvider(ModelProvider):
         events: tuple[ModelStreamEvent, ...] | None = None,
     ) -> None:
         self.adapter = _OfflineOperationAdapter(status, events=events)
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:opo-adapter",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     @property
     def provider_operation_mode(self) -> ProviderOperationMode:
@@ -755,6 +768,75 @@ class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
         return result
 
 
+class _CorruptResolutionProfileEventStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.corrupt_resolution_profile = False
+
+    async def query_events(self, query):
+        records = await super().query_events(query)
+        if not self.corrupt_resolution_profile:
+            return records
+        corrupted = []
+        for record in records:
+            if record.event.type is not EventType.PROVIDER_OPERATION_RESOLVED:
+                corrupted.append(record)
+                continue
+            payload = dict(record.event.payload)
+            payload["execution_profile_fingerprint"] = "0" * 64
+            corrupted.append(
+                record.model_copy(
+                    update={"event": record.event.model_copy(update={"payload": payload})}
+                )
+            )
+        return corrupted
+
+
+class _LegacyResolutionProfileStore(InMemorySessionStore):
+    """Persist provider-resolution evidence in the pre-attribution shape."""
+
+    # This shim changes only the persisted resolution representation while
+    # delegating the atomic checkpoint/stage-release transaction to the
+    # conforming in-memory store below.
+    supports_atomic_model_completion_stage_release = True
+
+    async def publish_session_operation(self, session_id: str, **kwargs):
+        events = kwargs["events"]
+        if not any(event.type is EventType.PROVIDER_OPERATION_RESOLVED for event in events):
+            return await super().publish_session_operation(session_id, **kwargs)
+
+        operation_transform = kwargs["operation_transform"]
+
+        def legacy_operation_transform(session, checkpoint, current_record):
+            publication = operation_transform(session, checkpoint, current_record)
+            operation_records = {
+                key: dict(record) for key, record in publication.operation_records.items()
+            }
+            for record in operation_records.values():
+                if record.get("record_type") != "cayu.provider-operation-resolution":
+                    continue
+                record.pop("execution_profile_fingerprint", None)
+                record["record_digest"] = _resolution_record_digest(record)
+            return publication.model_copy(update={"operation_records": operation_records})
+
+        legacy_events = []
+        for event in events:
+            if event.type is not EventType.PROVIDER_OPERATION_RESOLVED:
+                legacy_events.append(event)
+                continue
+            payload = dict(event.payload)
+            payload.pop("execution_profile_fingerprint", None)
+            legacy_events.append(event.model_copy(update={"payload": payload}))
+        return await super().publish_session_operation(
+            session_id,
+            **{
+                **kwargs,
+                "operation_transform": legacy_operation_transform,
+                "events": legacy_events,
+            },
+        )
+
+
 class _BlockingInterruptionTransitionStore(InMemorySessionStore):
     def __init__(self) -> None:
         super().__init__()
@@ -870,6 +952,9 @@ async def _stage_offline_operation(
     runtime_hooks: tuple[RuntimeHook, ...] = (),
 ) -> Message:
     user_message = Message.text("user", "finish this while no worker is attached")
+    typed_recovery_context = ModelCompletionRecoveryContext.model_validate(
+        {} if recovery_context is None else recovery_context
+    )
     interaction_id = f"interaction-{session_id}"
     started_event_id = f"{session_id}:interaction-started"
     started_at = datetime.now(UTC) if started_at is None else started_at
@@ -892,6 +977,14 @@ async def _stage_offline_operation(
         tools=tools,
         tool_policy=tool_policy,
         runtime_hooks=runtime_hooks,
+        provider=provider,
+        structured_output=typed_recovery_context.structured_output,
+        thinking=typed_recovery_context.thinking,
+        request_budget_limits=typed_recovery_context.budget_limits,
+        causal_budget_id=session_id,
+        max_steps=typed_recovery_context.max_steps,
+        limits=typed_recovery_context.limits,
+        retry_policy=typed_recovery_context.retry_policy,
     )
     execution_profile = session_identity.execution_profile
     assert execution_profile is not None
@@ -937,9 +1030,9 @@ async def _stage_offline_operation(
         "source_transcript_cursor": 1,
         "request_fingerprint": "c" * 64,
     }
-    typed_recovery_context = ModelCompletionRecoveryContext.model_validate(
-        {} if recovery_context is None else recovery_context
-    ).model_copy(update={"execution_profile_fingerprint": execution_profile.fingerprint})
+    typed_recovery_context = typed_recovery_context.model_copy(
+        update={"execution_profile_fingerprint": execution_profile.fingerprint}
+    )
     intent["recovery_context"] = typed_recovery_context.model_dump(mode="json")
     await store.prepare_model_completion_stage(
         session_id,
@@ -969,6 +1062,7 @@ async def _stage_offline_operation(
                     "attempt": 1,
                     "max_attempts": 1,
                     **identity.payload(),
+                    "execution_profile_fingerprint": execution_profile.fingerprint,
                 },
             ),
             Event(
@@ -990,6 +1084,7 @@ async def _stage_offline_operation(
                     "stream_protocol": provider.adapter.state.stream_protocol,
                     "status": ProviderOperationStatus.IN_PROGRESS.value,
                     "recovery_metadata": {"cursor": 0},
+                    "execution_profile_fingerprint": execution_profile.fingerprint,
                 },
             ),
         ],
@@ -1193,6 +1288,94 @@ def test_pending_fail_resolution_rejects_conflicting_terminal_event() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("outcome", "event_type"),
+    (
+        ("model_error", EventType.MODEL_ERROR),
+        ("session_failed", EventType.SESSION_FAILED),
+    ),
+)
+def test_pending_fail_resolution_rejects_conflicting_terminal_profile(
+    outcome: Literal["model_error", "session_failed"],
+    event_type: EventType,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = f"conflicting-resolution-profile-{outcome}"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active = await store.load_active_model_completion_stage(session_id)
+        assert interrupted is not None
+        assert active is not None
+        request = ProviderOperationResolutionRequest(
+            session_id=session_id,
+            stage_id=active.stage.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+        )
+        accepted = await resolve_provider_operation_stage(
+            store,
+            request,
+            redactor=SecretRedactor(),
+        )
+        fingerprint = accepted.event.payload.get("execution_profile_fingerprint")
+        assert type(fingerprint) is str
+        conflicting_fingerprint = "0" * 64 if fingerprint != "0" * 64 else "1" * 64
+        payload = {
+            **accepted.event.payload,
+            "execution_profile_fingerprint": conflicting_fingerprint,
+            "error": "Provider operation could not be recovered.",
+        }
+        interaction_id = accepted.event.interaction_id
+        if outcome == "model_error":
+            payload.update(
+                error_type="provider_operation_unavailable",
+                stage="provider_operation_recovery",
+            )
+        else:
+            interaction_id = None
+            payload["failure_type"] = "provider_operation_unavailable"
+        await store.append_event(
+            session_id,
+            Event(
+                id=provider_operation_resolution_outcome_event_id(
+                    accepted.record.resolution_id,
+                    outcome,
+                ),
+                type=event_type,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                agent_name=accepted.event.agent_name,
+                environment_name=accepted.event.environment_name,
+                timestamp=accepted.event.timestamp,
+                payload=payload,
+            ),
+        )
+
+        with pytest.raises(
+            ProviderOperationEvidenceError,
+            match="conflicts with its execution profile",
+        ):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+        assert await load_pending_provider_operation_disposition(store, session_id) is not None
+        unchanged = await store.load(session_id)
+        assert unchanged is not None
+        assert unchanged.status is SessionStatus.INTERRUPTED
+        assert provider.adapter.start_calls == 0
+
+    asyncio.run(scenario())
+
+
 async def stage_provider_resolution_process_loss(
     store: SessionStore,
     *,
@@ -1371,6 +1554,10 @@ async def _commit_partial_provider_progress(
     stage = active.stage
     model_attempt_id = stage.intent["model_attempt_id"]
     assert isinstance(model_attempt_id, str)
+    recovery_context = stage.intent.get("recovery_context")
+    assert type(recovery_context) is dict
+    execution_profile_fingerprint = recovery_context.get("execution_profile_fingerprint")
+    assert type(execution_profile_fingerprint) is str
     identity = ModelAttemptIdentity(
         model_step_id=stage.logical_step_id,
         model_attempt_id=model_attempt_id,
@@ -1395,6 +1582,7 @@ async def _commit_partial_provider_progress(
             **identity.payload(),
             "source_run_epoch": stage.source_run_epoch,
             "provider_operation_progress": envelope.model_dump(mode="json"),
+            "execution_profile_fingerprint": execution_profile_fingerprint,
         },
     )
     await commit_provider_operation_progress(
@@ -1439,9 +1627,58 @@ async def assert_offline_provider_operation_recovery(store: SessionStore) -> Non
     assert len(completed_events) == 1
     assert completed_events[0].payload["usage_metrics"]["input_tokens"] == 3
     assert completed_events[0].payload["usage_metrics"]["output_tokens"] == 4
+    profiled_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.MODEL_STARTED,
+            EventType.MODEL_COMPLETED,
+            EventType.PROVIDER_OPERATION_STARTED,
+            EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+            EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
+            EventType.PROVIDER_OPERATION_RECONCILED,
+        }
+    ]
+    assert profiled_events
+    assert {event.payload.get("execution_profile_fingerprint") for event in profiled_events} == {
+        completed_events[0].payload["execution_profile_fingerprint"]
+    }
     assert await store.load_active_model_completion_stage("offline-completed") is None
     inspection = await inspect_provider_operation(store, "offline-completed")
     assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
+
+
+def test_offline_provider_operation_recovery_rejects_changed_context_before_retrieval() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        provider = _OfflineOperationProvider(ProviderOperationStatus.COMPLETED)
+        await _stage_offline_operation(
+            store,
+            session_id="offline-context-profile-drift",
+            provider=provider,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=MessageWindowContextPolicy(max_messages=3),
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id="offline-context-profile-drift",
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        )
+        assert provider.adapter.retrieve_calls == []
+
+    asyncio.run(exercise())
 
 
 async def assert_terminal_session_fails_closed_with_active_provider_operation(
@@ -3069,6 +3306,42 @@ def test_sqlite_provider_resolution_process_loss_finishes_disposition(
     asyncio.run(scenario())
 
 
+def test_legacy_fail_resolution_finishes_after_profile_attribution_upgrade() -> None:
+    async def scenario() -> None:
+        store = _LegacyResolutionProfileStore()
+        session_id, provider = await stage_provider_resolution_process_loss(
+            store,
+            action=ProviderOperationResolutionAction.FAIL,
+            after_status_transition=False,
+        )
+        pending_resolution = await load_pending_provider_operation_disposition(store, session_id)
+        assert pending_resolution is not None
+        pending, resolution = pending_resolution
+        assert resolution.record.execution_profile_fingerprint is None
+        assert "execution_profile_fingerprint" not in resolution.event.payload
+
+        await assert_provider_resolution_process_loss_recovery(
+            store,
+            session_id=session_id,
+            provider=provider,
+            action=ProviderOperationResolutionAction.FAIL,
+        )
+
+        events = await store.load_events(session_id)
+        profiled_outcomes = [
+            event
+            for event in events
+            if event.type in {EventType.MODEL_ERROR, EventType.SESSION_FAILED}
+        ]
+        assert len(profiled_outcomes) == 2
+        assert {
+            event.payload.get("execution_profile_fingerprint") for event in profiled_outcomes
+        } == {pending.execution_profile_fingerprint}
+        assert provider.adapter.start_calls == 0
+
+    asyncio.run(scenario())
+
+
 def test_sqlite_fallback_pre_dispatch_failure_remains_recoverable_after_restart(
     tmp_path: Path,
 ) -> None:
@@ -3872,7 +4145,7 @@ def test_successful_provider_resolution_redacts_audit_fields_before_persistence_
 ) -> None:
     async def scenario() -> str:
         canary = "provider-resolution-audit-secret-canary-0123456789"
-        store = InMemorySessionStore()
+        store = _CorruptResolutionProfileEventStore()
         sink = InMemoryEventSink()
         session_id = "provider-resolution-secret-audit-fields"
         provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
@@ -3919,6 +4192,46 @@ def test_successful_provider_resolution_redacts_audit_fields_before_persistence_
             active.stage.stage_id,
         )
         assert stored_resolution is not None
+        assert stored_resolution.record.execution_profile_fingerprint is not None
+        assert (
+            stored_resolution.record.execution_profile_fingerprint
+            == stored_resolution.event.payload["execution_profile_fingerprint"]
+        )
+        legacy_record_payload = stored_resolution.record.model_dump(mode="json")
+        legacy_record_payload.pop("execution_profile_fingerprint")
+        legacy_record_payload["record_digest"] = _resolution_record_digest(legacy_record_payload)
+        legacy_record = _parse_provider_operation_resolution_record(
+            legacy_record_payload,
+            session_id=session_id,
+            stage_id=active.stage.stage_id,
+        )
+        assert legacy_record.execution_profile_fingerprint is None
+        malformed_record_payload = {
+            **legacy_record_payload,
+            "execution_profile_fingerprint": None,
+        }
+        malformed_record_payload["record_digest"] = _resolution_record_digest(
+            malformed_record_payload
+        )
+        with pytest.raises(
+            ProviderOperationResolutionConflict,
+            match="profile evidence is malformed",
+        ):
+            _parse_provider_operation_resolution_record(
+                malformed_record_payload,
+                session_id=session_id,
+                stage_id=active.stage.stage_id,
+            )
+        store.corrupt_resolution_profile = True
+        with pytest.raises(
+            ProviderOperationResolutionConflict,
+            match="event conflicts with its record",
+        ):
+            await load_provider_operation_resolution(
+                store,
+                session_id,
+                active.stage.stage_id,
+            )
         durable_events = await store.load_events(session_id)
         combined = repr(
             (
@@ -4291,6 +4604,12 @@ def test_explicit_fail_resolution_terminalizes_without_provider_redispatch() -> 
         assert events[1].payload["recovery_reason"] == "unavailable"
         assert events[0].payload["duplicate_request_risk"] is True
         assert events[3].payload["failure_type"] == "provider_operation_unavailable"
+        expected_profile_fingerprint = active.stage.intent["recovery_context"][
+            "execution_profile_fingerprint"
+        ]
+        assert events[0].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
+        assert events[1].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
+        assert events[3].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
         failed = await store.load(session_id)
         assert failed is not None
         assert failed.status is SessionStatus.FAILED
@@ -4765,6 +5084,7 @@ async def assert_offline_provider_operation_reuses_run_limit_accounting(
     limit_kind: str,
     approval_limits: RunLimits | None = None,
     approval_budget_limits: tuple[BudgetLimit, ...] | None = None,
+    expected_profile_change: ExecutionProfileComponentClass | None = None,
 ) -> None:
     session_id = f"offline-run-limit-{limit_kind}"
     provider = _OfflineOperationProvider(
@@ -4891,6 +5211,34 @@ async def assert_offline_provider_operation_reuses_run_limit_accounting(
     checkpoint = await store.load_checkpoint(session_id)
     pending = app._pending_tool_approval_from_checkpoint(checkpoint)
     assert pending is not None
+    session_before_resolution = await store.load(session_id)
+    assert session_before_resolution is not None
+
+    if expected_profile_change is not None:
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            _ = [
+                event
+                async for event in app.resolve_tool_approval(
+                    ToolApprovalRequest(
+                        session_id=session_id,
+                        approval_id=pending.approval_id,
+                        tool_round_id=pending.tool_round_id,
+                        tool_call_id=pending.tool_call_id,
+                        decision=ToolApprovalDecision.APPROVE,
+                        limits=approval_limits,
+                        budget_limits=approval_budget_limits,
+                    )
+                )
+            ]
+        assert caught.value.changed_component_classes == (expected_profile_change,)
+        session_after_resolution = await store.load(session_id)
+        assert session_after_resolution is not None
+        assert session_after_resolution.status is session_before_resolution.status
+        assert session_after_resolution.run_epoch == session_before_resolution.run_epoch
+        assert tool.calls == []
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.retrieve_calls == [provider.adapter.state]
+        return
 
     resolution_events = [
         event
@@ -4948,8 +5296,8 @@ def test_offline_recovery_reuses_original_run_limit_accounting(
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
-@pytest.mark.parametrize("override_kind", ["limits", "budget_limits"])
-def test_offline_recovery_field_override_preserves_other_run_accounting(
+@pytest.mark.parametrize("override_kind", ["changed_limits", "same_budget_limits"])
+def test_offline_recovery_field_restatement_obeys_frozen_profile(
     store_kind: str,
     override_kind: str,
     tmp_path: Path,
@@ -4963,13 +5311,18 @@ def test_offline_recovery_field_override_preserves_other_run_accounting(
         try:
             await assert_offline_provider_operation_reuses_run_limit_accounting(
                 store,
-                limit_kind="cost" if override_kind == "limits" else "tokens",
+                limit_kind="cost" if override_kind == "changed_limits" else "tokens",
                 approval_limits=(
                     RunLimits(max_total_tokens=1_000, scope="run")
-                    if override_kind == "limits"
+                    if override_kind == "changed_limits"
                     else None
                 ),
-                approval_budget_limits=() if override_kind == "budget_limits" else None,
+                approval_budget_limits=(() if override_kind == "same_budget_limits" else None),
+                expected_profile_change=(
+                    ExecutionProfileComponentClass.FINALIZATION
+                    if override_kind == "changed_limits"
+                    else None
+                ),
             )
         finally:
             if isinstance(store, SQLiteSessionStore):

@@ -1389,6 +1389,7 @@ def test_product_continuation_adoption_retry_survives_product_state_changes() ->
                 agent_name="assistant",
                 session_id=operation.session_id,
                 messages=[Message.text("user", "initial")],
+                max_steps=20,
             ),
         )
         assert outcome.ok

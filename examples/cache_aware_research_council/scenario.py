@@ -30,11 +30,14 @@ from cayu import (
     ComparableOutputBudget,
     CostQualityAttemptOperation,
     EventType,
+    ExecutionProfileAdoptionIntent,
     Message,
     PairedQualityEvidence,
     PriceBook,
     QualityEvidenceReference,
     QualityEvidenceStatus,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
     SessionStore,
@@ -134,6 +137,19 @@ class CacheWindowDecision:
         return self.cache_expires_at_s - self.observed_at_s <= self.safety_margin_s
 
 
+def _resume_profile_adoption(session_id: str) -> ExecutionProfileAdoptionIntent:
+    """Authorize the example's explicit per-branch output contract."""
+
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key=f"example-resume-profile:{session_id}",
+        reason="Use the explicitly selected structured-output contract for this branch.",
+        requested_by=ResolutionActor(
+            subject="example-scenario",
+            source=ResolutionActorSource.REQUEST,
+        ),
+    )
+
+
 async def run_scenario(
     root: Path,
     *,
@@ -224,6 +240,7 @@ async def run_scenario(
                     session_id=branch_id,
                     messages=[Message.text("user", prompts[role])],
                     structured_output=stable_output_spec(f"baseline-{role}-report", REPORT_SCHEMA),
+                    profile_adoption=_resume_profile_adoption(branch_id),
                     limits=advanced_run_limits(),
                 )
             )
@@ -255,6 +272,7 @@ async def run_scenario(
                     session_id=branch_id,
                     messages=[Message.text("user", prompts[role])],
                     structured_output=stable_output_spec(f"{role}-report", REPORT_SCHEMA),
+                    profile_adoption=_resume_profile_adoption(branch_id),
                     limits=advanced_run_limits(),
                 )
             )
@@ -274,6 +292,7 @@ async def run_scenario(
                 session_id=evaluator_id,
                 messages=[Message.text("user", f"Evaluate these reports: {reports!r}")],
                 structured_output=stable_output_spec("research-evaluation", EVALUATION_SCHEMA),
+                profile_adoption=_resume_profile_adoption(evaluator_id),
                 limits=advanced_run_limits(),
             )
         )
@@ -293,6 +312,7 @@ async def run_scenario(
                 session_id=repair_id,
                 messages=[Message.text("user", evaluation["repair_instruction"])],
                 structured_output=stable_output_spec("research-repair", REPAIR_SCHEMA),
+                profile_adoption=_resume_profile_adoption(repair_id),
                 limits=advanced_run_limits(),
             )
         )

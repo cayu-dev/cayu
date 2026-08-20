@@ -54,6 +54,7 @@ from cayu.environments import (
     WorkspaceBinding,
     WorkspaceSnapshot,
 )
+from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -104,6 +105,7 @@ from cayu.runtime import (
     InvocationOriginClaim,
     InvocationOriginTrust,
     McpManifestBaseline,
+    MessageWindowContextPolicy,
     ModelCompactor,
     ModelCompletionStageRequest,
     ModelTarget,
@@ -550,6 +552,14 @@ class _ConformanceOverlappingCompactor(ContextCompactor):
         self.release = self.provider.release
         self.calls = 0
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session_store_conformance:overlapping_compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.calls += 1
         return await ModelCompactor(
@@ -633,6 +643,14 @@ class _ConformancePartialOverlapCompactor(ContextCompactor):
         self.release = [asyncio.Event(), asyncio.Event()]
         self.calls = 0
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session_store_conformance:partial_overlap_compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     def provider_budget_identity(self, _session: Session) -> None:
         return None
 
@@ -651,14 +669,40 @@ class _ConformancePartialOverlapCompactor(ContextCompactor):
 class _UnusedForkProvider(ModelProvider):
     name = "fake"
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session_store_conformance:unused_fork_provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class _ForkGroupConformanceProvider(FakeProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:fork-group-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+
 class _UnusedNamedForkProvider(ModelProvider):
     def __init__(self, name: str) -> None:
         self.name = name
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name=f"tests:session-store-conformance:{type(self).__name__}",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
@@ -704,6 +748,14 @@ class _TransitionReplayConformanceProvider(ModelProvider):
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:transition-replay-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(request)
         yield ModelStreamEvent.text_delta("completed")
@@ -715,6 +767,14 @@ class _WorkspaceObservationRecoveryProvider(ModelProvider):
 
     def __init__(self) -> None:
         self.requests = 0
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:workspace-recovery-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
@@ -773,6 +833,14 @@ class _ApprovalRecoveryProvider(ModelProvider):
     def __init__(self, *, complete_without_tools: bool = False) -> None:
         self._complete_without_tools = complete_without_tools
         self.requests: list[ModelRequest] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name=f"tests:session-store-conformance:{type(self).__name__}",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(request)
@@ -1433,7 +1501,7 @@ def test_session_store_conformance_recovers_nonterminal_fork_group_branch(
             store_kind = session_store_case[0]
             source_id = f"fork-group-recovery-source-{store_kind}"
             group_id = f"fork-group-recovery-{store_kind}"
-            initial_provider = FakeProvider(
+            initial_provider = _ForkGroupConformanceProvider(
                 [[ModelStreamEvent.completed({"finish_reason": "stop"})]]
             )
             initial_app = CayuApp(session_store=store, enable_logging=False)
@@ -1483,7 +1551,7 @@ def test_session_store_conformance_recovers_nonterminal_fork_group_branch(
             )
 
             store = await _reopen_store(session_store_case, store)
-            recovery_provider = FakeProvider(
+            recovery_provider = _ForkGroupConformanceProvider(
                 [
                     [
                         ModelStreamEvent.tool_call(
@@ -2073,6 +2141,31 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
         store = await _open_store(session_store_case)
         try:
             app = CayuApp(session_store=store, enable_logging=False)
+
+            class CompleteThenBlockProvider(ModelProvider):
+                name = "fake"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+                    self.second_started = asyncio.Event()
+
+                @property
+                def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+                    return ExecutionProfileBehaviorIdentity(
+                        name="tests:terminal-evidence-provider",
+                        behavior_version="1",
+                        implementation_version="1",
+                    )
+
+                async def stream(self, _request: Any):
+                    self.calls += 1
+                    if self.calls == 2:
+                        self.second_started.set()
+                        await asyncio.Event().wait()
+                        raise AssertionError("unreachable")
+                    yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+            provider = CompleteThenBlockProvider()
             expected_types = {
                 SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
                 SessionStatus.FAILED: EventType.SESSION_FAILED,
@@ -2090,6 +2183,7 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                     identity=profiled_session_identity(
                         provider_name="fake",
                         model="fake-model",
+                        provider=provider,
                     ),
                 )
                 terminal = await store.update_status(session_id, status)
@@ -2132,22 +2226,6 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                     CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
                 }
 
-            class CompleteThenBlockProvider(ModelProvider):
-                name = "fake"
-
-                def __init__(self) -> None:
-                    self.calls = 0
-                    self.second_started = asyncio.Event()
-
-                async def stream(self, _request: Any):
-                    self.calls += 1
-                    if self.calls == 2:
-                        self.second_started.set()
-                        await asyncio.Event().wait()
-                        raise AssertionError("unreachable")
-                    yield ModelStreamEvent.completed({"finish_reason": "stop"})
-
-            provider = CompleteThenBlockProvider()
             resumed_app = CayuApp(session_store=store, enable_logging=False)
             resumed_app.register_provider(provider, default=True)
             resumed_app.register_agent(AgentSpec(name="removed_agent", model="fake-model"))
@@ -4455,13 +4533,14 @@ def test_session_store_conformance_approval_open_and_close_lost_ack_replay_exact
     asyncio.run(run())
 
 
-def test_session_store_conformance_approval_limit_close_replays_exact_request(
+def test_session_store_conformance_approval_with_frozen_limit_replays_exact_request(
     session_store_case,
 ) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)
         calls: list[dict[str, Any]] = []
         session_id = f"approval-limit-close-replay-{session_store_case[0]}"
+        limits = RunLimits(max_tool_calls=1, scope="session")
         try:
             app = CayuApp(session_store=store, enable_logging=False)
             app.register_provider(_ApprovalLimitProvider(), default=True)
@@ -4477,6 +4556,7 @@ def test_session_store_conformance_approval_limit_close_replays_exact_request(
                         session_id=session_id,
                         agent_name="assistant",
                         messages=[Message.text("user", "run the protected tool")],
+                        limits=limits,
                     )
                 )
             ]
@@ -4497,18 +4577,18 @@ def test_session_store_conformance_approval_limit_close_replays_exact_request(
                 reason="approved within the configured limit",
                 metadata={"ticket": "OPS-526"},
                 resolved_by=ResolutionActor(subject="operator-1"),
-                limits=RunLimits(max_total_tokens=1, scope="session"),
+                limits=limits,
             )
 
             closed = [event async for event in app.resolve_tool_approval(request)]
             assert EventType.SESSION_LIMIT_REACHED in [event.type for event in closed]
-            assert calls == []
+            assert calls == [{"value": "must remain gated"}]
             receipt = await store.load_runtime_publication_receipt(
                 session_id,
                 f"approval-close:{approval.approval_id}",
             )
             assert receipt is not None
-            assert receipt.intent["decision"] == "limit_reached"
+            assert receipt.intent["decision"] == "approve"
             assert receipt.intent["requested_decision"] == request.decision.value
             assert receipt.intent["resolution_request_digest"] == (
                 runtime_publication_checkpoint_value_digest(
@@ -4529,7 +4609,7 @@ def test_session_store_conformance_approval_limit_close_replays_exact_request(
                 await _private_event_for_public_event(store, event) for event in replayed
             ]
             assert tuple(event.id for event in private_replayed) == receipt.appended_event_ids
-            assert calls == []
+            assert calls == [{"value": "must remain gated"}]
 
             with pytest.raises(RuntimeError, match="conflicting identity or decision"):
                 _ = [
@@ -4538,7 +4618,7 @@ def test_session_store_conformance_approval_limit_close_replays_exact_request(
                         request.model_copy(update={"decision": ToolApprovalDecision.DENY})
                     )
                 ]
-            assert calls == []
+            assert calls == [{"value": "must remain gated"}]
         finally:
             await _close_store(store)
 
@@ -5478,8 +5558,23 @@ def test_session_store_conformance_registration_drift_rejects_paused_call(
     class MixedProvider(ModelProvider):
         name = "fake"
 
+        def __init__(self, *, complete_without_tools: bool = False) -> None:
+            self._complete_without_tools = complete_without_tools
+            self.requests: list[ModelRequest] = []
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:session-store-conformance:registration-drift-provider",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-            del request
+            self.requests.append(request)
+            if self._complete_without_tools:
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
             yield ModelStreamEvent.tool_call(
                 id="call_late",
                 name="late_effect",
@@ -5544,7 +5639,7 @@ def test_session_store_conformance_registration_drift_rejects_paused_call(
 
             store = await _reopen_store(session_store_case, store)
             resumed_app = CayuApp(session_store=store, enable_logging=False)
-            resumed_provider = _ApprovalRecoveryProvider(complete_without_tools=True)
+            resumed_provider = MixedProvider(complete_without_tools=True)
             resumed_app.register_provider(resumed_provider, default=True)
             resumed_app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
@@ -5578,6 +5673,67 @@ def test_session_store_conformance_registration_drift_rejects_paused_call(
             assert late_calls == []
             assert protected_calls == []
             assert resumed_provider.requests == []
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_rejects_context_profile_drift_after_reopen(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"context-profile-reopen-{session_store_case[0]}"
+        try:
+            first_provider = ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="fake",
+            )
+            first_app = CayuApp(session_store=store, enable_logging=False)
+            first_app.register_provider(first_provider, default=True)
+            first_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=MessageWindowContextPolicy(max_messages=4),
+            )
+            _ = [
+                event
+                async for event in first_app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "first")],
+                    )
+                )
+            ]
+
+            store = await _reopen_store(session_store_case, store)
+            replacement_provider = ScriptedModelProvider(
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                name="fake",
+            )
+            replacement_app = CayuApp(session_store=store, enable_logging=False)
+            replacement_app.register_provider(replacement_provider, default=True)
+            replacement_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=MessageWindowContextPolicy(max_messages=5),
+            )
+
+            with pytest.raises(ExecutionProfileMismatchError) as raised:
+                _ = [
+                    event
+                    async for event in replacement_app.resume(
+                        ResumeRequest(
+                            session_id=session_id,
+                            messages=[Message.text("user", "second")],
+                        )
+                    )
+                ]
+
+            assert raised.value.changed_component_classes == (
+                ExecutionProfileComponentClass.CONTEXT_SELECTION,
+            )
+            assert replacement_provider.requests == []
         finally:
             await _close_store(store)
 
@@ -8848,9 +9004,9 @@ def test_session_store_conformance_reclaimed_partial_publication_has_one_prefix(
                 return [event async for event in app.compact_session(attempted)]
 
             first = asyncio.create_task(collect(first_app, "operator-a"))
-            await compactor.started[0].wait()
+            await asyncio.wait_for(compactor.started[0].wait(), timeout=5)
             reclaimed = asyncio.create_task(collect(reclaimed_app, "operator-b"))
-            await compactor.started[1].wait()
+            await asyncio.wait_for(compactor.started[1].wait(), timeout=5)
             compactor.release[1].set()
             reclaimed_events = await reclaimed
             compactor.release[0].set()
@@ -13520,9 +13676,9 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
                 return [event async for event in app.compact_session(request)]
 
             first_task = asyncio.create_task(collect(first_app, first_request))
-            await compactor.started[0].wait()
+            await asyncio.wait_for(compactor.started[0].wait(), timeout=5)
             recovered_task = asyncio.create_task(collect(recovered_app, recovered_request))
-            await compactor.started[1].wait()
+            await asyncio.wait_for(compactor.started[1].wait(), timeout=5)
             compactor.release[1].set()
             recovered_events = await recovered_task
             compactor.release[0].set()
@@ -17628,6 +17784,7 @@ def test_session_store_conformance_equal_current_child_authorization_is_replayab
                 identity=profiled_session_identity(
                     provider_name="fake",
                     model="fake-model",
+                    provider=_UnusedForkProvider(),
                 ),
             )
             source = await store.update_status(source.id, SessionStatus.COMPLETED)

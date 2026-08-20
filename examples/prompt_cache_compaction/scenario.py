@@ -557,7 +557,7 @@ async def run_scenario(
                     )
                 ],
                 thinking=thinking,
-                max_steps=1,
+                max_steps=3,
             )
         )
     )
@@ -572,7 +572,7 @@ async def run_scenario(
                     )
                 ],
                 thinking=thinking,
-                max_steps=1,
+                max_steps=3,
             )
         )
     )
@@ -588,7 +588,7 @@ async def run_scenario(
                     )
                 ],
                 thinking=thinking,
-                max_steps=1,
+                max_steps=3,
             )
         )
     )

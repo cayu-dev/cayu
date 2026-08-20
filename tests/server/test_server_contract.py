@@ -34,7 +34,11 @@ from cayu.server import (
     ServerConfig,
     create_server,
 )
-from cayu.server.contracts import SSE_LAST_EVENT_ID_FORMAT, CapabilityOperation
+from cayu.server.contracts import (
+    SERVER_CONTRACT_VERSION,
+    SSE_LAST_EVENT_ID_FORMAT,
+    CapabilityOperation,
+)
 from cayu.server.sse import (
     SSE_ERROR_SESSION_ID_MAX_BYTES,
     SSE_ERROR_TEXT_MAX_BYTES,
@@ -162,8 +166,8 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert response.status_code == 200
     body = response.json()
     assert body["api_prefix"] == "/api"
-    assert body["contract_version"] == "13"
-    assert body["versioning"]["contract_version"] == "13"
+    assert body["contract_version"] == SERVER_CONTRACT_VERSION
+    assert body["versioning"]["contract_version"] == SERVER_CONTRACT_VERSION
     assert body["versioning"]["breaking_change_requires"] == [
         "openapi_snapshot_update",
         "client_regeneration",

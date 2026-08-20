@@ -50,6 +50,7 @@ from cayu.core.billing import (
     BillingIdentity,
 )
 from cayu.core.events import EventType
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -120,6 +121,7 @@ from cayu.vaults.redaction import _bounded_redacted_head, _bounded_stream_retent
 
 _COMPACTION_CHECKPOINT_KEY = "context_compaction"
 _COMPACTION_CHECKPOINT_VERSION = 2
+_DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX = "Previous session context summary:"
 _COMPACTION_PROGRESS_STATE_KEY = "progress"
 _COMPACTION_PROGRESS_EXHAUSTED_KEY = "exhausted"
 _COMPACTION_PROGRESS_KEY = "key"
@@ -839,6 +841,12 @@ class ContextPolicy(ABC):
     context. They must not be used as durable transcript storage.
     """
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Optional application-versioned identity for opaque policy behavior."""
+
+        return None
+
     @abstractmethod
     async def build(self, request: ContextRequest) -> list[Message]:
         """Return provider-neutral messages for one model request."""
@@ -1450,6 +1458,14 @@ class ContextBuildError(RuntimeError):
             if checkpoint_event_payload is None
             else copy_json_value(checkpoint_event_payload, "checkpoint_event_payload")
         )
+        self.cause = cause
+
+
+class _ContextCountAuthorityError(RuntimeError):
+    """Carry a runtime-owned count authority failure across policy fallback."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__("Context token counting was rejected by runtime authority.")
         self.cause = cause
 
 
@@ -2314,6 +2330,11 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
             return estimate
         try:
             input_tokens = await request.count_input_tokens(messages)
+        except _ContextCountAuthorityError as authority_error:
+            # Only the runtime-owned wrapper authenticates this as an
+            # authority failure. An identical exception raised by provider
+            # code remains an optional counter failure below.
+            raise authority_error.cause from None
         except Exception:
             return estimate
         if input_tokens is None:
@@ -2774,6 +2795,12 @@ def _detach_compaction_result(
 
 class ContextCompactor(ABC):
     """Summarizes older context into durable checkpoint data."""
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Optional application-versioned identity for opaque compaction behavior."""
+
+        return None
 
     def provider_budget_identity(self, session: Session) -> tuple[str, str] | None:
         """Declare the provider/model charged by one compaction invocation.
@@ -5648,7 +5675,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         compactor: ContextCompactor | None = None,
         max_user_turns: int = 10,
         compact_after_messages: int = 40,
-        summary_prefix: str = "Previous session context summary:",
+        summary_prefix: str = _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
         max_attachment_results: int = 1,
     ) -> None:
         if compactor is None:

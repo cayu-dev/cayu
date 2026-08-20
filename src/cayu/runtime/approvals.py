@@ -147,8 +147,8 @@ class ToolApprovalRequest(BaseModel):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
     to ``None``, which means "inherit the original run's configuration" as
-    persisted on the pending approval checkpoint. Passing an explicit value
-    overrides the persisted configuration for the resumed run.
+    persisted on the pending approval checkpoint. An explicit value is accepted
+    only when it preserves the invocation's frozen execution profile.
     """
 
     model_config = ConfigDict(
@@ -231,8 +231,8 @@ class ToolApprovalRecoveryRequest(BaseModel):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
     to ``None``, which means "inherit the original run's configuration" as
-    persisted on the pending approval checkpoint. Passing an explicit value
-    overrides the persisted configuration for the resumed run.
+    persisted on the pending approval checkpoint. An explicit value is accepted
+    only when it preserves the invocation's frozen execution profile.
     """
 
     model_config = ConfigDict(
@@ -404,9 +404,10 @@ class PendingToolApproval(BaseModel):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` persist
     the original run's configuration across the approval pause so resolving
-    the approval resumes with the same config instead of fresh defaults
-    (unless the resolution request overrides them explicitly). They are
-    optional so checkpoints written before this state existed still load.
+    the approval resumes with the same config instead of fresh defaults. A
+    resolution request may restate those values only when they preserve the
+    invocation's frozen execution profile. They are optional so checkpoints
+    written before this state existed still load.
     Loop policies are runtime callables and cannot be checkpointed; they must
     be re-supplied on the resolution request when needed.
     """

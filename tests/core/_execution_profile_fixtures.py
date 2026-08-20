@@ -8,12 +8,20 @@ from uuid import uuid4
 
 from cayu.core.agents import AgentSpec
 from cayu.core.events import Event
-from cayu.core.execution_identity import copy_execution_profile_behavior_identity
+from cayu.core.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
+from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.providers import ModelProvider
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
+from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.app import CayuApp
+from cayu.runtime.budgets import BudgetLimit, request_budget_limits_for_session
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -28,6 +36,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import (
     RunRequest,
     Session,
@@ -35,6 +44,8 @@ from cayu.runtime.sessions import (
     SessionStore,
     bind_runtime_session_create_claim,
 )
+from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tool_policy import ToolPolicy
 from cayu.vaults import SecretRedactor
 
@@ -43,6 +54,26 @@ class _ProfileFixtureTool(Tool):
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         del ctx, args
         raise AssertionError("Execution-profile fixture tools must never run.")
+
+
+def versioned_test_provider_identity(
+    provider: ModelProvider,
+    *,
+    behavior_version: str = "1",
+) -> ExecutionProfileBehaviorIdentity:
+    """Return a stable test-owned identity for one declared provider behavior.
+
+    Restart and rolling-deployment tests use this helper to make their custom
+    adapters explicitly reconstructable. Tests for opaque-provider rejection
+    deliberately continue to inherit ``ModelProvider`` without using it.
+    """
+
+    provider_type = type(provider)
+    return ExecutionProfileBehaviorIdentity(
+        name=f"tests:{provider_type.__module__}.{provider_type.__qualname__}",
+        behavior_version=behavior_version,
+        implementation_version="1",
+    )
 
 
 @dataclass(frozen=True)
@@ -68,14 +99,19 @@ async def create_admitted_session(
     execution_profile: ExecutionProfileIdentity | None = None,
     interaction_id: str | None = None,
     secret_redactor: SecretRedactor | None = None,
+    provider: ModelProvider | None = None,
+    app: CayuApp | None = None,
 ) -> AdmittedSessionFixture:
     """Create the production-valid starting point for resume/recovery tests."""
 
-    app = CayuApp(
-        session_store=store,
-        enable_logging=False,
-        secret_redactor=secret_redactor,
-    )
+    if app is None:
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            secret_redactor=secret_redactor,
+        )
+    elif secret_redactor is not None:
+        raise ValueError("secret_redactor and app are mutually exclusive.")
     prepared_request = session_request_boundary.prepare_run_request(
         request,
         redactor=app._secret_redactor,
@@ -96,6 +132,18 @@ async def create_admitted_session(
         tools=tools,
         invocation_loop_policies=prepared_request.loop_policies,
         execution_profile=execution_profile,
+        provider=provider,
+        app=(app if execution_profile is None and app._providers else None),
+        agent_name=prepared_request.agent_name,
+        structured_output=prepared_request.structured_output,
+        thinking=prepared_request.thinking,
+        request_budget_limits=prepared_request.budget_limits,
+        causal_budget_id=(
+            prepared_request.causal_budget_id or prepared_request.task_id or session_id
+        ),
+        max_steps=prepared_request.max_steps,
+        limits=prepared_request.limits,
+        retry_policy=app._effective_retry_policy(prepared_request.retry_policy),
     )
     execution_profile = identity.execution_profile
     if execution_profile is None:
@@ -180,6 +228,7 @@ def profiled_session_identity(
     *,
     provider_name: str,
     model: str,
+    agent_name: str = "assistant",
     durable_system_prompt: str | None = None,
     direct_tools: Iterable[Mapping[str, Any]] = (),
     tools: Iterable[Tool] | None = None,
@@ -187,12 +236,52 @@ def profiled_session_identity(
     runtime_hooks: Iterable[RuntimeHook] = (),
     invocation_loop_policies: Iterable[LoopPolicy] = (),
     execution_profile: ExecutionProfileIdentity | None = None,
+    provider: ModelProvider | None = None,
+    structured_output: StructuredOutputSpec | None = None,
+    thinking: ThinkingConfig | None = None,
+    request_budget_limits: tuple[BudgetLimit, ...] = (),
+    causal_budget_id: str | None = None,
+    max_steps: int = 16,
+    limits: RunLimits | None = None,
+    retry_policy: RetryPolicy | None = None,
+    app: CayuApp | None = None,
 ) -> SessionIdentity:
     """Build the identity used by low-level tests that later enter public resume."""
 
     runtime_version = version("cayu")
     resolved_profile = execution_profile
     if resolved_profile is None:
+        if app is not None:
+            registered_agent = app._agents[agent_name]
+            resolved_profile = session_engine_module._execution_profile_identity(
+                registered_agent=registered_agent,
+                provider_name=provider_name,
+                registered_provider=app._providers.get(provider_name),
+                model=model,
+                durable_system_prompt=durable_system_prompt,
+                redactor=app._secret_redactor,
+                process_identity=app._execution_profile_process_identity,
+                runtime_hooks=app._runtime_hooks,
+                loop_policies=app._loop_policies,
+                loop_policy_execution_profile_identities=(
+                    app._loop_policy_execution_profile_identities
+                ),
+                budget_policy=app.budget_policy,
+                request_budget_limits=request_budget_limits,
+                causal_budget_id=causal_budget_id,
+                structured_output=structured_output,
+                thinking=thinking,
+                max_steps=max_steps,
+                limits=limits,
+                retry_policy=retry_policy,
+            )
+            return SessionIdentity(
+                provider_name=provider_name,
+                model=model,
+                runtime_name="cayu",
+                runtime_version=runtime_version,
+                execution_profile=resolved_profile,
+            )
         tool_material = tuple(direct_tools)
         resolved_tools = (
             tuple(tools)
@@ -215,6 +304,12 @@ def profiled_session_identity(
             raise ValueError("tools and direct_tools are mutually exclusive.")
         resolved_invocation_loop_policies = tuple(invocation_loop_policies)
         profile_app = CayuApp(enable_logging=False)
+        profile_provider = (
+            ScriptedModelProvider([], name=provider_name) if provider is None else provider
+        )
+        if profile_provider.name != provider_name:
+            raise ValueError("provider_name must match the supplied provider.")
+        profile_app.register_provider(profile_provider, default=True)
         profile_app.register_agent(
             AgentSpec(name="assistant", model=model),
             tools=resolved_tools,
@@ -230,6 +325,29 @@ def profiled_session_identity(
             runtime_version=runtime_version,
             redactor=profile_app._secret_redactor,
             process_identity=profile_app._execution_profile_process_identity,
+            registered_provider=profile_app._providers[provider_name],
+            thinking=None if thinking is None else thinking_config_payload(thinking),
+            request_budget_limit_ids=(
+                ()
+                if not request_budget_limits
+                else tuple(
+                    limit.budget_limit_id
+                    for limit in request_budget_limits_for_session(
+                        limits=request_budget_limits,
+                        agent_name=agent_name,
+                        causal_budget_id=causal_budget_id,
+                    )
+                )
+            ),
+            structured_output=session_engine_module._execution_profile_structured_output(
+                structured_output
+            ),
+            finalization={
+                "kind": "cayu:model-finalization:v1",
+                "max_steps": max_steps,
+                "limits": copy_run_limits(limits).model_dump(mode="json"),
+                "retry_policy": copy_retry_policy(retry_policy).model_dump(mode="json"),
+            },
             invocation_loop_policies=resolved_invocation_loop_policies,
             invocation_loop_policy_identities=tuple(
                 copy_execution_profile_behavior_identity(policy.execution_profile_identity)

@@ -1035,12 +1035,12 @@ class ApprovalLimitProvider(ModelProvider):
 
     async def stream(self, request: ModelRequest):
         self.requests.append(request)
-        for ordinal in (1, 2):
-            yield ModelStreamEvent.tool_call(
-                id=f"call_{ordinal}",
-                name="limited_side_effect",
-                arguments={"ordinal": ordinal},
-            )
+        ordinal = len(self.requests)
+        yield ModelStreamEvent.tool_call(
+            id=f"call_{ordinal}",
+            name="limited_side_effect",
+            arguments={"ordinal": ordinal},
+        )
         yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
 
@@ -2362,6 +2362,7 @@ async def _approval_limit_request(
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "run both limited tools")],
+                limits=RunLimits(max_tool_calls=1),
             )
         )
     ]
@@ -2447,8 +2448,8 @@ def test_recovery_limit_cancellation_reconciles_precommit_transition_failures() 
         # Two ambiguous transition attempts settle before abandonment cleanup
         # publishes the distinct terminal transition under the same owner.
         assert store.attempts == 3
-        assert len(provider.requests) == 1
-        assert tool.calls == []
+        assert len(provider.requests) == 2
+        assert tool.calls == [{"ordinal": 1}]
         assert sum(event.type == EventType.SESSION_LIMIT_REACHED for event in recovery_events) == 1
         assert (
             sum(event.type == EventType.INTERACTION_INTERRUPTED for event in recovery_events) == 1
@@ -2540,8 +2541,8 @@ def test_recovery_limit_cancellation_consumes_committed_transition_handoff(
             SessionStatus.RUNNING if run_fence_lost else SessionStatus.INTERRUPTED
         )
         assert store.attempts == 2
-        assert len(provider.requests) == 1
-        assert tool.calls == []
+        assert len(provider.requests) == 2
+        assert tool.calls == [{"ordinal": 1}]
         assert sum(event.type == EventType.SESSION_LIMIT_REACHED for event in recovery_events) == 1
         assert (
             sum(event.type == EventType.INTERACTION_INTERRUPTED for event in recovery_events) == 1

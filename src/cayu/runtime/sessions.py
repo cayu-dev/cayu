@@ -1754,6 +1754,12 @@ class _ForkSourceSnapshotExpectation:
     profile_fingerprint: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ForkGroupInitialInvocationExpectation:
+    request: ResumeRequest
+    request_sha256: str
+
+
 class ForkSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1771,6 +1777,9 @@ class ForkSessionRequest(BaseModel):
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     _expected_source_snapshot: _ForkSourceSnapshotExpectation | None = PrivateAttr(default=None)
+    _fork_group_initial_invocation: _ForkGroupInitialInvocationExpectation | None = PrivateAttr(
+        default=None
+    )
 
     @field_validator("session_id")
     @classmethod
@@ -1946,6 +1955,8 @@ class SessionForkProfileRelationship(BaseModel):
     system_prompt_policy: ForkSystemPromptPolicy
     selection: ForkExecutionProfileSelection
     selected_profile: ExecutionProfileIdentity
+    initial_invocation_request_sha256: str | None = None
+    initial_invocation_profile: ExecutionProfileIdentity | None = None
     decision: ForkExecutionProfileDecisionRecord | None = None
     fork_event_id: str
 
@@ -1973,9 +1984,16 @@ class SessionForkProfileRelationship(BaseModel):
             return None
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("source_profile", "selected_profile", mode="before")
+    @field_validator(
+        "source_profile",
+        "selected_profile",
+        "initial_invocation_profile",
+        mode="before",
+    )
     @classmethod
-    def copy_profile(cls, value: object) -> ExecutionProfileIdentity:
+    def copy_profile(cls, value: object) -> ExecutionProfileIdentity | None:
+        if value is None:
+            return None
         if isinstance(value, ExecutionProfileIdentity):
             value = value.model_dump(mode="json")
         return ExecutionProfileIdentity.model_validate(value)
@@ -1986,6 +2004,22 @@ class SessionForkProfileRelationship(BaseModel):
             character not in "0123456789abcdef" for character in self.request_sha256
         ):
             raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
+        if (self.initial_invocation_request_sha256 is None) != (
+            self.initial_invocation_profile is None
+        ):
+            raise ValueError(
+                "Fork-group initial invocation authority requires both request and profile."
+            )
+        if self.initial_invocation_request_sha256 is not None and (
+            len(self.initial_invocation_request_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.initial_invocation_request_sha256
+            )
+        ):
+            raise ValueError(
+                "initial_invocation_request_sha256 must be a lowercase SHA-256 digest."
+            )
         active = self.source_profile_source is ForkExecutionProfileSource.ACTIVE_INVOCATION
         if active != (self.source_active_interaction_id is not None):
             raise ValueError("Active parent profile authority requires an interaction identity.")
@@ -1994,6 +2028,22 @@ class SessionForkProfileRelationship(BaseModel):
         if self.selection is ForkExecutionProfileSelection.INHERIT_PARENT:
             if self.decision is not None or self.selected_profile != self.source_profile:
                 raise ValueError("Inherited fork profile authority is inconsistent.")
+            if self.initial_invocation_profile is not None:
+                allowed_initial_changes = {
+                    ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+                    ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+                    ExecutionProfileComponentClass.FINALIZATION,
+                }
+                if any(
+                    component not in allowed_initial_changes
+                    for component in changed_execution_profile_components(
+                        self.source_profile,
+                        self.initial_invocation_profile,
+                    )
+                ):
+                    raise ValueError(
+                        "Inherited fork-group initial invocation changes unrelated authority."
+                    )
         else:
             if (
                 self.decision is None
@@ -2001,6 +2051,13 @@ class SessionForkProfileRelationship(BaseModel):
             ):
                 raise ValueError(
                     "Current-child fork profile authority requires its exact request decision."
+                )
+            if (
+                self.initial_invocation_profile is not None
+                and self.initial_invocation_profile != self.selected_profile
+            ):
+                raise ValueError(
+                    "Current-child fork-group initial invocation conflicts with its selection."
                 )
             changed = changed_execution_profile_components(
                 self.source_profile,
@@ -14000,6 +14057,52 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
         metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
     copied._expected_source_snapshot = request._expected_source_snapshot
+    initial_invocation = request._fork_group_initial_invocation
+    copied._fork_group_initial_invocation = (
+        None
+        if initial_invocation is None
+        else _ForkGroupInitialInvocationExpectation(
+            request=copy_resume_request(initial_invocation.request),
+            request_sha256=initial_invocation.request_sha256,
+        )
+    )
+    return copied
+
+
+def _fork_group_initial_invocation_request_sha256(request: ResumeRequest) -> str:
+    """Hash one exact, already-prepared fork-group branch invocation."""
+
+    copied = copy_resume_request(request)
+    return sha256(
+        canonical_durable_json_bytes(
+            copied.model_dump(mode="json", warnings=False),
+            "fork_group_initial_invocation",
+        )
+    ).hexdigest()
+
+
+def _bind_fork_group_initial_invocation(
+    request: ForkSessionRequest,
+    initial_invocation: ResumeRequest,
+) -> ForkSessionRequest:
+    """Bind a coordinator-owned branch fork to its exact first invocation."""
+
+    if type(request) is not ForkSessionRequest:
+        raise TypeError("Session fork requires a ForkSessionRequest.")
+    if type(initial_invocation) is not ResumeRequest:
+        raise TypeError("Fork-group initial invocation requires a ResumeRequest.")
+    copied_invocation = copy_resume_request(initial_invocation)
+    if request.session_id is None or copied_invocation.session_id != request.session_id:
+        raise ValueError("Fork-group initial invocation must target the exact child session.")
+    if copied_invocation.target is not None or copied_invocation.profile_adoption is not None:
+        raise ValueError(
+            "Fork-group initial invocation cannot carry model-target or profile adoption."
+        )
+    copied = copy_fork_session_request(request)
+    copied._fork_group_initial_invocation = _ForkGroupInitialInvocationExpectation(
+        request=copied_invocation,
+        request_sha256=_fork_group_initial_invocation_request_sha256(copied_invocation),
+    )
     return copied
 
 
@@ -14648,6 +14751,14 @@ def validate_profiled_fork_evidence(
         or payload.get("selected_profile_fingerprint") != relationship.selected_profile.fingerprint
         or payload.get("source_profile_fingerprint") != relationship.source_profile.fingerprint
         or payload.get("fork_request_sha256") != relationship.request_sha256
+        or payload.get("initial_invocation_request_sha256")
+        != relationship.initial_invocation_request_sha256
+        or payload.get("initial_invocation_profile_fingerprint")
+        != (
+            None
+            if relationship.initial_invocation_profile is None
+            else relationship.initial_invocation_profile.fingerprint
+        )
     ):
         raise ValueError("Fork event payload conflicts with its profile relationship.")
 

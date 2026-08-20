@@ -33,7 +33,7 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
 
-EXECUTION_PROFILE_SCHEMA_VERSION = 2
+EXECUTION_PROFILE_SCHEMA_VERSION = 3
 _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
@@ -58,6 +58,58 @@ class ExecutionProfileComponentClass(StrEnum):
     RUNTIME_HOOKS = "runtime_hooks"
     EXECUTION_ENVIRONMENT = "execution_environment"
     EFFECT_AUTHORITY = "effect_authority"
+    CONTEXT_SELECTION = "context_selection"
+    KNOWLEDGE_INJECTION = "knowledge_injection"
+    CONTEXT_COMPACTION = "context_compaction"
+    LIVE_STATE_PROJECTION = "live_state_projection"
+    PROVIDER_ADAPTER = "provider_adapter"
+    PROVIDER_REQUEST_POLICY = "provider_request_policy"
+    APPLICATION_BUDGET_POLICY = "application_budget_policy"
+    INVOCATION_BUDGET_POLICY = "invocation_budget_policy"
+    STRUCTURED_OUTPUT = "structured_output"
+    FINALIZATION = "finalization"
+
+
+_SCHEMA_V1_COMPONENT_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.RUNTIME,
+        ExecutionProfileComponentClass.PROVIDER_TARGET,
+        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+    }
+)
+_SCHEMA_V2_COMPONENT_CLASSES = frozenset(
+    {
+        *_SCHEMA_V1_COMPONENT_CLASSES,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ExecutionProfileComponentClass.RUNTIME_HOOKS,
+        ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+    }
+)
+_SCHEMA_V3_COMPONENT_CLASSES = frozenset(
+    {
+        *_SCHEMA_V2_COMPONENT_CLASSES,
+        ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+        ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+        ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+        ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+        ExecutionProfileComponentClass.FINALIZATION,
+    }
+)
+_SCHEMA_COMPONENT_CLASSES = {
+    1: _SCHEMA_V1_COMPONENT_CLASSES,
+    2: _SCHEMA_V2_COMPONENT_CLASSES,
+    3: _SCHEMA_V3_COMPONENT_CLASSES,
+}
 
 
 class ExecutionProfileIdentityStrength(StrEnum):
@@ -79,6 +131,16 @@ _AUTHORITY_COMPONENT_CLASSES = frozenset(
         ExecutionProfileComponentClass.RUNTIME_HOOKS,
         ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
         ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+        ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+        ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+        ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+        ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+        ExecutionProfileComponentClass.FINALIZATION,
     }
 )
 
@@ -472,7 +534,7 @@ class ExecutionProfileIdentity(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2] = EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3] = EXECUTION_PROFILE_SCHEMA_VERSION
     fingerprint: str
     components: tuple[ExecutionProfileComponentIdentity, ...]
 
@@ -486,21 +548,7 @@ class ExecutionProfileIdentity(BaseModel):
     @model_validator(mode="after")
     def validate_components(self) -> ExecutionProfileIdentity:
         classes = tuple(component.component_class for component in self.components)
-        required_classes = tuple(
-            sorted(
-                (
-                    {
-                        ExecutionProfileComponentClass.RUNTIME,
-                        ExecutionProfileComponentClass.PROVIDER_TARGET,
-                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
-                        ExecutionProfileComponentClass.DIRECT_TOOLS,
-                    }
-                    if self.schema_version == 1
-                    else set(ExecutionProfileComponentClass)
-                ),
-                key=str,
-            )
-        )
+        required_classes = tuple(sorted(_SCHEMA_COMPONENT_CLASSES[self.schema_version], key=str))
         if classes != required_classes:
             raise ValueError(
                 "Execution-profile components must contain every required class exactly once "
@@ -727,6 +775,26 @@ def build_execution_profile_identity(
     execution_environment_process_local: bool = False,
     execution_environment_application_versioned: bool = False,
     effect_authority: Mapping[str, Any] | None = None,
+    context_selection: Mapping[str, Any] | None = None,
+    context_selection_process_local: bool = False,
+    context_selection_application_versioned: bool = False,
+    knowledge_injection: Mapping[str, Any] | None = None,
+    knowledge_injection_process_local: bool = False,
+    knowledge_injection_application_versioned: bool = False,
+    context_compaction: Mapping[str, Any] | None = None,
+    context_compaction_process_local: bool = False,
+    context_compaction_application_versioned: bool = False,
+    live_state_projection: Mapping[str, Any] | None = None,
+    provider_adapter: Mapping[str, Any] | None = None,
+    provider_adapter_process_local: bool = False,
+    provider_adapter_application_versioned: bool = False,
+    provider_request_policy: Mapping[str, Any] | None = None,
+    provider_request_policy_process_local: bool = False,
+    provider_request_policy_application_versioned: bool = False,
+    application_budget_policy: Mapping[str, Any] | None = None,
+    invocation_budget_policy: Mapping[str, Any] | None = None,
+    structured_output: Mapping[str, Any] | None = None,
+    finalization: Mapping[str, Any] | None = None,
 ) -> ExecutionProfileIdentity:
     """Build a profile without retaining raw prompts, schemas, or tool names."""
 
@@ -840,6 +908,79 @@ def build_execution_profile_identity(
                 if effect_authority is None
                 else effect_authority
             ),
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.CONTEXT_SELECTION,
+            _aggregate_identity_strength(
+                process_local=context_selection_process_local,
+                application_versioned=context_selection_application_versioned,
+            ),
+            {"kind": "cayu:default-context-selection:v1"}
+            if context_selection is None
+            else context_selection,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+            _aggregate_identity_strength(
+                process_local=knowledge_injection_process_local,
+                application_versioned=knowledge_injection_application_versioned,
+            ),
+            {"kind": "none", "version": 1} if knowledge_injection is None else knowledge_injection,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+            _aggregate_identity_strength(
+                process_local=context_compaction_process_local,
+                application_versioned=context_compaction_application_versioned,
+            ),
+            {"kind": "none", "version": 1} if context_compaction is None else context_compaction,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            {"kind": "none", "version": 1}
+            if live_state_projection is None
+            else live_state_projection,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+            _aggregate_identity_strength(
+                process_local=provider_adapter_process_local,
+                application_versioned=provider_adapter_application_versioned,
+            ),
+            {"kind": "provider-defaults", "version": 1}
+            if provider_adapter is None
+            else provider_adapter,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+            _aggregate_identity_strength(
+                process_local=provider_request_policy_process_local,
+                application_versioned=provider_request_policy_application_versioned,
+            ),
+            {"kind": "provider-defaults", "version": 1}
+            if provider_request_policy is None
+            else provider_request_policy,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            {"limit_ids": []} if application_budget_policy is None else application_budget_policy,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            {"limit_ids": []} if invocation_budget_policy is None else invocation_budget_policy,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            {"kind": "none", "version": 1} if structured_output is None else structured_output,
+        ),
+        _available_component(
+            ExecutionProfileComponentClass.FINALIZATION,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            {"kind": "cayu:default-finalization:v1"} if finalization is None else finalization,
         ),
         _available_component(
             ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,

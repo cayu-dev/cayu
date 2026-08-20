@@ -27,30 +27,22 @@ import uvicorn
 from cayu import (
     AgentSpec,
     CayuApp,
-    ContextPolicy,
-    ContextRequest,
     Environment,
     EnvironmentSpec,
     ListFilesTool,
     LocalRunner,
     LocalWorkspace,
-    Message,
     ReadFileTool,
+    RecentTurnsContextPolicy,
     SQLiteSessionStore,
     SQLiteTaskStore,
     WriteFileTool,
     public_authority_alias_codec_from_environment,
-    trim_context_turns,
 )
 from cayu.server import BasicAuth, ServerConfig, create_server
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "server"
 DATA_DIR = WORKSPACE / "data"
-
-
-class RecentContextPolicy(ContextPolicy):
-    async def build(self, request: ContextRequest) -> list[Message]:
-        return trim_context_turns(request.messages, max_user_turns=5, preserve_system=True)
 
 
 def main() -> None:
@@ -83,7 +75,7 @@ def main() -> None:
             system_prompt="You are a helpful assistant with workspace access.",
         ),
         tools=[ReadFileTool(), WriteFileTool(), ListFilesTool()],
-        context_policy=RecentContextPolicy(),
+        context_policy=RecentTurnsContextPolicy(max_user_turns=5),
     )
 
     server = create_server(

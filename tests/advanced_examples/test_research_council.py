@@ -46,7 +46,7 @@ def test_research_council_forks_strategies_and_repairs_seeded_weakness(
     assert observation["baseline_model_steps"] == 3
     assert observation["candidate_model_steps"] == 3
     cost_report = result.metrics["paired_cost_evidence"]
-    assert cost_report["schema_version"] == 1
+    assert cost_report["schema_version"] == 2
     assert cost_report["status"] == "verified"
     pair = cost_report["pairs"][0]
     assert pair["baseline_cost"] == "0.00087"

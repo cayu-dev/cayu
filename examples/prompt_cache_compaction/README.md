@@ -52,7 +52,7 @@ To estimate the two first-compaction attempts in dollars, point
 file. The result includes price-book version/generation time and the matched
 model's source, URL, and as-of date. A missing or non-matching entry remains
 unpriced rather than being treated as free. The paired result is the public
-`PairedCostQualityComparisonReport` v1 shape: it attributes the bounded control
+`PairedCostQualityComparisonReport` v2 shape: it attributes the bounded control
 as `comparison_control`, the candidate as `compaction`, and applies the same
 mandatory-retention-token quality contract to both sides:
 

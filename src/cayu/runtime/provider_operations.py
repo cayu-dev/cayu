@@ -40,6 +40,9 @@ from cayu.runtime.approvals import (
     resolution_actor_payload,
 )
 from cayu.runtime.budgets import budget_settlement_event_id, budget_settlement_id
+from cayu.runtime.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.runtime.sessions import (
@@ -284,6 +287,12 @@ class ProviderOperationResolutionRecord(BaseModel):
     resolved_at: datetime
     event_id: str
     request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     record_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -351,15 +360,21 @@ class _ProviderOperationResolutionReplay(RuntimeError):
     pass
 
 
-def _provider_operation_stage_profile_fingerprint(stage: ModelCompletionStage) -> str:
-    """Return the frozen profile authority carried by one durable model stage."""
+def _provider_operation_stage_profile_fingerprint(
+    stage: ModelCompletionStage,
+) -> str | None:
+    """Return profile authority carried by a stage, or ``None`` for legacy stages."""
 
     raw_recovery_context = stage.intent.get("recovery_context")
-    profile_fingerprint = (
-        None
-        if type(raw_recovery_context) is not dict
-        else raw_recovery_context.get("execution_profile_fingerprint")
-    )
+    if raw_recovery_context is None:
+        return None
+    if type(raw_recovery_context) is not dict:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation stage has malformed recovery authority."
+        )
+    if "execution_profile_fingerprint" not in raw_recovery_context:
+        return None
+    profile_fingerprint = raw_recovery_context.get("execution_profile_fingerprint")
     if (
         type(profile_fingerprint) is not str
         or len(profile_fingerprint) != 64
@@ -369,6 +384,40 @@ def _provider_operation_stage_profile_fingerprint(stage: ModelCompletionStage) -
             "Provider-operation stage has no execution-profile authority."
         )
     return profile_fingerprint
+
+
+def _require_provider_operation_event_profile(
+    event: Event,
+    *,
+    stage: ModelCompletionStage,
+    label: str,
+) -> None:
+    """Require event attribution whenever the owning stage is profiled.
+
+    Historical stages predate execution-profile attribution, so their events
+    remain readable without the field. A profiled stage is positive evidence
+    that every governed event belongs to the new protocol and must carry the
+    exact same fingerprint.
+    """
+
+    expected = _provider_operation_stage_profile_fingerprint(stage)
+    if expected is None and "execution_profile_fingerprint" not in event.payload:
+        return
+    if "execution_profile_fingerprint" not in event.payload:
+        raise ProviderOperationEvidenceError(
+            f"{label} has no execution-profile evidence for its profiled stage."
+        )
+    observed = event.payload.get("execution_profile_fingerprint")
+    if (
+        type(observed) is not str
+        or len(observed) != 64
+        or any(character not in "0123456789abcdef" for character in observed)
+    ):
+        raise ProviderOperationEvidenceError(f"{label} has malformed execution-profile evidence.")
+    if expected is None or observed != expected:
+        raise ProviderOperationEvidenceError(
+            f"{label} conflicts with its active execution profile."
+        )
 
 
 def provider_operation_unavailable_reason(
@@ -1028,6 +1077,11 @@ async def _load_accepted_provider_operation_progress(
                 raise ProviderOperationEvidenceError(
                     "Provider-operation progress changed its owning interaction or attempt."
                 )
+            _require_provider_operation_event_profile(
+                event,
+                stage=stage,
+                label="Provider-operation progress evidence",
+            )
             envelope = _parse_progress_envelope(event)
             if (
                 envelope.state_version != operation.state.version
@@ -1126,6 +1180,11 @@ async def load_recoverable_provider_operation(
     if not records:
         return None
     latest = _parse_operation_event(records[0].event)
+    _require_provider_operation_event_profile(
+        records[0].event,
+        stage=stage,
+        label="Provider-operation recovery evidence",
+    )
     raw_attempt_id = stage.intent.get("model_attempt_id")
     raw_provider = stage.intent.get("provider_name")
     raw_model = stage.intent.get("requested_model")
@@ -1151,6 +1210,11 @@ async def load_recoverable_provider_operation(
             "Provider-operation recovery evidence has no authoritative model-started owner."
         )
     started_event = started_records[0].event
+    _require_provider_operation_event_profile(
+        started_event,
+        stage=stage,
+        label="Authoritative model-started evidence",
+    )
     started_identity = _model_identity(
         started_event,
         label="Authoritative model-started evidence",
@@ -1216,6 +1280,11 @@ async def load_recoverable_provider_operation(
             )
             if output_identity != expected_output_identity:
                 continue
+            _require_provider_operation_event_profile(
+                output_event,
+                stage=stage,
+                label="Provider-operation output evidence",
+            )
             if (
                 output_event.type == EventType.MODEL_ATTEMPT_DISCARDED
                 or output_event.payload.get("provider_operation_progress") is None
@@ -1269,6 +1338,11 @@ async def load_recoverable_provider_operation_start(
             "Provider-operation start-only evidence is contradictory."
         )
     event = matching[0]
+    _require_provider_operation_event_profile(
+        event,
+        stage=stage,
+        label="Provider-operation starting evidence",
+    )
     try:
         identity = _model_identity(event, label="Provider-operation starting evidence")
         provider, model = _provider_scope(
@@ -1374,6 +1448,7 @@ def validate_provider_operation_resolution_outcome_event(
     *,
     resolution_event: Event,
     outcome: Literal["model_error", "interaction_failed", "session_failed"],
+    expected_execution_profile_fingerprint: str | None = None,
 ) -> None:
     """Require exact durable evidence for one explicit-failure outcome."""
 
@@ -1416,6 +1491,52 @@ def validate_provider_operation_resolution_outcome_event(
                 "Provider-operation interaction failure has contradictory status."
             )
         return
+
+    if expected_execution_profile_fingerprint is not None and (
+        type(expected_execution_profile_fingerprint) is not str
+        or len(expected_execution_profile_fingerprint) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_execution_profile_fingerprint
+        )
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation failure outcome has malformed expected profile authority."
+        )
+    resolution_has_profile = "execution_profile_fingerprint" in resolution_event.payload
+    outcome_has_profile = "execution_profile_fingerprint" in event.payload
+    resolution_profile = resolution_event.payload.get("execution_profile_fingerprint")
+    outcome_profile = event.payload.get("execution_profile_fingerprint")
+    if resolution_has_profile:
+        profiles_match = (
+            outcome_has_profile
+            and type(resolution_profile) is str
+            and type(outcome_profile) is str
+            and len(resolution_profile) == 64
+            and all(character in "0123456789abcdef" for character in resolution_profile)
+            and outcome_profile == resolution_profile
+            and (
+                expected_execution_profile_fingerprint is None
+                or resolution_profile == expected_execution_profile_fingerprint
+            )
+        )
+    elif outcome_has_profile:
+        # Schema-v1 resolution evidence written before profile attribution can
+        # be completed after an upgrade. In that mixed-version case, the exact
+        # pending disposition/source stage supplies the independently frozen
+        # profile authority for the newly written outcome.
+        profiles_match = (
+            expected_execution_profile_fingerprint is not None
+            and type(outcome_profile) is str
+            and outcome_profile == expected_execution_profile_fingerprint
+        )
+    else:
+        # Historical resolution and outcome events both predate profile attribution.
+        profiles_match = True
+    if not profiles_match:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation failure outcome conflicts with its execution profile."
+        )
 
     for field in (
         "provider",
@@ -1520,7 +1641,21 @@ def _parse_provider_operation_resolution_record(
         raise ProviderOperationResolutionConflict(
             "Provider-operation resolution belongs to another stage."
         )
-    if record.record_digest != _resolution_record_digest(record.model_dump(mode="json")):
+    if record.execution_profile_fingerprint is None and (
+        type(raw) is not dict or "execution_profile_fingerprint" in raw
+    ):
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation resolution profile evidence is malformed."
+        )
+    record_payload = record.model_dump(mode="json")
+    expected_digest = _resolution_record_digest(record_payload)
+    if record.record_digest != expected_digest and record.execution_profile_fingerprint is None:
+        # Schema-v1 records written before execution-profile attribution did not
+        # carry this optional authority field. Preserve their original digest
+        # material while requiring all newly written records to bind it.
+        record_payload.pop("execution_profile_fingerprint")
+        expected_digest = _resolution_record_digest(record_payload)
+    if record.record_digest != expected_digest:
         raise ProviderOperationResolutionConflict(
             "Provider-operation resolution digest is invalid."
         )
@@ -1560,6 +1695,12 @@ async def _load_provider_operation_resolution_event(
                 "resolved_by",
             )
         )
+        or (
+            ("execution_profile_fingerprint" in event.payload)
+            != (record.execution_profile_fingerprint is not None)
+        )
+        or event.payload.get("execution_profile_fingerprint")
+        != record.execution_profile_fingerprint
         or event.payload.get("resolution_id") != record.resolution_id
         or event.payload.get("stage_id") != record.stage_id
         or event.payload.get("model_step_id") != record.logical_step_id
@@ -1653,6 +1794,10 @@ async def load_pending_provider_operation_disposition(
         or record.resolved_run_epoch != pending.resolved_run_epoch
         or record.logical_step_id != pending.logical_step_id
         or record.dispatch_ordinal != pending.source_dispatch_ordinal
+        or (
+            record.execution_profile_fingerprint is not None
+            and record.execution_profile_fingerprint != pending.execution_profile_fingerprint
+        )
         or resolution.event.payload.get("step") != pending.source_step
     ):
         raise ProviderOperationEvidenceError(
@@ -1767,6 +1912,10 @@ async def resolve_provider_operation_stage(
         profile_fingerprint = _provider_operation_stage_profile_fingerprint(stage)
     except ProviderOperationEvidenceError as exc:
         raise ProviderOperationResolutionConflict(str(exc)) from None
+    if profile_fingerprint is None:
+        raise ProviderOperationResolutionConflict(
+            "Legacy provider-operation stages cannot enter a profiled resolution."
+        )
     inspection = await inspect_provider_operation(session_store, request.session_id)
     if (
         inspection.status
@@ -1845,6 +1994,10 @@ async def resolve_provider_operation_stage(
         timestamp=resolved_at,
         payload=event_payload,
     )
+    resolution_event = event_with_execution_profile_fingerprint_authority(
+        resolution_event,
+        profile_fingerprint,
+    )
     resolution_event = event_with_runtime_payload_authority(
         resolution_event,
         "model_attempt_id",
@@ -1875,6 +2028,7 @@ async def resolve_provider_operation_stage(
         "resolved_at": resolved_at.isoformat().replace("+00:00", "Z"),
         "event_id": event_id,
         "request_digest": request_digest,
+        "execution_profile_fingerprint": profile_fingerprint,
     }
     record_payload["record_digest"] = _resolution_record_digest(record_payload)
     record = ProviderOperationResolutionRecord.model_validate(record_payload)

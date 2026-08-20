@@ -376,6 +376,12 @@ def test_approval_resume_budget_notification_retains_the_originating_attempt() -
         tools=[tool],
         tool_policy=AlwaysRequireApprovalToolPolicy(),
     )
+    budget_limit = BudgetLimit(
+        scope="session",
+        max_estimated_cost=Decimal("0.5"),
+        pricing=_price_book(),
+        action="notify",
+    )
 
     paused = asyncio.run(
         _collect_app_events(
@@ -384,6 +390,7 @@ def test_approval_resume_budget_notification_retains_the_originating_attempt() -
                 agent_name="assistant",
                 session_id="sess_approval_budget_identity",
                 messages=[Message.text("user", "record once")],
+                budget_limits=(budget_limit,),
             ),
         )
     )
@@ -400,14 +407,7 @@ def test_approval_resume_budget_notification_retains_the_originating_attempt() -
                 tool_round_id=approval_requested.payload["tool_round_id"],
                 tool_call_id=approval_requested.payload["tool_call_id"],
                 decision=ToolApprovalDecision.APPROVE,
-                budget_limits=(
-                    BudgetLimit(
-                        scope="session",
-                        max_estimated_cost=Decimal("0.5"),
-                        pricing=_price_book(),
-                        action="notify",
-                    ),
-                ),
+                budget_limits=(budget_limit,),
             ),
         )
     )

@@ -38,6 +38,7 @@ from cayu.runtime import (
     DispatchRequest,
     DispatchStatus,
     EventQuery,
+    ExecutionProfileComponentClass,
     ExecutionProfilePolicy,
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyRequest,
@@ -117,6 +118,14 @@ class FakeProvider(ModelProvider):
         self.event_batches = events
         self.requests: list[ModelRequest] = []
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:dispatch:fake-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         batch_index = len(self.requests)
         self.requests.append(request)
@@ -128,6 +137,11 @@ class FakeProvider(ModelProvider):
 
 class NativeStructuredOutputFakeProvider(FakeProvider):
     supports_native_structured_output = True
+
+
+class ModelAwareOptionsFakeProvider(FakeProvider):
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return {"test": {"effective_model": request.model}}
 
 
 class PortableMessageRejectingFakeProvider(FakeProvider):
@@ -1760,6 +1774,64 @@ def test_separate_worker_process_executes_exact_queued_profile() -> None:
     )
 
 
+def test_queued_model_target_binds_target_effective_request_policy() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        dispatcher = TaskStoreDispatcher(tasks)
+        provider = ModelAwareOptionsFakeProvider([_batch("initial")])
+        app = _configured_app(
+            session_store=store,
+            task_store=tasks,
+            dispatcher=dispatcher,
+            provider=provider,
+        )
+        session_id = "sess_queued_target_effective_options"
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "initial")],
+            )
+        ):
+            pass
+
+        submitted = await app.dispatch(
+            DispatchRequest(
+                session_id=session_id,
+                dispatch_id="d_queued_target_effective_options",
+                messages=[Message.text("user", "switch model")],
+                target=ModelTarget(provider_name="fake", model="upgraded-model"),
+            )
+        )
+        task = await tasks.load_task(submitted.metadata["queue_task_id"])
+        assert task is not None
+        envelope = _QueuedDispatchEnvelope.model_validate(task.input["dispatch"])
+        component_class = ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY
+        assert envelope.required_profile.component(component_class) != (
+            envelope.source_profile.component(component_class)
+        )
+
+        result = await dispatcher.process_next(app, worker_id="worker_target_options")
+
+        assert result is not None
+        assert result.status is DispatchStatus.FAILED
+        assert len(provider.requests) == 1
+        decisions = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_EXECUTION_PROFILE_REJECTED,
+            )
+        )
+        assert len(decisions) == 1
+        assert decisions[0].event.payload["changed_component_classes"] == [
+            ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY.value,
+            ExecutionProfileComponentClass.PROVIDER_TARGET.value,
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_queued_dispatch_preserves_compatible_active_profile_after_release(
     monkeypatch,
 ) -> None:
@@ -1781,7 +1853,7 @@ def test_queued_dispatch_preserves_compatible_active_profile_after_release(
                 reason="The worker supports this runtime transition.",
             )
 
-    class BlockingFirstProvider(ModelProvider):
+    class BlockingFirstProvider(FakeProvider):
         name = "fake"
 
         def __init__(self) -> None:
@@ -2275,7 +2347,7 @@ def test_terminal_redelivery_settles_independently_of_a_newer_active_invocation(
 
 
 def test_worker_cancellation_redelivery_replays_without_provider_redispatch() -> None:
-    class BlockingProvider(ModelProvider):
+    class BlockingProvider(FakeProvider):
         name = "fake"
 
         def __init__(self) -> None:

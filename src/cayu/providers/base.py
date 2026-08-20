@@ -19,6 +19,7 @@ from cayu._validation import (
 )
 from cayu.artifacts.attachments import file_attachment_from_payload
 from cayu.core.billing import BillingIdentity
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -880,6 +881,12 @@ class ModelProvider(ABC):
     ``json_schema`` response format). The runtime rejects ``NATIVE`` specs
     before running when the resolved provider does not set this.
     """
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Optional application-versioned identity for opaque adapter behavior."""
+
+        return None
 
     @property
     def provider_operation_mode(self) -> ProviderOperationMode:

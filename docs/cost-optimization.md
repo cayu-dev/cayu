@@ -63,7 +63,9 @@ candidate attempts, provider-reported `CostLineItem` evidence, an explicit
 output budget, opaque generation-settings revision, pricing-catalog identity,
 and application-owned quality results.
 Cayu recomputes operation, session, branch, side, pair, and aggregate totals and
-returns a `PairedCostQualityComparisonReport` with `schema_version=1`.
+returns a `PairedCostQualityComparisonReport` with `schema_version=2`. Version 2
+links each cost line item to its governing execution profile when that durable
+authority is available.
 
 The status is the strongest wording supported by the evidence:
 
@@ -110,7 +112,7 @@ that costs more retains a negative saving and
 
 Run `uv run python examples/cost_quality_comparison.py` for a deterministic
 report containing all four statuses. The advanced prompt-cache and research
-council examples emit the same public v1 shape while keeping their
+council examples emit the same public v2 shape while keeping their
 workload-specific quality checks in scenario code.
 
 ## Cost governance map

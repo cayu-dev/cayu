@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import cast
 
+from tests.core._execution_profile_fixtures import versioned_test_provider_identity
+
 from cayu.core import Event, ExecutionProfileBehaviorIdentity
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -24,6 +26,10 @@ from cayu.runtime import (
 
 class FakeProvider(ModelProvider):
     name = "fake"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return versioned_test_provider_identity(self)
 
     def __init__(
         self,

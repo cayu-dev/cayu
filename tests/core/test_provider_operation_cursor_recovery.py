@@ -28,6 +28,7 @@ from cayu.providers import (
     ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationSnapshot,
+    ProviderOperationStartIdempotencySupport,
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
@@ -56,6 +57,7 @@ from cayu.runtime.provider_operations import (
     commit_provider_operation_progress,
     inspect_provider_operation,
     load_recoverable_provider_operation,
+    load_recoverable_provider_operation_start,
     provider_operation_progress_event_id,
     provider_operation_progress_payload,
 )
@@ -65,6 +67,28 @@ from cayu.runtime.sessions import (
     SessionOperationTransform,
 )
 from cayu.vaults import SecretRedactor
+
+_PROFILE_UNSET = object()
+_PROFILE_MISSING = object()
+
+
+def _profile_evidence_payload(
+    value: object,
+    *,
+    default: str,
+) -> dict[str, object]:
+    selected = default if value is _PROFILE_UNSET else value
+    if selected is _PROFILE_MISSING:
+        return {}
+    return {"execution_profile_fingerprint": selected}
+
+
+def _stage_execution_profile_fingerprint(stage: ModelCompletionStage) -> str:
+    recovery_context = stage.intent.get("recovery_context")
+    assert type(recovery_context) is dict
+    fingerprint = recovery_context.get("execution_profile_fingerprint")
+    assert type(fingerprint) is str
+    return fingerprint
 
 
 class _CursorReplayAdapter(ProviderOperationAdapter):
@@ -132,6 +156,14 @@ class _CursorReplayProvider(ModelProvider):
 
     def __init__(self) -> None:
         self.adapter = _CursorReplayAdapter()
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name=f"tests:provider-operation-cursor:{type(self).__name__}",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     @property
     def provider_operation_mode(self) -> ProviderOperationMode:
@@ -1317,6 +1349,238 @@ def test_recovery_rejects_operation_identity_that_conflicts_with_model_started(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "evidence_kind",
+    ["model_started", "operation_started", "progress"],
+)
+def test_recovery_rejects_profile_evidence_that_conflicts_with_active_stage(
+    store_kind: str,
+    evidence_kind: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / f"profile-conflict-{evidence_kind}.db")
+        )
+        provider = _CursorReplayProvider()
+        conflicting_profile = "0" * 64
+        stage, _identity, _state = await _stage_partial_operation(
+            store,
+            session_id=f"provider-profile-conflict-{store_kind}-{evidence_kind}",
+            provider=provider,
+            model_started_profile_fingerprint=(
+                conflicting_profile if evidence_kind == "model_started" else _PROFILE_UNSET
+            ),
+            operation_profile_fingerprint=(
+                conflicting_profile if evidence_kind == "operation_started" else _PROFILE_UNSET
+            ),
+            progress_profile_fingerprint=(
+                conflicting_profile if evidence_kind == "progress" else _PROFILE_UNSET
+            ),
+        )
+
+        with pytest.raises(ProviderOperationEvidenceError, match="execution profile"):
+            await load_recoverable_provider_operation(store, stage)
+
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.retrieve_calls == 0
+        assert provider.adapter.reconnect_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "evidence_kind",
+    ["model_started", "operation_started", "progress"],
+)
+def test_profiled_recovery_requires_profile_on_every_governed_event(
+    store_kind: str,
+    evidence_kind: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / f"profile-missing-{evidence_kind}.db")
+        )
+        provider = _CursorReplayProvider()
+        stage, _identity, _state = await _stage_partial_operation(
+            store,
+            session_id=f"provider-profile-missing-{store_kind}-{evidence_kind}",
+            provider=provider,
+            model_started_profile_fingerprint=(
+                _PROFILE_MISSING if evidence_kind == "model_started" else _PROFILE_UNSET
+            ),
+            operation_profile_fingerprint=(
+                _PROFILE_MISSING if evidence_kind == "operation_started" else _PROFILE_UNSET
+            ),
+            progress_profile_fingerprint=(
+                _PROFILE_MISSING if evidence_kind == "progress" else _PROFILE_UNSET
+            ),
+        )
+
+        with pytest.raises(ProviderOperationEvidenceError, match="no execution-profile evidence"):
+            await load_recoverable_provider_operation(store, stage)
+
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.retrieve_calls == 0
+        assert provider.adapter.reconnect_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_genuine_legacy_stage_accepts_legacy_provider_operation_events(
+    store_kind: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store: SessionStore = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "profile-legacy.db")
+        )
+        provider = _CursorReplayProvider()
+        stage, identity, _state = await _stage_partial_operation(
+            store,
+            session_id=f"provider-profile-legacy-{store_kind}",
+            provider=provider,
+            stage_profile_fingerprint=_PROFILE_MISSING,
+            model_started_profile_fingerprint=_PROFILE_MISSING,
+            operation_profile_fingerprint=_PROFILE_MISSING,
+            progress_profile_fingerprint=_PROFILE_MISSING,
+        )
+
+        recovered = await load_recoverable_provider_operation(store, stage)
+
+        assert recovered is not None
+        assert recovered.model_attempt_identity == identity
+
+    asyncio.run(scenario())
+
+
+def test_start_only_recovery_rejects_profile_that_conflicts_with_active_stage() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _CursorReplayProvider()
+        session_id = "provider-starting-profile-conflict"
+        stage, identity, _state = await _stage_partial_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+            partial_events=(),
+        )
+        start_id = f"provider-operation:{identity.model_attempt_id}"
+        start_stage = stage.model_copy(
+            update={
+                "intent": {
+                    **stage.intent,
+                    "provider_operation_start": {
+                        "schema_version": 1,
+                        "idempotency_support": (
+                            ProviderOperationStartIdempotencySupport.EXACT.value
+                        ),
+                        "idempotency_key": start_id,
+                    },
+                }
+            },
+            deep=True,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.PROVIDER_OPERATION_STARTING,
+                session_id=session_id,
+                interaction_id=f"interaction-{session_id}",
+                agent_name="assistant",
+                payload={
+                    "provider": provider.name,
+                    "model": "fake-model",
+                    "step": 1,
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    **identity.payload(),
+                    "source_run_epoch": stage.source_run_epoch,
+                    "start_id": start_id,
+                    "start_idempotency_support": (
+                        ProviderOperationStartIdempotencySupport.EXACT.value
+                    ),
+                    "execution_profile_fingerprint": "0" * 64,
+                },
+            ),
+        )
+
+        with pytest.raises(ProviderOperationEvidenceError, match="execution profile"):
+            await load_recoverable_provider_operation_start(store, start_stage)
+
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.retrieve_calls == 0
+        assert provider.adapter.reconnect_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_profiled_start_only_recovery_requires_profile_evidence() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _CursorReplayProvider()
+        session_id = "provider-starting-profile-missing"
+        stage, identity, _state = await _stage_partial_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+            partial_events=(),
+        )
+        start_id = f"provider-operation:{identity.model_attempt_id}"
+        start_stage = stage.model_copy(
+            update={
+                "intent": {
+                    **stage.intent,
+                    "provider_operation_start": {
+                        "schema_version": 1,
+                        "idempotency_support": (
+                            ProviderOperationStartIdempotencySupport.EXACT.value
+                        ),
+                        "idempotency_key": start_id,
+                    },
+                }
+            },
+            deep=True,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.PROVIDER_OPERATION_STARTING,
+                session_id=session_id,
+                interaction_id=f"interaction-{session_id}",
+                agent_name="assistant",
+                payload={
+                    "provider": provider.name,
+                    "model": "fake-model",
+                    "step": 1,
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    **identity.payload(),
+                    "source_run_epoch": stage.source_run_epoch,
+                    "start_id": start_id,
+                    "start_idempotency_support": (
+                        ProviderOperationStartIdempotencySupport.EXACT.value
+                    ),
+                },
+            ),
+        )
+
+        with pytest.raises(ProviderOperationEvidenceError, match="no execution-profile evidence"):
+            await load_recoverable_provider_operation_start(store, start_stage)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "untracked_event_type",
     [EventType.MODEL_TEXT_DELTA, EventType.PROVIDER_OPERATION_PROGRESS],
@@ -1388,11 +1652,47 @@ def test_discarded_attempt_cannot_claim_cursor_progress_authority() -> None:
                     "max_attempts": 1,
                     **identity.payload(),
                     "provider_operation_progress": {},
+                    "execution_profile_fingerprint": (_stage_execution_profile_fingerprint(stage)),
                 },
             ),
         )
 
         with pytest.raises(ProviderOperationEvidenceError, match="unsafe"):
+            await load_recoverable_provider_operation(store, stage)
+
+    asyncio.run(scenario())
+
+
+def test_profiled_recovery_requires_profile_on_matching_output_evidence() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _CursorReplayProvider()
+        session_id = "provider-output-profile-missing"
+        stage, identity, _state = await _stage_partial_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.MODEL_ATTEMPT_DISCARDED,
+                session_id=session_id,
+                interaction_id=f"interaction-{session_id}",
+                agent_name="assistant",
+                payload={
+                    "provider": provider.name,
+                    "model": "fake-model",
+                    "step": 1,
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    **identity.payload(),
+                    "provider_operation_progress": {},
+                },
+            ),
+        )
+
+        with pytest.raises(ProviderOperationEvidenceError, match="no execution-profile evidence"):
             await load_recoverable_provider_operation(store, stage)
 
     asyncio.run(scenario())
@@ -1433,6 +1733,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                 identity=identity,
                 state=provider.adapter.initial_state,
                 stream_event=first,
+                execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
             ),
             expected_run_epoch=stage.source_run_epoch,
         )
@@ -1455,6 +1756,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                     identity=identity,
                     state=state,
                     stream_event=conflicting,
+                    execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
                 ),
                 expected_run_epoch=stage.source_run_epoch,
             )
@@ -1476,6 +1778,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                     identity=identity,
                     state=state,
                     stream_event=gap,
+                    execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
                 ),
                 expected_run_epoch=stage.source_run_epoch,
             )
@@ -1501,6 +1804,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                     identity=cross_attempt,
                     state=state,
                     stream_event=next_event,
+                    execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
                 ),
                 expected_run_epoch=stage.source_run_epoch,
             )
@@ -1519,6 +1823,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                         identity=identity,
                         state=state,
                         stream_event=next_event,
+                        execution_profile_fingerprint=(_stage_execution_profile_fingerprint(stage)),
                     ),
                     expected_run_epoch=stage.source_run_epoch,
                 )
@@ -1541,6 +1846,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                 identity=identity,
                 state=provider.adapter.initial_state,
                 stream_event=first,
+                execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
             ),
             expected_run_epoch=stage.source_run_epoch,
         )
@@ -1563,6 +1869,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                     identity=identity,
                     state=state,
                     stream_event=stale_advance,
+                    execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
                 ),
                 expected_run_epoch=stage.source_run_epoch,
             )
@@ -1596,6 +1903,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
                     identity=identity,
                     state=advanced.state,
                     stream_event=stale,
+                    execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
                 ),
                 expected_run_epoch=stage.source_run_epoch,
             )
@@ -1644,6 +1952,7 @@ def test_old_boundary_replay_remains_exact_while_competing_worker_advances() -> 
                     identity=identity,
                     state=current_state,
                     stream_event=stream_event,
+                    execution_profile_fingerprint=_stage_execution_profile_fingerprint(stage),
                 ),
                 expected_run_epoch=stage.source_run_epoch,
             )
@@ -1684,6 +1993,10 @@ async def _stage_partial_operation(
     thinking: ThinkingConfig | None = None,
     tools: tuple[Tool, ...] = (),
     operation_identity_overrides: dict[str, object] | None = None,
+    stage_profile_fingerprint: object = _PROFILE_UNSET,
+    model_started_profile_fingerprint: object = _PROFILE_UNSET,
+    operation_profile_fingerprint: object = _PROFILE_UNSET,
+    progress_profile_fingerprint: object = _PROFILE_UNSET,
 ) -> tuple[ModelCompletionStage, ModelAttemptIdentity, ProviderOperationState]:
     if advances not in {1, 2}:
         raise ValueError("advances must be 1 or 2")
@@ -1699,10 +2012,27 @@ async def _stage_partial_operation(
         provider_name=provider.name,
         model="fake-model",
         tools=tools,
+        provider=provider,
         interaction_id=interaction_id,
     )
     session = admitted.session
     execution_profile = admitted.active_invocation_profile.profile
+    selected_stage_profile = (
+        execution_profile.fingerprint
+        if stage_profile_fingerprint is _PROFILE_UNSET
+        else stage_profile_fingerprint
+    )
+    recovery_context = ModelCompletionRecoveryContext(
+        execution_profile_fingerprint=execution_profile.fingerprint,
+        thinking=thinking,
+    ).model_dump(mode="json")
+    if selected_stage_profile is _PROFILE_MISSING:
+        recovery_context.pop("execution_profile_fingerprint")
+    else:
+        recovery_context["execution_profile_fingerprint"] = selected_stage_profile
+    event_profile_default = execution_profile.fingerprint
+    if type(selected_stage_profile) is str:
+        event_profile_default = selected_stage_profile
     identity = ModelAttemptIdentity(
         model_step_id="mstep_" + "a" * 32,
         model_attempt_id="matt_" + "b" * 32,
@@ -1723,10 +2053,7 @@ async def _stage_partial_operation(
                 "requested_model": "fake-model",
                 "source_transcript_cursor": 1,
                 "request_fingerprint": "c" * 64,
-                "recovery_context": ModelCompletionRecoveryContext(
-                    execution_profile_fingerprint=execution_profile.fingerprint,
-                    thinking=thinking,
-                ).model_dump(mode="json"),
+                "recovery_context": recovery_context,
             },
         ),
         expected_statuses={session.status},
@@ -1753,6 +2080,10 @@ async def _stage_partial_operation(
             "status": ProviderOperationStatus.IN_PROGRESS.value,
             "recovery_metadata": provider.adapter.initial_state.recovery_metadata.model_dump(
                 mode="json"
+            ),
+            **_profile_evidence_payload(
+                operation_profile_fingerprint,
+                default=event_profile_default,
             ),
         },
     )
@@ -1790,6 +2121,10 @@ async def _stage_partial_operation(
                     "attempt": 1,
                     "max_attempts": 1,
                     **identity.payload(),
+                    **_profile_evidence_payload(
+                        model_started_profile_fingerprint,
+                        default=event_profile_default,
+                    ),
                 },
             ),
             operation_event,
@@ -1827,6 +2162,11 @@ async def _stage_partial_operation(
                 state=current_state,
                 stream_event=accepted,
                 identity_overrides=operation_identity_overrides,
+                execution_profile_fingerprint=(
+                    event_profile_default
+                    if progress_profile_fingerprint is _PROFILE_UNSET
+                    else progress_profile_fingerprint
+                ),
             ),
             expected_run_epoch=session.run_epoch,
         )
@@ -1844,6 +2184,7 @@ def _progress_event(
     state: ProviderOperationState,
     stream_event: ModelStreamEvent,
     identity_overrides: dict[str, object] | None = None,
+    execution_profile_fingerprint: object,
 ) -> Event:
     metadata = stream_event.recovery_metadata
     assert metadata is not None and metadata.cursor is not None
@@ -1855,6 +2196,11 @@ def _progress_event(
         "provider_operation_progress": provider_operation_progress_payload(
             state,
             stream_event,
+        ),
+        **(
+            {}
+            if execution_profile_fingerprint is _PROFILE_MISSING
+            else {"execution_profile_fingerprint": execution_profile_fingerprint}
         ),
     }
     if stream_event.type.value == "text_delta":

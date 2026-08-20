@@ -327,7 +327,7 @@ def test_runtime_evidence_projects_bounded_lineage_attempts_and_safe_totals() ->
 
     report = asyncio.run(scenario())
 
-    assert report.schema_version == 1
+    assert report.schema_version == 2
     assert report.scope.descendant_session_ids == ("root", "child")
     assert [session.session_id for session in report.sessions] == ["root", "child"]
     assert report.sessions[1].parent_session_id == "root"
@@ -1307,7 +1307,7 @@ async def _minimal_golden_report(
     )
 
 
-def test_runtime_evidence_sqlite_restart_and_v1_golden_are_exact(tmp_path: Path) -> None:
+def test_runtime_evidence_sqlite_restart_and_v2_golden_are_exact(tmp_path: Path) -> None:
     async def scenario():
         database = tmp_path / "runtime-evidence.sqlite"
         first_store = SQLiteSessionStore(database)
@@ -1323,7 +1323,7 @@ def test_runtime_evidence_sqlite_restart_and_v1_golden_are_exact(tmp_path: Path)
 
     first, second = asyncio.run(scenario())
     assert first == second
-    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v1.json"
+    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v2.json"
     assert first.model_dump(mode="json") == json.loads(golden_path.read_text())
 
 

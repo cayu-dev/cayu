@@ -26,7 +26,7 @@ from cayu._validation import (
 )
 from cayu.runtime.costs import CostLineItem, Provenance
 
-COST_QUALITY_COMPARISON_SCHEMA_VERSION = 1
+COST_QUALITY_COMPARISON_SCHEMA_VERSION = 2
 
 _MAX_PAIRS = 256
 _MAX_ATTEMPTS_PER_SIDE = 2_048
@@ -75,6 +75,11 @@ class ComparisonCostLineItem(BaseModel):
     model_config = _MODEL_CONFIG
 
     model_step: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    execution_profile_fingerprint: str | None = Field(
+        default=None,
+        max_length=64,
+        exclude_if=lambda value: value is None,
+    )
     provider_name: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     requested_model: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     model: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
@@ -124,6 +129,7 @@ class ComparisonCostLineItem(BaseModel):
             raise TypeError("item must be a CostLineItem.")
         return cls(
             model_step=item.model_step,
+            execution_profile_fingerprint=item.execution_profile_fingerprint,
             provider_name=item.provider_name,
             requested_model=item.requested_model,
             model=item.model,
@@ -164,6 +170,7 @@ class ComparisonCostLineItem(BaseModel):
         return revalidate_model_input(value, ComparisonPricingProvenance)
 
     @field_validator(
+        "execution_profile_fingerprint",
         "provider_name",
         "requested_model",
         "model",
@@ -175,6 +182,12 @@ class ComparisonCostLineItem(BaseModel):
     def validate_optional_text(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
+        if info.field_name == "execution_profile_fingerprint":
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(
+                    "execution_profile_fingerprint must be a lowercase SHA-256 digest."
+                )
+            return value
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("currency")
@@ -775,7 +788,7 @@ class PairedCostQualityComparisonReport(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[1] = COST_QUALITY_COMPARISON_SCHEMA_VERSION
+    schema_version: Literal[2] = COST_QUALITY_COMPARISON_SCHEMA_VERSION
     status: CostQualityComparisonStatus
     pairs: tuple[PairedCostQualityPairReport, ...]
     aggregate: CostQualityAggregateReport

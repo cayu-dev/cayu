@@ -956,6 +956,8 @@ def project_budget_inspection_event(event: Event) -> Event:
         retained_keys = ()
 
     payload = {key: event.payload[key] for key in retained_keys if key in event.payload}
+    if "execution_profile_fingerprint" in event.payload:
+        payload["execution_profile_fingerprint"] = event.payload["execution_profile_fingerprint"]
     if (
         event.type
         in {
@@ -1583,6 +1585,7 @@ class BudgetReconciliation(BaseModel):
     budget_limit_id: str
     model_step_id: str
     model_attempt_id: str
+    execution_profile_fingerprint: str | None = None
     status: BudgetReservationStatus
     reserved_amount: Decimal = Field(ge=0)
     actual_amount: Decimal | None = Field(default=None, ge=0)
@@ -1614,6 +1617,15 @@ class BudgetReconciliation(BaseModel):
     @classmethod
     def validate_budget_limit_id(cls, value: str) -> str:
         return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
+
+    @field_validator("execution_profile_fingerprint")
+    @classmethod
+    def validate_execution_profile_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("execution_profile_fingerprint must be a lowercase SHA-256 digest.")
+        return value
 
     @field_validator("reason", "pricing_provider_name", "pricing_model")
     @classmethod
@@ -1752,6 +1764,11 @@ class BudgetSettlementRecord(BaseModel):
         expected_payload = budget_reconciliation_payload(reconciliation)
         if any(self.event.payload.get(key) != value for key, value in expected_payload.items()):
             raise ValueError("Budget settlement audit event conflicts with committed accounting.")
+        profile_fingerprint = reconciliation.execution_profile_fingerprint
+        if ("execution_profile_fingerprint" in self.event.payload) != (
+            profile_fingerprint is not None
+        ) or self.event.payload.get("execution_profile_fingerprint") != profile_fingerprint:
+            raise ValueError("Budget settlement audit event conflicts with its execution profile.")
         return self
 
 
@@ -3220,7 +3237,20 @@ def model_completion_budget_settlements(
         raise ValueError("Model completion has no durable budget settlement evidence.")
     if len(raw_settlements) != len(expected_ids):
         raise ValueError("Model completion budget settlement count conflicts with its stage.")
-    parsed = tuple(budget_reconciliation_from_payload(value) for value in raw_settlements)
+    profile_fingerprint = event.payload.get("execution_profile_fingerprint")
+    if profile_fingerprint is not None and (
+        type(profile_fingerprint) is not str
+        or len(profile_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in profile_fingerprint)
+    ):
+        raise ValueError("Model completion has an invalid execution-profile fingerprint.")
+    parsed = tuple(
+        budget_reconciliation_from_payload(value).model_copy(
+            update={"execution_profile_fingerprint": profile_fingerprint},
+            deep=True,
+        )
+        for value in raw_settlements
+    )
     parsed_ids = tuple(item.reservation_id for item in parsed)
     if (
         len(set(parsed_ids)) != len(parsed_ids)
@@ -3678,6 +3708,9 @@ def _reconciliation_from_record(
         budget_limit_id=record.budget_limit_id,
         model_step_id=record.model_step_id,
         model_attempt_id=record.model_attempt_id,
+        execution_profile_fingerprint=record.settlement_event_payload.get(
+            "execution_profile_fingerprint"
+        ),
         status=record.status,
         reserved_amount=record.reserved_amount,
         actual_amount=actual_amount,
@@ -3778,6 +3811,8 @@ def _budget_settlement_record(
         "model_step_id",
         "model_attempt_id",
     ]
+    if "execution_profile_fingerprint" in event.payload:
+        payload_fields.append("execution_profile_fingerprint")
     if event.interaction_id is not None:
         if event.payload.get("interaction_id") != event.interaction_id:
             raise RuntimeError("Budget settlement event changed its interaction identity.")

@@ -22,6 +22,7 @@ from cayu import (
     AgentSpec,
     CayuApp,
     DispatchRequest,
+    ExecutionProfileBehaviorIdentity,
     InMemorySessionStore,
     InMemoryTaskStore,
     Message,
@@ -33,6 +34,16 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
 class FakeProvider(ModelProvider):
     name = "fake"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        """Bind the producer and worker to this example's exact adapter behavior."""
+
+        return ExecutionProfileBehaviorIdentity(
+            name="examples:dispatch-worker-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         yield ModelStreamEvent.text_delta("dispatched work done")

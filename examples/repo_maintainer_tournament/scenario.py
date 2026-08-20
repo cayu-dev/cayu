@@ -28,7 +28,10 @@ from examples.repo_maintainer_tournament.candidate_gates import (
 from cayu import (
     AgentSpec,
     CayuApp,
+    ExecutionProfileAdoptionIntent,
     Message,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
     StructuredOutputSpec,
@@ -87,6 +90,19 @@ class RepositorySourceContext:
     pull: dict[str, Any]
     files: list[dict[str, Any]]
     baseline: dict[str, str]
+
+
+def _resume_profile_adoption(session_id: str) -> ExecutionProfileAdoptionIntent:
+    """Authorize the example's explicit per-branch output contract."""
+
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key=f"example-resume-profile:{session_id}",
+        reason="Use the explicitly selected structured-output contract for this branch.",
+        requested_by=ResolutionActor(
+            subject="example-scenario",
+            source=ResolutionActorSource.REQUEST,
+        ),
+    )
 
 
 async def run_scenario(
@@ -187,6 +203,7 @@ async def run_scenario(
                             ),
                         ),
                         limits=advanced_run_limits(),
+                        profile_adoption=_resume_profile_adoption(session_id),
                     )
                 )
             )
@@ -220,6 +237,7 @@ async def run_scenario(
                         "repo-tournament-evaluation", EVALUATION_SCHEMA
                     ),
                     limits=advanced_run_limits(),
+                    profile_adoption=_resume_profile_adoption(evaluator_id),
                 )
             )
         )

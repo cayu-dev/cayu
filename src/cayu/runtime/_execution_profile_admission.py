@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import hmac
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from hashlib import sha256
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu._validation import canonical_durable_json_bytes
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -24,7 +27,9 @@ from cayu.runtime.execution_profiles import (
     changed_execution_profile_components,
     execution_profile_with_component,
 )
+from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import Session
+from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.vaults import SecretRedactor
 
@@ -72,6 +77,12 @@ class ProcessLocalBehaviorIdentityRegistry:
             return identity
 
 
+def _process_scope_identity(process_identity: str) -> str:
+    """Return a public commitment without exposing the private process HMAC key."""
+
+    return sha256(process_identity.encode("utf-8")).hexdigest()
+
+
 def resolve_execution_profile_identity(
     *,
     registered_agent: runtime_records.RegisteredAgentState,
@@ -89,6 +100,14 @@ def resolve_execution_profile_identity(
     invocation_loop_policies: tuple[Any, ...] = (),
     invocation_loop_policy_identities: tuple[ExecutionProfileBehaviorIdentity | None, ...] = (),
     invocation_loop_policy_instance_identities: tuple[str | None, ...] = (),
+    registered_provider: runtime_records.RegisteredProvider | None = None,
+    provider_options: Mapping[str, Any] | None = None,
+    provider_options_process_local: bool = False,
+    thinking: Mapping[str, Any] | None = None,
+    app_budget_limit_ids: tuple[str, ...] = (),
+    request_budget_limit_ids: tuple[str, ...] = (),
+    structured_output: Mapping[str, Any] | None = None,
+    finalization: Mapping[str, Any] | None = None,
 ) -> ExecutionProfileIdentity:
     """Resolve one registered runtime body into its durable profile identity."""
 
@@ -266,6 +285,75 @@ def resolve_execution_profile_identity(
         if registered_environment is not None and registered_environment.factory_backed
         else ("present" if environment is not None and environment.runner is not None else "none")
     )
+    context_components = _context_component_materials(
+        registered_agent=registered_agent,
+        runtime_version=runtime_version,
+        process_identity=process_identity,
+        redactor=redactor,
+    )
+    provider_entry: dict[str, Any]
+    provider_process_local = False
+    provider_application_versioned = False
+    if registered_provider is None:
+        provider_entry = {
+            "kind": "structural_target_only",
+            "provider_name": provider_name,
+        }
+    else:
+        provider_material = _cayu_provider_material(registered_provider.provider)
+        safe_provider_material = _secret_safe_cayu_owned_material(
+            provider_material,
+            redactor=redactor,
+        )
+        if provider_material is not None and safe_provider_material is None:
+            provider_entry = _process_local_private_material(
+                provider_material,
+                value=registered_provider.provider,
+                process_identity=process_identity,
+                slot=f"model-provider:{registered_provider.name}",
+            )
+            provider_process_local = True
+        else:
+            provider_entry, provider_process_local = _behavior_identity_material(
+                identity=registered_provider.execution_profile_identity,
+                value=registered_provider.provider,
+                runtime_version=runtime_version,
+                process_identity=process_identity,
+                slot=f"model-provider:{registered_provider.name}",
+                cayu_owned_material=safe_provider_material,
+            )
+        provider_application_versioned = registered_provider.execution_profile_identity is not None
+    provider_request_process_local = provider_options_process_local
+    if provider_options_process_local:
+        safe_provider_options = _validated_private_provider_options_material(
+            provider_options,
+            redactor=redactor,
+        )
+    else:
+        safe_provider_options = _secret_safe_cayu_owned_material(
+            {} if provider_options is None else dict(provider_options),
+            redactor=redactor,
+        )
+    if safe_provider_options is None:
+        provider_request_process_local = True
+        safe_provider_options = _process_local_private_material(
+            {} if provider_options is None else dict(provider_options),
+            value=registered_agent.spec,
+            process_identity=process_identity,
+            slot="provider-options",
+        )
+    safe_thinking = _secret_safe_cayu_owned_material(
+        {} if thinking is None else dict(thinking),
+        redactor=redactor,
+    )
+    if safe_thinking is None:
+        provider_request_process_local = True
+        safe_thinking = _process_local_private_material(
+            {} if thinking is None else dict(thinking),
+            value=registered_agent.spec,
+            process_identity=process_identity,
+            slot="thinking",
+        )
     return build_execution_profile_identity(
         runtime_name=runtime_name,
         runtime_version=runtime_version,
@@ -314,6 +402,45 @@ def resolve_execution_profile_identity(
             ),
             "runner_authority": runner_authority,
         },
+        context_selection=context_components.selection,
+        context_selection_process_local=context_components.selection_process_local,
+        context_selection_application_versioned=(
+            context_components.selection_application_versioned
+        ),
+        knowledge_injection=context_components.knowledge,
+        knowledge_injection_process_local=context_components.knowledge_process_local,
+        knowledge_injection_application_versioned=(
+            context_components.knowledge_application_versioned
+        ),
+        context_compaction=context_components.compaction,
+        context_compaction_process_local=context_components.compaction_process_local,
+        context_compaction_application_versioned=(
+            context_components.compaction_application_versioned
+        ),
+        live_state_projection={"kind": "none", "version": 1},
+        provider_adapter=provider_entry,
+        provider_adapter_process_local=provider_process_local,
+        provider_adapter_application_versioned=provider_application_versioned,
+        provider_request_policy={
+            "provider_options": safe_provider_options,
+            "thinking": safe_thinking,
+        },
+        provider_request_policy_process_local=provider_request_process_local,
+        application_budget_policy={"limit_ids": list(app_budget_limit_ids)},
+        invocation_budget_policy={"limit_ids": list(request_budget_limit_ids)},
+        structured_output=(
+            {"kind": "none", "version": 1} if structured_output is None else structured_output
+        ),
+        finalization=(
+            {
+                "kind": "cayu:model-finalization:v1",
+                "max_steps": 16,
+                "limits": RunLimits().model_dump(mode="json"),
+                "retry_policy": RetryPolicy().model_dump(mode="json"),
+            }
+            if finalization is None
+            else finalization
+        ),
     )
 
 
@@ -335,6 +462,14 @@ def prepare_execution_profile_continuation(
     invocation_loop_policy_instance_identities: tuple[str | None, ...] = (),
     additional_profile_fingerprints: Iterable[str | None] = (),
     frozen_candidate_profile: ExecutionProfileIdentity | None = None,
+    provider_options: Mapping[str, Any] | None = None,
+    provider_options_process_local: bool = False,
+    thinking: Mapping[str, Any] | None = None,
+    app_budget_limit_ids: tuple[str, ...] = (),
+    request_budget_limit_ids: tuple[str, ...] = (),
+    structured_output: Mapping[str, Any] | None = None,
+    finalization: Mapping[str, Any] | None = None,
+    invocation_semantics_available: bool = False,
 ) -> ExecutionProfileContinuationPlan:
     """Reconstruct a pending invocation and fail closed on invalid authority."""
 
@@ -405,6 +540,14 @@ def prepare_execution_profile_continuation(
             ),
             invocation_loop_policy_identities=invocation_loop_policy_identities,
             invocation_loop_policy_instance_identities=(invocation_loop_policy_instance_identities),
+            registered_provider=registered_provider,
+            provider_options=provider_options,
+            provider_options_process_local=provider_options_process_local,
+            thinking=thinking,
+            app_budget_limit_ids=app_budget_limit_ids,
+            request_budget_limit_ids=request_budget_limit_ids,
+            structured_output=structured_output,
+            finalization=finalization,
         )
     elif type(frozen_candidate_profile) is not ExecutionProfileIdentity:
         raise TypeError("frozen_candidate_profile must be an ExecutionProfileIdentity or None.")
@@ -424,6 +567,17 @@ def prepare_execution_profile_continuation(
             candidate,
             snapshot.profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
         )
+        if snapshot.profile.schema_version >= 3 and not invocation_semantics_available:
+            for component_class in (
+                ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+                ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+                ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+                ExecutionProfileComponentClass.FINALIZATION,
+            ):
+                candidate = execution_profile_with_component(
+                    candidate,
+                    snapshot.profile.component(component_class),
+                )
     return ExecutionProfileContinuationPlan(
         snapshot=snapshot,
         candidate_profile=candidate,
@@ -461,7 +615,11 @@ def _behavior_identity_material(
         {
             "kind": "process_local_unverifiable",
             "component": _qualified_type_name(value),
-            "process_identity": process_identity,
+            "process_scope": (
+                _process_scope_identity(process_identity)
+                if process_local_instance_identity is None
+                else "exact_live_object"
+            ),
             "slot": slot,
             **(
                 {"instance_identity": process_local_instance_identity}
@@ -487,6 +645,45 @@ def _secret_safe_cayu_owned_material(
         # one identity. Fall back to exact app-local behavior identity instead.
         return None
     return material
+
+
+def _validated_private_provider_options_material(
+    material: Mapping[str, Any] | None,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    """Detach the internal opaque-options commitment without trusting raw values."""
+
+    if material is None or set(material) != {
+        "public_projection",
+        "private_configuration_hmac_sha256",
+        "process_scope",
+    }:
+        raise ValueError("Private provider-options material is malformed.")
+    public_projection = material["public_projection"]
+    private_commitment = material["private_configuration_hmac_sha256"]
+    process_scope = material["process_scope"]
+    if type(public_projection) is not dict:
+        raise TypeError("Private provider-options public projection must be a dictionary.")
+    if not _is_lower_sha256(private_commitment) or not _is_lower_sha256(process_scope):
+        raise ValueError("Private provider-options commitments are malformed.")
+    safe_public_projection = _secret_safe_cayu_owned_material(
+        public_projection,
+        redactor=redactor,
+    )
+    return {
+        **({} if safe_public_projection is None else {"public_projection": safe_public_projection}),
+        "private_configuration_hmac_sha256": private_commitment,
+        "process_scope": process_scope,
+    }
+
+
+def _is_lower_sha256(value: object) -> bool:
+    return bool(
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _qualified_type_name(value: object) -> str:
@@ -613,6 +810,802 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
 
 def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
     return _material_from_exact_type(policy, _cayu_policy_material_extractors())
+
+
+@dataclass(frozen=True)
+class _ContextComponentMaterials:
+    selection: dict[str, Any]
+    knowledge: dict[str, Any]
+    compaction: dict[str, Any]
+    selection_process_local: bool = False
+    knowledge_process_local: bool = False
+    compaction_process_local: bool = False
+    selection_application_versioned: bool = False
+    knowledge_application_versioned: bool = False
+    compaction_application_versioned: bool = False
+
+
+def _context_component_materials(
+    *,
+    registered_agent: runtime_records.RegisteredAgentState,
+    runtime_version: str | None,
+    process_identity: str,
+    redactor: SecretRedactor,
+) -> _ContextComponentMaterials:
+    primary = _project_context_policy(
+        registered_agent.context_policy,
+        identity=registered_agent.context_policy_execution_profile_identity,
+        behavior_identities=(registered_agent.context_behavior_execution_profile_identities),
+        runtime_version=runtime_version,
+        process_identity=process_identity,
+        slot="context-policy",
+        redactor=redactor,
+    )
+    overflow_policy = registered_agent.context_overflow_policy
+    if overflow_policy is None:
+        overflow = _ContextComponentMaterials(
+            selection={"kind": "none", "version": 1},
+            knowledge={"kind": "none", "version": 1},
+            compaction={"kind": "none", "version": 1},
+        )
+    else:
+        overflow = _project_context_policy(
+            overflow_policy,
+            identity=registered_agent.context_overflow_policy_execution_profile_identity,
+            behavior_identities=(registered_agent.context_behavior_execution_profile_identities),
+            runtime_version=runtime_version,
+            process_identity=process_identity,
+            slot="context-overflow-policy",
+            redactor=redactor,
+        )
+    return _ContextComponentMaterials(
+        selection={"primary": primary.selection, "overflow": overflow.selection},
+        knowledge={"primary": primary.knowledge, "overflow": overflow.knowledge},
+        compaction={"primary": primary.compaction, "overflow": overflow.compaction},
+        selection_process_local=(
+            primary.selection_process_local or overflow.selection_process_local
+        ),
+        knowledge_process_local=(
+            primary.knowledge_process_local or overflow.knowledge_process_local
+        ),
+        compaction_process_local=(
+            primary.compaction_process_local or overflow.compaction_process_local
+        ),
+        selection_application_versioned=(
+            primary.selection_application_versioned or overflow.selection_application_versioned
+        ),
+        knowledge_application_versioned=(
+            primary.knowledge_application_versioned or overflow.knowledge_application_versioned
+        ),
+        compaction_application_versioned=(
+            primary.compaction_application_versioned or overflow.compaction_application_versioned
+        ),
+    )
+
+
+def _project_context_policy(
+    policy: object,
+    *,
+    identity: ExecutionProfileBehaviorIdentity | None,
+    behavior_identities: Mapping[int, ExecutionProfileBehaviorIdentity | None],
+    runtime_version: str | None,
+    process_identity: str,
+    slot: str,
+    redactor: SecretRedactor,
+) -> _ContextComponentMaterials:
+    if identity is not None:
+        entry, _ = _behavior_identity_material(
+            identity=identity,
+            value=policy,
+            runtime_version=runtime_version,
+            process_identity=process_identity,
+            slot=slot,
+        )
+        material = {"behavior": entry}
+        return _ContextComponentMaterials(
+            selection=material,
+            knowledge=material,
+            compaction=material,
+            selection_application_versioned=True,
+            knowledge_application_versioned=True,
+            compaction_application_versioned=True,
+        )
+
+    projected = _cayu_context_policy_material(
+        policy,
+        behavior_identities=behavior_identities,
+        process_identity=process_identity,
+    )
+    if projected is None:
+        entry, _ = _behavior_identity_material(
+            identity=None,
+            value=policy,
+            runtime_version=runtime_version,
+            process_identity=process_identity,
+            slot=slot,
+        )
+        material = {"behavior": entry}
+        return _ContextComponentMaterials(
+            selection=material,
+            knowledge=material,
+            compaction=material,
+            selection_process_local=True,
+            knowledge_process_local=True,
+            compaction_process_local=True,
+        )
+
+    selection_material = dict(projected.selection)
+    knowledge_material = dict(projected.knowledge)
+    compaction_material = dict(projected.compaction)
+    if projected.selection_process_local:
+        selection_material["process_scope"] = _process_scope_identity(process_identity)
+        selection_material["slot"] = f"{slot}:selection"
+    if projected.knowledge_process_local:
+        knowledge_material["process_scope"] = _process_scope_identity(process_identity)
+        knowledge_material["slot"] = f"{slot}:knowledge"
+    if projected.compaction_process_local:
+        compaction_material["process_scope"] = _process_scope_identity(process_identity)
+        compaction_material["slot"] = f"{slot}:compaction"
+    safe_selection = _secret_safe_cayu_owned_material(selection_material, redactor=redactor)
+    safe_knowledge = _secret_safe_cayu_owned_material(knowledge_material, redactor=redactor)
+    safe_compaction = _secret_safe_cayu_owned_material(compaction_material, redactor=redactor)
+    private_selection = _process_local_private_material(
+        selection_material,
+        value=policy,
+        process_identity=process_identity,
+        slot=f"{slot}:selection",
+    )
+    private_knowledge = _process_local_private_material(
+        knowledge_material,
+        value=policy,
+        process_identity=process_identity,
+        slot=f"{slot}:knowledge",
+    )
+    private_compaction = _process_local_private_material(
+        compaction_material,
+        value=policy,
+        process_identity=process_identity,
+        slot=f"{slot}:compaction",
+    )
+    return _ContextComponentMaterials(
+        selection=(private_selection if safe_selection is None else safe_selection),
+        knowledge=(private_knowledge if safe_knowledge is None else safe_knowledge),
+        compaction=(private_compaction if safe_compaction is None else safe_compaction),
+        selection_process_local=(projected.selection_process_local or safe_selection is None),
+        knowledge_process_local=(projected.knowledge_process_local or safe_knowledge is None),
+        compaction_process_local=(projected.compaction_process_local or safe_compaction is None),
+        selection_application_versioned=projected.selection_application_versioned,
+        knowledge_application_versioned=projected.knowledge_application_versioned,
+        compaction_application_versioned=projected.compaction_application_versioned,
+    )
+
+
+def _cayu_context_policy_material(
+    policy: object,
+    *,
+    behavior_identities: Mapping[int, ExecutionProfileBehaviorIdentity | None],
+    process_identity: str,
+) -> _ContextComponentMaterials | None:
+    from cayu.runtime.context import (
+        _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
+        CheckpointCompactionContextPolicy,
+        DefaultContextPolicy,
+        KnowledgeInjectionPolicy,
+        MessageWindowContextPolicy,
+        RecentTurnsContextPolicy,
+        TranscriptDigestCompactor,
+        UsageTriggeredContextPolicy,
+    )
+
+    declared_identity = behavior_identities.get(id(policy))
+    if declared_identity is not None:
+        material = {
+            "behavior": {
+                "kind": "application_versioned",
+                **declared_identity.model_dump(mode="json"),
+            }
+        }
+        return _ContextComponentMaterials(
+            selection=material,
+            knowledge=material,
+            compaction=material,
+            selection_application_versioned=True,
+            knowledge_application_versioned=True,
+            compaction_application_versioned=True,
+        )
+
+    if type(policy) is DefaultContextPolicy:
+        return _ContextComponentMaterials(
+            selection={
+                "kind": "default",
+                "version": 1,
+                "max_attachment_results": policy.max_attachment_results,
+            },
+            knowledge={"kind": "none", "version": 1},
+            compaction={"kind": "none", "version": 1},
+        )
+    if type(policy) is MessageWindowContextPolicy:
+        return _ContextComponentMaterials(
+            selection={
+                "kind": "message_window",
+                "version": 1,
+                "max_messages": policy.max_messages,
+                "preserve_system": policy.preserve_system,
+                "max_attachment_results": policy.max_attachment_results,
+            },
+            knowledge={"kind": "none", "version": 1},
+            compaction={"kind": "none", "version": 1},
+        )
+    if type(policy) is RecentTurnsContextPolicy:
+        return _ContextComponentMaterials(
+            selection={
+                "kind": "recent_turns",
+                "version": 1,
+                "max_user_turns": policy.max_user_turns,
+                "preserve_system": policy.preserve_system,
+                "max_attachment_results": policy.max_attachment_results,
+            },
+            knowledge={"kind": "none", "version": 1},
+            compaction={"kind": "none", "version": 1},
+        )
+    if type(policy) is KnowledgeInjectionPolicy:
+        base = _cayu_context_policy_material(
+            policy.base_policy,
+            behavior_identities=behavior_identities,
+            process_identity=process_identity,
+        )
+        if base is None:
+            return None
+        has_private_filters = any(
+            (
+                policy.namespace != "default",
+                policy.labels is not None,
+                policy.kinds is not None,
+                policy.visibilities is not None,
+                bool(policy.aspects),
+                bool(policy.impact_targets),
+                policy.source_type is not None,
+                policy.source_id is not None,
+                policy.prefix != "Relevant knowledge retrieved for this request:",
+            )
+        )
+        knowledge = (
+            {
+                "kind": "process_local_private_configuration",
+                "component": _qualified_type_name(policy),
+                "configuration_hmac_sha256": _process_local_configuration_commitment(
+                    {
+                        "enabled": policy.enabled,
+                        "namespace": policy.namespace,
+                        "labels": policy.labels,
+                        "kinds": policy.kinds,
+                        "visibilities": (
+                            None
+                            if policy.visibilities is None
+                            else [item.value for item in policy.visibilities]
+                        ),
+                        "aspects": policy.aspects,
+                        "impact_targets": policy.impact_targets,
+                        "source_type": policy.source_type,
+                        "source_id": policy.source_id,
+                        "mode": policy.mode.value,
+                        "include_expired": policy.include_expired,
+                        "max_hits": policy.max_hits,
+                        "max_bytes": policy.max_bytes,
+                        "max_checkpoint_bytes": policy.max_checkpoint_bytes,
+                        "query_max_chars": policy.query_max_chars,
+                        "prefix": policy.prefix,
+                        "fail_open": policy.fail_open,
+                    },
+                    process_identity=process_identity,
+                    field_name="knowledge_injection_private_configuration",
+                ),
+            }
+            if has_private_filters
+            else {
+                "kind": "knowledge_injection",
+                "version": 1,
+                "enabled": policy.enabled,
+                "mode": policy.mode.value,
+                "include_expired": policy.include_expired,
+                "max_hits": policy.max_hits,
+                "max_bytes": policy.max_bytes,
+                "max_checkpoint_bytes": policy.max_checkpoint_bytes,
+                "query_max_chars": policy.query_max_chars,
+                "fail_open": policy.fail_open,
+            }
+        )
+        return _ContextComponentMaterials(
+            selection=base.selection,
+            knowledge=knowledge,
+            compaction=base.compaction,
+            selection_process_local=base.selection_process_local,
+            knowledge_process_local=(has_private_filters or base.knowledge_process_local),
+            compaction_process_local=base.compaction_process_local,
+            selection_application_versioned=base.selection_application_versioned,
+            knowledge_application_versioned=base.knowledge_application_versioned,
+            compaction_application_versioned=base.compaction_application_versioned,
+        )
+    if type(policy) is UsageTriggeredContextPolicy:
+        base = _cayu_context_policy_material(
+            policy.base_policy,
+            behavior_identities=behavior_identities,
+            process_identity=process_identity,
+        )
+        triggered = _cayu_context_policy_material(
+            policy.triggered_policy,
+            behavior_identities=behavior_identities,
+            process_identity=process_identity,
+        )
+        if base is None or triggered is None:
+            return None
+        selection = {
+            "kind": "usage_triggered",
+            "version": 1,
+            "base": base.selection,
+            "triggered": triggered.selection,
+            "min_input_tokens": policy.min_input_tokens,
+            "trigger_estimated_context_tokens": policy.trigger_estimated_context_tokens,
+            "reserved_output_tokens": policy.reserved_output_tokens,
+            "verify_estimate_with_provider_count": policy.verify_estimate_with_provider_count,
+            "provider_count_threshold_ratio": policy.provider_count_threshold_ratio,
+            "provider_count_min_delta_tokens": policy.provider_count_min_delta_tokens,
+            "min_total_tokens": policy.min_total_tokens,
+            "sticky": policy.sticky,
+        }
+        return _ContextComponentMaterials(
+            selection=selection,
+            knowledge={"base": base.knowledge, "triggered": triggered.knowledge},
+            compaction={"base": base.compaction, "triggered": triggered.compaction},
+            selection_process_local=(
+                base.selection_process_local or triggered.selection_process_local
+            ),
+            knowledge_process_local=(
+                base.knowledge_process_local or triggered.knowledge_process_local
+            ),
+            compaction_process_local=(
+                base.compaction_process_local or triggered.compaction_process_local
+            ),
+            selection_application_versioned=(
+                base.selection_application_versioned or triggered.selection_application_versioned
+            ),
+            knowledge_application_versioned=(
+                base.knowledge_application_versioned or triggered.knowledge_application_versioned
+            ),
+            compaction_application_versioned=(
+                base.compaction_application_versioned or triggered.compaction_application_versioned
+            ),
+        )
+    if type(policy) is CheckpointCompactionContextPolicy:
+        compactor = policy.compactor
+        private_summary_prefix = (
+            policy.summary_prefix != _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX
+        )
+        compactor_identity = behavior_identities.get(id(compactor))
+        if type(compactor) is TranscriptDigestCompactor:
+            compaction = {
+                "kind": "transcript_digest",
+                "version": 2,
+                "max_summary_chars": compactor.max_summary_chars,
+            }
+            compaction_process_local = False
+        elif (
+            built_in_compactor := _cayu_compactor_material(
+                compactor,
+                behavior_identities=behavior_identities,
+                process_identity=process_identity,
+            )
+        ) is not None:
+            compaction = built_in_compactor
+            compaction_process_local = _material_contains_process_local_identity(compaction)
+        else:
+            if compactor_identity is None:
+                compaction, _ = _behavior_identity_material(
+                    identity=None,
+                    value=compactor,
+                    runtime_version=None,
+                    process_identity=process_identity,
+                    slot="context-compactor",
+                )
+                compaction_process_local = True
+            else:
+                compaction = {
+                    "kind": "application_versioned",
+                    **compactor_identity.model_dump(mode="json"),
+                }
+                compaction_process_local = False
+        selection: dict[str, Any] = {
+            "kind": "checkpoint_compaction",
+            "version": 1,
+            "max_user_turns": policy.max_user_turns,
+            "compact_after_messages": policy.compact_after_messages,
+            "summary_prefix": (
+                {
+                    "kind": "process_local_private_configuration",
+                    "configuration_hmac_sha256": (
+                        _process_local_configuration_commitment(
+                            {"summary_prefix": policy.summary_prefix},
+                            process_identity=process_identity,
+                            field_name="checkpoint_summary_prefix_private_configuration",
+                        )
+                    ),
+                }
+                if private_summary_prefix
+                else {"kind": "cayu_default", "version": 1}
+            ),
+            "max_attachment_results": policy.max_attachment_results,
+        }
+        return _ContextComponentMaterials(
+            selection=selection,
+            knowledge={"kind": "none", "version": 1},
+            compaction=compaction,
+            selection_process_local=private_summary_prefix,
+            compaction_process_local=compaction_process_local,
+            compaction_application_versioned=(
+                compactor_identity is not None
+                or _material_contains_application_identity(compaction)
+            ),
+        )
+    return None
+
+
+def _material_contains_application_identity(value: object) -> bool:
+    if type(value) is dict:
+        material = cast("dict[object, object]", value)
+        if material.get("kind") == "application_versioned":
+            return True
+        return any(_material_contains_application_identity(item) for item in material.values())
+    if type(value) is list:
+        return any(_material_contains_application_identity(item) for item in value)
+    return False
+
+
+def _material_contains_process_local_identity(value: object) -> bool:
+    if type(value) is dict:
+        material = cast("dict[object, object]", value)
+        if material.get("kind") in {
+            "process_local_private_configuration",
+            "process_local_unverifiable",
+        }:
+            return True
+        return any(_material_contains_process_local_identity(item) for item in material.values())
+    if type(value) is list:
+        return any(_material_contains_process_local_identity(item) for item in value)
+    return False
+
+
+def _process_local_configuration_commitment(
+    value: object,
+    *,
+    process_identity: str,
+    field_name: str,
+) -> str:
+    return hmac.new(
+        process_identity.encode("utf-8"),
+        canonical_durable_json_bytes(value, field_name),
+        sha256,
+    ).hexdigest()
+
+
+def _process_local_private_material(
+    material: object,
+    *,
+    value: object,
+    process_identity: str,
+    slot: str,
+) -> dict[str, Any]:
+    """Bind private configuration exactly without retaining its raw representation."""
+
+    return {
+        "kind": "process_local_private_configuration",
+        "component": _qualified_type_name(value),
+        "process_scope": _process_scope_identity(process_identity),
+        "slot": slot,
+        "configuration_hmac_sha256": _process_local_configuration_commitment(
+            material,
+            process_identity=process_identity,
+            field_name=f"{slot}_private_configuration",
+        ),
+    }
+
+
+def _process_local_object_material(
+    value: object,
+    *,
+    process_identity: str,
+    slot: str,
+) -> dict[str, Any]:
+    return {
+        "kind": "process_local_unverifiable",
+        "component": _qualified_type_name(value),
+        "process_scope": _process_scope_identity(process_identity),
+        "slot": slot,
+        "instance_hmac_sha256": _process_local_configuration_commitment(
+            {"object_id": str(id(value))},
+            process_identity=process_identity,
+            field_name=f"{slot}_instance",
+        ),
+    }
+
+
+def _cayu_compactor_material(
+    compactor: object,
+    *,
+    behavior_identities: Mapping[int, ExecutionProfileBehaviorIdentity | None],
+    process_identity: str,
+) -> dict[str, Any] | None:
+    """Identify transparent built-in compactors without retaining prompt content."""
+
+    from cayu.runtime.context import (
+        ModelCompactor,
+        PromptCacheCompactor,
+        TranscriptDigestCompactor,
+        default_compaction_prompt,
+    )
+
+    if type(compactor) is TranscriptDigestCompactor:
+        return {
+            "kind": "transcript_digest",
+            "version": 2,
+            "max_summary_chars": compactor.max_summary_chars,
+        }
+    if type(compactor) is ModelCompactor:
+        default_prompt = (
+            "You summarize prior agent session context for a future model call. "
+            "Return only the compact summary. Do not call tools."
+        )
+        provider = _nested_provider_material(
+            compactor.provider,
+            behavior_identities=behavior_identities,
+            process_identity=process_identity,
+            slot="model-compactor-provider",
+        )
+        material = {
+            "kind": "model_compactor",
+            "version": 1,
+            "provider": provider,
+            "provider_name": compactor._provider_snapshot.provider_name,
+            "pricing_provider_name": compactor._provider_snapshot.pricing_provider_name,
+            "usage_dialect": compactor._provider_snapshot.usage_dialect.value,
+            "model": compactor.model,
+            "max_input_chars": compactor.max_input_chars,
+            "max_hierarchy_calls": compactor.max_hierarchy_calls,
+            "retry_policy": compactor.retry_policy.model_dump(mode="json"),
+        }
+        if (
+            compactor.system_prompt != default_prompt
+            or compactor.options
+            or compactor.prompt_builder not in (None, default_compaction_prompt)
+        ):
+            material["private_configuration"] = {
+                "kind": "process_local_private_configuration",
+                "configuration_hmac_sha256": _process_local_configuration_commitment(
+                    {
+                        "system_prompt": compactor.system_prompt,
+                        "options": compactor.options,
+                        "prompt_builder": (
+                            None
+                            if compactor.prompt_builder is None
+                            else {
+                                "component": _qualified_type_name(compactor.prompt_builder),
+                                "object_id": str(id(compactor.prompt_builder)),
+                            }
+                        ),
+                    },
+                    process_identity=process_identity,
+                    field_name="model_compactor_private_configuration",
+                ),
+            }
+        return material
+    if type(compactor) is PromptCacheCompactor:
+        default_instruction = (
+            "Summarize the conversation above so a future agent step can continue "
+            "with the important context. Preserve concrete user requests, decisions, "
+            "files or resources mentioned, tool results, errors, and pending work. "
+            "Do not invent facts. Keep the summary concise but specific. "
+            "Do not call tools. Return only the summary text."
+        )
+        provider = _nested_provider_material(
+            compactor.provider,
+            behavior_identities=behavior_identities,
+            process_identity=process_identity,
+            slot="prompt-cache-compactor-provider",
+        )
+        fallback_identity = behavior_identities.get(id(compactor._fallback))
+        fallback = (
+            {
+                "kind": "application_versioned",
+                **fallback_identity.model_dump(mode="json"),
+            }
+            if fallback_identity is not None
+            else _cayu_compactor_material(
+                compactor._fallback,
+                behavior_identities=behavior_identities,
+                process_identity=process_identity,
+            )
+        )
+        if fallback is None:
+            fallback = _process_local_object_material(
+                compactor._fallback,
+                process_identity=process_identity,
+                slot="prompt-cache-fallback",
+            )
+        material = {
+            "kind": "prompt_cache_compactor",
+            "version": 1,
+            "provider": provider,
+            "provider_name": compactor._provider_snapshot.provider_name,
+            "pricing_provider_name": compactor._provider_snapshot.pricing_provider_name,
+            "usage_dialect": compactor._provider_snapshot.usage_dialect.value,
+            "fallback": fallback,
+            "retry_policy": compactor.retry_policy.model_dump(mode="json"),
+        }
+        if (
+            compactor.options
+            or compactor.model is not None
+            or compactor.compaction_instruction != default_instruction
+        ):
+            material["private_configuration"] = {
+                "kind": "process_local_private_configuration",
+                "configuration_hmac_sha256": _process_local_configuration_commitment(
+                    {
+                        "options": compactor.options,
+                        "model": compactor.model,
+                        "compaction_instruction": compactor.compaction_instruction,
+                    },
+                    process_identity=process_identity,
+                    field_name="prompt_cache_compactor_private_configuration",
+                ),
+            }
+        return material
+    return None
+
+
+def _nested_provider_material(
+    provider: object,
+    *,
+    behavior_identities: Mapping[int, ExecutionProfileBehaviorIdentity | None],
+    process_identity: str,
+    slot: str,
+) -> dict[str, Any]:
+    identity = behavior_identities.get(id(provider))
+    if identity is not None:
+        return {
+            "kind": "application_versioned",
+            **identity.model_dump(mode="json"),
+        }
+    built_in = _cayu_provider_material(provider)
+    if built_in is not None:
+        return built_in
+    return _process_local_object_material(
+        provider,
+        process_identity=process_identity,
+        slot=slot,
+    )
+
+
+def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
+    """Return bounded behavior material only for transparent built-in adapters."""
+
+    from cayu.evals.testing import ScriptedModelProvider
+    from cayu.providers.anthropic import (
+        DEFAULT_ANTHROPIC_BASE_URL,
+        AnthropicProvider,
+        HttpxAnthropicTransport,
+    )
+    from cayu.providers.bedrock import BedrockProvider
+    from cayu.providers.chat_completions import (
+        DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV,
+        DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER,
+        DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX,
+        DEFAULT_CHAT_COMPLETIONS_BASE_URL,
+        ChatCompletionsProvider,
+        HttpxChatCompletionsTransport,
+    )
+    from cayu.providers.openai import (
+        DEFAULT_OPENAI_BASE_URL,
+        HttpxOpenAITransport,
+        OpenAIProvider,
+    )
+    from cayu.providers.openai_subscription import OpenAISubscriptionProvider
+
+    if type(provider) is ScriptedModelProvider:
+        return {
+            "adapter": "scripted-model-provider",
+            "version": 1,
+            "background": provider.provider_operations is not None,
+        }
+
+    if type(provider) is OpenAIProvider:
+        if type(provider.transport) is not HttpxOpenAITransport or provider.extra_headers:
+            return None
+        return {
+            "adapter": "openai-responses",
+            "version": 1,
+            "base_url": provider.base_url,
+            "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
+            "reasoning_state": provider.reasoning_state,
+            "timeout_s": provider.timeout_s,
+            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+        }
+    if type(provider) is ChatCompletionsProvider:
+        if type(provider.transport) is not HttpxChatCompletionsTransport or provider.extra_headers:
+            return None
+        return {
+            "adapter": "chat-completions",
+            "version": 1,
+            "base_url": provider.base_url,
+            "endpoint_url": provider.endpoint_url,
+            "api_key_env": provider.api_key_env,
+            "auth_header": provider.auth_header,
+            "auth_value_prefix": provider.auth_value_prefix,
+            "allow_http": provider.allow_http,
+            "stream_include_usage": provider.stream_include_usage,
+            "timeout_s": provider.timeout_s,
+            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+            "api_version": provider.api_version,
+            "default_route": bool(
+                provider.base_url == DEFAULT_CHAT_COMPLETIONS_BASE_URL
+                and provider.endpoint_url is None
+                and provider.api_key_env == DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV
+                and provider.auth_header == DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER
+                and provider.auth_value_prefix == DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX
+                and not provider.allow_http
+                and provider.api_version is None
+            ),
+            "clean_schemas": provider.clean_schemas,
+            "strip_additional_properties": provider.strip_additional_properties,
+            "document_encoding": provider.document_encoding,
+            "usage_dialect": provider.usage_dialect.value,
+        }
+    if type(provider) is AnthropicProvider:
+        if (
+            type(provider.transport) is not HttpxAnthropicTransport
+            or provider.extra_headers
+            or provider.credential_proxy is not None
+        ):
+            return None
+        return {
+            "adapter": "anthropic-messages",
+            "version": 1,
+            "base_url": provider.base_url,
+            "default_route": provider.base_url == DEFAULT_ANTHROPIC_BASE_URL,
+            "credential_mode": ("brokered" if provider.api_key_ref is not None else "direct"),
+            "anthropic_version": provider.anthropic_version,
+            "max_tokens": provider.max_tokens,
+            "timeout_s": provider.timeout_s,
+            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+            "cache_policy": (
+                None
+                if provider.cache_policy is None
+                else provider.cache_policy.model_dump(mode="json")
+            ),
+        }
+    if type(provider) is BedrockProvider:
+        if any(
+            (
+                not provider._owns_client,
+                provider.region_name is None,
+            )
+        ):
+            return None
+        return {
+            "adapter": "bedrock-converse-stream",
+            "version": 1,
+            "region_name": provider.region_name,
+            "profile_name": provider.profile_name,
+            "endpoint_url": provider.endpoint_url,
+            "max_tokens": provider.max_tokens,
+            "stream_idle_timeout_s": provider.stream_idle_timeout_s,
+            "stream_close_timeout_s": provider.stream_close_timeout_s,
+        }
+    if type(provider) is OpenAISubscriptionProvider:
+        # Authentication and transport collaborators are opaque unless the app
+        # declares a stable provider identity.
+        return None
+    # Vertex configuration includes project and credential-routing authority;
+    # it likewise requires an application identity for cross-process reuse.
+    return None
 
 
 def _environment_identity_material(

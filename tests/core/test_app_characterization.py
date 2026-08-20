@@ -27,6 +27,8 @@ import asyncio
 from collections.abc import AsyncIterator
 from decimal import Decimal
 
+from tests.core._execution_profile_fixtures import versioned_test_provider_identity
+
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
@@ -79,6 +81,10 @@ class ScriptedProvider(ModelProvider):
     """
 
     name = "fake"
+
+    @property
+    def execution_profile_identity(self):
+        return versioned_test_provider_identity(self)
 
     def __init__(
         self,

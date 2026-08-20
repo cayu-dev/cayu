@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import sys
@@ -77,7 +78,7 @@ from cayu.core.messages import (
     MessageRole,
     detach_message,
 )
-from cayu.core.thinking import ThinkingConfig
+from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.core.tools import (
     ToolResult,
 )
@@ -86,6 +87,8 @@ from cayu.environments import (
     WorkspaceInstructions,
 )
 from cayu.providers import (
+    CacheBreakpoint,
+    CachePolicy,
     ModelProvider,
     ModelRequest,
     NativeStructuredOutputSchemaInvalid,
@@ -93,6 +96,7 @@ from cayu.providers import (
     UsageDialect,
     copy_usage_dialect,
 )
+from cayu.providers.base import privacy_safe_provider_option_projection
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
@@ -249,6 +253,7 @@ from cayu.runtime.budgets import (
     budget_check_payload,
     budget_limits_for_session,
     budget_reservation_payload,
+    copy_budget_policy,
     has_deferred_contextual_price,
     request_budget_limits_for_session,
 )
@@ -283,6 +288,7 @@ from cayu.runtime.context import (
 from cayu.runtime.costs import (
     SessionCostSummary,
 )
+from cayu.runtime.dispatch import DispatchRequest
 from cayu.runtime.errors import (
     TerminalEventPublicationUncertain,
     _is_runtime_interaction_lifecycle_publication_rejection,
@@ -452,6 +458,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _event_with_session_run_operation,
+    _fork_group_initial_invocation_request_sha256,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
@@ -1309,8 +1316,7 @@ class _ForkPromptWorkflow:
 
 
 def _fork_event_with_runtime_authority(event: Event) -> Event:
-    return event_with_runtime_payload_authority(
-        event_with_runtime_envelope_authority(event, "session_id"),
+    payload_fields = [
         "source_session_id",
         "parent_session_id",
         "causal_budget_id",
@@ -1319,6 +1325,17 @@ def _fork_event_with_runtime_authority(event: Event) -> Event:
         "source_profile_fingerprint",
         "fork_request_sha256",
         "system_prompt_policy",
+    ]
+    if "initial_invocation_request_sha256" in event.payload:
+        payload_fields.extend(
+            (
+                "initial_invocation_request_sha256",
+                "initial_invocation_profile_fingerprint",
+            )
+        )
+    return event_with_runtime_payload_authority(
+        event_with_runtime_envelope_authority(event, "session_id"),
+        *payload_fields,
     )
 
 
@@ -2679,6 +2696,7 @@ class _PreparedInitialRun:
     rendered_system_prompt: str | None
     prompt_contributions: tuple[Any, ...]
     execution_profile: ExecutionProfileIdentity
+    budget_policy: BudgetPolicy | None
     session_identity: SessionIdentity
 
 
@@ -2720,7 +2738,43 @@ def _execution_profile_identity(
     ] = (),
     request_loop_policies: tuple[LoopPolicy, ...] = (),
     request_loop_policy_instance_identities: tuple[str | None, ...] = (),
+    registered_provider: runtime_records.RegisteredProvider | None = None,
+    budget_policy: BudgetPolicy | None = None,
+    request_budget_limits: tuple[BudgetLimit, ...] = (),
+    causal_budget_id: str | None = None,
+    structured_output: StructuredOutputSpec | None = None,
+    thinking: ThinkingConfig | None = None,
+    max_steps: int = 16,
+    limits: RunLimits | None = None,
+    retry_policy: RetryPolicy | None = None,
+    finalization_material: dict[str, Any] | None = None,
 ) -> ExecutionProfileIdentity:
+    provider_options, provider_options_process_local = _execution_profile_provider_options(
+        registered_agent.spec.provider_options,
+        provider=registered_provider.provider if registered_provider is not None else None,
+        model=model,
+        process_identity=process_identity,
+    )
+    effective_thinking = thinking if thinking is not None else registered_agent.spec.thinking
+    app_limit_ids: tuple[str, ...] = ()
+    request_limit_ids: tuple[str, ...] = ()
+    if causal_budget_id is not None:
+        app_limit_ids = tuple(
+            limit.budget_limit_id
+            for limit in budget_limits_for_session(
+                policy=budget_policy,
+                agent_name=registered_agent.spec.name,
+                causal_budget_id=causal_budget_id,
+            )
+        )
+        request_limit_ids = tuple(
+            limit.budget_limit_id
+            for limit in request_budget_limits_for_session(
+                limits=request_budget_limits,
+                agent_name=registered_agent.spec.name,
+                causal_budget_id=causal_budget_id,
+            )
+        )
     return execution_profile_admission.resolve_execution_profile_identity(
         registered_agent=registered_agent,
         provider_name=provider_name,
@@ -2744,17 +2798,213 @@ def _execution_profile_identity(
             for index, policy in enumerate(request_loop_policies)
         ),
         invocation_loop_policy_instance_identities=(request_loop_policy_instance_identities),
+        registered_provider=registered_provider,
+        provider_options=provider_options,
+        provider_options_process_local=provider_options_process_local,
+        thinking=(
+            None if effective_thinking is None else thinking_config_payload(effective_thinking)
+        ),
+        app_budget_limit_ids=app_limit_ids,
+        request_budget_limit_ids=request_limit_ids,
+        structured_output=_execution_profile_structured_output(structured_output),
+        finalization=(
+            {
+                "kind": "cayu:model-finalization:v1",
+                "max_steps": max_steps,
+                "limits": copy_run_limits(limits).model_dump(mode="json"),
+                "retry_policy": copy_retry_policy(retry_policy).model_dump(mode="json"),
+            }
+            if finalization_material is None
+            else copy_json_value(finalization_material, "finalization_material")
+        ),
     )
+
+
+def _execution_profile_provider_options(
+    options: dict[str, Any],
+    *,
+    provider: ModelProvider | None = None,
+    model: str = "execution-profile-options",
+    process_identity: str,
+) -> tuple[dict[str, Any], bool]:
+    """Project the selected adapter's effective request-option policy.
+
+    Built-in adapters remove inactive namespaces, normalize controls, and add
+    provider defaults through ``request_fingerprint_options``.  The optional
+    provider preserves the conservative raw-options behavior for internal
+    helper callers that do not yet have a resolved adapter.
+    """
+
+    effective_options = options
+    cache_policy_material: dict[str, Any] | None = None
+    private_options_material: dict[str, Any] = effective_options
+    provider_defined_cache_policy = False
+    if provider is not None:
+        detached_request = ModelRequest(
+            model=model,
+            messages=[],
+            options=options,
+        )
+        projected_options = provider.request_fingerprint_options(detached_request)
+        if type(projected_options) is not dict:
+            raise TypeError("ModelProvider.request_fingerprint_options() must return a dict.")
+        copied_options = copy_durable_json_value(
+            projected_options,
+            "execution profile provider options",
+        )
+        if type(copied_options) is not dict:  # pragma: no cover - copier invariant.
+            raise TypeError("ModelProvider.request_fingerprint_options() must return a dict.")
+        effective_options = copied_options
+        private_options_material = effective_options
+        effective_cache_policy, cache_policy_is_authoritative = (
+            _execution_profile_effective_cache_policy(
+                provider,
+                options=detached_request.options,
+            )
+        )
+        cache_policy_material = _execution_profile_cache_policy(effective_cache_policy)
+        raw_cache_policy = detached_request.options.get("cache_policy")
+        if not cache_policy_is_authoritative and raw_cache_policy is not None:
+            copied_cache_policy = copy_durable_json_value(
+                raw_cache_policy,
+                "execution profile provider-defined cache policy",
+            )
+            private_options_material = {
+                "provider_options": effective_options,
+                "provider_defined_cache_policy": copied_cache_policy,
+            }
+            provider_defined_cache_policy = True
+
+    projected: dict[str, Any] = {}
+    opaque = False
+    for namespace, value in effective_options.items():
+        if type(value) is dict:
+            safe = privacy_safe_provider_option_projection(value)
+            if safe:
+                projected[namespace] = safe
+            visible_source = {key: item for key, item in value.items() if item is not None}
+            opaque |= safe != visible_source
+        elif value is not None:
+            opaque = True
+    if cache_policy_material is not None:
+        projected["cache_policy"] = cache_policy_material
+    elif provider_defined_cache_policy:
+        projected["cache_policy"] = {"configuration": "provider_defined"}
+        opaque = True
+    if not opaque:
+        return projected, False
+    private_digest = hmac.new(
+        process_identity.encode("utf-8"),
+        canonical_durable_json_bytes(private_options_material, "provider_options"),
+        hashlib.sha256,
+    ).hexdigest()
+    return (
+        {
+            "public_projection": projected,
+            "private_configuration_hmac_sha256": private_digest,
+            "process_scope": hashlib.sha256(process_identity.encode("utf-8")).hexdigest(),
+        },
+        True,
+    )
+
+
+def _execution_profile_cache_policy(
+    policy: CachePolicy | None,
+) -> dict[str, Any] | None:
+    """Canonicalize the effective provider cache policy without request content."""
+
+    if policy is None:
+        return None
+    if type(policy) is not CachePolicy:
+        raise TypeError("ModelProvider.request_cache_policy() must return CachePolicy or None.")
+    copied = CachePolicy.model_validate(policy.model_dump(mode="python"))
+    breakpoints = set(copied.breakpoints)
+    if copied.conversation_prefix_strategy == "none":
+        breakpoints.discard(CacheBreakpoint.CONVERSATION_PREFIX)
+    if not breakpoints:
+        return None
+    ordered = tuple(sorted(breakpoints, key=lambda item: item.value))
+    material: dict[str, Any] = {
+        "breakpoints": [breakpoint.value for breakpoint in ordered],
+        "ttl": "extended" if copied.ttl == "extended" else "standard",
+    }
+    if CacheBreakpoint.CONVERSATION_PREFIX in breakpoints:
+        material["conversation_prefix_strategy"] = copied.conversation_prefix_strategy
+        if copied.conversation_prefix_strategy == "all_but_last_n":
+            material["conversation_prefix_n"] = copied.conversation_prefix_n
+    return material
+
+
+def _execution_profile_effective_cache_policy(
+    provider: ModelProvider,
+    *,
+    options: dict[str, Any],
+) -> tuple[CachePolicy | None, bool]:
+    """Resolve cache configuration only for an adapter whose complete contract is known."""
+
+    from cayu.providers.anthropic import AnthropicProvider
+    from cayu.providers.cache import resolve_cache_policy
+
+    if type(provider) is AnthropicProvider:
+        return resolve_cache_policy(provider.cache_policy, options), True
+    provider_type = type(provider)
+    uses_default_cache_contract = (
+        provider_type.request_cache_policy is ModelProvider.request_cache_policy
+        and provider_type.request_cache_projection is ModelProvider.request_cache_projection
+    )
+    return None, uses_default_cache_contract
+
+
+def _execution_profile_structured_output(
+    spec: StructuredOutputSpec | None,
+) -> dict[str, Any] | None:
+    if spec is None:
+        return None
+    copied = copy_structured_output_spec(spec)
+    if copied is None:
+        return None
+    schema_digest = hashlib.sha256(
+        canonical_durable_json_bytes(copied.json_schema, "structured_output.json_schema")
+    ).hexdigest()
+    return {
+        "kind": "structured_output",
+        "version": 1,
+        "schema_sha256": schema_digest,
+        "strategy": copied.strategy.value,
+        "max_retries": copied.max_retries,
+        "name_sha256": (
+            None if copied.name is None else hashlib.sha256(copied.name.encode("utf-8")).hexdigest()
+        ),
+        "repair_prompt_sha256": (
+            None
+            if copied.repair_prompt is None
+            else hashlib.sha256(copied.repair_prompt.encode("utf-8")).hexdigest()
+        ),
+    }
 
 
 _EXACT_PROFILE_POLICY_ID = "cayu:execution-profile-exact-reuse:v1"
 _DEFAULT_PROFILE_POLICY_ID = "cayu:execution-profile-default-reject:v1"
 _MODEL_TARGET_PROFILE_POLICY_ID = "cayu:model-target-adoption:v1"
+_FORK_GROUP_INITIAL_PROFILE_POLICY_ID = "cayu:fork-group-initial-invocation:v1"
+_MODEL_TARGET_BUILT_IN_COMPONENTS = frozenset(
+    {
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        ExecutionProfileComponentClass.PROVIDER_TARGET,
+    }
+)
 
 
 def _model_target_profile_actor() -> ResolutionActor:
     return ResolutionActor(
         subject="cayu:model-target-adoption",
+        source=ResolutionActorSource.SYSTEM,
+    )
+
+
+def _fork_group_initial_profile_actor() -> ResolutionActor:
+    return ResolutionActor(
+        subject="cayu:fork-group-initial-invocation",
         source=ResolutionActorSource.SYSTEM,
     )
 
@@ -3679,26 +3929,31 @@ class SessionEngine:
 
         return self._workflow_structured_output_handoff.take(session_id)
 
-    def _queued_dispatch_target_profile(
+    def _queued_dispatch_required_profile(
         self,
         *,
         session: Session,
         source_profile: ExecutionProfileIdentity,
-        target: ModelTarget,
+        request: DispatchRequest,
     ) -> ExecutionProfileIdentity:
-        """Resolve the governed profile for one queued model-target transition."""
+        """Resolve the governed profile for one new queued invocation."""
 
         if type(session) is not Session:
             raise TypeError("Queued dispatch profile resolution requires a Session.")
         if type(source_profile) is not ExecutionProfileIdentity:
             raise TypeError("Queued dispatch source profile has an invalid type.")
-        if type(target) is not ModelTarget:
-            raise TypeError("Queued dispatch target has an invalid type.")
+        if type(request) is not DispatchRequest:
+            raise TypeError("Queued dispatch profile resolution requires a DispatchRequest.")
+        target = request.target or ModelTarget(
+            provider_name=session.provider_name,
+            model=session.model,
+        )
         registered_agent = self._get_registered_agent(session.agent_name)
         registered_provider = self._get_registered_provider(target.provider_name)
         candidate = _execution_profile_identity(
             registered_agent=registered_agent,
             provider_name=registered_provider.name,
+            registered_provider=registered_provider,
             model=target.model,
             durable_system_prompt=None,
             redactor=self._secret_redactor,
@@ -3711,6 +3966,18 @@ class SessionEngine:
             loop_policy_execution_profile_identities=(
                 self._loop_policy_execution_profile_identities
             ),
+            request_loop_policies=request.loop_policies,
+            request_loop_policy_instance_identities=(
+                self._request_loop_policy_instance_identities(request.loop_policies)
+            ),
+            budget_policy=self._get_budget_policy(),
+            request_budget_limits=request.budget_limits,
+            causal_budget_id=session.causal_budget_id,
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            retry_policy=self._effective_retry_policy(request.retry_policy),
         )
         candidate = execution_profile_with_component(
             candidate,
@@ -3731,6 +3998,14 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        budget_policy: BudgetPolicy | None = None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+        structured_output: StructuredOutputSpec | None = None,
+        thinking: ThinkingConfig | None = None,
+        max_steps: int = 16,
+        limits: RunLimits | None = None,
+        retry_policy: RetryPolicy | None = None,
+        invocation_semantics_available: bool = False,
         frozen_candidate_profile: ExecutionProfileIdentity | None = None,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
@@ -3745,6 +4020,31 @@ class SessionEngine:
             if active_model_completion is None
             else model_completion_recovery_context_from_stage(active_model_completion.stage)
         )
+        provider_options, provider_options_process_local = _execution_profile_provider_options(
+            registered_agent.spec.provider_options,
+            provider=registered_provider.provider,
+            model=session.model,
+            process_identity=self._execution_profile_process_identity,
+        )
+        effective_thinking = thinking if thinking is not None else registered_agent.spec.thinking
+        app_limit_ids = tuple(
+            limit.budget_limit_id
+            for limit in budget_limits_for_session(
+                policy=budget_policy,
+                agent_name=registered_agent.spec.name,
+                causal_budget_id=session.causal_budget_id,
+            )
+        )
+        request_limit_ids: tuple[str, ...] = ()
+        if invocation_semantics_available:
+            request_limit_ids = tuple(
+                limit.budget_limit_id
+                for limit in request_budget_limits_for_session(
+                    limits=request_budget_limits,
+                    agent_name=registered_agent.spec.name,
+                    causal_budget_id=session.causal_budget_id,
+                )
+            )
         plan = execution_profile_admission.prepare_execution_profile_continuation(
             session=session,
             checkpoint=checkpoint,
@@ -3790,6 +4090,21 @@ class SessionEngine:
                 ),
             ),
             frozen_candidate_profile=frozen_candidate_profile,
+            provider_options=provider_options,
+            provider_options_process_local=provider_options_process_local,
+            thinking=(
+                None if effective_thinking is None else thinking_config_payload(effective_thinking)
+            ),
+            app_budget_limit_ids=app_limit_ids,
+            request_budget_limit_ids=request_limit_ids,
+            structured_output=_execution_profile_structured_output(structured_output),
+            finalization={
+                "kind": "cayu:model-finalization:v1",
+                "max_steps": max_steps,
+                "limits": copy_run_limits(limits).model_dump(mode="json"),
+                "retry_policy": copy_retry_policy(retry_policy).model_dump(mode="json"),
+            },
+            invocation_semantics_available=invocation_semantics_available,
         )
         snapshot = plan.snapshot
         candidate = plan.candidate_profile
@@ -3867,6 +4182,7 @@ class SessionEngine:
         target_changed: bool,
         target_provider_name: str,
         target_model: str,
+        built_in_model_target_transition: bool = False,
         decision_session: Session | None = None,
         source_provider_name: str | None = None,
         source_model: str | None = None,
@@ -3890,8 +4206,12 @@ class SessionEngine:
                 clock=self._clock,
             )
 
-        model_target_only = target_changed and changed_component_classes == (
-            ExecutionProfileComponentClass.PROVIDER_TARGET,
+        changed_component_set = frozenset(changed_component_classes)
+        model_target_only = (
+            target_changed
+            and built_in_model_target_transition
+            and ExecutionProfileComponentClass.PROVIDER_TARGET in changed_component_set
+            and changed_component_set <= _MODEL_TARGET_BUILT_IN_COMPONENTS
         )
         built_in_model_target_adoption = model_target_only and not force_authority_review
         fallback_actor = _model_target_profile_actor() if built_in_model_target_adoption else None
@@ -3906,7 +4226,11 @@ class SessionEngine:
             else _DEFAULT_PROFILE_POLICY_ID
         )
         policy_reason = fallback_reason
-        authority_decision = ExecutionProfileAuthorityDecision.NOT_REQUIRED
+        authority_decision = (
+            ExecutionProfileAuthorityDecision.AUTHORIZED
+            if built_in_model_target_adoption
+            else ExecutionProfileAuthorityDecision.NOT_REQUIRED
+        )
         action = (
             ExecutionProfilePolicyAction.ADOPT
             if built_in_model_target_adoption
@@ -5404,6 +5728,7 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity,
+        legacy_resolution_without_profile: bool = False,
     ) -> AsyncIterator[Event]:
         """Terminalize one explicit provider failure through normal lifecycle hooks."""
 
@@ -5415,6 +5740,12 @@ class SessionEngine:
         recovery_reason = resolution_event.payload.get("recovery_reason")
         if type(resolution_id) is not str or type(recovery_reason) is not str:
             raise ValueError("Provider-operation resolution evidence is malformed.")
+        resolution_has_profile = "execution_profile_fingerprint" in resolution_event.payload
+        resolution_profile = resolution_event.payload.get("execution_profile_fingerprint")
+        if resolution_profile != execution_profile.fingerprint and not (
+            legacy_resolution_without_profile and not resolution_has_profile
+        ):
+            raise ValueError("Provider-operation resolution belongs to another execution profile.")
         try:
             model_attempt_identity = ModelAttemptIdentity.model_validate(
                 {
@@ -5464,25 +5795,29 @@ class SessionEngine:
                 model_error_records[0].event,
                 resolution_event=resolution_event,
                 outcome="model_error",
+                expected_execution_profile_fingerprint=execution_profile.fingerprint,
             )
         else:
-            model_error = _event_with_model_identity_authority(
-                Event(
-                    id=model_error_id,
-                    type=EventType.MODEL_ERROR,
-                    session_id=session.id,
-                    interaction_id=resolution_event.interaction_id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    timestamp=resolution_event.timestamp,
-                    payload={
-                        **common_payload,
-                        "error": "Provider operation was explicitly failed after recovery.",
-                        "error_type": "provider_operation_unavailable",
-                        "stage": "provider_operation_recovery",
-                    },
+            model_error = event_with_execution_profile_authority(
+                _event_with_model_identity_authority(
+                    Event(
+                        id=model_error_id,
+                        type=EventType.MODEL_ERROR,
+                        session_id=session.id,
+                        interaction_id=resolution_event.interaction_id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        timestamp=resolution_event.timestamp,
+                        payload={
+                            **common_payload,
+                            "error": "Provider operation was explicitly failed after recovery.",
+                            "error_type": "provider_operation_unavailable",
+                            "stage": "provider_operation_recovery",
+                        },
+                    ),
+                    model_attempt_identity,
                 ),
-                model_attempt_identity,
+                execution_profile,
             )
             yield await self._event_writer.emit(model_error)
 
@@ -5505,6 +5840,7 @@ class SessionEngine:
                 interaction_failed_records[0].event,
                 resolution_event=resolution_event,
                 outcome="interaction_failed",
+                expected_execution_profile_fingerprint=execution_profile.fingerprint,
             )
             if transitioned_session.status is not SessionStatus.FAILED:
                 raise ProviderOperationEvidenceError(
@@ -5552,6 +5888,7 @@ class SessionEngine:
                 terminal_records[0].event,
                 resolution_event=resolution_event,
                 outcome="session_failed",
+                expected_execution_profile_fingerprint=execution_profile.fingerprint,
             )
             if transitioned_session.status is not SessionStatus.FAILED:
                 raise ProviderOperationEvidenceError(
@@ -5561,18 +5898,21 @@ class SessionEngine:
             return
         try:
             async for terminal_event in self._emit_terminal_event_with_hooks(
-                event=Event(
-                    id=session_failed_id,
-                    type=EventType.SESSION_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    timestamp=resolution_event.timestamp,
-                    payload={
-                        **common_payload,
-                        "failure_type": "provider_operation_unavailable",
-                        "error": "Provider operation was explicitly failed after recovery.",
-                    },
+                event=event_with_execution_profile_authority(
+                    Event(
+                        id=session_failed_id,
+                        type=EventType.SESSION_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        timestamp=resolution_event.timestamp,
+                        payload={
+                            **common_payload,
+                            "failure_type": "provider_operation_unavailable",
+                            "error": "Provider operation was explicitly failed after recovery.",
+                        },
+                    ),
+                    execution_profile,
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
                 session=transitioned_session,
@@ -5591,6 +5931,21 @@ class SessionEngine:
             request,
             redactor=self._secret_redactor,
         )
+        if request.session_id is None:
+            request = request.model_copy(update={"session_id": str(uuid4())})
+        if request.session_id is None:
+            raise AssertionError("Run request session identity was not assigned.")
+        if request.task_id is not None and self.task_store is not None:
+            source_task = await self.task_store.load_invocation_snapshot(request.task_id)
+            if source_task is not None and source_task.session_id in {None, request.session_id}:
+                request = run_request_with_task_invocation(
+                    request,
+                    source_task,
+                )
+        # Freeze application-budget authority before any await can expose the
+        # prepared invocation. The same snapshot must govern both the durable
+        # execution profile and the model dispatch that follows it.
+        budget_policy = copy_budget_policy(self._get_budget_policy())
         registered_agent = self._get_registered_agent(request.agent_name)
         # An explicit target is exact. Otherwise the agent model and optional
         # provider pin feed the existing routing/default selection.
@@ -5640,6 +5995,7 @@ class SessionEngine:
         execution_profile = _execution_profile_identity(
             registered_agent=registered_agent,
             provider_name=registered_provider.name,
+            registered_provider=registered_provider,
             model=model,
             durable_system_prompt=rendered_system_prompt,
             redactor=self._secret_redactor,
@@ -5654,6 +6010,14 @@ class SessionEngine:
             request_loop_policy_instance_identities=(
                 self._request_loop_policy_instance_identities(request.loop_policies)
             ),
+            budget_policy=budget_policy,
+            request_budget_limits=request.budget_limits,
+            causal_budget_id=(request.causal_budget_id or request.task_id or request.session_id),
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            retry_policy=self._effective_retry_policy(request.retry_policy),
         )
         unavailable_profile_components = unavailable_execution_profile_components(execution_profile)
         if unavailable_profile_components:
@@ -5667,17 +6031,6 @@ class SessionEngine:
         _require_native_structured_output_support(
             request.structured_output, registered_provider=registered_provider
         )
-        if request.session_id is None:
-            request = request.model_copy(update={"session_id": str(uuid4())})
-        if request.session_id is None:
-            raise AssertionError("Run request session identity was not assigned.")
-        if request.task_id is not None and self.task_store is not None:
-            source_task = await self.task_store.load_invocation_snapshot(request.task_id)
-            if source_task is not None and source_task.session_id in {None, request.session_id}:
-                request = run_request_with_task_invocation(
-                    request,
-                    source_task,
-                )
         session_identity = _session_identity(
             provider_name=registered_provider.name,
             model=model,
@@ -5692,6 +6045,7 @@ class SessionEngine:
             rendered_system_prompt=rendered_system_prompt,
             prompt_contributions=tuple(prompt_contributions),
             execution_profile=execution_profile,
+            budget_policy=budget_policy,
             session_identity=session_identity,
         )
 
@@ -5705,6 +6059,7 @@ class SessionEngine:
         rendered_system_prompt = prepared.rendered_system_prompt
         prompt_contributions = list(prepared.prompt_contributions)
         execution_profile = prepared.execution_profile
+        budget_policy = prepared.budget_policy
         session_identity = prepared.session_identity
         # ``prepared`` also retains the registered provider, whose repr may contain
         # live credentials. Keep the deliberately scoped provider local below as the
@@ -6165,6 +6520,7 @@ class SessionEngine:
                 max_steps=request.max_steps,
                 limits=request.limits,
                 budget_limits=request.budget_limits,
+                budget_policy=budget_policy,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 structured_output=request.structured_output,
                 thinking=request.thinking,
@@ -6655,8 +7011,9 @@ class SessionEngine:
                 "Session transcript contains a workload secret in execution authority "
                 "and cannot be compacted."
             ) from None
+        compaction_budget_policy = copy_budget_policy(self._get_budget_policy())
         candidate_app_policy_budget_limits = budget_limits_for_session(
-            policy=self._get_budget_policy(),
+            policy=compaction_budget_policy,
             agent_name=registered_agent.spec.name,
             causal_budget_id=loaded_session.causal_budget_id,
         )
@@ -6769,6 +7126,118 @@ class SessionEngine:
                 "an unmodified built-in provider compactor so Cayu can admit every "
                 "provider dispatch before execution."
             )
+        expected_profile = (
+            None
+            if EXECUTION_PROFILE_METADATA_KEY not in loaded_session.metadata
+            else execution_profile_from_session_metadata(loaded_session.metadata)
+        )
+        try:
+            registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        except KeyError:
+            registered_provider = None
+
+        def current_compaction_profile_candidate() -> ExecutionProfileIdentity:
+            candidate = _execution_profile_identity(
+                registered_agent=registered_agent,
+                provider_name=loaded_session.provider_name,
+                registered_provider=registered_provider,
+                model=loaded_session.model,
+                durable_system_prompt=None,
+                redactor=self._secret_redactor,
+                registered_environment=registered_environment,
+                process_identity=self._execution_profile_process_identity,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                loop_policy_execution_profile_identities=(
+                    self._loop_policy_execution_profile_identities
+                ),
+                budget_policy=compaction_budget_policy,
+                request_budget_limits=request.budget_limits,
+                causal_budget_id=loaded_session.causal_budget_id,
+                limits=request.limits,
+                finalization_material={
+                    "kind": "cayu:explicit-context-compaction:v1",
+                    "reason": request.reason,
+                    "instruction_present": request.instructions is not None,
+                    "instruction_digest": _optional_text_digest(request.instructions),
+                    "limits": request.limits.model_dump(mode="json"),
+                    "provider_name": compactor_provider_name,
+                    "model": compactor_model,
+                },
+            )
+            if expected_profile is None:
+                return execution_profile_with_durable_system_projection_digest(
+                    candidate,
+                    system_prompt_messages_sha256(transcript),
+                )
+            return execution_profile_with_component(
+                candidate,
+                expected_profile.component(
+                    ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                ),
+            )
+
+        profile_candidate = current_compaction_profile_candidate()
+        governed_registration_components = (
+            ExecutionProfileComponentClass.CONTEXT_SELECTION,
+            ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+            ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+            ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        )
+        changed_registration_components = (
+            ()
+            if expected_profile is None or expected_profile.schema_version < 3
+            else tuple(
+                component
+                for component in governed_registration_components
+                if expected_profile.component(component) != profile_candidate.component(component)
+            )
+        )
+        if changed_registration_components:
+            assert expected_profile is not None
+            raise ExecutionProfileMismatchError(
+                session_id=loaded_session.id,
+                expected_profile_fingerprint=expected_profile.fingerprint,
+                candidate_profile_fingerprint=profile_candidate.fingerprint,
+                changed_component_classes=changed_registration_components,
+            )
+        if expected_profile is None or expected_profile.schema_version < 3:
+            compaction_execution_profile = profile_candidate
+        else:
+            compaction_execution_profile = expected_profile
+            for component_class in (
+                *governed_registration_components,
+                ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+                ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+                ExecutionProfileComponentClass.FINALIZATION,
+            ):
+                compaction_execution_profile = execution_profile_with_component(
+                    compaction_execution_profile,
+                    profile_candidate.component(component_class),
+                )
+
+        def validate_live_compaction_semantics() -> None:
+            candidate = current_compaction_profile_candidate()
+            changed = tuple(
+                component
+                for component in governed_registration_components
+                if candidate.component(component)
+                != compaction_execution_profile.component(component)
+            )
+            if changed:
+                raise ExecutionProfileMismatchError(
+                    session_id=loaded_session.id,
+                    expected_profile_fingerprint=compaction_execution_profile.fingerprint,
+                    candidate_profile_fingerprint=candidate.fingerprint,
+                    changed_component_classes=changed,
+                )
+
+        def governed_compaction_events(events: Iterable[Event]) -> list[Event]:
+            return [
+                event_with_execution_profile_authority(event, compaction_execution_profile)
+                for event in events
+            ]
+
         operation_started_at = time.monotonic()
 
         operation_id = str(uuid4())
@@ -6828,24 +7297,43 @@ class SessionEngine:
                     "Session compaction records disagree on logical model-step identity."
                 )
             stored_model_step_identity = candidate_identity
+            raw_profile = existing_record.get("execution_profile")
+            if type(raw_profile) is not dict:
+                raise RuntimeError(
+                    "Existing session compaction lacks its governing execution profile."
+                )
+            stored_profile = ExecutionProfileIdentity.model_validate(raw_profile)
+            if stored_profile != compaction_execution_profile:
+                raise ExecutionProfileMismatchError(
+                    session_id=loaded_session.id,
+                    expected_profile_fingerprint=stored_profile.fingerprint,
+                    candidate_profile_fingerprint=compaction_execution_profile.fingerprint,
+                    changed_component_classes=changed_execution_profile_components(
+                        stored_profile,
+                        compaction_execution_profile,
+                    ),
+                )
         model_step_identity = stored_model_step_identity or new_model_step_identity()
         reservation_identity_guard = self._run_limit_controller.reservation_identity_guard()
         started_event = self._event_writer.prepare(
-            Event(
-                type=EventType.CONTEXT_COMPACTION_STARTED,
-                session_id=loaded_session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    **_application_compaction_causal_payload(
-                        request=request,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        source_cursor=source_transcript_cursor,
-                        compactor=compactor_name,
-                    ),
-                    **model_step_identity.payload(),
-                },
+            event_with_execution_profile_authority(
+                Event(
+                    type=EventType.CONTEXT_COMPACTION_STARTED,
+                    session_id=loaded_session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        **_application_compaction_causal_payload(
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            source_cursor=source_transcript_cursor,
+                            compactor=compactor_name,
+                        ),
+                        **model_step_identity.payload(),
+                    },
+                ),
+                compaction_execution_profile,
             )
         )
         claimed_checkpoint: dict[str, Any] | None = None
@@ -6969,6 +7457,7 @@ class SessionEngine:
                 "event_ids": [started_event.id],
                 "instruction_present": request.instructions is not None,
                 "instruction_digest": _optional_text_digest(request.instructions),
+                "execution_profile": compaction_execution_profile.model_dump(mode="json"),
                 "claim_expires_at": claim_expires_at.isoformat(),
                 "created_at": claim_now.isoformat(),
                 "updated_at": claim_now.isoformat(),
@@ -7183,7 +7672,7 @@ class SessionEngine:
                 execution_identity=model_step_identity,
             )
             if attempt_events:
-                persisted_attempt_events = list(attempt_events)
+                persisted_attempt_events = governed_compaction_events(attempt_events)
                 await self._persist_compaction_attempt_events(
                     session=loaded_session,
                     request=request,
@@ -7221,6 +7710,7 @@ class SessionEngine:
                 reservations=budget_reservations,
                 events=attempt_events,
                 reservation_identity_guard=reservation_identity_guard,
+                execution_profile_fingerprint=compaction_execution_profile.fingerprint,
             )
             reservation_error: RuntimeError | None = None
             if reservation_failure is not None:
@@ -7242,7 +7732,7 @@ class SessionEngine:
                     f"Compaction budget reservation failed: {reservation_failure.message}"
                 )
             if attempt_events:
-                persisted_attempt_events = list(attempt_events)
+                persisted_attempt_events = governed_compaction_events(attempt_events)
                 await self._persist_compaction_attempt_events(
                     session=loaded_session,
                     request=request,
@@ -7268,7 +7758,7 @@ class SessionEngine:
             async def publish_dispatch_budget_events() -> None:
                 if not attempt_events:
                     return
-                events = list(attempt_events)
+                events = governed_compaction_events(attempt_events)
                 await self._persist_compaction_attempt_events(
                     session=loaded_session,
                     request=request,
@@ -7315,47 +7805,54 @@ class SessionEngine:
                         config=self._request_footprint,
                         operation_id=operation_id,
                         operation_attempt_id=attempt_id,
+                        execution_profile_fingerprint=(compaction_execution_profile.fingerprint),
                     )
                     attempt_events.append(
-                        event_with_runtime_payload_authority(
-                            Event(
-                                type=EventType.REQUEST_FOOTPRINT_RECORDED,
-                                session_id=loaded_session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                payload=footprint.model_dump(mode="json", exclude_none=True),
+                        event_with_execution_profile_authority(
+                            event_with_runtime_payload_authority(
+                                Event(
+                                    type=EventType.REQUEST_FOOTPRINT_RECORDED,
+                                    session_id=loaded_session.id,
+                                    agent_name=registered_agent.spec.name,
+                                    environment_name=environment_name,
+                                    payload=footprint.model_dump(mode="json", exclude_none=True),
+                                ),
+                                "observation_id",
+                                "model_step_id",
+                                "model_attempt_id",
+                                "operation_id",
+                                "attempt_id",
                             ),
-                            "observation_id",
+                            compaction_execution_profile,
+                        )
+                    )
+                attempt_events.append(
+                    event_with_execution_profile_authority(
+                        event_with_runtime_payload_authority(
+                            _application_compaction_ledger_event(
+                                event_type=EventType.MODEL_STARTED,
+                                payload={
+                                    "model": detached_request.model,
+                                    "provider": provider_name,
+                                    "attempt": dispatch_attempt,
+                                    "max_attempts": max_dispatch_attempts,
+                                    "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                                    **model_attempt_identity.payload(),
+                                },
+                                request=request,
+                                operation_id=operation_id,
+                                attempt_id=attempt_id,
+                                session=loaded_session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                compactor=compactor_name,
+                            ),
                             "model_step_id",
                             "model_attempt_id",
                             "operation_id",
                             "attempt_id",
-                        )
-                    )
-                attempt_events.append(
-                    event_with_runtime_payload_authority(
-                        _application_compaction_ledger_event(
-                            event_type=EventType.MODEL_STARTED,
-                            payload={
-                                "model": detached_request.model,
-                                "provider": provider_name,
-                                "attempt": dispatch_attempt,
-                                "max_attempts": max_dispatch_attempts,
-                                "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
-                                **model_attempt_identity.payload(),
-                            },
-                            request=request,
-                            operation_id=operation_id,
-                            attempt_id=attempt_id,
-                            session=loaded_session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                            compactor=compactor_name,
                         ),
-                        "model_step_id",
-                        "model_attempt_id",
-                        "operation_id",
-                        "attempt_id",
+                        compaction_execution_profile,
                     )
                 )
                 await publish_dispatch_budget_events()
@@ -7458,16 +7955,19 @@ class SessionEngine:
                             "model_attempt_id": identified_payload.get("model_attempt_id"),
                         }
                     )
-                return _application_compaction_event(
-                    telemetry=telemetry,
-                    request=request,
-                    operation_id=operation_id,
-                    attempt_id=attempt_id,
-                    session=loaded_session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    compactor=compactor_name,
-                    execution_identity=execution_identity,
+                return event_with_execution_profile_authority(
+                    _application_compaction_event(
+                        telemetry=telemetry,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        compactor=compactor_name,
+                        execution_identity=execution_identity,
+                    ),
+                    compaction_execution_profile,
                 )
 
             def dispatch_completion_event(
@@ -7503,12 +8003,15 @@ class SessionEngine:
                 durable_payload.update(
                     copy_model_attempt_identity(model_attempt_identity).payload()
                 )
-                return Event(
-                    type=EventType.MODEL_COMPLETED,
-                    session_id=loaded_session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=durable_payload,
+                return event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=loaded_session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=durable_payload,
+                    ),
+                    compaction_execution_profile,
                 )
 
             async def publish_compaction_completions(
@@ -7552,7 +8055,9 @@ class SessionEngine:
                 if not pending and not deferred_dispatch_settlement_events:
                     return
 
-                completion_events = [event for _attempt_id, event in pending]
+                completion_events = governed_compaction_events(
+                    event for _attempt_id, event in pending
+                )
                 completion_event_attempt_ids.update(
                     (event.id, compaction_attempt_id) for compaction_attempt_id, event in pending
                 )
@@ -7690,6 +8195,7 @@ class SessionEngine:
                 model_attempt_identity: ModelAttemptIdentity,
             ) -> tuple[str, dict[str, Any]]:
                 model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+                validate_live_compaction_semantics()
                 actual_pricing_provider_name = _require_application_compaction_event_text(
                     actual_pricing_provider_name,
                     "compactor_provider_name",
@@ -7762,6 +8268,7 @@ class SessionEngine:
                     events=attempt_events,
                     billing_identity=billing_identity,
                     reservation_identity_guard=reservation_identity_guard,
+                    execution_profile_fingerprint=(compaction_execution_profile.fingerprint),
                 )
                 dispatch_reservations = budget_reservations[reservation_start:]
                 if reservation_failure is not None:
@@ -7788,6 +8295,7 @@ class SessionEngine:
 
                 async def tracked_dispatch() -> tuple[str, dict[str, Any]]:
                     nonlocal provider_dispatch_started
+                    validate_live_compaction_semantics()
                     await record_compaction_footprint(
                         provider=provider,
                         provider_name=actual_provider_name,
@@ -7796,15 +8304,18 @@ class SessionEngine:
                         max_dispatch_attempts=max_dispatch_attempts,
                         model_attempt_identity=model_attempt_identity,
                     )
+                    validate_live_compaction_semantics()
                     deferred_dispatch_failure = (
                         await self._run_limit_controller.mark_reservations_dispatched(
                             dispatch_reservations,
                             dispatch_id=model_attempt_identity.model_attempt_id,
                         )
                     )
-                    provider_dispatch_started = True
                     if deferred_dispatch_failure is not None:
+                        provider_dispatch_started = True
                         raise deferred_dispatch_failure
+                    validate_live_compaction_semantics()
+                    provider_dispatch_started = True
                     with _compaction_model_attempt_identity_scope(model_attempt_identity):
                         return await dispatch()
 
@@ -7991,6 +8502,7 @@ class SessionEngine:
                 dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
             ) -> tuple[str, dict[str, Any]]:
                 nonlocal active_compaction_model_attempt_identity
+                validate_live_compaction_semantics()
                 if active_compaction_model_attempt_identity is not None:
                     raise RuntimeError("Compaction provider dispatches cannot overlap.")
                 model_attempt_identity = model_step_identity.new_attempt()
@@ -8040,6 +8552,7 @@ class SessionEngine:
                     billing_identity,
                 )
                 nonlocal active_compaction_model_attempt_identity
+                validate_live_compaction_semantics()
                 if has_compaction_accounting_limits:
                     raise RuntimeError(
                         "Explicit compaction declared deterministic execution but "
@@ -8061,6 +8574,7 @@ class SessionEngine:
                         max_dispatch_attempts=max_dispatch_attempts,
                         model_attempt_identity=model_attempt_identity,
                     )
+                    validate_live_compaction_semantics()
                     with _compaction_model_attempt_identity_scope(model_attempt_identity):
                         return await dispatch()
                 finally:
@@ -8258,15 +8772,17 @@ class SessionEngine:
             )
             published_events = self._event_writer.prepare_many(
                 attribute_events_to_current_interaction(
-                    [
-                        *attempt_events,
-                        *[
-                            event
-                            for event in telemetry_events
-                            if event.type != EventType.MODEL_COMPLETED
-                        ],
-                        checkpoint_event,
-                    ]
+                    governed_compaction_events(
+                        [
+                            *attempt_events,
+                            *[
+                                event
+                                for event in telemetry_events
+                                if event.type != EventType.MODEL_COMPLETED
+                            ],
+                            checkpoint_event,
+                        ]
+                    )
                 )
             )
             event_ids = [started_event.id, *[event.id for event in published_events]]
@@ -8637,7 +9153,7 @@ class SessionEngine:
                     event for event in attempt_events if event.id not in persisted_attempt_event_ids
                 ]
                 failed_events = self._event_writer.prepare_many(
-                    [*unpublished_attempt_events, failed_event]
+                    governed_compaction_events([*unpublished_attempt_events, failed_event])
                 )
                 failed_terminal_claim_expires_at: datetime | None = None
 
@@ -8844,7 +9360,7 @@ class SessionEngine:
                 ]
                 failed_events = self._event_writer.prepare_many(
                     attribute_events_to_current_interaction(
-                        [*unpublished_attempt_events, failed_event]
+                        governed_compaction_events([*unpublished_attempt_events, failed_event])
                     )
                 )
                 failed_terminal_claim_expires_at: datetime | None = None
@@ -9813,6 +10329,7 @@ class SessionEngine:
         events: list[Event],
         reservation_identity_guard: BudgetReservationIdentityGuard,
         billing_identity: BillingIdentity | None = None,
+        execution_profile_fingerprint: str | None = None,
     ) -> BudgetReservationResult | None:
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         setup = await self._run_limit_controller.reserve_operation_budgets(
@@ -9839,6 +10356,7 @@ class SessionEngine:
                 )
             ).payload,
             billing_identity=billing_identity,
+            execution_profile_fingerprint=execution_profile_fingerprint,
             reservation_identity_guard=reservation_identity_guard,
             rejection_release_reason="compaction budget reservation failed",
             accepted_record_error="Accepted compaction budget reservation has no record.",
@@ -10328,6 +10846,10 @@ class SessionEngine:
         terminal_event_id: str | None = None,
         queue_task_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
+        # Resume profile admission and the resumed dispatch must observe one
+        # application-budget snapshot even if the app configuration is changed
+        # while the interaction-start event is being consumed.
+        budget_policy = copy_budget_policy(self._get_budget_policy())
         if (source_execution_profile is None) != (required_execution_profile is None):
             raise ValueError(
                 "Queued execution-profile authority requires both source and required profiles."
@@ -10439,6 +10961,7 @@ class SessionEngine:
             replay_candidate_profile = _execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=registered_provider.name,
+                registered_provider=registered_provider,
                 model=(
                     requested_target.model
                     if target_changed and requested_target is not None
@@ -10457,6 +10980,14 @@ class SessionEngine:
                 request_loop_policy_instance_identities=(
                     self._request_loop_policy_instance_identities(request.loop_policies)
                 ),
+                budget_policy=budget_policy,
+                request_budget_limits=request.budget_limits,
+                causal_budget_id=loaded_session.causal_budget_id,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
             )
             replay_candidate_profile = execution_profile_with_component(
                 replay_candidate_profile,
@@ -10659,6 +11190,14 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
                     request_loop_policies=request.loop_policies,
+                    budget_policy=budget_policy,
+                    request_budget_limits=request.budget_limits,
+                    structured_output=request.structured_output,
+                    thinking=request.thinking,
+                    max_steps=request.max_steps,
+                    limits=request.limits,
+                    retry_policy=self._effective_retry_policy(request.retry_policy),
+                    invocation_semantics_available=True,
                 )
             )
             pending_model_completion = (
@@ -10705,6 +11244,7 @@ class SessionEngine:
             candidate_execution_profile = _execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=registered_provider.name,
+                registered_provider=registered_provider,
                 model=(
                     requested_target.model
                     if target_changed and requested_target is not None
@@ -10723,6 +11263,14 @@ class SessionEngine:
                 request_loop_policy_instance_identities=(
                     self._request_loop_policy_instance_identities(request.loop_policies)
                 ),
+                budget_policy=budget_policy,
+                request_budget_limits=request.budget_limits,
+                causal_budget_id=loaded_session.causal_budget_id,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
             )
             if legacy_unprofiled_fork:
                 fork_transcript = await self.session_store.load_transcript(loaded_session.id)
@@ -10747,6 +11295,51 @@ class SessionEngine:
                         ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
                     ),
                 )
+                built_in_model_target_transition = False
+                if target_changed:
+                    try:
+                        source_registered_provider = self._get_registered_provider(
+                            loaded_session.provider_name
+                        )
+                    except (KeyError, ValueError):
+                        source_registered_provider = None
+                    if source_registered_provider is not None:
+                        source_registration_profile = _execution_profile_identity(
+                            registered_agent=registered_agent,
+                            provider_name=source_registered_provider.name,
+                            registered_provider=source_registered_provider,
+                            model=loaded_session.model,
+                            durable_system_prompt=None,
+                            redactor=self._secret_redactor,
+                            registered_environment=registered_environment,
+                            process_identity=self._execution_profile_process_identity,
+                            runtime_hooks=self._runtime_hooks,
+                            loop_policies=self._loop_policies,
+                            loop_policy_execution_profile_identities=(
+                                self._loop_policy_execution_profile_identities
+                            ),
+                            request_loop_policies=request.loop_policies,
+                            request_loop_policy_instance_identities=(
+                                self._request_loop_policy_instance_identities(request.loop_policies)
+                            ),
+                            budget_policy=budget_policy,
+                            request_budget_limits=request.budget_limits,
+                            causal_budget_id=loaded_session.causal_budget_id,
+                            structured_output=request.structured_output,
+                            thinking=request.thinking,
+                            max_steps=request.max_steps,
+                            limits=request.limits,
+                            retry_policy=self._effective_retry_policy(request.retry_policy),
+                        )
+                        source_registration_profile = execution_profile_with_component(
+                            source_registration_profile,
+                            expected_execution_profile.component(
+                                ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                            ),
+                        )
+                        built_in_model_target_transition = (
+                            source_registration_profile == expected_execution_profile
+                        )
                 if required_execution_profile is not None:
                     assert source_execution_profile is not None
                     if target_changed and expected_execution_profile != source_execution_profile:
@@ -10774,21 +11367,53 @@ class SessionEngine:
                     expected_execution_profile,
                     candidate_execution_profile,
                 )
-                execution_profile_decision = await self._classify_execution_profile(
-                    session=loaded_session,
-                    expected_profile=expected_execution_profile,
-                    candidate_profile=candidate_execution_profile,
-                    changed_component_classes=changed_profile_components,
-                    intent=request.profile_adoption,
-                    adoption_request_fingerprint=adoption_request_fingerprint,
-                    target_changed=target_changed,
-                    target_provider_name=registered_provider.name,
-                    target_model=(
-                        requested_target.model
-                        if target_changed and requested_target is not None
-                        else loaded_session.model
-                    ),
+                fork_relationship = session_fork_profile_relationship(loaded_session)
+                exact_fork_group_initial_invocation = (
+                    loaded_session.run_epoch == 0
+                    and request.profile_adoption is None
+                    and fork_relationship is not None
+                    and fork_relationship.initial_invocation_request_sha256
+                    == _fork_group_initial_invocation_request_sha256(request)
+                    and fork_relationship.initial_invocation_profile == candidate_execution_profile
                 )
+                if exact_fork_group_initial_invocation and changed_profile_components:
+                    execution_profile_decision = _execution_profile_decision_event(
+                        session=loaded_session,
+                        expected_profile=expected_execution_profile,
+                        candidate_profile=candidate_execution_profile,
+                        changed_component_classes=changed_profile_components,
+                        kind=ExecutionProfileDecisionKind.ADOPTED,
+                        policy_identity=_FORK_GROUP_INITIAL_PROFILE_POLICY_ID,
+                        policy_reason=(
+                            "The exact invocation was frozen with the durable fork-group "
+                            "branch before child creation."
+                        ),
+                        authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                        intent=None,
+                        adoption_request_fingerprint=None,
+                        fallback_actor=_fork_group_initial_profile_actor(),
+                        fallback_reason=(
+                            "Apply the runtime-owned initial fork-group branch invocation."
+                        ),
+                        clock=self._clock,
+                    )
+                else:
+                    execution_profile_decision = await self._classify_execution_profile(
+                        session=loaded_session,
+                        expected_profile=expected_execution_profile,
+                        candidate_profile=candidate_execution_profile,
+                        changed_component_classes=changed_profile_components,
+                        intent=request.profile_adoption,
+                        adoption_request_fingerprint=adoption_request_fingerprint,
+                        target_changed=target_changed,
+                        target_provider_name=registered_provider.name,
+                        target_model=(
+                            requested_target.model
+                            if target_changed and requested_target is not None
+                            else loaded_session.model
+                        ),
+                        built_in_model_target_transition=(built_in_model_target_transition),
+                    )
                 if execution_profile_decision.kind in {
                     ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
                     ExecutionProfileDecisionKind.REJECTED,
@@ -10828,6 +11453,14 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
                     request_loop_policies=request.loop_policies,
+                    budget_policy=budget_policy,
+                    request_budget_limits=request.budget_limits,
+                    structured_output=request.structured_output,
+                    thinking=request.thinking,
+                    max_steps=request.max_steps,
+                    limits=request.limits,
+                    retry_policy=self._effective_retry_policy(request.retry_policy),
+                    invocation_semantics_available=True,
                     frozen_candidate_profile=(
                         None
                         if continuing_execution_profile_snapshot is None
@@ -11337,6 +11970,7 @@ class SessionEngine:
             max_steps=request.max_steps,
             limits=request.limits,
             budget_limits=request.budget_limits,
+            budget_policy=budget_policy,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             structured_output=request.structured_output,
             thinking=request.thinking,
@@ -11610,12 +12244,19 @@ class SessionEngine:
             environment_lifecycle=self._environment_lifecycle,
         )
 
-        selected_execution_profile = source_execution_profile
-        execution_profile_decision: ExecutionProfileDecision | None = None
-        if request.execution_profile_selection is ForkExecutionProfileSelection.CURRENT_CHILD:
-            candidate_execution_profile = _execution_profile_identity(
+        initial_invocation = request._fork_group_initial_invocation
+        if initial_invocation is not None and (
+            initial_invocation.request.session_id != destination_session_id
+            or _fork_group_initial_invocation_request_sha256(initial_invocation.request)
+            != initial_invocation.request_sha256
+        ):
+            raise RuntimeError("Fork-group initial invocation authority is inconsistent.")
+
+        def current_child_execution_profile() -> ExecutionProfileIdentity:
+            candidate = _execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=registered_provider.name,
+                registered_provider=registered_provider,
                 model=model,
                 durable_system_prompt=prompt_workflow.rendered_child_prompt,
                 redactor=self._secret_redactor,
@@ -11626,17 +12267,56 @@ class SessionEngine:
                 loop_policy_execution_profile_identities=(
                     self._loop_policy_execution_profile_identities
                 ),
+                request_loop_policies=(
+                    () if initial_invocation is None else initial_invocation.request.loop_policies
+                ),
+                request_loop_policy_instance_identities=(
+                    ()
+                    if initial_invocation is None
+                    else self._request_loop_policy_instance_identities(
+                        initial_invocation.request.loop_policies
+                    )
+                ),
+                budget_policy=self._get_budget_policy(),
+                request_budget_limits=(
+                    () if initial_invocation is None else initial_invocation.request.budget_limits
+                ),
+                causal_budget_id=source_session.causal_budget_id,
+                structured_output=(
+                    None
+                    if initial_invocation is None
+                    else initial_invocation.request.structured_output
+                ),
+                thinking=(
+                    None if initial_invocation is None else initial_invocation.request.thinking
+                ),
+                max_steps=(
+                    16 if initial_invocation is None else initial_invocation.request.max_steps
+                ),
+                limits=(None if initial_invocation is None else initial_invocation.request.limits),
+                retry_policy=(
+                    None
+                    if initial_invocation is None
+                    else self._effective_retry_policy(initial_invocation.request.retry_policy)
+                ),
             )
             if (
                 prompt_workflow.rendered_child_prompt is None
                 and request.system_prompt_policy is ForkSystemPromptPolicy.INHERIT_SOURCE
             ):
-                candidate_execution_profile = execution_profile_with_component(
-                    candidate_execution_profile,
+                candidate = execution_profile_with_component(
+                    candidate,
                     source_execution_profile.component(
                         ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
                     ),
                 )
+            return candidate
+
+        initial_invocation_profile: ExecutionProfileIdentity | None = None
+        selected_execution_profile = source_execution_profile
+        execution_profile_decision: ExecutionProfileDecision | None = None
+        if request.execution_profile_selection is ForkExecutionProfileSelection.CURRENT_CHILD:
+            candidate_execution_profile = current_child_execution_profile()
             unavailable_child_components = unavailable_execution_profile_components(
                 candidate_execution_profile
             )
@@ -11696,6 +12376,41 @@ class SessionEngine:
                     changed_component_classes=changed_profile_components,
                 )
             selected_execution_profile = candidate_execution_profile
+            initial_invocation_profile = (
+                None if initial_invocation is None else candidate_execution_profile
+            )
+        elif initial_invocation is not None:
+            candidate_execution_profile = current_child_execution_profile()
+            changed_profile_components = changed_execution_profile_components(
+                source_execution_profile,
+                candidate_execution_profile,
+            )
+            allowed_initial_changes = {
+                ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+                ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+                ExecutionProfileComponentClass.FINALIZATION,
+            }
+            unsupported_changes = tuple(
+                component
+                for component in changed_profile_components
+                if component not in allowed_initial_changes
+            )
+            if unsupported_changes:
+                raise RuntimeError(
+                    "An inherited fork-group branch changed execution authority outside its "
+                    "declared initial budget, structured-output, or finalization semantics: "
+                    + ", ".join(component.value for component in unsupported_changes)
+                    + ". Use an explicitly authorized current-child branch."
+                )
+            unavailable_child_components = unavailable_execution_profile_components(
+                candidate_execution_profile
+            )
+            if unavailable_child_components:
+                raise RuntimeError(
+                    "Fork-group initial invocation has unavailable required components: "
+                    + ", ".join(component.value for component in unavailable_child_components)
+                )
+            initial_invocation_profile = candidate_execution_profile
 
         if (
             prompt_workflow.prompt_replacement is not None
@@ -12120,6 +12835,17 @@ class SessionEngine:
                 ),
             ).model_dump(mode="json"),
         }
+        if initial_invocation is not None:
+            if initial_invocation_profile is None:
+                raise AssertionError("Fork-group initial invocation lost its frozen profile.")
+            fork_event_payload.update(
+                {
+                    "initial_invocation_request_sha256": (initial_invocation.request_sha256),
+                    "initial_invocation_profile_fingerprint": (
+                        initial_invocation_profile.fingerprint
+                    ),
+                }
+            )
         ordinary_fork_event = event_with_runtime_generated_id(
             Event(
                 id=(
@@ -12195,6 +12921,10 @@ class SessionEngine:
             system_prompt_policy=request.system_prompt_policy,
             selection=request.execution_profile_selection,
             selected_profile=selected_execution_profile,
+            initial_invocation_request_sha256=(
+                None if initial_invocation is None else initial_invocation.request_sha256
+            ),
+            initial_invocation_profile=initial_invocation_profile,
             decision=decision_record,
             fork_event_id=fork_event.id,
         )
@@ -12757,6 +13487,7 @@ class SessionEngine:
         max_steps: int,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
+        budget_policy: BudgetPolicy | None,
         retry_policy: RetryPolicy,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
@@ -12901,6 +13632,7 @@ class SessionEngine:
         # not force per-delta store polling for the whole resumed run.
         self._session_control.discard_interrupt_signal(session.id)
         limits = copy_run_limits(limits)
+        budget_policy = copy_budget_policy(budget_policy)
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
             agent_name=registered_agent.spec.name,
@@ -13288,6 +14020,9 @@ class SessionEngine:
                 pricing_provider_name=(
                     registered_provider.provider.billing_provider_name or registered_provider.name
                 ),
+                execution_profile_fingerprint=(
+                    None if execution_profile is None else execution_profile.fingerprint
+                ),
             )
             tool_round_runner = self._tool_round_executor.create_run(
                 session=session,
@@ -13393,6 +14128,69 @@ class SessionEngine:
                     run_limit_accounting=run_limit_accounting,
                 )
 
+            live_model_semantic_components = (
+                ExecutionProfileComponentClass.CONTEXT_SELECTION,
+                ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+                ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+                ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+                ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+            )
+            request_loop_policy_instance_identities = self._request_loop_policy_instance_identities(
+                request_loop_policies
+            )
+
+            def validate_live_model_semantics() -> None:
+                """Fail before mutable registered model semantics can drift."""
+
+                if execution_profile is None:
+                    return
+                candidate = _execution_profile_identity(
+                    registered_agent=registered_agent,
+                    provider_name=registered_provider.name,
+                    registered_provider=registered_provider,
+                    model=session.model,
+                    durable_system_prompt=None,
+                    redactor=self._secret_redactor,
+                    registered_environment=registered_environment,
+                    process_identity=self._execution_profile_process_identity,
+                    runtime_hooks=self._runtime_hooks,
+                    loop_policies=self._loop_policies,
+                    loop_policy_execution_profile_identities=(
+                        self._loop_policy_execution_profile_identities
+                    ),
+                    request_loop_policies=request_loop_policies,
+                    request_loop_policy_instance_identities=(
+                        request_loop_policy_instance_identities
+                    ),
+                    budget_policy=budget_policy,
+                    request_budget_limits=budget_limits,
+                    causal_budget_id=session.causal_budget_id,
+                    structured_output=structured_output,
+                    thinking=effective_thinking,
+                    max_steps=max_steps,
+                    limits=limits,
+                    retry_policy=retry_policy,
+                )
+                candidate = execution_profile_with_component(
+                    candidate,
+                    execution_profile.component(
+                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                    ),
+                )
+                changed = tuple(
+                    component_class
+                    for component_class in live_model_semantic_components
+                    if candidate.component(component_class)
+                    != execution_profile.component(component_class)
+                )
+                if changed:
+                    raise ExecutionProfileMismatchError(
+                        session_id=session.id,
+                        expected_profile_fingerprint=execution_profile.fingerprint,
+                        candidate_profile_fingerprint=candidate.fingerprint,
+                        changed_component_classes=changed,
+                    )
+
             model_step_run = self._model_step_executor.create_run(
                 provider=provider,
                 session=session,
@@ -13408,11 +14206,12 @@ class SessionEngine:
                 retry_policy=retry_policy,
                 request_budget_limits=budget_limits,
                 limit_gate=limit_gate,
-                budget_policy=self._get_budget_policy(),
+                budget_policy=budget_policy,
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
                 execution_profile=execution_profile,
+                validate_live_model_semantics=validate_live_model_semantics,
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )
@@ -13452,7 +14251,7 @@ class SessionEngine:
                     session.id
                 )
                 budget_evaluation = await limit_gate.evaluate_budget(
-                    self._get_budget_policy(),
+                    budget_policy,
                     execution_identity=model_step_identity,
                 )
                 async for event in self._apply_budget_evaluation(
@@ -13630,7 +14429,7 @@ class SessionEngine:
                     return
 
                 budget_evaluation = await limit_gate.evaluate_budget(
-                    self._get_budget_policy(),
+                    budget_policy,
                     execution_identity=completed_model_attempt_identity,
                 )
                 async for event in self._apply_budget_evaluation(
@@ -13712,12 +14511,15 @@ class SessionEngine:
                             ),
                         )
                         terminal_event = await self._event_writer.emit(
-                            _structured_output_tool_terminal_event(
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                                tool_round_identity=tool_round_identity,
-                                outcome=outcome,
+                            event_with_execution_profile_authority(
+                                _structured_output_tool_terminal_event(
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    environment_name=environment_name,
+                                    tool_round_identity=tool_round_identity,
+                                    outcome=outcome,
+                                ),
+                                execution_profile,
                             )
                         )
                         terminal_events.append(terminal_event)
@@ -13769,7 +14571,12 @@ class SessionEngine:
                                 tool_round_identity=tool_round_identity,
                             )
                         )
-                    auxiliary_events = self._event_writer.prepare_many(auxiliary_events)
+                    auxiliary_events = self._event_writer.prepare_many(
+                        [
+                            event_with_execution_profile_authority(event, execution_profile)
+                            for event in auxiliary_events
+                        ]
+                    )
 
                     source_checkpoint = await self.session_store.load_checkpoint(session.id)
                     durable_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
@@ -13891,14 +14698,17 @@ class SessionEngine:
                     close_new_pending_round_on_interrupt = False
                     if structured_output is not None:
                         yield await self._event_writer.emit(
-                            _structured_output_validating_event(
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                                spec=structured_output,
-                                step=step,
-                                attempt=structured_output_retries + 1,
-                                execution_identity=completed_model_attempt_identity,
+                            event_with_execution_profile_authority(
+                                _structured_output_validating_event(
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    environment_name=environment_name,
+                                    spec=structured_output,
+                                    step=step,
+                                    attempt=structured_output_retries + 1,
+                                    execution_identity=completed_model_attempt_identity,
+                                ),
+                                execution_profile,
                             )
                         )
                         if structured_output.strategy == StructuredOutputStrategy.NATIVE:
@@ -13917,17 +14727,20 @@ class SessionEngine:
                                     validation.output,
                                 )
                                 yield await self._event_writer.emit(
-                                    _structured_output_event(
-                                        event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
-                                        session=session,
-                                        registered_agent=registered_agent,
-                                        environment_name=environment_name,
-                                        spec=structured_output,
-                                        validation=validation,
-                                        step=step,
-                                        attempt=structured_output_retries + 1,
-                                        execution_identity=completed_model_attempt_identity,
-                                        redactor=self._secret_redactor,
+                                    event_with_execution_profile_authority(
+                                        _structured_output_event(
+                                            event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
+                                            session=session,
+                                            registered_agent=registered_agent,
+                                            environment_name=environment_name,
+                                            spec=structured_output,
+                                            validation=validation,
+                                            step=step,
+                                            attempt=structured_output_retries + 1,
+                                            execution_identity=completed_model_attempt_identity,
+                                            redactor=self._secret_redactor,
+                                        ),
+                                        execution_profile,
                                     )
                                 )
                                 (
@@ -13967,17 +14780,20 @@ class SessionEngine:
                         else:
                             validation = structured_output_tool_required_validation()
                         yield await self._event_writer.emit(
-                            _structured_output_event(
-                                event_type=EventType.STRUCTURED_OUTPUT_FAILED,
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                                spec=structured_output,
-                                validation=validation,
-                                step=step,
-                                attempt=structured_output_retries + 1,
-                                execution_identity=completed_model_attempt_identity,
-                                redactor=self._secret_redactor,
+                            event_with_execution_profile_authority(
+                                _structured_output_event(
+                                    event_type=EventType.STRUCTURED_OUTPUT_FAILED,
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    environment_name=environment_name,
+                                    spec=structured_output,
+                                    validation=validation,
+                                    step=step,
+                                    attempt=structured_output_retries + 1,
+                                    execution_identity=completed_model_attempt_identity,
+                                    redactor=self._secret_redactor,
+                                ),
+                                execution_profile,
                             )
                         )
                         if structured_output_retries >= structured_output.max_retries:
@@ -14018,17 +14834,20 @@ class SessionEngine:
                             )
                         )
                         yield await self._event_writer.emit(
-                            _structured_output_event(
-                                event_type=EventType.STRUCTURED_OUTPUT_RETRY,
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                                spec=structured_output,
-                                validation=validation,
-                                step=step,
-                                attempt=structured_output_retries,
-                                execution_identity=completed_model_attempt_identity,
-                                redactor=self._secret_redactor,
+                            event_with_execution_profile_authority(
+                                _structured_output_event(
+                                    event_type=EventType.STRUCTURED_OUTPUT_RETRY,
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    environment_name=environment_name,
+                                    spec=structured_output,
+                                    validation=validation,
+                                    step=step,
+                                    attempt=structured_output_retries,
+                                    execution_identity=completed_model_attempt_identity,
+                                    redactor=self._secret_redactor,
+                                ),
+                                execution_profile,
                             )
                         )
                         continue
@@ -15625,12 +16444,15 @@ class SessionEngine:
     ) -> AsyncGenerator[Event, None]:
         payload = budget_reservation_payload(result)
         yield await self._event_writer.emit(
-            Event(
-                type=EventType.BUDGET_LIMIT_REACHED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload=payload,
+            event_with_execution_profile_authority(
+                Event(
+                    type=EventType.BUDGET_LIMIT_REACHED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=payload,
+                ),
+                execution_profile,
             )
         )
         session_events = await self._run_limit_controller.session_usage_events(session.id)
@@ -15679,12 +16501,15 @@ class SessionEngine:
     ) -> AsyncGenerator[Event, None]:
         payload = budget_limit_reached_payload(check)
         yield await self._event_writer.emit(
-            Event(
-                type=EventType.BUDGET_LIMIT_REACHED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload=payload,
+            event_with_execution_profile_authority(
+                Event(
+                    type=EventType.BUDGET_LIMIT_REACHED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=payload,
+                ),
+                execution_profile,
             )
         )
         decision = StopDecision(

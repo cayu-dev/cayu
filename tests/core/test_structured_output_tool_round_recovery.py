@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from importlib.metadata import version
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
@@ -31,9 +30,9 @@ from cayu.runtime import (
     SessionStatus,
     StructuredOutputSpec,
 )
-from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
@@ -56,6 +55,14 @@ class _RecordingProvider(ModelProvider):
     def __init__(self, responses: list[list[ModelStreamEvent]] | None = None) -> None:
         self._responses = [] if responses is None else responses
         self.requests: list[ModelRequest] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:structured-output-recovery-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         response_index = len(self.requests)
@@ -181,7 +188,7 @@ async def _publish_structured_model_step(
     store: InMemorySessionStore,
     *,
     session_id: str,
-    provider_name: str,
+    provider: _RecordingProvider,
     spec: StructuredOutputSpec,
     tool_calls: list[runtime_records.ToolCallRequest],
     tools: tuple[Tool, ...] = (),
@@ -189,20 +196,24 @@ async def _publish_structured_model_step(
 ) -> _PublishedStructuredStep:
     user_message = Message.text("user", "produce the final structured answer")
     interaction_id = f"interaction-{session_id}"
-    profile_app = CayuApp(enable_logging=False)
+    profile_app = CayuApp(
+        enable_logging=False,
+        secret_redactor=redactor,
+    )
+    profile_app.register_provider(provider, default=True)
     profile_app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=tools,
     )
-    execution_profile = execution_profile_admission.resolve_execution_profile_identity(
+    execution_profile = session_engine_module._execution_profile_identity(
         registered_agent=profile_app._agents["assistant"],
-        provider_name=provider_name,
+        provider_name=provider.name,
+        registered_provider=profile_app._providers[provider.name],
         model="fake-model",
         durable_system_prompt=None,
-        runtime_name="cayu",
-        runtime_version=version("cayu"),
         redactor=profile_app._secret_redactor,
         process_identity=profile_app._execution_profile_process_identity,
+        structured_output=spec,
     )
     admitted = await create_admitted_session(
         store,
@@ -212,7 +223,7 @@ async def _publish_structured_model_step(
             messages=[user_message],
             structured_output=spec,
         ),
-        provider_name=provider_name,
+        provider_name=provider.name,
         model="fake-model",
         direct_tools=(
             {
@@ -242,7 +253,7 @@ async def _publish_structured_model_step(
         "purpose": "assistant-turn",
         **model_attempt_identity.payload(),
         "logical_step_id": logical_step_id,
-        "provider_name": provider_name,
+        "provider_name": provider.name,
         "requested_model": "fake-model",
         "source_transcript_cursor": source_transcript_cursor,
         "request_fingerprint": "5" * 64,
@@ -413,7 +424,7 @@ def test_incomplete_recovery_atomically_finalizes_valid_structured_output_round(
         staged = await _publish_structured_model_step(
             store,
             session_id="structured-recovery-valid",
-            provider_name=provider.name,
+            provider=provider,
             spec=spec,
             tool_calls=[
                 _structured_call(
@@ -509,7 +520,7 @@ def test_incomplete_recovery_accepts_partial_unavailable_terminal_evidence() -> 
         staged = await _publish_structured_model_step(
             store,
             session_id="structured-recovery-partial-terminal",
-            provider_name=provider.name,
+            provider=provider,
             spec=spec,
             tool_calls=[
                 _structured_call(
@@ -586,7 +597,7 @@ def test_incomplete_recovery_uses_authoritative_validation_before_redaction() ->
         staged = await _publish_structured_model_step(
             store,
             session_id="structured-recovery-redacted-valid",
-            provider_name=provider.name,
+            provider=provider,
             spec=spec,
             tool_calls=[
                 _structured_call(
@@ -648,7 +659,7 @@ def test_resume_recovers_invalid_round_then_continues_once_at_next_attempt() -> 
         staged = await _publish_structured_model_step(
             store,
             session_id="structured-recovery-retry",
-            provider_name=provider.name,
+            provider=provider,
             spec=spec,
             tool_calls=[
                 _structured_call(
@@ -784,7 +795,7 @@ def test_incomplete_recovery_fails_mixed_round_without_retry_or_side_effects() -
         staged = await _publish_structured_model_step(
             store,
             session_id="structured-recovery-interrupted",
-            provider_name=provider.name,
+            provider=provider,
             spec=spec,
             tool_calls=[
                 runtime_records.ToolCallRequest(
@@ -859,7 +870,7 @@ def test_recovery_replays_lost_structured_publication_acknowledgement_exactly() 
         staged = await _publish_structured_model_step(
             store,
             session_id="structured-recovery-ack-loss",
-            provider_name=provider.name,
+            provider=provider,
             spec=spec,
             tool_calls=[
                 _structured_call(

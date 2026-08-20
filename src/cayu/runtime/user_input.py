@@ -52,7 +52,8 @@ class UserInputResponse(BaseModel):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``,
     which means "inherit the original run's configuration" as persisted on the pending
-    user-input checkpoint. Passing an explicit value overrides it for the resumed run.
+    user-input checkpoint. An explicit value is accepted only when it preserves the
+    invocation's frozen execution profile.
     """
 
     model_config = ConfigDict(
@@ -132,8 +133,9 @@ class PendingUserInput(BaseModel):
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` persist the original
     run's configuration across the pause so resolving the question resumes with the same
-    config instead of fresh defaults (unless the resolution request overrides them). They
-    are optional so checkpoints written before this state existed still load.
+    config instead of fresh defaults. A resolution request may restate those values only
+    when they preserve the invocation's frozen execution profile. They are optional so
+    checkpoints written before this state existed still load.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)

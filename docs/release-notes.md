@@ -198,6 +198,24 @@ events. Stop pre-43 knowledge writers, run `cayu storage migrate`, and confirm
 revision 43 before starting this build. Mixed revision-42/revision-43 knowledge
 writers are unsupported.
 
+### Model execution is attributable to complete immutable profiles
+
+Execution-profile schema version 3 now binds provider-adapter behavior,
+provider-visible request controls, context selection, knowledge injection,
+compaction, live-state projection, application and invocation budgets,
+structured output, and finalization semantics in addition to the existing
+runtime, model, instruction, tool, policy, hook, environment, and effect
+authority. Model dispatch, retries, recovery, explicit compaction, budget
+evidence, structured-output repair, and model completion retain the frozen
+governing profile instead of resolving mutable registrations again.
+
+Governed request footprints advance to schema version 2 and reference that
+profile without replacing their separate concrete-request evidence role.
+Paired cost-quality comparison reports and bounded runtime-evidence reports
+also advance to schema version 2 so attempt-level cost and runtime evidence can
+identify the governing profile. These records remain content-free: they do not
+retain raw prompts, knowledge, credentials, secrets, or unbounded schemas.
+
 ### Fork and workspace branch authority fails closed
 
 `CURRENT_CHILD` session forks now require an attributable application authority

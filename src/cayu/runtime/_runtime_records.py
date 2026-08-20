@@ -42,13 +42,18 @@ class RegisteredAgentState:
     tools: Mapping[str, RegisteredTool]
     tool_capabilities: tuple[RegisteredToolCapability, ...]
     context_policy: ContextPolicy
+    context_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     context_overflow_policy: ContextPolicy | None
+    context_overflow_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool_policy: ToolPolicy
     tool_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     runtime_hooks: tuple[RegisteredRuntimeHook, ...]
     loop_policies: tuple[LoopPolicy, ...]
     loop_policy_execution_profile_identities: tuple[ExecutionProfileBehaviorIdentity | None, ...]
     execution_requirements: ExecutionRequirements
+    context_behavior_execution_profile_identities: Mapping[
+        int, ExecutionProfileBehaviorIdentity | None
+    ] = field(default_factory=dict)
     registration_source: str | None = None
     registration_symbol: str | None = None
 
@@ -90,6 +95,7 @@ class RegisteredRuntimeHook:
 class RegisteredProvider:
     name: str
     provider: ModelProvider
+    execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
     model_patterns: tuple[str, ...] = ()
     registration_source: str | None = None
     registration_symbol: str | None = None

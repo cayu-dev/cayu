@@ -441,8 +441,18 @@ def prepare_fork_session_request_with_identity(
     aliases: tuple[str, ...] = ()
     try:
         raw_request = copy_fork_session_request(request)
+        request_document: dict[str, Any] = raw_request.model_dump(
+            mode="json",
+            warnings=False,
+        )
+        initial_invocation = raw_request._fork_group_initial_invocation
+        if initial_invocation is not None:
+            request_document = {
+                "request": request_document,
+                "fork_group_initial_invocation_sha256": (initial_invocation.request_sha256),
+            }
         material = canonical_durable_json_bytes(
-            raw_request.model_dump(mode="json", warnings=False),
+            request_document,
             "fork_session_request",
         )
         if public_authority_alias_codec is None:
