@@ -1100,6 +1100,7 @@ def test_strict_sigkill_selection_reports_command_failure(
 @pytest.mark.parametrize(
     ("check_id", "module"),
     [
+        ("advanced-bounded-fork-group", "bounded_fork_group"),
         ("advanced-research-council", "cache_aware_research_council"),
         ("advanced-counterfactual-approval", "counterfactual_approval"),
         ("advanced-repo-tournament", "repo_maintainer_tournament"),
@@ -1140,6 +1141,7 @@ def test_advanced_examples_are_verified_gemini_contracts(
 @pytest.mark.parametrize(
     ("check_id", "module"),
     [
+        ("advanced-bounded-fork-group", "bounded_fork_group"),
         ("advanced-research-council", "cache_aware_research_council"),
         ("advanced-counterfactual-approval", "counterfactual_approval"),
         ("advanced-repo-tournament", "repo_maintainer_tournament"),

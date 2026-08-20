@@ -56,6 +56,7 @@ task-backed sessions inherit the immutable root origin automatically.
 | The model itself wants to delegate a sub-task | `SubagentTool` | Model-facing. Creates a child session with `parent_session_id`; foreground, in-process background, or task-backed durable. |
 | React to Cayu's **own** durable events (budget alerts, session completion) | `EventWatcher` | Trusted app code that pulls the durable event log. **Not** an external-webhook receiver. |
 | Continue one specific session by id | `ResumeRequest` / `ForkSessionRequest` / `InterruptSessionRequest` | Resume appends messages; fork branches without mutating the source; interrupt stops a pending/running session. |
+| Run and evaluate one bounded in-process candidate population | `await app.run_fork_group(ForkGroupRequest(...))` | Freezes one source, runs 2-16 profiled sibling sessions under one causal budget, applies deterministic app gates, and produces one tool-free bounded judgment. Exact retries reconstruct; any failed sibling fails version 1. |
 
 ## The two worker loops
 

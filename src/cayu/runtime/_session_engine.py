@@ -140,6 +140,7 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._fork_source_snapshot import fork_source_checkpoint_sha256
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
@@ -392,6 +393,7 @@ from cayu.runtime.sessions import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     FORK_EXECUTION_PROFILE_METADATA_KEY,
+    FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
@@ -11518,6 +11520,15 @@ class SessionEngine:
                 delivered = await self._event_writer.fan_out_persisted(persisted_events)
                 yield delivered[-1]
                 return
+        expected_source_snapshot = request._expected_source_snapshot
+        if expected_source_snapshot is not None and (
+            source_session.run_epoch != expected_source_snapshot.run_epoch
+        ):
+            raise SessionRunFenced(
+                "Fork source changed after its coordinator snapshot was frozen: "
+                f"expected run epoch {expected_source_snapshot.run_epoch}, "
+                f"current {source_session.run_epoch}."
+            )
         if source_session.status not in _FORKABLE_SESSION_STATUSES:
             raise ValueError(
                 "Only completed, failed, or interrupted sessions can be forked: "
@@ -11544,6 +11555,12 @@ class SessionEngine:
             )
         finally:
             source_checkpoint_for_profile = None
+        if expected_source_snapshot is not None and (
+            source_execution_profile.fingerprint != expected_source_snapshot.profile_fingerprint
+        ):
+            raise SessionRunFenced(
+                "Fork source execution profile changed after its coordinator snapshot was frozen."
+            )
         try:
             source_registered_agent = self._get_registered_agent(source_session.agent_name)
         except KeyError as exc:
@@ -11898,6 +11915,25 @@ class SessionEngine:
         ) -> dict[str, Any] | None:
             """Validate live checkpoint state even when the fork will discard it."""
 
+            if expected_source_snapshot is not None:
+                _, live_source_profile, _ = (
+                    session_request_boundary.prepare_fork_source_execution_profile(
+                        current_source,
+                        source_checkpoint,
+                    )
+                )
+                if live_source_profile.fingerprint != expected_source_snapshot.profile_fingerprint:
+                    raise SessionRunFenced(
+                        "Fork source execution profile changed after its coordinator "
+                        "snapshot was frozen."
+                    )
+            if expected_source_snapshot is not None and (
+                fork_source_checkpoint_sha256(source_checkpoint)
+                != expected_source_snapshot.checkpoint_sha256
+            ):
+                raise SessionRunFenced(
+                    "Fork source checkpoint changed after its coordinator snapshot was frozen."
+                )
             source_checkpoint = validate_source_checkpoint(current_source, source_checkpoint)
             prompt_workflow.require_prepared_intent(source_checkpoint)
             fork_checkpoint = approval_support.checkpoint_for_fork(
@@ -11941,10 +11977,16 @@ class SessionEngine:
 
         def transcript_validator(messages: tuple[Message, ...]) -> bool:
             return (
-                expected_fork_transcript is None or messages == expected_fork_transcript
-            ) and session_request_boundary.fork_transcript_is_secret_free(
-                messages,
-                redactor=self._secret_redactor,
+                (expected_fork_transcript is None or messages == expected_fork_transcript)
+                and (
+                    expected_source_snapshot is None
+                    or session_input_messages_sha256(messages)
+                    == expected_source_snapshot.transcript_sha256
+                )
+                and session_request_boundary.fork_transcript_is_secret_free(
+                    messages,
+                    redactor=self._secret_redactor,
+                )
             )
 
         inherited_taint_labels = await self._tool_round_executor.prior_taint_labels_for_policy(
@@ -12017,6 +12059,22 @@ class SessionEngine:
             agent_name = model = environment_name = destination_session_id = ""
             runtime_generated_session_id = None
             raise
+        if expected_source_snapshot is not None:
+            authoritative_metadata = copy_json_value(fork_session.metadata, "metadata")
+            authoritative_metadata[FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY] = {
+                "source_session_id": source_session.id,
+                "status": source_session.status.value,
+                "run_epoch": expected_source_snapshot.run_epoch,
+                "transcript_cursor": expected_source_snapshot.transcript_cursor,
+                "transcript_sha256": expected_source_snapshot.transcript_sha256,
+                "checkpoint_sha256": expected_source_snapshot.checkpoint_sha256,
+                "execution_profile_fingerprint": (expected_source_snapshot.profile_fingerprint),
+                "causal_budget_id": source_session.causal_budget_id,
+            }
+            fork_session = fork_session.model_copy(
+                update={"metadata": authoritative_metadata},
+                deep=True,
+            )
         fork_session = await prompt_workflow.prepare_effect(
             session_store=self.session_store,
             source_session=source_session,

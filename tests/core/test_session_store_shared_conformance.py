@@ -20,6 +20,7 @@ from tests.core._workload_secret_support import FakeProvider
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime.fork_groups as fork_group_module
 import cayu.runtime.sessions as sessions_module
 from cayu import (
     SQLiteSessionStore,
@@ -83,10 +84,19 @@ from cayu.runtime import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     ForkExecutionProfileSelection,
+    ForkGroupArtifactReference,
+    ForkGroupBranchSpec,
+    ForkGroupCheckpointSelector,
+    ForkGroupConflict,
+    ForkGroupEvaluatorSpec,
+    ForkGroupFailureCode,
+    ForkGroupRequest,
+    ForkGroupState,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
+    InMemoryBudgetLedger,
     InMemoryBudgetStore,
     InMemorySessionStore,
     InteractionTransitionSpec,
@@ -961,6 +971,568 @@ def conformance_postgres_dsn(postgres_dsn) -> Iterator[str]:
         yield postgres_dsn
     finally:
         asyncio.run(_reset_postgres_data(postgres_dsn))
+
+
+def test_session_store_conformance_reconstructs_completed_fork_group(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            branch_output = StructuredOutputSpec(
+                name="candidate",
+                json_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            )
+            provider = FakeProvider(
+                [
+                    [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="alpha-output",
+                            name=STRUCTURED_OUTPUT_TOOL_NAME,
+                            arguments={"output": {"value": "alpha"}},
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="beta-output",
+                            name=STRUCTURED_OUTPUT_TOOL_NAME,
+                            arguments={"output": {"value": "beta"}},
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="judgment-output",
+                            name=STRUCTURED_OUTPUT_TOOL_NAME,
+                            arguments={
+                                "output": {
+                                    "dispositions": [
+                                        {
+                                            "branch_id": "alpha",
+                                            "disposition": "selected",
+                                            "reason": "deterministic winner",
+                                        },
+                                        {
+                                            "branch_id": "beta",
+                                            "disposition": "rejected",
+                                            "reason": "deterministic runner-up",
+                                        },
+                                    ]
+                                }
+                            },
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                ]
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="fork-source", model="fake-model"))
+            app.register_agent(AgentSpec(name="fork-evaluator", model="fake-model"))
+            source_id = f"fork-group-source-{session_store_case[0]}"
+            group_id = f"fork-group-conformance-{session_store_case[0]}"
+            source_events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="fork-source",
+                        session_id=source_id,
+                        causal_budget_id=group_id,
+                        messages=[Message.text("user", "freeze this source")],
+                    )
+                )
+            ]
+            assert source_events[-1].type == EventType.SESSION_COMPLETED
+            request = ForkGroupRequest(
+                group_id=group_id,
+                source_session_id=source_id,
+                source_checkpoint=ForkGroupCheckpointSelector(),
+                causal_budget_id=group_id,
+                max_parallelism=1,
+                branches=(
+                    ForkGroupBranchSpec(
+                        branch_id="alpha",
+                        session_id=f"{group_id}-alpha",
+                        messages=(Message.text("user", "run alpha"),),
+                        structured_output=branch_output,
+                    ),
+                    ForkGroupBranchSpec(
+                        branch_id="beta",
+                        session_id=f"{group_id}-beta",
+                        messages=(Message.text("user", "run beta"),),
+                        structured_output=branch_output,
+                    ),
+                ),
+                evaluator=ForkGroupEvaluatorSpec(
+                    session_id=f"{group_id}-evaluator",
+                    agent_name="fork-evaluator",
+                ),
+            )
+
+            completed = await app.run_fork_group(request)
+            assert completed.state is ForkGroupState.COMPLETED
+            assert completed.replayed is False
+            assert len(provider.requests) == 4
+
+            store = await _reopen_store(session_store_case, store)
+            restarted = CayuApp(session_store=store, enable_logging=False)
+            replay = await restarted.run_fork_group(request)
+            assert replay.state is ForkGroupState.COMPLETED
+            assert replay.replayed is True
+            assert replay.branches == completed.branches
+            assert replay.dispositions == completed.dispositions
+            with pytest.raises(ForkGroupConflict, match="different request"):
+                await restarted.run_fork_group(
+                    request.model_copy(update={"max_parallelism": 2}, deep=True)
+                )
+            lifecycle = await store.query_events(
+                EventQuery(
+                    session_id=source_id,
+                    event_types=(
+                        EventType.FORK_GROUP_CREATED,
+                        EventType.FORK_GROUP_BRANCHES_RUNNING,
+                        EventType.FORK_GROUP_AWAITING_EVALUATION,
+                        EventType.FORK_GROUP_COMPLETED,
+                        EventType.FORK_GROUP_FAILED,
+                    ),
+                )
+            )
+            assert [record.event.type for record in lifecycle] == [
+                EventType.FORK_GROUP_CREATED,
+                EventType.FORK_GROUP_BRANCHES_RUNNING,
+                EventType.FORK_GROUP_AWAITING_EVALUATION,
+                EventType.FORK_GROUP_COMPLETED,
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def _fork_group_conformance_output() -> StructuredOutputSpec:
+    return StructuredOutputSpec(
+        name="candidate",
+        json_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
+
+
+def _fork_group_conformance_request(
+    *,
+    source_id: str,
+    group_id: str,
+    artifact_only: bool = False,
+    budget_limit: BudgetLimit | None = None,
+) -> ForkGroupRequest:
+    output = None if artifact_only else _fork_group_conformance_output()
+    limits = () if budget_limit is None else (budget_limit,)
+    return ForkGroupRequest(
+        group_id=group_id,
+        source_session_id=source_id,
+        source_checkpoint=ForkGroupCheckpointSelector(),
+        causal_budget_id=group_id,
+        max_parallelism=1,
+        branches=tuple(
+            ForkGroupBranchSpec(
+                branch_id=branch_id,
+                session_id=f"{group_id}-{branch_id}",
+                messages=(Message.text("user", f"run {branch_id}"),),
+                structured_output=output,
+                artifact_references=(
+                    (ForkGroupArtifactReference(artifact_id=f"artifact-{branch_id}"),)
+                    if artifact_only
+                    else ()
+                ),
+                budget_limits=limits,
+            )
+            for branch_id in ("alpha", "beta")
+        ),
+        evaluator=ForkGroupEvaluatorSpec(
+            session_id=f"{group_id}-evaluator",
+            agent_name="fork-evaluator",
+        ),
+    )
+
+
+async def _create_fork_group_conformance_source(
+    app: CayuApp,
+    *,
+    source_id: str,
+    causal_budget_id: str,
+) -> None:
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="fork-source",
+                session_id=source_id,
+                causal_budget_id=causal_budget_id,
+                messages=[Message.text("user", "freeze this source")],
+            )
+        )
+    ]
+    assert events[-1].type is EventType.SESSION_COMPLETED
+
+
+@pytest.mark.parametrize("failure_stage", ["branch", "evaluator"])
+def test_session_store_conformance_reconstructs_failed_fork_group(
+    session_store_case,
+    failure_stage: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            store_kind = session_store_case[0]
+            source_id = f"fork-group-failure-source-{failure_stage}-{store_kind}"
+            group_id = f"fork-group-failure-{failure_stage}-{store_kind}"
+            alpha = [
+                ModelStreamEvent.tool_call(
+                    id="alpha-output",
+                    name=STRUCTURED_OUTPUT_TOOL_NAME,
+                    arguments={"output": {"value": "alpha"}},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+            beta = [
+                ModelStreamEvent.tool_call(
+                    id="beta-output",
+                    name=STRUCTURED_OUTPUT_TOOL_NAME,
+                    arguments={"output": {"value": "beta"}},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+            provider = FakeProvider(
+                [
+                    [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                    alpha,
+                    (
+                        [ModelStreamEvent.error("branch failed")]
+                        if failure_stage == "branch"
+                        else beta
+                    ),
+                    *(
+                        [[ModelStreamEvent.error("evaluator failed")]]
+                        if failure_stage == "evaluator"
+                        else []
+                    ),
+                ]
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="fork-source", model="fake-model"))
+            app.register_agent(AgentSpec(name="fork-evaluator", model="fake-model"))
+            await _create_fork_group_conformance_source(
+                app,
+                source_id=source_id,
+                causal_budget_id=group_id,
+            )
+            request = _fork_group_conformance_request(
+                source_id=source_id,
+                group_id=group_id,
+            )
+
+            failed = await app.run_fork_group(request)
+            assert failed.state is ForkGroupState.FAILED
+            assert failed.failure is not None
+            assert failed.failure.code is (
+                ForkGroupFailureCode.BRANCH_FAILED
+                if failure_stage == "branch"
+                else ForkGroupFailureCode.EVALUATOR_FAILED
+            )
+            assert failed.branches[0].status == "completed"
+            if failure_stage == "evaluator":
+                assert failed.branches[1].status == "completed"
+
+            request_count = len(provider.requests)
+            store = await _reopen_store(session_store_case, store)
+            restarted = CayuApp(session_store=store, enable_logging=False)
+            replay = await restarted.run_fork_group(request)
+            assert replay.state is ForkGroupState.FAILED
+            assert replay.replayed is True
+            assert replay.failure == failed.failure
+            assert len(provider.requests) == request_count
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_fences_same_epoch_fork_group_source_mutation(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            store_kind = session_store_case[0]
+            source_id = f"fork-group-mutation-source-{store_kind}"
+            group_id = f"fork-group-mutation-{store_kind}"
+            provider = FakeProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="fork-source", model="fake-model"))
+            app.register_agent(AgentSpec(name="fork-evaluator", model="fake-model"))
+            await _create_fork_group_conformance_source(
+                app,
+                source_id=source_id,
+                causal_budget_id=group_id,
+            )
+            request = _fork_group_conformance_request(
+                source_id=source_id,
+                group_id=group_id,
+            )
+            source_before = await store.load(source_id)
+            assert source_before is not None
+            original_fork = app.fork_session
+            fork_count = 0
+
+            async def fork_then_mutate_checkpoint(
+                fork_request: ForkSessionRequest,
+            ) -> AsyncIterator[Event]:
+                nonlocal fork_count
+                async for event in original_fork(fork_request):
+                    yield event
+                fork_count += 1
+                if fork_count == 1:
+                    checkpoint = await store.load_checkpoint(source_id)
+                    mutated = {} if checkpoint is None else checkpoint
+                    mutated["same_epoch_semantic_mutation"] = {"value": "changed"}
+                    await store.checkpoint(source_id, mutated)
+
+            app.fork_session = fork_then_mutate_checkpoint  # ty: ignore[invalid-assignment]
+            app._fork_group_coordinator._fork_session_callback = fork_then_mutate_checkpoint
+            failed = await app.run_fork_group(request)
+
+            assert failed.state is ForkGroupState.FAILED
+            assert failed.failure is not None
+            assert failed.failure.code is ForkGroupFailureCode.SOURCE_CHANGED
+            source_after = await store.load(source_id)
+            assert source_after is not None
+            assert source_after.run_epoch == source_before.run_epoch
+            assert await store.load(f"{group_id}-alpha") is not None
+            assert await store.load(f"{group_id}-beta") is None
+            assert len(provider.requests) == 1
+
+            store = await _reopen_store(session_store_case, store)
+            replay = await CayuApp(session_store=store, enable_logging=False).run_fork_group(
+                request
+            )
+            assert replay.state is ForkGroupState.FAILED
+            assert replay.replayed is True
+            assert replay.failure == failed.failure
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reconstructs_fork_group_budget_exhaustion(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            store_kind = session_store_case[0]
+            source_id = f"fork-group-budget-source-{store_kind}"
+            group_id = f"fork-group-budget-{store_kind}"
+            provider = FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.completed(
+                            {
+                                "finish_reason": "stop",
+                                "usage": {"input_tokens": 5, "output_tokens": 2},
+                            }
+                        )
+                    ],
+                    [
+                        ModelStreamEvent.completed(
+                            {
+                                "finish_reason": "stop",
+                                "usage": {"input_tokens": 7, "output_tokens": 3},
+                            }
+                        )
+                    ],
+                ]
+            )
+            app = CayuApp(
+                session_store=store,
+                budget_ledger=InMemoryBudgetLedger(),
+                enable_logging=False,
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="fork-source", model="fake-model"))
+            app.register_agent(AgentSpec(name="fork-evaluator", model="fake-model"))
+            await _create_fork_group_conformance_source(
+                app,
+                source_id=source_id,
+                causal_budget_id=group_id,
+            )
+            limit = BudgetLimit(
+                scope="causal",
+                key=group_id,
+                max_estimated_cost=Decimal("0.000045"),
+                pricing=PriceBook(
+                    prices=(
+                        ModelPrice.fixed(
+                            provider_name="fake",
+                            model="fake-model",
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("10"),
+                        ),
+                    )
+                ),
+                reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=1),
+            )
+            request = _fork_group_conformance_request(
+                source_id=source_id,
+                group_id=group_id,
+                artifact_only=True,
+                budget_limit=limit,
+            )
+
+            failed = await app.run_fork_group(request)
+            assert failed.state is ForkGroupState.FAILED
+            assert failed.failure is not None
+            assert failed.failure.code is ForkGroupFailureCode.BUDGET_EXHAUSTED
+            assert [branch.status for branch in failed.branches] == [
+                "interrupted",
+                "interrupted",
+            ]
+            assert len(provider.requests) == 2
+
+            store = await _reopen_store(session_store_case, store)
+            replay = await CayuApp(session_store=store, enable_logging=False).run_fork_group(
+                request
+            )
+            assert replay.state is ForkGroupState.FAILED
+            assert replay.replayed is True
+            assert replay.failure == failed.failure
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_recovers_nonterminal_fork_group_branch(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            store_kind = session_store_case[0]
+            source_id = f"fork-group-recovery-source-{store_kind}"
+            group_id = f"fork-group-recovery-{store_kind}"
+            initial_provider = FakeProvider(
+                [[ModelStreamEvent.completed({"finish_reason": "stop"})]]
+            )
+            initial_app = CayuApp(session_store=store, enable_logging=False)
+            initial_app.register_provider(initial_provider, default=True)
+            initial_app.register_agent(AgentSpec(name="fork-source", model="fake-model"))
+            initial_app.register_agent(AgentSpec(name="fork-evaluator", model="fake-model"))
+            await _create_fork_group_conformance_source(
+                initial_app,
+                source_id=source_id,
+                causal_budget_id=group_id,
+            )
+            request = _fork_group_conformance_request(
+                source_id=source_id,
+                group_id=group_id,
+            )
+            coordinator = initial_app._fork_group_coordinator
+            prepared = fork_group_module._prepare_request(
+                coordinator,
+                request,
+                source_session_id=source_id,
+            )
+            record = await fork_group_module._create_record(coordinator, prepared)
+            record = await fork_group_module._publish_record(
+                coordinator,
+                source_id,
+                fork_group_module._result_with(
+                    record,
+                    state=ForkGroupState.BRANCHES_RUNNING,
+                ),
+                EventType.FORK_GROUP_BRANCHES_RUNNING,
+                expected_record=record,
+            )
+            for branch in prepared.branches:
+                assert (
+                    await fork_group_module._prepare_branch_fork(
+                        coordinator,
+                        prepared,
+                        record.result.source,
+                        branch,
+                    )
+                    is None
+                )
+            await store.transition_status(
+                f"{group_id}-alpha",
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            recovery_provider = FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="beta-output",
+                            name=STRUCTURED_OUTPUT_TOOL_NAME,
+                            arguments={"output": {"value": "beta"}},
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ]
+                ]
+            )
+            recovered_app = CayuApp(session_store=store, enable_logging=False)
+            recovered_app.register_provider(recovery_provider, default=True)
+            recovered_app.register_agent(AgentSpec(name="fork-source", model="fake-model"))
+            recovered_app.register_agent(AgentSpec(name="fork-evaluator", model="fake-model"))
+            recovered_session_ids: list[str] = []
+            original_recover = recovered_app.recover_incomplete_session
+
+            async def capture_recovery(recovery_request: IncompleteSessionRecoveryRequest):
+                recovered_session_ids.append(recovery_request.session_id)
+                return await original_recover(recovery_request)
+
+            recovered_app.recover_incomplete_session = (  # ty: ignore[invalid-assignment]
+                capture_recovery
+            )
+            recovered_app._fork_group_coordinator._recover_incomplete_session_callback = (
+                capture_recovery
+            )
+            failed = await recovered_app.run_fork_group(request)
+
+            assert failed.state is ForkGroupState.FAILED
+            assert failed.failure is not None
+            assert failed.failure.code is ForkGroupFailureCode.BRANCH_INVALID
+            assert failed.failure.branch_id == "alpha"
+            assert recovered_session_ids == [f"{group_id}-alpha"]
+            assert [branch.status for branch in failed.branches] == ["invalid", "completed"]
+            assert len(recovery_provider.requests) == 1
+
+            store = await _reopen_store(session_store_case, store)
+            replay = await CayuApp(session_store=store, enable_logging=False).run_fork_group(
+                request
+            )
+            assert replay.state is ForkGroupState.FAILED
+            assert replay.replayed is True
+            assert replay.failure == failed.failure
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_lists_queued_dispatch_terminal_receipts(

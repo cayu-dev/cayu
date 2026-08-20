@@ -71,6 +71,6 @@ corresponding credentials or service.
   [`dashboard_knowledge_review.py`](dashboard_knowledge_review.py) — operator dashboard projections.
 - [`business_approval_tiers.py`](business_approval_tiers.py) — application-owned approval routing.
 - [`github_pr_reviewer/`](github_pr_reviewer/) — durable cloud PR-review workflow.
-- [`ADVANCED_RUNTIME_EXAMPLES.md`](ADVANCED_RUNTIME_EXAMPLES.md) — caching, compaction,
-  counterfactual approval, repository tournaments, and taint isolation with explicit
-  deterministic and live evidence boundaries.
+- [`ADVANCED_RUNTIME_EXAMPLES.md`](ADVANCED_RUNTIME_EXAMPLES.md) — bounded fork groups,
+  caching, compaction, counterfactual approval, repository tournaments, and taint
+  isolation with explicit deterministic and live evidence boundaries.

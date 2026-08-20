@@ -89,6 +89,25 @@ guard.
 
 ## Unreleased
 
+### Bounded fork groups are durable public runtime operations
+
+`CayuApp.run_fork_group(...)` now freezes one terminal source checkpoint and
+execution profile, runs 2-16 caller-named sibling sessions under bounded
+parallelism and one causal budget, applies registered deterministic gates, and
+admits only bounded allow-listed evidence to a tool-free evaluator. Lifecycle,
+branch evidence, one validated selection, failures, and exact-request replay
+are durable across in-memory, SQLite, and PostgreSQL session stores. Version 1
+fails the group if any sibling or gate fails while preserving every branch for
+inspection.
+Atomic source digests prevent same-epoch source drift while siblings are being
+created. Revision-fenced lifecycle publication prevents stale coordinators from
+replacing a terminal result, reconciles lost commit acknowledgements, and sends
+nonterminal child sessions through ordinary Cayu recovery after process loss.
+One renewable store-backed execution claim prevents applications sharing a
+store from concurrently resuming the same group. The tool-free evaluator's
+exact execution profile is frozen before durable admission, and extension
+failures are recorded only through bounded, secret-redacted diagnostics.
+
 ### Fork and workspace branch authority fails closed
 
 `CURRENT_CHILD` session forks now require an attributable application authority

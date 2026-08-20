@@ -705,6 +705,7 @@ PROMPT_ANATOMY_TRANSITION_METADATA_KEY = "cayu:prompt_anatomy_transition"
 PROMPT_ANATOMY_TRANSITION_RECORD_TYPE = "cayu.prompt-anatomy-transition"
 PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION = 1
 FORK_EXECUTION_PROFILE_METADATA_KEY = "cayu:fork_execution_profile"
+FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY = "cayu:fork_group_source_snapshot"
 FORK_EXECUTION_PROFILE_RECORD_TYPE = "cayu.session-fork-execution-profile"
 FORK_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 SESSION_CREATE_CLAIM_METADATA_KEY = "cayu:session_create_claim"
@@ -1744,6 +1745,15 @@ class ForkExecutionProfileSource(StrEnum):
     ACTIVE_INVOCATION = "active_invocation"
 
 
+@dataclass(frozen=True, slots=True)
+class _ForkSourceSnapshotExpectation:
+    run_epoch: int
+    transcript_cursor: int
+    transcript_sha256: str
+    checkpoint_sha256: str
+    profile_fingerprint: str
+
+
 class ForkSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1760,6 +1770,7 @@ class ForkSessionRequest(BaseModel):
     )
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    _expected_source_snapshot: _ForkSourceSnapshotExpectation | None = PrivateAttr(default=None)
 
     @field_validator("session_id")
     @classmethod
@@ -1792,6 +1803,7 @@ class ForkSessionRequest(BaseModel):
             EXECUTION_PROFILE_METADATA_KEY: "execution-profile authority",
             PROMPT_ANATOMY_TRANSITION_METADATA_KEY: "prompt-transition authority",
             FORK_EXECUTION_PROFILE_METADATA_KEY: "fork-profile authority",
+            FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY: "fork-group source authority",
         }
         reserved_key = next(
             (key for key in reserved_authority_kinds if key in copied),
@@ -13970,7 +13982,7 @@ def copy_incomplete_sessions_recovery_request(
 def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest:
     if type(request) is not ForkSessionRequest:
         raise TypeError("Session fork requires a ForkSessionRequest.")
-    return ForkSessionRequest(
+    copied = ForkSessionRequest(
         source_session_id=request.source_session_id,
         session_id=request.session_id,
         agent_name=request.agent_name,
@@ -13987,6 +13999,43 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
         ),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
+    copied._expected_source_snapshot = request._expected_source_snapshot
+    return copied
+
+
+def _bind_fork_expected_source_snapshot(
+    request: ForkSessionRequest,
+    *,
+    expected_source_run_epoch: int,
+    expected_source_transcript_cursor: int,
+    expected_source_transcript_sha256: str,
+    expected_source_checkpoint_sha256: str,
+    expected_source_profile_fingerprint: str,
+) -> ForkSessionRequest:
+    """Bind an internal fork to a coordinator-frozen source snapshot."""
+
+    if type(request) is not ForkSessionRequest:
+        raise TypeError("Session fork requires a ForkSessionRequest.")
+    if type(expected_source_run_epoch) is not int or expected_source_run_epoch < 0:
+        raise ValueError("expected_source_run_epoch must be a non-negative integer.")
+    if type(expected_source_transcript_cursor) is not int or expected_source_transcript_cursor < 0:
+        raise ValueError("expected_source_transcript_cursor must be a non-negative integer.")
+    for field_name, value in (
+        ("expected_source_transcript_sha256", expected_source_transcript_sha256),
+        ("expected_source_checkpoint_sha256", expected_source_checkpoint_sha256),
+        ("expected_source_profile_fingerprint", expected_source_profile_fingerprint),
+    ):
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"{field_name} must be a lowercase SHA-256 digest.")
+    copied = copy_fork_session_request(request)
+    copied._expected_source_snapshot = _ForkSourceSnapshotExpectation(
+        run_epoch=expected_source_run_epoch,
+        transcript_cursor=expected_source_transcript_cursor,
+        transcript_sha256=expected_source_transcript_sha256,
+        checkpoint_sha256=expected_source_checkpoint_sha256,
+        profile_fingerprint=expected_source_profile_fingerprint,
+    )
+    return copied
 
 
 def session_fork_profile_relationship(

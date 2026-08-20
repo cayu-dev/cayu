@@ -131,6 +131,11 @@ ProgressReporter = Callable[[str], None]
 
 _ADVANCED_EXAMPLE_PORTABILITY_SPECS = (
     (
+        "advanced-bounded-fork-group",
+        "bounded_fork_group",
+        "durable bounded population, deterministic gates, and tool-free evaluation",
+    ),
+    (
         "advanced-research-council",
         "cache_aware_research_council",
         "checkpoint forks, evaluator repair, causal budget, and cache-window policy",
@@ -742,6 +747,29 @@ CHECKS: tuple[VerificationCheck, ...] = (
         prerequisites=("OPENAI_API_KEY",),
         env={"CAYU_PROVIDER": "openai"},
         required_env=("OPENAI_API_KEY",),
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
+        id="advanced-bounded-fork-group",
+        capability=("durable bounded population, deterministic gates, and tool-free evaluation"),
+        lane="advanced-runtime",
+        command=(
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "examples.bounded_fork_group.app",
+            "--mode",
+            "live",
+            "--provider",
+            "gemini",
+            "--trials",
+            "5",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("GEMINI_API_KEY",),
+        required_env=("GEMINI_API_KEY",),
+        requires_provider_api_key=True,
         requires_structured_evidence=True,
     ),
     VerificationCheck(

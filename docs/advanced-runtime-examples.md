@@ -13,7 +13,22 @@ reconstruction around the same store.
 For commands, source locations, and contributor guidance, start with the
 [advanced example developer index](../examples/ADVANCED_RUNTIME_EXAMPLES.md).
 
-## Five executable product stories
+## Six executable product stories
+
+### Freeze and evaluate one bounded population
+
+The [bounded fork-group example](../examples/bounded_fork_group/) invokes
+`CayuApp.run_fork_group(...)` directly. It freezes one completed source,
+executes two caller-named sibling sessions under bounded parallelism and a
+shared causal budget, runs an application-owned deterministic contract gate,
+and admits only bounded structured evidence to a tool-free evaluator. The
+judgment covers both branches and selects exactly one.
+
+The scenario then repeats the same normalized request. Success requires Cayu
+to reconstruct the terminal result and immutable dispositions without another
+model completion. This is the version-1 all-branches-viable path: it does not
+claim failed-sibling evaluation, replacement, distributed dispatch, or
+workspace promotion.
 
 ### Refresh a provider cache, then compact only the checkpoint delta
 

@@ -14,7 +14,7 @@ from itertools import islice
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_tree_contains, set_exception_cause
@@ -365,6 +365,14 @@ from cayu.vaults import (
 
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
+
+if TYPE_CHECKING:
+    from cayu.runtime.fork_groups import (
+        ForkGroupGate,
+        ForkGroupGateSelection,
+        ForkGroupRequest,
+        ForkGroupResult,
+    )
 
 
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
@@ -940,6 +948,7 @@ class CayuApp:
             clock=self._clock,
         )
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
+        self._fork_group_evaluator_agents: dict[str, str] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
@@ -1089,6 +1098,20 @@ class CayuApp:
             load_session_invocation=self.session_invocation_for_dispatch,
             classify_dispatch_settlement=self._queued_dispatch_settlement_state,
             acknowledge_dispatch=self._acknowledge_queued_dispatch,
+        )
+        from cayu.runtime.fork_groups import ForkGroupCoordinator
+
+        self._fork_group_coordinator = ForkGroupCoordinator(
+            session_store=self._runtime_session_store,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            resolve_public_session_authority=self._resolve_public_session_authority,
+            fork_session=self.fork_session,
+            run_session=self.run,
+            resume_session=self.resume,
+            recover_incomplete_session=self.recover_incomplete_session,
+            get_session_usage=self.get_session_usage,
+            prepare_evaluator_agent=self._prepare_fork_group_evaluator_agent,
         )
 
     def redact_json(self, value: Any) -> Any:
@@ -1650,6 +1673,82 @@ class CayuApp:
             registration_symbol=registration_symbol,
         )
         return spec
+
+    def register_fork_group_gate(
+        self,
+        gate_id: str,
+        gate: ForkGroupGate,
+    ) -> ForkGroupGateSelection:
+        """Register one application-owned deterministic fork-group gate."""
+
+        return self._fork_group_coordinator.register_gate(gate_id, gate)
+
+    def _register_fork_group_evaluator_agent(
+        self,
+        *,
+        source_agent_name: str,
+        synthetic_agent_name: str,
+        request_sha256: str,
+    ) -> str:
+        """Own one runtime-generated, structurally isolated evaluator registration."""
+
+        original = self._get_registered_agent(source_agent_name)
+        existing = self._agents.get(synthetic_agent_name)
+        if existing is not None:
+            if self._fork_group_evaluator_agents.get(synthetic_agent_name) != request_sha256:
+                raise RuntimeError(
+                    "Fork-group evaluator registration collides with application state."
+                )
+            if (
+                existing.tools
+                or existing.spec.workflow_tool_names
+                or existing.runtime_hooks
+                or existing.loop_policies
+            ):
+                raise RuntimeError(
+                    "Fork-group evaluator registration is not structurally isolated."
+                )
+            return synthetic_agent_name
+        self._agents[synthetic_agent_name] = runtime_records.RegisteredAgentState(
+            spec=original.spec.model_copy(
+                update={
+                    "name": synthetic_agent_name,
+                    "workflow_tool_names": (),
+                    "metadata": {},
+                    "provider_options": {},
+                },
+                deep=True,
+            ),
+            tools=MappingProxyType({}),
+            context_policy=DefaultContextPolicy(),
+            context_overflow_policy=None,
+            tool_policy=AllowAllToolPolicy(),
+            tool_policy_execution_profile_identity=None,
+            runtime_hooks=(),
+            loop_policies=(),
+            loop_policy_execution_profile_identities=(),
+            execution_requirements=ExecutionRequirements.trusted(),
+            registration_source=original.registration_source,
+            registration_symbol=original.registration_symbol,
+        )
+        self._fork_group_evaluator_agents[synthetic_agent_name] = request_sha256
+        return synthetic_agent_name
+
+    async def _prepare_fork_group_evaluator_agent(
+        self,
+        request: RunRequest,
+        source_agent_name: str,
+        request_sha256: str,
+    ) -> tuple[str, str]:
+        """Freeze the exact tool-free evaluator profile before durable admission."""
+
+        synthetic_name = self._register_fork_group_evaluator_agent(
+            source_agent_name=source_agent_name,
+            synthetic_agent_name=request.agent_name,
+            request_sha256=request_sha256,
+        )
+        prepared = await self._session_engine._prepare_initial_run(request)
+        return synthetic_name, prepared.execution_profile.fingerprint
 
     def register_provider(
         self,
@@ -3582,6 +3681,11 @@ class CayuApp:
             raise RuntimeError("Session fork ended without events or a failure.")
         for event in events:
             yield event
+
+    async def run_fork_group(self, request: ForkGroupRequest) -> ForkGroupResult:
+        """Run or reconstruct one bounded, durable in-process fork group."""
+
+        return await self._fork_group_coordinator.run_group(request)
 
     async def _fork_session_from_runtime_context(
         self,

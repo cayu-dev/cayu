@@ -27,6 +27,7 @@ from cayu.runtime.public_authority import (
 )
 from cayu.runtime.sessions import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
+    FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
@@ -493,6 +494,12 @@ def _require_secret_free_fork_policy_metadata(
         raise ForkAuthorityError(
             f"metadata[{FORK_EXECUTION_PROFILE_METADATA_KEY!r}] is runtime-owned "
             "fork-profile authority."
+        ) from None
+    if FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY in metadata:
+        metadata.clear()
+        raise ForkAuthorityError(
+            f"metadata[{FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY!r}] is runtime-owned "
+            "fork-group source authority."
         ) from None
     if EXECUTION_PROFILE_METADATA_KEY in metadata:
         metadata.clear()

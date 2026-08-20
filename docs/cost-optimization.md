@@ -33,7 +33,7 @@ research branch calls, with all six final trials passing their runtime and quali
 gates. See [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)
 for the exact paired denominators, range, pricing provenance, and run IDs.
 
-Cayu currently has five advanced runtime examples. Two are deliberately
+Cayu currently has six advanced runtime examples. Two are deliberately
 cost-optimization examples:
 
 - [Prompt-cache compaction](../examples/prompt_cache_compaction/) runs a
@@ -49,9 +49,10 @@ cost-optimization examples:
   branch sessions. It does not provide an explicit same-checkpoint, pre-expiry
   compaction lifecycle.
 
-The other three advanced examples focus on authority during approval,
-verified repository repair, and taint-preserving incident response. They may
-affect operational cost, but Cayu does not present them as savings examples.
+The other four advanced examples focus on bounded population evaluation,
+authority during approval, verified repository repair, and taint-preserving
+incident response. They may affect operational cost, but Cayu does not present
+them as savings examples.
 
 ## Typed paired reports and claim strength
 
@@ -184,7 +185,7 @@ explicit; neither should be silently treated as permission to spend.
 
 ## Start here
 
-- Run the five deterministic product stories with
+- Run the six deterministic product stories with
   `uv run pytest -q tests/advanced_examples`.
 - Run the prompt-cache pair with
   `uv run python -m examples.prompt_cache_compaction.app`.
