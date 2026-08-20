@@ -32,6 +32,13 @@ By default, `deploy` also waits for a declared Agent service to reach `running`.
 aggregates their safe messages and remediation hints for humans. `--no-wait` keeps the
 explicit asynchronous workflow.
 
+When an immutable Release fails to build, `deploy` automatically reads that Release's
+timeline before exiting. If Cloud has a safe structured diagnostic, the nonzero JSON
+result uses its stable category and message and includes `error.failure` with the phase,
+bounded build detail, remediation hint, and automatic-retry decision. Coding agents do
+not need to make a second timeline request. Older Cloud deployments and failures without
+a safe diagnostic retain the generic `deployment_failed` result.
+
 `cayu cloud deploy` creates the 8-63 character application slug declared in
 `cayu-cloud.toml` when it does not exist, then updates it on later deploys. Slugs use
 lowercase letters, numbers, and interior hyphens. `--application SLUG`

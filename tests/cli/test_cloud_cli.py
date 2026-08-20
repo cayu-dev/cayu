@@ -1629,6 +1629,174 @@ command = "python -m outbound.worker"
     }
 
 
+def test_cloud_deploy_wait_reports_typed_deployment_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failure = {
+        "automatic_retryable": False,
+        "code": "source_build_failed",
+        "detail": "The Agent dependency set could not be resolved.",
+        "hint": "Fix the Agent source and deploy again.",
+        "message": "The Agent image could not be built.",
+        "phase": "image_built",
+    }
+
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str]] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            self.requests.append((method, path))
+            if path.endswith("/timeline"):
+                return {"failure": failure, "items": []}
+            return {"id": "dep_failed", "status": "failed"}
+
+    client = Client()
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_deployment(
+            client,
+            application_id="outbound-agent",
+            deployment_id="dep_failed",
+            include_failure_diagnostics=True,
+            poll_seconds=0.01,
+            wait_seconds=10.0,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "category": "source_build_failed",
+            "failure": failure,
+            "message": "The Agent image could not be built.",
+        },
+        "ok": False,
+    }
+    assert client.requests == [
+        ("GET", "/v1/applications/outbound-agent/deployments/dep_failed"),
+        ("GET", "/v1/applications/outbound-agent/deployments/dep_failed/timeline"),
+    ]
+
+
+def test_cloud_deploy_wait_falls_back_when_timeline_failure_is_unavailable() -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, kwargs
+            if path.endswith("/timeline"):
+                raise CloudApiError("api_unavailable", "Cayu Cloud API is unavailable.")
+            return {"id": "dep_failed", "status": "failed"}
+
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_deployment(
+            Client(),
+            application_id="outbound-agent",
+            deployment_id="dep_failed",
+            include_failure_diagnostics=True,
+            poll_seconds=0.01,
+            wait_seconds=10.0,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    assert raised.value.category == "deployment_failed"
+    assert str(raised.value) == "Deployment reached terminal status: failed"
+
+
+@pytest.mark.parametrize(
+    "unsafe_detail",
+    [
+        "credential=customer-secret-material",
+        "OPENAI_API_KEY=sk-customer-secret-material",
+        "build_id=release-project:3d6f4cd4-524f-4b43-a081-dfb1dbd20c9c",
+        "CodeBuild operation cayu-release-builder:build-123",
+        "ERROR: raw Docker build output",
+        "Dependency resolution failed for sk-proj-customer-secret-material.",
+        "Dependency resolution failed for 3d6f4cd4-524f-4b43-a081-dfb1dbd20c9c.",
+        "x" * 4097,
+    ],
+)
+def test_cloud_deploy_wait_rejects_unsafe_timeline_failure(
+    unsafe_detail: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failure = {
+        "automatic_retryable": False,
+        "code": "source_build_failed",
+        "detail": unsafe_detail,
+        "hint": "Fix the Agent source and deploy again.",
+        "message": "The Agent image could not be built.",
+        "phase": "image_built",
+    }
+
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, kwargs
+            if path.endswith("/timeline"):
+                return {"failure": failure, "items": []}
+            return {"id": "dep_failed", "status": "failed"}
+
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_deployment(
+            Client(),
+            application_id="outbound-agent",
+            deployment_id="dep_failed",
+            include_failure_diagnostics=True,
+            poll_seconds=0.01,
+            wait_seconds=10.0,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "error": {
+            "category": "deployment_failed",
+            "message": "Deployment reached terminal status: failed",
+        },
+        "ok": False,
+    }
+    assert unsafe_detail not in rendered
+
+
+def test_cloud_deployment_wait_does_not_request_failure_diagnostics() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str]] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            self.requests.append((method, path))
+            if path == "/v1/applications":
+                return {"items": [{"id": "outbound-agent", "name": "Outbound Agent"}]}
+            if path.endswith("/dep_failed"):
+                return {"id": "dep_failed", "status": "failed"}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = Client()
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._deployment(
+            SimpleNamespace(
+                application="outbound-agent",
+                deployment_command="wait",
+                deployment_id="dep_failed",
+                poll_seconds=0.01,
+                wait_seconds=10.0,
+            ),
+            client=client,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    assert raised.value.category == "deployment_failed"
+    assert client.requests == [
+        ("GET", "/v1/applications"),
+        ("GET", "/v1/applications/outbound-agent/deployments/dep_failed"),
+    ]
+
+
 def test_cloud_deploy_wait_requires_the_agent_service_to_be_running() -> None:
     class Client:
         def __init__(self) -> None:

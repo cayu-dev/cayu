@@ -14,7 +14,7 @@ import time
 import webbrowser
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Never
+from typing import Any, Never, TypedDict
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_auth import (
@@ -37,6 +37,26 @@ _DEPLOYMENT_READY = {"smoke_tested", "promoted"}
 _SERVICE_FAILURES = {"degraded", "failed", "stopped"}
 _SERVICE_READY = {"running"}
 _PRODUCTION_API_URL = "https://cloud.cayu.dev"
+_SOURCE_BUILD_FAILURE_MESSAGE = "The Agent image could not be built."
+_SOURCE_BUILD_FAILURE_HINT = "Fix the Agent source and deploy again."
+_SOURCE_BUILD_FAILURE_DETAILS = frozenset(
+    {
+        "The Agent dependency set could not be resolved.",
+        "The Agent Docker build context is invalid.",
+        "The Agent package discovery configuration is ambiguous.",
+        "The Agent Python project or lockfile is incomplete.",
+        "The Agent source or a required package failed to compile.",
+    }
+)
+
+
+class _CloudDeploymentFailure(TypedDict):
+    automatic_retryable: bool
+    code: str
+    detail: str
+    hint: str
+    message: str
+    phase: str
 
 
 class CloudCommandError(RuntimeError):
@@ -59,6 +79,20 @@ class _CloudServiceHealthError(CloudApiError):
     ) -> None:
         super().__init__(category, message)
         self.issues = [dict(issue) for issue in issues]
+
+
+class _CloudDeploymentFailureError(CloudApiError):
+    """Safe structured Cayu Cloud deployment failure."""
+
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        failure: _CloudDeploymentFailure,
+    ) -> None:
+        super().__init__(category, message)
+        self.failure = failure.copy()
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -122,6 +156,8 @@ def _cloud_failure(exc: Exception) -> int:
     else:
         category, message = "invalid_input", str(exc)
     error: dict[str, object] = {"category": category, "message": message}
+    if isinstance(exc, _CloudDeploymentFailureError):
+        error["failure"] = exc.failure
     if isinstance(exc, _CloudServiceHealthError):
         error["issues"] = exc.issues
     print(
@@ -623,6 +659,7 @@ def _deploy(
             client,
             application_id=str(application["id"]),
             deployment_id=str(deployment["id"]),
+            include_failure_diagnostics=True,
             poll_seconds=arguments.poll_seconds,
             wait_seconds=arguments.wait_seconds,
             sleep=sleep,
@@ -983,6 +1020,7 @@ def _wait_for_deployment(
     *,
     application_id: str,
     deployment_id: str,
+    include_failure_diagnostics: bool = False,
     poll_seconds: float,
     wait_seconds: float,
     sleep: Callable[[float], None],
@@ -997,6 +1035,14 @@ def _wait_for_deployment(
         if status in _DEPLOYMENT_READY:
             return deployment
         if status in _DEPLOYMENT_FAILURES:
+            if status == "failed" and include_failure_diagnostics:
+                failure = _deployment_failure(client, path=path)
+                if failure is not None:
+                    raise _CloudDeploymentFailureError(
+                        failure["code"],
+                        failure["message"],
+                        failure=failure,
+                    )
             raise CloudApiError(
                 "deployment_failed",
                 f"Deployment reached terminal status: {status}",
@@ -1004,6 +1050,57 @@ def _wait_for_deployment(
         if monotonic() >= deadline:
             raise CloudApiError("wait_timeout", "Timed out waiting for deployment.")
         sleep(poll_seconds)
+
+
+def _deployment_failure(
+    client: CloudApiClient,
+    *,
+    path: str,
+) -> _CloudDeploymentFailure | None:
+    try:
+        timeline = client.request("GET", f"{path}/timeline")
+    except CloudApiError:
+        return None
+    candidate = timeline.get("failure")
+    if not isinstance(candidate, dict):
+        return None
+    code = _deployment_failure_string(candidate.get("code"), max_bytes=64)
+    phase = _deployment_failure_string(candidate.get("phase"), max_bytes=64)
+    detail = _deployment_failure_string(candidate.get("detail"), max_bytes=4096)
+    hint = _deployment_failure_string(candidate.get("hint"), max_bytes=1024)
+    message = _deployment_failure_string(candidate.get("message"), max_bytes=512)
+    if code is None or phase is None or detail is None or hint is None or message is None:
+        return None
+    automatic_retryable = candidate.get("automatic_retryable")
+    if (
+        automatic_retryable is not False
+        or code != "source_build_failed"
+        or phase != "image_built"
+        or message != _SOURCE_BUILD_FAILURE_MESSAGE
+        or hint != _SOURCE_BUILD_FAILURE_HINT
+        or detail not in _SOURCE_BUILD_FAILURE_DETAILS
+    ):
+        return None
+    return {
+        "automatic_retryable": automatic_retryable,
+        "code": code,
+        "detail": detail,
+        "hint": hint,
+        "message": message,
+        "phase": phase,
+    }
+
+
+def _deployment_failure_string(value: object, *, max_bytes: int) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not value.isprintable()
+        or len(value.encode("utf-8")) > max_bytes
+    ):
+        return None
+    return value
 
 
 def _wait_for_service(
