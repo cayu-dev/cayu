@@ -192,7 +192,12 @@ class _DurableSubagentSubmissionCommittedDuringCancellation(RuntimeError):
 
 _DURABLE_SUBAGENT_COMMITTED_CANCELLATION_PROVENANCE: WeakKeyDictionary[
     _DurableSubagentSubmissionCommittedDuringCancellation,
-    tuple[Any, asyncio.CancelledError, int],
+    tuple[
+        Any,
+        asyncio.CancelledError,
+        asyncio.CancelledError | None,
+        int,
+    ],
 ] = WeakKeyDictionary()
 
 
@@ -207,7 +212,12 @@ class _DurableSubagentSubmissionUnsettledDuringCancellation(RuntimeError):
 
 _DURABLE_SUBAGENT_UNSETTLED_CANCELLATION_PROVENANCE: WeakKeyDictionary[
     _DurableSubagentSubmissionUnsettledDuringCancellation,
-    tuple[_DurableSubagentSubmissionUnsettled, asyncio.CancelledError, int],
+    tuple[
+        _DurableSubagentSubmissionUnsettled,
+        asyncio.CancelledError,
+        asyncio.CancelledError | None,
+        int,
+    ],
 ] = WeakKeyDictionary()
 
 
@@ -215,12 +225,18 @@ def durable_subagent_submission_committed_during_cancellation(
     *,
     result: Any,
     cancellation: asyncio.CancelledError,
+    subsequent_cancellation: asyncio.CancelledError | None,
     cancellation_requests_consumed: int,
 ) -> RuntimeError:
     """Carry a committed result to the boundary that owns cancellation classification."""
 
     if not isinstance(cancellation, asyncio.CancelledError):
         raise TypeError("Durable subagent cancellation settlement requires CancelledError.")
+    if subsequent_cancellation is not None and not isinstance(
+        subsequent_cancellation,
+        asyncio.CancelledError,
+    ):
+        raise TypeError("Subsequent durable subagent cancellation must be CancelledError.")
     if type(cancellation_requests_consumed) is not int or cancellation_requests_consumed < 1:
         raise ValueError(
             "Durable subagent cancellation settlement requires consumed cancellation evidence."
@@ -231,6 +247,7 @@ def durable_subagent_submission_committed_during_cancellation(
     _DURABLE_SUBAGENT_COMMITTED_CANCELLATION_PROVENANCE[signal] = (
         result,
         cancellation,
+        subsequent_cancellation,
         cancellation_requests_consumed,
     )
     return signal
@@ -238,7 +255,7 @@ def durable_subagent_submission_committed_during_cancellation(
 
 def durable_subagent_committed_cancellation_outcome(
     error: BaseException,
-) -> tuple[Any, asyncio.CancelledError, int] | None:
+) -> tuple[Any, asyncio.CancelledError, asyncio.CancelledError | None, int] | None:
     """Return only the outcome attached to an exact runtime-created private signal."""
 
     if type(error) is not _DurableSubagentSubmissionCommittedDuringCancellation:
@@ -253,6 +270,7 @@ def durable_subagent_submission_unsettled_during_cancellation(
     *,
     unsettled: BaseException,
     cancellation: asyncio.CancelledError,
+    subsequent_cancellation: asyncio.CancelledError | None,
     cancellation_requests_consumed: int,
 ) -> RuntimeError:
     """Carry an unsettled result to the boundary that owns timeout classification."""
@@ -267,6 +285,11 @@ def durable_subagent_submission_unsettled_during_cancellation(
         raise TypeError("Durable subagent cancellation requires runtime-owned unsettled evidence.")
     if not isinstance(cancellation, asyncio.CancelledError):
         raise TypeError("Durable subagent cancellation settlement requires CancelledError.")
+    if subsequent_cancellation is not None and not isinstance(
+        subsequent_cancellation,
+        asyncio.CancelledError,
+    ):
+        raise TypeError("Subsequent durable subagent cancellation must be CancelledError.")
     if type(cancellation_requests_consumed) is not int or cancellation_requests_consumed < 1:
         raise ValueError(
             "Durable subagent cancellation settlement requires consumed cancellation evidence."
@@ -277,6 +300,7 @@ def durable_subagent_submission_unsettled_during_cancellation(
     _DURABLE_SUBAGENT_UNSETTLED_CANCELLATION_PROVENANCE[signal] = (
         unsettled,
         cancellation,
+        subsequent_cancellation,
         cancellation_requests_consumed,
     )
     return signal
@@ -284,7 +308,15 @@ def durable_subagent_submission_unsettled_during_cancellation(
 
 def durable_subagent_unsettled_cancellation_outcome(
     error: BaseException,
-) -> tuple[RuntimeError, asyncio.CancelledError, int] | None:
+) -> (
+    tuple[
+        RuntimeError,
+        asyncio.CancelledError,
+        asyncio.CancelledError | None,
+        int,
+    ]
+    | None
+):
     """Return only runtime-owned unsettled cancellation evidence."""
 
     if type(error) is not _DurableSubagentSubmissionUnsettledDuringCancellation:

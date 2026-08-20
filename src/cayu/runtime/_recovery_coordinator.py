@@ -1237,6 +1237,7 @@ RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterat
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
 IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
+RecoveryMutationHook = Callable[[], Awaitable[None]]
 IncompleteRecoveryResultHook = Callable[
     [IncompleteSessionRecoveryResult],
     Awaitable[IncompleteSessionRecoveryResult],
@@ -2805,6 +2806,7 @@ class RecoveryCoordinator:
         checkpoint_transform: CheckpointTransform | None = None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
         preserve_open_interaction_on_failure: bool = False,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
 
@@ -2820,6 +2822,26 @@ class RecoveryCoordinator:
         expected_statuses = (
             {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
         )
+        if before_mutation is not None:
+            preflight_events = await self._session_store.query_events(
+                EventQuery(
+                    session_id=loaded_session.id,
+                    event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            if (
+                not preflight_events
+                or preflight_events[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES
+            ):
+                raise RuntimeError(
+                    "Pending recovery state has no open interaction. "
+                    "Pre-interaction prerelease recovery state is unsupported."
+                )
+            if preflight_events[0].event.interaction_id is None:
+                raise RuntimeError("Interaction lifecycle event has no interaction identity.")
+            await before_mutation()
         if loaded_session.status in expected_statuses:
             (
                 loaded_session,
@@ -3049,6 +3071,8 @@ class RecoveryCoordinator:
     async def resolve_user_input(
         self,
         response: UserInputResponse,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -3128,6 +3152,7 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             execution_profile_snapshot=execution_profile_snapshot,
+            before_mutation=before_mutation,
         )
         if resumed_event is not None:
             yield resumed_event
@@ -3166,6 +3191,8 @@ class RecoveryCoordinator:
     async def recover_user_input_request(
         self,
         request: UserInputRecoveryRequest,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a user-input round stuck on `manual_recovery_required`.
 
@@ -3247,6 +3274,7 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             execution_profile_snapshot=execution_profile_snapshot,
+            before_mutation=before_mutation,
         )
         if resumed_event is not None:
             yield resumed_event
@@ -3284,6 +3312,8 @@ class RecoveryCoordinator:
     async def resolve_tool_approval(
         self,
         request: ToolApprovalRequest,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self._session_store.load(request.session_id)
         if loaded_session is None:
@@ -3327,6 +3357,8 @@ class RecoveryCoordinator:
                 raise SessionRuntimePublicationConflict(
                     "Tool approval closure event is missing from durable history."
                 )
+            if before_mutation is not None:
+                await before_mutation()
             await self.materialize_deferred_input_for_receipt(close_receipt)
             closure_event = closure_records[0].event
             yield closure_event
@@ -3481,6 +3513,7 @@ class RecoveryCoordinator:
             registered_environment=registered_environment,
             checkpoint_transform=claim_exact_approval,
             execution_profile_snapshot=execution_profile_snapshot,
+            before_mutation=before_mutation,
         )
         if pending_approval is None or pending_round is None:
             raise RuntimeError("Tool approval claim completed without approval state.")
@@ -3522,6 +3555,8 @@ class RecoveryCoordinator:
     async def resolve_provider_operation(
         self,
         request: ProviderOperationResolutionRequest,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Accept one disposition and drive its durable effect to a recovery boundary."""
 
@@ -3533,6 +3568,7 @@ class RecoveryCoordinator:
             self._session_store,
             request,
             redactor=self._secret_redactor,
+            before_resolution=before_mutation,
         )
         if not result.replayed:
             await self._event_writer.fan_out_persisted([result.event])
@@ -4205,6 +4241,8 @@ class RecoveryCoordinator:
     async def recover_tool_approval_request(
         self,
         request: ToolApprovalRecoveryRequest,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self._session_store.load(request.session_id)
         if loaded_session is None:
@@ -4314,6 +4352,7 @@ class RecoveryCoordinator:
             registered_environment=registered_environment,
             checkpoint_transform=claim_exact_approval,
             execution_profile_snapshot=execution_profile_snapshot,
+            before_mutation=before_mutation,
         )
         if pending_approval is None or pending_round is None:
             raise RuntimeError("Tool approval recovery claim completed without approval state.")
@@ -4369,6 +4408,8 @@ class RecoveryCoordinator:
     async def recover_tool_round_request(
         self,
         request: ToolRoundRecoveryRequest,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a crashed ordinary tool round with an operator-verified outcome.
 
@@ -4469,6 +4510,27 @@ class RecoveryCoordinator:
             raise _ManualRecoveryCascadePending(
                 "Session has an incomplete background interruption cascade."
             )
+        if before_mutation is not None:
+            if self._session_control.has_active_tasks(loaded_session.id):
+                raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
+            interaction_records = await self._session_store.query_events(
+                EventQuery(
+                    session_id=loaded_session.id,
+                    event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            if (
+                not interaction_records
+                or interaction_records[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES
+                or interaction_records[0].event.interaction_id is None
+            ):
+                raise RuntimeError(
+                    "Pending tool recovery state has no open interaction. "
+                    "Pre-interaction prerelease recovery state is unsupported."
+                )
+            await before_mutation()
         if (
             loaded_session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
             and not pending_operator_interruption
@@ -10644,6 +10706,8 @@ class RecoveryCoordinator:
     async def recover_incomplete_session(
         self,
         request: IncompleteSessionRecoveryRequest,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
         """Repair one incomplete session without executing providers or tools."""
         session = await self._session_store.load(request.session_id)
@@ -10654,12 +10718,18 @@ class RecoveryCoordinator:
             inactive_before=request.inactive_before,
             reason=request.reason,
             metadata=request.metadata,
+            before_mutation=before_mutation,
         )
-        return await self._finish_provider_operation_disposition_after_recovery(recovered)
+        return await self._finish_provider_operation_disposition_after_recovery(
+            recovered,
+            before_mutation=before_mutation,
+        )
 
     async def _finish_provider_operation_disposition_after_recovery(
         self,
         recovered: IncompleteSessionRecoveryResult,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
         pending_resolution = await load_pending_provider_operation_disposition(
             self._session_store,
@@ -10668,6 +10738,8 @@ class RecoveryCoordinator:
         if pending_resolution is None:
             return recovered
         pending, result = pending_resolution
+        if before_mutation is not None:
+            await before_mutation()
         if await self._retire_completed_provider_operation_disposition(
             pending=pending,
             result=result,
@@ -10858,6 +10930,7 @@ class RecoveryCoordinator:
         request: IncompleteSessionsRecoveryRequest,
         *,
         before_recovery: IncompleteRecoveryScopeHook | None = None,
+        before_mutation: IncompleteRecoveryScopeHook | None = None,
         after_recovery: IncompleteRecoveryScopeHook | None = None,
         reconcile_result: IncompleteRecoveryResultHook | None = None,
     ) -> IncompleteSessionsRecoveryPage:
@@ -10957,6 +11030,7 @@ class RecoveryCoordinator:
                             session=candidate,
                             request=request,
                             before_recovery=before_recovery,
+                            before_mutation=before_mutation,
                             after_recovery=after_recovery,
                             reconcile_result=reconcile_result,
                         )
@@ -11018,6 +11092,7 @@ class RecoveryCoordinator:
         session: Session,
         request: IncompleteSessionsRecoveryRequest,
         before_recovery: IncompleteRecoveryScopeHook | None,
+        before_mutation: IncompleteRecoveryScopeHook | None,
         after_recovery: IncompleteRecoveryScopeHook | None,
         reconcile_result: IncompleteRecoveryResultHook | None,
     ) -> IncompleteSessionRecoveryResult:
@@ -11030,8 +11105,16 @@ class RecoveryCoordinator:
                     inactive_before=request.inactive_before,
                     reason=request.reason,
                     metadata=request.metadata,
+                    before_mutation=(
+                        None if before_mutation is None else lambda: before_mutation(session.id)
+                    ),
                 )
-                result = await self._finish_provider_operation_disposition_after_recovery(result)
+                result = await self._finish_provider_operation_disposition_after_recovery(
+                    result,
+                    before_mutation=(
+                        None if before_mutation is None else lambda: before_mutation(session.id)
+                    ),
+                )
                 return result if reconcile_result is None else await reconcile_result(result)
             finally:
                 if after_recovery is not None:
@@ -11071,6 +11154,7 @@ class RecoveryCoordinator:
         inactive_before: datetime | None,
         reason: str,
         metadata: dict[str, Any],
+        before_mutation: RecoveryMutationHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_json_value(metadata, "metadata")
@@ -11092,6 +11176,7 @@ class RecoveryCoordinator:
             reason=reason,
             metadata=metadata,
             previous_status=previous_status,
+            before_mutation=before_mutation,
         )
 
     async def _recover_incomplete_session_owned(
@@ -11102,7 +11187,17 @@ class RecoveryCoordinator:
         reason: str,
         metadata: dict[str, Any],
         previous_status: SessionStatus,
+        before_mutation: RecoveryMutationHook | None,
     ) -> IncompleteSessionRecoveryResult:
+
+        mutation_admitted = False
+
+        async def admit_before_mutation() -> None:
+            nonlocal mutation_admitted
+            if mutation_admitted or before_mutation is None:
+                return
+            await before_mutation()
+            mutation_admitted = True
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
         active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
@@ -11190,6 +11285,7 @@ class RecoveryCoordinator:
                         run_epoch=session.run_epoch,
                     )
                 ):
+                    await admit_before_mutation()
                     return await self._settle_terminal_invocation_closure_owned(
                         session=session,
                         inactive_before=inactive_before,
@@ -11205,6 +11301,7 @@ class RecoveryCoordinator:
                     message="Session is terminal and has durable terminal evidence.",
                 )
             if terminal_repair and not has_pending_work:
+                await admit_before_mutation()
                 return await self._repair_terminal_evidence_owned(
                     session=session,
                     inactive_before=inactive_before,
@@ -11215,6 +11312,7 @@ class RecoveryCoordinator:
             registered_agent = self._resolve_registered_agent(session.agent_name)
         except KeyError:
             if terminal_repair_required:
+                await admit_before_mutation()
                 return await self._repair_terminal_evidence_owned(
                     session=session,
                     inactive_before=inactive_before,
@@ -11232,6 +11330,7 @@ class RecoveryCoordinator:
             registered_environment = self._resolve_registered_environment(session.environment_name)
         except KeyError:
             if terminal_repair_required:
+                await admit_before_mutation()
                 return await self._repair_terminal_evidence_owned(
                     session=session,
                     inactive_before=inactive_before,
@@ -11324,6 +11423,7 @@ class RecoveryCoordinator:
         claim: _IncompleteRecoveryClaim | None = None
         authoritative_failure: BaseException | None = None
         try:
+            await admit_before_mutation()
             claim = await self._claim_incomplete_recovery(
                 session=session,
                 inactive_before=inactive_before,

@@ -33,6 +33,7 @@ from cayu import (
     ArtifactScope,
     BillingIdentity,
     CayuApp,
+    CompletionVerifierRef,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
@@ -60,8 +61,11 @@ from cayu import (
     TextPart,
     ThinkingPart,
     UserInputTool,
+    WorkContractDraft,
+    WorkCriterion,
     WorkspaceBinding,
     default_price_book,
+    work_contract_from_draft,
 )
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
@@ -1961,6 +1965,75 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
     assert "error" not in tasks[0]
     assert "metadata" not in tasks[0]
     assert isinstance(tasks[0]["updated_at"], str)
+
+
+def test_server_task_status_omits_private_work_contract_fingerprint() -> None:
+    secret = "private-verification-threshold"
+    task_store = InMemoryTaskStore()
+    contract = work_contract_from_draft(
+        WorkContractDraft(
+            contract_id="private-status-contract",
+            version=1,
+            objective=f"Approve only when the score exceeds {secret}.",
+            criteria=(
+                WorkCriterion(
+                    criterion_id="threshold",
+                    ordinal=1,
+                    description=f"Confirm the private threshold {secret}.",
+                ),
+            ),
+            verifier=CompletionVerifierRef(
+                verifier_id="private-status-verifier",
+                version="v1",
+                configuration_fingerprint="0" * 64,
+            ),
+        )
+    )
+
+    async def setup_task() -> None:
+        await task_store.publish_work_contract(contract)
+        task = await task_store.create_task(
+            TaskCreate(
+                task_id="private-status-task",
+                type="verified-work",
+                work_contract=contract.reference(),
+            )
+        )
+        claimed = await task_store.claim_task("ordinary-worker")
+        assert claimed is not None
+        assert claimed.id == task.id
+        await task_store.hold_claimed_work_contract_task(
+            task.id,
+            worker_id="ordinary-worker",
+            contract=contract.reference(),
+        )
+
+    asyncio.run(setup_task())
+    client = TestClient(
+        create_server(
+            CayuApp(
+                task_store=task_store,
+                secret_redactor=SecretRedactor(secret),
+            ),
+            config=_LOCAL_SERVER_CONFIG,
+        )
+    )
+
+    list_response = client.get("/api/tasks")
+    detail_response = client.get("/api/tasks/private-status-task")
+    assert list_response.status_code == 200
+    assert detail_response.status_code == 200
+    listed = list_response.json()[0]
+    detailed = detail_response.json()
+    expected_status = {
+        "contract_id": contract.contract_id,
+        "contract_version": contract.version,
+    }
+    assert listed["status_payload"] == expected_status
+    assert detailed["status_payload"] == expected_status
+    for rendered in (list_response.text, detail_response.text):
+        assert secret not in rendered
+        assert contract.fingerprint not in rendered
 
 
 def test_server_task_endpoints_serialize_availability_in_canonical_utc() -> None:

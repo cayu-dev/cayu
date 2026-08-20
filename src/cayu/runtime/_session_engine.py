@@ -226,6 +226,10 @@ from cayu.runtime._structured_output_tool_round import (
     _StructuredOutputToolRoundPublicationExtension,
     _validate_structured_output_tool_round,
 )
+from cayu.runtime._task_store_operation_boundary import (
+    capture_sensitive_validation,
+    capture_task_store_operation,
+)
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
@@ -484,6 +488,7 @@ from cayu.runtime.sessions import (
     copy_run_request,
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
+    run_request_authority_is_runtime_generated,
     run_request_with_task_invocation,
     runtime_prepared_session_authority,
     runtime_publication_checkpoint_mutation,
@@ -519,6 +524,7 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.tasks import (
     Task,
+    TaskCompletionDecisionRequired,
     TaskQuery,
     TaskStatus,
     TaskStore,
@@ -526,6 +532,7 @@ from cayu.runtime.tasks import (
     TaskTerminalKind,
     _task_invocation_for_attachment,
     _terminalize_claimed_task,
+    copy_task,
 )
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
@@ -585,6 +592,89 @@ _RESUMABLE_SESSION_STATUSES = {
 _FORKABLE_SESSION_STATUSES = _RESUMABLE_SESSION_STATUSES
 _PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY = "prompt_anatomy_transition_intents"
 _PROMPT_ANATOMY_TRANSITION_INTENT_LIMIT = 256
+
+
+def _validate_fork_source_checkpoint_state(
+    current_source: Session,
+    source_checkpoint: dict[str, Any] | None,
+    *,
+    copy_checkpoint: bool,
+    clock: Callable[[], datetime],
+    redactor: SecretRedactor,
+) -> dict[str, Any] | None:
+    """Reject source state that no direct or grouped fork may inherit."""
+
+    claim_now = clock()
+    recovery_claim = _incomplete_recovery_claim_from_checkpoint(source_checkpoint)
+    if recovery_claim is not None and recovery_claim[1] <= claim_now:
+        raise _ExpiredIncompleteRecoveryClaim(recovery_claim[0])
+    source_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
+        source_checkpoint,
+        now=claim_now,
+    )
+    if _initial_transcript_pending_interaction_id(source_checkpoint) is not None:
+        raise RuntimeError(
+            "Source session setup did not publish its authoritative initial "
+            "transcript; fork fails closed. Start a new session."
+        )
+    if source_checkpoint is not None and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint:
+        operations = _session_operation_state(source_checkpoint)
+        _abandon_expired_session_operation(operations, now=clock())
+        source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+    active_operation_id = _active_session_operation_id(source_checkpoint)
+    if active_operation_id is not None:
+        raise RuntimeError(f"Session has an active durable operation: {active_operation_id}")
+    if current_source.status == SessionStatus.INTERRUPTED and not copy_checkpoint:
+        raise ValueError("Interrupted sessions cannot be forked without checkpoint state.")
+    if current_source.status == SessionStatus.INTERRUPTED and source_checkpoint is None:
+        raise RuntimeError(
+            "Interrupted session cannot be forked because checkpoint state is missing."
+        )
+    if (
+        pending_user_input_from_checkpoint(
+            source_checkpoint,
+            redactor=redactor,
+            consume_on_rejection=True,
+        )
+        is not None
+    ):
+        raise RuntimeError(
+            "Session awaiting user input cannot be forked; answer it with "
+            "resolve_user_input(...) first."
+        )
+    if (
+        approval_support.pending_approval_from_checkpoint(
+            source_checkpoint,
+            redactor=redactor,
+            consume_on_rejection=True,
+        )
+        is not None
+    ):
+        raise RuntimeError(
+            "Session awaiting tool approval cannot be forked; resolve it with "
+            "resolve_tool_approval(...) first."
+        )
+    if (
+        tool_round_recovery.pending_tool_round_from_checkpoint(
+            source_checkpoint,
+            redactor=redactor,
+            consume_on_rejection=True,
+        )
+        is not None
+    ):
+        raise RuntimeError(
+            "Session with a pending tool round cannot be forked; resume or "
+            "recover the session first."
+        )
+    if (
+        source_checkpoint is not None
+        and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in source_checkpoint
+    ):
+        raise RuntimeError(
+            "Session has an incomplete background interruption cascade. "
+            "Retry the interruption before forking it."
+        )
+    return source_checkpoint
 
 
 class _PromptTransitionIntentStatus(StrEnum):
@@ -844,6 +934,7 @@ async def _reconcile_committed_prompt_transition_intents(
     source_session_id: str,
     checkpoint: dict[str, Any] | None,
     clock: Callable[[], datetime],
+    persist: bool = True,
 ) -> dict[str, Any] | None:
     """Complete prepared intents whose descendants already prove the durable effect."""
 
@@ -869,11 +960,7 @@ async def _reconcile_committed_prompt_transition_intents(
 
     reconciled_checkpoint: dict[str, Any] | None = None
 
-    def reconcile(
-        _current_source: Session,
-        current_checkpoint: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        nonlocal reconciled_checkpoint
+    def reconciled_value(current_checkpoint: dict[str, Any] | None) -> dict[str, Any]:
         if current_checkpoint is None:
             raise RuntimeError("Prompt-anatomy transition intent disappeared.")
         updated = copy_json_value(current_checkpoint, "checkpoint")
@@ -881,20 +968,25 @@ async def _reconcile_committed_prompt_transition_intents(
             updated,
             required=True,
         )
-        changed = False
         for receipt, descendant_created_at in committed_receipts:
-            changed = (
-                current_ledger.complete_from_receipt(
-                    receipt,
-                    descendant_created_at=descendant_created_at,
-                    completed_at=clock(),
-                )
-                or changed
+            current_ledger.complete_from_receipt(
+                receipt,
+                descendant_created_at=descendant_created_at,
+                completed_at=clock(),
             )
-        if changed:
-            current_ledger.store_in(updated)
-        reconciled_checkpoint = updated
+        current_ledger.store_in(updated)
         return updated
+
+    if not persist:
+        return reconciled_value(checkpoint)
+
+    def reconcile(
+        _current_source: Session,
+        current_checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        nonlocal reconciled_checkpoint
+        reconciled_checkpoint = reconciled_value(current_checkpoint)
+        return reconciled_checkpoint
 
     await session_store.publish_checkpoint_and_events(
         source_session_id,
@@ -4607,6 +4699,11 @@ class SessionEngine:
                 for session in result.sessions:
                     if session.id in admitted_parent_ids:
                         continue
+                    if (
+                        session.status == SessionStatus.INTERRUPTING
+                        and interrupting_inactive_before is None
+                    ):
+                        continue
                     try:
                         marker = await self._load_pending_interruption_cascade(session.id)
                     except (TypeError, ValueError) as exc:
@@ -4618,12 +4715,46 @@ class SessionEngine:
                         continue
                     if marker is None:
                         continue
+                    if session.status == SessionStatus.INTERRUPTING:
+                        (
+                            requires_completion_decision,
+                            admission_failure,
+                        ) = await self._verifier_aware_task_execution_outcome(
+                            None,
+                            session_id=session.id,
+                            admit_session=False,
+                        )
+                        if admission_failure is not None:
+                            del marker, result, session
+                            raise admission_failure from None
+                        if requires_completion_decision:
+                            # Keep both the stale parent and its durable cascade marker
+                            # untouched for the verifier-aware recovery owner.
+                            continue
                     already_scheduled = self._background_interruption_coordinator.is_admitted(
                         session.id
                     )
                     if session.status == SessionStatus.INTERRUPTING:
-                        if interrupting_inactive_before is None:
-                            continue
+                        recovery_session_id = session.id
+
+                        async def admit_before_recovery_mutation(
+                            session_id: str = recovery_session_id,
+                        ) -> None:
+                            (
+                                requires_completion_decision,
+                                admission_failure,
+                            ) = await self._verifier_aware_task_execution_outcome(
+                                None,
+                                session_id=session_id,
+                            )
+                            if admission_failure is not None:
+                                raise admission_failure from None
+                            if requires_completion_decision:
+                                raise TaskCompletionDecisionRequired(
+                                    "Contracted tasks require the verifier-aware execution "
+                                    "entrance."
+                                ) from None
+
                         with suppress_interruption_cascade():
                             recovery = await self._recovery_coordinator.recover_incomplete_session(
                                 IncompleteSessionRecoveryRequest(
@@ -4631,7 +4762,8 @@ class SessionEngine:
                                     inactive_before=interrupting_inactive_before,
                                     reason="interruption_cascade_startup_recovery",
                                     metadata={"source": "resume_pending_interruption_cascades"},
-                                )
+                                ),
+                                before_mutation=admit_before_recovery_mutation,
                             )
                         session = await self._require_session(session.id)
                         if session.status != SessionStatus.INTERRUPTED:
@@ -4748,6 +4880,22 @@ class SessionEngine:
         request: IncompleteSessionRecoveryRequest,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            None,
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         interaction_id = await self._activate_latest_open_interaction(request.session_id)
         active_through = (
             None
@@ -4763,7 +4911,26 @@ class SessionEngine:
                 active_through,
             )
         try:
-            result = await self._recovery_coordinator.recover_incomplete_session(request)
+
+            async def admit_before_mutation() -> None:
+                (
+                    requires_completion_decision,
+                    admission_failure,
+                ) = await self._verifier_aware_task_execution_outcome(
+                    None,
+                    session_id=request.session_id,
+                )
+                if admission_failure is not None:
+                    raise admission_failure from None
+                if requires_completion_decision:
+                    raise TaskCompletionDecisionRequired(
+                        "Contracted tasks require the verifier-aware execution entrance."
+                    ) from None
+
+            result = await self._recovery_coordinator.recover_incomplete_session(
+                request,
+                before_mutation=admit_before_mutation,
+            )
             if interaction_id is not None:
                 _activate_session_interaction(request.session_id, interaction_id)
             return await self._reconcile_recovered_interaction(
@@ -4781,7 +4948,21 @@ class SessionEngine:
         request = copy_incomplete_sessions_recovery_request(request)
         active_through_by_session: dict[str, datetime] = {}
 
-        async def activate_interaction(session_id: str) -> None:
+        async def admit_and_activate_interaction(session_id: str) -> None:
+            (
+                requires_completion_decision,
+                admission_failure,
+            ) = await self._verifier_aware_task_execution_outcome(
+                None,
+                session_id=session_id,
+                admit_session=False,
+            )
+            if admission_failure is not None:
+                raise admission_failure from None
+            if requires_completion_decision:
+                raise TaskCompletionDecisionRequired(
+                    "Contracted tasks require the verifier-aware execution entrance."
+                ) from None
             interaction_id = await self._activate_latest_open_interaction(session_id)
             if interaction_id is not None:
                 active_through_by_session[session_id] = await self._latest_interaction_activity_at(
@@ -4792,6 +4973,21 @@ class SessionEngine:
                     session_id,
                     active_through_by_session[session_id],
                 )
+
+        async def admit_before_mutation(session_id: str) -> None:
+            (
+                requires_completion_decision,
+                admission_failure,
+            ) = await self._verifier_aware_task_execution_outcome(
+                None,
+                session_id=session_id,
+            )
+            if admission_failure is not None:
+                raise admission_failure from None
+            if requires_completion_decision:
+                raise TaskCompletionDecisionRequired(
+                    "Contracted tasks require the verifier-aware execution entrance."
+                ) from None
 
         async def deactivate_interaction(session_id: str) -> None:
             _deactivate_session_interaction(session_id)
@@ -4808,13 +5004,15 @@ class SessionEngine:
                 recovered_active_through=active_through_by_session.get(result.session_id),
             )
 
-        page = await self._recovery_coordinator.recover_incomplete_sessions(
+        recovery = self._recovery_coordinator.recover_incomplete_sessions(
             request,
-            before_recovery=activate_interaction,
+            before_recovery=admit_and_activate_interaction,
+            before_mutation=admit_before_mutation,
             after_recovery=deactivate_interaction,
             reconcile_result=reconcile_result,
         )
-        return page
+        del request
+        return await recovery
 
     async def _activate_latest_open_interaction(self, session_id: str) -> str | None:
         records = await self.session_store.query_events(
@@ -5930,8 +6128,15 @@ class SessionEngine:
         finally:
             _deactivate_session_interaction(session.id)
 
-    async def _prepare_initial_run(self, request: RunRequest) -> _PreparedInitialRun:
-        """Resolve one new-session request without creating or admitting a session."""
+    async def _prepare_initial_run(
+        self,
+        request: RunRequest,
+        *,
+        registered_agent_override: runtime_records.RegisteredAgentState | None = None,
+        admit_session: bool = True,
+        store_resolved_existing_session_id: str | None = None,
+    ) -> _PreparedInitialRun | None:
+        """Resolve one new-session request, optionally without ordinary admission."""
 
         request = session_request_boundary.prepare_run_request(
             request,
@@ -5951,8 +6156,40 @@ class SessionEngine:
         # Freeze application-budget authority before any await can expose the
         # prepared invocation. The same snapshot must govern both the durable
         # execution profile and the model dispatch that follows it.
+        deferred_runtime_task_creation = (
+            request.task_id is not None
+            and run_request_authority_is_runtime_generated(
+                request,
+                field_name="task_id",
+                value=request.task_id,
+            )
+        )
+        # Reject authority that is already attached to an explicit session
+        # before workspace/provider extensions participate in preparation. The
+        # final call below still performs the atomic ordinary-execution
+        # admission, closing a concurrent contract-attachment race.
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=request.session_id,
+            admit_session=False,
+            allow_missing_task=deferred_runtime_task_creation,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            return None
         budget_policy = copy_budget_policy(self._get_budget_policy())
-        registered_agent = self._get_registered_agent(request.agent_name)
+        registered_agent = (
+            self._get_registered_agent(request.agent_name)
+            if registered_agent_override is None
+            else registered_agent_override
+        )
+        if registered_agent.spec.name != request.agent_name:
+            raise ValueError("Initial-run agent override conflicts with the request agent.")
         # An explicit target is exact. Otherwise the agent model and optional
         # provider pin feed the existing routing/default selection.
         if request.target is not None:
@@ -6037,11 +6274,35 @@ class SessionEngine:
         _require_native_structured_output_support(
             request.structured_output, registered_provider=registered_provider
         )
+        prepared_session_id = request.session_id
+        if prepared_session_id is None:
+            raise AssertionError("Run request session identity was not assigned.")
+        if runtime_prepared_session_authority(request) is None:
+            existing_session = await self.session_store.load(prepared_session_id)
+            if existing_session is not None and (
+                store_resolved_existing_session_id != prepared_session_id
+            ):
+                del existing_session
+                raise ValueError(f"Session already exists: {prepared_session_id}")
         session_identity = _session_identity(
             provider_name=registered_provider.name,
             model=model,
             execution_profile=execution_profile,
         )
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=request.session_id,
+            admit_session=admit_session,
+            allow_missing_task=deferred_runtime_task_creation,
+        )
+        if admission_failure is not None:
+            del request, workspace_instructions, rendered_system_prompt, prompt_contributions
+            raise admission_failure from None
+        if requires_completion_decision:
+            return None
         return _PreparedInitialRun(
             request=request,
             registered_agent=registered_agent,
@@ -6055,8 +6316,203 @@ class SessionEngine:
             session_identity=session_identity,
         )
 
+    async def _verifier_aware_task_execution_outcome(
+        self,
+        task_id: str | None,
+        *,
+        session_id: str | None = None,
+        admit_session: bool = True,
+        allow_missing_task: bool = False,
+    ) -> tuple[bool, BaseException | None]:
+        if self.task_store is None:
+            # Preserve the established run lifecycle: a missing TaskStore is
+            # terminalized after session creation with ordinary durable failure
+            # evidence. With no store there is no contract authority to inspect
+            # or admit at this earlier verifier-aware boundary.
+            return False, None
+        task_store = self.task_store
+
+        # An explicit task is authoritative evidence in its own right. Inspect
+        # it even when the store does not implement the complete verified-work
+        # lifecycle: an adopted/custom store must not turn a materialized
+        # contract binding into ordinary execution merely through its
+        # capability flag.
+        if task_id is not None:
+            task_outcome = await capture_task_store_operation(
+                lambda: task_store.load_task(task_id),
+                operation_name="Verified-work task lookup",
+                redactor=self._secret_redactor,
+            )
+            if task_outcome.failure is not None:
+                return False, task_outcome.failure
+            task = task_outcome.result
+            del task_outcome
+            if task is None:
+                if not allow_missing_task:
+                    return False, KeyError("Task not found.")
+            else:
+                validation = capture_sensitive_validation(
+                    lambda task=task: copy_task(task),
+                    operation_name="Verified-work task lookup result validation",
+                    redactor=self._secret_redactor,
+                )
+                del task
+                if validation.failure is not None:
+                    return False, validation.failure
+                task = validation.result
+                del validation
+                if task is None:
+                    return False, RuntimeError("Task store returned an invalid task lookup result.")
+                if task.id != task_id:
+                    del task
+                    return False, RuntimeError(
+                        "Task store returned a task other than the exact requested task."
+                    )
+                requires_completion_decision = task.work_contract is not None
+                del task
+                if requires_completion_decision:
+                    return True, None
+
+        if session_id is None:
+            return False, None
+        session_contract_lookup_supported = (
+            type(task_store).load_active_work_contract_task_for_session
+            is not TaskStore.load_active_work_contract_task_for_session
+        )
+        session_admission_supported = (
+            type(task_store).admit_ordinary_session_execution
+            is not TaskStore.admit_ordinary_session_execution
+        )
+        if (
+            not task_store.supports_verified_work_contracts
+            and not session_contract_lookup_supported
+            and not session_admission_supported
+        ):
+            return False, None
+        if not admit_session:
+            if (
+                not task_store.supports_verified_work_contracts
+                and not session_contract_lookup_supported
+            ):
+                return False, None
+            task_outcome = await capture_task_store_operation(
+                lambda: task_store.load_active_work_contract_task_for_session(session_id),
+                operation_name="Verified-work session lookup",
+                redactor=self._secret_redactor,
+            )
+            if task_outcome.failure is not None:
+                return False, task_outcome.failure
+            task = task_outcome.result
+            del task_outcome
+            if task is not None and type(task) is not Task:
+                del task
+                return False, RuntimeError(
+                    "Task store returned an invalid session contract lookup result."
+                )
+            requires_completion_decision = task is not None
+            del task
+            return requires_completion_decision, None
+        admission_outcome = await capture_task_store_operation(
+            lambda: task_store.admit_ordinary_session_execution(session_id),
+            operation_name="Ordinary session execution admission",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="admit_ordinary_session_execution",
+        )
+        if type(admission_outcome.failure) is TaskCompletionDecisionRequired:
+            return True, None
+        if admission_outcome.failure is not None:
+            return False, admission_outcome.failure
+        return False, None
+
+    async def _require_ordinary_session_execution(
+        self,
+        session_id: str,
+        *,
+        admit_session: bool,
+    ) -> None:
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            None,
+            session_id=session_id,
+            admit_session=admit_session,
+        )
+        if admission_failure is not None:
+            raise admission_failure from None
+        if requires_completion_decision:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+
+    async def preflight_fork_source_checkpoint_state(
+        self,
+        source: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> None:
+        """Apply direct-fork source-state rules before a group owns authority."""
+
+        if source.status not in _FORKABLE_SESSION_STATUSES:
+            raise ValueError(
+                f"Only completed, failed, or interrupted sessions can be forked: {source.status}"
+            )
+        active_model_stage = await self.session_store.load_active_model_completion_stage(source.id)
+        if active_model_stage is not None:
+            del active_model_stage
+            raise session_request_boundary.ForkActiveModelStageError(
+                "Fork source session has an active model-completion stage."
+            ) from None
+        copied_checkpoint = (
+            None if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        )
+        try:
+            try:
+                _validate_fork_source_checkpoint_state(
+                    source,
+                    copied_checkpoint,
+                    copy_checkpoint=True,
+                    clock=self._clock,
+                    redactor=self._secret_redactor,
+                )
+            except _ExpiredIncompleteRecoveryClaim as expired_claim:
+                await self._fence_expired_incomplete_recovery_claim_for_fork(
+                    source.id,
+                    expired_claim,
+                )
+        finally:
+            if copied_checkpoint is not None:
+                copied_checkpoint.clear()
+
+    async def _fence_expired_incomplete_recovery_claim_for_fork(
+        self,
+        session_id: str,
+        expired_claim: _ExpiredIncompleteRecoveryClaim,
+    ) -> NoReturn:
+        current = await self._require_session(session_id)
+        fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
+            session=current,
+            claim_id=expired_claim.claim_id,
+        )
+        if not fenced:
+            raise RuntimeError(
+                "Expired incomplete-session recovery ownership changed while the "
+                "fork was fencing it; retry with current session state."
+            ) from None
+        raise ValueError(
+            "Session fork fenced an expired incomplete-session recovery owner; "
+            "retry with current session state."
+        ) from None
+
     async def run(self, request: RunRequest) -> AsyncGenerator[Event, None]:
-        prepared = await self._prepare_initial_run(request)
+        preparation = self._prepare_initial_run(request)
+        del request
+        prepared = await preparation
+        del preparation
+        if prepared is None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         request = prepared.request
         registered_agent = prepared.registered_agent
         registered_provider = prepared.registered_provider
@@ -6707,15 +7163,17 @@ class SessionEngine:
             redactor=self._secret_redactor,
             store_resolved_session_id=store_resolved_session_id,
         )
-        task_id = await self._linked_running_task_id(request.session_id)
+        task_id = await self._linked_resume_task_id(request.session_id)
         session_stream = self._resume_session(
             request=request,
             task_id=task_id,
             start_event_payload_extra={},
             start_task_on_enter=False,
         )
+        session_id = request.session_id
+        del request
         forwarded_stream = self._session_control.stream_with_out_of_band_events(
-            request.session_id,
+            session_id,
             session_stream,
         )
         billing_identity_cancellation: asyncio.CancelledError | None = None
@@ -6750,6 +7208,22 @@ class SessionEngine:
             redactor=self._secret_redactor,
             store_resolved_session_id=store_resolved_session_id,
         )
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            None,
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         operation_stream = self._compact_session(request)
         forwarded_stream = self._session_control.stream_with_out_of_band_events(
             request.session_id,
@@ -6916,7 +7390,18 @@ class SessionEngine:
             source_session_id=loaded_session.id,
             checkpoint=checkpoint_before_claim,
             clock=self._clock,
+            persist=False,
         )
+
+        async def reconcile_after_admission() -> dict[str, Any] | None:
+            current_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+            return await _reconcile_committed_prompt_transition_intents(
+                session_store=self.session_store,
+                source_session_id=loaded_session.id,
+                checkpoint=current_checkpoint,
+                clock=self._clock,
+            )
+
         persisted_before_claim = await self.session_store.load_session_operation(
             loaded_session.id,
             request.idempotency_key,
@@ -6928,6 +7413,22 @@ class SessionEngine:
                 )
             replay_event_ids = _session_compaction_replay_event_ids(persisted_before_claim)
             if replay_event_ids is not None:
+                (
+                    requires_completion_decision,
+                    admission_failure,
+                ) = await self._verifier_aware_task_execution_outcome(
+                    None,
+                    session_id=loaded_session.id,
+                )
+                if admission_failure is not None:
+                    del loaded_session, request
+                    raise admission_failure from None
+                if requires_completion_decision:
+                    del loaded_session, request
+                    raise TaskCompletionDecisionRequired(
+                        "Contracted tasks require the verifier-aware execution entrance."
+                    ) from None
+                await reconcile_after_admission()
                 for event in await self._load_session_compaction_replay_events(
                     session_id=loaded_session.id,
                     event_ids=replay_event_ids,
@@ -6949,6 +7450,22 @@ class SessionEngine:
                     )
                 replay_event_ids = _session_compaction_replay_event_ids(existing_before_claim)
                 if replay_event_ids is not None:
+                    (
+                        requires_completion_decision,
+                        admission_failure,
+                    ) = await self._verifier_aware_task_execution_outcome(
+                        None,
+                        session_id=loaded_session.id,
+                    )
+                    if admission_failure is not None:
+                        del loaded_session, request
+                        raise admission_failure from None
+                    if requires_completion_decision:
+                        del loaded_session, request
+                        raise TaskCompletionDecisionRequired(
+                            "Contracted tasks require the verifier-aware execution entrance."
+                        ) from None
+                    await reconcile_after_admission()
                     for event in await self._load_session_compaction_replay_events(
                         session_id=loaded_session.id,
                         event_ids=replay_event_ids,
@@ -7017,6 +7534,22 @@ class SessionEngine:
                 "Session transcript contains a workload secret in execution authority "
                 "and cannot be compacted."
             ) from None
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            None,
+            session_id=loaded_session.id,
+        )
+        if admission_failure is not None:
+            del loaded_session, request, transcript
+            raise admission_failure from None
+        if requires_completion_decision:
+            del loaded_session, request, transcript
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        checkpoint_before_claim = await reconcile_after_admission()
         compaction_budget_policy = copy_budget_policy(self._get_budget_policy())
         candidate_app_policy_budget_limits = budget_limits_for_session(
             policy=compaction_budget_policy,
@@ -10890,6 +11423,22 @@ class SessionEngine:
             raise ValueError("A terminal event identity requires a session run operation.")
         if queue_task_id is not None and terminal_event_id is None:
             raise ValueError("A queue task identity requires a terminal event identity.")
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            task_id,
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         require_secret_free_structured_output_spec(
             request.structured_output,
             redactor=self._secret_redactor,
@@ -11166,6 +11715,7 @@ class SessionEngine:
             source_session_id=loaded_session.id,
             checkpoint=checkpoint,
             clock=self._clock,
+            persist=False,
         )
         validate_resumable_checkpoint(loaded_session, checkpoint)
         active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
@@ -11217,6 +11767,29 @@ class SessionEngine:
             raise RuntimeError(
                 "A session model target cannot change while model-completion recovery is pending."
             )
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_task_execution_outcome(
+            task_id,
+            session_id=request.session_id,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        checkpoint = await _reconcile_committed_prompt_transition_intents(
+            session_store=self.session_store,
+            source_session_id=loaded_session.id,
+            checkpoint=checkpoint,
+            clock=self._clock,
+        )
+        validate_resumable_checkpoint(loaded_session, checkpoint)
         (
             loaded_session,
             checkpoint,
@@ -12127,12 +12700,24 @@ class SessionEngine:
                     relationship=relationship,
                     events=persisted_events,
                 )
-                if request.system_prompt_policy is ForkSystemPromptPolicy.CURRENT_AGENT:
-                    succession = _PromptSuccessionWorkflow.recover(
+                succession = (
+                    _PromptSuccessionWorkflow.recover(
                         request=request,
                         accepted_request_sha256s=accepted_request_sha256s,
                         descendant=existing_descendant,
                     )
+                    if request.system_prompt_policy is ForkSystemPromptPolicy.CURRENT_AGENT
+                    else None
+                )
+                # Exact replay is still an ordinary fork entrance. Atomically
+                # admit the source immediately before checkpoint repair or
+                # public delivery so a concurrently attached work contract
+                # cannot be weakened by replaying an uncontracted descendant.
+                await self._require_ordinary_session_execution(
+                    source_session.id,
+                    admit_session=True,
+                )
+                if succession is not None:
 
                     def reconcile_surviving_intent(
                         _current_source: Session,
@@ -12545,98 +13130,35 @@ class SessionEngine:
             selected_source_records.clear()
             del source_snapshot
 
-        def reject_active_or_expired_recovery_claim(
-            source_checkpoint: dict[str, Any] | None,
-        ) -> dict[str, Any] | None:
-            claim_now = self._clock()
-            recovery_claim = _incomplete_recovery_claim_from_checkpoint(source_checkpoint)
-            if recovery_claim is not None and recovery_claim[1] <= claim_now:
-                raise _ExpiredIncompleteRecoveryClaim(recovery_claim[0])
-            return _checkpoint_without_active_incomplete_recovery_claim(
-                source_checkpoint,
-                now=claim_now,
-            )
-
         def validate_source_checkpoint(
             current_source: Session,
             source_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
-            source_checkpoint = reject_active_or_expired_recovery_claim(source_checkpoint)
-            if _initial_transcript_pending_interaction_id(source_checkpoint) is not None:
-                raise RuntimeError(
-                    "Source session setup did not publish its authoritative initial "
-                    "transcript; fork fails closed. Start a new session."
-                )
-            if (
-                source_checkpoint is not None
-                and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
-            ):
-                operations = _session_operation_state(source_checkpoint)
-                _abandon_expired_session_operation(operations, now=self._clock())
-                source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
-            active_operation_id = _active_session_operation_id(source_checkpoint)
-            if active_operation_id is not None:
-                raise RuntimeError(
-                    f"Session has an active durable operation: {active_operation_id}"
-                )
-            if current_source.status == SessionStatus.INTERRUPTED and not request.copy_checkpoint:
-                raise ValueError("Interrupted sessions cannot be forked without checkpoint state.")
-            if current_source.status == SessionStatus.INTERRUPTED and source_checkpoint is None:
-                raise RuntimeError(
-                    "Interrupted session cannot be forked because checkpoint state is missing."
-                )
-            if (
-                pending_user_input_from_checkpoint(
-                    source_checkpoint,
-                    redactor=self._secret_redactor,
-                    consume_on_rejection=True,
-                )
-                is not None
-            ):
-                raise RuntimeError(
-                    "Session awaiting user input cannot be forked; answer it with "
-                    "resolve_user_input(...) first."
-                )
-            if (
-                approval_support.pending_approval_from_checkpoint(
-                    source_checkpoint,
-                    redactor=self._secret_redactor,
-                    consume_on_rejection=True,
-                )
-                is not None
-            ):
-                raise RuntimeError(
-                    "Session awaiting tool approval cannot be forked; resolve it with "
-                    "resolve_tool_approval(...) first."
-                )
-            if (
-                tool_round_recovery.pending_tool_round_from_checkpoint(
-                    source_checkpoint,
-                    redactor=self._secret_redactor,
-                    consume_on_rejection=True,
-                )
-                is not None
-            ):
-                raise RuntimeError(
-                    "Session with a pending tool round cannot be forked; resume or "
-                    "recover the session first."
-                )
-            if (
-                source_checkpoint is not None
-                and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in source_checkpoint
-            ):
-                raise RuntimeError(
-                    "Session has an incomplete background interruption cascade. "
-                    "Retry the interruption before forking it."
-                )
-            return source_checkpoint
+            return _validate_fork_source_checkpoint_state(
+                current_source,
+                source_checkpoint,
+                copy_checkpoint=request.copy_checkpoint,
+                clock=self._clock,
+                redactor=self._secret_redactor,
+            )
 
         def checkpoint_transform(
             current_source: Session,
             source_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
             """Validate live checkpoint state even when the fork will discard it."""
+            return prepare_fork_checkpoint(
+                current_source,
+                source_checkpoint,
+                require_prepared_intent=True,
+            )
 
+        def prepare_fork_checkpoint(
+            current_source: Session,
+            source_checkpoint: dict[str, Any] | None,
+            *,
+            require_prepared_intent: bool,
+        ) -> dict[str, Any] | None:
             if expected_source_snapshot is not None:
                 _, live_source_profile, _ = (
                     session_request_boundary.prepare_fork_source_execution_profile(
@@ -12649,15 +13171,16 @@ class SessionEngine:
                         "Fork source execution profile changed after its coordinator "
                         "snapshot was frozen."
                     )
-            if expected_source_snapshot is not None and (
-                fork_source_checkpoint_sha256(source_checkpoint)
-                != expected_source_snapshot.checkpoint_sha256
-            ):
-                raise SessionRunFenced(
-                    "Fork source checkpoint changed after its coordinator snapshot was frozen."
-                )
+                if (
+                    fork_source_checkpoint_sha256(source_checkpoint)
+                    != expected_source_snapshot.checkpoint_sha256
+                ):
+                    raise SessionRunFenced(
+                        "Fork source checkpoint changed after its coordinator snapshot was frozen."
+                    )
             source_checkpoint = validate_source_checkpoint(current_source, source_checkpoint)
-            prompt_workflow.require_prepared_intent(source_checkpoint)
+            if require_prepared_intent:
+                prompt_workflow.require_prepared_intent(source_checkpoint)
             fork_checkpoint = approval_support.checkpoint_for_fork(
                 checkpoint=source_checkpoint,
             )
@@ -12797,6 +13320,50 @@ class SessionEngine:
                 update={"metadata": authoritative_metadata},
                 deep=True,
             )
+        active_model_stage = await self.session_store.load_active_model_completion_stage(
+            source_session.id
+        )
+        if active_model_stage is not None:
+            del active_model_stage
+            raise session_request_boundary.ForkActiveModelStageError(
+                "Fork source session has an active model-completion stage."
+            ) from None
+        # Reject known-invalid checkpoint state before ordinary admission. The
+        # store-owned transform below repeats the same validation after
+        # admission so a concurrent checkpoint change still fails closed.
+        source_checkpoint_preflight = await self.session_store.load_checkpoint(source_session.id)
+        preflight_checkpoint: dict[str, Any] | None = None
+        try:
+            preflight_checkpoint = (
+                None
+                if source_checkpoint_preflight is None
+                else copy_json_value(source_checkpoint_preflight, "checkpoint")
+            )
+            prepare_fork_checkpoint(
+                source_session,
+                preflight_checkpoint,
+                require_prepared_intent=False,
+            )
+        except _ExpiredIncompleteRecoveryClaim as expired_claim:
+            await self._fence_expired_incomplete_recovery_claim_for_fork(
+                source_session.id,
+                expired_claim,
+            )
+        finally:
+            if type(preflight_checkpoint) is dict:
+                preflight_checkpoint.clear()
+            preflight_checkpoint = None
+            if type(source_checkpoint_preflight) is dict:
+                source_checkpoint_preflight.clear()
+            source_checkpoint_preflight = None
+
+        # Prompt-succession preparation may publish a durable source intent.
+        # Close the contract-attachment race immediately before that first
+        # possible mutation; the admission also protects the later atomic fork.
+        await self._require_ordinary_session_execution(
+            source_session.id,
+            admit_session=True,
+        )
         fork_session = await prompt_workflow.prepare_effect(
             session_store=self.session_store,
             source_session=source_session,
@@ -13135,20 +13702,10 @@ class SessionEngine:
                     "Fork source session has an active model-completion stage."
                 ) from None
             if isinstance(publication_error, _ExpiredIncompleteRecoveryClaim):
-                current = await self._require_session(source_session.id)
-                fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
-                    session=current,
-                    claim_id=publication_error.claim_id,
+                await self._fence_expired_incomplete_recovery_claim_for_fork(
+                    source_session.id,
+                    publication_error,
                 )
-                if not fenced:
-                    raise RuntimeError(
-                        "Expired incomplete-session recovery ownership changed while the "
-                        "fork was fencing it; retry with current session state."
-                    ) from None
-                raise ValueError(
-                    "Session fork fenced an expired incomplete-session recovery owner; "
-                    "retry with current session state."
-                ) from None
             raise publication_error
         if publication_value is None:
             if (
@@ -16037,12 +16594,12 @@ class SessionEngine:
         except Exception as task_error:
             return None, task_error
 
-    async def _linked_running_task_id(self, session_id: str) -> str | None:
-        """Find the one running task already attached to a resumed session.
+    async def _linked_resume_task_id(self, session_id: str) -> str | None:
+        """Find the running task that ordinary resume must terminalize.
 
-        Task attachment is durable in ``TaskStore`` while ``ResumeRequest`` carries
-        no task id. Re-associate that task before entering the resumed loop so a
-        post-crash completion or failure terminalizes the original work item.
+        Contract authority is checked independently from the session identity at
+        the shared resume boundary. This lookup retains the historical behavior of
+        re-associating the one running task for ordinary task terminalization.
         """
         if self.task_store is None:
             return None

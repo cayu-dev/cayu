@@ -14,10 +14,14 @@ from itertools import islice
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
-from cayu._exception_groups import exception_cause, exception_tree_contains, set_exception_cause
+from cayu._exception_groups import (
+    exception_cause,
+    exception_tree_contains,
+    set_exception_cause,
+)
 from cayu._task_wait import capture_awaitable_outcome, unexpected_child_cancellation_error
 from cayu._validation import (
     copy_json_value,
@@ -151,6 +155,11 @@ from cayu.runtime._session_engine import (
 )
 from cayu.runtime._session_queries import query_all_event_records, query_all_sessions
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
+from cayu.runtime._task_store_operation_boundary import (
+    TaskStoreOperationOutcome,
+    capture_sensitive_validation,
+    capture_task_store_operation,
+)
 from cayu.runtime._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
@@ -238,8 +247,12 @@ from cayu.runtime.hooks import (
     RuntimeHookPhase,
 )
 from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionInvocation,
     SessionInvocationBinding,
     TaskExecutionSource,
+    TaskInvocation,
     copy_session_invocation_binding,
 )
 from cayu.runtime.loop_policies import (
@@ -323,8 +336,13 @@ from cayu.runtime.structured_output import (
 from cayu.runtime.tasks import (
     Task,
     TaskCreate,
+    TaskInvocationSnapshot,
+    TaskStatus,
     TaskStore,
+    copy_task,
     copy_task_create,
+    preflight_contract_bound_task_creation,
+    require_contract_bound_task_creation_snapshot,
     task_create_with_runtime_invocation,
 )
 from cayu.runtime.tool_exposure import (
@@ -360,6 +378,17 @@ from cayu.runtime.user_input import (
     UserInputResponse,
     copy_user_input_recovery_request,
     copy_user_input_response,
+)
+from cayu.runtime.work_contracts import (
+    TaskCompletionDecisionRequired,
+    WorkCompletionConflict,
+    WorkContract,
+    WorkContractConflict,
+    WorkContractDraft,
+    WorkContractRef,
+    copy_work_contract,
+    copy_work_contract_ref,
+    work_contract_from_draft,
 )
 from cayu.runtime.workspace_observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
@@ -1124,7 +1153,13 @@ class CayuApp:
             resume_session=self.resume,
             recover_incomplete_session=self.recover_incomplete_session,
             get_session_usage=self.get_session_usage,
+            preflight_evaluator_agent=self._preflight_fork_group_evaluator_agent,
             prepare_evaluator_agent=self._prepare_fork_group_evaluator_agent,
+            preflight_fork_source=self._preflight_ordinary_fork_source,
+            preflight_fork_source_state=(
+                self._session_engine.preflight_fork_source_checkpoint_state
+            ),
+            admit_fork_source=self._admit_ordinary_fork_source,
         )
 
     def redact_json(self, value: Any) -> Any:
@@ -1769,14 +1804,14 @@ class CayuApp:
 
         return self._fork_group_coordinator.register_gate(gate_id, gate)
 
-    def _register_fork_group_evaluator_agent(
+    def _fork_group_evaluator_agent_state(
         self,
         *,
         source_agent_name: str,
         synthetic_agent_name: str,
         request_sha256: str,
-    ) -> str:
-        """Own one runtime-generated, structurally isolated evaluator registration."""
+    ) -> tuple[runtime_records.RegisteredAgentState, bool]:
+        """Build or validate an isolated evaluator registration without publishing it."""
 
         original = self._get_registered_agent(source_agent_name)
         existing = self._agents.get(synthetic_agent_name)
@@ -1787,6 +1822,7 @@ class CayuApp:
                 )
             if (
                 existing.tools
+                or existing.tool_capabilities
                 or existing.spec.workflow_tool_names
                 or existing.runtime_hooks
                 or existing.loop_policies
@@ -1794,62 +1830,108 @@ class CayuApp:
                 raise RuntimeError(
                     "Fork-group evaluator registration is not structurally isolated."
                 )
-            return synthetic_agent_name
+            return existing, True
         evaluator_context_policy = DefaultContextPolicy()
-        self._agents[synthetic_agent_name] = runtime_records.RegisteredAgentState(
-            spec=original.spec.model_copy(
-                update={
-                    "name": synthetic_agent_name,
-                    "workflow_tool_names": (),
-                    "metadata": {},
-                    "provider_options": {},
-                },
-                deep=True,
+        return (
+            runtime_records.RegisteredAgentState(
+                spec=original.spec.model_copy(
+                    update={
+                        "name": synthetic_agent_name,
+                        "workflow_tool_names": (),
+                        "metadata": {},
+                        "provider_options": {},
+                    },
+                    deep=True,
+                ),
+                tools=MappingProxyType({}),
+                tool_capabilities=(),
+                all_registered_tool_exposure=ResolvedToolExposure(
+                    profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+                    tools=(),
+                    registered_count=0,
+                    ceiling_count=0,
+                ),
+                tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
+                tool_exposure_policy_execution_profile_identity=None,
+                context_policy=evaluator_context_policy,
+                context_policy_execution_profile_identity=(
+                    copy_secret_free_execution_profile_behavior_identity(
+                        evaluator_context_policy.execution_profile_identity,
+                        redactor=self._secret_redactor,
+                        field_name="context_policy.execution_profile_identity",
+                    )
+                ),
+                context_overflow_policy=None,
+                context_overflow_policy_execution_profile_identity=None,
+                tool_policy=AllowAllToolPolicy(),
+                tool_policy_execution_profile_identity=None,
+                runtime_hooks=(),
+                loop_policies=(),
+                loop_policy_execution_profile_identities=(),
+                execution_requirements=ExecutionRequirements.trusted(),
+                context_behavior_execution_profile_identities=(
+                    _snapshot_context_behavior_execution_profile_identities(
+                        evaluator_context_policy,
+                        None,
+                        redactor=self._secret_redactor,
+                    )
+                ),
+                registration_source=original.registration_source,
+                registration_symbol=original.registration_symbol,
             ),
-            tools=MappingProxyType({}),
-            tool_capabilities=(),
-            all_registered_tool_exposure=ResolvedToolExposure(
-                profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
-                tools=(),
-                registered_count=0,
-                ceiling_count=0,
-            ),
-            tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
-            tool_exposure_policy_execution_profile_identity=None,
-            context_policy=evaluator_context_policy,
-            context_policy_execution_profile_identity=(
-                copy_secret_free_execution_profile_behavior_identity(
-                    evaluator_context_policy.execution_profile_identity,
-                    redactor=self._secret_redactor,
-                    field_name="context_policy.execution_profile_identity",
-                )
-            ),
-            context_overflow_policy=None,
-            context_overflow_policy_execution_profile_identity=None,
-            tool_policy=AllowAllToolPolicy(),
-            tool_policy_execution_profile_identity=None,
-            runtime_hooks=(),
-            loop_policies=(),
-            loop_policy_execution_profile_identities=(),
-            execution_requirements=ExecutionRequirements.trusted(),
-            context_behavior_execution_profile_identities=(
-                _snapshot_context_behavior_execution_profile_identities(
-                    evaluator_context_policy,
-                    None,
-                    redactor=self._secret_redactor,
-                )
-            ),
-            registration_source=original.registration_source,
-            registration_symbol=original.registration_symbol,
+            False,
         )
+
+    def _register_fork_group_evaluator_agent(
+        self,
+        *,
+        source_agent_name: str,
+        synthetic_agent_name: str,
+        request_sha256: str,
+    ) -> str:
+        """Own one runtime-generated, structurally isolated evaluator registration."""
+
+        evaluator_agent, already_registered = self._fork_group_evaluator_agent_state(
+            source_agent_name=source_agent_name,
+            synthetic_agent_name=synthetic_agent_name,
+            request_sha256=request_sha256,
+        )
+        if already_registered:
+            return synthetic_agent_name
+        self._agents[synthetic_agent_name] = evaluator_agent
         self._fork_group_evaluator_agents[synthetic_agent_name] = request_sha256
         return synthetic_agent_name
+
+    async def _preflight_fork_group_evaluator_agent(
+        self,
+        request: RunRequest,
+        source_agent_name: str,
+        request_sha256: str,
+    ) -> tuple[str, str]:
+        """Validate evaluator authority without registration or ordinary admission."""
+
+        evaluator_agent, _ = self._fork_group_evaluator_agent_state(
+            source_agent_name=source_agent_name,
+            synthetic_agent_name=request.agent_name,
+            request_sha256=request_sha256,
+        )
+        prepared = await self._session_engine._prepare_initial_run(
+            request,
+            registered_agent_override=evaluator_agent,
+            admit_session=False,
+        )
+        if prepared is None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        return request.agent_name, prepared.execution_profile.fingerprint
 
     async def _prepare_fork_group_evaluator_agent(
         self,
         request: RunRequest,
         source_agent_name: str,
         request_sha256: str,
+        store_resolved_existing_session_id: str | None,
     ) -> tuple[str, str]:
         """Freeze the exact tool-free evaluator profile before durable admission."""
 
@@ -1858,7 +1940,14 @@ class CayuApp:
             synthetic_agent_name=request.agent_name,
             request_sha256=request_sha256,
         )
-        prepared = await self._session_engine._prepare_initial_run(request)
+        prepared = await self._session_engine._prepare_initial_run(
+            request,
+            store_resolved_existing_session_id=store_resolved_existing_session_id,
+        )
+        if prepared is None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         return synthetic_name, prepared.execution_profile.fingerprint
 
     def register_provider(
@@ -2451,6 +2540,7 @@ class CayuApp:
 
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
         stream = self._run_private(request)
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -2460,6 +2550,7 @@ class CayuApp:
             raise TypeError("Runtime run requires a RunRequest.")
         request = _validate_run_request(request)
         stream = self._session_engine.run(request=request)
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -2476,6 +2567,7 @@ class CayuApp:
             request,
             store_resolved_session_id=store_resolved_session_id,
         )
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -2493,6 +2585,7 @@ class CayuApp:
             request=request,
             store_resolved_session_id=store_resolved_session_id,
         )
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -2614,7 +2707,9 @@ class CayuApp:
             update={"session_id": await self._resolve_public_session_id(request.session_id)},
             deep=True,
         )
-        result = await self._recover_incomplete_session_private(request)
+        recovery = self._recover_incomplete_session_private(request)
+        del request
+        result = await recovery
         return await self._project_incomplete_recovery_result_for_public_api(result)
 
     async def _recover_incomplete_session_private(
@@ -2622,7 +2717,9 @@ class CayuApp:
         request: IncompleteSessionRecoveryRequest,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
-        return await self._session_engine.recover_incomplete_session(request)
+        recovery = self._session_engine.recover_incomplete_session(request)
+        del request
+        return await recovery
 
     async def recover_persisted_event_side_effects(self, *, limit: int = 1000) -> list[Event]:
         """Retry committed event fan-out that was not acknowledged before a crash.
@@ -2679,11 +2776,28 @@ class CayuApp:
         if type(request) is not DispatchRequest:
             raise TypeError("Runtime dispatch requires a DispatchRequest.")
         request = copy_dispatch_request(request)
+        if request.task_id is not None and self.task_store is None:
+            raise RuntimeError("task_store is required when DispatchRequest.task_id is set.")
         # Resolve at the public boundary to reject malformed or unknown aliases. Keep
         # the public request value across dispatcher boundaries so durable queues do
         # not persist private session authority; dispatch_inline resolves it again in
         # the worker that owns execution.
         private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
+        (
+            contract_rejected,
+            admission_failure,
+        ) = await self._session_engine._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=private_session_id,
+        )
+        if admission_failure is not None:
+            del private_session_id, request
+            raise admission_failure from None
+        if contract_rejected:
+            del private_session_id, request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         handle = await self.dispatcher.submit(self, request)
         _validate_dispatch_handle_for_request(handle=handle, request=request)
         copied = copy_dispatch_handle(handle)
@@ -2710,7 +2824,14 @@ class CayuApp:
         self,
         request: RunRequest,
     ) -> DurableSubagentPreparedRun:
-        prepared = await self._session_engine._prepare_initial_run(request)
+        preparation = self._session_engine._prepare_initial_run(request)
+        del request
+        prepared = await preparation
+        del preparation
+        if prepared is None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         try:
             return DurableSubagentPreparedRun(
                 request=prepared.request,
@@ -2850,6 +2971,22 @@ class CayuApp:
             raise TypeError("Queued dispatch preparation requires a DispatchRequest.")
         request = copy_dispatch_request(request)
         private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
+        (
+            contract_rejected,
+            admission_failure,
+        ) = await self._session_engine._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=private_session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del private_session_id, request
+            raise admission_failure from None
+        if contract_rejected:
+            del private_session_id, request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         session, checkpoint = await self._load_queued_dispatch_session_snapshot(private_session_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
@@ -2935,6 +3072,21 @@ class CayuApp:
                 durable_request.structured_output,
                 registered_provider=registered_provider,
             )
+        (
+            contract_rejected,
+            admission_failure,
+        ) = await self._session_engine._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=private_session_id,
+        )
+        if admission_failure is not None:
+            del durable_request, private_session_id, request
+            raise admission_failure from None
+        if contract_rejected:
+            del durable_request, private_session_id, request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         return _new_queued_dispatch_envelope(
             queue_task_id=queue_task_id,
             request=durable_request,
@@ -3392,12 +3544,171 @@ class CayuApp:
                 async for event in owned_forwarded_stream:
                     yield event
 
+    async def create_work_contract(self, request: WorkContractDraft) -> WorkContract:
+        if type(request) is not WorkContractDraft:
+            del request
+            raise TypeError("Work-contract creation requires a WorkContractDraft request.")
+        if self.task_store is None:
+            del request
+            raise RuntimeError("task_store is required to create work contracts.")
+        if not self.task_store.supports_verified_work_contracts:
+            del request
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support verified work contracts."
+            )
+        validation = _validated_public_work_contract(
+            request,
+            redactor=self._secret_redactor,
+        )
+        del request
+        validation_failure = validation.failure
+        contract = validation.result
+        del validation
+        if validation_failure is not None:
+            raise validation_failure from None
+        if contract is None:
+            raise ValueError("Work-contract creation request is invalid.") from None
+        contains_secret_identity = _work_contract_contains_secret_public_identity(
+            contract,
+            self._secret_redactor,
+        )
+        if contains_secret_identity:
+            del contract
+            raise ValueError(
+                "Work-contract public identity contains a workload secret and cannot be published."
+            ) from None
+        published_value, publication_failure = await _publish_public_work_contract(
+            self.task_store,
+            contract,
+            redactor=self._secret_redactor,
+        )
+        if publication_failure is not None:
+            del contract, published_value
+            raise publication_failure from None
+        validation = _copied_public_work_contract(
+            published_value,
+            redactor=self._secret_redactor,
+        )
+        del published_value
+        validation_failure = validation.failure
+        published = validation.result
+        del validation
+        if validation_failure is not None:
+            del contract
+            raise validation_failure from None
+        if published is None:
+            del contract
+            raise WorkContractConflict(
+                "Task store returned an invalid published work contract."
+            ) from None
+        if published != contract:
+            del contract, published
+            raise WorkContractConflict(
+                "Task store returned a work contract other than the exact published definition."
+            ) from None
+        return published
+
+    async def load_work_contract(self, reference: WorkContractRef) -> WorkContract | None:
+        if type(reference) is not WorkContractRef:
+            del reference
+            raise TypeError("Work-contract lookup requires a WorkContractRef.")
+        if self.task_store is None:
+            del reference
+            raise RuntimeError("task_store is required to load work contracts.")
+        if not self.task_store.supports_verified_work_contracts:
+            del reference
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support verified work contracts."
+            )
+        validation = _copied_public_work_contract_ref(
+            reference,
+            redactor=self._secret_redactor,
+        )
+        del reference
+        validation_failure = validation.failure
+        copied_reference = validation.result
+        del validation
+        if validation_failure is not None:
+            raise validation_failure from None
+        if copied_reference is None:
+            raise ValueError("Work-contract lookup reference is invalid.") from None
+        contains_secret_identity = (
+            self._secret_redactor.redact_text(copied_reference.contract_id)
+            != copied_reference.contract_id
+        )
+        if contains_secret_identity:
+            del copied_reference
+            raise ValueError(
+                "Work-contract identity contains a workload secret and cannot be used for lookup."
+            ) from None
+        loaded_value, lookup_failure = await _load_public_work_contract(
+            self.task_store,
+            copied_reference,
+            redactor=self._secret_redactor,
+        )
+        if lookup_failure is not None:
+            del copied_reference, loaded_value
+            raise lookup_failure from None
+        if loaded_value is None:
+            return None
+        validation = _copied_public_work_contract(
+            loaded_value,
+            redactor=self._secret_redactor,
+        )
+        del loaded_value
+        validation_failure = validation.failure
+        loaded = validation.result
+        del validation
+        if validation_failure is not None:
+            del copied_reference
+            raise validation_failure from None
+        if loaded is None:
+            del copied_reference
+            raise WorkContractConflict("Task store returned an invalid work contract.") from None
+        if loaded.reference() != copied_reference:
+            del copied_reference, loaded
+            raise WorkContractConflict(
+                "Task store returned a work contract other than the exact requested version."
+            ) from None
+        contains_secret_identity = _work_contract_contains_secret_public_identity(
+            loaded,
+            self._secret_redactor,
+        )
+        if contains_secret_identity:
+            del copied_reference, loaded
+            raise ValueError(
+                "Loaded work contract contains a workload secret in a public identity."
+            ) from None
+        return loaded
+
     async def create_task(self, request: TaskCreate) -> Task:
         if type(request) is not TaskCreate:
+            del request
             raise TypeError("Task creation requires a TaskCreate request.")
+        if request.work_contract is None:
+            # Preserve the established ordinary-task validation contract,
+            # including actionable Pydantic field diagnostics. Contract-bound
+            # requests use the detached boundary below because their durable
+            # authority fields may contain workload-sensitive material.
+            request = copy_task_create(request)
+        else:
+            validation = _copied_public_task_create(
+                request,
+                redactor=self._secret_redactor,
+            )
+            del request
+            validation_failure = validation.failure
+            copied_request = validation.result
+            del validation
+            if validation_failure is not None:
+                raise validation_failure from None
+            if copied_request is None:
+                raise ValueError("Task creation request is invalid.") from None
+            request = copied_request
+            del copied_request
         if self.task_store is None:
+            del request
             raise RuntimeError("task_store is required to create tasks.")
-        request = copy_task_create(request)
         if (
             request.retry_policy is not None
             and self._secret_redactor.redact_uppercase_text(request.retry_policy.cost_currency)
@@ -3406,16 +3717,45 @@ class CayuApp:
             raise ValueError(
                 "Task retry cost currency contains a workload secret and cannot be used "
                 "as durable accounting authority."
-            )
+            ) from None
         for origin in (request.invocation_origin, request._verified_invocation_origin):
             if origin is None:
                 continue
             for value in (origin.subject, origin.tenant):
                 if value is not None and self._secret_redactor.redact_text(value) != value:
+                    del origin, request, value
                     raise ValueError(
                         "Task invocation origin contains a workload secret and cannot be "
                         "used as durable task authority."
-                    )
+                    ) from None
+        if request.work_contract is not None:
+            if not self.task_store.supports_verified_work_contracts:
+                del request
+                raise NotImplementedError(
+                    f"{type(self.task_store).__name__} does not support verified work contracts."
+                )
+            if request.task_id is None:
+                del request
+                raise ValueError(
+                    "Contracted task creation requires a caller-stable task_id for "
+                    "cancellation reconciliation."
+                ) from None
+            if self._secret_redactor.redact_text(request.task_id) != request.task_id:
+                del request
+                raise ValueError(
+                    "Task identity contains a workload secret and cannot be exposed "
+                    "through durable task projections."
+                ) from None
+            contains_secret_identity = (
+                self._secret_redactor.redact_text(request.work_contract.contract_id)
+                != request.work_contract.contract_id
+            )
+            if contains_secret_identity:
+                del request
+                raise ValueError(
+                    "Work-contract identity contains a workload secret and cannot be exposed "
+                    "through durable task projections."
+                ) from None
         if (
             request.session_id is not None
             and request._verified_invocation_origin is None
@@ -3428,15 +3768,151 @@ class CayuApp:
                     source=(request._runtime_invocation_source or TaskExecutionSource.SDK_TASK),
                     session_invocation=snapshot,
                 )
+            del snapshot
         if request.available_at is not None and not self.task_store.supports_delayed_availability:
+            del request
             raise NotImplementedError(
                 f"{type(self.task_store).__name__} does not support delayed task availability."
             )
         if request.retry_policy is not None and not self.task_store.supports_task_retry_series:
+            del request
             raise NotImplementedError(
                 f"{type(self.task_store).__name__} does not support task retry series."
             )
-        return await self.task_store.create_task(request)
+        if request.work_contract is None:
+            return await self.task_store.create_task(request)
+        parent_invocation_snapshot: TaskInvocationSnapshot | None = None
+        if request.parent_task_id is not None:
+            (
+                parent_snapshot_value,
+                parent_lookup_failure,
+            ) = await _load_public_task_invocation_snapshot(
+                self.task_store,
+                request.parent_task_id,
+                redactor=self._secret_redactor,
+            )
+            if parent_lookup_failure is not None:
+                del parent_snapshot_value, request
+                raise parent_lookup_failure from None
+            parent_validation = _copied_public_task_invocation_snapshot(
+                parent_snapshot_value,
+                redactor=self._secret_redactor,
+            )
+            del parent_snapshot_value
+            parent_validation_failure = parent_validation.failure
+            parent_invocation_snapshot = parent_validation.result
+            del parent_validation
+            if parent_validation_failure is not None:
+                del parent_invocation_snapshot, request
+                raise parent_validation_failure from None
+            if (
+                parent_invocation_snapshot is None
+                or parent_invocation_snapshot.id != request.parent_task_id
+            ):
+                del parent_invocation_snapshot, request
+                raise WorkContractConflict(
+                    "Task parent invocation authority is unavailable for contracted creation."
+                ) from None
+        session_invocation_contains_secret = (
+            request._runtime_session_binding is not None
+            and _invocation_contains_secret_public_identity(
+                request._runtime_session_binding.invocation,
+                self._secret_redactor,
+            )
+        )
+        parent_invocation_contains_secret = (
+            parent_invocation_snapshot is not None
+            and _invocation_contains_secret_public_identity(
+                parent_invocation_snapshot.invocation,
+                self._secret_redactor,
+            )
+        )
+        direct_root_session_contains_secret = (
+            request._runtime_session_binding is None
+            and parent_invocation_snapshot is None
+            and request.session_id is not None
+            and self._secret_redactor.redact_text(request.session_id) != request.session_id
+        )
+        if (
+            session_invocation_contains_secret
+            or parent_invocation_contains_secret
+            or direct_root_session_contains_secret
+        ):
+            del parent_invocation_snapshot, request
+            raise ValueError(
+                "Task invocation identity contains a workload secret and cannot be exposed "
+                "through durable task projections."
+            ) from None
+        preflight_contract_bound_task_creation(
+            request,
+            parent_task=parent_invocation_snapshot,
+        )
+        task, creation_failure = await _create_public_contracted_task(
+            self.task_store,
+            request,
+            redactor=self._secret_redactor,
+        )
+        if creation_failure is not None:
+            del parent_invocation_snapshot, request, task
+            raise creation_failure from None
+        validation = _copied_public_task(
+            task,
+            redactor=self._secret_redactor,
+        )
+        del task
+        validation_failure = validation.failure
+        copied_task = validation.result
+        del validation
+        if validation_failure is not None:
+            del parent_invocation_snapshot, request
+            raise validation_failure from None
+        if copied_task is None:
+            del parent_invocation_snapshot, request
+            raise WorkContractConflict("Task store returned an invalid contracted task.") from None
+        task = copied_task
+        del copied_task
+        try:
+            require_contract_bound_task_creation_snapshot(task)
+        except (TypeError, ValueError):
+            del parent_invocation_snapshot, request, task
+            raise WorkContractConflict(
+                "Task store returned a contracted task outside the creation-snapshot bounds."
+            ) from None
+        (
+            invocation_snapshot,
+            invocation_lookup_failure,
+        ) = await _load_public_task_invocation_snapshot(
+            self.task_store,
+            task.id,
+            redactor=self._secret_redactor,
+        )
+        if invocation_lookup_failure is not None:
+            del invocation_snapshot, parent_invocation_snapshot, request, task
+            raise invocation_lookup_failure from None
+        validation = _copied_public_task_invocation_snapshot(
+            invocation_snapshot,
+            redactor=self._secret_redactor,
+        )
+        del invocation_snapshot
+        validation_failure = validation.failure
+        copied_invocation_snapshot = validation.result
+        del validation
+        if validation_failure is not None:
+            del parent_invocation_snapshot, request, task
+            raise validation_failure from None
+        if not _contracted_task_creation_result_matches_request(
+            task=task,
+            request=request,
+            invocation_snapshot=copied_invocation_snapshot,
+            parent_invocation_snapshot=parent_invocation_snapshot,
+            redactor=self._secret_redactor,
+        ):
+            del copied_invocation_snapshot, parent_invocation_snapshot, request, task
+            raise WorkContractConflict(
+                "Task store did not preserve the exact contracted task creation request."
+            ) from None
+        del copied_invocation_snapshot, parent_invocation_snapshot
+        return task
 
     async def pause_task(
         self,
@@ -3867,13 +4343,26 @@ class CayuApp:
         stream: AsyncGenerator[Event, None] | None = None
         owned_stream: _RunFenceOwnedEventStream | None = None
         try:
-            stream = self._fork_session_private(
-                request,
-                store_resolved_source_session_id=store_resolved_source_session_id,
-            )
-            async with _close_delegated_event_stream(stream) as owned_stream:
-                async for event in owned_stream:
-                    projected_events.append(await self._project_emitted_event_for_public_api(event))
+            try:
+                session_request_boundary.require_store_resolved_or_secret_free_session_authority(
+                    request.source_session_id,
+                    store_resolved_value=store_resolved_source_session_id,
+                    field_name="source_session_id",
+                    redactor=self._secret_redactor,
+                )
+            except ValueError as exc:
+                failure = ValueError(str(exc))
+            if failure is None:
+                await self._preflight_ordinary_fork_source(request.source_session_id)
+                stream = self._fork_session_private(
+                    request,
+                    store_resolved_source_session_id=store_resolved_source_session_id,
+                )
+                async with _close_delegated_event_stream(stream) as owned_stream:
+                    async for event in owned_stream:
+                        projected_events.append(
+                            await self._project_emitted_event_for_public_api(event)
+                        )
         except session_request_boundary.ForkSourceNotFoundError:
             failure = KeyError("Fork source session was not found.")
         except session_request_boundary.ForkActiveModelStageError:
@@ -3888,6 +4377,18 @@ class CayuApp:
             projected_events.clear()
             raise failure from None
         return tuple(projected_events)
+
+    async def _preflight_ordinary_fork_source(self, session_id: str) -> None:
+        await self._session_engine._require_ordinary_session_execution(
+            session_id,
+            admit_session=False,
+        )
+
+    async def _admit_ordinary_fork_source(self, session_id: str) -> None:
+        await self._session_engine._require_ordinary_session_execution(
+            session_id,
+            admit_session=True,
+        )
 
     async def _fork_session_private(
         self,
@@ -3914,10 +4415,60 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
+    async def _verifier_aware_recovery_execution_outcome(
+        self,
+        *,
+        session_id: str,
+        task_id: str | None = None,
+        admit_session: bool = True,
+    ) -> tuple[bool, BaseException | None]:
+        return await self._session_engine._verifier_aware_task_execution_outcome(
+            task_id,
+            session_id=session_id,
+            admit_session=admit_session,
+        )
+
+    async def _require_ordinary_recovery_execution(
+        self,
+        *,
+        session_id: str,
+        task_id: str | None = None,
+        admit_session: bool,
+    ) -> None:
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=session_id,
+            task_id=task_id,
+            admit_session=admit_session,
+        )
+        if admission_failure is not None:
+            raise admission_failure from None
+        if requires_completion_decision:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+
     async def _run_recovery_session(
         self,
         request: RecoverySessionRunRequest,
     ) -> AsyncGenerator[Event, None]:
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session.id,
+            task_id=request.task_id,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
         checkpoint = await self._runtime_session_store.load_checkpoint(request.session.id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         expected_profile = request.active_invocation_profile
@@ -4138,6 +4689,7 @@ class CayuApp:
             },
         )
         stream = self._resolve_user_input_private(response)
+        del response
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -4154,7 +4706,30 @@ class CayuApp:
         if type(response) is not UserInputResponse:
             raise TypeError("Runtime user input resolution requires a UserInputResponse.")
         response = copy_user_input_response(response)
-        stream = self._recovery_coordinator.resolve_user_input(response=response)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=response.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del response
+            raise admission_failure from None
+        if requires_completion_decision:
+            del response
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        session_id = response.session_id
+        stream = self._recovery_coordinator.resolve_user_input(
+            response=response,
+            before_mutation=lambda: self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                admit_session=True,
+            ),
+        )
+        del response
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -4182,6 +4757,7 @@ class CayuApp:
             },
         )
         stream = self._recover_user_input_private(request)
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -4201,7 +4777,30 @@ class CayuApp:
         if type(request) is not UserInputRecoveryRequest:
             raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
         request = copy_user_input_recovery_request(request)
-        stream = self._recovery_coordinator.recover_user_input_request(request=request)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        session_id = request.session_id
+        stream = self._recovery_coordinator.recover_user_input_request(
+            request=request,
+            before_mutation=lambda: self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                admit_session=True,
+            ),
+        )
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -4234,6 +4833,7 @@ class CayuApp:
             },
         )
         stream = self._resolve_tool_approval_private(request)
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -4254,7 +4854,30 @@ class CayuApp:
             request,
             session_id=session_id,
         )
-        stream = self._recovery_coordinator.resolve_provider_operation(request)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        session_id = request.session_id
+        stream = self._recovery_coordinator.resolve_provider_operation(
+            request,
+            before_mutation=lambda: self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                admit_session=True,
+            ),
+        )
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -4266,7 +4889,30 @@ class CayuApp:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
         request = _validate_tool_approval_request(request)
-        stream = self._recovery_coordinator.resolve_tool_approval(request=request)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        session_id = request.session_id
+        stream = self._recovery_coordinator.resolve_tool_approval(
+            request=request,
+            before_mutation=lambda: self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                admit_session=True,
+            ),
+        )
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -4299,6 +4945,7 @@ class CayuApp:
             },
         )
         stream = self._recover_tool_approval_private(request)
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -4310,7 +4957,30 @@ class CayuApp:
         if type(request) is not ToolApprovalRecoveryRequest:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         request = _validate_tool_approval_recovery_request(request)
-        stream = self._recovery_coordinator.recover_tool_approval_request(request=request)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        session_id = request.session_id
+        stream = self._recovery_coordinator.recover_tool_approval_request(
+            request=request,
+            before_mutation=lambda: self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                admit_session=True,
+            ),
+        )
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -4338,6 +5008,7 @@ class CayuApp:
             },
         )
         stream = self._recover_tool_round_private(request)
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
@@ -4370,7 +5041,30 @@ class CayuApp:
         if type(request) is not ToolRoundRecoveryRequest:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
         request = copy_tool_round_recovery_request(request)
-        stream = self._recovery_coordinator.recover_tool_round_request(request=request)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise admission_failure from None
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        session_id = request.session_id
+        stream = self._recovery_coordinator.recover_tool_round_request(
+            request=request,
+            before_mutation=lambda: self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                admit_session=True,
+            ),
+        )
+        del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -5029,6 +5723,330 @@ def _validate_environment_spec(
             redactor=redactor,
             field_name="environment_spec.execution_profile_identity",
         ),
+    )
+
+
+def _work_contract_contains_secret_public_identity(
+    contract: WorkContract,
+    redactor: SecretRedactor,
+) -> bool:
+    public_identities = (
+        contract.contract_id,
+        contract.verifier.verifier_id,
+        contract.verifier.version,
+        *(criterion.criterion_id for criterion in contract.criteria),
+        *(constraint.constraint_id for constraint in contract.constraints),
+        *(requirement.requirement_id for requirement in contract.evidence_requirements),
+    )
+    return any(redactor.redact_text(value) != value for value in public_identities)
+
+
+async def _publish_public_work_contract(
+    task_store: TaskStore,
+    contract: WorkContract,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[WorkContract | None, BaseException | None]:
+    """Capture a publication conflict without exporting its sensitive store traceback."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.publish_work_contract(contract),
+        operation_name="Work-contract publication",
+        redactor=redactor,
+        mutation_store=task_store,
+        mutation_method_name="publish_work_contract",
+    )
+    if type(outcome.failure) is WorkContractConflict:
+        return None, WorkContractConflict(
+            "Task store rejected the work-contract publication because its durable identity "
+            "conflicts with existing state."
+        )
+    return outcome.result, outcome.failure
+
+
+async def _load_public_work_contract(
+    task_store: TaskStore,
+    reference: WorkContractRef,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[WorkContract | None, BaseException | None]:
+    """Capture a lookup conflict without exporting the stored contract traceback."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.load_work_contract(reference),
+        operation_name="Work-contract lookup",
+        redactor=redactor,
+    )
+    if type(outcome.failure) is WorkContractConflict:
+        return None, WorkContractConflict(
+            "Task store rejected the work-contract lookup because its durable identity "
+            "conflicts with the requested reference."
+        )
+    return outcome.result, outcome.failure
+
+
+async def _create_public_contracted_task(
+    task_store: TaskStore,
+    request: TaskCreate,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[Task | None, BaseException | None]:
+    """Capture contract-binding conflicts without exporting the task payload traceback."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.create_task(request),
+        operation_name="Contracted task creation",
+        redactor=redactor,
+        mutation_store=task_store,
+        mutation_method_name="create_task",
+    )
+    if type(outcome.failure) is WorkContractConflict:
+        return None, WorkContractConflict(
+            "Task store rejected the contracted task because its work contract conflicts "
+            "with durable state."
+        )
+    if type(outcome.failure) is WorkCompletionConflict:
+        return None, WorkCompletionConflict(
+            "Task store rejected the contracted task because its session binding conflicts "
+            "with durable work authority."
+        )
+    return outcome.result, outcome.failure
+
+
+async def _load_public_task_invocation_snapshot(
+    task_store: TaskStore,
+    task_id: str,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[TaskInvocationSnapshot | None, BaseException | None]:
+    """Read back one contracted task's durable provenance without leaking extension state."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.load_invocation_snapshot(task_id),
+        operation_name="Contracted task invocation lookup",
+        redactor=redactor,
+    )
+    return outcome.result, outcome.failure
+
+
+def _validated_public_work_contract(
+    draft: WorkContractDraft,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkContract]:
+    """Validate a caller-owned draft without retaining a rejected model traceback."""
+
+    return capture_sensitive_validation(
+        lambda: work_contract_from_draft(draft),
+        operation_name="Work-contract request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_contract(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkContract]:
+    """Copy one extension-returned contract behind a detached validation boundary."""
+
+    if type(value) is not WorkContract:
+        return TaskStoreOperationOutcome()
+    return capture_sensitive_validation(
+        lambda: copy_work_contract(value),
+        operation_name="Work-contract result validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_contract_ref(
+    value: WorkContractRef,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkContractRef]:
+    """Copy one caller-owned reference behind a detached validation boundary."""
+
+    return capture_sensitive_validation(
+        lambda: cast("WorkContractRef", copy_work_contract_ref(value)),
+        operation_name="Work-contract reference validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_task_create(
+    value: TaskCreate,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[TaskCreate]:
+    """Copy one caller-owned task request behind a detached validation boundary."""
+
+    return capture_sensitive_validation(
+        lambda: copy_task_create(value),
+        operation_name="Task request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_task(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[Task]:
+    """Copy one extension-returned task behind a detached validation boundary."""
+
+    if type(value) is not Task:
+        return TaskStoreOperationOutcome()
+    return capture_sensitive_validation(
+        lambda: copy_task(value),
+        operation_name="Task result validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_task_invocation_snapshot(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[TaskInvocationSnapshot]:
+    """Copy extension-returned task provenance behind a detached validation boundary."""
+
+    if type(value) is not TaskInvocationSnapshot:
+        return TaskStoreOperationOutcome()
+    return capture_sensitive_validation(
+        lambda: TaskInvocationSnapshot(
+            id=value.id,
+            session_id=value.session_id,
+            invocation=value.invocation,
+        ),
+        operation_name="Task invocation result validation",
+        redactor=redactor,
+    )
+
+
+def _contracted_task_invocation_matches_request(
+    *,
+    task: Task,
+    request: TaskCreate,
+    invocation_snapshot: TaskInvocationSnapshot,
+    parent_invocation_snapshot: TaskInvocationSnapshot | None,
+    redactor: SecretRedactor,
+) -> bool:
+    """Authenticate durable provenance and every request-owned invocation field."""
+
+    invocation = task.invocation
+    if (
+        invocation_snapshot.id != task.id
+        or invocation_snapshot.session_id != task.session_id
+        or invocation_snapshot.invocation != invocation
+        or invocation.source
+        is not (request._runtime_invocation_source or TaskExecutionSource.SDK_TASK)
+    ):
+        return False
+    if redactor.redact_text(task.id) != task.id or _invocation_contains_secret_public_identity(
+        invocation,
+        redactor,
+    ):
+        return False
+    session_binding = request._runtime_session_binding
+    if session_binding is not None:
+        matches_session = (
+            invocation.origin == session_binding.invocation.origin
+            and invocation.root_invocation_id == session_binding.invocation.root_invocation_id
+            and invocation.root_session_id == session_binding.invocation.root_session_id
+        )
+        if not matches_session:
+            return False
+        if request.parent_task_id is None:
+            return True
+        return (
+            parent_invocation_snapshot is not None
+            and parent_invocation_snapshot.id == request.parent_task_id
+            and parent_invocation_snapshot.invocation.origin == invocation.origin
+            and parent_invocation_snapshot.invocation.root_invocation_id
+            == invocation.root_invocation_id
+        )
+    if request.parent_task_id is not None:
+        return (
+            parent_invocation_snapshot is not None
+            and parent_invocation_snapshot.id == request.parent_task_id
+            and parent_invocation_snapshot.invocation.origin == invocation.origin
+            and parent_invocation_snapshot.invocation.root_invocation_id
+            == invocation.root_invocation_id
+            and parent_invocation_snapshot.invocation.root_session_id == invocation.root_session_id
+        )
+    if request._verified_invocation_origin is not None:
+        expected_origin = request._verified_invocation_origin
+    elif request.invocation_origin is not None:
+        expected_origin = InvocationOrigin(
+            trust=InvocationOriginTrust.HOST_ASSERTED,
+            subject=request.invocation_origin.subject,
+            tenant=request.invocation_origin.tenant,
+        )
+    else:
+        expected_origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    return invocation.origin == expected_origin and invocation.root_session_id == request.session_id
+
+
+def _invocation_contains_secret_public_identity(
+    invocation: SessionInvocation | TaskInvocation,
+    redactor: SecretRedactor,
+) -> bool:
+    """Return whether immutable invocation authority contains a known workload secret."""
+
+    public_identities = (
+        invocation.origin.subject,
+        invocation.origin.tenant,
+        invocation.root_invocation_id,
+        invocation.root_session_id,
+    )
+    return any(
+        value is not None and redactor.redact_text(value) != value for value in public_identities
+    )
+
+
+def _contracted_task_creation_result_matches_request(
+    *,
+    task: Task,
+    request: TaskCreate,
+    invocation_snapshot: TaskInvocationSnapshot | None,
+    parent_invocation_snapshot: TaskInvocationSnapshot | None,
+    redactor: SecretRedactor,
+) -> bool:
+    """Authenticate a custom store's contracted-create result before publication."""
+
+    if invocation_snapshot is None or not _contracted_task_invocation_matches_request(
+        task=task,
+        request=request,
+        invocation_snapshot=invocation_snapshot,
+        parent_invocation_snapshot=parent_invocation_snapshot,
+        redactor=redactor,
+    ):
+        return False
+    if request.task_id is not None and task.id != request.task_id:
+        return False
+    if (
+        task.type != request.type
+        or task.title != request.title
+        or task.description != request.description
+        or task.session_id != request.session_id
+        or task.parent_task_id != request.parent_task_id
+        or task.assigned_agent_name != request.assigned_agent_name
+        or task.available_at != request.available_at
+        or task.input != request.input
+        or task.metadata != request.metadata
+        or task.work_contract != request.work_contract
+    ):
+        return False
+    return (
+        task.status is TaskStatus.PENDING
+        and task.worker_id is None
+        and task.lease_expires_at is None
+        and task.status_reason is None
+        and task.status_payload is None
+        and task.result is None
+        and task.error is None
+        and task.started_at is None
+        and task.completed_at is None
     )
 
 

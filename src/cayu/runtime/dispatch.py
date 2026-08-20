@@ -64,6 +64,7 @@ from cayu.runtime.structured_output import (
 from cayu.runtime.tasks import (
     Task,
     TaskClaimLost,
+    TaskCompletionDecisionRequired,
     TaskCreate,
     TaskOrder,
     TaskQuery,
@@ -996,6 +997,7 @@ class TaskStoreDispatcher(Dispatcher):
             except (
                 ExecutionProfileMismatchError,
                 _QueuedDispatchAuthorityRejected,
+                TaskCompletionDecisionRequired,
             ) as exc:
                 return await self._reject_claimed_dispatch(
                     durable_runtime,
@@ -1830,6 +1832,8 @@ def _require_dispatch_task_authority(
 ) -> None:
     if not isinstance(task, Task):
         raise TypeError("Dispatch task authority requires a Task.")
+    if task.work_contract is not None:
+        raise ValueError("Contracted tasks require the verifier-aware execution entrance.")
     if task.type != task_type or task.session_id is not None:
         raise ValueError("Dispatch task structural authority conflicts with its queue.")
     request = envelope.request

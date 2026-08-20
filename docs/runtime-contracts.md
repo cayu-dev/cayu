@@ -2472,6 +2472,49 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_task_terminalization_receipt(task_id, idempotency_key)`
 - `cancel_task(task_id, error=...)`
 
+Verified-work runtime mutations require stronger cancellation settlement than
+the ordinary capability flag alone can prove. A custom store implementation
+that owns a verified-work mutation must also declare
+`verified_work_mutations_are_cancellation_quiescent = True` on that concrete
+implementation owner before Cayu will call the mutation. The declaration means
+every such awaitable has stopped all mutation—including work delegated to
+threads, executors, remote clients, or other tasks—before it returns or raises
+after cancellation. A subclass can use an unchanged inherited mutation under
+its owner's proof unless the subclass explicitly revokes the guarantee, but
+each override is a new implementation and must repeat the declaration after
+verifying its own behavior. Instance-shadowed methods and classes with dynamic
+attribute lookup do not provide stable structural proof and are rejected.
+Stores that cannot make this
+guarantee must leave the declaration false and expose a separate owned
+settlement boundary before opting in. Read-only verified-work lookups do not
+require the mutation declaration. When a store exposes materialized
+verified-work queue support, the built-in task-worker entrance applies this
+proof and its cancellation-aware settlement owner to expired-claim reclamation,
+queue claiming, and contracted-task parking; an override of any one of those
+methods must independently satisfy the same contract before the worker begins
+its claim loop. Ordinary stores retain the direct worker-call exception and
+cancellation behavior that predates verified-work support.
+The ordinary built-in task worker does not execute contract-bound tasks. After
+claiming one, it atomically parks the task in `needs_attention` with
+`status_reason="verified_work_contract_runner_required"`; that claimed item
+counts toward `max_tasks`. Until a verifier-aware worker entrance is available,
+deployments should keep contract-bound and ordinary work in separately filtered
+queues so ordinary worker capacity is not consumed by parked contract work.
+`CayuApp.create_task(...)` also requires a caller-stable `task_id` for a
+contract-bound task, so cancellation or acknowledgement loss cannot discard the
+only handle to a mutation that durably completed. The lower-level `TaskStore`
+interface continues its existing ID-generation contract for direct callers.
+Initial contract-bound task snapshots reserve bounded byte and item headroom
+beneath the complete persisted-task ceiling for store-owned claim, attachment,
+timestamp, and fixed decision-status fields. Consequently, a task admitted at
+the creation-snapshot boundary remains representable through those lifecycle
+transitions; caller-supplied result, error, and status payloads must still fit
+the complete task bound together with the task's existing content.
+Supporting custom stores must enforce the initial-snapshot reserve inside their
+atomic creation mutation. The application boundary preflights the authoritative
+snapshot and validates the returned pending task, but post-mutation validation
+does not make a nonconforming extension's private write safe.
+
 `terminalize_task(...)` is the claim-fenced, replay-safe completion/failure
 boundary for worker-owned tasks. A request carries the exact task and worker,
 terminal kind, terminal JSON payload, and a caller-stable idempotency key. On its
@@ -2664,8 +2707,13 @@ same durable session boundary.
 An unattached queue task may instead opt into a runtime-owned retry series with
 `TaskCreate.retry_policy=TaskRetryPolicy(...)`. The policy requires a positive
 series-wide `max_attempts` and may bound cumulative elapsed seconds and the
-reported token/cost accounting used to decide successor eligibility. Reported
-accounting is not a reservation for arbitrary application-owned external calls;
+reported token/cost accounting used to decide successor eligibility.
+Retry-series authority and verified-work authority cannot be combined in this
+release: `TaskCreate` rejects a request that supplies both `retry_policy` and
+`work_contract` before any task-store mutation. A verifier-aware retry-series
+settlement contract must be introduced before that combination can be admitted.
+Reported accounting is not a reservation for arbitrary application-owned
+external calls;
 Cayu-governed model dispatches must also use the same `causal_budget_id` with
 ordinary run limits and priced budget reservations when hard pre-dispatch
 enforcement is required. The cost is normalized into `cost_currency` (USD by

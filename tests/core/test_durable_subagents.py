@@ -4640,7 +4640,14 @@ def test_durable_submission_rejects_retargeted_genuine_authority(tool_type) -> N
     asyncio.run(run())
 
 
-def test_parent_task_cancellation_waits_for_durable_submission_settlement() -> None:
+@pytest.mark.parametrize(
+    "tool_timeout_seconds",
+    [None, 1.0],
+    ids=["without-timeout", "before-timeout"],
+)
+def test_parent_task_cancellation_waits_for_durable_submission_settlement(
+    tool_timeout_seconds: float | None,
+) -> None:
     async def run() -> None:
         sessions = _BlockingDurableChildCreationStore()
         tasks = InMemoryTaskStore()
@@ -4649,6 +4656,7 @@ def test_parent_task_cancellation_waits_for_durable_submission_settlement() -> N
             session_store=sessions,
             task_store=tasks,
             dispatcher=dispatcher,
+            tool_timeout_seconds=tool_timeout_seconds,
             enable_logging=False,
         )
         app.register_provider(_DurableSubagentProvider(), default=True)
@@ -4848,7 +4856,15 @@ def test_tool_timeout_preserves_unsettled_submission_for_exact_recovery() -> Non
     asyncio.run(run())
 
 
-def test_external_cancellation_remains_authoritative_over_unsettled_timeout() -> None:
+@pytest.mark.parametrize(
+    ("tool_timeout_seconds", "settlement_delay_s"),
+    [(1.0, 0.0), (0.02, 0.03)],
+    ids=["before-timeout", "after-timeout"],
+)
+def test_external_cancellation_remains_authoritative_over_unsettled_timeout(
+    tool_timeout_seconds: float,
+    settlement_delay_s: float,
+) -> None:
     async def run() -> None:
         sessions = InMemorySessionStore()
         tasks = _BlockingFailOnceDurableTaskReadStore()
@@ -4856,7 +4872,7 @@ def test_external_cancellation_remains_authoritative_over_unsettled_timeout() ->
             session_store=sessions,
             task_store=tasks,
             dispatcher=TaskStoreDispatcher(tasks),
-            tool_timeout_seconds=0.02,
+            tool_timeout_seconds=tool_timeout_seconds,
             enable_logging=False,
         )
         app.register_provider(_DurableSubagentProvider(), default=True)
@@ -4874,7 +4890,7 @@ def test_external_cancellation_remains_authoritative_over_unsettled_timeout() ->
         )
         await asyncio.wait_for(tasks.read_started.wait(), timeout=1)
         parent.cancel("external cancellation during unsettled durable submission")
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(settlement_delay_s)
         tasks.release_read.set()
 
         with pytest.raises(
@@ -4933,6 +4949,8 @@ def test_external_cancellation_wins_when_durable_submission_outlasts_tool_timeou
         await asyncio.wait_for(sessions.child_creation_started.wait(), timeout=1)
         parent.cancel("external cancellation during durable submission")
         await asyncio.sleep(0.03)
+        parent.cancel("repeated external cancellation during durable submission")
+        await asyncio.sleep(0)
         sessions.release_child_creation.set()
 
         with pytest.raises(
@@ -4940,7 +4958,7 @@ def test_external_cancellation_wins_when_durable_submission_outlasts_tool_timeou
             match="external cancellation during durable submission",
         ):
             await parent
-        assert parent.cancelling() == 1
+        assert parent.cancelling() == 2
         assert parent.cancelled() is True
         children = (
             await sessions.list_sessions(

@@ -596,6 +596,31 @@ class _GroupedCleanupFailureRunner(_BlockingRunner):
             ) from cleanup
 
 
+class _DelayedGroupedCleanupFailureRunner(_BlockingRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_started: asyncio.Event | None = None
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        **kwargs,
+    ) -> ExecResult:
+        try:
+            return await super().exec(command, **kwargs)
+        except asyncio.CancelledError:
+            assert self.cleanup_started is not None
+            self.cleanup_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as caller_cancellation:
+                cleanup = RuntimeError("runner cleanup failed")
+                raise BaseExceptionGroup(
+                    "runner cleanup reported caller cancellation",
+                    [caller_cancellation, cleanup],
+                ) from cleanup
+
+
 class _FatalCleanupGroupRunner(_BlockingRunner):
     isolation = "microsandbox"
 
@@ -2793,6 +2818,65 @@ def test_tool_timeout_classifies_grouped_runner_cleanup_as_timeout() -> None:
     }
     assert "workload-secret" not in repr(outcome)
     assert runner.cancelled is True
+
+
+def test_caller_cancellation_wins_during_grouped_tool_timeout_cleanup() -> None:
+    runner = _DelayedGroupedCleanupFailureRunner()
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+
+    class BlockingTool(Tool):
+        spec = ToolSpec(
+            name="grouped_cleanup_cancellation",
+            description="Block in grouped runner cleanup.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            await ctx.runner.exec(ExecCommand.process("blocked"))
+            return ToolResult(content="unexpected")
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        runner.started = asyncio.Event()
+        runner.cleanup_started = asyncio.Event()
+        execution = asyncio.create_task(
+            run_tool(
+                tool=BlockingTool(),
+                effect=ToolEffect.NONE,
+                ctx=ToolContext(session_id="grouped-timeout-caller-cancellation", runner=handle),
+                arguments={},
+                redactor=SecretRedactor,
+                timeout_seconds=0.01,
+            )
+        )
+        await asyncio.wait_for(runner.cleanup_started.wait(), timeout=1)
+        execution.cancel("caller cancellation during grouped cleanup")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await execution
+        return raised.value, execution.cancelling(), execution.cancelled()
+
+    cancellation, cancellation_requests, cancelled = asyncio.run(scenario())
+
+    assert cancellation.args == ("Runner command was cancelled.",)
+    failure = runner_cancellation_failure(cancellation)
+    assert failure is not None
+    leaves = [
+        candidate
+        for candidate in iter_exception_tree(failure)
+        if not isinstance(candidate, BaseExceptionGroup)
+    ]
+    assert len(leaves) == 1
+    assert type(leaves[0]) is RunnerExecutionError
+    assert str(leaves[0]) == "Runner command execution failed."
+    assert cancellation_requests == 1
+    assert cancelled is True
 
 
 @pytest.mark.parametrize(

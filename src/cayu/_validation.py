@@ -5,6 +5,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from itertools import islice
 from math import isfinite
 from types import MappingProxyType
 from typing import Any, Never, cast
@@ -44,8 +45,13 @@ def revalidate_model_input(value: Any, *model_types: type[BaseModel]) -> Any:
     return value
 
 
-def revalidate_model_inputs(value: Any, *model_types: type[BaseModel]) -> Any:
-    """Reconstruct validated models inside one iterable field input."""
+def revalidate_model_inputs(
+    value: Any,
+    *model_types: type[BaseModel],
+    maximum: int | None = None,
+    field_name: str = "value",
+) -> Any:
+    """Reconstruct validated models inside one optionally bounded iterable input."""
 
     if (
         value is None
@@ -53,7 +59,15 @@ def revalidate_model_inputs(value: Any, *model_types: type[BaseModel]) -> Any:
         or not isinstance(value, Iterable)
     ):
         return value
-    return tuple(revalidate_model_input(item, *model_types) for item in value)
+    if maximum is None:
+        items = value
+    else:
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError("maximum must be a non-negative integer.")
+        items = tuple(islice(value, maximum + 1))
+        if len(items) > maximum:
+            raise ValueError(f"{field_name} must contain at most {maximum} values.")
+    return tuple(revalidate_model_input(item, *model_types) for item in items)
 
 
 def _model_instance_python_input(value: BaseModel) -> dict[str, Any]:
@@ -572,13 +586,22 @@ def thaw_json_value(value: Any) -> Any:
 class JsonUtf8SizeCounter:
     """Count compact JSON UTF-8 bytes without building the serialized value."""
 
-    def __init__(self, limit: int, *, ensure_ascii: bool = False) -> None:
+    def __init__(
+        self,
+        limit: int,
+        *,
+        ensure_ascii: bool = False,
+        canonical_durable_numbers: bool = False,
+    ) -> None:
         if type(limit) is not int or limit < 0:
             raise ValueError("limit must be a non-negative integer.")
         if type(ensure_ascii) is not bool:
             raise TypeError("ensure_ascii must be a boolean.")
+        if type(canonical_durable_numbers) is not bool:
+            raise TypeError("canonical_durable_numbers must be a boolean.")
         self.remaining = limit
         self.ensure_ascii = ensure_ascii
+        self.canonical_durable_numbers = canonical_durable_numbers
         self.exceeded_limit = False
         self.encountered_unsupported_value = False
 
@@ -629,8 +652,12 @@ class JsonUtf8SizeCounter:
             return self._string(value.isoformat())
         if type(value) in {int, float}:
             try:
-                rendered = str(value)
-            except (OverflowError, ValueError):
+                rendered = (
+                    _canonical_durable_json_text(value)
+                    if self.canonical_durable_numbers
+                    else str(value)
+                )
+            except (AssertionError, OverflowError, ValueError):
                 # CPython bounds decimal conversion of very large integers. A
                 # size preflight must fail closed instead of leaking that raw
                 # interpreter error past a caller expecting a bounded result.
@@ -669,7 +696,7 @@ class JsonUtf8SizeCounter:
                 if not self.value(item):
                     return False
             return True
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, (list, tuple)) or type(value) is FrozenJsonList:
             if not self._consume(2):
                 return False
             for index, item in enumerate(value):

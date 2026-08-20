@@ -460,7 +460,13 @@ class ForkGroupCoordinator:
             [IncompleteSessionRecoveryRequest], Awaitable[IncompleteSessionRecoveryResult]
         ],
         get_session_usage: Callable[[str], Awaitable[SessionUsageSummary]],
-        prepare_evaluator_agent: Callable[[RunRequest, str, str], Awaitable[tuple[str, str]]],
+        preflight_evaluator_agent: Callable[[RunRequest, str, str], Awaitable[tuple[str, str]]],
+        prepare_evaluator_agent: Callable[
+            [RunRequest, str, str, str | None], Awaitable[tuple[str, str]]
+        ],
+        preflight_fork_source: Callable[[str], Awaitable[None]],
+        preflight_fork_source_state: Callable[[Session, dict[str, Any] | None], Awaitable[None]],
+        admit_fork_source: Callable[[str], Awaitable[None]],
     ) -> None:
         if not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("ForkGroupCoordinator requires a SecretRedactor.")
@@ -473,7 +479,11 @@ class ForkGroupCoordinator:
         self._resume_session_callback = resume_session
         self._recover_incomplete_session_callback = recover_incomplete_session
         self._get_session_usage_callback = get_session_usage
+        self._preflight_evaluator_agent_callback = preflight_evaluator_agent
         self._prepare_evaluator_agent_callback = prepare_evaluator_agent
+        self._preflight_fork_source_callback = preflight_fork_source
+        self._preflight_fork_source_state_callback = preflight_fork_source_state
+        self._admit_fork_source_callback = admit_fork_source
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._gates: dict[str, ForkGroupGate] = {}
 
@@ -519,12 +529,40 @@ class ForkGroupCoordinator:
         *,
         source_agent_name: str,
         request_sha256: str,
+        store_resolved_existing_session_id: str | None,
     ) -> tuple[str, str]:
         return await self._prepare_evaluator_agent_callback(
             request,
             source_agent_name,
             request_sha256,
+            store_resolved_existing_session_id,
         )
+
+    async def preflight_evaluator_agent(
+        self,
+        request: RunRequest,
+        *,
+        source_agent_name: str,
+        request_sha256: str,
+    ) -> tuple[str, str]:
+        return await self._preflight_evaluator_agent_callback(
+            request,
+            source_agent_name,
+            request_sha256,
+        )
+
+    async def preflight_fork_source(self, session_id: str) -> None:
+        await self._preflight_fork_source_callback(session_id)
+
+    async def preflight_fork_source_state(
+        self,
+        source: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> None:
+        await self._preflight_fork_source_state_callback(source, checkpoint)
+
+    async def admit_fork_source(self, session_id: str) -> None:
+        await self._admit_fork_source_callback(session_id)
 
     def register_gate(self, gate_id: str, gate: ForkGroupGate) -> ForkGroupGateSelection:
         gate_id = require_durable_clean_nonblank(gate_id, "gate_id")
@@ -554,8 +592,23 @@ class ForkGroupCoordinator:
             raise TypeError("Runtime fork group requires a ForkGroupRequest.")
         public_source_session_id = request.source_session_id
         copied = ForkGroupRequest.model_validate(request.model_dump(mode="python", warnings=False))
-        source_id, _ = await self.resolve_public_session_authority(copied.source_session_id)
-        copied = _prepare_request(self, copied, source_session_id=source_id)
+        (
+            source_id,
+            store_resolved_source_session_id,
+        ) = await self.resolve_public_session_authority(copied.source_session_id)
+        session_request_boundary.require_store_resolved_or_secret_free_session_authority(
+            source_id,
+            store_resolved_value=store_resolved_source_session_id,
+            field_name="source_session_id",
+            redactor=self.secret_redactor,
+        )
+        await self.preflight_fork_source(source_id)
+        copied = _prepare_request(
+            self,
+            copied,
+            source_session_id=source_id,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+        )
         lock_key = (source_id, copied.group_id)
         lock = self._locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
@@ -563,6 +616,11 @@ class ForkGroupCoordinator:
             replayed = record is not None
             if record is None:
                 record = await _create_record(self, copied)
+            else:
+                # A durable legacy/current record does not itself authorize a
+                # new ordinary replay. Establish the source admission before a
+                # claim update or result publication.
+                await self.admit_fork_source(source_id)
             if record.result.state not in {ForkGroupState.COMPLETED, ForkGroupState.FAILED}:
                 record, claim_id = await _claim_execution(
                     self,
@@ -835,13 +893,14 @@ def _prepare_request(
     request: ForkGroupRequest,
     *,
     source_session_id: str,
+    store_resolved_source_session_id: str | None = None,
 ) -> ForkGroupRequest:
     """Apply ordinary fork/resume durability boundaries before identity is bound."""
 
     redactor = coordinator.secret_redactor
     session_request_boundary.require_store_resolved_or_secret_free_session_authority(
         source_session_id,
-        store_resolved_value=source_session_id,
+        store_resolved_value=store_resolved_source_session_id,
         field_name="source_session_id",
         redactor=redactor,
     )
@@ -867,7 +926,7 @@ def _prepare_request(
         prepared_fork = session_request_boundary.prepare_fork_session_request(
             _branch_fork_request(request, branch),
             redactor=redactor,
-            store_resolved_source_session_id=source_session_id,
+            store_resolved_source_session_id=store_resolved_source_session_id,
         )
         prepared_resume = session_request_boundary.prepare_resume_request(
             _branch_resume_request(request, branch),
@@ -1786,6 +1845,25 @@ async def _tool_free_evaluator_authority(
         ),
         source_agent_name=evaluator.agent_name,
         request_sha256=record.request_sha256,
+        store_resolved_existing_session_id=record.result.evaluator_session_id,
+    )
+
+
+async def _preflight_tool_free_evaluator_authority(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+) -> tuple[str, str]:
+    evaluator = record.request.evaluator
+    synthetic_name = _synthetic_evaluator_name(record)
+    branch_ids = tuple(branch.branch_id for branch in record.request.branches)
+    return await coordinator.preflight_evaluator_agent(
+        _evaluator_run_request(
+            record,
+            synthetic_agent_name=synthetic_name,
+            branch_ids=branch_ids,
+        ),
+        source_agent_name=evaluator.agent_name,
+        request_sha256=record.request_sha256,
     )
 
 
@@ -2042,6 +2120,7 @@ async def _create_record(
         raise ValueError("Fork-group causal_budget_id must match the source session.")
     snapshot = await coordinator.session_store.load_transcript_snapshot(source.id)
     checkpoint = await coordinator.session_store.load_checkpoint(source.id)
+    await coordinator.preflight_fork_source_state(source, checkpoint)
     effective_checkpoint = {} if checkpoint is None else checkpoint
     _, profile, _ = session_request_boundary.prepare_fork_source_execution_profile(
         source,
@@ -2094,10 +2173,25 @@ async def _create_record(
             source=source_snapshot,
         ),
     )
-    _, evaluator_profile_fingerprint = await _tool_free_evaluator_authority(
+    # Resolve every deterministic evaluator dependency without registering its
+    # synthetic agent or admitting either session. Known-invalid groups must
+    # not consume the source's future contract-attachment authority.
+    evaluator_name, preflight_profile_fingerprint = await _preflight_tool_free_evaluator_authority(
+        coordinator, record
+    )
+    # Live evaluator preparation registers its isolated runtime agent and
+    # atomically admits the evaluator session. Close the source attachment race
+    # immediately before that first group-owned side effect.
+    await coordinator.admit_fork_source(source.id)
+    prepared_evaluator_name, evaluator_profile_fingerprint = await _tool_free_evaluator_authority(
         coordinator,
         record,
     )
+    if (
+        prepared_evaluator_name != evaluator_name
+        or evaluator_profile_fingerprint != preflight_profile_fingerprint
+    ):
+        raise ForkGroupConflict("Evaluator execution profile changed during fork-group admission.")
     record = record.model_copy(
         update={"evaluator_execution_profile_fingerprint": evaluator_profile_fingerprint}
     )

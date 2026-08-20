@@ -15,6 +15,7 @@ class ShieldedTaskOutcome(Generic[_ResultT]):
     result: _ResultT | None = None
     error: BaseException | None = None
     cancellation: asyncio.CancelledError | None = None
+    subsequent_cancellation: asyncio.CancelledError | None = None
     cancellation_requests_consumed: int = 0
     timed_out: bool = False
 
@@ -80,15 +81,36 @@ def consume_pending_task_cancellation(
     return captured
 
 
-def restore_task_cancellation_requests(count: int) -> None:
-    """Restore shield-consumed requests immediately before control escapes."""
+def restore_task_cancellation_requests(
+    count: int,
+    *,
+    cancellation: asyncio.CancelledError | None = None,
+) -> None:
+    """Restore shield-consumed requests immediately before control escapes.
+
+    When the boundary retained the delivered cancellation, preserve its single
+    task-owned message on every restored request.  Reissuing a bare request can
+    otherwise replace the authoritative ``CancelledError`` at the next await.
+    """
 
     if type(count) is not int or count < 0:
         raise ValueError("Consumed cancellation request count must be a non-negative int.")
+    if cancellation is not None and not isinstance(cancellation, asyncio.CancelledError):
+        raise TypeError("Restored cancellation must be a CancelledError.")
+    cancellation_message = None
+    has_cancellation_message = False
+    if cancellation is not None:
+        cancellation_args = BaseException.__dict__["args"].__get__(cancellation, BaseException)
+        if type(cancellation_args) is tuple and len(cancellation_args) == 1:
+            cancellation_message = cancellation_args[0]
+            has_cancellation_message = True
     current_task = asyncio.current_task()
     if current_task is not None:
         for _request in range(count):
-            current_task.cancel()
+            if has_cancellation_message:
+                current_task.cancel(cancellation_message)
+            else:
+                current_task.cancel()
 
 
 async def await_shielded_task_outcome(
@@ -103,6 +125,7 @@ async def await_shielded_task_outcome(
     current_task = asyncio.current_task()
     historical_requests = 0 if current_task is None else current_task.cancelling()
     cancellation_requests_consumed = 0
+    subsequent_cancellation: asyncio.CancelledError | None = None
     loop = asyncio.get_running_loop()
     deadline = None if timeout_s is None else loop.time() + timeout_s
     if cancellation is not None and timeout_after_cancellation_s is not None:
@@ -116,12 +139,14 @@ async def await_shielded_task_outcome(
             return ShieldedTaskOutcome(
                 result=task.result(),
                 cancellation=cancellation,
+                subsequent_cancellation=subsequent_cancellation,
                 cancellation_requests_consumed=cancellation_requests_consumed,
             )
         except BaseException as child_error:
             return ShieldedTaskOutcome(
                 error=child_error,
                 cancellation=cancellation,
+                subsequent_cancellation=subsequent_cancellation,
                 cancellation_requests_consumed=cancellation_requests_consumed,
             )
 
@@ -130,7 +155,8 @@ async def await_shielded_task_outcome(
         *,
         preserve_requests: int,
     ) -> bool:
-        nonlocal cancellation, cancellation_requests_consumed, deadline
+        nonlocal cancellation, subsequent_cancellation
+        nonlocal cancellation_requests_consumed, deadline
         if current_task is None or current_task.cancelling() <= preserve_requests:
             return False
         # This helper deliberately suppresses cancellation only long enough to
@@ -138,8 +164,17 @@ async def await_shielded_task_outcome(
         # cleanup phases do not rediscover and duplicate the same cancellation;
         # the returned outcome makes its wrapper responsible for redelivery.
         requests_before_consumption = current_task.cancelling()
+        # The first delivered caller signal stays authoritative across repeated
+        # cancellation. Retain one later delivery separately so a boundary with
+        # its own structurally identified cancellation (for example a tool
+        # deadline) can exclude that internal request without replacing the
+        # first caller signal globally.
+        if cancellation is None:
+            cancellation = observed
+        elif observed is not None and subsequent_cancellation is None:
+            subsequent_cancellation = observed
         cancellation = consume_pending_task_cancellation(
-            cancellation or observed,
+            cancellation,
             preserve_requests=preserve_requests,
         )
         cancellation_requests_consumed += max(
@@ -197,6 +232,7 @@ async def await_shielded_task_outcome(
     if deadline is not None and loop.time() >= deadline:
         return ShieldedTaskOutcome(
             cancellation=cancellation,
+            subsequent_cancellation=subsequent_cancellation,
             cancellation_requests_consumed=cancellation_requests_consumed,
             timed_out=True,
         )
@@ -209,6 +245,7 @@ async def await_shielded_task_outcome(
                 if remaining <= 0:
                     return ShieldedTaskOutcome(
                         cancellation=cancellation,
+                        subsequent_cancellation=subsequent_cancellation,
                         cancellation_requests_consumed=cancellation_requests_consumed,
                         timed_out=True,
                     )
@@ -226,6 +263,7 @@ async def await_shielded_task_outcome(
             if not task.done():
                 return ShieldedTaskOutcome(
                     cancellation=cancellation,
+                    subsequent_cancellation=subsequent_cancellation,
                     cancellation_requests_consumed=cancellation_requests_consumed,
                     timed_out=True,
                 )

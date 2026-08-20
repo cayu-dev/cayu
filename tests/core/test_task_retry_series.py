@@ -2657,6 +2657,8 @@ def test_task_worker_rejects_retry_report_for_legacy_task_without_stopping() -> 
 
 def test_task_worker_rejects_corrupted_retry_authority_before_handler() -> None:
     class CorruptingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def claim_task(self, worker_id, query=None, *, lease_seconds=300):
             claimed = await super().claim_task(
                 worker_id,

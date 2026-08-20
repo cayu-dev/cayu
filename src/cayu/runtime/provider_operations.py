@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1858,6 +1859,7 @@ async def resolve_provider_operation_stage(
     request: ProviderOperationResolutionRequest,
     *,
     redactor: SecretRedactor,
+    before_resolution: Callable[[], Awaitable[None]] | None = None,
 ) -> ProviderOperationResolutionResult:
     """Atomically record one disposition and release only its exact active stage."""
 
@@ -1880,6 +1882,8 @@ async def resolve_provider_operation_stage(
             raise ProviderOperationResolutionConflict(
                 "Existing provider-operation resolution does not prove atomic source-stage release."
             )
+        if before_resolution is not None:
+            await before_resolution()
         return existing
     if not session_store._supports_atomic_model_completion_stage_release_protocol():
         raise ProviderOperationResolutionConflict(
@@ -2095,6 +2099,8 @@ async def resolve_provider_operation_stage(
             ),
         )
 
+    if before_resolution is not None:
+        await before_resolution()
     try:
         await session_store.publish_session_operation(
             request.session_id,

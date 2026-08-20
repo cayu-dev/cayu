@@ -58,6 +58,7 @@ from cayu.tools.knowledge import (
     SearchKnowledgeTool,
 )
 from cayu.tools.subagents import SubagentResultTool, SubagentTool
+from cayu.vaults import SecretRedactor
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):
@@ -372,6 +373,90 @@ def test_remember_knowledge_ambiguous_failure_event_is_bounded_and_content_free(
     transcript_payload = json.dumps(tool_result.model_dump(mode="json"), sort_keys=True)
     assert knowledge_canary not in transcript_payload
     assert exception_canary not in transcript_payload
+
+
+def test_tool_timeout_consumes_only_its_owned_cancellation_request() -> None:
+    class SlowTool(Tool):
+        spec = ToolSpec(
+            name="slow_tool",
+            description="Wait beyond the tool deadline.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx, args
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def run() -> tuple[tool_execution.ToolExecutionOutcome, int]:
+        outcome = await tool_execution.run_tool(
+            tool=SlowTool(),
+            effect=ToolEffect.NONE,
+            ctx=ToolContext(session_id="tool-timeout-cancellation-owner"),
+            arguments={},
+            redactor=SecretRedactor,
+            timeout_seconds=0.01,
+        )
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        return outcome, current_task.cancelling()
+
+    outcome, cancellation_requests = asyncio.run(run())
+
+    assert outcome.result.is_error is True
+    assert outcome.result.content == "Tool call timed out after 0.01 seconds."
+    assert cancellation_requests == 0
+
+
+def test_tool_timeout_isolated_owner_preserves_later_caller_cancellation() -> None:
+    class CancellationResettingTool(Tool):
+        spec = ToolSpec(
+            name="cancellation_resetting_tool",
+            description="Consume the child deadline before caller cancellation.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.deadline_consumed = asyncio.Event()
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx, args
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                child_task = asyncio.current_task()
+                assert child_task is not None
+                child_task.uncancel()
+                self.deadline_consumed.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def run() -> tuple[asyncio.CancelledError, int]:
+        tool = CancellationResettingTool()
+        execution = asyncio.create_task(
+            tool_execution.run_tool(
+                tool=tool,
+                effect=ToolEffect.NONE,
+                ctx=ToolContext(session_id="isolated-tool-timeout-cancellation"),
+                arguments={},
+                redactor=SecretRedactor,
+                timeout_seconds=0.01,
+            )
+        )
+        await asyncio.wait_for(tool.deadline_consumed.wait(), timeout=1)
+        execution.cancel("caller cancellation after tool deadline")
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="caller cancellation after tool deadline",
+        ) as raised:
+            await execution
+        assert execution.cancelled() is True
+        return raised.value, execution.cancelling()
+
+    cancellation, cancellation_requests = asyncio.run(run())
+
+    assert cancellation.args == ("caller cancellation after tool deadline",)
+    assert cancellation_requests == 1
 
 
 def test_remember_knowledge_timeout_returns_while_owned_publication_finishes() -> None:

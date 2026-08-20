@@ -13,7 +13,7 @@ from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, cast
 from uuid import uuid4
 
 from pydantic import (
@@ -33,6 +33,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    revalidate_model_input,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -55,6 +56,50 @@ from cayu.runtime.invocation import (
     inherited_task_invocation,
 )
 from cayu.runtime.service_manifest import RuntimeStoreDurability
+from cayu.runtime.work_contracts import (
+    WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
+    WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS,
+    WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
+    WORK_CONTRACT_TASK_CREATION_MAX_ITEMS,
+    WORK_CONTRACT_TASK_MAX_BYTES,
+    WORK_CONTRACT_TASK_MAX_ITEMS,
+    CompletionDecision,
+    CompletionDecisionApplicationRequest,
+    CompletionDecisionCreate,
+    CompletionProposal,
+    CompletionProposalCreate,
+    CompletionRejectionAction,
+    CompletionSatisfactionBasis,
+    CompletionVerdict,
+    CompletionVerificationClaim,
+    CompletionVerificationClaimLost,
+    CompletionVerificationClaimRequest,
+    CriterionOutcomeStatus,
+    TaskCompletionDecisionRequired,
+    WorkAttempt,
+    WorkAttemptCreate,
+    WorkCompletionConflict,
+    WorkContract,
+    WorkContractConflict,
+    WorkContractRef,
+    completion_decision_application_request_sha256,
+    completion_decision_request_sha256,
+    completion_gap_fingerprint,
+    completion_proposal_request_sha256,
+    completion_verification_claim_request_sha256,
+    copy_completion_decision_application_request,
+    copy_completion_decision_create,
+    copy_completion_proposal_create,
+    copy_completion_verification_claim_request,
+    copy_work_attempt_create,
+    copy_work_contract,
+    copy_work_contract_ref,
+    preflight_work_completion_document,
+    require_bounded_work_completion_document,
+    validate_work_completion_idempotency_key,
+    validate_work_completion_linked_id,
+    work_attempt_request_sha256,
+)
 
 _TASK_RETRY_COST_MAX_DIGITS = 64
 _TASK_RETRY_TOTAL_COST_MAX_DIGITS = 128
@@ -390,6 +435,28 @@ class TaskRetryEvent(BaseModel):
 
 
 TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES = 256
+_CONTRACT_TASK_JSON_FIELDS = ("input", "metadata", "status_payload", "result", "error")
+
+
+def _preflight_bounded_task_payloads(
+    value: object,
+    field_names: tuple[str, ...] = _CONTRACT_TASK_JSON_FIELDS,
+    *,
+    field_label: str = "Contract-bound task",
+) -> None:
+    document = cast("dict[str, object]", value) if type(value) is dict else None
+    for field_name in field_names:
+        field_value = (
+            document.get(field_name) if document is not None else getattr(value, field_name)
+        )
+        if field_value is None:
+            continue
+        preflight_work_completion_document(
+            field_value,
+            f"{field_label} {field_name}",
+            max_bytes=WORK_CONTRACT_TASK_MAX_BYTES,
+            max_items=WORK_CONTRACT_TASK_MAX_ITEMS,
+        )
 
 
 class TaskOrder(StrEnum):
@@ -432,6 +499,18 @@ class Task(BaseModel):
     completed_at: datetime | None = None
     invocation: TaskInvocation = Field(frozen=True)
     retry_series: TaskRetrySeriesSnapshot | None = None
+    work_contract: WorkContractRef | None = Field(default=None, frozen=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def preflight_work_contract_payloads(cls, value: object) -> object:
+        if type(value) is not dict:
+            return value
+        document = cast("dict[str, object]", value)
+        if document.get("work_contract") is None:
+            return value
+        _preflight_bounded_task_payloads(document)
+        return value
 
     @field_validator("input", "metadata", mode="before")
     @classmethod
@@ -482,33 +561,52 @@ class Task(BaseModel):
             return None
         return normalize_utc_datetime(value, "available_at")
 
+    @field_validator("work_contract", mode="before")
+    @classmethod
+    def copy_work_contract(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkContractRef)
+
     @model_validator(mode="after")
-    def validate_retry_series_authority(self) -> Task:
-        if self.retry_series is None:
+    def validate_retry_and_work_contract_authority(self) -> Task:
+        if self.retry_series is not None:
+            expected = _task_retry_attempt_authority_sha256(
+                task_id=self.id,
+                task_type=self.type,
+                title=self.title,
+                description=self.description,
+                parent_task_id=self.parent_task_id,
+                assigned_agent_name=self.assigned_agent_name,
+                available_at=self.available_at,
+                created_at=self.created_at,
+                task_input=self.input,
+                metadata=self.metadata,
+                invocation=self.invocation,
+                series_id=self.retry_series.series_id,
+                causal_budget_id=self.retry_series.causal_budget_id,
+                attempt=self.retry_series.attempt,
+                policy=self.retry_series.policy,
+                started_at=self.retry_series.started_at,
+                cumulative_tokens=self.retry_series.cumulative_tokens,
+                cumulative_estimated_cost=self.retry_series.cumulative_estimated_cost,
+                predecessor_task_id=self.retry_series.predecessor_task_id,
+            )
+            if self.retry_series.authority_sha256 != expected:
+                raise ValueError("Task retry-series authority conflicts with its task evidence.")
+        if self.retry_series is not None and self.work_contract is not None:
+            raise ValueError("Retry-series tasks cannot use verified work contracts.")
+        if self.work_contract is None:
             return self
-        expected = _task_retry_attempt_authority_sha256(
-            task_id=self.id,
-            task_type=self.type,
-            title=self.title,
-            description=self.description,
-            parent_task_id=self.parent_task_id,
-            assigned_agent_name=self.assigned_agent_name,
-            available_at=self.available_at,
-            created_at=self.created_at,
-            task_input=self.input,
-            metadata=self.metadata,
-            invocation=self.invocation,
-            series_id=self.retry_series.series_id,
-            causal_budget_id=self.retry_series.causal_budget_id,
-            attempt=self.retry_series.attempt,
-            policy=self.retry_series.policy,
-            started_at=self.retry_series.started_at,
-            cumulative_tokens=self.retry_series.cumulative_tokens,
-            cumulative_estimated_cost=self.retry_series.cumulative_estimated_cost,
-            predecessor_task_id=self.retry_series.predecessor_task_id,
+        validate_work_completion_linked_id(self.id, "id")
+        if self.session_id is not None:
+            validate_work_completion_linked_id(self.session_id, "session_id")
+        if self.worker_id is not None:
+            validate_work_completion_linked_id(self.worker_id, "worker_id")
+        require_bounded_work_completion_document(
+            self.model_dump(mode="json", warnings=False),
+            "Contract-bound task",
+            max_bytes=WORK_CONTRACT_TASK_MAX_BYTES,
+            max_items=WORK_CONTRACT_TASK_MAX_ITEMS,
         )
-        if self.retry_series.authority_sha256 != expected:
-            raise ValueError("Task retry-series authority conflicts with its task evidence.")
         return self
 
 
@@ -553,10 +651,22 @@ class TaskCreate(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     retry_policy: TaskRetryPolicy | None = None
+    work_contract: WorkContractRef | None = None
     invocation_origin: InvocationOriginClaim | None = None
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: TaskExecutionSource | None = PrivateAttr(default=None)
     _runtime_session_binding: SessionInvocationBinding | None = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def preflight_work_contract_payloads(cls, value: object) -> object:
+        if type(value) is not dict:
+            return value
+        document = cast("dict[str, object]", value)
+        if document.get("work_contract") is None:
+            return value
+        _preflight_bounded_task_payloads(document, ("input", "metadata"))
+        return value
 
     @field_validator("input", "metadata", mode="before")
     @classmethod
@@ -595,10 +705,30 @@ class TaskCreate(BaseModel):
             return None
         return normalize_utc_datetime(value, "available_at")
 
+    @field_validator("work_contract", mode="before")
+    @classmethod
+    def copy_work_contract(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkContractRef)
+
     @model_validator(mode="after")
-    def validate_retry_series_shape(self) -> TaskCreate:
-        if self.retry_policy is not None and self.session_id is not None:
-            raise ValueError("Retry-series tasks must start as unattached queue work.")
+    def validate_retry_and_work_contract_shape(self) -> TaskCreate:
+        if self.retry_policy is not None:
+            if self.session_id is not None:
+                raise ValueError("Retry-series tasks must start as unattached queue work.")
+            if self.work_contract is not None:
+                raise ValueError("Retry-series tasks cannot use verified work contracts.")
+        if self.work_contract is None:
+            return self
+        if self.task_id is not None:
+            validate_work_completion_linked_id(self.task_id, "task_id")
+        if self.session_id is not None:
+            validate_work_completion_linked_id(self.session_id, "session_id")
+        require_bounded_work_completion_document(
+            self.model_dump(mode="json", warnings=False),
+            "Contract-bound task creation request",
+            max_bytes=WORK_CONTRACT_TASK_MAX_BYTES,
+            max_items=WORK_CONTRACT_TASK_MAX_ITEMS,
+        )
         return self
 
 
@@ -900,6 +1030,62 @@ class TaskRetrySettlementResult(BaseModel):
                 or event.next_eligible_at != series.next_eligible_at
             ):
                 raise ValueError("Task retry receipt event conflicts with the settled attempt.")
+        return self
+
+
+class CompletionDecisionApplicationReceipt(BaseModel):
+    """Immutable evidence that one verifier decision was applied to its task."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    task_id: str
+    decision_id: str
+    idempotency_key: str
+    request_sha256: str
+    task: Task
+    applied_at: datetime
+
+    @field_validator("task_id", "decision_id", "idempotency_key")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        if info.field_name == "idempotency_key":
+            return validate_work_completion_idempotency_key(value)
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("task", mode="before")
+    @classmethod
+    def copy_task(cls, value: object) -> object:
+        if type(value) is Task:
+            _preflight_bounded_task_payloads(
+                value,
+                field_label="Decision-application receipt task",
+            )
+        return revalidate_model_input(value, Task)
+
+    @field_validator("applied_at")
+    @classmethod
+    def normalize_applied_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "applied_at")
+
+    @model_validator(mode="after")
+    def validate_receipt_task(self) -> CompletionDecisionApplicationReceipt:
+        if self.task.id != self.task_id:
+            raise ValueError("Decision-application receipt conflicts with its task.")
+        if self.task.work_contract is None:
+            raise ValueError("Decision-application receipt requires a contract-bound task.")
+        require_bounded_work_completion_document(
+            self.model_dump(mode="json", warnings=False),
+            "Completion decision application receipt",
+            max_bytes=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
+            max_items=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS,
+        )
         return self
 
 
@@ -1620,7 +1806,116 @@ class TaskStore(ABC):
     supports_task_topology: ClassVar[bool] = False
     supports_idempotent_terminalization: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
+    supports_verified_work_contracts: ClassVar[bool] = False
+    verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
+
+    # ``supports_verified_work_contracts`` alone is not settlement authority.
+    # A class may set this flag to exactly ``True`` only when each verified-work
+    # mutation implementation it owns has stopped mutating before its awaitable
+    # returns or raises, including after caller cancellation. A subclass may
+    # inherit proof for an unchanged method, but an override becomes a new
+    # implementation owner and must declare its own proof.
+
+    async def publish_work_contract(self, contract: WorkContract) -> WorkContract:
+        """Publish one immutable version or replay its exact canonical content."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_work_contract(self, reference: WorkContractRef) -> WorkContract | None:
+        """Load the exact contract named by ``reference`` or reject a fingerprint conflict."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_active_work_contract_task_for_session(
+        self,
+        session_id: str,
+    ) -> Task | None:
+        """Load a contracted task whose binding retains authority over a session.
+
+        A terminal task does not implicitly release pending session work into the
+        ordinary runtime. Until a verifier-aware release operation exists, the
+        durable session binding remains authoritative and callers must start a new
+        ordinary session.
+        """
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def admit_ordinary_session_execution(self, session_id: str) -> None:
+        """Atomically admit a session to the ordinary, non-verifier runtime.
+
+        Supporting stores must reject admission while a contracted task binding
+        retains authority over the session and must durably prevent later contract
+        attachment to an admitted session. Task terminalization alone is not a
+        release. Repeated admission of the same session is idempotent.
+        """
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def hold_claimed_work_contract_task(
+        self,
+        task_id: str,
+        *,
+        worker_id: str,
+        contract: WorkContractRef,
+    ) -> Task:
+        """Claim-fence an unsupported contracted task into operator attention."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def begin_work_attempt(self, request: WorkAttemptCreate) -> WorkAttempt:
+        """Create or replay one bounded execution attempt under a task's frozen contract."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_work_attempt(self, attempt_id: str) -> WorkAttempt | None:
+        """Load one work attempt by stable identity."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def submit_completion_proposal(
+        self,
+        request: CompletionProposalCreate,
+    ) -> CompletionProposal:
+        """Persist a worker proposal without granting completion authority."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
+        """Load one completion proposal by stable identity."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def claim_completion_verification(
+        self,
+        request: CompletionVerificationClaimRequest,
+    ) -> CompletionVerificationClaim:
+        """Claim bounded exclusive authority to verify one undecided proposal."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_completion_verification_claim(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerificationClaim | None:
+        """Load the latest verification claim, including an expired claim for recovery."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def record_completion_decision(
+        self,
+        request: CompletionDecisionCreate,
+    ) -> CompletionDecision:
+        """Persist the one authoritative verifier decision for a proposal."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_completion_decision(self, decision_id: str) -> CompletionDecision | None:
+        """Load one completion decision by stable identity."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def apply_completion_decision(
+        self,
+        request: CompletionDecisionApplicationRequest,
+    ) -> Task:
+        """Apply or exactly replay a decision-bound task transition."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_completion_decision_application_receipt(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> CompletionDecisionApplicationReceipt | None:
+        """Load exact durable evidence for decision application reconciliation."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
 
     @abstractmethod
     async def create_task(self, request: TaskCreate) -> Task:
@@ -1896,6 +2191,8 @@ class InMemoryTaskStore(TaskStore):
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
+    supports_verified_work_contracts: ClassVar[bool] = True
+    verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
@@ -1904,19 +2201,522 @@ class InMemoryTaskStore(TaskStore):
         self._tasks: dict[str, Task] = {}
         self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
         self._retry_settlements: dict[tuple[str, str], TaskRetrySettlementResult] = {}
+        self._work_contracts: dict[tuple[str, int], WorkContract] = {}
+        self._work_attempts: dict[str, WorkAttempt] = {}
+        self._attempt_ids_by_task: dict[str, list[str]] = {}
+        self._completion_proposals: dict[str, CompletionProposal] = {}
+        self._proposal_id_by_attempt: dict[str, str] = {}
+        self._completion_verification_claims: dict[str, CompletionVerificationClaim] = {}
+        self._verification_claims_by_id: dict[str, CompletionVerificationClaim] = {}
+        self._completion_decisions: dict[str, CompletionDecision] = {}
+        self._decision_id_by_proposal: dict[str, str] = {}
+        self._decision_application_receipts: dict[
+            tuple[str, str], CompletionDecisionApplicationReceipt
+        ] = {}
+        self._decision_application_key_by_decision: dict[str, tuple[str, str]] = {}
+        self._ordinary_execution_session_ids: set[str] = set()
         self._task_keys_by_session: dict[str, list[tuple[datetime, str]]] = {}
         self._task_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
+
+    async def publish_work_contract(self, contract: WorkContract) -> WorkContract:
+        contract = copy_work_contract(contract)
+        key = (contract.contract_id, contract.version)
+        async with self._lock:
+            existing = self._work_contracts.get(key)
+            if existing is not None:
+                if existing != contract:
+                    raise WorkContractConflict(
+                        "Work-contract identity is already bound to different content."
+                    )
+                return copy_work_contract(existing)
+            if contract.supersedes is not None:
+                predecessor = self._work_contracts.get(
+                    (contract.supersedes.contract_id, contract.supersedes.version)
+                )
+                if predecessor is None:
+                    raise WorkContractConflict("Work-contract predecessor has not been published.")
+                if predecessor.reference() != contract.supersedes:
+                    raise WorkContractConflict(
+                        "Work-contract predecessor fingerprint conflicts with durable history."
+                    )
+            self._work_contracts[key] = contract
+            return copy_work_contract(contract)
+
+    async def load_work_contract(self, reference: WorkContractRef) -> WorkContract | None:
+        copied_reference = copy_work_contract_ref(reference)
+        if copied_reference is None:  # pragma: no cover - excluded by the public type
+            raise TypeError("reference must be a WorkContractRef.")
+        async with self._lock:
+            contract = self._work_contracts.get(
+                (copied_reference.contract_id, copied_reference.version)
+            )
+            if contract is None:
+                return None
+            if contract.fingerprint != copied_reference.fingerprint:
+                raise WorkContractConflict(
+                    "Work-contract reference conflicts with the published fingerprint."
+                )
+            return copy_work_contract(contract)
+
+    async def load_active_work_contract_task_for_session(
+        self,
+        session_id: str,
+    ) -> Task | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            task = self._active_work_contract_task_for_session(session_id)
+            return None if task is None else task.model_copy(deep=True)
+
+    async def admit_ordinary_session_execution(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            contracted_task = self._active_work_contract_task_for_session(session_id)
+            requires_completion_decision = contracted_task is not None
+            del contracted_task
+            if requires_completion_decision:
+                raise TaskCompletionDecisionRequired(
+                    "Contracted tasks require the verifier-aware execution entrance."
+                ) from None
+            self._ordinary_execution_session_ids.add(session_id)
+
+    async def hold_claimed_work_contract_task(
+        self,
+        task_id: str,
+        *,
+        worker_id: str,
+        contract: WorkContractRef,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        copied_contract = copy_work_contract_ref(contract)
+        if copied_contract is None:  # pragma: no cover - excluded by the public type
+            raise TypeError("contract must be a WorkContractRef.")
+        async with self._lock:
+            task = self._require_task(task_id)
+            now = datetime.now(UTC)
+            _ensure_owned_active_task_lease(task, worker_id, now=now)
+            if task.status is not TaskStatus.CLAIMED or task.session_id is not None:
+                raise TaskClaimLost("Only the current worker may park its unattached claimed task.")
+            self._ensure_task_contract_matches(task, copied_contract)
+            updated = task.model_copy(
+                update={
+                    "status": TaskStatus.NEEDS_ATTENTION,
+                    "status_reason": "verified_work_contract_runner_required",
+                    "status_payload": {
+                        "contract_id": copied_contract.contract_id,
+                        "contract_version": copied_contract.version,
+                    },
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            self._store_task(updated)
+            return updated.model_copy(deep=True)
+
+    async def begin_work_attempt(self, request: WorkAttemptCreate) -> WorkAttempt:
+        request = copy_work_attempt_create(request)
+        request_sha256 = work_attempt_request_sha256(request)
+        async with self._lock:
+            existing = self._work_attempts.get(request.attempt_id)
+            if existing is not None:
+                if existing.request_sha256 != request_sha256:
+                    raise WorkCompletionConflict(
+                        "Work-attempt identity is already bound to another request."
+                    )
+                return existing.model_copy(deep=True)
+            task = self._require_task(request.task_id)
+            contract = self._ensure_task_contract_matches(task, request.contract)
+            if task.status is not TaskStatus.RUNNING:
+                raise ValueError("Work attempts require a running contracted task.")
+            if task.session_id != request.session_id:
+                raise WorkCompletionConflict("Work attempt is bound to a different task session.")
+            self._ensure_attempt_worker_matches(task, request.worker_id)
+            attempt_ids = self._attempt_ids_by_task.get(task.id, [])
+            if len(attempt_ids) >= contract.continuation_policy.max_attempts:
+                raise WorkCompletionConflict(
+                    "Work-contract attempt limit forbids another work attempt."
+                )
+            if attempt_ids:
+                prior_attempt_id = attempt_ids[-1]
+                prior_proposal_id = self._proposal_id_by_attempt.get(prior_attempt_id)
+                prior_decision_id = (
+                    None
+                    if prior_proposal_id is None
+                    else self._decision_id_by_proposal.get(prior_proposal_id)
+                )
+                if prior_decision_id is None:
+                    raise WorkCompletionConflict(
+                        "A prior work attempt has not reached a durable decision."
+                    )
+                if prior_decision_id not in self._decision_application_key_by_decision:
+                    raise WorkCompletionConflict(
+                        "A prior verifier decision has not reached durable task application."
+                    )
+            attempt = WorkAttempt(
+                attempt_id=request.attempt_id,
+                task_id=request.task_id,
+                session_id=request.session_id,
+                contract=request.contract,
+                execution_profile_fingerprint=request.execution_profile_fingerprint,
+                worker_id=request.worker_id,
+                ordinal=len(attempt_ids) + 1,
+                request_sha256=request_sha256,
+                started_at=self._clock(),
+            )
+            self._work_attempts[attempt.attempt_id] = attempt
+            self._attempt_ids_by_task.setdefault(task.id, []).append(attempt.attempt_id)
+            return attempt.model_copy(deep=True)
+
+    async def load_work_attempt(self, attempt_id: str) -> WorkAttempt | None:
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        async with self._lock:
+            attempt = self._work_attempts.get(attempt_id)
+            return None if attempt is None else attempt.model_copy(deep=True)
+
+    async def submit_completion_proposal(
+        self,
+        request: CompletionProposalCreate,
+    ) -> CompletionProposal:
+        request = copy_completion_proposal_create(request)
+        request_sha256 = completion_proposal_request_sha256(request)
+        async with self._lock:
+            existing = self._completion_proposals.get(request.proposal_id)
+            if existing is not None:
+                if existing.request_sha256 != request_sha256:
+                    raise WorkCompletionConflict(
+                        "Completion-proposal identity is already bound to another request."
+                    )
+                return existing.model_copy(deep=True)
+            prior_proposal_id = self._proposal_id_by_attempt.get(request.attempt_id)
+            if prior_proposal_id is not None:
+                raise WorkCompletionConflict(
+                    "Work attempt already has a different completion proposal."
+                )
+            attempt = self._require_work_attempt(request.attempt_id)
+            task = self._require_task(attempt.task_id)
+            self._ensure_attempt_is_current(task, attempt)
+            proposal = CompletionProposal(
+                proposal_id=request.proposal_id,
+                attempt_id=request.attempt_id,
+                result=request.result,
+                evidence_references=request.evidence_references,
+                task_id=attempt.task_id,
+                contract=attempt.contract,
+                request_sha256=request_sha256,
+                proposed_at=self._clock(),
+            )
+            self._completion_proposals[proposal.proposal_id] = proposal
+            self._proposal_id_by_attempt[attempt.attempt_id] = proposal.proposal_id
+            return proposal.model_copy(deep=True)
+
+    async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            proposal = self._completion_proposals.get(proposal_id)
+            return None if proposal is None else proposal.model_copy(deep=True)
+
+    async def claim_completion_verification(
+        self,
+        request: CompletionVerificationClaimRequest,
+    ) -> CompletionVerificationClaim:
+        request = copy_completion_verification_claim_request(request)
+        request_sha256 = completion_verification_claim_request_sha256(request)
+        async with self._lock:
+            claim_by_id = self._verification_claims_by_id.get(request.claim_id)
+            if claim_by_id is not None and (
+                claim_by_id.proposal_id != request.proposal_id
+                or claim_by_id.request_sha256 != request_sha256
+            ):
+                raise WorkCompletionConflict(
+                    "Verification-claim identity is already bound to another request."
+                )
+            proposal = self._require_completion_proposal(request.proposal_id)
+            contract = self._require_work_contract(proposal.contract)
+            if request.verifier != contract.verifier:
+                raise WorkCompletionConflict(
+                    "Verification claim uses a verifier other than the frozen contract verifier."
+                )
+            now = self._clock()
+            current = self._completion_verification_claims.get(request.proposal_id)
+            if (
+                current is not None
+                and current.claim_id == request.claim_id
+                and current.request_sha256 == request_sha256
+            ):
+                if (
+                    current.lease_expires_at > now
+                    or proposal.proposal_id in self._decision_id_by_proposal
+                ):
+                    return current.model_copy(deep=True)
+                raise CompletionVerificationClaimLost(
+                    "Verification claim expired and cannot regain authority by replay."
+                )
+            if proposal.proposal_id in self._decision_id_by_proposal:
+                raise WorkCompletionConflict("Completion proposal already has a durable decision.")
+            if current is not None and current.lease_expires_at > now:
+                raise CompletionVerificationClaimLost(
+                    "Completion proposal is owned by another live verifier claim."
+                )
+            if claim_by_id is not None:
+                raise CompletionVerificationClaimLost(
+                    "Verification claim expired and cannot regain authority by replay."
+                )
+            self._ensure_completion_proposal_is_current(proposal)
+            attempt_number = 1 if current is None else current.attempt_number + 1
+            claim = CompletionVerificationClaim(
+                claim_id=request.claim_id,
+                proposal_id=request.proposal_id,
+                worker_id=request.worker_id,
+                verifier=request.verifier,
+                attempt_number=attempt_number,
+                request_sha256=request_sha256,
+                claimed_at=now,
+                lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+            )
+            self._completion_verification_claims[proposal.proposal_id] = claim
+            self._verification_claims_by_id[claim.claim_id] = claim
+            return claim.model_copy(deep=True)
+
+    async def load_completion_verification_claim(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerificationClaim | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            claim = self._completion_verification_claims.get(proposal_id)
+            return None if claim is None else claim.model_copy(deep=True)
+
+    async def record_completion_decision(
+        self,
+        request: CompletionDecisionCreate,
+    ) -> CompletionDecision:
+        request = copy_completion_decision_create(request)
+        request_sha256 = completion_decision_request_sha256(request)
+        async with self._lock:
+            existing = self._completion_decisions.get(request.decision_id)
+            if existing is not None:
+                if existing.request_sha256 != request_sha256:
+                    raise WorkCompletionConflict(
+                        "Completion-decision identity is already bound to another request."
+                    )
+                return existing.model_copy(deep=True)
+            prior_decision_id = self._decision_id_by_proposal.get(request.proposal_id)
+            if prior_decision_id is not None:
+                raise WorkCompletionConflict(
+                    "Completion proposal already has a different durable decision."
+                )
+            proposal = self._require_completion_proposal(request.proposal_id)
+            claim = self._completion_verification_claims.get(proposal.proposal_id)
+            now = self._clock()
+            if (
+                claim is None
+                or claim.claim_id != request.claim_id
+                or claim.worker_id != request.worker_id
+                or claim.verifier != request.verifier
+                or claim.lease_expires_at <= now
+            ):
+                raise CompletionVerificationClaimLost(
+                    "Completion decision requires the current live verifier claim."
+                )
+            self._ensure_completion_proposal_is_current(proposal)
+            contract = self._require_work_contract(proposal.contract)
+            expected_criteria = tuple(item.criterion_id for item in contract.criteria)
+            observed_criteria = tuple(item.criterion_id for item in request.criterion_outcomes)
+            if observed_criteria != expected_criteria:
+                raise WorkCompletionConflict(
+                    "Completion decision must cover every contract criterion exactly once in order."
+                )
+            expected_constraints = tuple(item.constraint_id for item in contract.constraints)
+            observed_constraints = tuple(item.constraint_id for item in request.constraint_outcomes)
+            if observed_constraints != expected_constraints:
+                raise WorkCompletionConflict(
+                    "Completion decision must cover every contract constraint exactly once in order."
+                )
+            _validate_completion_decision_contract(contract, request)
+            decision = CompletionDecision(
+                decision_id=request.decision_id,
+                proposal_id=request.proposal_id,
+                claim_id=request.claim_id,
+                worker_id=request.worker_id,
+                verifier=request.verifier,
+                decision_version=request.decision_version,
+                verdict=request.verdict,
+                criterion_outcomes=request.criterion_outcomes,
+                constraint_outcomes=request.constraint_outcomes,
+                gaps=request.gaps,
+                evidence_references=request.evidence_references,
+                task_id=proposal.task_id,
+                attempt_id=proposal.attempt_id,
+                contract=proposal.contract,
+                request_sha256=request_sha256,
+                gap_fingerprint=completion_gap_fingerprint(request),
+                decided_at=now,
+            )
+            self._completion_decisions[decision.decision_id] = decision
+            self._decision_id_by_proposal[proposal.proposal_id] = decision.decision_id
+            return decision.model_copy(deep=True)
+
+    async def load_completion_decision(self, decision_id: str) -> CompletionDecision | None:
+        decision_id = require_clean_nonblank(decision_id, "decision_id")
+        async with self._lock:
+            decision = self._completion_decisions.get(decision_id)
+            return None if decision is None else decision.model_copy(deep=True)
+
+    async def apply_completion_decision(
+        self,
+        request: CompletionDecisionApplicationRequest,
+    ) -> Task:
+        try:
+            copied_request = copy_completion_decision_application_request(request)
+        except BaseException:
+            del request
+            raise
+        request = copied_request
+        del copied_request
+        request_sha256 = completion_decision_application_request_sha256(request)
+        receipt_key = (request.task_id, request.idempotency_key)
+        async with self._lock:
+            receipt = self._decision_application_receipts.get(receipt_key)
+            if receipt is not None:
+                if receipt.request_sha256 != request_sha256:
+                    raise WorkCompletionConflict(
+                        "Decision-application identity is already bound to another request."
+                    )
+                return receipt.task.model_copy(deep=True)
+            prior_receipt_key = self._decision_application_key_by_decision.get(request.decision_id)
+            if prior_receipt_key is not None:
+                raise WorkCompletionConflict(
+                    "Completion decision was already applied under another identity."
+                )
+            task = self._require_task(request.task_id)
+            decision = self._completion_decisions.get(request.decision_id)
+            if decision is None:
+                raise KeyError(f"Completion decision not found: {request.decision_id}")
+            if decision.task_id != task.id:
+                raise WorkCompletionConflict("Completion decision belongs to another task.")
+            contract = self._ensure_task_contract_matches(task, decision.contract)
+            attempt = self._require_work_attempt(decision.attempt_id)
+            # The durable verifier decision, exact application tuple, and latest
+            # attempt identity authorize this transition. The originating task
+            # worker may have crashed or its lease may have expired while an
+            # independent verifier was running.
+            self._ensure_decision_attempt_is_current(task, attempt)
+            proposal = self._require_completion_proposal(decision.proposal_id)
+            applied_at = self._clock()
+            task_changed = False
+            if decision.verdict is CompletionVerdict.ACCEPTED:
+                if request.result is None or request.result_reference is None:
+                    raise ValueError(
+                        "Accepted completion decisions require a verified task result."
+                    )
+                if request.result_reference != proposal.result:
+                    raise WorkCompletionConflict(
+                        "Decision application result conflicts with the accepted proposal."
+                    )
+                task = self._prepare_finished_task(
+                    task.id,
+                    TaskStatus.COMPLETED,
+                    result=request.result,
+                    error=None,
+                    worker_id=None,
+                    accepted_decision_id=decision.decision_id,
+                    now=applied_at,
+                )
+                task_changed = True
+            else:
+                if request.result is not None:
+                    raise ValueError("Non-accepted completion decisions cannot carry a result.")
+                if decision.verdict is CompletionVerdict.BLOCKED:
+                    task = self._prepare_held_task_from_completion_decision(
+                        task,
+                        TaskStatus.BLOCKED,
+                        decision=decision,
+                        now=applied_at,
+                    )
+                    task_changed = True
+                elif decision.verdict is CompletionVerdict.NEEDS_REVIEW:
+                    task = self._prepare_held_task_from_completion_decision(
+                        task,
+                        TaskStatus.NEEDS_ATTENTION,
+                        decision=decision,
+                        now=applied_at,
+                    )
+                    task_changed = True
+                elif decision.verdict is CompletionVerdict.REJECTED:
+                    rejection_hold = self._completion_rejection_hold(
+                        contract,
+                        decision,
+                        attempt,
+                    )
+                    if rejection_hold is not None:
+                        hold_status, status_reason = rejection_hold
+                        task = self._prepare_held_task_from_completion_decision(
+                            task,
+                            hold_status,
+                            decision=decision,
+                            now=applied_at,
+                            status_reason=status_reason,
+                        )
+                        task_changed = True
+                    elif task.worker_id is not None or task.lease_expires_at is not None:
+                        # A decision closes the attempt and fences its worker. A
+                        # verifier-aware owner can begin the next attempt without
+                        # inheriting authority from the prior attempt's lease.
+                        task = task.model_copy(
+                            update={
+                                "worker_id": None,
+                                "lease_expires_at": None,
+                                "updated_at": applied_at,
+                            }
+                        )
+                        task_changed = True
+            receipt = CompletionDecisionApplicationReceipt(
+                task_id=task.id,
+                decision_id=decision.decision_id,
+                idempotency_key=request.idempotency_key,
+                request_sha256=request_sha256,
+                task=task,
+                applied_at=applied_at,
+            )
+            if task_changed:
+                self._store_task(task)
+            self._decision_application_receipts[receipt_key] = receipt
+            self._decision_application_key_by_decision[decision.decision_id] = receipt_key
+            return task.model_copy(deep=True)
+
+    async def load_completion_decision_application_receipt(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> CompletionDecisionApplicationReceipt | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        idempotency_key = validate_work_completion_idempotency_key(idempotency_key)
+        async with self._lock:
+            receipt = self._decision_application_receipts.get((task_id, idempotency_key))
+            if receipt is None:
+                return None
+            return CompletionDecisionApplicationReceipt.model_validate(
+                receipt.model_dump(mode="python", warnings=False)
+            )
 
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         async with self._lock:
             task_id = request.task_id or str(uuid4())
             parent = self._task_parent_for_create(request, task_id=task_id)
+            if request.work_contract is not None:
+                self._require_work_contract(request.work_contract)
+                self._ensure_contract_session_accepts_attachment(
+                    request.work_contract,
+                    request.session_id,
+                )
             task = _task_from_create(
                 request,
                 task_id=task_id,
                 parent_task=parent,
                 retry_started_at=self._clock(),
+                supports_verified_work_contracts=True,
             )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
@@ -1934,12 +2734,19 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             task_id = request.task_id or str(uuid4())
             parent = self._task_parent_for_create(request, task_id=task_id)
+            if request.work_contract is not None:
+                self._require_work_contract(request.work_contract)
+                self._ensure_contract_session_accepts_attachment(
+                    request.work_contract,
+                    request.session_id,
+                )
             task = _running_task_from_create(
                 request,
                 task_id=task_id,
                 parent_task=parent,
                 session_invocation=session_binding,
                 retry_started_at=self._clock(),
+                supports_verified_work_contracts=True,
             )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
@@ -2114,6 +2921,11 @@ class InMemoryTaskStore(TaskStore):
                 stored_session_id=task.session_id,
                 requested_session_id=session_id,
             )
+            self._ensure_contract_session_accepts_attachment(
+                task.work_contract,
+                effective_session_id,
+                require_session=True,
+            )
             _task_invocation_for_attachment(
                 task.invocation,
                 session_id=effective_session_id,
@@ -2148,6 +2960,10 @@ class InMemoryTaskStore(TaskStore):
             now = datetime.now(UTC)
             if not _can_attach_claimed_task(task, worker_id=worker_id, now=now):
                 _raise_task_claim_attach_error(task, worker_id, now=now)
+            self._ensure_contract_session_accepts_attachment(
+                task.work_contract,
+                session_id,
+            )
             _task_invocation_for_attachment(
                 task.invocation,
                 session_id=session_id,
@@ -2476,6 +3292,8 @@ class InMemoryTaskStore(TaskStore):
             # Claiming is always FIFO by creation time, independent of the query's
             # display ordering, so the oldest pending task is dispatched first.
             task = _sort_tasks(candidates, TaskOrder.CREATED_AT_ASC)[0]
+            if task.work_contract is not None:
+                validate_work_completion_linked_id(worker_id, "worker_id")
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.CLAIMED,
@@ -2603,6 +3421,107 @@ class InMemoryTaskStore(TaskStore):
             raise KeyError(f"Task not found: {task_id}")
         return task
 
+    def _require_work_contract(self, reference: WorkContractRef) -> WorkContract:
+        contract = self._work_contracts.get((reference.contract_id, reference.version))
+        if contract is None:
+            raise WorkContractConflict("Referenced work contract has not been published.")
+        if contract.fingerprint != reference.fingerprint:
+            raise WorkContractConflict(
+                "Work-contract reference conflicts with the published fingerprint."
+            )
+        return contract
+
+    def _ensure_task_contract_matches(
+        self,
+        task: Task,
+        reference: WorkContractRef,
+    ) -> WorkContract:
+        contract = self._require_work_contract(reference)
+        if task.work_contract is None:
+            raise WorkCompletionConflict("Task is not bound to a work contract.")
+        if task.work_contract != reference:
+            raise WorkCompletionConflict(
+                "Work operation conflicts with the task's frozen contract binding."
+            )
+        return contract
+
+    def _require_work_attempt(self, attempt_id: str) -> WorkAttempt:
+        attempt = self._work_attempts.get(attempt_id)
+        if attempt is None:
+            raise KeyError(f"Work attempt not found: {attempt_id}")
+        return attempt
+
+    def _require_completion_proposal(self, proposal_id: str) -> CompletionProposal:
+        proposal = self._completion_proposals.get(proposal_id)
+        if proposal is None:
+            raise KeyError(f"Completion proposal not found: {proposal_id}")
+        return proposal
+
+    def _ensure_attempt_worker_matches(self, task: Task, worker_id: str | None) -> None:
+        if task.worker_id != worker_id:
+            raise TaskClaimLost("Work attempt does not carry the task's current worker authority.")
+        if worker_id is not None:
+            # Task ownership leases use wall-clock time. ``self._clock`` is the
+            # independently injectable availability/verifier lifecycle clock.
+            _ensure_active_task_lease(task, worker_id)
+
+    def _ensure_attempt_is_current(self, task: Task, attempt: WorkAttempt) -> None:
+        self._ensure_attempt_state_is_current(task, attempt)
+        self._ensure_attempt_worker_matches(task, attempt.worker_id)
+
+    def _ensure_decision_attempt_is_current(self, task: Task, attempt: WorkAttempt) -> None:
+        self._ensure_attempt_state_is_current(task, attempt)
+        if task.worker_id not in {None, attempt.worker_id}:
+            raise TaskClaimLost(
+                "Completion decision conflicts with replacement task-worker authority."
+            )
+
+    def _ensure_attempt_state_is_current(self, task: Task, attempt: WorkAttempt) -> None:
+        self._ensure_task_contract_matches(task, attempt.contract)
+        attempt_ids = self._attempt_ids_by_task.get(task.id, [])
+        if not attempt_ids or attempt_ids[-1] != attempt.attempt_id:
+            raise WorkCompletionConflict(
+                "Work operation does not reference the latest task attempt."
+            )
+        if task.status is not TaskStatus.RUNNING or task.session_id != attempt.session_id:
+            raise WorkCompletionConflict("Work attempt no longer owns the live task session.")
+
+    def _ensure_completion_proposal_is_current(self, proposal: CompletionProposal) -> None:
+        attempt = self._require_work_attempt(proposal.attempt_id)
+        if attempt.task_id != proposal.task_id or attempt.contract != proposal.contract:
+            raise WorkCompletionConflict(
+                "Completion proposal conflicts with its durable work attempt."
+            )
+        task = self._require_task(proposal.task_id)
+        self._ensure_attempt_state_is_current(task, attempt)
+
+    def _active_work_contract_task_for_session(self, session_id: str) -> Task | None:
+        for task in self._tasks.values():
+            if task.session_id == session_id and task.work_contract is not None:
+                return task
+        return None
+
+    def _ensure_contract_session_accepts_attachment(
+        self,
+        contract: WorkContractRef | None,
+        session_id: str | None,
+        *,
+        require_session: bool = False,
+    ) -> None:
+        if contract is None:
+            return
+        if session_id is None:
+            if require_session:
+                raise WorkCompletionConflict(
+                    "Contracted tasks require a session binding before starting."
+                )
+            return
+        validate_work_completion_linked_id(session_id, "session_id")
+        if session_id in self._ordinary_execution_session_ids:
+            raise WorkCompletionConflict(
+                "Work-contract attachment conflicts with prior ordinary session execution."
+            )
+
     def _task_parent_for_create(
         self,
         request: TaskCreate,
@@ -2636,14 +3555,45 @@ class InMemoryTaskStore(TaskStore):
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
         worker_id: str | None = None,
+        accepted_decision_id: str | None = None,
+    ) -> Task:
+        updated = self._prepare_finished_task(
+            task_id,
+            status,
+            result=result,
+            error=error,
+            worker_id=worker_id,
+            accepted_decision_id=accepted_decision_id,
+            now=datetime.now(UTC),
+        )
+        self._store_task(updated)
+        return updated.model_copy(deep=True)
+
+    def _prepare_finished_task(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+        worker_id: str | None,
+        accepted_decision_id: str | None,
+        now: datetime,
     ) -> Task:
         task = self._require_task(task_id)
+        if (
+            status is TaskStatus.COMPLETED
+            and task.work_contract is not None
+            and accepted_decision_id is None
+        ):
+            raise TaskCompletionDecisionRequired(
+                "Contracted task completion requires an accepted durable verifier decision."
+            )
         if worker_id is not None:
             if task.worker_id != worker_id:
                 raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
-            _ensure_active_task_lease(task, worker_id)
+            _ensure_active_task_lease(task, worker_id, now=now)
         _ensure_can_transition(task, status)
-        now = datetime.now(UTC)
         if task.retry_series is not None:
             if status is not TaskStatus.CANCELLED:
                 raise ValueError(
@@ -2683,8 +3633,65 @@ class InMemoryTaskStore(TaskStore):
                 "retry_series": None,
             }
         )
-        self._store_task(updated)
-        return updated.model_copy(deep=True)
+        return updated
+
+    def _prepare_held_task_from_completion_decision(
+        self,
+        task: Task,
+        status: TaskStatus,
+        *,
+        decision: CompletionDecision,
+        now: datetime,
+        status_reason: str | None = None,
+    ) -> Task:
+        if status not in {TaskStatus.PAUSED, TaskStatus.BLOCKED, TaskStatus.NEEDS_ATTENTION}:
+            raise ValueError("Completion decisions can only apply supported held statuses.")
+        if task.status is not TaskStatus.RUNNING:
+            raise WorkCompletionConflict("Completion decision no longer owns a running task.")
+        return task.model_copy(
+            update={
+                "status": status,
+                "status_reason": status_reason or f"work_contract_{decision.verdict.value}",
+                "status_payload": {
+                    "completion_decision_id": decision.decision_id,
+                    "gap_fingerprint": decision.gap_fingerprint,
+                    "verdict": decision.verdict.value,
+                },
+                "worker_id": None,
+                "lease_expires_at": None,
+                "updated_at": now,
+            }
+        )
+
+    def _completion_rejection_hold(
+        self,
+        contract: WorkContract,
+        decision: CompletionDecision,
+        attempt: WorkAttempt,
+    ) -> tuple[TaskStatus, str] | None:
+        policy = contract.continuation_policy
+        if attempt.ordinal >= policy.max_attempts:
+            return (TaskStatus.NEEDS_ATTENTION, "work_contract_attempt_limit")
+
+        matching_gap_count = 0
+        for attempt_id in self._attempt_ids_by_task.get(decision.task_id, []):
+            proposal_id = self._proposal_id_by_attempt.get(attempt_id)
+            decision_id = (
+                None if proposal_id is None else self._decision_id_by_proposal.get(proposal_id)
+            )
+            candidate = None if decision_id is None else self._completion_decisions.get(decision_id)
+            if (
+                candidate is not None
+                and candidate.verdict is CompletionVerdict.REJECTED
+                and candidate.gap_fingerprint == decision.gap_fingerprint
+            ):
+                matching_gap_count += 1
+        repeated_gap_count = max(0, matching_gap_count - 1)
+        if repeated_gap_count >= policy.max_repeated_gap_count:
+            return (TaskStatus.NEEDS_ATTENTION, "work_contract_repeated_gap_limit")
+        if policy.rejection_action is CompletionRejectionAction.INTERRUPT:
+            return (TaskStatus.PAUSED, "work_contract_rejected")
+        return None
 
     async def _hold_task(
         self,
@@ -2748,6 +3755,12 @@ class InMemoryTaskStore(TaskStore):
         return candidates
 
     def _store_task(self, task: Task) -> None:
+        # ``model_copy(update=...)`` intentionally skips Pydantic validation.
+        # Revalidate every contracted lifecycle snapshot at the final in-memory
+        # publication boundary so no transition can outgrow the bounded task
+        # representation that decision receipts rely on.
+        if task.work_contract is not None:
+            task = copy_task(task)
         prior = self._tasks.get(task.id)
         if prior is not None and (
             prior.created_at,
@@ -3200,6 +4213,8 @@ def _reject_task_parent_link_cycles(
 def copy_task(task: Task) -> Task:
     if type(task) is not Task:
         raise TypeError("Tasks must be Task instances.")
+    if task.work_contract is not None:
+        _preflight_bounded_task_payloads(task)
     return Task(
         id=task.id,
         type=task.type,
@@ -3232,6 +4247,7 @@ def copy_task(task: Task) -> Task:
             if task.retry_series is None
             else _copy_task_retry_series_snapshot(task.retry_series)
         ),
+        work_contract=copy_work_contract_ref(task.work_contract),
     )
 
 
@@ -4525,6 +5541,8 @@ def _bounded_task_terminalization_evidence(value: str) -> str:
 def copy_task_create(request: TaskCreate) -> TaskCreate:
     if type(request) is not TaskCreate:
         raise TypeError("Task creation requires a TaskCreate instance.")
+    if request.work_contract is not None:
+        _preflight_bounded_task_payloads(request, ("input", "metadata"))
     copied = TaskCreate(
         task_id=request.task_id,
         type=request.type,
@@ -4543,6 +5561,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
                 request.retry_policy.model_dump(mode="python", warnings=False)
             )
         ),
+        work_contract=copy_work_contract_ref(request.work_contract),
         invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
     )
     copied._verified_invocation_origin = (
@@ -4808,6 +5827,19 @@ def task_query_from_aggregate_filter(filters: TaskAggregateFilter) -> TaskQuery:
     )
 
 
+def require_contract_bound_task_creation_snapshot(task: Task) -> None:
+    """Enforce the initial-snapshot reserve shared by every supporting store."""
+
+    if type(task) is not Task or task.work_contract is None:
+        raise TypeError("Creation-snapshot validation requires a contract-bound Task.")
+    require_bounded_work_completion_document(
+        task.model_dump(mode="json", warnings=False),
+        "Contract-bound task creation snapshot",
+        max_bytes=WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
+        max_items=WORK_CONTRACT_TASK_CREATION_MAX_ITEMS,
+    )
+
+
 def _task_from_create(
     request: TaskCreate,
     *,
@@ -4815,7 +5847,12 @@ def _task_from_create(
     parent_task: Task | TaskInvocationSnapshot | None,
     session_invocation: SessionInvocationBinding | None = None,
     retry_started_at: datetime | None = None,
+    supports_verified_work_contracts: bool = False,
 ) -> Task:
+    if request.work_contract is not None and not supports_verified_work_contracts:
+        raise NotImplementedError(
+            "This TaskStore does not support verified work-contract task bindings."
+        )
     now = datetime.now(UTC)
     retry_started_at = (
         now
@@ -4862,7 +5899,7 @@ def _task_from_create(
             policy=retry_policy,
             started_at=retry_started_at,
         )
-    return Task(
+    task = Task(
         id=task_id,
         type=request.type,
         title=request.title,
@@ -4878,7 +5915,11 @@ def _task_from_create(
         updated_at=now,
         invocation=invocation,
         retry_series=retry_series,
+        work_contract=copy_work_contract_ref(request.work_contract),
     )
+    if task.work_contract is not None:
+        require_contract_bound_task_creation_snapshot(task)
+    return task
 
 
 def _running_task_from_create(
@@ -4888,6 +5929,7 @@ def _running_task_from_create(
     parent_task: Task | TaskInvocationSnapshot | None,
     session_invocation: SessionInvocationBinding,
     retry_started_at: datetime | None = None,
+    supports_verified_work_contracts: bool = False,
 ) -> Task:
     task = _task_from_create(
         request,
@@ -4895,15 +5937,37 @@ def _running_task_from_create(
         parent_task=parent_task,
         session_invocation=session_invocation,
         retry_started_at=retry_started_at,
+        supports_verified_work_contracts=supports_verified_work_contracts,
     )
     if task.session_id is None:
         raise ValueError("TaskCreate.session_id is required to create a running task.")
-    return task.model_copy(
+    running = task.model_copy(
         update={
             "status": TaskStatus.RUNNING,
             "started_at": task.created_at,
         }
     )
+    return copy_task(running) if running.work_contract is not None else running
+
+
+def preflight_contract_bound_task_creation(
+    request: TaskCreate,
+    *,
+    parent_task: Task | TaskInvocationSnapshot | None,
+) -> None:
+    """Validate the authoritative pending snapshot before an extension mutates."""
+
+    if type(request) is not TaskCreate or request.work_contract is None:
+        raise TypeError("Creation preflight requires a contract-bound TaskCreate request.")
+    if request.task_id is None:
+        raise ValueError("Contract-bound task creation requires a caller-stable task_id.")
+    preview = _task_from_create(
+        request,
+        task_id=request.task_id,
+        parent_task=parent_task,
+        supports_verified_work_contracts=True,
+    )
+    del preview
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
@@ -5132,6 +6196,73 @@ def _copy_optional_status_payload(value: dict[str, Any] | None) -> dict[str, Any
     if value is None:
         return None
     return copy_durable_json_object(value, "payload")
+
+
+def _validate_completion_decision_contract(
+    contract: WorkContract,
+    request: CompletionDecisionCreate,
+) -> None:
+    requirements = {item.requirement_id: item for item in contract.evidence_requirements}
+    all_outcomes = (*request.criterion_outcomes, *request.constraint_outcomes)
+    all_references = (
+        *request.evidence_references,
+        *(reference for outcome in all_outcomes for reference in outcome.evidence_references),
+    )
+    for reference in all_references:
+        if reference.requirement_id is None:
+            continue
+        requirement = requirements.get(reference.requirement_id)
+        if requirement is None or requirement.kind != reference.kind:
+            raise WorkCompletionConflict(
+                "Completion decision evidence conflicts with the frozen contract requirements."
+            )
+
+    subject_requirements: dict[tuple[str, str], frozenset[str]] = {
+        ("criterion", item.criterion_id): frozenset(item.evidence_requirement_ids)
+        for item in contract.criteria
+    }
+    subject_requirements.update(
+        {
+            ("constraint", item.constraint_id): frozenset(item.evidence_requirement_ids)
+            for item in contract.constraints
+        }
+    )
+    outcomes_with_subjects = (
+        *((("criterion", item.criterion_id), item) for item in request.criterion_outcomes),
+        *((("constraint", item.constraint_id), item) for item in request.constraint_outcomes),
+    )
+    for subject, outcome in outcomes_with_subjects:
+        required = subject_requirements[subject]
+        bound = {
+            reference.requirement_id
+            for reference in outcome.evidence_references
+            if reference.requirement_id is not None
+        }
+        if not bound.issubset(required):
+            raise WorkCompletionConflict(
+                "Completion outcome cites evidence assigned to another contract outcome."
+            )
+        if outcome.status is not CriterionOutcomeStatus.SATISFIED:
+            continue
+        available = {
+            reference.requirement_id
+            for reference in outcome.evidence_references
+            if reference.available and reference.requirement_id is not None
+        }
+        if required and (
+            outcome.satisfaction_basis is not CompletionSatisfactionBasis.EVIDENCE
+            or not required.issubset(available)
+        ):
+            raise WorkCompletionConflict(
+                "Satisfied completion outcomes must carry every available required evidence item."
+            )
+
+    for gap in request.gaps:
+        required = subject_requirements.get(gap.subject_key())
+        if required is None or not set(gap.evidence_requirement_ids).issubset(required):
+            raise WorkCompletionConflict(
+                "Completion decision contains a gap outside the frozen contract."
+            )
 
 
 _TERMINAL_TASK_STATUSES = {

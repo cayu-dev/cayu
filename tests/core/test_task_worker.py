@@ -35,6 +35,7 @@ from cayu import (
     TaskInvocationSnapshot,
     TaskQuery,
     TaskStatus,
+    TaskStore,
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,
     TaskTerminalKind,
@@ -96,6 +97,58 @@ def test_run_task_worker_rejects_nan_poll_interval(tmp_path: Path) -> None:
             )
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_method", ["reclaim_expired", "claim_task"])
+def test_ordinary_task_worker_preserves_store_failure_identity_and_traceback(
+    failure_method: str,
+) -> None:
+    class OrdinaryFailureStore:
+        supports_verified_work_contracts = False
+        hold_claimed_work_contract_task = TaskStore.hold_claimed_work_contract_task
+
+        def __init__(self) -> None:
+            self.failure = KeyError(f"ordinary {failure_method} failure")
+
+        async def reclaim_expired(self, *, query=None):
+            del query
+            if failure_method == "reclaim_expired":
+                raise self.failure
+            return []
+
+        async def claim_task(self, worker_id, query, *, lease_seconds):
+            del worker_id, query, lease_seconds
+            if failure_method == "claim_task":
+                raise self.failure
+            return None
+
+    async def scenario() -> tuple[BaseException, OrdinaryFailureStore]:
+        store = OrdinaryFailureStore()
+        app = CayuApp(enable_logging=False)
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            raise AssertionError("An ordinary store failure must precede task handling.")
+
+        with pytest.raises(KeyError) as raised:
+            await run_task_worker(
+                app,
+                store,  # type: ignore[arg-type]
+                handler,
+                worker_id="ordinary-worker-failure",
+                poll_interval_s=0.001,
+                max_tasks=1,
+            )
+        return raised.value, store
+
+    failure, store = asyncio.run(scenario())
+
+    assert failure is store.failure
+    traceback_names: list[str] = []
+    traceback = failure.__traceback__
+    while traceback is not None:
+        traceback_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert failure_method in traceback_names
 
 
 @pytest.mark.anyio

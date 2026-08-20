@@ -38,6 +38,10 @@ from cayu._exception_groups import (
     set_exception_cause,
 )
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
+from cayu.runtime._task_store_operation_boundary import (
+    capture_task_store_operation,
+    task_store_mutation_is_cancellation_quiescent,
+)
 from cayu.runtime.sessions import SessionStatus
 from cayu.runtime.tasks import (
     Task,
@@ -164,17 +168,94 @@ async def run_task_worker(
         raise ValueError(
             "worker_id contains a workload secret and cannot be used as durable task authority."
         )
+    if max_tasks == 0 or _is_stopped(stop):
+        return 0
+    materialized_work_contract_queue_supported = (
+        task_store.supports_verified_work_contracts
+        or type(task_store).hold_claimed_work_contract_task
+        is not TaskStore.hold_claimed_work_contract_task
+    )
+    verified_mutation_methods = [
+        ("hold_claimed_work_contract_task", "contracted-task parking"),
+        ("claim_task", "task claiming"),
+    ]
+    if reclaim:
+        verified_mutation_methods.append(("reclaim_expired", "expired-claim reclamation"))
+    if materialized_work_contract_queue_supported:
+        for method_name, operation_name in verified_mutation_methods:
+            if task_store_mutation_is_cancellation_quiescent(task_store, method_name):
+                continue
+            raise NotImplementedError(
+                f"The {operation_name} implementation must explicitly guarantee that "
+                "verified-work mutations are cancellation-quiescent."
+            )
 
     handled = 0
     while (max_tasks is None or handled < max_tasks) and not _is_stopped(stop):
         if reclaim:
-            await task_store.reclaim_expired(query=query)
-        task = await task_store.claim_task(worker_id, query, lease_seconds=lease_seconds)
+            if materialized_work_contract_queue_supported:
+                reclaim_outcome = await capture_task_store_operation(
+                    lambda: task_store.reclaim_expired(query=query),
+                    operation_name="Expired task-claim reclamation",
+                    redactor=app._secret_redactor,
+                    mutation_store=task_store,
+                    mutation_method_name="reclaim_expired",
+                )
+                if reclaim_outcome.failure is not None:
+                    failure = reclaim_outcome.failure
+                    del reclaim_outcome
+                    raise failure from None
+                del reclaim_outcome
+            else:
+                await task_store.reclaim_expired(query=query)
+        if materialized_work_contract_queue_supported:
+            claim_outcome = await capture_task_store_operation(
+                lambda: task_store.claim_task(worker_id, query, lease_seconds=lease_seconds),
+                operation_name="Task claim",
+                redactor=app._secret_redactor,
+                mutation_store=task_store,
+                mutation_method_name="claim_task",
+            )
+            if claim_outcome.failure is not None:
+                failure = claim_outcome.failure
+                del claim_outcome
+                raise failure from None
+            task = claim_outcome.result
+            del claim_outcome
+        else:
+            task = await task_store.claim_task(
+                worker_id,
+                query,
+                lease_seconds=lease_seconds,
+            )
         if task is None:
             if await _wait_or_stop(poll_interval_s, stop):
                 break
             continue
         task = copy_task(task)
+        if task.work_contract is not None:
+            task_id = task.id
+            contract = task.work_contract
+            parking_outcome = await capture_task_store_operation(
+                lambda task_id=task_id, contract=contract: (
+                    task_store.hold_claimed_work_contract_task(
+                        task_id,
+                        worker_id=worker_id,
+                        contract=contract,
+                    )
+                ),
+                operation_name="Contracted task parking",
+                redactor=app._secret_redactor,
+                mutation_store=task_store,
+                mutation_method_name="hold_claimed_work_contract_task",
+            )
+            if parking_outcome.failure is not None:
+                failure = parking_outcome.failure
+                del contract, parking_outcome, task, task_id
+                raise failure from None
+            del contract, parking_outcome, task_id
+            handled += 1
+            continue
         await _handle_with_heartbeat(app, task_store, task, handler, worker_id, lease_seconds)
         handled += 1
     return handled

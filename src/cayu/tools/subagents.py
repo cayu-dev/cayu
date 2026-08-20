@@ -513,6 +513,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                     raise durable_subagent_submission_committed_during_cancellation(
                         result=result,
                         cancellation=submission.cancellation,
+                        subsequent_cancellation=submission.subsequent_cancellation,
                         cancellation_requests_consumed=(submission.cancellation_requests_consumed),
                     ) from None
                 current_task = asyncio.current_task()
@@ -525,6 +526,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                     raise durable_subagent_submission_unsettled_during_cancellation(
                         unsettled=submission.error,
                         cancellation=submission.cancellation,
+                        subsequent_cancellation=submission.subsequent_cancellation,
                         cancellation_requests_consumed=(submission.cancellation_requests_consumed),
                     ) from None
                 if current_task is not None:
