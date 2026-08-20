@@ -203,6 +203,24 @@ and cannot be safely assigned the missing identity. Stop older workers, migrate
 once, and rebuild semantic projections; Cayu does not add a legacy read path or
 fabricate readiness.
 
+### Knowledge-store conformance is adversarial and explicit
+
+The shared `KnowledgeStore` suite now registers each in-memory, SQLite, and
+PostgreSQL backend with explicit lifecycle, durability, and optional-capability
+claims. Reusable scenarios cover compare-and-swap revisions, owned immutable
+results, authorization, atomic failure, exact change publication and page
+metadata, portable ordering, lifecycle guards, projection readiness, and
+embedding-space isolation. Ten deliberately broken adapters prove that each
+scenario detects its intended defect instead of merely replaying happy paths.
+
+Structured knowledge query terms and phrases that normalize to no searchable
+tokens now fail at `KnowledgeQuery` construction consistently across backends.
+PostgreSQL embedding startup also validates the revision-bound table's primary
+key, checks, composite cascading foreign key, and required ready B-tree indexes;
+a same-named but structurally incompatible index no longer survives `CREATE`,
+`MIGRATE`, or `VALIDATE` startup. These checks harden the rebuildable revision-44
+derived table and require no new storage revision.
+
 ### Knowledge revisions carry evidence and publish atomic changes
 
 Knowledge create, append, and owned-publication operations now accept immutable

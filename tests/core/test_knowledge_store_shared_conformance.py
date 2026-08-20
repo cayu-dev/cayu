@@ -11,6 +11,16 @@ import pytest
 from tests.core.knowledge_access_scope_conformance import (
     assert_knowledge_access_scope_conformance,
 )
+from tests.core.knowledge_index_readiness_conformance import (
+    assert_index_readiness_conformance,
+)
+from tests.core.knowledge_store_conformance import (
+    CORE_KNOWLEDGE_STORE_SCENARIOS,
+    KnowledgeStoreCapabilities,
+    KnowledgeStoreCapabilityClaim,
+    KnowledgeStoreConformanceRegistration,
+    verify_access_scope,
+)
 
 from cayu.storage import (
     MAX_KNOWLEDGE_CHANGE_LIMIT,
@@ -40,13 +50,6 @@ from cayu.storage.migrations import SchemaMode
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 
 
-@dataclass(frozen=True)
-class KnowledgeStoreCase:
-    name: str
-    location: Path | str | None
-    durable: bool
-
-
 @dataclass
 class _MutableClock:
     current: datetime
@@ -56,38 +59,106 @@ class _MutableClock:
 
 
 @pytest.fixture(params=("memory", "sqlite", "postgres"))
-def knowledge_store_case(request, tmp_path: Path) -> KnowledgeStoreCase:
+def knowledge_store_case(
+    request,
+    tmp_path: Path,
+) -> KnowledgeStoreConformanceRegistration:
+    supported = KnowledgeStoreCapabilityClaim.supported()
+    lexical_capabilities = KnowledgeStoreCapabilities(
+        owned_publication=supported,
+        change_outbox=supported,
+        index_readiness=supported,
+        embedding_projections=KnowledgeStoreCapabilityClaim.not_applicable(
+            "This registration exercises the lexical store surface."
+        ),
+    )
     if request.param == "memory":
-        return KnowledgeStoreCase("memory", None, False)
+
+        async def open_memory(access_scope, clock):
+            return InMemoryKnowledgeStore(access_scope=access_scope, clock=clock)
+
+        async def reset_memory() -> None:
+            return None
+
+        return KnowledgeStoreConformanceRegistration(
+            name="memory",
+            store_type=InMemoryKnowledgeStore,
+            factory=open_memory,
+            reset=reset_memory,
+            lifecycle="process_bound",
+            durability="ephemeral",
+            capabilities=lexical_capabilities,
+        )
     if request.param == "sqlite":
-        return KnowledgeStoreCase("sqlite", tmp_path / "knowledge.sqlite", True)
-    return KnowledgeStoreCase(
-        "postgres",
-        request.getfixturevalue("postgres_dsn"),
-        True,
+        location = tmp_path / "knowledge.sqlite"
+
+        async def open_sqlite(access_scope, clock):
+            return SQLiteKnowledgeStore(location, access_scope=access_scope, clock=clock)
+
+        async def reset_sqlite() -> None:
+            for path in (
+                location,
+                Path(f"{location}-shm"),
+                Path(f"{location}-wal"),
+            ):
+                path.unlink(missing_ok=True)
+
+        return KnowledgeStoreConformanceRegistration(
+            name="sqlite",
+            store_type=SQLiteKnowledgeStore,
+            factory=open_sqlite,
+            reset=reset_sqlite,
+            lifecycle="reopenable",
+            durability="durable",
+            capabilities=lexical_capabilities,
+        )
+    location = request.getfixturevalue("postgres_dsn")
+
+    async def open_postgres(access_scope, clock):
+        return PostgresKnowledgeStore(
+            location,
+            access_scope=access_scope,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            clock=clock,
+        )
+
+    async def reset_postgres() -> None:
+        import psycopg
+        from psycopg import sql
+
+        async with await psycopg.AsyncConnection.connect(location) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT tablename FROM pg_tables "
+                    "WHERE schemaname = current_schema() AND tablename LIKE 'cayu_%'"
+                )
+                tables = [str(row[0]) for row in await cursor.fetchall()]
+                for table in tables:
+                    await cursor.execute(
+                        sql.SQL("DROP TABLE {} CASCADE").format(sql.Identifier(table))
+                    )
+            await connection.commit()
+
+    return KnowledgeStoreConformanceRegistration(
+        name="postgres",
+        store_type=PostgresKnowledgeStore,
+        factory=open_postgres,
+        reset=reset_postgres,
+        lifecycle="reopenable",
+        durability="durable",
+        capabilities=lexical_capabilities,
     )
 
 
 async def _open_store(
-    case: KnowledgeStoreCase,
+    case: KnowledgeStoreConformanceRegistration,
     *,
     access_scope: KnowledgeAccessScope | None = _ACCESS_SCOPE,
     clock: Callable[[], datetime] | None = None,
 ):
-    if case.name == "memory":
-        return InMemoryKnowledgeStore(access_scope=access_scope, clock=clock)
-    if case.name == "sqlite":
-        assert isinstance(case.location, Path)
-        return SQLiteKnowledgeStore(case.location, access_scope=access_scope, clock=clock)
-    assert isinstance(case.location, str)
-    return PostgresKnowledgeStore(
-        case.location,
-        access_scope=access_scope,
-        min_size=1,
-        max_size=4,
-        schema_mode=SchemaMode.CREATE,
-        clock=clock,
-    )
+    return await case.open(access_scope=access_scope, clock=clock)
 
 
 async def _close_store(store: Any) -> None:
@@ -96,23 +167,30 @@ async def _close_store(store: Any) -> None:
         await close()
 
 
-async def _reset_case(case: KnowledgeStoreCase) -> None:
-    if case.name != "postgres":
-        return
-    import psycopg
-    from psycopg import sql
+async def _reset_case(case: KnowledgeStoreConformanceRegistration) -> None:
+    await case.reset()
 
-    assert isinstance(case.location, str)
-    async with await psycopg.AsyncConnection.connect(case.location) as connection:
-        async with connection.cursor() as cursor:
-            await cursor.execute(
-                "SELECT tablename FROM pg_tables "
-                "WHERE schemaname = current_schema() AND tablename LIKE 'cayu_%'"
-            )
-            tables = [str(row[0]) for row in await cursor.fetchall()]
-            for table in tables:
-                await cursor.execute(sql.SQL("DROP TABLE {} CASCADE").format(sql.Identifier(table)))
-        await connection.commit()
+
+def test_knowledge_store_registered_closure_scenarios(knowledge_store_case) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            for scenario in CORE_KNOWLEDGE_STORE_SCENARIOS:
+                await scenario(store, adapter=knowledge_store_case.name)
+            if knowledge_store_case.capabilities.index_readiness.state == "supported":
+                await assert_index_readiness_conformance(store)
+        finally:
+            await _close_store(store)
+
+        unbound = await _open_store(knowledge_store_case, access_scope=None)
+        try:
+            await verify_access_scope(unbound, adapter=knowledge_store_case.name)
+        finally:
+            await _close_store(unbound)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
 
 
 def test_knowledge_store_shared_revision_contract(knowledge_store_case) -> None:

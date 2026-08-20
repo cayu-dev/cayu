@@ -6963,7 +6963,10 @@ Postgres embedding operational contract:
   `none_terms` exclude an entire entry when any forbidden term appears in the
   entry title, entry text, or any of its chunks. Stores apply that exclusion
   before ranking candidates, counting results, or enforcing result and semantic
-  candidate limits in every supported search mode.
+  candidate limits in every supported search mode. Every supplied structured
+  term or phrase must produce at least one normalized search token.
+  Punctuation-only values therefore fail when `KnowledgeQuery` is constructed rather than
+  surfacing a backend-dependent error during `search(...)`.
 - `KnowledgeSearchResult`: result envelope containing copied hits, truncation
   metadata, configured limits, and `total_hits_known` when the backend can count
   candidates.
@@ -7204,6 +7207,26 @@ complete identity and expose `KnowledgeIndexCoverage` in semantic/hybrid search
 results. The migration preserves canonical revision-43 knowledge and discards
 pre-identity vector rows as rebuildable derived data; it creates no fabricated
 readiness or legacy compatibility path.
+
+The deterministic backend conformance registry lives in
+`tests/core/test_knowledge_store_shared_conformance.py`, with reusable scenarios
+and registration types in `tests/core/knowledge_store_conformance.py`. A
+registration names the concrete store type and factory, declares whether its
+lifecycle is process-bound or reopenable, pairs that with an explicit ephemeral
+or durable storage claim, and makes owned publication, change outbox, readiness,
+and embedding-projection capability claims explicit. This is a test extension
+point, not another runtime registry or public manager.
+
+An out-of-tree `KnowledgeStore` should add a registration and run the complete
+shared suite before advertising parity. Semantic stores must additionally run
+the projection-readiness and embedding-space scenarios. The seeded broken-store
+tests prove that these scenarios reject lost compare-and-swap updates, mutable
+result leakage, access widening, partial authoritative writes, missing change
+records, stale or non-ready projection hits, dishonest page metadata, unstable
+ordering, invalid lifecycle transitions, and mixed embedding spaces. A passing
+adapter must preserve the same behavior under reopen whenever it declares a
+reopenable lifecycle; a skip or an unimplemented optional hook must be recorded
+as an explicit capability claim instead of being treated as a pass.
 
 `RememberKnowledgePolicy` controls
 the actual stored status, namespace, visibility, required labels, and allowed

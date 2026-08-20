@@ -24,6 +24,10 @@ from tests.core.knowledge_publication_conformance import (
     assert_stale_operation_cannot_replace_newer_publication,
     publication_material,
 )
+from tests.core.knowledge_store_conformance import (
+    verify_embedding_space_isolation,
+    verify_projection_readiness,
+)
 
 from cayu.embeddings import (
     TextEmbedding,
@@ -261,6 +265,30 @@ def _new_embedding_store(
         embedding_dimensions=3,
         semantic_min_score=0.70,
     )
+
+
+def test_postgres_embedding_store_passes_projection_conformance(postgres_dsn: str) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        readiness_store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await verify_projection_readiness(readiness_store, adapter="postgres-embedding")
+        finally:
+            await readiness_store.close()
+
+        await _drop_all(postgres_dsn)
+        space_store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await verify_embedding_space_isolation(
+                space_store,
+                adapter="postgres-embedding",
+            )
+        finally:
+            await space_store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
 
 
 def test_postgres_knowledge_store_owned_publication_conformance(postgres_dsn: str) -> None:
@@ -1681,6 +1709,157 @@ def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_in
                 await second._ensure_ready()
         finally:
             await second.close()
+
+    asyncio.run(ops())
+
+
+@pytest.mark.parametrize(
+    ("defect", "constraint_kind", "definition_fragment", "replace_not_valid"),
+    (
+        ("primary-key", "p", None, False),
+        ("identity-check", "c", "identity_sha256", False),
+        ("revision-check", "c", "entry_revision > 0", False),
+        ("readiness-check", "c", "readiness_sequence > 0", False),
+        ("embedding-hash-check", "c", "embedding_sha256", False),
+        ("chunk-revision-foreign-key", "f", None, False),
+        ("unvalidated-chunk-revision-foreign-key", "f", None, True),
+    ),
+)
+def test_postgres_embedding_schema_rejects_missing_declared_constraints(
+    postgres_dsn: str,
+    defect: str,
+    constraint_kind: str,
+    definition_fragment: str | None,
+    replace_not_valid: bool,
+) -> None:
+    async def ops() -> None:
+        import psycopg
+        from psycopg import sql
+
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        created = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await created._ensure_ready()
+        finally:
+            await created.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(
+                """
+                SELECT constraint_record.conname,
+                       pg_get_constraintdef(constraint_record.oid)
+                FROM pg_catalog.pg_constraint AS constraint_record
+                WHERE constraint_record.conrelid =
+                      'cayu_knowledge_embeddings'::regclass
+                  AND constraint_record.contype = %s
+                """,
+                (constraint_kind,),
+            )
+            candidates = [
+                (str(name), str(definition).lower()) for name, definition in await cursor.fetchall()
+            ]
+            matching = [
+                name
+                for name, definition in candidates
+                if definition_fragment is None or definition_fragment in definition
+            ]
+            assert len(matching) == 1, (defect, candidates)
+            await cursor.execute(
+                sql.SQL("ALTER TABLE cayu_knowledge_embeddings DROP CONSTRAINT {}").format(
+                    sql.Identifier(matching[0])
+                )
+            )
+            if replace_not_valid:
+                await cursor.execute(
+                    """
+                    ALTER TABLE cayu_knowledge_embeddings
+                    ADD CONSTRAINT seeded_unvalidated_embedding_foreign_key
+                    FOREIGN KEY (chunk_id, entry_id, entry_revision)
+                    REFERENCES cayu_knowledge_chunks(id, entry_id, entry_revision)
+                    ON DELETE CASCADE NOT VALID
+                    """
+                )
+            await connection.commit()
+
+        validated = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            schema_mode=SchemaMode.VALIDATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="revision-bound projection contract"):
+                await validated._ensure_ready()
+        finally:
+            await validated.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(ops())
+
+
+@pytest.mark.parametrize(
+    ("index_name", "replacement_columns", "replacement_predicate"),
+    (
+        ("idx_cayu_knowledge_embeddings_entry", "entry_revision, entry_id", None),
+        (
+            "idx_cayu_knowledge_embeddings_model_dims",
+            "dimensions, embedding_model",
+            None,
+        ),
+        (
+            "idx_cayu_knowledge_embeddings_entry",
+            "entry_id, entry_revision",
+            "entry_revision > 1",
+        ),
+    ),
+)
+def test_postgres_embedding_schema_rejects_conflicting_required_indexes(
+    postgres_dsn: str,
+    index_name: str,
+    replacement_columns: str,
+    replacement_predicate: str | None,
+) -> None:
+    async def ops() -> None:
+        import psycopg
+        from psycopg import sql
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        created = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await created._ensure_ready()
+        finally:
+            await created.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(index_name)))
+            statement = sql.SQL("CREATE INDEX {} ON cayu_knowledge_embeddings ({})").format(
+                sql.Identifier(index_name),
+                sql.SQL(replacement_columns),
+            )
+            if replacement_predicate is not None:
+                statement += sql.SQL(" WHERE ") + sql.SQL(replacement_predicate)
+            await cursor.execute(statement)
+            await connection.commit()
+
+        conflicting = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            with pytest.raises(RuntimeError, match=index_name):
+                await conflicting._ensure_ready()
+        finally:
+            await conflicting.close()
+            await _drop_all(postgres_dsn)
 
     asyncio.run(ops())
 

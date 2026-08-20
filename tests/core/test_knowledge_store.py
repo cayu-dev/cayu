@@ -368,6 +368,23 @@ def test_knowledge_entry_and_query_dedupe_list_filters() -> None:
     assert query.impact_targets == ["refunds"]
 
 
+@pytest.mark.parametrize(
+    "query_input",
+    (
+        {"text": "---"},
+        {"any_terms": ["---"]},
+        {"all_terms": ["---"]},
+        {"phrases": ["---"]},
+        {"text": "valid", "none_terms": ["---"]},
+    ),
+)
+def test_knowledge_query_rejects_structured_values_without_search_tokens(
+    query_input: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="at least one token|requires"):
+        KnowledgeQuery(**query_input)
+
+
 def test_knowledge_entry_rejects_invalid_identity_labels_and_scores() -> None:
     with pytest.raises(ValidationError, match="must not start or end with whitespace"):
         KnowledgeEntry(id=" entry_1", text="memory")

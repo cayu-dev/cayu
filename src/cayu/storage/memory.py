@@ -1436,7 +1436,8 @@ class KnowledgeQuery(BaseModel):
 
     @model_validator(mode="after")
     def validate_has_positive_search_terms(self) -> KnowledgeQuery:
-        if _knowledge_query_has_positive_terms(self):
+        terms = _knowledge_query_terms(self)
+        if _query_terms_have_positive_terms(terms):
             return self
         raise ValueError("Knowledge query requires `text`, `any_terms`, `all_terms`, or `phrases`.")
 
@@ -5741,12 +5742,6 @@ def _knowledge_query_terms(query: KnowledgeQuery) -> _SearchTerms:
             [_normalize_search_phrase(phrase) for phrase in query.phrases]
         ),
     }
-
-
-def _knowledge_query_has_positive_terms(query: KnowledgeQuery) -> bool:
-    if _tokenize_search_text(query.text or ""):
-        return True
-    return bool(query.any_terms or query.all_terms or query.phrases)
 
 
 def _query_terms_have_positive_terms(terms: _SearchTerms) -> bool:
