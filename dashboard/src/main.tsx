@@ -90,11 +90,7 @@ const evalsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/evals",
   validateSearch: validateEvalsSearch,
-  component: () => (
-    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
-      <EvalsPage />
-    </CapabilityRoute>
-  ),
+  component: EvalsPage,
 })
 
 const tasksRoute = createRoute({

@@ -46,7 +46,6 @@ const navSections = [
         to: "/evals",
         label: "Evals",
         icon: FlaskConical,
-        capability: DASHBOARD_ROUTE_REQUIREMENTS["/evals"],
       },
       {
         to: "/tasks",

@@ -4120,6 +4120,9 @@
           "title": "Configured Store Roles",
           "type": "array"
         },
+        "evals_readiness": {
+          "$ref": "#/components/schemas/EvalsReadiness"
+        },
         "mutations": {
           "$ref": "#/components/schemas/ControlPlaneMutationCapabilities"
         },
@@ -4132,7 +4135,8 @@
         "configured_store_roles",
         "actor",
         "surfaces",
-        "mutations"
+        "mutations",
+        "evals_readiness"
       ],
       "title": "ControlPlaneCapabilities",
       "type": "object"
@@ -4536,6 +4540,93 @@
         "total_count"
       ],
       "title": "EnvironmentsResponse",
+      "type": "object"
+    },
+    "EvalsOperationReadiness": {
+      "additionalProperties": false,
+      "description": "Discovery state for one Evals product operation.\n\nReadiness is presentation metadata, not an authorization grant. Underlying\nroutes continue to enforce authentication, mutation policy, and runtime\npreconditions.",
+      "properties": {
+        "reason_code": {
+          "anyOf": [
+            {
+              "enum": [
+                "evaluation_promotion_not_configured",
+                "terminal_evidence_not_supported",
+                "session_lineage_not_supported",
+                "eval_store_not_configured",
+                "eval_target_not_configured",
+                "captured_result_persistence_not_available",
+                "scenario_v2_not_available"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason Code"
+        },
+        "state": {
+          "enum": [
+            "ready",
+            "gated",
+            "unsupported"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "reason_code"
+      ],
+      "title": "EvalsOperationReadiness",
+      "type": "object"
+    },
+    "EvalsReadiness": {
+      "additionalProperties": false,
+      "description": "Independent availability of the Evals product workflows.",
+      "properties": {
+        "cancellation": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "captured_evaluation": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "captured_result_persistence": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "catalog_read": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "catalog_write": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "comparison": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "fresh_launch": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "reports": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        },
+        "scenario_conversion": {
+          "$ref": "#/components/schemas/EvalsOperationReadiness"
+        }
+      },
+      "required": [
+        "captured_evaluation",
+        "catalog_read",
+        "catalog_write",
+        "captured_result_persistence",
+        "scenario_conversion",
+        "fresh_launch",
+        "cancellation",
+        "comparison",
+        "reports"
+      ],
+      "title": "EvalsReadiness",
       "type": "object"
     },
     "EventOrder": {
@@ -6195,7 +6286,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "13",
+          "default": "14",
           "title": "Contract Version",
           "type": "string"
         },
@@ -9506,7 +9597,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "13",
+          "default": "14",
           "title": "Contract Version",
           "type": "string"
         }

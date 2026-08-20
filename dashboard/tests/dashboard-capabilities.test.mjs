@@ -56,6 +56,11 @@ function capabilities() {
         read: operation(true),
         mutate: operation(false, "unsupported"),
       },
+      evals: {
+        configured: false,
+        read: operation(false, "not_configured"),
+        mutate: operation(false, "not_configured"),
+      },
     },
     mutations: {
       session_execution: operation(true),
@@ -148,6 +153,8 @@ test("a previous v4 response without a newer optional surface fails closed", () 
 
 test("direct optional routes share the same server-authoritative requirements as navigation", () => {
   const snapshot = capabilities()
+
+  assert.equal("/evals" in DASHBOARD_ROUTE_REQUIREMENTS, false)
 
   assert.equal(dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/"]), true)
   assert.equal(dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/tasks"]), false)

@@ -458,13 +458,32 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
             assert download.content.endswith(b"\n")
             assert json.loads(download.content)["revision"] == corpus.revision
 
-            capability = client.get("/api/contract", headers=_AUTH_HEADERS).json()["capabilities"][
-                "surfaces"
-            ]["evals"]
+            capabilities = client.get("/api/contract", headers=_AUTH_HEADERS).json()["capabilities"]
+            capability = capabilities["surfaces"]["evals"]
             assert capability == {
                 "configured": True,
                 "read": {"enabled": True, "unavailable_reason": None},
                 "mutate": {"enabled": True, "unavailable_reason": None},
+            }
+            assert capabilities["evals_readiness"] == {
+                "captured_evaluation": {
+                    "state": "gated",
+                    "reason_code": "evaluation_promotion_not_configured",
+                },
+                "catalog_read": {"state": "ready", "reason_code": None},
+                "catalog_write": {"state": "ready", "reason_code": None},
+                "captured_result_persistence": {
+                    "state": "unsupported",
+                    "reason_code": "captured_result_persistence_not_available",
+                },
+                "scenario_conversion": {
+                    "state": "unsupported",
+                    "reason_code": "scenario_v2_not_available",
+                },
+                "fresh_launch": {"state": "ready", "reason_code": None},
+                "cancellation": {"state": "ready", "reason_code": None},
+                "comparison": {"state": "ready", "reason_code": None},
+                "reports": {"state": "ready", "reason_code": None},
             }
     finally:
         asyncio.run(store.close())

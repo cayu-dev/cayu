@@ -1141,6 +1141,7 @@ async def _run_browser_contract(
             "mutation_pre_frame_recovery",
             "contract_version_gate",
             "capability_aware_routes",
+            "evals_readiness_shell",
             "usage_without_default_pricing",
             "unavailable_mutation_controls",
             "overview_read_only_controls",
@@ -2423,6 +2424,90 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
     finally:
         page.remove_listener("request", record_api_request)
         await page.unroute("**/api/contract", serve_without_task_surface)
+
+    async def serve_without_evals_configuration(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        body["capabilities"]["surfaces"]["evals"] = {
+            "configured": False,
+            "read": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+            "mutate": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+        }
+        body["capabilities"]["evals_readiness"] = {
+            "captured_evaluation": {
+                "state": "gated",
+                "reason_code": "evaluation_promotion_not_configured",
+            },
+            "catalog_read": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "catalog_write": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "captured_result_persistence": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "scenario_conversion": {
+                "state": "unsupported",
+                "reason_code": "scenario_v2_not_available",
+            },
+            "fresh_launch": {
+                "state": "gated",
+                "reason_code": "eval_target_not_configured",
+            },
+            "cancellation": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "comparison": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+            "reports": {
+                "state": "gated",
+                "reason_code": "eval_store_not_configured",
+            },
+        }
+        await route.fulfill(response=response, json=body)
+
+    observed_evals_requests: list[str] = []
+
+    def record_evals_request(request) -> None:
+        path = urlsplit(request.url).path
+        if path.startswith("/api/evals"):
+            observed_evals_requests.append(f"{request.method} {path}")
+
+    await page.route("**/api/contract", serve_without_evals_configuration)
+    page.on("request", record_evals_request)
+    try:
+        await page.goto(f"{base_url}/cayu/evals", wait_until="networkidle")
+        await expect(page.get_by_role("heading", name="Evals", exact=True)).to_be_visible()
+        await expect(page.get_by_role("link", name="Evals", exact=True)).to_be_visible()
+        await expect(
+            page.get_by_text("The Evals catalog is not ready yet", exact=True)
+        ).to_be_visible()
+        await expect(
+            page.get_by_text(
+                "Multi-stage production scenarios are planned for a future Cayu release.",
+                exact=True,
+            )
+        ).to_be_visible()
+        require(
+            not observed_evals_requests,
+            f"the unconfigured Evals shell probed absent endpoints: {observed_evals_requests!r}",
+        )
+    finally:
+        page.remove_listener("request", record_evals_request)
+        await page.unroute("**/api/contract", serve_without_evals_configuration)
 
     async def serve_usage_without_pricing_contract(route) -> None:
         response = await route.fetch()

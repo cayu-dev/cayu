@@ -38,6 +38,7 @@ from cayu.server.contracts import (
     SERVER_CONTRACT_VERSION,
     SSE_LAST_EVENT_ID_FORMAT,
     CapabilityOperation,
+    EvalsOperationReadiness,
 )
 from cayu.server.sse import (
     SSE_ERROR_SESSION_ID_MAX_BYTES,
@@ -247,6 +248,26 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
         "task_lifecycle": {"enabled": False, "unavailable_reason": "not_configured"},
         "knowledge_review": {"enabled": False, "unavailable_reason": "not_configured"},
     }
+    assert body["capabilities"]["evals_readiness"] == {
+        "captured_evaluation": {
+            "state": "gated",
+            "reason_code": "evaluation_promotion_not_configured",
+        },
+        "catalog_read": {"state": "gated", "reason_code": "eval_store_not_configured"},
+        "catalog_write": {"state": "gated", "reason_code": "eval_store_not_configured"},
+        "captured_result_persistence": {
+            "state": "gated",
+            "reason_code": "eval_store_not_configured",
+        },
+        "scenario_conversion": {
+            "state": "unsupported",
+            "reason_code": "scenario_v2_not_available",
+        },
+        "fresh_launch": {"state": "gated", "reason_code": "eval_target_not_configured"},
+        "cancellation": {"state": "gated", "reason_code": "eval_store_not_configured"},
+        "comparison": {"state": "gated", "reason_code": "eval_store_not_configured"},
+        "reports": {"state": "gated", "reason_code": "eval_store_not_configured"},
+    }
 
 
 def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tmp_path) -> None:
@@ -386,7 +407,7 @@ def test_system_diagnostics_reports_bounded_protected_runtime_state(tmp_path) ->
         "dashboard_enabled": True,
         "docs_enabled": False,
     }
-    assert body["versions"]["server_contract"] == "13"
+    assert body["versions"]["server_contract"] == "14"
     assert body["versions"]["cayu"] == body["capabilities"]["cayu_version"]
     assert body["capabilities"]["actor"] == {
         "subject": "operator-a",
@@ -651,6 +672,37 @@ def test_capability_operation_rejects_inconsistent_availability() -> None:
         CapabilityOperation(enabled=True, unavailable_reason="unsupported")
     with pytest.raises(ValueError, match="require an unavailable reason"):
         CapabilityOperation(enabled=False)
+
+
+def test_evals_operation_readiness_rejects_inconsistent_reason_codes() -> None:
+    with pytest.raises(ValueError, match="Ready Evals operations cannot have a reason code"):
+        EvalsOperationReadiness(
+            state="ready",
+            reason_code="eval_store_not_configured",
+        )
+    with pytest.raises(ValueError, match="Unavailable Evals operations require a reason code"):
+        EvalsOperationReadiness(state="gated", reason_code=None)
+    with pytest.raises(ValueError, match="Gated Evals operations require a gated reason code"):
+        EvalsOperationReadiness(
+            state="gated",
+            reason_code="scenario_v2_not_available",
+        )
+    with pytest.raises(
+        ValueError,
+        match="Unsupported Evals operations require an unsupported reason code",
+    ):
+        EvalsOperationReadiness(
+            state="unsupported",
+            reason_code="eval_target_not_configured",
+        )
+
+    assert (
+        EvalsOperationReadiness(
+            state="unsupported",
+            reason_code="session_lineage_not_supported",
+        ).reason_code
+        == "session_lineage_not_supported"
+    )
 
 
 def test_openapi_declares_auth_tenant_as_provenance_only() -> None:

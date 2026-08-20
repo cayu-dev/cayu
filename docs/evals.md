@@ -925,8 +925,25 @@ worker protocol, or hosted eval service.
 
 ### First-class dashboard Evals area
 
-When `surfaces.evals.read` is enabled, the bundled dashboard exposes an
-**Evals** navigation area backed only by the authenticated APIs above. The
+The bundled dashboard always exposes an **Evals** navigation area and accepts
+authenticated direct links to `/evals`. The contract's required
+`capabilities.evals_readiness` projection reports each product operation as
+`ready`, `gated`, or `unsupported` with a closed reason code. The operations are
+captured evaluation, catalog read and write, captured-result persistence,
+scenario conversion, fresh launch, cancellation, comparison, and reports.
+This projection is discovery metadata, not authorization: the authenticated
+routes and their mutation and runtime checks remain authoritative.
+
+If catalog reads are not ready, the page renders a deterministic readiness
+shell and does not query absent Evals endpoints. Deployment-gated operations
+remain visible with their factual missing dependency, planned framework work is
+labeled separately from a genuine runtime incompatibility, and ready operations
+remain independently visible. This contract does not automatically assemble
+storage or execution targets; existing explicit Evals and evaluation promotion
+configuration remains supported while automatic project assembly is a planned
+extension.
+
+When `surfaces.evals.read` and `evals_readiness.catalog_read` are enabled, the
 catalog pages through immutable corpus revisions, suites, and cases without
 hydrating complete corpus documents. Operators can import an 8 MiB-or-smaller
 corpus file, download canonical corpus JSON, select a suite, choose bounded

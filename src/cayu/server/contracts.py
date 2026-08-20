@@ -757,6 +757,31 @@ class ClientGenerationContract(ApiBaseModel):
 
 CapabilityUnavailableReason = Literal["not_configured", "unsupported"]
 ConfiguredStoreRole = Literal["session", "task", "knowledge", "artifact"]
+EvalsReadinessState = Literal["ready", "gated", "unsupported"]
+EvalsReadinessReasonCode = Literal[
+    "evaluation_promotion_not_configured",
+    "terminal_evidence_not_supported",
+    "session_lineage_not_supported",
+    "eval_store_not_configured",
+    "eval_target_not_configured",
+    "captured_result_persistence_not_available",
+    "scenario_v2_not_available",
+]
+_GATED_EVALS_READINESS_REASONS = frozenset(
+    {
+        "evaluation_promotion_not_configured",
+        "eval_store_not_configured",
+        "eval_target_not_configured",
+    }
+)
+_UNSUPPORTED_EVALS_READINESS_REASONS = frozenset(
+    {
+        "terminal_evidence_not_supported",
+        "session_lineage_not_supported",
+        "captured_result_persistence_not_available",
+        "scenario_v2_not_available",
+    }
+)
 
 
 class CapabilityOperation(ApiBaseModel):
@@ -786,6 +811,47 @@ class OptionalSurfaceCapability(ApiBaseModel):
         if not self.configured and (self.read.enabled or self.mutate.enabled):
             raise ValueError("Unconfigured surfaces cannot expose enabled operations.")
         return self
+
+
+class EvalsOperationReadiness(ApiBaseModel):
+    """Discovery state for one Evals product operation.
+
+    Readiness is presentation metadata, not an authorization grant. Underlying
+    routes continue to enforce authentication, mutation policy, and runtime
+    preconditions.
+    """
+
+    state: EvalsReadinessState
+    reason_code: EvalsReadinessReasonCode | None
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> EvalsOperationReadiness:
+        if self.state == "ready" and self.reason_code is not None:
+            raise ValueError("Ready Evals operations cannot have a reason code.")
+        if self.state != "ready" and self.reason_code is None:
+            raise ValueError("Unavailable Evals operations require a reason code.")
+        if self.state == "gated" and self.reason_code not in _GATED_EVALS_READINESS_REASONS:
+            raise ValueError("Gated Evals operations require a gated reason code.")
+        if (
+            self.state == "unsupported"
+            and self.reason_code not in _UNSUPPORTED_EVALS_READINESS_REASONS
+        ):
+            raise ValueError("Unsupported Evals operations require an unsupported reason code.")
+        return self
+
+
+class EvalsReadiness(ApiBaseModel):
+    """Independent availability of the Evals product workflows."""
+
+    captured_evaluation: EvalsOperationReadiness
+    catalog_read: EvalsOperationReadiness
+    catalog_write: EvalsOperationReadiness
+    captured_result_persistence: EvalsOperationReadiness
+    scenario_conversion: EvalsOperationReadiness
+    fresh_launch: EvalsOperationReadiness
+    cancellation: EvalsOperationReadiness
+    comparison: EvalsOperationReadiness
+    reports: EvalsOperationReadiness
 
 
 class ControlPlaneSurfaceCapabilities(ApiBaseModel):
@@ -833,6 +899,7 @@ class ControlPlaneCapabilities(ApiBaseModel):
     actor: ServerContractActor | None
     surfaces: ControlPlaneSurfaceCapabilities
     mutations: ControlPlaneMutationCapabilities
+    evals_readiness: EvalsReadiness
 
 
 PromotionPortableId = Annotated[

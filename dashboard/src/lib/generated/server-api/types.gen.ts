@@ -2446,6 +2446,7 @@ export type ControlPlaneCapabilities = {
      * Configured Store Roles
      */
     configured_store_roles: Array<'session' | 'task' | 'knowledge' | 'artifact'>;
+    evals_readiness: EvalsReadiness;
     mutations: ControlPlaneMutationCapabilities;
     surfaces: ControlPlaneSurfaceCapabilities;
 };
@@ -3332,6 +3333,43 @@ export type EvalTrialOutputPreviewV1 = {
      * Text
      */
     text?: string;
+};
+
+/**
+ * EvalsOperationReadiness
+ *
+ * Discovery state for one Evals product operation.
+ *
+ * Readiness is presentation metadata, not an authorization grant. Underlying
+ * routes continue to enforce authentication, mutation policy, and runtime
+ * preconditions.
+ */
+export type EvalsOperationReadiness = {
+    /**
+     * Reason Code
+     */
+    reason_code: 'evaluation_promotion_not_configured' | 'terminal_evidence_not_supported' | 'session_lineage_not_supported' | 'eval_store_not_configured' | 'eval_target_not_configured' | 'captured_result_persistence_not_available' | 'scenario_v2_not_available' | null;
+    /**
+     * State
+     */
+    state: 'ready' | 'gated' | 'unsupported';
+};
+
+/**
+ * EvalsReadiness
+ *
+ * Independent availability of the Evals product workflows.
+ */
+export type EvalsReadiness = {
+    cancellation: EvalsOperationReadiness;
+    captured_evaluation: EvalsOperationReadiness;
+    captured_result_persistence: EvalsOperationReadiness;
+    catalog_read: EvalsOperationReadiness;
+    catalog_write: EvalsOperationReadiness;
+    comparison: EvalsOperationReadiness;
+    fresh_launch: EvalsOperationReadiness;
+    reports: EvalsOperationReadiness;
+    scenario_conversion: EvalsOperationReadiness;
 };
 
 /**

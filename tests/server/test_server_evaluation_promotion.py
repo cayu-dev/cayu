@@ -26,6 +26,7 @@ from cayu import (
     default_price_book,
     eval_corpus_from_json,
 )
+from cayu.runtime import InMemorySessionStore
 from cayu.server import (
     AuthContext,
     DashboardConfig,
@@ -53,6 +54,14 @@ class _PromotionProvider(ModelProvider):
                 "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
             }
         )
+
+
+class _NoTerminalEvidenceSessionStore(InMemorySessionStore):
+    supports_terminal_session_evidence = False
+
+
+class _NoSessionLineageStore(InMemorySessionStore):
+    supports_session_lineage = False
 
 
 def _authenticate(request: Request) -> AuthContext:
@@ -197,13 +206,48 @@ def test_promotion_capability_and_routes_require_authentication() -> None:
         client.post(f"/api/evals/promotion/sessions/{_SESSION_ID}/preview", json={}).status_code
         == 401
     )
-    surface = client.get("/api/contract", headers=_AUTH_HEADERS).json()["capabilities"]["surfaces"][
-        "evaluation_promotion"
-    ]
+    capabilities = client.get("/api/contract", headers=_AUTH_HEADERS).json()["capabilities"]
+    surface = capabilities["surfaces"]["evaluation_promotion"]
     assert surface == {
         "configured": True,
         "read": {"enabled": True, "unavailable_reason": None},
         "mutate": {"enabled": True, "unavailable_reason": None},
+    }
+    assert capabilities["evals_readiness"]["captured_evaluation"] == {
+        "state": "ready",
+        "reason_code": None,
+    }
+    assert capabilities["evals_readiness"]["catalog_read"] == {
+        "state": "gated",
+        "reason_code": "eval_store_not_configured",
+    }
+
+
+@pytest.mark.parametrize(
+    ("store_type", "reason_code"),
+    [
+        (_NoTerminalEvidenceSessionStore, "terminal_evidence_not_supported"),
+        (_NoSessionLineageStore, "session_lineage_not_supported"),
+    ],
+)
+def test_captured_evaluation_readiness_identifies_the_missing_store_capability(
+    store_type: type[InMemorySessionStore],
+    reason_code: str,
+) -> None:
+    app = CayuApp(session_store=store_type(), enable_logging=False)
+    app.register_provider(_PromotionProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="promotion-model"))
+
+    capabilities = _client(app).get("/api/contract", headers=_AUTH_HEADERS).json()["capabilities"]
+
+    assert capabilities["surfaces"]["evaluation_promotion"] == {
+        "configured": True,
+        "read": {"enabled": False, "unavailable_reason": "unsupported"},
+        "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+    }
+    assert capabilities["evals_readiness"]["captured_evaluation"] == {
+        "state": "unsupported",
+        "reason_code": reason_code,
     }
 
 

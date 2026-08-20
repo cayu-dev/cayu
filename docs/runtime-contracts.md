@@ -3763,9 +3763,10 @@ accounting reconciliation state to session inspection. Server contract version
 model target. Server contract version 12 makes the exact knowledge revision
 required on entry and chunk projections. Server contract version 13 adds typed
 unavailable and ambiguous provider-operation inspection, a run-epoch-fenced
-resolution mutation, and its control-plane capability. Clients generated
-against contract version 1 through 12 must regenerate from the current OpenAPI
-document.
+resolution mutation, and its control-plane capability. Server contract version
+14 adds the required operation-level Evals readiness projection. Clients
+generated against contract version 1 through 13 must regenerate from the
+current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
@@ -3794,6 +3795,16 @@ access, `actor` contains only the verified subject and optional tenant. Arbitrar
 authentication claims are deliberately excluded.
 Because the response may contain caller identity, it is returned with
 `Cache-Control: private, no-store`.
+
+The required `evals_readiness` projection reports captured evaluation, catalog
+read and write, captured-result persistence, scenario conversion, fresh launch,
+cancellation, comparison, and reports independently. Every operation is
+`ready`, `gated`, or `unsupported`; non-ready operations carry a closed factual
+reason code. The projection lets the dashboard remain discoverable without
+probing absent endpoints and distinguishes planned framework work from a
+deployment dependency or runtime limitation. It does not grant authority or
+weaken route-level authentication, mutation policy, target admission, or
+execution preconditions.
 
 The protected `GET /api/system/diagnostics` response is a separate, manually
 requested operator snapshot. It repeats the capability projection so the

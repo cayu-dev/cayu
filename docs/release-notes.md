@@ -89,6 +89,25 @@ guard.
 
 ## Unreleased
 
+### Control Plane Evals now publishes operation-level readiness
+
+The Evals navigation and direct route now remain discoverable even when a
+deployment has not assembled the Evals catalog. The page renders the server's
+independent readiness for captured evaluation, catalog reads and writes,
+captured-result persistence, scenario conversion, fresh launches,
+cancellation, comparison, and reports. Unready pages do not probe absent Evals
+endpoints, and planned framework work is distinguished from a genuine
+deployment or runtime limitation.
+
+The control-plane contract advances from version 13 to version 14 with the new
+required `capabilities.evals_readiness` projection. Its closed state and reason
+codes are discovery metadata rather than authorization: authentication,
+mutation policy, and operation preconditions remain authoritative at the
+underlying routes. Independently deployed servers, generated clients, and
+dashboards must be upgraded together. This first delivery slice does not yet
+assemble Evals storage or execution targets automatically and adds no durable
+writes or workers.
+
 ### Tool exposure now governs frozen model-step request profiles
 
 Cayu now provides immutable `RegisteredToolCapability` summaries, bounded

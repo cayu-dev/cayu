@@ -3487,11 +3487,8 @@ def create_router(
         session_usage_aggregates_supported=session_store.supports_usage_aggregates,
         session_topology_supported=session_store.supports_session_topology,
         evaluation_promotion_configured=evaluation_promotion is not None,
-        evaluation_promotion_supported=(
-            evaluation_promotion is not None
-            and session_store.supports_terminal_session_evidence
-            and session_store.supports_session_lineage
-        ),
+        terminal_session_evidence_supported=session_store.supports_terminal_session_evidence,
+        session_lineage_supported=session_store.supports_session_lineage,
         evals_configured=evals is not None,
     )
     if dashboard_access_authenticated is None and dashboard_configured:

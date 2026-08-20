@@ -13,6 +13,8 @@ from cayu.server.contracts import (
     ControlPlaneCapabilities,
     ControlPlaneMutationCapabilities,
     ControlPlaneSurfaceCapabilities,
+    EvalsOperationReadiness,
+    EvalsReadiness,
     OptionalSurfaceCapability,
     ServerContractActor,
 )
@@ -30,8 +32,17 @@ class ControlPlaneCapabilitySnapshot:
     session_usage_aggregates_supported: bool
     session_topology_supported: bool
     evaluation_promotion_configured: bool
-    evaluation_promotion_supported: bool
+    terminal_session_evidence_supported: bool
+    session_lineage_supported: bool
     evals_configured: bool
+
+    @property
+    def evaluation_promotion_supported(self) -> bool:
+        return (
+            self.evaluation_promotion_configured
+            and self.terminal_session_evidence_supported
+            and self.session_lineage_supported
+        )
 
     def project(
         self,
@@ -112,6 +123,7 @@ class ControlPlaneCapabilitySnapshot:
                 task_lifecycle=_operation(self.tasks_configured),
                 knowledge_review=_operation(self.knowledge_configured),
             ),
+            evals_readiness=_evals_readiness(self),
         )
 
 
@@ -124,7 +136,8 @@ def inspect_control_plane_capabilities(
     session_usage_aggregates_supported: bool,
     session_topology_supported: bool,
     evaluation_promotion_configured: bool = False,
-    evaluation_promotion_supported: bool = False,
+    terminal_session_evidence_supported: bool = False,
+    session_lineage_supported: bool = False,
     evals_configured: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
@@ -137,16 +150,14 @@ def inspect_control_plane_capabilities(
         ("session_usage_aggregates_supported", session_usage_aggregates_supported),
         ("session_topology_supported", session_topology_supported),
         ("evaluation_promotion_configured", evaluation_promotion_configured),
-        ("evaluation_promotion_supported", evaluation_promotion_supported),
+        ("terminal_session_evidence_supported", terminal_session_evidence_supported),
+        ("session_lineage_supported", session_lineage_supported),
         ("evals_configured", evals_configured),
     ):
         if type(value) is not bool:
             raise TypeError(f"{field_name} must be a bool.")
     if dashboard_pricing_configured and not dashboard_configured:
         raise ValueError("Dashboard pricing cannot be configured when the dashboard is disabled.")
-    if evaluation_promotion_supported and not evaluation_promotion_configured:
-        raise ValueError("Evaluation promotion support requires complete configuration.")
-
     return ControlPlaneCapabilitySnapshot(
         cayu_version=_cayu_distribution_version(),
         dashboard_configured=dashboard_configured,
@@ -156,7 +167,8 @@ def inspect_control_plane_capabilities(
         session_usage_aggregates_supported=session_usage_aggregates_supported,
         session_topology_supported=session_topology_supported,
         evaluation_promotion_configured=evaluation_promotion_configured,
-        evaluation_promotion_supported=evaluation_promotion_supported,
+        terminal_session_evidence_supported=terminal_session_evidence_supported,
+        session_lineage_supported=session_lineage_supported,
         evals_configured=evals_configured,
     )
 
@@ -216,4 +228,62 @@ def _evaluation_promotion_surface(
         configured=configured,
         read=_operation(enabled, unavailable_reason=unavailable_reason),
         mutate=_operation(enabled, unavailable_reason=unavailable_reason),
+    )
+
+
+def _evals_readiness(snapshot: ControlPlaneCapabilitySnapshot) -> EvalsReadiness:
+    if not snapshot.evaluation_promotion_configured:
+        captured_evaluation = EvalsOperationReadiness(
+            state="gated",
+            reason_code="evaluation_promotion_not_configured",
+        )
+    elif not snapshot.terminal_session_evidence_supported:
+        captured_evaluation = EvalsOperationReadiness(
+            state="unsupported",
+            reason_code="terminal_evidence_not_supported",
+        )
+    elif not snapshot.session_lineage_supported:
+        captured_evaluation = EvalsOperationReadiness(
+            state="unsupported",
+            reason_code="session_lineage_not_supported",
+        )
+    else:
+        captured_evaluation = EvalsOperationReadiness(state="ready", reason_code=None)
+
+    if snapshot.evals_configured:
+        catalog = EvalsOperationReadiness(state="ready", reason_code=None)
+        fresh_launch = EvalsOperationReadiness(state="ready", reason_code=None)
+        stored_result_operation = EvalsOperationReadiness(state="ready", reason_code=None)
+        captured_result_persistence = EvalsOperationReadiness(
+            state="unsupported",
+            reason_code="captured_result_persistence_not_available",
+        )
+    else:
+        catalog = EvalsOperationReadiness(
+            state="gated",
+            reason_code="eval_store_not_configured",
+        )
+        fresh_launch = EvalsOperationReadiness(
+            state="gated",
+            reason_code="eval_target_not_configured",
+        )
+        stored_result_operation = EvalsOperationReadiness(
+            state="gated",
+            reason_code="eval_store_not_configured",
+        )
+        captured_result_persistence = stored_result_operation.model_copy()
+
+    return EvalsReadiness(
+        captured_evaluation=captured_evaluation,
+        catalog_read=catalog,
+        catalog_write=catalog.model_copy(),
+        captured_result_persistence=captured_result_persistence,
+        scenario_conversion=EvalsOperationReadiness(
+            state="unsupported",
+            reason_code="scenario_v2_not_available",
+        ),
+        fresh_launch=fresh_launch,
+        cancellation=stored_result_operation,
+        comparison=stored_result_operation.model_copy(),
+        reports=stored_result_operation.model_copy(),
     )

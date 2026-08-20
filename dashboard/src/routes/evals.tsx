@@ -26,7 +26,7 @@ import {
   PayloadViewer,
   StateMessage,
 } from "@/components/dashboard/layout"
-import { useDashboardCapability } from "@/components/dashboard/server-contract"
+import { useDashboardCapability, useServerContract } from "@/components/dashboard/server-contract"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -76,8 +76,14 @@ import {
   preflightEvalCorpusFile,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
+import {
+  EVALS_READINESS_OPERATIONS,
+  evalsReadinessReasonText,
+  evalsReadinessStateLabel,
+} from "@/lib/evals-readiness"
 import { type EvalsSearch, evalRunIdIsValid, evalsSearchWithout } from "@/lib/evals-search"
 import { formatBytes, formatCount, formatDateTime } from "@/lib/format"
+import type { EvalsReadiness } from "@/lib/generated/server-api"
 
 const PAGE_LIMIT = 25
 type UpdateEvalsSearch = (next: (current: EvalsSearch) => EvalsSearch) => Promise<void>
@@ -86,6 +92,8 @@ export function EvalsPage() {
   const search = useSearch({ from: "/evals" })
   const navigate = useNavigate({ from: "/evals" })
   const queryClient = useQueryClient()
+  const readiness = useServerContract().capabilities.evals_readiness
+  const catalogReady = readiness.catalog_read.state === "ready"
   const mutateCapability = useDashboardCapability({
     kind: "surface",
     surface: "evals",
@@ -190,6 +198,25 @@ export function EvalsPage() {
     }
   }
 
+  if (!catalogReady) {
+    return (
+      <Page>
+        <PageHeader
+          title="Evals"
+          description="Evaluate captured production behavior and build reusable regression protection."
+        />
+        <EvalsReadinessOverview readiness={readiness} />
+        <StateMessage className="rounded-lg border border-border bg-muted/30 py-12" role="status">
+          <div className="font-medium text-foreground">The Evals catalog is not ready yet</div>
+          <div className="mt-1">
+            This page remains available so the deployment&apos;s exact readiness and planned
+            capabilities are visible.
+          </div>
+        </StateMessage>
+      </Page>
+    )
+  }
+
   return (
     <Page>
       <PageHeader
@@ -218,6 +245,8 @@ export function EvalsPage() {
           </>
         }
       />
+
+      <EvalsReadinessOverview readiness={readiness} />
 
       <div
         className="flex gap-2 border-b border-border"
@@ -310,6 +339,38 @@ export function EvalsPage() {
         )}
       </div>
     </Page>
+  )
+}
+
+function EvalsReadinessOverview({ readiness }: { readiness: EvalsReadiness }) {
+  return (
+    <DataCard
+      title="Readiness"
+      description="Server-published operation availability. Underlying routes still enforce authentication and runtime policy."
+      contentClassName="p-4"
+    >
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {EVALS_READINESS_OPERATIONS.map(([operationName, label]) => {
+          const operation = readiness[operationName]
+          return (
+            <div
+              key={operationName}
+              className="min-w-0 rounded-md border border-border bg-muted/20 p-3"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="font-medium">{label}</div>
+                <Badge variant={operation.state === "ready" ? "secondary" : "outline"}>
+                  {evalsReadinessStateLabel(operation)}
+                </Badge>
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {evalsReadinessReasonText(operation)}
+              </p>
+            </div>
+          )
+        })}
+      </div>
+    </DataCard>
   )
 }
 
