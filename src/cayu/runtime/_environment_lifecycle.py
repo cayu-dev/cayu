@@ -8,6 +8,7 @@ status decisions belong to the session engine behind :class:`CayuApp`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 from collections.abc import Callable, Iterator
@@ -119,6 +120,8 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.sessions import (
     CheckpointTransform,
+    EventOrder,
+    EventQuery,
     Session,
     SessionStore,
     _current_session_run_epoch,
@@ -137,9 +140,13 @@ from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults import SecretRedactor
 from cayu.workspaces import (
     WorkspaceIdentity,
+    WorkspaceMutationAttributionConfidence,
+    WorkspacePathRevision,
+    WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
+    compare_workspace_revisions,
 )
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimitExceeded,
@@ -1981,6 +1988,7 @@ class EnvironmentLifecycle:
             start_publication_error = exc
 
         final_revision: WorkspaceRevisionObservation | None = None
+        finalization_delta: dict[str, Any] | None = None
         try:
             final_revision = await environment_operation_boundary.await_environment_operation(
                 lambda: _observe_final_workspace_revision(
@@ -1991,6 +1999,12 @@ class EnvironmentLifecycle:
                 ),
                 operation_name="Final workspace revision observation",
                 redactor=self._secret_redactor,
+            )
+            finalization_delta = await _final_workspace_delta_payload(
+                session_store=self._session_store,
+                session_id=session.id,
+                binding_generation_id=registered_environment.binding_generation_id,
+                final_observation=final_revision,
             )
             final_snapshot_value = await environment_operation_boundary.await_environment_operation(
                 lambda: _finalize_binding_after_mutation_quiescence(
@@ -2031,6 +2045,7 @@ class EnvironmentLifecycle:
                     session_id=session.id,
                     redactor=self._secret_redactor,
                     public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
+                    finalization_delta=finalization_delta,
                 )
             )
             error_payload = {
@@ -2187,6 +2202,7 @@ class EnvironmentLifecycle:
                                         public_authority_alias_codec=(
                                             self._session_store.public_authority_alias_codec
                                         ),
+                                        finalization_delta=finalization_delta,
                                     ),
                                 },
                             ),
@@ -2220,6 +2236,7 @@ class EnvironmentLifecycle:
                 session_id=session.id,
                 redactor=self._secret_redactor,
                 public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
+                finalization_delta=finalization_delta,
             )
             event = _copy_event_with_payload(event, terminal_payload)
         return EnvironmentBindingFinalizeResult(event=event, events=events)
@@ -3143,6 +3160,124 @@ async def _observe_final_workspace_revision(
         return failed("final_revision_observer_failed")
 
 
+async def _final_workspace_delta_payload(
+    *,
+    session_store: SessionStore,
+    session_id: str,
+    binding_generation_id: str,
+    final_observation: WorkspaceRevisionObservation,
+) -> dict[str, Any]:
+    """Compare final state with the latest durable tool-window endpoint."""
+
+    baseline_payload: dict[str, Any] | None = None
+    try:
+        records = await session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.WORKSPACE_REVISION_OBSERVED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=16,
+            )
+        )
+        for record in records:
+            candidate = record.event.payload
+            if (
+                candidate.get("phase") == "after"
+                and candidate.get("binding_generation_id") == binding_generation_id
+                and candidate.get("workspace_id") == final_observation.identity.workspace_id
+                and candidate.get("observer") == final_observation.identity.observer
+            ):
+                baseline_payload = candidate
+                break
+    except Exception:
+        baseline_payload = None
+
+    attribution = WorkspaceMutationAttributionConfidence.UNATTRIBUTED_FINALIZATION_CHANGE.value
+    if baseline_payload is None:
+        return {
+            "attribution_confidence": attribution,
+            "status": WorkspaceRevisionDeltaStatus.INCOMPLETE.value,
+            "before_revision": None,
+            "after_revision": final_observation.revision,
+            "paths": [],
+            "retained_paths": 0,
+            "total_paths": 0,
+            "truncated": False,
+            "head_changed": False,
+            "branch_changed": False,
+            "detail_code": "finalization_baseline_unavailable",
+        }
+
+    before_revision = baseline_payload.get("revision")
+    if type(before_revision) is not str or not before_revision.strip():
+        before_revision = None
+    try:
+        raw_paths = baseline_payload.get("paths")
+        total_paths = baseline_payload.get("total_paths")
+        if (
+            baseline_payload.get("status") != WorkspaceRevisionObservationStatus.SUPPORTED.value
+            or type(raw_paths) is not list
+            or type(total_paths) is not int
+            or total_paths != len(raw_paths)
+        ):
+            raise ValueError("Finalization baseline is incomplete.")
+        baseline = WorkspaceRevisionObservation(
+            identity=final_observation.identity,
+            status=WorkspaceRevisionObservationStatus.SUPPORTED,
+            revision=before_revision,
+            head_revision=baseline_payload.get("head_revision"),
+            branch=baseline_payload.get("branch"),
+            path_scope=baseline_payload.get("path_scope", "complete"),
+            paths=tuple(WorkspacePathRevision.model_validate(path) for path in raw_paths),
+            total_paths=total_paths,
+        )
+        delta = compare_workspace_revisions(baseline, final_observation)
+    except Exception:
+        changed = (
+            before_revision is not None
+            and final_observation.revision is not None
+            and before_revision != final_observation.revision
+        )
+        return {
+            "attribution_confidence": attribution,
+            "status": (
+                WorkspaceRevisionDeltaStatus.TRUNCATED.value
+                if changed
+                else WorkspaceRevisionDeltaStatus.INCOMPLETE.value
+            ),
+            "before_revision": before_revision,
+            "after_revision": final_observation.revision,
+            "paths": [],
+            "retained_paths": 0,
+            "total_paths": 0,
+            "truncated": changed,
+            "head_changed": False,
+            "branch_changed": False,
+            "detail_code": "finalization_baseline_evidence_incomplete",
+        }
+
+    retained_paths = delta.paths[:_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS]
+    return {
+        "attribution_confidence": attribution,
+        "status": delta.status.value,
+        "before_revision": delta.before_revision,
+        "after_revision": delta.after_revision,
+        "paths": [
+            {
+                "path_sha256": hashlib.sha256(f"{session_id}\0{path.path}".encode()).hexdigest(),
+                "change": path.change,
+            }
+            for path in retained_paths
+        ],
+        "retained_paths": len(retained_paths),
+        "total_paths": delta.total_paths,
+        "truncated": len(retained_paths) < delta.total_paths,
+        "head_changed": delta.head_changed,
+        "branch_changed": delta.branch_changed,
+        "detail_code": delta.detail_code,
+    }
+
+
 def _final_workspace_revision_payload(
     observation: WorkspaceRevisionObservation,
     *,
@@ -3150,6 +3285,7 @@ def _final_workspace_revision_payload(
     session_id: str,
     redactor: SecretRedactor,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+    finalization_delta: dict[str, Any] | None,
 ) -> dict[str, Any]:
     if (
         invocation_secrets.registered_environment_secret_resolution_scope(registered_environment)
@@ -3190,7 +3326,7 @@ def _final_workspace_revision_payload(
                 if runtime_owned_observer == observation.identity.observer
                 else "workspace-observer-unavailable"
             )
-        return {
+        payload: dict[str, Any] = {
             "workspace_id": workspace_id,
             "observer": observer,
             "status": WorkspaceRevisionObservationStatus.TRUNCATED.value,
@@ -3201,7 +3337,24 @@ def _final_workspace_revision_payload(
             "total_paths": observation.total_paths,
             "detail_code": "final_revision_secret_scope_unavailable",
         }
-    return {
+        if finalization_delta is not None:
+            payload["finalization_delta"] = {
+                "attribution_confidence": (
+                    WorkspaceMutationAttributionConfidence.UNATTRIBUTED_FINALIZATION_CHANGE.value
+                ),
+                "status": WorkspaceRevisionDeltaStatus.TRUNCATED.value,
+                "before_revision": None,
+                "after_revision": None,
+                "paths": [],
+                "retained_paths": 0,
+                "total_paths": 0,
+                "truncated": True,
+                "head_changed": False,
+                "branch_changed": False,
+                "detail_code": "finalization_delta_secret_scope_unavailable",
+            }
+        return payload
+    payload = {
         "workspace_id": observation.identity.workspace_id,
         "observer": observation.identity.observer,
         "status": observation.status.value,
@@ -3212,6 +3365,12 @@ def _final_workspace_revision_payload(
         "total_paths": observation.total_paths,
         "detail_code": observation.detail_code,
     }
+    if finalization_delta is not None:
+        payload["finalization_delta"] = copy_json_value(
+            finalization_delta,
+            "finalization_delta",
+        )
+    return payload
 
 
 def _final_workspace_snapshot_payload(

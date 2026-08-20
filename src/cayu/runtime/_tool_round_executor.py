@@ -193,6 +193,15 @@ from cayu.runtime.user_input import (
     public_pending_user_input_event_payload,
     public_pending_user_input_prompt,
 )
+from cayu.runtime.workspace_mutation_attribution import (
+    DirectWorkspaceMutationCollector,
+    WorkspaceMutationWindow,
+    begin_workspace_mutation_window,
+    classify_workspace_mutation_attribution,
+    direct_workspace_mutation_payload,
+    observed_pre_window_change,
+    reconcile_direct_workspace_mutations,
+)
 from cayu.runtime.workspace_observation_recovery import (
     WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
     WorkspaceObservationArtifact,
@@ -233,12 +242,16 @@ from cayu.tools._runner import (
 from cayu.vaults import SecretRedactor
 from cayu.workspaces import (
     LocalWorkspace,
+    WorkspaceDirectMutationReconciliation,
     WorkspaceIdentity,
+    WorkspaceMutationAttribution,
+    WorkspaceMutationAttributionConfidence,
     WorkspaceRevisionDelta,
     WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
+    WorkspaceWriterIsolationEvidence,
     compare_workspace_revisions,
 )
 from cayu.workspaces.revisions import (
@@ -2354,6 +2367,7 @@ class ToolRoundExecutor:
 
         raw_workspace = _workspace(registered_environment)
         raw_artifact_store = _artifact_store(registered_environment)
+        direct_workspace_mutations = DirectWorkspaceMutationCollector()
         workspace_mutation_owner = (
             InvocationWorkspaceMutationOwner(
                 on_settlement_unproven=(
@@ -2384,6 +2398,7 @@ class ToolRoundExecutor:
                 redactor_snapshot_provider=invocation_secret_scope.snapshot,
                 capture_observer=invocation_secret_scope.record_ambiguous_output_capture,
                 mutation_owner=workspace_mutation_owner,
+                direct_mutation_observer=direct_workspace_mutations.record,
             ),
             artifact_store=invocation_artifact_store_handle(
                 raw_artifact_store,
@@ -2441,6 +2456,8 @@ class ToolRoundExecutor:
                 secret_publication_sealer=invocation_secret_scope.seal_for_publication,
             )
         workspace_window_id: str | None = None
+        workspace_attribution_window: WorkspaceMutationWindow | None = None
+        writer_isolation_before = WorkspaceWriterIsolationEvidence()
         before_workspace_observation: WorkspaceRevisionObservation | None = None
         workspace_lifecycle: WorkspaceObservationLifecycle | None = None
         if registered_tool.workspace_mutation and _workspace(registered_environment) is not None:
@@ -2509,32 +2526,42 @@ class ToolRoundExecutor:
                     authority_projection=workspace_authority,
                 ),
             )
-            before_workspace_observation = await _observe_workspace_revision(
-                registered_environment,
-                operation_registry=self._workspace_capture_operations,
-                require_quiescence_before_return=True,
-                authority_projection=workspace_authority,
+            workspace_attribution_window = begin_workspace_mutation_window(
+                raw_workspace,
+                window_id=workspace_window_id,
             )
-            captured_before_state = (
-                WorkspaceObservationEvidenceState.FAILED
-                if before_workspace_observation.status is WorkspaceRevisionObservationStatus.FAILED
-                else WorkspaceObservationEvidenceState.CAPTURED_PRIVATE
-            )
-            before_captured_lifecycle = WorkspaceObservationLifecycle.model_validate(
-                {
-                    **workspace_lifecycle.model_dump(mode="json"),
-                    "phase": WorkspaceObservationPhase.BEFORE_CAPTURED.value,
-                    "before_state": captured_before_state.value,
-                }
-            )
-            await publish_workspace_observation_transition(
-                session_store=self._session_store,
-                event_writer=self._event_writer,
-                session=session,
-                previous=workspace_lifecycle,
-                current=before_captured_lifecycle,
-                phase="before-capture",
-            )
+            writer_isolation_before = _workspace_writer_isolation(registered_environment)
+            try:
+                before_workspace_observation = await _observe_workspace_revision(
+                    registered_environment,
+                    operation_registry=self._workspace_capture_operations,
+                    require_quiescence_before_return=True,
+                    authority_projection=workspace_authority,
+                )
+                captured_before_state = (
+                    WorkspaceObservationEvidenceState.FAILED
+                    if before_workspace_observation.status
+                    is WorkspaceRevisionObservationStatus.FAILED
+                    else WorkspaceObservationEvidenceState.CAPTURED_PRIVATE
+                )
+                before_captured_lifecycle = WorkspaceObservationLifecycle.model_validate(
+                    {
+                        **workspace_lifecycle.model_dump(mode="json"),
+                        "phase": WorkspaceObservationPhase.BEFORE_CAPTURED.value,
+                        "before_state": captured_before_state.value,
+                    }
+                )
+                await publish_workspace_observation_transition(
+                    session_store=self._session_store,
+                    event_writer=self._event_writer,
+                    session=session,
+                    previous=workspace_lifecycle,
+                    current=before_captured_lifecycle,
+                    phase="before-capture",
+                )
+            except BaseException:
+                workspace_attribution_window.close()
+                raise
             workspace_lifecycle = before_captured_lifecycle
 
         async def close_workspace_mutation_window() -> tuple[Event, ...]:
@@ -2622,6 +2649,7 @@ class ToolRoundExecutor:
                 deferred_terminal_stager is None
                 or deferred_terminal_capture_recorder is None
                 or workspace_window_id is None
+                or workspace_attribution_window is None
                 or before_workspace_observation is None
             ):
                 raise RuntimeError("Workspace observation lost its durable staging boundary.")
@@ -2670,6 +2698,9 @@ class ToolRoundExecutor:
 
                 capture: _WorkspaceCaptureResult | None = None
                 capture_failure_detail: str | None = None
+                workspace_evidence_available = (
+                    not snapshot.unsafe_output and not publish_arguments_as_unavailable
+                )
                 if workspace_settlement_failure is not None:
                     capture_failure_detail = "mutation_settlement_unproven"
                 elif workspace_capture_failure_detail is not None:
@@ -2695,10 +2726,11 @@ class ToolRoundExecutor:
                             lifecycle=workspace_lifecycle,
                             before_observation=before_workspace_observation,
                             authority_projection=workspace_authority,
+                            attribution_window=workspace_attribution_window,
+                            writer_isolation_before=writer_isolation_before,
+                            direct_mutations=direct_workspace_mutations,
                             redactor=snapshot.redactor,
-                            evidence_available=(
-                                not snapshot.unsafe_output and not publish_arguments_as_unavailable
-                            ),
+                            evidence_available=workspace_evidence_available,
                             operation_registry=self._workspace_capture_operations,
                         )
                     except (KeyboardInterrupt, SystemExit, GeneratorExit):
@@ -2743,6 +2775,16 @@ class ToolRoundExecutor:
                         capture_failure_detail = "receipt_publication_interrupted"
                     except Exception:
                         capture_failure_detail = "receipt_publication_failed"
+                    finally:
+                        if workspace_attribution_window is not None:
+                            workspace_attribution_window.close(
+                                discard_history=not workspace_evidence_available
+                            )
+
+                if workspace_attribution_window is not None:
+                    workspace_attribution_window.close(
+                        discard_history=not workspace_evidence_available
+                    )
 
                 if capture is None:
                     if capture_failure_detail == "receipt_publication_interrupted":
@@ -6241,6 +6283,33 @@ def _workspace_revision_observer_is_runtime_owned(
     return _runtime_owned_workspace_observer_name(binding) is not None
 
 
+def _workspace_writer_isolation(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> WorkspaceWriterIsolationEvidence:
+    """Copy adapter isolation evidence without treating malformed claims as proof."""
+
+    if registered_environment is None:
+        return WorkspaceWriterIsolationEvidence()
+    binding = registered_environment.environment.binding
+    if binding is None:
+        return WorkspaceWriterIsolationEvidence()
+    bound = registered_environment.bound_workspace
+    if bound is None:
+        workspace = registered_environment.environment.workspace
+        bound = BoundWorkspace(
+            workspace=workspace,
+            source_workspace=workspace,
+            runner=registered_environment.environment.runner,
+        )
+    try:
+        evidence = binding.observe_writer_isolation(bound)
+        if type(evidence) is not WorkspaceWriterIsolationEvidence:
+            raise TypeError("Workspace binding returned invalid writer-isolation evidence.")
+        return WorkspaceWriterIsolationEvidence.model_validate(evidence.model_dump(mode="python"))
+    except Exception:
+        return WorkspaceWriterIsolationEvidence(detail_code="writer_isolation_observer_failed")
+
+
 async def _observe_workspace_revision(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     *,
@@ -6540,6 +6609,9 @@ async def _record_workspace_mutation_after(
     lifecycle: WorkspaceObservationLifecycle,
     before_observation: WorkspaceRevisionObservation,
     authority_projection: _WorkspaceObservationAuthorityProjection,
+    attribution_window: WorkspaceMutationWindow,
+    writer_isolation_before: WorkspaceWriterIsolationEvidence,
+    direct_mutations: DirectWorkspaceMutationCollector,
     redactor: SecretRedactor,
     evidence_available: bool,
     operation_registry: BoundedInvocationOperationRegistry,
@@ -6688,16 +6760,77 @@ async def _record_workspace_mutation_after(
         events=(before_event,),
     )
     active_lifecycle = before_published
-    after_observation = await _observe_workspace_revision(
-        registered_environment,
-        operation_registry=operation_registry,
-        authority_projection=authority_projection,
-    )
+    try:
+        after_observation = await _observe_workspace_revision(
+            registered_environment,
+            operation_registry=operation_registry,
+            authority_projection=authority_projection,
+        )
+        writer_isolation_after = _workspace_writer_isolation(registered_environment)
+    except BaseException:
+        attribution_window.close(discard_history=not evidence_available)
+        raise
     if (
         after_observation.identity.workspace_id != lifecycle.workspace_id
         or after_observation.identity.observer != lifecycle.observer
     ):
+        attribution_window.close(discard_history=not evidence_available)
         raise RuntimeError("Workspace capture after evidence conflicts with its authority.")
+    try:
+        try:
+            delta = compare_workspace_revisions(before_observation, after_observation)
+        except Exception:
+            delta = WorkspaceRevisionDelta(
+                identity=before_observation.identity,
+                status=WorkspaceRevisionDeltaStatus.FAILED,
+                before_revision=before_observation.revision,
+                after_revision=after_observation.revision,
+                detail_code="revision_comparison_failed",
+            )
+        direct_reconciliation = (
+            reconcile_direct_workspace_mutations(
+                before=before_observation,
+                after=after_observation,
+                collector=direct_mutations,
+            )
+            if evidence_available
+            else WorkspaceDirectMutationReconciliation.NOT_OBSERVED
+        )
+        attribution = classify_workspace_mutation_attribution(
+            window=attribution_window,
+            isolation_before=writer_isolation_before,
+            isolation_after=writer_isolation_after,
+            direct_reconciliation=direct_reconciliation,
+        )
+        if not evidence_available:
+            attribution = WorkspaceMutationAttribution(
+                confidence=(
+                    WorkspaceMutationAttributionConfidence.CONCURRENT_AMBIGUITY
+                    if attribution_window.overlap_detected
+                    else WorkspaceMutationAttributionConfidence.EXTERNAL_OR_UNKNOWN
+                ),
+                writer_isolation=attribution.writer_isolation,
+                overlap_detected=attribution_window.overlap_detected,
+                direct_reconciliation=WorkspaceDirectMutationReconciliation.NOT_OBSERVED,
+                detail_code=(
+                    "overlapping_workspace_mutation_windows"
+                    if attribution_window.overlap_detected
+                    else "workspace_evidence_quarantined"
+                ),
+            )
+        pre_window_change = (
+            observed_pre_window_change(
+                attribution_window,
+                before_observation,
+            )
+            if evidence_available
+            else None
+        )
+    finally:
+        attribution_window.close(
+            after_observation if evidence_available else None,
+            discard_history=not evidence_available,
+        )
     after_projection = await _workspace_evidence_projection(
         paths=[path.model_dump(mode="json") for path in after_observation.paths],
         status=after_observation.status.value,
@@ -6766,16 +6899,6 @@ async def _record_workspace_mutation_after(
         events=(after_event,),
     )
     active_lifecycle = after_captured
-    try:
-        delta = compare_workspace_revisions(before_observation, after_observation)
-    except Exception:
-        delta = WorkspaceRevisionDelta(
-            identity=before_observation.identity,
-            status=WorkspaceRevisionDeltaStatus.FAILED,
-            before_revision=before_observation.revision,
-            after_revision=after_observation.revision,
-            detail_code="revision_comparison_failed",
-        )
     delta_projection = await _workspace_evidence_projection(
         paths=[path.model_dump(mode="json") for path in delta.paths],
         status=delta.status.value,
@@ -6813,6 +6936,15 @@ async def _record_workspace_mutation_after(
             after_observation_id=after_event.id,
             delta=delta,
             projection=delta_projection,
+            attribution=attribution,
+            writer_isolation_before=writer_isolation_before,
+            writer_isolation_after=writer_isolation_after,
+            direct_mutations=direct_workspace_mutation_payload(
+                direct_mutations,
+                window_id=window_id,
+                evidence_available=evidence_available,
+            ),
+            pre_window_change=pre_window_change,
         ),
         redactor=redactor,
     )
@@ -6955,6 +7087,11 @@ def _workspace_mutation_recorded_event(
     after_observation_id: str,
     delta: WorkspaceRevisionDelta,
     projection: _WorkspaceEvidenceProjection,
+    attribution: WorkspaceMutationAttribution,
+    writer_isolation_before: WorkspaceWriterIsolationEvidence,
+    writer_isolation_after: WorkspaceWriterIsolationEvidence,
+    direct_mutations: dict[str, Any],
+    pre_window_change: WorkspaceRevisionDelta | None,
 ) -> Event:
     payload: dict[str, Any] = {
         "window_id": window_id,
@@ -6976,8 +7113,19 @@ def _workspace_mutation_recorded_event(
         "head_changed": delta.head_changed if projection.evidence_available else False,
         "branch_changed": delta.branch_changed if projection.evidence_available else False,
         "detail_code": projection.detail_code,
+        "attribution": attribution.model_dump(mode="json"),
+        "writer_isolation": {
+            "before": writer_isolation_before.model_dump(mode="json"),
+            "after": writer_isolation_after.model_dump(mode="json"),
+        },
+        "direct_mutations": direct_mutations,
         **tool_round_identity.payload(),
     }
+    if pre_window_change is not None:
+        payload["pre_window_change"] = _pre_window_change_payload(
+            pre_window_change,
+            window_id=window_id,
+        )
     if model_step is not None:
         payload["model_step"] = model_step
     _add_workspace_manifest_artifact_fields(payload, projection)
@@ -6993,7 +7141,7 @@ def _workspace_mutation_recorded_event(
             payload=payload,
         )
     )
-    return _event_with_workspace_observation_authority(
+    event = _event_with_workspace_observation_authority(
         event_with_execution_profile_authority(event, execution_profile),
         tool_round_identity,
         interaction_id,
@@ -7010,6 +7158,59 @@ def _workspace_mutation_recorded_event(
         "manifest_artifact_id",
         "manifest_artifact_sha256",
     )
+    nested_authority_paths: list[tuple[str, ...]] = [
+        ("attribution", "confidence"),
+        ("attribution", "detail_code"),
+        ("attribution", "direct_reconciliation"),
+        ("attribution", "writer_isolation"),
+        ("writer_isolation", "before", "status"),
+        ("writer_isolation", "after", "status"),
+        ("direct_mutations", "operations", "*", "method"),
+        ("direct_mutations", "operations", "*", "path_sha256"),
+        ("direct_mutations", "operations", "*", "result_operation"),
+        ("direct_mutations", "operations", "*", "result_evidence_sha256"),
+    ]
+    if pre_window_change is not None:
+        nested_authority_paths.extend(
+            (
+                ("pre_window_change", "attribution_confidence"),
+                ("pre_window_change", "status"),
+                ("pre_window_change", "paths", "*", "change"),
+            )
+        )
+    return event_with_runtime_nested_payload_authority(
+        event,
+        *nested_authority_paths,
+    )
+
+
+def _pre_window_change_payload(
+    delta: WorkspaceRevisionDelta,
+    *,
+    window_id: str,
+) -> dict[str, Any]:
+    """Project a bounded gap delta without exposing an unredacted path."""
+
+    retained_paths = delta.paths[:_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS]
+    return {
+        "attribution_confidence": "external_or_unknown",
+        "status": delta.status.value,
+        "before_revision": delta.before_revision,
+        "after_revision": delta.after_revision,
+        "paths": [
+            {
+                "path_sha256": hashlib.sha256(f"{window_id}\0{path.path}".encode()).hexdigest(),
+                "change": path.change,
+            }
+            for path in retained_paths
+        ],
+        "retained_paths": len(retained_paths),
+        "total_paths": delta.total_paths,
+        "truncated": len(retained_paths) < delta.total_paths,
+        "head_changed": delta.head_changed,
+        "branch_changed": delta.branch_changed,
+        "detail_code": delta.detail_code,
+    }
 
 
 def _workspace_mutation_incomplete_event(
@@ -7071,6 +7272,18 @@ def _workspace_mutation_incomplete_event(
         **artifact_payload,
         **identity.payload(),
     }
+    if lifecycle.mutation_event_id is None:
+        payload["attribution"] = {
+            "confidence": (
+                "concurrent_ambiguity"
+                if status is WorkspaceObservationTerminalStatus.AMBIGUOUS
+                else "external_or_unknown"
+            ),
+            "writer_isolation": "unknown",
+            "overlap_detected": False,
+            "direct_reconciliation": "not_observed",
+            "detail_code": "workspace_attribution_recovery_incomplete",
+        }
     if lifecycle.model_step is not None:
         payload["model_step"] = lifecycle.model_step
     if lifecycle.tool_outcome_event_id is not None:

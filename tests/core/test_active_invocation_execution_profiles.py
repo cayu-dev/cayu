@@ -45,6 +45,7 @@ from cayu import (
     InMemorySessionStore,
     InteractionStatus,
     InteractionSummaryEvidence,
+    LocalWorkspace,
     LoopPolicy,
     Message,
     ModelPrice,
@@ -571,6 +572,11 @@ def test_fork_profile_inheritance_is_atomic_and_exactly_replayable(
         assert [event.id for event in replay] == [event.id for event in first]
         assert first[0].payload["execution_profile_selection"] == "inherit_parent"
         assert first[0].payload["system_prompt_policy"] == "inherit_source"
+        assert first[0].payload["workspace_lineage"] == {
+            "status": "unproven",
+            "source_workspace_revision": None,
+            "detail_code": "child_workspace_derivation_unproven",
+        }
         assert "fork_request_sha256" not in first[0].payload
         assert "selected_profile_fingerprint" not in first[0].payload
         assert "source_profile_fingerprint" not in first[0].payload
@@ -588,6 +594,7 @@ def test_fork_profile_inheritance_is_atomic_and_exactly_replayable(
         assert stored_payload["fork_request_sha256"] == relationship.request_sha256
         assert stored_payload["selected_profile_fingerprint"] == expected.fingerprint
         assert stored_payload["source_profile_fingerprint"] == expected.fingerprint
+        assert stored_payload["workspace_lineage"] == first[0].payload["workspace_lineage"]
         if isinstance(store, SQLiteSessionStore):
             assert (
                 await store.prune_events(
@@ -606,6 +613,57 @@ def test_fork_profile_inheritance_is_atomic_and_exactly_replayable(
         close = getattr(store, "close", None)
         if close is not None:
             await close()
+
+    asyncio.run(scenario())
+
+
+def test_fork_with_same_live_workspace_reports_shared_ambiguous_lineage(tmp_path) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            ScriptedModelProvider(
+                [
+                    ModelStreamEvent.text_delta("source complete"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                name="fake",
+            ),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="shared"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="shared-workspace"),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="shared-lineage-source",
+                    messages=[Message.text("user", "source")],
+                )
+            )
+        )
+
+        events = await collect(
+            app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="shared-lineage-source",
+                    session_id="shared-lineage-child",
+                )
+            )
+        )
+
+        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        assert events[0].payload["workspace_lineage"] == {
+            "status": "shared_or_ambiguous",
+            "source_workspace_revision": None,
+            "detail_code": "shared_live_workspace_not_isolated",
+        }
 
     asyncio.run(scenario())
 

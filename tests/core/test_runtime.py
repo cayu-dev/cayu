@@ -10021,6 +10021,19 @@ def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
         "path_scope": "complete",
         "total_paths": 0,
         "detail_code": "revision_observation_unsupported",
+        "finalization_delta": {
+            "attribution_confidence": "unattributed_finalization_change",
+            "status": "incomplete",
+            "before_revision": None,
+            "after_revision": None,
+            "paths": [],
+            "retained_paths": 0,
+            "total_paths": 0,
+            "truncated": False,
+            "head_changed": False,
+            "branch_changed": False,
+            "detail_code": "finalization_baseline_unavailable",
+        },
     }
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.finalize_calls) == 1

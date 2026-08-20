@@ -106,6 +106,8 @@ from cayu.workspaces import (
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
+    WorkspaceWriterIsolationEvidence,
+    WorkspaceWriterIsolationStatus,
 )
 
 
@@ -137,6 +139,18 @@ def _portable_environment_spec(name: str) -> EnvironmentSpec:
             implementation_version="test-build",
         ),
     )
+
+
+def _assert_content_free_quarantined_mutation_receipt(receipt: Event) -> None:
+    assert receipt.payload["direct_mutations"] == {
+        "operations": [],
+        "retained_operations": 0,
+        "total_operations": 0,
+        "truncated": True,
+    }
+    assert receipt.payload["attribution"]["direct_reconciliation"] == "not_observed"
+    assert receipt.payload["attribution"]["confidence"] != "exclusive_tool"
+    assert "pre_window_change" not in receipt.payload
 
 
 @pytest.mark.parametrize(
@@ -247,6 +261,61 @@ class _SingleToolProvider(ModelProvider):
             )
             yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
             return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _BetweenWindowEditProvider(ModelProvider):
+    name = "between-window-edit"
+
+    def __init__(self, workspace_root, *, tool_name: str = "public_workspace_write") -> None:
+        self.workspace_root = workspace_root
+        self.tool_name = tool_name
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.requests += 1
+        if self.requests == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call-first-window",
+                name=self.tool_name,
+                arguments={"path": "first.txt"},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if self.requests == 2:
+            (self.workspace_root / "external.txt").write_text("external", encoding="utf-8")
+            yield ModelStreamEvent.tool_call(
+                id="call-second-window",
+                name=self.tool_name,
+                arguments={"path": "second.txt"},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _FinalizationEditProvider(ModelProvider):
+    name = "finalization-edit"
+
+    def __init__(self, workspace_root) -> None:
+        self.workspace_root = workspace_root
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.requests += 1
+        if self.requests == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call-before-finalization",
+                name="public_workspace_write",
+                arguments={"path": "tool.txt"},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        (self.workspace_root / "late.txt").write_text("late", encoding="utf-8")
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
@@ -482,6 +551,60 @@ class _NoopWorkspaceMutationTool(Tool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         del ctx, args
         return ToolResult(content="no mutation requested")
+
+
+class _ExclusiveWriterBinding(DeterministicWorkspaceBinding):
+    def observe_writer_isolation(self, bound):
+        assert bound.workspace is not None
+        return WorkspaceWriterIsolationEvidence(
+            status=WorkspaceWriterIsolationStatus.EXCLUSIVE,
+            mechanism="test-held-writer-lease",
+            generation="test-generation-1",
+            detail_code=None,
+        )
+
+
+class _ConcurrentWindowMutationTool(Tool):
+    spec = ToolSpec(
+        name="concurrent_window_mutation",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    def __init__(self, *, path: str, started: list[int], both_started: asyncio.Event) -> None:
+        self.path = path
+        self.started = started
+        self.both_started = both_started
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del args
+        assert ctx.workspace is not None
+        self.started[0] += 1
+        if self.started[0] == 2:
+            self.both_started.set()
+        await asyncio.wait_for(self.both_started.wait(), timeout=5)
+        await ctx.workspace.create_bytes(self.path, self.path.encode())
+        return ToolResult(content="created")
+
+
+class _BackgroundEditMutationTool(Tool):
+    spec = ToolSpec(
+        name="background_edit_mutation",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    def __init__(self, *, started: asyncio.Event, release: asyncio.Event) -> None:
+        self.started = started
+        self.release = release
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del args
+        assert ctx.workspace is not None
+        self.started.set()
+        await asyncio.wait_for(self.release.wait(), timeout=5)
+        await ctx.workspace.create_bytes("tool.txt", b"tool")
+        return ToolResult(content="created")
 
 
 class _MalformedListWorkspace(LocalWorkspace):
@@ -1214,6 +1337,19 @@ class _PrivateWorkspaceWriteTool(Tool):
         return ToolResult(content="written")
 
 
+class _PublicWorkspaceWriteTool(Tool):
+    spec = ToolSpec(
+        name="public_workspace_write",
+        parallel_safe=False,
+        workspace_mutation=True,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        assert ctx.workspace is not None
+        await ctx.workspace.create_bytes(args["path"], b"public")
+        return ToolResult(content="written")
+
+
 class _BlockingThreadWorkspace(LocalWorkspace):
     def __init__(self, root, *, workspace_id: str) -> None:
         super().__init__(root, workspace_id=workspace_id)
@@ -1872,6 +2008,344 @@ def test_workspace_mutation_without_binding_records_unsupported_evidence(tmp_pat
     )
 
 
+def test_exclusive_binding_and_direct_operation_produce_exact_attribution(tmp_path) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _SingleToolProvider(
+                tool_name="public_workspace_write",
+                arguments={"path": "created.txt"},
+            ),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="exclusive-workspace"),
+                binding=_ExclusiveWriterBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_PublicWorkspaceWriteTool()],
+        )
+
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-exclusive-attribution",
+                messages=[Message.text("user", "create")],
+            ),
+        )
+        records = await store.query_events(EventQuery(session_id="session-exclusive-attribution"))
+        return next(
+            record.event
+            for record in records
+            if record.event.type is EventType.WORKSPACE_MUTATION_RECORDED
+        )
+
+    receipt = asyncio.run(run())
+
+    assert receipt.payload["attribution"] == {
+        "confidence": "exclusive_tool",
+        "writer_isolation": "exclusive",
+        "overlap_detected": False,
+        "direct_reconciliation": "consistent",
+        "detail_code": "exclusive_writer_isolation_verified",
+    }
+    assert receipt.payload["writer_isolation"]["before"] == {
+        "status": "exclusive",
+        "mechanism": "test-held-writer-lease",
+        "generation": "test-generation-1",
+        "detail_code": None,
+    }
+    assert (
+        receipt.payload["writer_isolation"]["after"]
+        == receipt.payload["writer_isolation"]["before"]
+    )
+    direct = receipt.payload["direct_mutations"]
+    assert direct["total_operations"] == direct["retained_operations"] == 1
+    assert direct["truncated"] is False
+    assert direct["operations"][0]["method"] == "create_bytes"
+    assert direct["operations"][0]["result_operation"] == "create"
+    assert len(direct["operations"][0]["path_sha256"]) == 64
+    assert "created.txt" not in str(direct)
+
+
+def test_overlapping_sessions_never_claim_per_tool_workspace_causality(tmp_path) -> None:
+    async def run():
+        workspace = LocalWorkspace(tmp_path, workspace_id="concurrent-workspace")
+        started = [0]
+        both_started = asyncio.Event()
+        results = []
+
+        for index in range(2):
+            store = InMemorySessionStore()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(
+                _SingleToolProvider(
+                    tool_name="concurrent_window_mutation",
+                    arguments={},
+                ),
+                default=True,
+            )
+            app.register_environment(
+                Environment(
+                    _portable_environment_spec("local"),
+                    workspace=workspace,
+                    binding=_ExclusiveWriterBinding(),
+                ),
+                default=True,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="scripted-model"),
+                tools=[
+                    _ConcurrentWindowMutationTool(
+                        path=f"concurrent-{index}.txt",
+                        started=started,
+                        both_started=both_started,
+                    )
+                ],
+            )
+            results.append((app, store, f"session-concurrent-{index}"))
+
+        await asyncio.gather(
+            *(
+                collect_events(
+                    app,
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "mutate")],
+                    ),
+                )
+                for app, _store, session_id in results
+            )
+        )
+        receipts = []
+        for _app, store, session_id in results:
+            records = await store.query_events(EventQuery(session_id=session_id))
+            receipts.append(
+                next(
+                    record.event
+                    for record in records
+                    if record.event.type is EventType.WORKSPACE_MUTATION_RECORDED
+                )
+            )
+        return receipts
+
+    receipts = asyncio.run(run())
+
+    assert len(receipts) == 2
+    assert {receipt.payload["attribution"]["confidence"] for receipt in receipts} == {
+        "concurrent_ambiguity"
+    }
+    assert all(receipt.payload["attribution"]["overlap_detected"] is True for receipt in receipts)
+    assert {receipt.payload["status"] for receipt in receipts} == {"changed"}
+    assert {receipt.payload["total_paths"] for receipt in receipts} == {2}
+
+
+def test_background_edit_during_window_remains_external_or_unknown(tmp_path) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _SingleToolProvider(tool_name="background_edit_mutation", arguments={}),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="background-workspace"),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_BackgroundEditMutationTool(started=started, release=release)],
+        )
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-background-edit",
+                    messages=[Message.text("user", "mutate")],
+                ),
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        (tmp_path / "background.txt").write_text("background", encoding="utf-8")
+        release.set()
+        await run_task
+        records = await store.query_events(EventQuery(session_id="session-background-edit"))
+        return next(
+            record.event
+            for record in records
+            if record.event.type is EventType.WORKSPACE_MUTATION_RECORDED
+        )
+
+    receipt = asyncio.run(run())
+
+    assert receipt.payload["status"] == "changed"
+    assert receipt.payload["total_paths"] == 2
+    assert receipt.payload["attribution"] == {
+        "confidence": "external_or_unknown",
+        "writer_isolation": "unknown",
+        "overlap_detected": False,
+        "direct_reconciliation": "consistent",
+        "detail_code": "exclusive_writer_isolation_unproven",
+    }
+
+
+def test_edit_between_tool_windows_is_reported_as_external_or_unknown(tmp_path) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_BetweenWindowEditProvider(tmp_path), default=True)
+        app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="gap-workspace"),
+                binding=_ExclusiveWriterBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_PublicWorkspaceWriteTool()],
+        )
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-between-window-edit",
+                messages=[Message.text("user", "mutate twice")],
+            ),
+        )
+        records = await store.query_events(EventQuery(session_id="session-between-window-edit"))
+        return [
+            record.event
+            for record in records
+            if record.event.type is EventType.WORKSPACE_MUTATION_RECORDED
+        ]
+
+    receipts = asyncio.run(run())
+
+    assert len(receipts) == 2
+    assert "pre_window_change" not in receipts[0].payload
+    gap = receipts[1].payload["pre_window_change"]
+    assert gap["attribution_confidence"] == "external_or_unknown"
+    assert gap["status"] == "changed"
+    assert gap["total_paths"] == gap["retained_paths"] == 1
+    assert gap["paths"][0]["change"] == "added"
+    assert "external.txt" not in receipts[1].model_dump_json()
+
+
+def test_private_tool_window_omits_external_gap_and_direct_operation_evidence(tmp_path) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _BetweenWindowEditProvider(tmp_path, tool_name="private_workspace_write"),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="private-gap-workspace"),
+                binding=_ExclusiveWriterBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_PrivateWorkspaceWriteTool()],
+        )
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-private-between-window-edit",
+                messages=[Message.text("user", "mutate twice")],
+            ),
+        )
+        records = await store.query_events(
+            EventQuery(session_id="session-private-between-window-edit")
+        )
+        return [
+            record.event
+            for record in records
+            if record.event.type is EventType.WORKSPACE_MUTATION_RECORDED
+        ]
+
+    receipts = asyncio.run(run())
+
+    assert len(receipts) == 2
+    for receipt in receipts:
+        _assert_content_free_quarantined_mutation_receipt(receipt)
+        assert receipt.payload["attribution"]["confidence"] == "external_or_unknown"
+        assert receipt.payload["attribution"]["detail_code"] == "workspace_evidence_quarantined"
+    second_json = receipts[1].model_dump_json()
+    for private_path in ("first.txt", "second.txt", "external.txt"):
+        candidate_digest = hashlib.sha256(
+            f"{receipts[1].payload['window_id']}\0{private_path}".encode()
+        ).hexdigest()
+        assert candidate_digest not in second_json
+
+
+def test_finalization_retains_change_after_last_tool_without_claiming_tool_causality(
+    tmp_path,
+) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_FinalizationEditProvider(tmp_path), default=True)
+        app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(tmp_path, workspace_id="finalization-workspace"),
+                binding=_ExclusiveWriterBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[_PublicWorkspaceWriteTool()],
+        )
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-finalization-change",
+                messages=[Message.text("user", "mutate")],
+            ),
+        )
+        records = await store.query_events(EventQuery(session_id="session-finalization-change"))
+        return next(
+            record.event
+            for record in records
+            if record.event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+        )
+
+    finalization = asyncio.run(run())
+    delta = finalization.payload["final_revision"]["finalization_delta"]
+
+    assert delta["attribution_confidence"] == "unattributed_finalization_change"
+    assert delta["status"] == "changed"
+    assert delta["before_revision"] != delta["after_revision"]
+    assert delta["total_paths"] == delta["retained_paths"] == 1
+    assert delta["paths"][0]["change"] == "added"
+    assert "late.txt" not in finalization.model_dump_json()
+
+
 def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path) -> None:
     if shutil.which("git") is None:
         pytest.skip("git executable is required")
@@ -2003,6 +2477,7 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
     )
     final_revision = dict(finalization.payload["final_revision"])
     assert final_revision.pop("observer") != "GitRepositoryBinding"
+    finalization_delta = final_revision.pop("finalization_delta")
     assert "GitRepositoryBinding" not in finalization.model_dump_json()
     assert final_revision == {
         "workspace_id": "git-workspace",
@@ -2012,6 +2487,19 @@ def test_cayu_app_records_git_workspace_mutation_receipt_for_shell_tool(tmp_path
         "branch": after.payload["branch"],
         "path_scope": "complete",
         "total_paths": after.payload["total_paths"],
+        "detail_code": None,
+    }
+    assert finalization_delta == {
+        "attribution_confidence": "unattributed_finalization_change",
+        "status": "no_change",
+        "before_revision": after.payload["revision"],
+        "after_revision": after.payload["revision"],
+        "paths": [],
+        "retained_paths": 0,
+        "total_paths": 0,
+        "truncated": False,
+        "head_changed": False,
+        "branch_changed": False,
         "detail_code": None,
     }
     assert "tool_call_id" not in finalization.payload["final_revision"]
@@ -4704,7 +5192,9 @@ def test_terminal_workspace_revision_quarantines_dynamic_secret_scope(
         redactor=SecretRedactor(),
         public_authority_alias_codec=store.public_authority_alias_codec,
     )
-    assert finalization.payload["final_revision"] == {
+    final_revision = dict(finalization.payload["final_revision"])
+    finalization_delta = final_revision.pop("finalization_delta")
+    assert final_revision == {
         "workspace_id": projected_authority.workspace_id,
         "observer": "GitRepositoryBinding",
         "status": "truncated",
@@ -4714,6 +5204,19 @@ def test_terminal_workspace_revision_quarantines_dynamic_secret_scope(
         "path_scope": "complete",
         "total_paths": 1,
         "detail_code": "final_revision_secret_scope_unavailable",
+    }
+    assert finalization_delta == {
+        "attribution_confidence": "unattributed_finalization_change",
+        "status": "truncated",
+        "before_revision": None,
+        "after_revision": None,
+        "paths": [],
+        "retained_paths": 0,
+        "total_paths": 0,
+        "truncated": True,
+        "head_changed": False,
+        "branch_changed": False,
+        "detail_code": "finalization_delta_secret_scope_unavailable",
     }
     combined = repr(
         (
@@ -4796,6 +5299,12 @@ def test_private_workspace_arguments_quarantine_receipt_paths(
     assert receipt.payload["status"] == "truncated"
     assert receipt.payload["detail_code"] == "workspace_evidence_quarantined"
     assert receipt.payload["paths"] == []
+    _assert_content_free_quarantined_mutation_receipt(receipt)
+    assert receipt.payload["attribution"]["detail_code"] == "workspace_evidence_quarantined"
+    candidate_digest = hashlib.sha256(
+        f"{receipt.payload['window_id']}\0{private_path}".encode()
+    ).hexdigest()
+    assert candidate_digest not in combined
 
 
 def test_multi_call_workspace_receipt_cannot_precede_sibling_secret_scope(
@@ -4859,6 +5368,12 @@ def test_multi_call_workspace_receipt_cannot_precede_sibling_secret_scope(
     assert all(
         receipt.payload["detail_code"] == "workspace_evidence_quarantined" for receipt in receipts
     )
+    for receipt in receipts:
+        _assert_content_free_quarantined_mutation_receipt(receipt)
+    candidate_digest = hashlib.sha256(
+        f"{receipts[0].payload['window_id']}\0{secret_path}".encode()
+    ).hexdigest()
+    assert candidate_digest not in combined
 
 
 def test_stream_abandonment_remains_authoritative_during_staged_settlement_failure(

@@ -108,6 +108,27 @@ store from concurrently resuming the same group. The tool-free evaluator's
 exact execution profile is frozen before durable admission, and extension
 failures are recorded only through bounded, secret-redacted diagnostics.
 
+### Workspace mutation attribution is explicit and fail-closed
+
+Workspace revision deltas no longer imply per-tool causality. Mutation receipts
+now distinguish exclusive tool attribution, concurrent ambiguity, and
+external/unknown changes; exact attribution requires stable resource identity
+plus matching adapter-provided writer-isolation evidence at both ends of the
+window. Overlapping in-process windows taint every participant, edits between
+windows remain separate gap evidence, and direct workspace operations are
+reconciled against independently observed endpoints with bounded content-free
+projections. Private-argument and dynamic multi-call quarantine uses a fixed
+projection with no direct-operation hashes, metadata, counts, or gap evidence,
+cannot claim exact attribution, and clears the process-local gap baseline so a
+later receipt cannot resurrect quarantined evidence. Built-in bindings default
+to unknown isolation.
+
+Terminal binding finalization records an unattributed delta from the last
+durable after-window observation, and session forks explicitly report shared or
+unproven workspace lineage without claiming an isolated derived revision. The
+new evidence is additive JSON in existing events and round-trips through all
+built-in session stores; no storage migration is required.
+
 ### Fork and workspace branch authority fails closed
 
 `CURRENT_CHILD` session forks now require an attributable application authority

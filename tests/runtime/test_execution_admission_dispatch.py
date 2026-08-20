@@ -859,6 +859,19 @@ def test_finalize_completed_publication_failure_preserves_final_revision(
             "path_scope": "complete",
             "total_paths": 0,
             "detail_code": "final_revision_secret_scope_unavailable",
+            "finalization_delta": {
+                "attribution_confidence": "unattributed_finalization_change",
+                "status": "truncated",
+                "before_revision": None,
+                "after_revision": None,
+                "paths": [],
+                "retained_paths": 0,
+                "total_paths": 0,
+                "truncated": True,
+                "head_changed": False,
+                "branch_changed": False,
+                "detail_code": "finalization_delta_secret_scope_unavailable",
+            },
         }
         assert final_revision["workspace_id"].startswith("cayu_authority_v1.")
         assert final_revision["observer"].startswith("cayu_authority_v1.")

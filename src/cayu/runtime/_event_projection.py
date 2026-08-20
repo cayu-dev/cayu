@@ -56,6 +56,8 @@ from cayu.workspaces.revisions import (
     _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS,
     _WORKSPACE_PATH_REVISION_DELTA_FIELDS,
     _WORKSPACE_PATH_REVISION_FIELDS,
+    WorkspaceForkLineageStatus,
+    WorkspaceMutationAttributionConfidence,
     WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservationStatus,
 )
@@ -263,6 +265,10 @@ _WORKSPACE_OBSERVATION_STATUS_VALUES = frozenset(
     item.value for item in WorkspaceRevisionObservationStatus
 )
 _WORKSPACE_MUTATION_STATUS_VALUES = frozenset(item.value for item in WorkspaceRevisionDeltaStatus)
+_WORKSPACE_ATTRIBUTION_CONFIDENCE_VALUES = frozenset(
+    item.value for item in WorkspaceMutationAttributionConfidence
+)
+_WORKSPACE_PATH_CHANGE_VALUES = frozenset({"added", "modified", "deleted", "renamed"})
 _WORKSPACE_OBSERVATION_ARTIFACT_STATE_VALUES = frozenset(
     item.value for item in WorkspaceObservationArtifactState
 )
@@ -409,6 +415,21 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("execution_profile_selection",): frozenset({"inherit_parent", "current_child"}),
         ("source_status",): _SESSION_STATUS_VALUES,
         ("system_prompt_policy",): frozenset({"inherit_source", "current_agent"}),
+        ("workspace_lineage", "status"): frozenset(
+            item.value for item in WorkspaceForkLineageStatus
+        ),
+        ("workspace_lineage", "detail_code"): frozenset(
+            {
+                "child_workspace_derivation_unproven",
+                "shared_live_workspace_not_isolated",
+            }
+        ),
+    },
+    EventType.WORKSPACE_OBSERVATION_FINALIZED: {
+        ("attribution", "confidence"): _WORKSPACE_ATTRIBUTION_CONFIDENCE_VALUES,
+        ("attribution", "writer_isolation"): frozenset({"unknown"}),
+        ("attribution", "direct_reconciliation"): frozenset({"not_observed"}),
+        ("attribution", "detail_code"): frozenset({"workspace_attribution_recovery_incomplete"}),
     },
     EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED: {
         ("transition_event_type",): _INTERACTION_TERMINAL_EVENT_TYPE_VALUES,
@@ -428,6 +449,19 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("approval", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
         ("final_revision", "status"): _WORKSPACE_OBSERVATION_STATUS_VALUES,
         ("final_revision", "path_scope"): _WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES,
+        (
+            "final_revision",
+            "finalization_delta",
+            "attribution_confidence",
+        ): _WORKSPACE_ATTRIBUTION_CONFIDENCE_VALUES,
+        ("final_revision", "finalization_delta", "status"): _WORKSPACE_MUTATION_STATUS_VALUES,
+        (
+            "final_revision",
+            "finalization_delta",
+            "paths",
+            "*",
+            "change",
+        ): _WORKSPACE_PATH_CHANGE_VALUES,
         ("user_input", "arguments_state"): frozenset({"quarantined"}),
         ("user_input", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
     },
@@ -435,6 +469,23 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         event_type: {
             ("final_revision", "status"): _WORKSPACE_OBSERVATION_STATUS_VALUES,
             ("final_revision", "path_scope"): _WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES,
+            (
+                "final_revision",
+                "finalization_delta",
+                "attribution_confidence",
+            ): _WORKSPACE_ATTRIBUTION_CONFIDENCE_VALUES,
+            (
+                "final_revision",
+                "finalization_delta",
+                "status",
+            ): _WORKSPACE_MUTATION_STATUS_VALUES,
+            (
+                "final_revision",
+                "finalization_delta",
+                "paths",
+                "*",
+                "change",
+            ): _WORKSPACE_PATH_CHANGE_VALUES,
         }
         for event_type in {
             EventType.SESSION_COMPLETED,
@@ -554,6 +605,23 @@ _DECLARED_FIXED_CONTROLS: Mapping[
                 "final_revision",
                 "path_scope",
             ): _WORKSPACE_OBSERVATION_PATH_SCOPE_VALUES,
+            (
+                "final_revision",
+                "finalization_delta",
+                "attribution_confidence",
+            ): _WORKSPACE_ATTRIBUTION_CONFIDENCE_VALUES,
+            (
+                "final_revision",
+                "finalization_delta",
+                "status",
+            ): _WORKSPACE_MUTATION_STATUS_VALUES,
+            (
+                "final_revision",
+                "finalization_delta",
+                "paths",
+                "*",
+                "change",
+            ): _WORKSPACE_PATH_CHANGE_VALUES,
         }
         for event_type in {
             EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
@@ -1906,6 +1974,90 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     workspace_delta_authority_paths = {
         ("paths", "*", field_name) for field_name in _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS
     }
+    workspace_attribution_owned_paths = (
+        {
+            ("attribution", field_name)
+            for field_name in {
+                "confidence",
+                "detail_code",
+                "direct_reconciliation",
+                "overlap_detected",
+                "writer_isolation",
+            }
+        }
+        | {("writer_isolation", phase) for phase in {"before", "after"}}
+        | {
+            ("writer_isolation", phase, field_name)
+            for phase in {"before", "after"}
+            for field_name in {"status", "mechanism", "generation", "detail_code"}
+        }
+        | {
+            ("direct_mutations", field_name)
+            for field_name in {
+                "operations",
+                "retained_operations",
+                "total_operations",
+                "truncated",
+            }
+        }
+        | {
+            ("direct_mutations", "operations", "*"),
+        }
+        | {
+            ("direct_mutations", "operations", "*", field_name)
+            for field_name in {
+                "sequence",
+                "method",
+                "path_sha256",
+                "result_valid",
+                "result_operation",
+                "result_evidence_sha256",
+            }
+        }
+        | {
+            ("pre_window_change", field_name)
+            for field_name in {
+                "attribution_confidence",
+                "status",
+                "before_revision",
+                "after_revision",
+                "paths",
+                "retained_paths",
+                "total_paths",
+                "truncated",
+                "head_changed",
+                "branch_changed",
+                "detail_code",
+            }
+        }
+        | {
+            ("pre_window_change", "paths", "*", field_name)
+            for field_name in {"path_sha256", "change"}
+        }
+    )
+    workspace_attribution_authority_paths = (
+        {
+            ("attribution", field_name)
+            for field_name in {
+                "confidence",
+                "detail_code",
+                "direct_reconciliation",
+                "writer_isolation",
+            }
+        }
+        | {("writer_isolation", phase, "status") for phase in {"before", "after"}}
+        | {
+            ("direct_mutations", "operations", "*", field_name)
+            for field_name in {
+                "method",
+                "path_sha256",
+                "result_operation",
+                "result_evidence_sha256",
+            }
+        }
+        | {("pre_window_change", field_name) for field_name in {"attribution_confidence", "status"}}
+        | {("pre_window_change", "paths", "*", "change")}
+    )
     policies[EventType.WORKSPACE_REVISION_OBSERVED] = _observed_policy(
         workspace_observation_keys,
         owned_nested_paths=workspace_path_owned_paths,
@@ -1935,11 +2087,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.WORKSPACE_MUTATION_RECORDED] = _observed_policy(
         "after_observation_id after_revision before_observation_id before_revision binding_generation_id "
+        "attribution direct_mutations pre_window_change writer_isolation "
         "branch_changed detail_code execution_profile_fingerprint head_changed model_attempt_id model_step model_step_id "
         "manifest_artifact_id manifest_artifact_sha256 manifest_artifact_size_bytes observer paths "
         "recovery_run_epoch session_run_epoch status tool_call_id tool_outcome_event_digest tool_outcome_event_id "
         "tool_round_id total_paths window_id workspace_id artifact_store_id",
-        owned_nested_paths=workspace_delta_owned_paths,
+        owned_nested_paths=workspace_delta_owned_paths | workspace_attribution_owned_paths,
         authority_keys={
             "execution_profile_fingerprint",
             "manifest_artifact_sha256",
@@ -1966,11 +2119,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "workspace_id",
             "artifact_store_id",
         },
-        nested_authority_paths=workspace_delta_authority_paths,
-        untrusted_container_keys={"paths"},
+        nested_authority_paths=(
+            workspace_delta_authority_paths | workspace_attribution_authority_paths
+        ),
+        untrusted_container_keys={"direct_mutations", "paths", "writer_isolation"},
     )
     policies[EventType.WORKSPACE_OBSERVATION_FINALIZED] = _observed_policy(
         "after_observation_id before_observation_id binding_generation_id branch_changed detail_code "
+        "attribution "
         "execution_profile_fingerprint failed_artifact_count head_changed "
         "model_attempt_id model_step model_step_id mutation_event_id paths recovery_run_epoch "
         "referenced_artifact_count "
@@ -1983,6 +2139,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "session_run_epoch status tool_call_id tool_outcome_event_digest tool_outcome_event_id "
         "mutation_event_digest "
         "tool_round_id total_paths window_id workspace_id observer artifact_store_id",
+        owned_nested_paths={
+            ("attribution", "confidence"),
+            ("attribution", "writer_isolation"),
+            ("attribution", "overlap_detected"),
+            ("attribution", "direct_reconciliation"),
+            ("attribution", "detail_code"),
+        },
         authority_keys={
             "execution_profile_fingerprint",
             "mutation_event_digest",
@@ -2149,10 +2312,34 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "environment_factory_release",
         "final_revision",
     }
-    terminal_finalization_owned_paths = {
-        ("final_revision", "status"),
-        ("final_revision", "path_scope"),
-    }
+    terminal_finalization_owned_paths = (
+        {
+            ("final_revision", "status"),
+            ("final_revision", "path_scope"),
+            ("final_revision", "finalization_delta"),
+        }
+        | {
+            ("final_revision", "finalization_delta", field_name)
+            for field_name in {
+                "attribution_confidence",
+                "status",
+                "before_revision",
+                "after_revision",
+                "paths",
+                "retained_paths",
+                "total_paths",
+                "truncated",
+                "head_changed",
+                "branch_changed",
+                "detail_code",
+            }
+        }
+        | {
+            ("final_revision", "finalization_delta", "paths", "*"),
+            ("final_revision", "finalization_delta", "paths", "*", "path_sha256"),
+            ("final_revision", "finalization_delta", "paths", "*", "change"),
+        }
+    )
     policies[EventType.SESSION_STARTED] = _observed_policy(
         "agent_name input_contract parent_session_id prompt_contribution_manifest "
         "traceparent tracestate",
@@ -2283,6 +2470,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "source_status",
         "system_prompt_policy",
         "transcript_cursor",
+        "workspace_lineage",
+        owned_nested_paths={
+            ("workspace_lineage", "status"),
+            ("workspace_lineage", "source_workspace_revision"),
+            ("workspace_lineage", "detail_code"),
+        },
         authority_keys={
             "causal_budget_id",
             "fork_request_sha256",
@@ -2558,10 +2751,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "bound_workspace_id configured_workspace_id environment_factory_release error "
         "error_type execution_profile_fingerprint factory_allocation_action failures final_revision final_snapshot has_bound_runner "
         "has_configured_runner outcome source_workspace_id terminal_outcome",
-        owned_nested_paths={
-            ("final_revision", "status"),
-            ("final_revision", "path_scope"),
-        },
+        owned_nested_paths=terminal_finalization_owned_paths,
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={

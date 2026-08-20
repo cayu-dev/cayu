@@ -542,6 +542,7 @@ from cayu.runtime.workspace_observation_recovery import (
 from cayu.vaults import (
     SecretRedactor,
 )
+from cayu.workspaces import WorkspaceForkLineage, WorkspaceForkLineageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -12083,6 +12084,12 @@ class SessionEngine:
             validate_source_checkpoint=validate_source_checkpoint,
             clock=self._clock,
         )
+        shared_live_workspace = (
+            registered_environment is not None
+            and registered_environment.environment.workspace is not None
+            and source_session.environment_name is not None
+            and source_session.environment_name == fork_session.environment_name
+        )
         fork_event_payload: dict[str, Any] = {
             "source_session_id": source_session.id,
             "source_status": source_session.status.value,
@@ -12100,6 +12107,18 @@ class SessionEngine:
             "selected_profile_fingerprint": selected_execution_profile.fingerprint,
             "source_profile_fingerprint": source_execution_profile.fingerprint,
             "fork_request_sha256": fork_request_sha256,
+            "workspace_lineage": WorkspaceForkLineage(
+                status=(
+                    WorkspaceForkLineageStatus.SHARED_OR_AMBIGUOUS
+                    if shared_live_workspace
+                    else WorkspaceForkLineageStatus.UNPROVEN
+                ),
+                detail_code=(
+                    "shared_live_workspace_not_isolated"
+                    if shared_live_workspace
+                    else "child_workspace_derivation_unproven"
+                ),
+            ).model_dump(mode="json"),
         }
         ordinary_fork_event = event_with_runtime_generated_id(
             Event(
