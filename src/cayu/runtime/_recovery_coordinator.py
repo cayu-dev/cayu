@@ -286,6 +286,14 @@ from cayu.runtime.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
 )
 from cayu.runtime.tasks import Task, TaskStatus, TaskStore
+from cayu.runtime.tool_exposure import (
+    ALL_REGISTERED_TOOLS_PROFILE_ID,
+    NOT_EXPOSED_IN_REQUEST_REASON,
+    ResolvedToolExposureAuthority,
+    resolved_tool_exposure_authority,
+    unexposed_tool_result,
+    validate_resolved_tool_exposure_authority,
+)
 from cayu.runtime.tool_policy import ToolPolicyDecision
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
@@ -949,6 +957,8 @@ class RecoverySessionRunRequest:
     run_limit_accounting: RunLimitAccountingContext | None = None
     initial_model_step_identity: ModelStepIdentity | None = None
     initial_model_step_number: int | None = None
+    initial_model_step_tool_exposure: ResolvedToolExposureAuthority | None = None
+    previous_tool_exposure_profile_id: str | None = None
     preserve_failure_until_initial_provider_dispatch: bool = False
 
 
@@ -961,6 +971,37 @@ def _rebound_active_invocation_profile(
     if snapshot.session_id != session.id:
         raise RuntimeError("Recovery profile authority belongs to a different session.")
     return snapshot.model_copy(update={"run_epoch": session.run_epoch})
+
+
+def _continued_tool_exposure_profile_id(
+    authority: ResolvedToolExposureAuthority | None,
+) -> str:
+    """Return the profile preceding a post-tool continuation model step."""
+
+    if authority is None:
+        # Pending rounds written before compact exposure authority was added used
+        # the byte-compatible expose-all policy. Execution-profile validation
+        # guarantees that the registered catalog and policy did not drift.
+        return ALL_REGISTERED_TOOLS_PROFILE_ID
+    if type(authority) is not ResolvedToolExposureAuthority:
+        raise TypeError("authority must be a ResolvedToolExposureAuthority or None.")
+    return authority.profile_id
+
+
+def _retried_model_step_tool_exposure_authority(
+    authority: ResolvedToolExposureAuthority | None,
+    registered_agent: runtime_records.RegisteredAgentState,
+) -> ResolvedToolExposureAuthority:
+    """Return exact exposure authority for a same-model-step retry."""
+
+    if authority is not None:
+        return authority
+    all_registered = registered_agent.all_registered_tool_exposure
+    if all_registered is None:
+        raise RuntimeError(
+            "Legacy provider-operation recovery cannot reconstruct its expose-all snapshot."
+        )
+    return resolved_tool_exposure_authority(all_registered)
 
 
 @dataclass(frozen=True)
@@ -4089,6 +4130,12 @@ class RecoveryCoordinator:
                     model_step_id=pending.logical_step_id,
                 ),
                 initial_model_step_number=pending.source_step,
+                initial_model_step_tool_exposure=(
+                    _retried_model_step_tool_exposure_authority(
+                        recovery_context.tool_exposure,
+                        registered_agent,
+                    )
+                ),
                 preserve_failure_until_initial_provider_dispatch=True,
             )
         )
@@ -4545,6 +4592,11 @@ class RecoveryCoordinator:
             model_step_id=pending.model_step_id,
             model_attempt_id=pending.model_attempt_id,
         )
+        if pending.tool_exposure is not None:
+            validate_resolved_tool_exposure_authority(
+                pending.tool_exposure,
+                registered_agent.tool_capabilities,
+            )
         pending_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         # Restore the original run's config persisted on the pending input. Explicit
@@ -4694,6 +4746,7 @@ class RecoveryCoordinator:
                     session_store=self._session_store,
                     redactor=base_round_redactor,
                     execution_profile=execution_profile_snapshot.profile,
+                    tool_exposure=pending.tool_exposure,
                 )
                 if defer_round_terminals
                 else None
@@ -4740,14 +4793,23 @@ class RecoveryCoordinator:
             ) -> Event:
                 if publication_coordinator is None:
                     raise AssertionError("Continuation terminal staging has no coordinator.")
+                prepared_event = self._event_writer.prepare(event)
+                exposure_blocked = (
+                    prepared_event.type is EventType.TOOL_CALL_BLOCKED
+                    and prepared_event.payload.get("blocked_by") == "tool_exposure"
+                )
                 staged = await publication_coordinator.stage_terminal(
                     tool_call_id=outcome.call.id,
-                    event=self._event_writer.prepare(event),
+                    event=prepared_event,
                     snapshot=snapshot,
                     hooks_state=(
-                        "observational"
-                        if publish_before_hooks
-                        else ("pending" if allow_modification else "finalized")
+                        "completed"
+                        if exposure_blocked
+                        else (
+                            "observational"
+                            if publish_before_hooks
+                            else ("pending" if allow_modification else "finalized")
+                        )
                     ),
                 )
                 staged_hook_modes[outcome.call.id] = (
@@ -5012,6 +5074,7 @@ class RecoveryCoordinator:
                 if policy_evidence in {
                     ToolPolicyEvidence.AMBIGUOUS,
                     ToolPolicyEvidence.UNREGISTERED,
+                    ToolPolicyEvidence.UNEXPOSED,
                 }:
                     await record_static_publication_scope(tool_call.id)
                     async for (
@@ -5024,6 +5087,7 @@ class RecoveryCoordinator:
                         environment_name=environment_name,
                         tool_call=tool_call,
                         policy_evidence=policy_evidence,
+                        tool_exposure=pending.tool_exposure,
                         tool_round_identity=tool_round_identity,
                         task_id=pending.task_id,
                         execution_profile=execution_profile_snapshot.profile,
@@ -5170,6 +5234,9 @@ class RecoveryCoordinator:
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
                     run_limit_accounting=continued_run_limit_accounting,
+                    previous_tool_exposure_profile_id=(
+                        _continued_tool_exposure_profile_id(pending.tool_exposure)
+                    ),
                 )
             )
             forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -5438,6 +5505,7 @@ class RecoveryCoordinator:
         environment_name: str | None,
         tool_call: runtime_records.ToolCallRequest,
         policy_evidence: ToolPolicyEvidence,
+        tool_exposure: ResolvedToolExposureAuthority | None,
         tool_round_identity: ToolRoundIdentity,
         task_id: str | None,
         execution_profile: ExecutionProfileIdentity,
@@ -5454,6 +5522,26 @@ class RecoveryCoordinator:
 
         if (approval_id is None) == (input_id is None):
             raise TypeError("Exactly one approval or user-input identity is required.")
+        if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
+            async for event, outcome in self._tool_round_executor.execute_tool_call(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                request_metadata={},
+                task_id=task_id,
+                execution_profile=execution_profile,
+                check_policy=False,
+                emit_started=False,
+                policy_evidence=policy_evidence,
+                tool_exposure=tool_exposure,
+                approval_id=approval_id,
+                input_id=input_id,
+                tool_round_identity=tool_round_identity,
+                deferred_terminal_stager=deferred_terminal_stager,
+            ):
+                yield event, outcome
+            return
         evidence_payload: dict[str, Any]
         structured: dict[str, Any]
         if policy_evidence is ToolPolicyEvidence.AMBIGUOUS:
@@ -5482,7 +5570,7 @@ class RecoveryCoordinator:
             }
         else:
             raise ValueError(
-                "Non-authoritative closure requires ambiguous or unregistered evidence."
+                "Non-authoritative closure requires ambiguous, unregistered, or unexposed evidence."
             )
 
         pause_payload: dict[str, Any]
@@ -5683,6 +5771,11 @@ class RecoveryCoordinator:
             ):
                 raise RuntimeError(
                     "Pending approval round changed before publication-scope recovery."
+                )
+            if publication_round.tool_exposure is not None:
+                validate_resolved_tool_exposure_authority(
+                    publication_round.tool_exposure,
+                    registered_agent.tool_capabilities,
                 )
             recorded_outcomes = approval_support.recorded_tool_outcomes(
                 events=approval_events,
@@ -5970,6 +6063,7 @@ class RecoveryCoordinator:
                     session_store=self._session_store,
                     redactor=base_round_redactor,
                     execution_profile=execution_profile_snapshot.profile,
+                    tool_exposure=publication_round.tool_exposure,
                 )
                 if defer_round_terminals
                 else None
@@ -6016,14 +6110,23 @@ class RecoveryCoordinator:
             ) -> Event:
                 if publication_coordinator is None:
                     raise AssertionError("Continuation terminal staging has no coordinator.")
+                prepared_event = self._event_writer.prepare(event)
+                exposure_blocked = (
+                    prepared_event.type is EventType.TOOL_CALL_BLOCKED
+                    and prepared_event.payload.get("blocked_by") == "tool_exposure"
+                )
                 staged = await publication_coordinator.stage_terminal(
                     tool_call_id=outcome.call.id,
-                    event=self._event_writer.prepare(event),
+                    event=prepared_event,
                     snapshot=snapshot,
                     hooks_state=(
-                        "observational"
-                        if publish_before_hooks
-                        else ("pending" if allow_modification else "finalized")
+                        "completed"
+                        if exposure_blocked
+                        else (
+                            "observational"
+                            if publish_before_hooks
+                            else ("pending" if allow_modification else "finalized")
+                        )
                     ),
                 )
                 staged_hook_modes[outcome.call.id] = (
@@ -6089,6 +6192,33 @@ class RecoveryCoordinator:
                     tool_outcomes.append(recorded_outcome)
                     continue
                 if tool_call.id in restarted_staged_ids:
+                    continue
+
+                if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
+                    await record_static_publication_scope(tool_call.id)
+                    async for event, outcome in self._emit_non_authoritative_policy_call(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        tool_call=tool_call,
+                        policy_evidence=policy_evidence,
+                        tool_exposure=publication_round.tool_exposure,
+                        tool_round_identity=tool_round_identity,
+                        task_id=pending_approval.task_id,
+                        execution_profile=execution_profile_snapshot.profile,
+                        approval_id=pending_approval.approval_id,
+                        requested_decision=request.decision,
+                        resolved_by_payload=resolved_by_payload,
+                        resolution_reason=request.reason,
+                        resolution_metadata=request.metadata,
+                        deferred_terminal_stager=(
+                            None if publication_coordinator is None else stage_round_terminal
+                        ),
+                    ):
+                        yield event
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
                     continue
 
                 if (
@@ -6284,6 +6414,7 @@ class RecoveryCoordinator:
                         environment_name=environment_name,
                         tool_call=tool_call,
                         policy_evidence=policy_evidence,
+                        tool_exposure=publication_round.tool_exposure,
                         tool_round_identity=tool_round_identity,
                         task_id=pending_approval.task_id,
                         execution_profile=execution_profile_snapshot.profile,
@@ -6513,6 +6644,9 @@ class RecoveryCoordinator:
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
                     run_limit_accounting=continued_run_limit_accounting,
+                    previous_tool_exposure_profile_id=(
+                        _continued_tool_exposure_profile_id(durable_round.tool_exposure)
+                    ),
                 )
             )
             forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -8869,6 +9003,9 @@ class RecoveryCoordinator:
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
                     run_limit_accounting=continued_run_limit_accounting,
+                    previous_tool_exposure_profile_id=(
+                        _continued_tool_exposure_profile_id(pending_round.tool_exposure)
+                    ),
                 )
             )
             async for event in session_stream:
@@ -9651,6 +9788,11 @@ class RecoveryCoordinator:
                 "Pending tool round belongs to a different environment: "
                 f"{pending_round.environment_name}."
             )
+        if pending_round.tool_exposure is not None:
+            validate_resolved_tool_exposure_authority(
+                pending_round.tool_exposure,
+                registered_agent.tool_capabilities,
+            )
         registered_tool_names = frozenset(registered_agent.tools)
         durable_policy_decisions = frozenset(decision.value for decision in ToolPolicyDecision)
         ambiguous_interrupt_close_intent = (
@@ -9671,6 +9813,7 @@ class RecoveryCoordinator:
                     and call.policy_decision in durable_policy_decisions
                 )
                 or call.policy_evidence is ToolPolicyEvidence.UNREGISTERED
+                or call.policy_evidence is ToolPolicyEvidence.UNEXPOSED
                 or (
                     call.policy_evidence is ToolPolicyEvidence.AMBIGUOUS
                     and ambiguous_interrupt_close_intent
@@ -9779,6 +9922,7 @@ class RecoveryCoordinator:
                     if pending_round.policy_context_version is None
                     else None
                 ),
+                tool_exposure=pending_round.tool_exposure,
             )
             if policy_plan.pending_approval is not None:
                 approval_plan = policy_plan.pending_approval
@@ -9881,6 +10025,31 @@ class RecoveryCoordinator:
                 name=pending_tool_call.tool_name,
                 arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
             )
+            policy_evidence = approval_support.effective_tool_policy_evidence(pending_tool_call)
+            if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
+                exposure = pending_round.tool_exposure
+                if exposure is None:
+                    raise RuntimeError(
+                        "Unexposed recovered tool call lost its frozen exposure snapshot."
+                    )
+                if (
+                    tool_call.name not in registered_agent.tools
+                    or tool_call.name in exposure.tool_names
+                ):
+                    raise RuntimeError(
+                        "Unexposed recovered tool call conflicts with its frozen exposure."
+                    )
+                synthesized_outcomes.append(
+                    runtime_records.ToolCallOutcome(
+                        call=runtime_records.ToolCallRequest(
+                            id=tool_call.id,
+                            name=tool_call.name,
+                            arguments={},
+                        ),
+                        result=unexposed_tool_result(),
+                    )
+                )
+                continue
             expected_idempotency_key = tool_execution.tool_idempotency_key(
                 session_id=session.id,
                 tool_round_id=pending_round.tool_round_id,
@@ -10011,11 +10180,22 @@ class RecoveryCoordinator:
             outcome = synthesized_by_id.get(pending_call.tool_call_id)
             if outcome is None:
                 raise RuntimeError("Recovery lost terminal evidence for a pending tool call.")
+            policy_evidence = approval_support.effective_tool_policy_evidence(pending_call)
+            is_unexposed = policy_evidence is ToolPolicyEvidence.UNEXPOSED
             event_type = (
-                EventType.TOOL_CALL_FAILED
-                if outcome.result.is_error
-                else EventType.TOOL_CALL_COMPLETED
+                EventType.TOOL_CALL_BLOCKED
+                if is_unexposed
+                else (
+                    EventType.TOOL_CALL_FAILED
+                    if outcome.result.is_error
+                    else EventType.TOOL_CALL_COMPLETED
+                )
             )
+            exposure = pending_round.tool_exposure if is_unexposed else None
+            if is_unexposed and exposure is None:
+                raise RuntimeError(
+                    "Unexposed recovered terminal lost its frozen exposure snapshot."
+                )
             planned_terminal_events.append(
                 Event(
                     type=event_type,
@@ -10032,12 +10212,27 @@ class RecoveryCoordinator:
                             tool_call_id=outcome.call.id,
                         ),
                         "recovered": True,
+                        **(
+                            {}
+                            if exposure is None
+                            else {
+                                "blocked_by": "tool_exposure",
+                                "reason": NOT_EXPOSED_IN_REQUEST_REASON,
+                                "profile_id": exposure.profile_id,
+                                "exposure_fingerprint": exposure.fingerprint,
+                            }
+                        ),
+                        **(
+                            tool_argument_publication.unavailable_argument_projection().payload_fields()
+                            if is_unexposed
+                            else {}
+                        ),
                         "result": outcome.result.model_dump(),
                     },
                 )
             )
             planned_outcomes.append(outcome)
-            planned_hook_states.append("finalized")
+            planned_hook_states.append("completed" if is_unexposed else "finalized")
         tool_round_publication.collect_tool_round_publication_evidence(
             session_id=session.id,
             pending_round=pending_round,
@@ -10078,6 +10273,7 @@ class RecoveryCoordinator:
                     terminal_event,
                     session_id=session.id,
                     tool_round_identity=tool_round_identity,
+                    tool_exposure=pending_round.tool_exposure,
                 )
             expected_public_outcome = runtime_records.ToolCallOutcome(
                 call=runtime_records.ToolCallRequest(

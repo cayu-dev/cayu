@@ -160,10 +160,13 @@ _TOOL_LINKAGE_AUTHORITY_KEYS = frozenset(
     }
 )
 _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS = frozenset({"execution_profile_fingerprint"})
+_TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS = frozenset({"exposure_fingerprint", "profile_id"})
 # Unlike caller-selected public linkage such as a server mutation id, these
 # fields assert which runtime authority governed an effect. They may survive a
 # first write or an untrusted projection only with exact in-process provenance.
-_PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+_PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = (
+    _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
+)
 _TOOL_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_CALL_STARTED,
@@ -2234,11 +2237,15 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "blocked_by",
         "decision",
         "denied_by",
+        "exposure_fingerprint",
+        "profile_id",
         "reason",
         "tool_result_projection",
         owned_nested_paths=_TOOL_PROJECTED_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
-        authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
-        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS,
+        public_authority_keys=(
+            _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
+        ),
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -3842,6 +3849,16 @@ def _public_authority_is_trusted(
         and all(character in "0123456789abcdef" for character in value)
     ):
         return False
+    if field_name == "exposure_fingerprint" and not (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        return False
+    if field_name == "profile_id" and not (
+        type(value) is str and bool(value.strip()) and len(value) <= 256
+    ):
+        return False
     if trust_persisted_projection:
         return True
     assert type(value) is str
@@ -4868,6 +4885,24 @@ def _recognize_policy_block_controls(
         controls["blocked_by"] = blocked_by
         controls["decision"] = decision
         controls["requested_decision"] = requested_decision
+        return
+    if blocked_by == "tool_exposure":
+        profile_id = event.payload.get("profile_id")
+        exposure_fingerprint = event.payload.get("exposure_fingerprint")
+        if (
+            decision is not None
+            or requested_decision is not None
+            or event.payload.get("reason") != "not_exposed_in_request"
+            or type(profile_id) is not str
+            or not profile_id.strip()
+            or len(profile_id) > 256
+            or type(exposure_fingerprint) is not str
+            or len(exposure_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in exposure_fingerprint)
+        ):
+            raise ValueError("Invalid tool-exposure block controls.")
+        controls["blocked_by"] = blocked_by
+        controls["reason"] = "not_exposed_in_request"
         return
     if blocked_by in {"before_tool_call_hook", "tool_policy_reauthorization"}:
         if decision is not None or requested_decision is not None:

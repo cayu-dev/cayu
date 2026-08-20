@@ -171,10 +171,12 @@ from cayu.runtime._model_step_executor import (
     ModelStepExecutor,
     ModelStepFlowOutcome,
     ModelStepLimitEvaluationRequest,
+    _all_registered_tool_exposure,
     _detach_model_request,
     _event_with_model_identity_authority,
     _model_request_messages,
     _model_request_tools,
+    _require_frozen_tool_exposure,
     _session_agent_spec,
     is_ambiguous_provider_operation_start_error,
     model_completion_recovery_context_from_stage,
@@ -524,6 +526,10 @@ from cayu.runtime.tasks import (
     TaskTerminalKind,
     _task_invocation_for_attachment,
     _terminalize_claimed_task,
+)
+from cayu.runtime.tool_exposure import (
+    ResolvedToolExposure,
+    validate_resolved_tool_exposure_authority,
 )
 from cayu.runtime.tool_policy import (
     metadata_with_taint_labels,
@@ -11555,7 +11561,7 @@ class SessionEngine:
                 portable_messages.clear()
                 try:
                     hook_tools = _model_request_tools(
-                        registered_agent=registered_agent,
+                        tool_exposure=_all_registered_tool_exposure(registered_agent),
                         structured_output=request.structured_output,
                     )
                     registered_provider.provider.preflight_portable_messages(
@@ -12512,7 +12518,7 @@ class SessionEngine:
                         hook_tools: list[dict[str, Any]] = []
                         try:
                             hook_tools = _model_request_tools(
-                                registered_agent=registered_agent,
+                                tool_exposure=_all_registered_tool_exposure(registered_agent),
                                 structured_output=None,
                             )
                             registered_provider.provider.preflight_portable_messages(
@@ -13329,6 +13335,12 @@ class SessionEngine:
         if tool_calls:
             if tool_round_identity is None or assistant_step_result is None:
                 raise RuntimeError("Model completion lost its tool-round execution material.")
+            if publication.tool_exposure is None:
+                raise RuntimeError("Model completion lost its frozen tool exposure.")
+            tool_exposure = validate_resolved_tool_exposure_authority(
+                publication.tool_exposure,
+                registered_agent.tool_capabilities,
+            )
             tool_redactor = self._tool_round_executor.redactor_for_tool_calls(
                 registered_agent=registered_agent,
                 tool_calls=tool_calls,
@@ -13341,6 +13353,7 @@ class SessionEngine:
                     task_id=task_id,
                     tool_calls=tool_calls,
                     policy_outcomes=None,
+                    tool_exposure=tool_exposure,
                     policy_context_version=1,
                     request_metadata=request_metadata,
                     assistant_message_state=(
@@ -13507,6 +13520,8 @@ class SessionEngine:
         run_limit_accounting: RunLimitAccountingContext | None = None,
         initial_model_step_identity: ModelStepIdentity | None = None,
         initial_model_step_number: int | None = None,
+        initial_model_step_tool_exposure: ResolvedToolExposure | None = None,
+        previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
     ) -> AsyncGenerator[Event, None]:
         # Deep defense for internal recovery callers. Public entry points
@@ -13534,6 +13549,23 @@ class SessionEngine:
             or not 1 <= initial_model_step_number <= max_steps
         ):
             raise ValueError("initial_model_step_number is outside this run's step bounds.")
+        if (
+            initial_model_step_tool_exposure is not None
+            and previous_tool_exposure_profile_id is not None
+        ):
+            raise ValueError(
+                "An initial frozen tool exposure and a previous profile cannot be supplied "
+                "together."
+            )
+        if (initial_model_step_identity is None) != (initial_model_step_tool_exposure is None):
+            raise ValueError(
+                "An initial model-step retry identity and its frozen tool exposure must be "
+                "supplied together."
+            )
+        if initial_model_step_tool_exposure is not None:
+            initial_model_step_tool_exposure = _require_frozen_tool_exposure(
+                initial_model_step_tool_exposure
+            )
         if type(preserve_failure_until_initial_provider_dispatch) is not bool:
             raise TypeError("preserve_failure_until_initial_provider_dispatch must be a bool.")
         if preserve_failure_until_initial_provider_dispatch and (
@@ -14212,6 +14244,8 @@ class SessionEngine:
                 active_run=active_run,
                 execution_profile=execution_profile,
                 validate_live_model_semantics=validate_live_model_semantics,
+                initial_tool_exposure=initial_model_step_tool_exposure,
+                previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )

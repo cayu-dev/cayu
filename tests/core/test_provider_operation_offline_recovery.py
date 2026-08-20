@@ -75,6 +75,9 @@ from cayu.runtime import (
     SessionStore,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolExposureDecision,
+    ToolExposurePolicy,
+    ToolExposurePolicyRequest,
     ToolPolicy,
 )
 from cayu.runtime import _model_step_executor as model_step_executor
@@ -128,6 +131,10 @@ from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
 )
+from cayu.runtime.tool_exposure import (
+    ResolvedToolExposure,
+    resolved_tool_exposure_authority,
+)
 from cayu.runtime.usage import SessionUsageSummary
 from cayu.vaults import SecretRedactor
 
@@ -146,12 +153,13 @@ class _OfflineOperationAdapter(ProviderOperationAdapter):
             recovery_metadata={"cursor": 0},
         )
         self.start_calls = 0
+        self.start_requests: list[ProviderOperationStartRequest] = []
         self.retrieve_calls: list[ProviderOperationState] = []
         self.events = events
         self.start_events: tuple[ModelStreamEvent, ...] | None = None
 
     async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
-        del request
+        self.start_requests.append(request)
         self.start_calls += 1
         if self.start_events is None:
             raise AssertionError("offline recovery must not submit a replacement operation")
@@ -913,6 +921,23 @@ class _RecordingLookupTool(_LookupTool):
         return ToolResult(content="lookup complete")
 
 
+class _RecomputedEmptyExposurePolicy(ToolExposurePolicy):
+    def __init__(self) -> None:
+        self.requests: list[ToolExposurePolicyRequest] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:provider-operation-offline-recovery:request-dependent-exposure",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def select(self, request: ToolExposurePolicyRequest) -> ToolExposureDecision:
+        self.requests.append(request)
+        return ToolExposureDecision(profile_id="recomputed-empty", tool_names=())
+
+
 def _budget_policy(provider_name: str) -> BudgetPolicy:
     return BudgetPolicy(
         limits=(
@@ -949,6 +974,7 @@ async def _stage_offline_operation(
     tools: tuple[Tool, ...] = (),
     step: int = 1,
     tool_policy: ToolPolicy | None = None,
+    tool_exposure_policy: ToolExposurePolicy | None = None,
     runtime_hooks: tuple[RuntimeHook, ...] = (),
 ) -> Message:
     user_message = Message.text("user", "finish this while no worker is attached")
@@ -976,6 +1002,7 @@ async def _stage_offline_operation(
         model="fake-model",
         tools=tools,
         tool_policy=tool_policy,
+        tool_exposure_policy=tool_exposure_policy,
         runtime_hooks=runtime_hooks,
         provider=provider,
         structured_output=typed_recovery_context.structured_output,
@@ -3438,16 +3465,36 @@ def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_ne
         store = InMemorySessionStore()
         session_id = "offline-fallback-resolution"
         provider = _OfflineOperationProvider(ProviderOperationStatus.EXPIRED)
+        tool = _RecordingLookupTool()
+        exposure_policy = _RecomputedEmptyExposurePolicy()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+            tool_exposure_policy=exposure_policy,
+        )
+        registered_agent = app._agents["assistant"]
+        frozen_exposure = ResolvedToolExposure(
+            profile_id="frozen-lookup",
+            tools=registered_agent.tool_capabilities,
+            registered_count=1,
+            ceiling_count=1,
+        )
         user_message = await _stage_offline_operation(
             store,
             session_id=session_id,
             provider=provider,
-            recovery_context={"max_steps": 2},
+            recovery_context={
+                "max_steps": 2,
+                "tool_exposure": resolved_tool_exposure_authority(frozen_exposure).model_dump(
+                    mode="json"
+                ),
+            },
+            tools=(tool,),
+            tool_exposure_policy=exposure_policy,
             step=2,
         )
-        app = CayuApp(session_store=store, enable_logging=False)
-        app.register_provider(provider, default=True)
-        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
@@ -3484,6 +3531,10 @@ def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_ne
         assert events[0].payload["resolution_action"] == "fallback_retry"
         assert events[0].payload["recovery_reason"] == "expired"
         assert provider.adapter.start_calls == 1
+        assert [
+            tool_spec["name"] for tool_spec in provider.adapter.start_requests[0].request.tools
+        ] == ["lookup"]
+        assert exposure_policy.requests == []
         assert await store.load_active_model_completion_stage(session_id) is None
         transcript = await store.load_transcript(session_id)
         assert transcript[0] == user_message

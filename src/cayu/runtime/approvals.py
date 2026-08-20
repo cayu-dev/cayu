@@ -389,6 +389,7 @@ class PendingToolCallApproval(BaseModel):
             in {
                 ToolPolicyEvidence.UNPLANNED,
                 ToolPolicyEvidence.UNREGISTERED,
+                ToolPolicyEvidence.UNEXPOSED,
                 ToolPolicyEvidence.AMBIGUOUS,
             }
             and self.policy_decision is not None

@@ -490,6 +490,44 @@ def test_execution_profile_reuses_registration_time_capability_summaries(
     )
 
 
+def test_execution_profile_preserves_default_identity_and_binds_static_exposure() -> None:
+    def profile(app: CayuApp):
+        return execution_profile_admission.resolve_execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            runtime_name="cayu",
+            runtime_version="test",
+            redactor=app._secret_redactor,
+            process_identity=app._execution_profile_process_identity,
+        )
+
+    default_app = CayuApp(enable_logging=False)
+    default_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(SearchTextTool(),),
+    )
+    explicit_default_app = CayuApp(enable_logging=False)
+    explicit_default_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(SearchTextTool(),),
+        tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
+    )
+    static_app = CayuApp(enable_logging=False)
+    static_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(SearchTextTool(),),
+        tool_exposure_policy=StaticToolExposurePolicy(
+            profile_id="tool-free",
+            tools=(),
+        ),
+    )
+
+    assert profile(default_app).fingerprint == profile(explicit_default_app).fingerprint
+    assert profile(default_app).fingerprint != profile(static_app).fingerprint
+
+
 def test_policy_input_contains_no_live_execution_objects() -> None:
     request = _request(_capability("first"))
     capability_fields = set(RegisteredToolCapability.model_fields)

@@ -1387,11 +1387,46 @@ does not remove sensitive text already present in the transcript, system
 projection, attachments, or other selected context; applications that need
 context isolation must enforce that through their context-selection boundary.
 
-This contract-only slice does not yet install a policy through
-`CayuApp.register_agent(...)` or change provider requests. The current runtime
-continues to expose all registered tools. Model-step policy invocation, frozen
-retry snapshots, and unexposed-call enforcement land together so Cayu never
-accepts a policy configuration that it silently ignores.
+Install a policy at agent registration:
+
+```python
+app.register_agent(
+    spec,
+    tools=[search, remember, publish],
+    tool_exposure_policy=StaticToolExposurePolicy(
+        profile_id="research",
+        tools=("search", "remember"),
+    ),
+)
+```
+
+Omitting `tool_exposure_policy` uses `AllRegisteredToolsExposurePolicy` and
+preserves the historical expose-all request shape. For a configured policy,
+Cayu resolves one snapshot before context construction and official provider
+counting. Context-pressure estimates and the final OpenAI, Anthropic, Chat
+Completions, Bedrock, or Vertex request see exactly that registration-ordered
+application subset. A runtime-owned structured-output submission tool remains
+outside application exposure and is added when the selected structured-output
+strategy needs it.
+
+The snapshot is frozen for the logical model step: generic retries and the one
+context-overflow recovery reuse its exact definitions and order. A later model
+step invokes the policy again and supplies `previous_profile_id`, allowing an
+application to select another explicit stable phase profile. Prefer a small
+number of stable profiles over arbitrary per-turn schema churn because changing
+the tool array can split or invalidate provider prompt-cache prefixes; a
+smaller single request is not proof of lower whole-task cost.
+
+Every returned application call is checked against the frozen snapshot before
+`ToolPolicy`. An exposed call still passes the normal policy, approval, taint,
+effect, secret, environment, hook, and execution boundaries. A registered but
+unexposed call instead emits `tool.call.blocked` with
+`reason="not_exposed_in_request"`, profile identity, and exposure fingerprint;
+its arguments are unavailable in that event. Cayu appends a provider-valid
+error `tool_result` and performs no approval, policy authorization, hook, or
+tool execution for that call. The compact frozen authority follows the pending
+tool round through ordinary recovery, approval, and user-input interruption so
+continuation cannot reinterpret the call against a wider request.
 
 ## Execution profiles
 
@@ -1409,7 +1444,7 @@ The schema-v3 component contract and its default comparison behavior are:
 | `direct_tools` | Ordered names, descriptions, schemas, parallel-safety, effects, and workspace-mutation declarations | Reject as authority-changing. |
 | `tool_implementations` | Ordered application or Cayu behavior/implementation identities | Reject as authority-changing; missing custom identity is `process_local`. |
 | `tool_view_grants` | View kind, generation, and ordered grant baseline | Reject as authority-changing. The current implementation is the direct-tool view; future catalogued tool views can implement this same seam. |
-| `execution_policies` | Tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
+| `execution_policies` | Tool exposure policy, tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
 | `invocation_policies` | Ordered request loop policies for this run, resume, or continuation | Reject as authority-changing; missing custom identity is `process_local`. Cleanup-only recovery retains the already-admitted component instead of inventing a replacement. |
 | `runtime_hooks` | Ordered app-then-agent hook names and behavior identities | Reject as authority-changing; order is semantic and missing custom identity is `process_local`. |
 | `execution_environment` | Environment/factory/runner identities, binding shape, workspace/runner presence, and execution requirements | Reject as authority-changing; missing custom environment, factory, or runner identity is `process_local`. |

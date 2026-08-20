@@ -46,6 +46,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec
+from cayu.runtime.tool_exposure import ToolExposurePolicy
 from cayu.runtime.tool_policy import ToolPolicy
 from cayu.vaults import SecretRedactor
 
@@ -233,6 +234,7 @@ def profiled_session_identity(
     direct_tools: Iterable[Mapping[str, Any]] = (),
     tools: Iterable[Tool] | None = None,
     tool_policy: ToolPolicy | None = None,
+    tool_exposure_policy: ToolExposurePolicy | None = None,
     runtime_hooks: Iterable[RuntimeHook] = (),
     invocation_loop_policies: Iterable[LoopPolicy] = (),
     execution_profile: ExecutionProfileIdentity | None = None,
@@ -314,6 +316,7 @@ def profiled_session_identity(
             AgentSpec(name="assistant", model=model),
             tools=resolved_tools,
             tool_policy=tool_policy,
+            tool_exposure_policy=tool_exposure_policy,
             runtime_hooks=runtime_hooks,
         )
         resolved_profile = execution_profile_admission.resolve_execution_profile_identity(

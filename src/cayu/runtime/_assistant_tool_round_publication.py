@@ -9,6 +9,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from cayu._validation import require_clean_nonblank, require_durable_text
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
+from cayu.core.tools import ToolResult
+from cayu.runtime._policy_evidence import ToolPolicyEvidence
+from cayu.runtime.tool_exposure import (
+    NOT_EXPOSED_IN_REQUEST_REASON,
+    ResolvedToolExposureAuthority,
+    unexposed_tool_result,
+)
+from cayu.vaults.redaction import REDACTED_SECRET
 
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -51,6 +59,103 @@ class StagedToolCallTerminal(BaseModel):
         if self.event.payload.get("tool_call_id") != self.tool_call_id:
             raise ValueError("Staged terminal event conflicts with its tool-call identity.")
         return self
+
+
+def validate_tool_exposure_terminal_event(
+    event: Event,
+    *,
+    tool_exposure: ResolvedToolExposureAuthority,
+) -> None:
+    """Bind one exposure block to its exact durable request authority."""
+
+    if type(event) is not Event:
+        raise TypeError("Tool-exposure terminal must be an Event.")
+    if type(tool_exposure) is not ResolvedToolExposureAuthority:
+        raise TypeError("tool_exposure must be a ResolvedToolExposureAuthority.")
+    exposure = tool_exposure
+    payload = event.payload
+    try:
+        result = ToolResult.model_validate(payload.get("result"))
+    except Exception as exc:
+        raise ValueError("Tool-exposure terminal lost its fixed error result.") from exc
+    fixed_result = unexposed_tool_result()
+    if (
+        event.type is not EventType.TOOL_CALL_BLOCKED
+        or payload.get("blocked_by") != "tool_exposure"
+        or payload.get("reason") != NOT_EXPOSED_IN_REQUEST_REASON
+        or payload.get("profile_id") != exposure.profile_id
+        or payload.get("exposure_fingerprint") != exposure.fingerprint
+        or payload.get("arguments_state") != "unavailable"
+        or "arguments" in payload
+        or "effective_arguments" in payload
+        or result.is_error is not True
+        or result.structured is not None
+        or bool(result.artifacts)
+        or not _is_fixed_or_redacted_text(result.content, fixed_result.content)
+    ):
+        raise ValueError("Tool-exposure terminal conflicts with its frozen exposure authority.")
+
+
+def _is_fixed_or_redacted_text(value: str, fixed: str) -> bool:
+    """Accept only the fixed text or a marker projection derived from it."""
+
+    if value == fixed:
+        return True
+    if REDACTED_SECRET not in value:
+        return False
+    pieces = value.split(REDACTED_SECRET)
+    first = pieces[0]
+    if first and not fixed.startswith(first):
+        return False
+    cursor = len(first)
+    for index, piece in enumerate(pieces[1:], start=1):
+        if index == len(pieces) - 1:
+            if not piece:
+                return cursor < len(fixed)
+            position = len(fixed) - len(piece)
+            return position >= cursor + 1 and fixed.endswith(piece)
+        if not piece:
+            cursor += 1
+            if cursor > len(fixed):
+                return False
+            continue
+        position = fixed.find(piece, cursor + 1)
+        if position < 0:
+            return False
+        cursor = position + len(piece)
+    return False
+
+
+def validate_staged_tool_exposure_terminal(
+    staged: StagedToolCallTerminal,
+    *,
+    policy_evidence: ToolPolicyEvidence | None,
+    tool_exposure: ResolvedToolExposureAuthority | None,
+) -> None:
+    """Require staged exposure evidence to match its call classification and owner."""
+
+    if type(staged) is not StagedToolCallTerminal:
+        raise TypeError("Staged terminal must be a StagedToolCallTerminal.")
+    payload = staged.event.payload
+    claims_exposure_block = (
+        staged.event.type is EventType.TOOL_CALL_BLOCKED
+        and payload.get("blocked_by") == "tool_exposure"
+    )
+    carries_exposure_authority = any(
+        field_name in payload for field_name in ("profile_id", "exposure_fingerprint")
+    )
+    if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
+        if tool_exposure is None:
+            raise ValueError("Unexposed staged terminal lost its frozen exposure authority.")
+        validate_tool_exposure_terminal_event(
+            staged.event,
+            tool_exposure=tool_exposure,
+        )
+        if staged.hooks_state != "completed":
+            raise ValueError("Unexposed staged terminal cannot retain executable hook work.")
+        return
+    if claims_exposure_block or carries_exposure_authority:
+        raise ValueError("Staged tool-exposure terminal requires unexposed tool-call evidence.")
 
 
 class AssistantToolRoundPublication(BaseModel):

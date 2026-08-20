@@ -22,6 +22,7 @@ from cayu.runtime import _transcript as transcript_support
 from cayu.runtime._assistant_tool_round_publication import (
     AssistantToolRoundPublication,
     StagedToolCallTerminal,
+    validate_staged_tool_exposure_terminal,
 )
 from cayu.runtime._checkpoint_redaction import (
     durable_value_contains_secret,
@@ -47,6 +48,10 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     StructuredOutputValidation,
     copy_structured_output_spec,
+)
+from cayu.runtime.tool_exposure import (
+    ResolvedToolExposureAuthority,
+    copy_resolved_tool_exposure_authority,
 )
 from cayu.runtime.tool_policy import ToolPolicyResult
 from cayu.vaults import SecretRedactor, contains_redacted_secret
@@ -82,6 +87,7 @@ class PendingToolRound(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+    tool_exposure: ResolvedToolExposureAuthority | None = None
     tool_calls: list[PendingToolCallApproval]
     policy_state: Literal["unplanned", "planned"] = "unplanned"
     policy_context_version: Literal[1] | None = None
@@ -211,6 +217,16 @@ class PendingToolRound(BaseModel):
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
 
+    @field_validator("tool_exposure")
+    @classmethod
+    def copy_tool_exposure(
+        cls,
+        value: ResolvedToolExposureAuthority | None,
+    ) -> ResolvedToolExposureAuthority | None:
+        if value is None:
+            return None
+        return copy_resolved_tool_exposure_authority(value)
+
     @field_validator("limits")
     @classmethod
     def copy_limits(cls, value: RunLimits | None) -> RunLimits | None:
@@ -300,6 +316,23 @@ class PendingToolRound(BaseModel):
                 raise ValueError("An unplanned pending tool round cannot contain policy authority.")
         elif any(call.policy_evidence is ToolPolicyEvidence.UNPLANNED for call in self.tool_calls):
             raise ValueError("A planned pending tool round cannot contain unplanned calls.")
+        unexposed_calls = [
+            call for call in self.tool_calls if call.policy_evidence is ToolPolicyEvidence.UNEXPOSED
+        ]
+        if unexposed_calls and self.tool_exposure is None:
+            raise ValueError("Unexposed tool calls require a frozen exposure snapshot.")
+        if self.tool_exposure is not None:
+            exposed_names = frozenset(self.tool_exposure.tool_names)
+            if any(call.tool_name in exposed_names for call in unexposed_calls):
+                raise ValueError("Unexposed tool-call evidence conflicts with the snapshot.")
+            if self.policy_state == "planned" and any(
+                call.policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+                and call.tool_name not in exposed_names
+                for call in self.tool_calls
+            ):
+                raise ValueError(
+                    "Authoritative tool-policy evidence names a tool outside the snapshot."
+                )
         if self.assistant_message_state == "quarantined":
             if self.quarantined_assistant_message is None:
                 raise ValueError(
@@ -336,6 +369,11 @@ class PendingToolRound(BaseModel):
             call = calls_by_id[item.tool_call_id]
             if event.tool_name != call.tool_name:
                 raise ValueError("Staged terminal evidence has a conflicting tool name.")
+            validate_staged_tool_exposure_terminal(
+                item,
+                policy_evidence=call.policy_evidence,
+                tool_exposure=self.tool_exposure,
+            )
         return self
 
 
@@ -729,6 +767,7 @@ def checkpoint_with_pending_tool_round(
     task_id: str | None,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
+    tool_exposure: ResolvedToolExposureAuthority | None = None,
     policy_state: Literal["unplanned", "planned"] = "unplanned",
     policy_context_version: Literal[1] | None = None,
     request_metadata: dict[str, Any] | None = None,
@@ -799,6 +838,7 @@ def checkpoint_with_pending_tool_round(
         execution_profile_fingerprint=(
             None if active_profile is None else active_profile.profile.fingerprint
         ),
+        tool_exposure=tool_exposure,
         tool_calls=pending_tool_call_records(
             tool_calls=tool_calls,
             policy_outcomes=policy_outcomes,
@@ -1180,7 +1220,17 @@ def _recovery_safe_staged_terminals(
             for item in pending_round.staged_terminals
         ]
     safe: list[StagedToolCallTerminal] = []
+    calls_by_id = {call.tool_call_id: call for call in pending_round.tool_calls}
     for item in pending_round.staged_terminals:
+        call = calls_by_id[item.tool_call_id]
+        if call.policy_evidence is ToolPolicyEvidence.UNEXPOSED:
+            validate_staged_tool_exposure_terminal(
+                item,
+                policy_evidence=call.policy_evidence,
+                tool_exposure=pending_round.tool_exposure,
+            )
+            safe.append(StagedToolCallTerminal.model_validate(item.model_dump(mode="json")))
+            continue
         terminal_controls = tool_results.runtime_terminal_controls(item.event.payload)
         fixed_result = ToolResult(
             content="Tool result unavailable because invocation secret scope was incomplete.",

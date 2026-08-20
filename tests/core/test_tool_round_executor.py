@@ -42,6 +42,10 @@ from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
 from cayu.runtime.execution_profiles import build_execution_profile_identity
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.runtime.tool_exposure import (
+    ResolvedToolExposureAuthority,
+    unexposed_tool_result,
+)
 from cayu.tools._runner import sanitize_runner_failure_group
 from cayu.vaults import SecretRedactor
 
@@ -251,6 +255,78 @@ def test_staged_terminal_profile_authority_is_owned_by_the_active_round() -> Non
                 }
             )
         )
+
+
+def test_staged_terminal_exposure_authority_is_owned_by_the_frozen_snapshot() -> None:
+    identity = _tool_round_identity()
+    exposure = ResolvedToolExposureAuthority(
+        profile_id="tool-free",
+        tool_names=(),
+        registered_count=1,
+        ceiling_count=1,
+        fingerprint="a" * 64,
+    )
+    coordinator = _ToolRoundPublicationCoordinator(
+        session_id="session-staged-exposure-authority",
+        tool_round_identity=identity,
+        session_store=InMemorySessionStore(),
+        redactor=SecretRedactor(),
+        execution_profile=None,
+        tool_exposure=exposure,
+    )
+    terminal = Event(
+        type=EventType.TOOL_CALL_BLOCKED,
+        session_id="session-staged-exposure-authority",
+        tool_name="side_effect",
+        payload={
+            **identity.payload(),
+            "tool_call_id": "call_1",
+            "blocked_by": "tool_exposure",
+            "reason": "not_exposed_in_request",
+            "profile_id": exposure.profile_id,
+            "exposure_fingerprint": exposure.fingerprint,
+            "arguments_state": "unavailable",
+            "result": unexposed_tool_result().model_dump(mode="json"),
+        },
+    )
+
+    restored = coordinator.restore_staged_event_authority(terminal)
+
+    for field_name, expected in (
+        ("profile_id", exposure.profile_id),
+        ("exposure_fingerprint", exposure.fingerprint),
+    ):
+        assert restored.payload[field_name] == expected
+        assert event_payload_authority_is_runtime_generated(
+            restored,
+            field_name=field_name,
+            value=expected,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="conflicts with its frozen exposure authority",
+    ):
+        coordinator.restore_staged_event_authority(
+            terminal.model_copy(
+                update={
+                    "payload": {
+                        **terminal.payload,
+                        "exposure_fingerprint": "b" * 64,
+                    }
+                }
+            )
+        )
+
+    unowned_coordinator = _ToolRoundPublicationCoordinator(
+        session_id="session-staged-exposure-authority",
+        tool_round_identity=identity,
+        session_store=InMemorySessionStore(),
+        redactor=SecretRedactor(),
+        execution_profile=None,
+    )
+    with pytest.raises(RuntimeError, match="has no durable exposure owner"):
+        unowned_coordinator.restore_staged_event_authority(terminal)
 
 
 def test_tool_round_agent_copy_rejects_agent_spec_subclasses() -> None:

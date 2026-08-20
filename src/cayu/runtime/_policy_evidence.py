@@ -13,4 +13,5 @@ class ToolPolicyEvidence(StrEnum):
     UNPLANNED = "unplanned"
     AUTHORITATIVE = "authoritative"
     UNREGISTERED = "unregistered"
+    UNEXPOSED = "unexposed"
     AMBIGUOUS = "ambiguous"

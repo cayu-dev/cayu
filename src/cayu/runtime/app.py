@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import mimetypes
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -327,7 +327,15 @@ from cayu.runtime.tasks import (
     copy_task_create,
     task_create_with_runtime_invocation,
 )
-from cayu.runtime.tool_exposure import RegisteredToolCapability
+from cayu.runtime.tool_exposure import (
+    ALL_REGISTERED_TOOLS_PROFILE_ID,
+    TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
+    AllRegisteredToolsExposurePolicy,
+    RegisteredToolCapability,
+    ResolvedToolExposure,
+    ToolExposurePolicy,
+    resolved_tool_exposure_from_authority,
+)
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     ToolPolicy,
@@ -1581,6 +1589,7 @@ class CayuApp:
         tools: Iterable[Tool] | None = None,
         context_policy: ContextPolicy | None = None,
         context_overflow_policy: ContextPolicy | None = None,
+        tool_exposure_policy: ToolExposurePolicy | None = None,
         tool_policy: ToolPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
@@ -1603,6 +1612,12 @@ class CayuApp:
             stored_context_overflow_policy = context_overflow_policy
         else:
             raise TypeError("context_overflow_policy must be a ContextPolicy.")
+        if tool_exposure_policy is None:
+            stored_tool_exposure_policy = AllRegisteredToolsExposurePolicy()
+        elif isinstance(tool_exposure_policy, ToolExposurePolicy):
+            stored_tool_exposure_policy = tool_exposure_policy
+        else:
+            raise TypeError("tool_exposure_policy must be a ToolExposurePolicy.")
         if tool_policy is None:
             stored_tool_policy = AllowAllToolPolicy()
         elif isinstance(tool_policy, ToolPolicy):
@@ -1662,10 +1677,35 @@ class CayuApp:
             )
             for tool in tools_by_name.values()
         )
+        all_registered_tool_exposure: ResolvedToolExposure | None = None
+        if len(tool_capabilities) <= TOOL_EXPOSURE_MAX_REGISTERED_TOOLS:
+            # Registration historically permits oversized MCP manifests so the
+            # run boundary can reject them with bounded public evidence. Defer
+            # aggregate exposure-size failures to that same boundary.
+            with suppress(ValueError):
+                all_registered_tool_exposure = ResolvedToolExposure(
+                    profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+                    tools=tool_capabilities,
+                    registered_count=len(tool_capabilities),
+                    ceiling_count=len(tool_capabilities),
+                )
+        if all_registered_tool_exposure is not None:
+            # Keep one canonical descriptor graph: both registration/profile
+            # admission and the expose-all snapshot reference validated copies.
+            tool_capabilities = all_registered_tool_exposure.tools
         self._agents[stored_spec.name] = runtime_records.RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
             tool_capabilities=tool_capabilities,
+            all_registered_tool_exposure=all_registered_tool_exposure,
+            tool_exposure_policy=stored_tool_exposure_policy,
+            tool_exposure_policy_execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    stored_tool_exposure_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name=("tool_exposure_policy.execution_profile_identity"),
+                )
+            ),
             context_policy=stored_context_policy,
             context_policy_execution_profile_identity=(
                 copy_secret_free_execution_profile_behavior_identity(
@@ -1763,6 +1803,14 @@ class CayuApp:
             ),
             tools=MappingProxyType({}),
             tool_capabilities=(),
+            all_registered_tool_exposure=ResolvedToolExposure(
+                profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+                tools=(),
+                registered_count=0,
+                ceiling_count=0,
+            ),
+            tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
+            tool_exposure_policy_execution_profile_identity=None,
             context_policy=evaluator_context_policy,
             context_policy_execution_profile_identity=(
                 copy_secret_free_execution_profile_behavior_identity(
@@ -3864,6 +3912,14 @@ class CayuApp:
                 "Recovery run does not reference the active invocation execution profile."
             )
         execution_profile = expected_profile.profile
+        initial_tool_exposure = (
+            None
+            if request.initial_model_step_tool_exposure is None
+            else resolved_tool_exposure_from_authority(
+                request.initial_model_step_tool_exposure,
+                request.registered_agent.tool_capabilities,
+            )
+        )
         stream = self._run_session(
             session=request.session,
             registered_agent=request.registered_agent,
@@ -3891,6 +3947,8 @@ class CayuApp:
             run_limit_accounting=request.run_limit_accounting,
             initial_model_step_identity=request.initial_model_step_identity,
             initial_model_step_number=request.initial_model_step_number,
+            initial_model_step_tool_exposure=initial_tool_exposure,
+            previous_tool_exposure_profile_id=(request.previous_tool_exposure_profile_id),
             preserve_failure_until_initial_provider_dispatch=(
                 request.preserve_failure_until_initial_provider_dispatch
             ),
@@ -4328,6 +4386,8 @@ class CayuApp:
         run_limit_accounting: RunLimitAccountingContext | None = None,
         initial_model_step_identity: ModelStepIdentity | None = None,
         initial_model_step_number: int | None = None,
+        initial_model_step_tool_exposure: ResolvedToolExposure | None = None,
+        previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
     ) -> AsyncGenerator[Event, None]:
         stream = self._session_engine._run_session(
@@ -4358,6 +4418,8 @@ class CayuApp:
             run_limit_accounting=run_limit_accounting,
             initial_model_step_identity=initial_model_step_identity,
             initial_model_step_number=initial_model_step_number,
+            initial_model_step_tool_exposure=initial_model_step_tool_exposure,
+            previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
             preserve_failure_until_initial_provider_dispatch=(
                 preserve_failure_until_initial_provider_dispatch
             ),

@@ -16,7 +16,7 @@ from cayu._validation import (
     require_durable_text,
     safe_durable_value_error_details,
 )
-from cayu.core.events import Event, event_payload_authority_is_runtime_generated
+from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.core.tools import ToolEffect, ToolResult
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._diagnostics import (
@@ -185,12 +185,14 @@ def redact_tool_result_event(
     )
     linkage_fields = _runtime_tool_event_linkage_fields(event.payload)
     profile_attribution = _runtime_execution_profile_attribution(event)
+    exposure_attribution = _runtime_tool_exposure_attribution(event)
     payload_to_redact = {
         key: value
         for key, value in event.payload.items()
         if key != "result"
         and key not in linkage_fields
         and key not in profile_attribution
+        and key not in exposure_attribution
         and not (terminal_controls and key in _RUNTIME_TERMINAL_CONTROL_FIELDS)
     }
     payload = redactor.redact_json(payload_to_redact)
@@ -198,6 +200,7 @@ def redact_tool_result_event(
         raise AssertionError("Event payload redaction returned non-object payload.")
     payload.update(linkage_fields)
     payload.update(profile_attribution)
+    payload.update(exposure_attribution)
     if terminal_controls:
         structured = dict(redacted_result.structured or {})
         structured.update(terminal_controls)
@@ -223,6 +226,44 @@ def _runtime_execution_profile_attribution(event: Event) -> dict[str, str]:
     ):
         return {}
     return {_EXECUTION_PROFILE_FINGERPRINT_FIELD: value}
+
+
+def _runtime_tool_exposure_attribution(event: Event) -> dict[str, str]:
+    """Preserve one exact runtime-attested unexposed-call classification."""
+
+    if (
+        event.type is not EventType.TOOL_CALL_BLOCKED
+        or event.payload.get("blocked_by") != "tool_exposure"
+        or event.payload.get("reason") != "not_exposed_in_request"
+    ):
+        return {}
+    profile_id = event.payload.get("profile_id")
+    fingerprint = event.payload.get("exposure_fingerprint")
+    if (
+        type(profile_id) is not str
+        or not profile_id.strip()
+        or len(profile_id) > 256
+        or type(fingerprint) is not str
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+        or not event_payload_authority_is_runtime_generated(
+            event,
+            field_name="profile_id",
+            value=profile_id,
+        )
+        or not event_payload_authority_is_runtime_generated(
+            event,
+            field_name="exposure_fingerprint",
+            value=fingerprint,
+        )
+    ):
+        return {}
+    return {
+        "blocked_by": "tool_exposure",
+        "reason": "not_exposed_in_request",
+        "profile_id": profile_id,
+        "exposure_fingerprint": fingerprint,
+    }
 
 
 def _runtime_tool_event_linkage_fields(payload: dict[str, Any]) -> dict[str, str]:

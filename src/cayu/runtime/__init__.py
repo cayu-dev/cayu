@@ -653,6 +653,7 @@ from cayu.runtime.tool_exposure import (
     ToolExposureDecision,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
+    copy_resolved_tool_exposure,
     resolve_tool_exposure,
 )
 from cayu.runtime.tool_policy import (
@@ -1308,6 +1309,7 @@ __all__ = [
     "copy_model_step_identity",
     "copy_price_book",
     "copy_request_footprint_config",
+    "copy_resolved_tool_exposure",
     "copy_retry_policy",
     "copy_run_limits",
     "copy_session_user_metadata",

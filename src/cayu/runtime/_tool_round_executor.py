@@ -88,6 +88,9 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._assistant_tool_round_publication import (
+    validate_tool_exposure_terminal_event,
+)
 from cayu.runtime._checkpoint_redaction import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
@@ -165,6 +168,13 @@ from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
+)
+from cayu.runtime.tool_exposure import (
+    NOT_EXPOSED_IN_REQUEST_REASON,
+    ResolvedToolExposureAuthority,
+    copy_resolved_tool_exposure_authority,
+    unexposed_tool_result,
+    validate_resolved_tool_exposure_authority,
 )
 from cayu.runtime.tool_policy import (
     TAINT_LABELS_METADATA_KEY,
@@ -501,6 +511,7 @@ class _ToolRoundPublicationCoordinator:
         session_store: SessionStore,
         redactor: SecretRedactor,
         execution_profile: ExecutionProfileIdentity | None,
+        tool_exposure: ResolvedToolExposureAuthority | None = None,
     ) -> None:
         self._session_id = require_clean_nonblank(session_id, "session_id")
         self._tool_round_identity = copy_tool_round_identity(tool_round_identity)
@@ -513,6 +524,9 @@ class _ToolRoundPublicationCoordinator:
             raise TypeError("execution_profile must be an ExecutionProfileIdentity or None.")
         self._execution_profile_fingerprint = (
             None if execution_profile is None else execution_profile.fingerprint
+        )
+        self._tool_exposure = (
+            None if tool_exposure is None else copy_resolved_tool_exposure_authority(tool_exposure)
         )
         self._lock = asyncio.Lock()
 
@@ -529,6 +543,7 @@ class _ToolRoundPublicationCoordinator:
             event,
             session_id=self._session_id,
             tool_round_identity=self._tool_round_identity,
+            tool_exposure=self._tool_exposure,
         )
         observed_fingerprint = restored.payload.get(EXECUTION_PROFILE_FINGERPRINT_FIELD)
         if (
@@ -586,7 +601,7 @@ class _ToolRoundPublicationCoordinator:
         tool_call_id: str,
         event: Event,
         snapshot: invocation_secrets.InvocationPublicationSnapshot,
-        hooks_state: Literal["pending", "finalized", "observational"],
+        hooks_state: Literal["pending", "finalized", "observational", "completed"],
     ) -> Event:
         """Persist a stable terminal event after applying the cumulative scope."""
 
@@ -854,14 +869,28 @@ class ToolRoundExecutor:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_calls: list[runtime_records.ToolCallRequest],
         request_metadata: dict[str, Any],
+        tool_exposure: ResolvedToolExposureAuthority | None = None,
     ) -> runtime_records.ToolRoundPolicyPlan:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         approval_policy_result: ToolPolicyResult | None = None
         approval_tool_call: runtime_records.ToolCallRequest | None = None
-        taint_labels = await self.prior_taint_labels_for_policy(
-            session_id=session.id,
-            policy=registered_agent.tool_policy,
-            request_metadata=request_metadata,
+        exposed_names = (
+            frozenset(registered_agent.tools)
+            if tool_exposure is None
+            else frozenset(tool_exposure.tool_names)
+        )
+        has_authorizable_call = any(
+            call.name in registered_agent.tools and call.name in exposed_names
+            for call in tool_calls
+        )
+        taint_labels = (
+            await self.prior_taint_labels_for_policy(
+                session_id=session.id,
+                policy=registered_agent.tool_policy,
+                request_metadata=request_metadata,
+            )
+            if has_authorizable_call
+            else set()
         )
         active_taint_labels: dict[str, frozenset[str]] = {}
         for tool_call in tool_calls:
@@ -872,6 +901,15 @@ class ToolRoundExecutor:
                         call=tool_call,
                         result=None,
                         evidence=ToolPolicyEvidence.UNREGISTERED,
+                    )
+                )
+                continue
+            if tool_call.name not in exposed_names:
+                policy_outcomes.append(
+                    runtime_records.ToolCallPolicyOutcome(
+                        call=tool_call,
+                        result=None,
+                        evidence=ToolPolicyEvidence.UNEXPOSED,
                     )
                 )
                 continue
@@ -930,6 +968,7 @@ class ToolRoundExecutor:
         tool_calls: list[runtime_records.ToolCallRequest],
         request_metadata: dict[str, Any],
         durable_tool_calls: list[PendingToolCallApproval] | None = None,
+        tool_exposure: ResolvedToolExposureAuthority | None = None,
     ) -> runtime_records.ToolRoundPolicyPlan:
         """Build a manual gate without replaying an outcome-ambiguous policy.
 
@@ -957,10 +996,23 @@ class ToolRoundExecutor:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         authoritative_approval_tool_call: runtime_records.ToolCallRequest | None = None
         ambiguous_tool_call: runtime_records.ToolCallRequest | None = None
-        taint_labels = await self.prior_taint_labels_for_policy(
-            session_id=session.id,
-            policy=registered_agent.tool_policy,
-            request_metadata=request_metadata,
+        exposed_names = (
+            frozenset(registered_agent.tools)
+            if tool_exposure is None
+            else frozenset(tool_exposure.tool_names)
+        )
+        has_authorizable_call = any(
+            call.name in registered_agent.tools and call.name in exposed_names
+            for call in tool_calls
+        )
+        taint_labels = (
+            await self.prior_taint_labels_for_policy(
+                session_id=session.id,
+                policy=registered_agent.tool_policy,
+                request_metadata=request_metadata,
+            )
+            if has_authorizable_call
+            else set()
         )
         active_taint_labels: dict[str, frozenset[str]] = {}
         for tool_call in tool_calls:
@@ -971,6 +1023,15 @@ class ToolRoundExecutor:
                         call=tool_call,
                         result=None,
                         evidence=ToolPolicyEvidence.UNREGISTERED,
+                    )
+                )
+                continue
+            if tool_call.name not in exposed_names:
+                policy_outcomes.append(
+                    runtime_records.ToolCallPolicyOutcome(
+                        call=tool_call,
+                        result=None,
+                        evidence=ToolPolicyEvidence.UNEXPOSED,
                     )
                 )
                 continue
@@ -1553,6 +1614,7 @@ class ToolRoundExecutor:
             workspace_id=_workspace_id(registered_environment),
             task_id=task_id,
             execution_profile_fingerprint=pending_round.execution_profile_fingerprint,
+            tool_exposure=pending_round.tool_exposure,
             tool_calls=approval_support.pending_tool_call_approvals(
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
@@ -1745,6 +1807,8 @@ class ToolRoundExecutor:
         check_policy: bool = True,
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
+        policy_evidence: ToolPolicyEvidence = ToolPolicyEvidence.AUTHORITATIVE,
+        tool_exposure: ResolvedToolExposureAuthority | None = None,
         policy_output_secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown",
         approval_id: str | None = None,
         tool_round_identity: ToolRoundIdentity,
@@ -1768,6 +1832,86 @@ class ToolRoundExecutor:
         identity_payload = tool_round_identity.payload()
         tool_round_id = tool_round_identity.tool_round_id
         environment_name = _environment_name(registered_environment)
+        if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
+            if tool_exposure is None:
+                raise RuntimeError("Unexposed tool call lost its frozen exposure snapshot.")
+            tool_exposure = validate_resolved_tool_exposure_authority(
+                tool_exposure,
+                registered_agent.tool_capabilities,
+            )
+            if tool_call.name not in registered_agent.tools:
+                raise RuntimeError("Unexposed tool call is not registered.")
+            if tool_call.name in tool_exposure.tool_names:
+                raise RuntimeError("Unexposed tool call is present in its exposure snapshot.")
+            result = unexposed_tool_result()
+            idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_call_id=tool_call.id,
+                tool_round_id=tool_round_id,
+                approval_id=approval_id,
+                pause_id=input_id,
+            )
+            payload: dict[str, Any] = {
+                "tool_call_id": tool_call.id,
+                "idempotency_key": idempotency_key,
+                "blocked_by": "tool_exposure",
+                "reason": NOT_EXPOSED_IN_REQUEST_REASON,
+                "profile_id": tool_exposure.profile_id,
+                "exposure_fingerprint": tool_exposure.fingerprint,
+                "result": result.model_dump(mode="json"),
+                **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                **identity_payload,
+            }
+            if approval_id is not None:
+                payload["approval_id"] = approval_id
+            if input_id is not None:
+                payload["input_id"] = input_id
+            event = _event_with_tool_round_authority(
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.TOOL_CALL_BLOCKED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=tool_call.name,
+                        payload=payload,
+                    ),
+                    execution_profile,
+                ),
+                tool_round_identity,
+                *(
+                    field
+                    for field in (
+                        "approval_id",
+                        "input_id",
+                        "profile_id",
+                        "exposure_fingerprint",
+                    )
+                    if field in payload
+                ),
+            )
+            projected_call = replace(tool_call, arguments={})
+            outcome = runtime_records.ToolCallOutcome(
+                call=projected_call,
+                result=result,
+            )
+            publication_snapshot = invocation_secrets.InvocationPublicationSnapshot(
+                redactor=self._secret_redactor,
+                unsafe_output=False,
+            )
+            if publication_snapshot_observer is not None:
+                await publication_snapshot_observer(tool_call.id, publication_snapshot)
+            if deferred_terminal_stager is not None:
+                await deferred_terminal_stager(
+                    event,
+                    outcome,
+                    False,
+                    False,
+                    publication_snapshot,
+                )
+                return
+            yield await self._event_writer.emit(event), outcome
+            return
         model_arguments = copy_json_value(tool_call.arguments, "tool_call.arguments")
         invocation_redactor = _redactor_for_tool_calls(
             self._secret_redactor,
@@ -4162,7 +4306,12 @@ class ToolRoundExecutor:
                 event_identity,
                 *(
                     field_name
-                    for field_name in ("approval_id", "input_id")
+                    for field_name in (
+                        "approval_id",
+                        "input_id",
+                        "profile_id",
+                        "exposure_fingerprint",
+                    )
                     if field_name in event.payload
                 ),
             )
@@ -4661,6 +4810,25 @@ class ToolRoundRun:
         session = self._session
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         durable_lifecycle_events: list[Event] = []
+        source_checkpoint = await executor._session_store.load_checkpoint(session.id)
+        source_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            source_checkpoint,
+            redactor=executor._secret_redactor,
+            consume_on_rejection=True,
+        )
+        if source_pending_round is None:
+            raise RuntimeError("Tool round has no durable pending exposure authority.")
+        _require_matching_policy_round(
+            pending_round=source_pending_round,
+            tool_round_identity=tool_round_identity,
+            tool_calls=tool_calls,
+        )
+        tool_exposure = source_pending_round.tool_exposure
+        if tool_exposure is not None:
+            tool_exposure = validate_resolved_tool_exposure_authority(
+                tool_exposure,
+                self._registered_agent.tool_capabilities,
+            )
         try:
             await executor._session_control.raise_if_interrupted(session.id)
             policy_plan = await executor.policy_plan(
@@ -4669,6 +4837,7 @@ class ToolRoundRun:
                 registered_environment=self._registered_environment,
                 tool_calls=tool_calls,
                 request_metadata=self._request_metadata,
+                tool_exposure=tool_exposure,
             )
             await executor._session_control.raise_if_interrupted(session.id)
         except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
@@ -4768,10 +4937,14 @@ class ToolRoundRun:
             raise ToolApprovalRequired(approval)
 
         policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_plan.outcomes}
+        policy_evidence_by_id = {
+            outcome.call.id: outcome.evidence for outcome in policy_plan.outcomes
+        }
         user_input_pause = _first_user_input_tool_call(
             self._registered_agent,
             tool_calls,
             policy_results_by_id,
+            policy_evidence_by_id,
         )
         if user_input_pause is not None:
             user_input_call, question, options = user_input_pause
@@ -4851,6 +5024,7 @@ class ToolRoundRun:
                     tool_calls=tool_calls,
                 ),
                 execution_profile=self._execution_profile,
+                tool_exposure=tool_exposure,
             )
             if defer_round_terminals
             else None
@@ -4931,17 +5105,25 @@ class ToolRoundRun:
                 raise AssertionError("Terminal staging requires a publication coordinator.")
             prepared_event = executor._event_writer.prepare(event)
             interrupted_terminal = prepared_event.payload.get("interrupted") is True
+            exposure_blocked = (
+                prepared_event.type is EventType.TOOL_CALL_BLOCKED
+                and prepared_event.payload.get("blocked_by") == "tool_exposure"
+            )
             staged_event = await publication_coordinator.stage_terminal(
                 tool_call_id=outcome.call.id,
                 event=prepared_event,
                 snapshot=snapshot,
                 hooks_state=(
-                    "pending"
-                    if interrupted_terminal
+                    "completed"
+                    if exposure_blocked
                     else (
-                        "observational"
-                        if publish_before_hooks
-                        else ("pending" if allow_modification else "finalized")
+                        "pending"
+                        if interrupted_terminal
+                        else (
+                            "observational"
+                            if publish_before_hooks
+                            else ("pending" if allow_modification else "finalized")
+                        )
                     )
                 ),
             )
@@ -5083,6 +5265,8 @@ class ToolRoundRun:
                         tool_calls=segment_calls,
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
+                        policy_evidence_by_id=policy_evidence_by_id,
+                        tool_exposure=tool_exposure,
                         tool_round_identity=tool_round_identity,
                         model_step=model_step,
                         taint_labels_by_id=policy_plan.active_taint_labels,
@@ -5110,6 +5294,8 @@ class ToolRoundRun:
                         round_tool_calls=tool_calls,
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
+                        policy_evidence_by_id=policy_evidence_by_id,
+                        tool_exposure=tool_exposure,
                         tool_round_identity=tool_round_identity,
                         model_step=model_step,
                         taint_labels_by_id=policy_plan.active_taint_labels,
@@ -5463,6 +5649,8 @@ class ToolRoundRun:
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
+        policy_evidence_by_id: dict[str, ToolPolicyEvidence],
+        tool_exposure: ResolvedToolExposureAuthority | None,
         tool_round_identity: ToolRoundIdentity,
         model_step: int | None,
         round_tool_calls: list[runtime_records.ToolCallRequest] | None = None,
@@ -5517,6 +5705,11 @@ class ToolRoundRun:
                 model_step=model_step,
                 execution_profile=self._execution_profile,
                 policy_result=policy_results_by_id.get(tool_call.id),
+                policy_evidence=policy_evidence_by_id.get(
+                    tool_call.id,
+                    ToolPolicyEvidence.UNPLANNED,
+                ),
+                tool_exposure=tool_exposure,
                 tool_round_identity=tool_round_identity,
                 taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
                 publish_arguments_as_unavailable=publish_arguments_as_unavailable,
@@ -5535,6 +5728,8 @@ class ToolRoundRun:
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
+        policy_evidence_by_id: dict[str, ToolPolicyEvidence],
+        tool_exposure: ResolvedToolExposureAuthority | None,
         tool_round_identity: ToolRoundIdentity,
         model_step: int | None,
         taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
@@ -5573,6 +5768,11 @@ class ToolRoundRun:
                         model_step=model_step,
                         execution_profile=self._execution_profile,
                         policy_result=policy_results_by_id.get(tool_call.id),
+                        policy_evidence=policy_evidence_by_id.get(
+                            tool_call.id,
+                            ToolPolicyEvidence.UNPLANNED,
+                        ),
+                        tool_exposure=tool_exposure,
                         tool_round_identity=tool_round_identity,
                         taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
                         publish_arguments_as_unavailable=publish_arguments_as_unavailable,
@@ -5798,10 +5998,13 @@ def _first_user_input_tool_call(
     registered_agent: runtime_records.RegisteredAgentState,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_results_by_id: dict[str, ToolPolicyResult | None],
+    policy_evidence_by_id: Mapping[str, ToolPolicyEvidence],
 ) -> tuple[runtime_records.ToolCallRequest, str, list[str]] | None:
     for tool_call in tool_calls:
         registered_tool = registered_agent.tools.get(tool_call.name)
         if registered_tool is None or not getattr(registered_tool.tool, "pauses_session", False):
+            continue
+        if policy_evidence_by_id.get(tool_call.id) is not ToolPolicyEvidence.AUTHORITATIVE:
             continue
         policy_result = policy_results_by_id.get(tool_call.id)
         if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
@@ -8587,6 +8790,7 @@ def restore_staged_terminal_authority(
     *,
     session_id: str,
     tool_round_identity: ToolRoundIdentity,
+    tool_exposure: ResolvedToolExposureAuthority | None = None,
 ) -> Event:
     """Restore only typed authority erased by checkpoint serialization."""
 
@@ -8598,11 +8802,23 @@ def restore_staged_terminal_authority(
     if type(tool_call_id) is not str or not tool_call_id:
         raise ValueError("Staged terminal lost its tool-call identity.")
     restored = event_with_runtime_generated_id(copy_event(event))
-    restored = _event_with_tool_round_authority(
-        restored,
-        identity,
-        "tool_call_id",
-    )
+    additional_fields = ["tool_call_id"]
+    if (
+        restored.type is EventType.TOOL_CALL_BLOCKED
+        and restored.payload.get("blocked_by") == "tool_exposure"
+    ):
+        if tool_exposure is None:
+            raise RuntimeError("Staged tool-exposure terminal has no durable exposure owner.")
+        if type(tool_exposure) is not ResolvedToolExposureAuthority:
+            raise TypeError("tool_exposure must be a ResolvedToolExposureAuthority.")
+        exposure = tool_exposure
+        validate_tool_exposure_terminal_event(restored, tool_exposure=exposure)
+        payload = dict(restored.payload)
+        payload["profile_id"] = exposure.profile_id
+        payload["exposure_fingerprint"] = exposure.fingerprint
+        restored = restored.model_copy(update={"payload": payload})
+        additional_fields.extend(("profile_id", "exposure_fingerprint"))
+    restored = _event_with_tool_round_authority(restored, identity, *additional_fields)
     if restored.interaction_id is not None:
         restored = event_with_runtime_envelope_authority(restored, "interaction_id")
     controls, _references = tool_results.runtime_tool_event_boundary_controls(

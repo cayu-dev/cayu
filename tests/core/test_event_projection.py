@@ -248,6 +248,7 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
             "execution_profile_fingerprint",
             "run_limit_accounting",
             "staged_terminals",
+            "tool_exposure",
         }
     ) | {"arguments_state"} == event_projection_module._PENDING_USER_INPUT_FIELD_NAMES
 

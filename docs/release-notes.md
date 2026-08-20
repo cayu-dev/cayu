@@ -89,7 +89,7 @@ guard.
 
 ## Unreleased
 
-### Tool exposure now has a bounded planning contract
+### Tool exposure now governs frozen model-step request profiles
 
 Cayu now provides immutable `RegisteredToolCapability` summaries, bounded
 `ToolExposurePolicyRequest` and `ToolExposureDecision` records, deterministic
@@ -101,10 +101,21 @@ definition fingerprints without exposing live tool or environment objects.
 Capability summaries are derived once at agent registration and reused by
 execution-profile resolution.
 
-This is the contract-only first slice of dynamic tool exposure. It deliberately
-does not change provider payloads or add a `tool_exposure_policy` argument to
-`CayuApp.register_agent(...)`; registered tools continue to be exposed exactly
-as before until model-step enforcement lands in the next slice.
+`CayuApp.register_agent(..., tool_exposure_policy=...)` now applies that
+contract end to end. Cayu resolves one registration-ordered exposure snapshot
+before context pressure and official token counting, sends exactly that subset
+through OpenAI, Anthropic, Chat Completions, Bedrock, and Vertex requests, and
+reuses the same snapshot for generic retries and context-overflow recovery.
+The default remains expose-all, and the runtime-owned structured-output tool is
+preserved independently of application exposure.
+
+A provider call for a registered tool absent from the frozen request is blocked
+before `ToolPolicy`, approval, hooks, secret resolution, environment access, or
+tool execution. Cayu emits typed `not_exposed_in_request` evidence without
+arguments and appends a provider-valid error result. Compact snapshot authority
+survives ordinary tool-round recovery and approval or user-input interruption,
+while exposed calls continue through every existing authorization and execution
+control.
 
 ### Bounded fork groups are durable public runtime operations
 

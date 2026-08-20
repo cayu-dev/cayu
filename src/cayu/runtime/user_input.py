@@ -22,8 +22,10 @@ from cayu.runtime._assistant_tool_round_publication import (
     AssistantToolRoundPublication,
     StagedToolCallTerminal,
     copy_assistant_tool_round_publication,
+    validate_staged_tool_exposure_terminal,
 )
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     has_run_limit_accounting_authority,
@@ -42,6 +44,10 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.runtime.tool_exposure import (
+    ResolvedToolExposureAuthority,
+    copy_resolved_tool_exposure_authority,
+)
 from cayu.vaults import SecretRedactor, contains_redacted_secret
 
 PENDING_USER_INPUT_CHECKPOINT_KEY = "pending_user_input"
@@ -164,6 +170,7 @@ class PendingUserInput(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+    tool_exposure: ResolvedToolExposureAuthority | None = None
     tool_calls: list[PendingToolCallApproval]
     assistant_message_state: Literal["published", "quarantined"] = "published"
     quarantined_assistant_message: Message | None = None
@@ -231,7 +238,42 @@ class PendingUserInput(BaseModel):
                 raise ValueError("Staged terminal evidence has a conflicting round identity.")
             if item.event.tool_name != calls_by_id[item.tool_call_id].tool_name:
                 raise ValueError("Staged terminal evidence has a conflicting tool name.")
+            call = calls_by_id[item.tool_call_id]
+            validate_staged_tool_exposure_terminal(
+                item,
+                policy_evidence=call.policy_evidence,
+                tool_exposure=self.tool_exposure,
+            )
+        unexposed_calls = [
+            call for call in self.tool_calls if call.policy_evidence is ToolPolicyEvidence.UNEXPOSED
+        ]
+        if unexposed_calls and self.tool_exposure is None:
+            raise ValueError("Unexposed user-input siblings require a frozen exposure snapshot.")
+        if self.tool_exposure is not None:
+            exposed_names = frozenset(self.tool_exposure.tool_names)
+            if any(call.tool_name in exposed_names for call in unexposed_calls):
+                raise ValueError(
+                    "Unexposed user-input sibling evidence conflicts with the snapshot."
+                )
+            if any(
+                call.policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+                and call.tool_name not in exposed_names
+                for call in self.tool_calls
+            ):
+                raise ValueError(
+                    "Authoritative user-input sibling evidence names a tool outside the snapshot."
+                )
         return self
+
+    @field_validator("tool_exposure")
+    @classmethod
+    def copy_tool_exposure(
+        cls,
+        value: ResolvedToolExposureAuthority | None,
+    ) -> ResolvedToolExposureAuthority | None:
+        if value is None:
+            return None
+        return copy_resolved_tool_exposure_authority(value)
 
     @field_validator("question")
     @classmethod
@@ -482,6 +524,7 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         workspace_id=pending.workspace_id,
         task_id=pending.task_id,
         execution_profile_fingerprint=pending.execution_profile_fingerprint,
+        tool_exposure=pending.tool_exposure,
         tool_calls=[copy_pending_tool_call_approval(call) for call in pending.tool_calls],
         assistant_message_state=pending.assistant_message_state,
         quarantined_assistant_message=(

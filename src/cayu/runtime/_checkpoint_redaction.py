@@ -42,6 +42,7 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "name",
         "policy_decision",
         "policy_evidence",
+        "profile_id",
         "phase",
         "role",
         "round_id",
@@ -92,6 +93,7 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
         "user_message_sha256",
         "fingerprint",
         "execution_profile_fingerprint",
+        "exposure_fingerprint",
         "sha256",
         "mutation_event_digest",
         "tool_outcome_event_digest",
@@ -232,6 +234,10 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "title",
     "thinking",
     "timezone",
+    "tool_exposure",
+    "tool_names",
+    "registered_count",
+    "ceiling_count",
     "tool_calls",
     "usage_triggered_context",
     "url",
@@ -485,6 +491,7 @@ def durable_value_contains_secret(
             _is_active_invocation_profile_identity_path(path)
             or _is_workspace_observation_identity_path(path)
             or _is_pending_tool_round_execution_identity_path(path)
+            or _is_tool_exposure_authority_identity_path(path)
         ):
             # Both checkpoint roots are runtime-owned typed authority. Active
             # profiles cross their dedicated admission boundary; workspace
@@ -525,6 +532,11 @@ def durable_value_contains_secret(
                 redactor=redactor,
                 field_name="checkpoint.json_schema",
             )
+        fixed_tool_exposure_reason = (
+            _is_staged_terminal_event_payload(path)
+            and value.get("blocked_by") == "tool_exposure"
+            and value.get("reason") == "not_exposed_in_request"
+        )
         for key, item in value.items():
             structural_key = (
                 (
@@ -545,6 +557,8 @@ def durable_value_contains_secret(
                     )
                 except ValueError:
                     return True
+            if fixed_tool_exposure_reason and key == "reason":
+                continue
             if durable_value_contains_secret(
                 item,
                 redactor=redactor,
@@ -590,6 +604,18 @@ def _is_pending_tool_round_execution_identity_path(path: tuple[str, ...]) -> boo
         len(path) >= 2
         and path[0] == "pending_tool_round"
         and path[-1] in _PENDING_TOOL_ROUND_EXECUTION_IDENTITY_FIELDS
+        and _path_has_typed_schema(path[:-1])
+    )
+
+
+def _is_tool_exposure_authority_identity_path(path: tuple[str, ...]) -> bool:
+    """Recognize exact typed exposure fields that must survive secret collisions."""
+
+    return (
+        len(path) == 3
+        and path[0] in {"pending_tool_round", "pending_user_input"}
+        and path[1] == "tool_exposure"
+        and path[2] in {"profile_id", "tool_names"}
         and _path_has_typed_schema(path[:-1])
     )
 

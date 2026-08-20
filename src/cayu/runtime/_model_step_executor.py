@@ -294,6 +294,17 @@ from cayu.runtime.structured_output import (
     structured_output_tool_instruction,
     structured_output_tool_spec,
 )
+from cayu.runtime.tool_exposure import (
+    ALL_REGISTERED_TOOLS_PROFILE_ID,
+    TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
+    AllRegisteredToolsExposurePolicy,
+    ResolvedToolExposure,
+    ResolvedToolExposureAuthority,
+    ToolExposurePolicyRequest,
+    copy_resolved_tool_exposure_authority,
+    resolve_tool_exposure,
+    resolved_tool_exposure_authority,
+)
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
     durable_model_completed_payload,
@@ -353,6 +364,7 @@ class ModelCompletionRecoveryContext(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+    tool_exposure: ResolvedToolExposureAuthority | None = None
     task_id: str | None = None
     request_metadata: dict[str, Any] = Field(default_factory=dict)
     structured_output: StructuredOutputSpec | None = None
@@ -830,6 +842,7 @@ class ModelCompletionPublicationRequest:
     authoritative_assistant_message: Message | None
     defer_assistant_message: bool
     structured_output_validation: StructuredOutputValidation | None
+    tool_exposure: ResolvedToolExposureAuthority | None = None
 
     def __post_init__(self) -> None:
         if type(self.dispatch) is not ModelCompletionDispatch:
@@ -860,6 +873,11 @@ class ModelCompletionPublicationRequest:
             None
             if self.structured_output_validation is None
             else self.structured_output_validation.model_copy(deep=True)
+        )
+        tool_exposure = (
+            None
+            if self.tool_exposure is None
+            else copy_resolved_tool_exposure_authority(self.tool_exposure)
         )
         if result is not None and result.session_id != dispatch.stage.session_id:
             raise ValueError("Assistant result session does not match its completion stage.")
@@ -900,6 +918,7 @@ class ModelCompletionPublicationRequest:
             "structured_output_validation",
             structured_output_validation,
         )
+        object.__setattr__(self, "tool_exposure", tool_exposure)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1099,7 +1118,15 @@ def _validate_model_completion_publication_result(
         for operation in publication_request.mutation.operations
         if operation.key == "pending_tool_round"
     ]
+    expects_pending_round = bool(
+        request.assistant_step_result is not None
+        and request.authoritative_assistant_message is not None
+        and request.assistant_step_result.tool_calls
+    )
+    if bool(pending_round_operations) != expects_pending_round:
+        raise RuntimeError("Model completion publication changed its pending tool-round mutation.")
     durable_validation = None
+    durable_tool_exposure = None
     if pending_round_operations:
         if len(pending_round_operations) != 1:
             raise RuntimeError(
@@ -1111,6 +1138,7 @@ def _validate_model_completion_publication_result(
                 "Model completion publication returned a malformed pending tool round."
             )
         durable_validation = pending_round_value.get("structured_output_validation")
+        durable_tool_exposure = pending_round_value.get("tool_exposure")
     expected_validation = (
         None
         if request.structured_output_validation is None
@@ -1118,6 +1146,13 @@ def _validate_model_completion_publication_result(
     )
     if durable_validation != expected_validation:
         raise RuntimeError("Model completion publication changed its structured-output validation.")
+    expected_tool_exposure = (
+        None
+        if not expects_pending_round or request.tool_exposure is None
+        else request.tool_exposure.model_dump(mode="json")
+    )
+    if durable_tool_exposure != expected_tool_exposure:
+        raise RuntimeError("Model completion publication changed its frozen tool exposure.")
 
     promoted = detached_result.publication
     receipt = promoted.receipt
@@ -1154,6 +1189,7 @@ async def _publish_model_completion(
         authoritative_assistant_message=request.authoritative_assistant_message,
         defer_assistant_message=request.defer_assistant_message,
         structured_output_validation=request.structured_output_validation,
+        tool_exposure=request.tool_exposure,
     )
     if publication_cancellation is not None:
         assert terminal_failure is not None
@@ -3685,6 +3721,13 @@ class ModelStepExecutor:
                 and post_completion_failure is None
             ),
             structured_output_validation=structured_output_validation,
+            tool_exposure=(
+                _legacy_all_registered_tool_exposure_authority(registered_agent)
+                if durable_step_result is not None
+                and durable_step_result.tool_calls
+                and (recovery_context is None or recovery_context.tool_exposure is None)
+                else (None if recovery_context is None else recovery_context.tool_exposure)
+            ),
         )
         await _publish_model_completion(
             model_completion_publisher,
@@ -3748,6 +3791,8 @@ class ModelStepExecutor:
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None = None,
         validate_live_model_semantics: Callable[[], None],
+        initial_tool_exposure: ResolvedToolExposure | None = None,
+        previous_tool_exposure_profile_id: str | None = None,
         model_completion_recovery_context_factory: (
             ModelCompletionRecoveryContextFactory | None
         ) = None,
@@ -3775,6 +3820,8 @@ class ModelStepExecutor:
             active_run=active_run,
             execution_profile=execution_profile,
             validate_live_model_semantics=validate_live_model_semantics,
+            initial_tool_exposure=initial_tool_exposure,
+            previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
             model_completion_recovery_context_factory=(
                 model_completion_recovery_context_factory
                 or (
@@ -3796,9 +3843,15 @@ class ModelStepExecutor:
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
         step: int,
+        tool_exposure: ResolvedToolExposure | None = None,
     ) -> ModelRequest:
+        resolved_tool_exposure = (
+            _all_registered_tool_exposure(registered_agent)
+            if tool_exposure is None
+            else _require_frozen_tool_exposure(tool_exposure)
+        )
         model_tools = _model_request_tools(
-            registered_agent=registered_agent,
+            tool_exposure=resolved_tool_exposure,
             structured_output=structured_output,
         )
         model_messages = _model_request_messages(
@@ -3989,11 +4042,15 @@ class ModelStepExecutor:
         | None = None,
         model_completion_publisher: ModelCompletionPublisher | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        tool_exposure: ResolvedToolExposure | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         request_variant = RequestVariant(request_variant)
         structured_output = copy_structured_output_spec(structured_output)
         model_step_identity = copy_model_step_identity(model_step_identity)
+        resolved_tool_exposure = (
+            None if tool_exposure is None else _require_frozen_tool_exposure(tool_exposure)
+        )
         next_model_attempt_identity = (
             None
             if initial_model_attempt_identity is None
@@ -4162,6 +4219,7 @@ class ModelStepExecutor:
                 prepare_model_completion_dispatch=prepare_model_completion_dispatch,
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=execution_profile,
+                tool_exposure=resolved_tool_exposure,
             )
             try:
                 result: AssistantStepResult | None = None
@@ -4566,6 +4624,7 @@ class ModelStepExecutor:
         | None,
         model_completion_publisher: ModelCompletionPublisher | None,
         execution_profile: ExecutionProfileIdentity | None,
+        tool_exposure: ResolvedToolExposure | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         assistant_parts: list[
             transcript_helpers.AssistantTextPart
@@ -5824,6 +5883,11 @@ class ModelStepExecutor:
                 authoritative_assistant_message=authoritative_assistant_message,
                 defer_assistant_message=defer_assistant_message,
                 structured_output_validation=structured_output_validation,
+                tool_exposure=(
+                    None
+                    if tool_exposure is None
+                    else resolved_tool_exposure_authority(tool_exposure)
+                ),
             )
             await _publish_model_completion(
                 model_completion_publisher,
@@ -5944,6 +6008,8 @@ class ModelStepRun:
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
         validate_live_model_semantics: Callable[[], None],
+        initial_tool_exposure: ResolvedToolExposure | None,
+        previous_tool_exposure_profile_id: str | None,
         model_completion_recovery_context_factory: ModelCompletionRecoveryContextFactory,
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> None:
@@ -5968,11 +6034,32 @@ class ModelStepRun:
         self._active_run = active_run
         self._execution_profile = execution_profile
         self._validate_live_model_semantics = validate_live_model_semantics
+        if initial_tool_exposure is not None and previous_tool_exposure_profile_id is not None:
+            raise ValueError(
+                "An initial frozen tool exposure and a previous profile cannot be supplied "
+                "together."
+            )
+        self._initial_tool_exposure = (
+            None
+            if initial_tool_exposure is None
+            else _require_frozen_tool_exposure(initial_tool_exposure)
+        )
+        if previous_tool_exposure_profile_id is not None:
+            previous_tool_exposure_profile_id = require_durable_clean_nonblank(
+                previous_tool_exposure_profile_id,
+                "previous_tool_exposure_profile_id",
+            )
+            if len(previous_tool_exposure_profile_id) > TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS:
+                raise ValueError(
+                    "previous_tool_exposure_profile_id cannot exceed "
+                    f"{TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS} characters."
+                )
         self._model_completion_recovery_context_factory = model_completion_recovery_context_factory
         self._reservation_identity_guard = (
             self._executor._run_limit_controller.reservation_identity_guard()
         )
         self._model_completion_publisher = model_completion_publisher
+        self._previous_tool_exposure_profile_id = previous_tool_exposure_profile_id
         contextual_limits = (
             *budget_limits_for_session(
                 policy=self._budget_policy,
@@ -5995,6 +6082,48 @@ class ModelStepRun:
         """Return the exact immutable profile resolved for this invocation."""
 
         return self._execution_profile
+
+    def _resolve_tool_exposure(
+        self,
+        *,
+        step: int,
+        transcript_cursor: int,
+    ) -> ResolvedToolExposure:
+        if self._initial_tool_exposure is not None:
+            exposure = self._initial_tool_exposure
+            self._initial_tool_exposure = None
+            return exposure
+        policy = self._registered_agent.tool_exposure_policy
+        if type(policy) is AllRegisteredToolsExposurePolicy:
+            # Preserve both the historical metadata bounds and the expose-all
+            # hot path: registration already validated this immutable snapshot.
+            return _all_registered_tool_exposure(self._registered_agent)
+        capability_ceiling = tuple(
+            capability.name for capability in self._registered_agent.tool_capabilities
+        )
+        request = ToolExposurePolicyRequest(
+            session_id=self._session.id,
+            agent_name=self._registered_agent.spec.name,
+            provider_name=self._registered_provider.name,
+            model=self._session.model,
+            step=step,
+            transcript_cursor=transcript_cursor,
+            registered_tools=self._registered_agent.tool_capabilities,
+            capability_ceiling=capability_ceiling,
+            previous_profile_id=self._previous_tool_exposure_profile_id,
+            metadata=self._request_metadata,
+        )
+        exposure = resolve_tool_exposure(policy, request)
+        if (
+            exposure.profile_id != ALL_REGISTERED_TOOLS_PROFILE_ID
+            and self._executor._secret_redactor.redact_text(exposure.profile_id)
+            != exposure.profile_id
+        ):
+            raise ValueError(
+                "Tool exposure profile_id contains a workload secret and cannot become "
+                "provider or durable execution authority."
+            )
+        return exposure
 
     async def _abandon_pre_dispatch_model_stage(
         self,
@@ -6102,6 +6231,11 @@ class ModelStepRun:
             raise ValueError("source_transcript_cursor must be >= 0.")
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
+        tool_exposure = self._resolve_tool_exposure(
+            step=step,
+            transcript_cursor=source_transcript_cursor,
+        )
+        self._previous_tool_exposure_profile_id = tool_exposure.profile_id
         context_messages: list[Message]
         context_operation_events: list[Event] = []
         published_compaction_attempt_ids: set[str] = set()
@@ -6193,9 +6327,16 @@ class ModelStepRun:
                     structured_output=self._structured_output,
                     thinking=self._thinking,
                     step=step,
+                    tool_exposure=tool_exposure,
                 ),
-                count_input_tokens=self._context_input_token_counter(step=step),
-                build_cache_prefix_request=self._cache_prefix_request_builder(step=step),
+                count_input_tokens=self._context_input_token_counter(
+                    step=step,
+                    tool_exposure=tool_exposure,
+                ),
+                build_cache_prefix_request=self._cache_prefix_request_builder(
+                    step=step,
+                    tool_exposure=tool_exposure,
+                ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
                 publish_knowledge_search_telemetry=publish_knowledge_search_telemetry,
@@ -6319,6 +6460,7 @@ class ModelStepRun:
             structured_output=self._structured_output,
             thinking=self._thinking,
             step=step,
+            tool_exposure=tool_exposure,
         )
         request_events = self._execute_request(
             model_request=model_request,
@@ -6327,6 +6469,7 @@ class ModelStepRun:
             source_transcript_cursor=source_transcript_cursor,
             model_step_identity=model_step_identity,
             request_variant=request_variant,
+            tool_exposure=tool_exposure,
         )
         try:
             async for event, outcome in request_events:
@@ -6343,7 +6486,13 @@ class ModelStepRun:
         source_transcript_cursor: int | None = None,
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant = RequestVariant.INITIAL,
+        tool_exposure: ResolvedToolExposure | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        tool_exposure = (
+            _all_registered_tool_exposure(self._registered_agent)
+            if tool_exposure is None
+            else _require_frozen_tool_exposure(tool_exposure)
+        )
         if source_transcript_cursor is None:
             source_transcript_cursor = len(messages)
         elif type(source_transcript_cursor) is not int:
@@ -6595,6 +6744,11 @@ class ModelStepRun:
                     billing_identity,
                     pending_reservations,
                 )
+                if recovery_context is not None:
+                    recovery_context = recovery_context.model_copy(
+                        update={"tool_exposure": resolved_tool_exposure_authority(tool_exposure)},
+                        deep=True,
+                    )
                 if (
                     recovery_context is not None
                     and type(recovery_context) is not ModelCompletionRecoveryContext
@@ -6730,6 +6884,7 @@ class ModelStepRun:
                 else None
             ),
             model_completion_publisher=self._model_completion_publisher,
+            tool_exposure=tool_exposure,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -6914,6 +7069,7 @@ class ModelStepRun:
         ]
         | None,
         model_completion_publisher: ModelCompletionPublisher | None,
+        tool_exposure: ResolvedToolExposure,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
@@ -6974,6 +7130,7 @@ class ModelStepRun:
                 prepare_model_completion_dispatch=prepare_model_completion_dispatch,
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=self._execution_profile,
+                tool_exposure=tool_exposure,
             )
 
         attempt_events = run_attempt(
@@ -7093,9 +7250,16 @@ class ModelStepRun:
                     structured_output=self._structured_output,
                     thinking=self._thinking,
                     step=step,
+                    tool_exposure=tool_exposure,
                 ),
-                count_input_tokens=self._context_input_token_counter(step=step),
-                build_cache_prefix_request=self._cache_prefix_request_builder(step=step),
+                count_input_tokens=self._context_input_token_counter(
+                    step=step,
+                    tool_exposure=tool_exposure,
+                ),
+                build_cache_prefix_request=self._cache_prefix_request_builder(
+                    step=step,
+                    tool_exposure=tool_exposure,
+                ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
                 publish_knowledge_search_telemetry=publish_knowledge_search_telemetry,
@@ -7257,6 +7421,7 @@ class ModelStepRun:
             structured_output=self._structured_output,
             thinking=self._thinking,
             step=step,
+            tool_exposure=tool_exposure,
         )
         yield (
             await self._executor._event_writer.emit(
@@ -8402,6 +8567,7 @@ class ModelStepRun:
         self,
         *,
         step: int,
+        tool_exposure: ResolvedToolExposure,
     ) -> Callable[[list[Message]], Awaitable[int | None]]:
         async def count_input_tokens(context_messages: list[Message]) -> int | None:
             request = await self._executor.build_request(
@@ -8412,6 +8578,7 @@ class ModelStepRun:
                 structured_output=self._structured_output,
                 thinking=self._thinking,
                 step=step,
+                tool_exposure=tool_exposure,
             )
             # Context-policy execution can await arbitrary application code.
             # Reject changed provider semantics at the final remote count seam.
@@ -8428,6 +8595,7 @@ class ModelStepRun:
         self,
         *,
         step: int,
+        tool_exposure: ResolvedToolExposure,
     ) -> Callable[[list[Message]], Awaitable[ModelRequest]]:
         async def build_cache_prefix_request(context_messages: list[Message]) -> ModelRequest:
             return await self._executor.build_request(
@@ -8438,6 +8606,7 @@ class ModelStepRun:
                 structured_output=self._structured_output,
                 thinking=self._thinking,
                 step=step,
+                tool_exposure=tool_exposure,
             )
 
         return build_cache_prefix_request
@@ -8838,7 +9007,7 @@ def _session_agent_spec(
 
 def _model_request_tools(
     *,
-    registered_agent: runtime_records.RegisteredAgentState,
+    tool_exposure: ResolvedToolExposure,
     structured_output: StructuredOutputSpec | None,
 ) -> list[dict[str, Any]]:
     """Build detached tool declarations shared by preflight and model dispatch."""
@@ -8847,9 +9016,9 @@ def _model_request_tools(
         {
             "name": tool.name,
             "description": tool.description,
-            "input_schema": deepcopy(tool.schema),
+            "input_schema": tool.input_schema_copy(),
         }
-        for tool in registered_agent.tools.values()
+        for tool in tool_exposure.tools
     ]
     if (
         structured_output is not None
@@ -8857,6 +9026,41 @@ def _model_request_tools(
     ):
         tools.append(structured_output_tool_spec(structured_output))
     return tools
+
+
+def _legacy_all_registered_tool_exposure_authority(
+    registered_agent: runtime_records.RegisteredAgentState,
+) -> ResolvedToolExposureAuthority:
+    """Reconstruct the expose-all authority for a pre-exposure recovery stage."""
+
+    return resolved_tool_exposure_authority(_all_registered_tool_exposure(registered_agent))
+
+
+def _require_frozen_tool_exposure(
+    exposure: ResolvedToolExposure,
+) -> ResolvedToolExposure:
+    """Accept only the exact immutable snapshot type without rehashing its catalog."""
+
+    if type(exposure) is not ResolvedToolExposure:
+        raise TypeError("tool_exposure must be a ResolvedToolExposure.")
+    return exposure
+
+
+def _all_registered_tool_exposure(
+    registered_agent: runtime_records.RegisteredAgentState,
+) -> ResolvedToolExposure:
+    """Build the compatibility snapshot for non-step portability preflight."""
+
+    cached = registered_agent.all_registered_tool_exposure
+    if cached is not None:
+        return _require_frozen_tool_exposure(cached)
+    capabilities = registered_agent.tool_capabilities
+    return ResolvedToolExposure(
+        profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+        tools=capabilities,
+        registered_count=len(capabilities),
+        ceiling_count=len(capabilities),
+    )
 
 
 def _model_request_messages(
@@ -8882,12 +9086,13 @@ def _context_pressure_overhead(
     structured_output: StructuredOutputSpec | None,
     thinking: ThinkingConfig | None,
     step: int,
+    tool_exposure: ResolvedToolExposure,
 ) -> ContextPressureOverhead:
     profile = copy_model_context_pressure_profile(
         registered_provider.provider.context_pressure_profile
     )
     tools = _model_request_tools(
-        registered_agent=registered_agent,
+        tool_exposure=tool_exposure,
         structured_output=structured_output,
     )
     structured_output_instruction: str | None = None

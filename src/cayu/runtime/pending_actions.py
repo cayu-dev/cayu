@@ -161,6 +161,7 @@ def pending_action_evidence_round_from_checkpoint(
         environment_name=candidate.environment_name,
         task_id=candidate.task_id,
         execution_profile_fingerprint=candidate.execution_profile_fingerprint,
+        tool_exposure=candidate.tool_exposure,
         tool_calls=candidate.tool_calls,
         policy_state="planned",
         policy_context_version=1,

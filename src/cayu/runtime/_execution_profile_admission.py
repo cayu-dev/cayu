@@ -184,6 +184,29 @@ def resolve_execution_profile_identity(
         registered_agent.tool_policy_execution_profile_identity is not None
     )
 
+    # Preserve the historical expose-all profile byte-for-byte. Any other
+    # exposure policy changes provider-visible behavior and therefore belongs
+    # in the existing execution-policies identity component.
+    from cayu.runtime.tool_exposure import AllRegisteredToolsExposurePolicy
+
+    tool_exposure_policy_entry: dict[str, Any] | None = None
+    if type(registered_agent.tool_exposure_policy) is not AllRegisteredToolsExposurePolicy:
+        tool_exposure_policy_entry, exposure_policy_process_local = _behavior_identity_material(
+            identity=(registered_agent.tool_exposure_policy_execution_profile_identity),
+            value=registered_agent.tool_exposure_policy,
+            runtime_version=runtime_version,
+            process_identity=process_identity,
+            slot="tool-exposure-policy",
+            cayu_owned_material=_secret_safe_cayu_owned_material(
+                _cayu_policy_material(registered_agent.tool_exposure_policy),
+                redactor=redactor,
+            ),
+        )
+        execution_policies_process_local |= exposure_policy_process_local
+        execution_policies_application_versioned |= (
+            registered_agent.tool_exposure_policy_execution_profile_identity is not None
+        )
+
     combined_loop_policies = (*loop_policies, *registered_agent.loop_policies)
     combined_loop_identities = (
         *loop_policy_identities,
@@ -373,6 +396,11 @@ def resolve_execution_profile_identity(
             "tool_policy": tool_policy_entry,
             "command_policies": command_policy_material,
             "loop_policies": loop_policy_material,
+            **(
+                {}
+                if tool_exposure_policy_entry is None
+                else {"tool_exposure_policy": tool_exposure_policy_entry}
+            ),
         },
         execution_policies_process_local=execution_policies_process_local,
         execution_policies_application_versioned=execution_policies_application_versioned,
@@ -786,6 +814,10 @@ def _cayu_runner_material(runner: object) -> dict[str, Any] | None:
 
 @lru_cache(maxsize=1)
 def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMaterialExtractor]:
+    from cayu.runtime.tool_exposure import (
+        AllRegisteredToolsExposurePolicy,
+        StaticToolExposurePolicy,
+    )
     from cayu.runtime.tool_policy import (
         AllowAllToolPolicy,
         AlwaysRequireApprovalToolPolicy,
@@ -804,6 +836,8 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
         TaintAwareToolPolicy,
         ProcessCommandPolicy,
         GitCommandPolicy,
+        AllRegisteredToolsExposurePolicy,
+        StaticToolExposurePolicy,
     )
     return {policy_type: policy_type._execution_profile_material for policy_type in policy_types}
 

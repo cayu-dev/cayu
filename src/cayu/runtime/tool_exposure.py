@@ -31,7 +31,7 @@ from cayu.core.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
-from cayu.core.tools import ToolEffect
+from cayu.core.tools import ToolEffect, ToolResult
 
 TOOL_EXPOSURE_SCHEMA_VERSION = 1
 TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS = 256
@@ -40,6 +40,7 @@ TOOL_EXPOSURE_MAX_CATALOG_BYTES = 32 * 1024 * 1024
 TOOL_EXPOSURE_METADATA_MAX_ENTRIES = 64
 TOOL_EXPOSURE_METADATA_MAX_BYTES = 4 * 1024
 ALL_REGISTERED_TOOLS_PROFILE_ID = "cayu:all-registered-tools:v1"
+NOT_EXPOSED_IN_REQUEST_REASON = "not_exposed_in_request"
 
 
 def _sha256_durable_json(value: Any, field_name: str) -> str:
@@ -474,6 +475,156 @@ class ResolvedToolExposure(BaseModel):
     @property
     def tool_names(self) -> tuple[str, ...]:
         return tuple(tool.name for tool in self.tools)
+
+
+class ResolvedToolExposureAuthority(BaseModel):
+    """Compact durable authority derived from one resolved request snapshot."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = TOOL_EXPOSURE_SCHEMA_VERSION
+    profile_id: str
+    tool_names: tuple[str, ...]
+    registered_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    ceiling_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @field_validator("profile_id")
+    @classmethod
+    def validate_profile_id(cls, value: str) -> str:
+        return _validate_profile_id(value)
+
+    @field_validator("tool_names", mode="before")
+    @classmethod
+    def copy_tool_names(cls, value: object) -> tuple[Any, ...]:
+        return _copy_bounded_sequence(
+            value,
+            field_name="tool_names",
+            max_items=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
+        )
+
+    @field_validator("tool_names")
+    @classmethod
+    def validate_tool_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        names = tuple(
+            _validate_tool_name(name, f"tool_names[{index}]") for index, name in enumerate(value)
+        )
+        if len(names) != len(set(names)):
+            raise ValueError("tool_names must contain unique tool names.")
+        return names
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> ResolvedToolExposureAuthority:
+        if self.ceiling_count > self.registered_count:
+            raise ValueError("ceiling_count cannot exceed registered_count.")
+        if len(self.tool_names) > self.ceiling_count:
+            raise ValueError("tool_names cannot exceed the capability ceiling.")
+        return self
+
+
+def resolved_tool_exposure_authority(
+    exposure: ResolvedToolExposure,
+) -> ResolvedToolExposureAuthority:
+    """Project a resolved descriptor snapshot into compact durable authority."""
+
+    if type(exposure) is not ResolvedToolExposure:
+        raise TypeError("exposure must be a ResolvedToolExposure.")
+    return ResolvedToolExposureAuthority(
+        profile_id=exposure.profile_id,
+        tool_names=exposure.tool_names,
+        registered_count=exposure.registered_count,
+        ceiling_count=exposure.ceiling_count,
+        fingerprint=exposure.fingerprint,
+    )
+
+
+def copy_resolved_tool_exposure_authority(
+    authority: ResolvedToolExposureAuthority,
+) -> ResolvedToolExposureAuthority:
+    """Return a detached, fully revalidated durable exposure authority."""
+
+    if type(authority) is not ResolvedToolExposureAuthority:
+        raise TypeError("authority must be a ResolvedToolExposureAuthority.")
+    return ResolvedToolExposureAuthority.model_validate(authority.model_dump(mode="python"))
+
+
+def validate_resolved_tool_exposure_authority(
+    authority: ResolvedToolExposureAuthority,
+    registered_tools: tuple[RegisteredToolCapability, ...],
+) -> ResolvedToolExposureAuthority:
+    """Bind compact durable authority back to the current registered catalog."""
+
+    copied, _reconstructed = _bind_resolved_tool_exposure_authority(
+        authority,
+        registered_tools,
+    )
+    return copied
+
+
+def resolved_tool_exposure_from_authority(
+    authority: ResolvedToolExposureAuthority,
+    registered_tools: tuple[RegisteredToolCapability, ...],
+) -> ResolvedToolExposure:
+    """Reconstruct one validated frozen snapshot from compact durable authority."""
+
+    _copied, reconstructed = _bind_resolved_tool_exposure_authority(
+        authority,
+        registered_tools,
+    )
+    return reconstructed
+
+
+def _bind_resolved_tool_exposure_authority(
+    authority: ResolvedToolExposureAuthority,
+    registered_tools: tuple[RegisteredToolCapability, ...],
+) -> tuple[ResolvedToolExposureAuthority, ResolvedToolExposure]:
+    """Return detached authority and its catalog-bound descriptor snapshot."""
+
+    copied = copy_resolved_tool_exposure_authority(authority)
+    capabilities = _copy_capability_sequence(registered_tools, "registered_tools")
+    if copied.registered_count != len(capabilities):
+        raise ValueError("Tool exposure authority conflicts with the registered tool count.")
+    selected_names = frozenset(copied.tool_names)
+    selected_tools = tuple(tool for tool in capabilities if tool.name in selected_names)
+    if tuple(tool.name for tool in selected_tools) != copied.tool_names:
+        raise ValueError("Tool exposure authority conflicts with registered tool order.")
+    reconstructed = ResolvedToolExposure(
+        profile_id=copied.profile_id,
+        tools=selected_tools,
+        registered_count=copied.registered_count,
+        ceiling_count=copied.ceiling_count,
+    )
+    if reconstructed.fingerprint != copied.fingerprint:
+        raise ValueError("Tool exposure authority conflicts with registered definitions.")
+    return copied, reconstructed
+
+
+def copy_resolved_tool_exposure(
+    exposure: ResolvedToolExposure,
+) -> ResolvedToolExposure:
+    """Return a detached, fully revalidated exposure snapshot."""
+
+    if type(exposure) is not ResolvedToolExposure:
+        raise TypeError("exposure must be a ResolvedToolExposure.")
+    return ResolvedToolExposure.model_validate(exposure.model_dump(mode="python"))
+
+
+def unexposed_tool_result() -> ToolResult:
+    """Build the fixed provider-facing failure for a call absent from a request."""
+
+    return ToolResult(
+        content="Tool unavailable for this model request.",
+        is_error=True,
+    )
 
 
 class ToolExposurePolicy(ABC):
