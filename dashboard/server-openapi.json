@@ -2742,6 +2742,16 @@
             ],
             "title": "Result"
           },
+          "retry_series": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApiTaskRetrySeries"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "session_id": {
             "anyOf": [
               {
@@ -2839,6 +2849,7 @@
           "created_at",
           "updated_at",
           "completed_at",
+          "retry_series",
           "invocation",
           "input",
           "result",
@@ -2967,6 +2978,16 @@
             ],
             "title": "Parent Task Id"
           },
+          "retry_series": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApiTaskRetrySeries"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "session_id": {
             "anyOf": [
               {
@@ -3052,9 +3073,217 @@
           "lease_expires_at",
           "created_at",
           "updated_at",
-          "completed_at"
+          "completed_at",
+          "retry_series"
         ],
         "title": "ApiTaskListItem",
+        "type": "object"
+      },
+      "ApiTaskRetryPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "backoff_multiplier": {
+            "minimum": 1.0,
+            "title": "Backoff Multiplier",
+            "type": "number"
+          },
+          "cost_currency": {
+            "title": "Cost Currency",
+            "type": "string"
+          },
+          "initial_backoff_seconds": {
+            "minimum": 0.0,
+            "title": "Initial Backoff Seconds",
+            "type": "number"
+          },
+          "max_attempts": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Max Attempts",
+            "type": "integer"
+          },
+          "max_backoff_seconds": {
+            "minimum": 0.0,
+            "title": "Max Backoff Seconds",
+            "type": "number"
+          },
+          "max_elapsed_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Elapsed Seconds"
+          },
+          "max_estimated_cost": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Estimated Cost"
+          },
+          "max_total_tokens": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Total Tokens"
+          }
+        },
+        "required": [
+          "max_attempts",
+          "max_elapsed_seconds",
+          "max_total_tokens",
+          "max_estimated_cost",
+          "cost_currency",
+          "initial_backoff_seconds",
+          "backoff_multiplier",
+          "max_backoff_seconds"
+        ],
+        "title": "ApiTaskRetryPolicy",
+        "type": "object"
+      },
+      "ApiTaskRetrySeries": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "attempts_remaining": {
+            "maximum": 99.0,
+            "minimum": 0.0,
+            "title": "Attempts Remaining",
+            "type": "integer"
+          },
+          "causal_budget_id": {
+            "title": "Causal Budget Id",
+            "type": "string"
+          },
+          "cumulative_estimated_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Cumulative Estimated Cost",
+            "type": "string"
+          },
+          "cumulative_tokens": {
+            "title": "Cumulative Tokens",
+            "type": "string"
+          },
+          "disposition": {
+            "title": "Disposition",
+            "type": "string"
+          },
+          "elapsed_deadline": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Deadline"
+          },
+          "estimated_cost_remaining": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost Remaining"
+          },
+          "next_eligible_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Eligible At"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ApiTaskRetryPolicy"
+          },
+          "predecessor_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Predecessor Task Id"
+          },
+          "series_id": {
+            "title": "Series Id",
+            "type": "string"
+          },
+          "started_at": {
+            "title": "Started At",
+            "type": "string"
+          },
+          "successor_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Successor Task Id"
+          },
+          "tokens_remaining": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens Remaining"
+          }
+        },
+        "required": [
+          "series_id",
+          "causal_budget_id",
+          "attempt",
+          "policy",
+          "started_at",
+          "cumulative_tokens",
+          "cumulative_estimated_cost",
+          "attempts_remaining",
+          "tokens_remaining",
+          "estimated_cost_remaining",
+          "elapsed_deadline",
+          "disposition",
+          "predecessor_task_id",
+          "successor_task_id",
+          "next_eligible_at"
+        ],
+        "title": "ApiTaskRetrySeries",
         "type": "object"
       },
       "ApiTaskTopologyChildBranch": {
@@ -10580,7 +10809,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "14",
+            "default": "15",
             "title": "Contract Version",
             "type": "string"
           },
@@ -14228,7 +14457,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "14",
+            "default": "15",
             "title": "Contract Version",
             "type": "string"
           }

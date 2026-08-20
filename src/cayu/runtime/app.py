@@ -1131,6 +1131,11 @@ class CayuApp:
         """Return a JSON-compatible value with configured secret values redacted."""
         return self._secret_redactor.redact_json(value)
 
+    def redact_uppercase_text(self, value: str) -> str:
+        """Redact text after the same uppercase normalization used by authorities."""
+
+        return self._secret_redactor.redact_uppercase_text(value)
+
     def stream_redacted_bytes(
         self,
         *,
@@ -3393,6 +3398,15 @@ class CayuApp:
         if self.task_store is None:
             raise RuntimeError("task_store is required to create tasks.")
         request = copy_task_create(request)
+        if (
+            request.retry_policy is not None
+            and self._secret_redactor.redact_uppercase_text(request.retry_policy.cost_currency)
+            != request.retry_policy.cost_currency
+        ):
+            raise ValueError(
+                "Task retry cost currency contains a workload secret and cannot be used "
+                "as durable accounting authority."
+            )
         for origin in (request.invocation_origin, request._verified_invocation_origin):
             if origin is None:
                 continue
@@ -3417,6 +3431,10 @@ class CayuApp:
         if request.available_at is not None and not self.task_store.supports_delayed_availability:
             raise NotImplementedError(
                 f"{type(self.task_store).__name__} does not support delayed task availability."
+            )
+        if request.retry_policy is not None and not self.task_store.supports_task_retry_series:
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support task retry series."
             )
         return await self.task_store.create_task(request)
 

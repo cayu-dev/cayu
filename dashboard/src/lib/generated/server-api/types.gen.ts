@@ -1396,6 +1396,7 @@ export type ApiTaskDetail = {
     result: {
         [key: string]: unknown;
     } | null;
+    retry_series: ApiTaskRetrySeries | null;
     /**
      * Session Id
      */
@@ -1492,6 +1493,7 @@ export type ApiTaskListItem = {
      * Parent Task Id
      */
     parent_task_id: string | null;
+    retry_series: ApiTaskRetrySeries | null;
     /**
      * Session Id
      */
@@ -1526,6 +1528,107 @@ export type ApiTaskListItem = {
      * Worker Id
      */
     worker_id: string | null;
+};
+
+/**
+ * ApiTaskRetryPolicy
+ */
+export type ApiTaskRetryPolicy = {
+    /**
+     * Backoff Multiplier
+     */
+    backoff_multiplier: number;
+    /**
+     * Cost Currency
+     */
+    cost_currency: string;
+    /**
+     * Initial Backoff Seconds
+     */
+    initial_backoff_seconds: number;
+    /**
+     * Max Attempts
+     */
+    max_attempts: number;
+    /**
+     * Max Backoff Seconds
+     */
+    max_backoff_seconds: number;
+    /**
+     * Max Elapsed Seconds
+     */
+    max_elapsed_seconds: number | null;
+    /**
+     * Max Estimated Cost
+     */
+    max_estimated_cost: string | null;
+    /**
+     * Max Total Tokens
+     */
+    max_total_tokens: string | null;
+};
+
+/**
+ * ApiTaskRetrySeries
+ */
+export type ApiTaskRetrySeries = {
+    /**
+     * Attempt
+     */
+    attempt: number;
+    /**
+     * Attempts Remaining
+     */
+    attempts_remaining: number;
+    /**
+     * Causal Budget Id
+     */
+    causal_budget_id: string;
+    /**
+     * Cumulative Estimated Cost
+     */
+    cumulative_estimated_cost: string;
+    /**
+     * Cumulative Tokens
+     */
+    cumulative_tokens: string;
+    /**
+     * Disposition
+     */
+    disposition: string;
+    /**
+     * Elapsed Deadline
+     */
+    elapsed_deadline: string | null;
+    /**
+     * Estimated Cost Remaining
+     */
+    estimated_cost_remaining: string | null;
+    /**
+     * Next Eligible At
+     */
+    next_eligible_at: string | null;
+    policy: ApiTaskRetryPolicy;
+    /**
+     * Predecessor Task Id
+     */
+    predecessor_task_id: string | null;
+    /**
+     * Series Id
+     */
+    series_id: string;
+    /**
+     * Started At
+     */
+    started_at: string;
+    /**
+     * Successor Task Id
+     */
+    successor_task_id: string | null;
+    /**
+     * Tokens Remaining
+     */
+    tokens_remaining: string | null;
 };
 
 /**

@@ -554,6 +554,68 @@ export function TasksPage() {
                     </div>
                   </div>
                 </div>
+                {selectedTask.retry_series && (
+                  <div className="rounded-md border border-border bg-muted/40 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        Retry series
+                      </span>
+                      <Badge variant="outline">{selectedTask.retry_series.disposition}</Badge>
+                    </div>
+                    <div className="grid gap-1.5 text-xs">
+                      <div className="flex justify-between gap-3">
+                        <span className="text-muted-foreground">Attempt</span>
+                        <span>
+                          {selectedTask.retry_series.attempt} /{" "}
+                          {selectedTask.retry_series.policy.max_attempts}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-3">
+                        <span className="text-muted-foreground">Attempts remaining</span>
+                        <span>{selectedTask.retry_series.attempts_remaining}</span>
+                      </div>
+                      <div className="flex justify-between gap-3">
+                        <span className="text-muted-foreground">Causal budget</span>
+                        <span
+                          className="max-w-48 truncate font-mono"
+                          title={selectedTask.retry_series.causal_budget_id}
+                        >
+                          {selectedTask.retry_series.causal_budget_id}
+                        </span>
+                      </div>
+                      {selectedTask.retry_series.tokens_remaining != null && (
+                        <div className="flex justify-between gap-3">
+                          <span className="text-muted-foreground">Tokens remaining</span>
+                          <span>{selectedTask.retry_series.tokens_remaining}</span>
+                        </div>
+                      )}
+                      {selectedTask.retry_series.estimated_cost_remaining != null && (
+                        <div className="flex justify-between gap-3">
+                          <span className="text-muted-foreground">Cost remaining</span>
+                          <span>
+                            {selectedTask.retry_series.estimated_cost_remaining}{" "}
+                            {selectedTask.retry_series.policy.cost_currency}
+                          </span>
+                        </div>
+                      )}
+                      {selectedTask.retry_series.next_eligible_at && (
+                        <div className="flex justify-between gap-3">
+                          <span className="text-muted-foreground">Next eligible</span>
+                          <span>{formatDateTime(selectedTask.retry_series.next_eligible_at)}</span>
+                        </div>
+                      )}
+                      {selectedTask.retry_series.elapsed_deadline && (
+                        <div className="flex justify-between gap-3">
+                          <span className="text-muted-foreground">Series deadline</span>
+                          <span>{formatDateTime(selectedTask.retry_series.elapsed_deadline)}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="mt-2 truncate font-mono text-[11px] text-muted-foreground">
+                      {selectedTask.retry_series.series_id}
+                    </div>
+                  </div>
+                )}
                 <div className="flex items-start justify-between gap-3">
                   <span className="text-muted-foreground">Created</span>
                   <span className="text-right text-xs">

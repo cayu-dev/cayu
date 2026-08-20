@@ -18,6 +18,7 @@ from cayu.runtime.tasks import (
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
     TaskOrder,
+    TaskRetrySeriesSnapshot,
     TaskStatus,
     TaskTopologyInconsistent,
     TaskTopologyNode,
@@ -236,7 +237,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at TIMESTAMPTZ NOT NULL,
         started_at TIMESTAMPTZ,
         completed_at TIMESTAMPTZ,
-        invocation JSONB NOT NULL
+        invocation JSONB NOT NULL,
+        retry_series JSONB
     )
     """,
     """
@@ -247,6 +249,16 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         worker_id TEXT NOT NULL,
         terminal_kind TEXT NOT NULL,
         task_json JSONB NOT NULL,
+        committed_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (task_id, idempotency_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_task_retry_settlements (
+        task_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        receipt_json JSONB NOT NULL,
         committed_at TIMESTAMPTZ NOT NULL,
         PRIMARY KEY (task_id, idempotency_key)
     )
@@ -591,6 +603,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         to_utc_optional(task.started_at),
         to_utc_optional(task.completed_at),
         _dumps(task.invocation.model_dump(mode="json")),
+        (None if task.retry_series is None else _dumps(task.retry_series.model_dump(mode="json"))),
     )
 
 
@@ -598,7 +611,7 @@ TASK_COLUMNS = (
     "id, type, title, description, status, session_id, parent_task_id, "
     "assigned_agent_name, available_at, worker_id, lease_expires_at, status_reason, "
     "status_payload, input, result, error, metadata, created_at, updated_at, started_at, "
-    "completed_at, invocation"
+    "completed_at, invocation, retry_series"
 )
 
 
@@ -626,6 +639,9 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         started_at=to_utc_optional(row[19]),
         completed_at=to_utc_optional(row[20]),
         invocation=TaskInvocation.model_validate(_loads(row[21])),
+        retry_series=(
+            None if row[22] is None else TaskRetrySeriesSnapshot.model_validate(_loads(row[22]))
+        ),
     )
 
 

@@ -259,6 +259,10 @@ REVISIONS: tuple[Revision, ...] = (
     # Canonical revision-43 knowledge is preserved, while pre-identity vector
     # rows are rebuildable derived data and are deliberately discarded.
     Revision(revision=44, kind=RevisionKind.BREAKING, compatible_from=44),
+    # Retry-series workers persist cumulative authority on every attempt and
+    # atomically create delayed successors with an immutable settlement receipt.
+    # Older task workers would ignore that authority and could renew the series.
+    Revision(revision=45, kind=RevisionKind.BREAKING, compatible_from=45),
 )
 
 #: The revision an empty database is initialized to.

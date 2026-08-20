@@ -119,6 +119,18 @@ class SecretRedactor:
             raise TypeError("SecretRedactor.is_exact_secret expects a string.")
         return value in self._values
 
+    def redact_uppercase_text(self, value: str) -> str:
+        """Redact text against uppercase-normalized registered secret values."""
+
+        if type(value) is not str:
+            raise TypeError("SecretRedactor.redact_uppercase_text expects a string.")
+        if not self._values:
+            return value
+        normalized = SecretRedactor._from_values(
+            tuple(sorted({secret.upper() for secret in self._values}, key=len, reverse=True))
+        )
+        return normalized.redact_text(value)
+
     def redact_text(self, value: str) -> str:
         if type(value) is not str:
             raise TypeError("SecretRedactor.redact_text expects a string.")

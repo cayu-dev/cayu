@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     StrictStr,
     StringConstraints,
@@ -1773,6 +1774,35 @@ class SessionTranscriptResponse(ApiBaseModel):
     total_messages: StrictInt = Field(ge=0)
 
 
+class ApiTaskRetryPolicy(ApiBaseModel):
+    max_attempts: StrictInt = Field(ge=1, le=100)
+    max_elapsed_seconds: StrictFloat | None
+    max_total_tokens: StrictStr | None
+    max_estimated_cost: Decimal | None = Field(gt=0)
+    cost_currency: str
+    initial_backoff_seconds: StrictFloat = Field(ge=0)
+    backoff_multiplier: StrictFloat = Field(ge=1)
+    max_backoff_seconds: StrictFloat = Field(ge=0)
+
+
+class ApiTaskRetrySeries(ApiBaseModel):
+    series_id: str
+    causal_budget_id: str
+    attempt: StrictInt = Field(ge=1, le=100)
+    policy: ApiTaskRetryPolicy
+    started_at: str
+    cumulative_tokens: StrictStr
+    cumulative_estimated_cost: Decimal = Field(ge=0)
+    attempts_remaining: StrictInt = Field(ge=0, le=99)
+    tokens_remaining: StrictStr | None
+    estimated_cost_remaining: Decimal | None = Field(ge=0)
+    elapsed_deadline: str | None
+    disposition: str
+    predecessor_task_id: str | None
+    successor_task_id: str | None
+    next_eligible_at: str | None
+
+
 class ApiTaskListItem(ApiBaseModel):
     id: str
     type: str
@@ -1790,6 +1820,7 @@ class ApiTaskListItem(ApiBaseModel):
     created_at: str
     updated_at: str
     completed_at: str | None
+    retry_series: ApiTaskRetrySeries | None
 
 
 class ApiTaskInvocation(ApiBaseModel):

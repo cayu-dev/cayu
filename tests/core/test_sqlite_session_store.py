@@ -2056,7 +2056,7 @@ def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 45"):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
@@ -2632,6 +2632,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
         "invocation_json",
+        "retry_series_json",
     }.issubset(task_columns)
     # The explicit catalog guards compatibility-floor regressions as new
     # additive and breaking revisions are appended.
@@ -2681,6 +2682,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (42, 42),
         (43, 43),
         (44, 44),
+        (45, 45),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

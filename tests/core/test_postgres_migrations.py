@@ -299,6 +299,7 @@ _TABLES = (
     "cayu_knowledge_index_readiness_events",
     "cayu_budget_settlements",
     "cayu_budget_reservations",
+    "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
@@ -1035,6 +1036,30 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 41"
             )
             assert await cur.fetchone() == ("breaking", 41)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 42"
+            )
+            assert await cur.fetchone() == ("breaking", 42)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 43"
+            )
+            assert await cur.fetchone() == ("breaking", 43)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 44"
+            )
+            assert await cur.fetchone() == ("breaking", 44)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 45"
+            )
+            assert await cur.fetchone() == ("breaking", 45)
+            await cur.execute(
+                "SELECT data_type, is_nullable FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_tasks' AND column_name = 'retry_series'"
+            )
+            assert await cur.fetchone() == ("jsonb", "YES")
+            await cur.execute("SELECT to_regclass('cayu_task_retry_settlements')")
+            assert (await cur.fetchone())[0] == "cayu_task_retry_settlements"
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

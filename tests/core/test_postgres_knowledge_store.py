@@ -4112,7 +4112,7 @@ def test_postgres_revision_44_preserves_canonical_knowledge_and_rebuilds_derived
                 )
                 """
             )
-            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 44")
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 44")
             await conn.commit()
 
         session_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)

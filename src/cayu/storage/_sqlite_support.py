@@ -35,6 +35,7 @@ from cayu.runtime.tasks import (
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
     TaskOrder,
+    TaskRetrySeriesSnapshot,
     TaskStatus,
     TaskTopologyInconsistent,
     TaskTopologyNode,
@@ -385,7 +386,8 @@ _BASELINE_DDL = """
         updated_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
-        invocation_json TEXT NOT NULL
+        invocation_json TEXT NOT NULL,
+        retry_series_json TEXT
     );
 
     CREATE TABLE IF NOT EXISTS cayu_task_terminalization_receipts (
@@ -395,6 +397,15 @@ _BASELINE_DDL = """
         worker_id TEXT NOT NULL,
         terminal_kind TEXT NOT NULL,
         task_json TEXT NOT NULL,
+        committed_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, idempotency_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS cayu_task_retry_settlements (
+        task_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        receipt_json TEXT NOT NULL,
         committed_at TEXT NOT NULL,
         PRIMARY KEY (task_id, idempotency_key)
     );
@@ -741,6 +752,16 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_knowledge_impact_targets(impact_target, entry_id);
         CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_chunks_entry_index
             ON cayu_knowledge_chunks(entry_id, chunk_index);
+    """,
+    45: """
+        CREATE TABLE IF NOT EXISTS cayu_task_retry_settlements (
+            task_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            committed_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, idempotency_key)
+        );
     """,
     8: """
         CREATE TABLE IF NOT EXISTS cayu_budget_reservations (
@@ -1927,6 +1948,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ("cayu_tasks", "status_reason", "TEXT"),
         ("cayu_tasks", "status_payload_json", "TEXT"),
     ),
+    45: (("cayu_tasks", "retry_series_json", "TEXT"),),
     14: (
         (
             "cayu_sessions",
@@ -3003,6 +3025,8 @@ def reconcile_schema(
         _validate_task_invocation_column(connection)
     if app_min_supported >= 41:
         _validate_knowledge_publication_access_snapshot_column(connection)
+    if app_min_supported >= 45:
+        _validate_task_retry_series_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -3845,6 +3869,33 @@ def _validate_task_invocation_column(connection: sqlite3.Connection) -> None:
         )
 
 
+def _validate_task_retry_series_schema(connection: sqlite3.Connection) -> None:
+    task_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_tasks)")
+    }
+    receipt_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_task_retry_settlements)")
+    )
+    expected_receipt_columns = (
+        ("task_id", "TEXT", 1, 1),
+        ("idempotency_key", "TEXT", 1, 2),
+        ("request_sha256", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+        ("committed_at", "TEXT", 1, 0),
+    )
+    if (
+        task_columns.get("retry_series_json") != ("TEXT", 0)
+        or receipt_columns != expected_receipt_columns
+    ):
+        raise RuntimeError(
+            "SQLite task retry-series schema conflicts with Cayu's revision-45 "
+            "durability contract. Run `cayu storage migrate` or restore the "
+            "database from a known-good backup."
+        )
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     reconcile_schema(connection, schema.SchemaMode.CREATE)
 
@@ -4112,6 +4163,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_43_knowledge_schema(connection)
         if rev.revision == 44:
             _validate_revision_44_knowledge_schema(connection)
+        if rev.revision == 45:
+            _validate_task_retry_series_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
@@ -4276,6 +4329,11 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         format_optional_datetime(task.started_at),
         format_optional_datetime(task.completed_at),
         json_dumps(task.invocation.model_dump(mode="json")),
+        (
+            None
+            if task.retry_series is None
+            else json_dumps(task.retry_series.model_dump(mode="json"))
+        ),
     )
 
 
@@ -4306,6 +4364,11 @@ def task_from_row(row: sqlite3.Row) -> Task:
         started_at=parse_optional_datetime(row["started_at"]),
         completed_at=parse_optional_datetime(row["completed_at"]),
         invocation=TaskInvocation.model_validate(json.loads(row["invocation_json"])),
+        retry_series=(
+            None
+            if row["retry_series_json"] is None
+            else TaskRetrySeriesSnapshot.model_validate(json.loads(row["retry_series_json"]))
+        ),
     )
 
 

@@ -136,6 +136,38 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
     assert observed_heartbeats == [("task-1", "worker-a", 1, pytest.approx(1 / 3))]
 
 
+def test_handler_may_finish_cleanup_after_terminalizing_its_task() -> None:
+    async def scenario() -> None:
+        store = InMemoryTaskStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="terminal-cleanup", type="job"))
+        cleanup_finished = asyncio.Event()
+
+        async def handler(_app: CayuApp, task: Task, worker_id: str) -> None:
+            await store.complete_task(task.id, {"ok": True}, worker_id=worker_id)
+            await asyncio.sleep(0.5)
+            cleanup_finished.set()
+
+        assert (
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="worker-a",
+                lease_seconds=1,
+                poll_interval_s=0.01,
+                max_tasks=1,
+            )
+            == 1
+        )
+        assert cleanup_finished.is_set()
+        terminal = await store.load_task("terminal-cleanup")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.COMPLETED
+
+    asyncio.run(scenario())
+
+
 async def _run_handler(app: CayuApp, task: Task, worker_id: str) -> None:
     async for _event in app.run(
         RunRequest(

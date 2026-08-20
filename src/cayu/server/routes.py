@@ -3144,7 +3144,7 @@ def _serialize_transcript_message(
 
 
 def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
-    return _redact_control_plane_values(
+    projected = _redact_control_plane_values(
         cayu_app,
         {
             "id": task.id,
@@ -3176,6 +3176,65 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
             "updated_at",
         },
         untrusted_container_fields={"status_payload"},
+    )
+    projected_status_payload = projected.get("status_payload")
+    if (
+        task.retry_series is not None
+        and type(task.status_payload) is dict
+        and type(projected_status_payload) is dict
+        and type(task.status_payload.get("cost_currency")) is str
+    ):
+        projected_status_payload["cost_currency"] = cayu_app.redact_uppercase_text(
+            task.status_payload["cost_currency"]
+        )
+    return {
+        **projected,
+        "retry_series": (
+            None if task.retry_series is None else _serialize_task_retry_series(cayu_app, task)
+        ),
+    }
+
+
+def _serialize_task_retry_series(cayu_app: Any, task: Task) -> dict[str, Any]:
+    series = task.retry_series
+    if series is None:
+        raise AssertionError("Task retry-series serialization requires retry authority.")
+    projected = series.model_dump(
+        mode="json",
+        warnings=False,
+        exclude={"authority_sha256"},
+    )
+    projected["causal_budget_id"] = cayu_app.project_causal_budget_id_for_exposure(
+        series.causal_budget_id,
+        session_ids=(),
+    )
+    projected["cumulative_tokens"] = str(series.cumulative_tokens)
+    projected["tokens_remaining"] = (
+        None if series.tokens_remaining is None else str(series.tokens_remaining)
+    )
+    projected_policy = projected["policy"]
+    if type(projected_policy) is not dict:
+        raise AssertionError("Task retry policy serialization returned a non-object.")
+    projected_policy["max_total_tokens"] = (
+        None if series.policy.max_total_tokens is None else str(series.policy.max_total_tokens)
+    )
+    projected_policy["cost_currency"] = cayu_app.redact_uppercase_text(series.policy.cost_currency)
+    return _redact_control_plane_values(
+        cayu_app,
+        projected,
+        "task.retry_series",
+        preserve_string_fields={
+            "cumulative_estimated_cost",
+            "cumulative_tokens",
+            "disposition",
+            "elapsed_deadline",
+            "estimated_cost_remaining",
+            "max_estimated_cost",
+            "max_total_tokens",
+            "next_eligible_at",
+            "started_at",
+            "tokens_remaining",
+        },
     )
 
 

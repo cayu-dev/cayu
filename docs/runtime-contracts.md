@@ -2638,7 +2638,7 @@ paused | blocked | needs_attention -> completed | failed | cancelled
 terminal statuses do not transition
 ```
 
-`paused`, `blocked`, and `needs_attention` are task-level orchestration states. They stop queue workers from claiming the task until trusted app code calls `resume_task(...)`. Held tasks can move directly among held states, so an app can escalate `blocked` to `needs_attention` without briefly returning the task to the claimable queue. They are not session pause states and they do not interrupt a live model loop. A running task that is already attached to a session cannot be moved into one of these held states through `TaskStore`; use session interruption/recovery for active model work instead. `status_reason` and `status_payload` describe the current held state and are cleared when the task resumes or becomes terminal.
+`paused`, `blocked`, and `needs_attention` are task-level orchestration states. They stop queue workers from claiming the task until trusted app code calls `resume_task(...)`. Held tasks can move directly among held states, so an app can escalate `blocked` to `needs_attention` without briefly returning the task to the claimable queue. They are not session pause states and they do not interrupt a live model loop. A running task that is already attached to a session cannot be moved into one of these held states through `TaskStore`; use session interruption/recovery for active model work instead. A retry-series attempt with a durable cancellation request also cannot enter a held state: its exact worker and lease remain authoritative until the dispatched handler is quiescent and the cancellation settlement commits. The first accepted cancellation request remains authoritative while draining and wins over a retry deadline that elapses afterward. `status_reason` and `status_payload` describe the current held state and are cleared when the task resumes or becomes terminal.
 
 `InMemoryTaskStore` exists for tests and examples. `SQLiteTaskStore` is the durable local implementation.
 
@@ -2660,6 +2660,135 @@ process may later resolve an approval or user-input request, resume the session,
 or run recovery; the existing session/task link then terminalizes the same task.
 Custom worker loops may call the store operation directly after establishing the
 same durable session boundary.
+
+An unattached queue task may instead opt into a runtime-owned retry series with
+`TaskCreate.retry_policy=TaskRetryPolicy(...)`. The policy requires a positive
+series-wide `max_attempts` and may bound cumulative elapsed seconds and the
+reported token/cost accounting used to decide successor eligibility. Reported
+accounting is not a reservation for arbitrary application-owned external calls;
+Cayu-governed model dispatches must also use the same `causal_budget_id` with
+ordinary run limits and priced budget reservations when hard pre-dispatch
+enforcement is required. The cost is normalized into `cost_currency` (USD by
+default), and every configured limit is strictly positive. The policy also defines bounded exponential
+backoff. Cayu mints one stable `series_id`; every attempt is a separate immutable
+task with a contiguous `retry_series.attempt`, predecessor/successor evidence,
+the original policy and start time, cumulative accounting, remaining
+successor-admission limits,
+and any `next_eligible_at`. The snapshot also carries one stable
+`causal_budget_id` for the complete series. Handlers must pass that identity to
+every `RunRequest` or child operation whose usage belongs to the attempt, so
+the ordinary budget ledger and run-limit machinery retain one authority across
+workers and retries rather than minting a fresh allowance. A delayed successor
+is an ordinary pending task and
+uses the existing store-authoritative availability gate. A process timer is
+never retry authority.
+
+Retry-series handlers return `TaskRetryAttemptReport` from `run_task_worker`.
+The report explicitly classifies the attempt as `succeeded`,
+`retryable_failure`, `non_retryable_failure`, or `cancelled`, supplies a stable
+idempotency key, and reports actual token/cost usage in the policy currency.
+Exceptions, exception
+types, messages, and opaque error payloads are never parsed to infer
+retryability: an exception or missing/unsupported handler result terminates the
+series as `non_retryable_failure` through the bounded task diagnostic boundary.
+Retry-series tasks cannot use the generic task/session terminalization path;
+the handler may run child/session work, but must return the explicit report to
+settle its task attempt.
+
+`settle_task_retry_attempt(...)` is one store-atomic operation. It claim- and
+lease-fences the active attempt, terminalizes it without rewriting prior
+attempts, updates cumulative accounting, and either creates exactly one
+deterministically identified delayed successor or records one terminal series
+disposition: `succeeded`, `non_retryable_failure`, `cancelled`,
+`attempts_exhausted`, `elapsed_exhausted`, `tokens_exhausted`, or
+`cost_exhausted`. Limit equality is exhausted: a retry is admitted only while
+every configured remaining ceiling is strictly positive and its eligibility
+time is before the elapsed deadline. Success, cancellation, and every terminal
+disposition create no successor. Direct cancellation of an idle attempt
+atomically writes the ordinary retry settlement receipt/events. Cancellation of
+a worker-owned active attempt instead records a durable cancellation request
+while retaining its worker and lease. The built-in worker cancels its handler,
+keeps heartbeating until the handler proves quiescent, and only then writes the
+terminal cancellation receipt. If the quiescent handler returns a typed attempt
+report, its token and cost usage is preserved in that operator-authoritative
+cancellation settlement; the report's disposition and payload cannot replace
+the durable cancellation request. Worker shutdown follows the same quiescence
+boundary: it settles a returned typed report before redelivering caller
+cancellation, or atomically releases a clean unreported claim only when no
+cancellation request has won that release race. Expired reclaim does not make a
+cancellation-requested attempt runnable; if its owner is lost while effects
+remain uncertain, the attempt stays fenced for explicit operator reconciliation
+rather than risking stale work beside a replacement.
+Attempt reports that exceed the remaining token or cost limit atomically
+terminalize the series as exhausted and create no successor. The full reported
+usage remains durable so accounting does not hide an overage; remaining values
+floor at zero.
+
+Claim admission also enforces the durable elapsed deadline. Before selecting
+work, the store atomically terminalizes pending retry attempts whose series
+deadline has passed as `elapsed_exhausted`, writes the ordinary immutable retry
+settlement receipt/events, and excludes them from the claim query. This lazy
+store transition needs no process timer and remains correct after restart. The
+terminal task's bounded `status_payload.settlement_idempotency_key` identifies
+the receipt for inspection; every application-settled attempt records its
+caller-supplied settlement key in the same field.
+
+The same transaction writes an immutable `TaskRetrySettlementResult` receipt.
+Its two failure-payload-free `TaskRetryEvent` values use stable
+`task.retry.attempt_settled`, `task.retry.scheduled`, and
+`task.retry.series_terminal` identities and expose the attempt ordinal,
+remaining ceilings, deadline, next eligibility, and final disposition. The
+terminal attempt and optional successor in the receipt are exact durable
+projections. `settle_task_retry_attempt_with_retry(...)` consumes that receipt
+after acknowledgement-ambiguous failures; identical reports converge, while a
+changed report under the same idempotency key or contradictory current task
+fails closed. `Task.retry_series` supplies the same bounded inspection fields to
+task detail/list projections without exposing the attempt's `error` payload in
+the retry events.
+
+Series time and accounting authority are durable. Successor construction copies
+the original series start, policy, invocation provenance, cumulative tokens,
+the cumulative estimated cost, scheduled availability, and the causal budget identity; another worker
+or a restarted process cannot renew them. PostgreSQL evaluates retry eligibility with its transaction clock;
+SQLite and in-memory stores use their authoritative availability clock. Lease
+loss rejects settlement with `TaskClaimLost`. Cancellation while a successor is
+waiting operates on that already-durable task and cannot create a second one.
+The built-in worker periodically asks the store whether the deadline elapsed
+while heartbeating. Positive store-authoritative evidence stops admission but
+does not terminalize or release the claim yet. The worker cancels the handler,
+continues extending the exact lease until the handler settles, and only then
+atomically records `elapsed_exhausted`. A handler must retain its own opaque
+SDK, thread, subprocess, or remote-operation handles until their work is known
+quiescent; returning from cancellation while such work remains live violates
+the handler contract. A typed report returned after quiescence contributes its
+actual token and cost usage to the terminal elapsed settlement without changing
+the elapsed disposition. A concurrent durable operator cancellation takes
+precedence and receives that same accounting. An indeterminate deadline check or heartbeat fails closed.
+Acknowledgement-ambiguous terminal commits are reconciled through the exact
+durable settlement receipt. A late success or other application report is
+likewise converted to elapsed exhaustion by the store transaction.
+Concurrent duplicate settlement reports converge through the deterministic
+successor and receipt; concurrent claims still select at most one eligible
+pending attempt through the existing store claim boundary.
+
+`TaskStore.supports_task_retry_series` defaults to `False`. A custom store may
+opt in only if it preserves every `Task.retry_series` field, implements the
+claim-fenced atomic attempt/receipt/successor operation, and supports exact
+receipt readback for acknowledgement reconciliation. It must also implement
+`task_retry_deadline_elapsed(...)` as an owned, store-clock-authoritative probe
+and `enforce_task_retry_deadline(...)` as the later atomic terminalization
+boundary. The terminalization operation accepts the already-quiescent handler's
+bounded token and cost usage and must commit those values in the same receipt.
+`release_task(...)` must atomically reject a retry attempt carrying a durable
+cancellation request. `CayuApp.create_task`
+rejects a retry policy before calling a store that has not opted in. Breaking schema revision
+45 adds the retry-series task field and receipt table to SQLite/PostgreSQL.
+Pre-45 task workers could ignore cumulative authority, so old task workers must
+be quiesced before migration and cannot share the migrated database. The
+in-memory, SQLite, and PostgreSQL implementations provide the complete
+capability. `examples/task_retry_worker.py` starts a new process for each attempt
+and proves that the same series continues and no worker can claim work after its
+successful attempt.
 
 The explicit outcome is fail-closed. A handler that returns it for an unattached
 task, a missing session, or a session in any state other than `interrupted` does
@@ -2689,7 +2818,13 @@ Held tasks are not reclaimed by lease cleanup. If a worker claims a task and dis
 
 The server exposes the same lifecycle for operator/backend integrations through `POST /api/tasks/{task_id}/pause`, `POST /api/tasks/{task_id}/block`, `POST /api/tasks/{task_id}/needs-attention`, and `POST /api/tasks/{task_id}/resume`. Hold endpoints accept optional `reason` and `payload` fields. `GET /api/tasks` stays a compact list view and does not include task input/result/error/metadata; it supports text search with `q`, filtering by status, type, session, parent task, assigned agent, offset/limit pagination, and `order_by` (`updated_at_desc` by default). Use `GET /api/tasks/{task_id}` to fetch full task detail, including the bounded invocation record and input/result/error/metadata, for a selected task. Task lists omit provenance identity. Lifecycle mutation responses also return the full task detail for the task that was changed.
 
-This is a durable ownership primitive, not a project-management system, retry scheduler, DAG engine, or agent messaging table. Apps own assignment policy, priorities, dependency graphs, retry timing, human workflows, and worker deployment. `examples/task_worker_loop.py` shows the queue-worker pattern with claim, heartbeat, run, failure, and reclaim paths.
+This is a durable ownership primitive, not a project-management system, general
+scheduler, DAG engine, or agent messaging table. Cayu owns only the explicitly
+configured retry-series envelope and delayed-successor transition. Apps own
+assignment policy, priorities, dependency graphs, domain retry classification,
+human workflows, and worker deployment. `examples/task_worker_loop.py` shows the
+ordinary queue-worker pattern with claim, heartbeat, run, failure, and reclaim
+paths.
 
 ## EventSink
 
@@ -3765,8 +3900,12 @@ required on entry and chunk projections. Server contract version 13 adds typed
 unavailable and ambiguous provider-operation inspection, a run-epoch-fenced
 resolution mutation, and its control-plane capability. Server contract version
 14 adds the required operation-level Evals readiness projection. Clients
-generated against contract version 1 through 13 must regenerate from the
-current OpenAPI document.
+generated against contract version 1 through 13 must regenerate from the current
+OpenAPI document. Server contract version 15 adds the bounded retry-series projection to
+task list/detail responses. Its cumulative and remaining token counters use the
+same lossless decimal-string representation as aggregate counters. Clients
+generated against version 14 must regenerate before rendering task records from
+a version-15 server.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.

@@ -9,6 +9,7 @@ from bisect import bisect_left, bisect_right, insort
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
@@ -55,6 +56,33 @@ from cayu.runtime.invocation import (
 )
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 
+_TASK_RETRY_COST_MAX_DIGITS = 64
+_TASK_RETRY_TOTAL_COST_MAX_DIGITS = 128
+_TASK_RETRY_COST_MAX_DECIMAL_PLACES = 64
+_TASK_RETRY_MAX_ATTEMPT_TOKEN_REPORT = MAX_DURABLE_JSON_INTEGER // 100
+_TASK_RETRY_CANCELLATION_REQUESTED_REASON = "retry_cancellation_requested"
+
+
+def _bounded_task_retry_decimal(
+    value: Decimal,
+    field_name: str,
+    *,
+    max_digits: int,
+) -> Decimal:
+    if not value.is_finite() or value < 0:
+        raise ValueError(f"{field_name} must be a finite non-negative Decimal.")
+    digits = value.as_tuple().digits
+    exponent = value.as_tuple().exponent
+    if len(digits) > max_digits:
+        raise ValueError(f"{field_name} exceeds its decimal digit limit.")
+    if (
+        not isinstance(exponent, int)
+        or exponent < -_TASK_RETRY_COST_MAX_DECIMAL_PLACES
+        or exponent > _TASK_RETRY_COST_MAX_DIGITS
+    ):
+        raise ValueError(f"{field_name} exceeds its decimal scale limit.")
+    return value
+
 
 class TaskStatus(StrEnum):
     PENDING = "pending"
@@ -79,6 +107,286 @@ class TaskTerminalizationConflict(ValueError):
 class TaskTerminalKind(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class TaskRetryAttemptDisposition(StrEnum):
+    """Application-classified outcome for one retry-series attempt."""
+
+    SUCCEEDED = "succeeded"
+    RETRYABLE_FAILURE = "retryable_failure"
+    NON_RETRYABLE_FAILURE = "non_retryable_failure"
+    CANCELLED = "cancelled"
+
+
+class TaskRetrySeriesDisposition(StrEnum):
+    """Durable retry-series state or terminal reason."""
+
+    ACTIVE = "active"
+    RETRY_SCHEDULED = "retry_scheduled"
+    SUCCEEDED = "succeeded"
+    NON_RETRYABLE_FAILURE = "non_retryable_failure"
+    CANCELLED = "cancelled"
+    ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+    ELAPSED_EXHAUSTED = "elapsed_exhausted"
+    TOKENS_EXHAUSTED = "tokens_exhausted"
+    COST_EXHAUSTED = "cost_exhausted"
+
+
+class TaskRetryEventType(StrEnum):
+    """Stable task-level retry event types committed with a settlement."""
+
+    ATTEMPT_SETTLED = "task.retry.attempt_settled"
+    RETRY_SCHEDULED = "task.retry.scheduled"
+    SERIES_TERMINAL = "task.retry.series_terminal"
+
+
+def _validate_task_retry_cost_currency(value: str) -> str:
+    value = require_clean_nonblank(value, "cost_currency").upper()
+    if len(value.encode("utf-8")) > 16:
+        raise ValueError("cost_currency must be at most 16 UTF-8 bytes.")
+    return value
+
+
+class TaskRetryPolicy(BaseModel):
+    """Serializable cumulative limits and backoff for one task retry series."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        allow_inf_nan=False,
+    )
+
+    max_attempts: StrictInt = Field(ge=1, le=100)
+    max_elapsed_seconds: StrictFloat | None = Field(default=None, gt=0, le=31_536_000)
+    max_total_tokens: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        description=(
+            "Maximum cumulative reported tokens used for retry-successor admission; "
+            "not an external-dispatch reservation."
+        ),
+    )
+    max_estimated_cost: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Maximum cumulative reported estimated cost used for retry-successor "
+            "admission; not an external-dispatch reservation."
+        ),
+    )
+    cost_currency: str = "USD"
+    initial_backoff_seconds: StrictFloat = Field(default=1.0, ge=0, le=86_400)
+    backoff_multiplier: StrictFloat = Field(default=2.0, ge=1, le=100)
+    max_backoff_seconds: StrictFloat = Field(default=300.0, ge=0, le=86_400)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> TaskRetryPolicy:
+        for field_name in (
+            "max_elapsed_seconds",
+            "initial_backoff_seconds",
+            "backoff_multiplier",
+            "max_backoff_seconds",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"{field_name} must be finite.")
+        return self
+
+    @field_validator("max_estimated_cost")
+    @classmethod
+    def validate_max_estimated_cost(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        return _bounded_task_retry_decimal(
+            value,
+            "max_estimated_cost",
+            max_digits=_TASK_RETRY_COST_MAX_DIGITS,
+        )
+
+    @field_validator("cost_currency")
+    @classmethod
+    def validate_cost_currency(cls, value: str) -> str:
+        return _validate_task_retry_cost_currency(value)
+
+
+class TaskRetrySeriesSnapshot(BaseModel):
+    """Bounded cumulative retry authority carried by each durable attempt."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        allow_inf_nan=False,
+    )
+
+    series_id: str
+    causal_budget_id: str
+    authority_sha256: str
+    attempt: StrictInt = Field(ge=1, le=100)
+    policy: TaskRetryPolicy
+    started_at: datetime
+    cumulative_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    cumulative_estimated_cost: Decimal = Field(default=Decimal(0), ge=0)
+    attempts_remaining: StrictInt = Field(ge=0, le=99)
+    tokens_remaining: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    estimated_cost_remaining: Decimal | None = Field(default=None, ge=0)
+    elapsed_deadline: datetime | None = None
+    disposition: TaskRetrySeriesDisposition = TaskRetrySeriesDisposition.ACTIVE
+    predecessor_task_id: str | None = None
+    successor_task_id: str | None = None
+    next_eligible_at: datetime | None = None
+
+    @field_validator("series_id", "causal_budget_id")
+    @classmethod
+    def validate_series_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("authority_sha256")
+    @classmethod
+    def validate_authority_sha256(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("authority_sha256 must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("predecessor_task_id", "successor_task_id")
+    @classmethod
+    def validate_optional_task_id(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("started_at")
+    @classmethod
+    def normalize_started_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "started_at")
+
+    @field_validator("next_eligible_at")
+    @classmethod
+    def normalize_next_eligible_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "next_eligible_at")
+
+    @field_validator("elapsed_deadline")
+    @classmethod
+    def normalize_elapsed_deadline(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "elapsed_deadline")
+
+    @field_validator("cumulative_estimated_cost", "estimated_cost_remaining")
+    @classmethod
+    def validate_estimated_costs(cls, value: Decimal | None, info) -> Decimal | None:
+        if value is None:
+            return None
+        return _bounded_task_retry_decimal(
+            value,
+            info.field_name,
+            max_digits=(
+                _TASK_RETRY_TOTAL_COST_MAX_DIGITS
+                if info.field_name == "cumulative_estimated_cost"
+                else _TASK_RETRY_COST_MAX_DIGITS
+            ),
+        )
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> TaskRetrySeriesSnapshot:
+        if self.attempts_remaining != max(0, self.policy.max_attempts - self.attempt):
+            raise ValueError("attempts_remaining conflicts with the retry policy.")
+        expected_tokens = (
+            None
+            if self.policy.max_total_tokens is None
+            else max(0, self.policy.max_total_tokens - self.cumulative_tokens)
+        )
+        if self.tokens_remaining != expected_tokens:
+            raise ValueError("tokens_remaining conflicts with cumulative token usage.")
+        expected_cost = (
+            None
+            if self.policy.max_estimated_cost is None
+            else max(
+                Decimal(0),
+                self.policy.max_estimated_cost - self.cumulative_estimated_cost,
+            )
+        )
+        if self.estimated_cost_remaining != expected_cost:
+            raise ValueError("estimated_cost_remaining conflicts with cumulative cost.")
+        expected_deadline = (
+            None
+            if self.policy.max_elapsed_seconds is None
+            else self.started_at + timedelta(seconds=self.policy.max_elapsed_seconds)
+        )
+        if self.elapsed_deadline != expected_deadline:
+            raise ValueError("elapsed_deadline conflicts with the retry policy.")
+        scheduled = self.disposition is TaskRetrySeriesDisposition.RETRY_SCHEDULED
+        if scheduled != (self.successor_task_id is not None):
+            raise ValueError("Only retry_scheduled snapshots carry a successor_task_id.")
+        if scheduled != (self.next_eligible_at is not None):
+            raise ValueError("Only retry_scheduled snapshots carry next_eligible_at.")
+        return self
+
+
+class TaskRetryEvent(BaseModel):
+    """Bounded, failure-payload-free retry evidence committed by a task store."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    id: str
+    type: TaskRetryEventType
+    task_id: str
+    series_id: str
+    causal_budget_id: str
+    attempt: StrictInt = Field(ge=1, le=100)
+    disposition: TaskRetrySeriesDisposition
+    occurred_at: datetime
+    attempts_remaining: StrictInt = Field(ge=0, le=99)
+    tokens_remaining: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    estimated_cost_remaining: Decimal | None = Field(default=None, ge=0)
+    cost_currency: str
+    elapsed_deadline: datetime | None = None
+    next_eligible_at: datetime | None = None
+
+    @field_validator("id", "task_id", "series_id", "causal_budget_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("cost_currency")
+    @classmethod
+    def validate_cost_currency(cls, value: str) -> str:
+        return _validate_task_retry_cost_currency(value)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def normalize_occurred_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "occurred_at")
+
+    @field_validator("elapsed_deadline", "next_eligible_at")
+    @classmethod
+    def normalize_optional_datetime(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, info.field_name)
+
+    @field_validator("estimated_cost_remaining")
+    @classmethod
+    def validate_estimated_cost_remaining(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        return _bounded_task_retry_decimal(
+            value,
+            "estimated_cost_remaining",
+            max_digits=_TASK_RETRY_COST_MAX_DIGITS,
+        )
 
 
 TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES = 256
@@ -123,6 +431,7 @@ class Task(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     invocation: TaskInvocation = Field(frozen=True)
+    retry_series: TaskRetrySeriesSnapshot | None = None
 
     @field_validator("input", "metadata", mode="before")
     @classmethod
@@ -173,6 +482,35 @@ class Task(BaseModel):
             return None
         return normalize_utc_datetime(value, "available_at")
 
+    @model_validator(mode="after")
+    def validate_retry_series_authority(self) -> Task:
+        if self.retry_series is None:
+            return self
+        expected = _task_retry_attempt_authority_sha256(
+            task_id=self.id,
+            task_type=self.type,
+            title=self.title,
+            description=self.description,
+            parent_task_id=self.parent_task_id,
+            assigned_agent_name=self.assigned_agent_name,
+            available_at=self.available_at,
+            created_at=self.created_at,
+            task_input=self.input,
+            metadata=self.metadata,
+            invocation=self.invocation,
+            series_id=self.retry_series.series_id,
+            causal_budget_id=self.retry_series.causal_budget_id,
+            attempt=self.retry_series.attempt,
+            policy=self.retry_series.policy,
+            started_at=self.retry_series.started_at,
+            cumulative_tokens=self.retry_series.cumulative_tokens,
+            cumulative_estimated_cost=self.retry_series.cumulative_estimated_cost,
+            predecessor_task_id=self.retry_series.predecessor_task_id,
+        )
+        if self.retry_series.authority_sha256 != expected:
+            raise ValueError("Task retry-series authority conflicts with its task evidence.")
+        return self
+
 
 class TaskInvocationSnapshot(BaseModel):
     """Bounded task identity and immutable provenance for delegation boundaries."""
@@ -214,6 +552,7 @@ class TaskCreate(BaseModel):
     available_at: datetime | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    retry_policy: TaskRetryPolicy | None = None
     invocation_origin: InvocationOriginClaim | None = None
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: TaskExecutionSource | None = PrivateAttr(default=None)
@@ -255,6 +594,12 @@ class TaskCreate(BaseModel):
         if value is None:
             return None
         return normalize_utc_datetime(value, "available_at")
+
+    @model_validator(mode="after")
+    def validate_retry_series_shape(self) -> TaskCreate:
+        if self.retry_policy is not None and self.session_id is not None:
+            raise ValueError("Retry-series tasks must start as unattached queue work.")
+        return self
 
 
 class TaskTerminalizationRequest(BaseModel):
@@ -351,6 +696,210 @@ class TaskTerminalizationReceipt(BaseModel):
             raise ValueError("Terminalization receipt conflicts with its terminal task.")
         if self.task.worker_id is not None or self.task.lease_expires_at is not None:
             raise ValueError("Terminalization receipt task retains live claim ownership.")
+        return self
+
+
+class _TaskRetryAttemptOutcome(BaseModel):
+    """Shared validated application-owned outcome material."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        hide_input_in_errors=True,
+        allow_inf_nan=False,
+    )
+
+    idempotency_key: str
+    disposition: TaskRetryAttemptDisposition
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    token_count: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=_TASK_RETRY_MAX_ATTEMPT_TOKEN_REPORT,
+    )
+    estimated_cost: Decimal = Field(default=Decimal(0), ge=0)
+    retry_after_seconds: StrictFloat | None = Field(default=None, ge=0, le=86_400)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return _validate_task_terminalization_idempotency_key(value)
+
+    @field_validator("result", "error", mode="before")
+    @classmethod
+    def copy_payload(cls, value: dict[str, Any] | None, info) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return copy_durable_json_object(value, info.field_name)
+
+    @field_validator("estimated_cost")
+    @classmethod
+    def validate_estimated_cost(cls, value: Decimal) -> Decimal:
+        return _bounded_task_retry_decimal(
+            value,
+            "estimated_cost",
+            max_digits=_TASK_RETRY_COST_MAX_DIGITS,
+        )
+
+    @model_validator(mode="after")
+    def validate_disposition_payload(self) -> _TaskRetryAttemptOutcome:
+        if self.retry_after_seconds is not None and not math.isfinite(self.retry_after_seconds):
+            raise ValueError("retry_after_seconds must be finite.")
+        if self.disposition is TaskRetryAttemptDisposition.SUCCEEDED:
+            if self.result is None or self.error is not None:
+                raise ValueError("Succeeded attempts require result and forbid error.")
+        elif self.result is not None or self.error is None:
+            raise ValueError("Non-success attempts require error and forbid result.")
+        if (
+            self.retry_after_seconds is not None
+            and self.disposition is not TaskRetryAttemptDisposition.RETRYABLE_FAILURE
+        ):
+            raise ValueError("Only retryable failures accept retry_after_seconds.")
+        return self
+
+
+class TaskRetrySettlementRequest(_TaskRetryAttemptOutcome):
+    """One typed, claim-fenced retry-attempt outcome."""
+
+    task_id: str
+    worker_id: str
+    causal_budget_id: str
+
+    @field_validator("task_id", "worker_id", "causal_budget_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+
+class TaskRetryAttemptReport(_TaskRetryAttemptOutcome):
+    """Application-owned classification and bounded accounting for one attempt."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        allow_inf_nan=False,
+    )
+
+
+class TaskRetrySettlementResult(BaseModel):
+    """Immutable settlement receipt for one attempt and optional successor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    task_id: str
+    idempotency_key: str
+    request_sha256: str
+    task: Task
+    successor: Task | None = None
+    events: tuple[TaskRetryEvent, ...] = Field(min_length=2, max_length=2)
+    committed_at: datetime
+
+    @field_validator("task_id")
+    @classmethod
+    def validate_task_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "task_id")
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_result_idempotency_key(cls, value: str) -> str:
+        return _validate_task_terminalization_idempotency_key(value)
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("committed_at")
+    @classmethod
+    def normalize_committed_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "committed_at")
+
+    @model_validator(mode="after")
+    def validate_settlement_evidence(self) -> TaskRetrySettlementResult:
+        series = self.task.retry_series
+        if self.task.id != self.task_id or series is None:
+            raise ValueError("Task retry receipt conflicts with its settled attempt.")
+        if self.task.worker_id is not None or self.task.lease_expires_at is not None:
+            raise ValueError("Task retry receipt retains live attempt ownership.")
+        expected_status = {
+            TaskRetrySeriesDisposition.SUCCEEDED: TaskStatus.COMPLETED,
+            TaskRetrySeriesDisposition.CANCELLED: TaskStatus.CANCELLED,
+        }.get(series.disposition, TaskStatus.FAILED)
+        if self.task.status is not expected_status:
+            raise ValueError("Task retry receipt conflicts with its series disposition.")
+
+        scheduled = series.disposition is TaskRetrySeriesDisposition.RETRY_SCHEDULED
+        if scheduled != (self.successor is not None):
+            raise ValueError("Task retry receipt has contradictory successor evidence.")
+        if self.successor is not None:
+            successor_series = self.successor.retry_series
+            if (
+                self.successor.id != series.successor_task_id
+                or self.successor.status is not TaskStatus.PENDING
+                or self.successor.available_at != series.next_eligible_at
+                or successor_series is None
+                or successor_series.series_id != series.series_id
+                or successor_series.attempt != series.attempt + 1
+                or successor_series.predecessor_task_id != self.task.id
+                or successor_series.disposition is not TaskRetrySeriesDisposition.ACTIVE
+                or successor_series.policy != series.policy
+                or successor_series.started_at != series.started_at
+                or successor_series.causal_budget_id != series.causal_budget_id
+                or successor_series.cumulative_tokens != series.cumulative_tokens
+                or successor_series.cumulative_estimated_cost != series.cumulative_estimated_cost
+                or successor_series.tokens_remaining != series.tokens_remaining
+                or successor_series.estimated_cost_remaining != series.estimated_cost_remaining
+                or successor_series.elapsed_deadline != series.elapsed_deadline
+                or self.successor.type != self.task.type
+                or self.successor.title != self.task.title
+                or self.successor.description != self.task.description
+                or self.successor.parent_task_id != self.task.parent_task_id
+                or self.successor.assigned_agent_name != self.task.assigned_agent_name
+                or self.successor.input != self.task.input
+                or self.successor.metadata != self.task.metadata
+                or self.successor.invocation != self.task.invocation
+                or self.successor.session_id is not None
+                or self.successor.worker_id is not None
+                or self.successor.lease_expires_at is not None
+                or self.successor.status_reason is not None
+                or self.successor.status_payload is not None
+                or self.successor.result is not None
+                or self.successor.error is not None
+                or self.successor.started_at is not None
+                or self.successor.completed_at is not None
+                or self.successor.created_at != self.committed_at
+                or self.successor.updated_at != self.committed_at
+            ):
+                raise ValueError("Task retry receipt successor conflicts with the settled attempt.")
+
+        expected_event_types = (
+            TaskRetryEventType.ATTEMPT_SETTLED,
+            (
+                TaskRetryEventType.RETRY_SCHEDULED
+                if scheduled
+                else TaskRetryEventType.SERIES_TERMINAL
+            ),
+        )
+        for event, expected_type in zip(self.events, expected_event_types, strict=True):
+            if (
+                event.type is not expected_type
+                or event.task_id != self.task_id
+                or event.series_id != series.series_id
+                or event.causal_budget_id != series.causal_budget_id
+                or event.attempt != series.attempt
+                or event.disposition is not series.disposition
+                or event.occurred_at != self.committed_at
+                or event.attempts_remaining != series.attempts_remaining
+                or event.tokens_remaining != series.tokens_remaining
+                or event.estimated_cost_remaining != series.estimated_cost_remaining
+                or event.cost_currency != series.policy.cost_currency
+                or event.elapsed_deadline != series.elapsed_deadline
+                or event.next_eligible_at != series.next_eligible_at
+            ):
+                raise ValueError("Task retry receipt event conflicts with the settled attempt.")
         return self
 
 
@@ -1070,6 +1619,7 @@ class TaskStore(ABC):
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
     supports_idempotent_terminalization: ClassVar[bool] = False
+    supports_task_retry_series: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @abstractmethod
@@ -1203,13 +1753,60 @@ class TaskStore(ABC):
         """Load exact durable commit evidence for receipt reconciliation."""
         raise NotImplementedError("This TaskStore does not support task terminalization receipts.")
 
+    async def settle_task_retry_attempt(
+        self,
+        request: TaskRetrySettlementRequest,
+    ) -> TaskRetrySettlementResult:
+        """Atomically record one attempt and optionally create its delayed successor."""
+
+        raise NotImplementedError("This TaskStore does not support task retry series.")
+
+    async def load_task_retry_settlement(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskRetrySettlementResult | None:
+        """Load an exact retry-attempt settlement receipt for acknowledgement recovery."""
+
+        raise NotImplementedError("This TaskStore does not support task retry series.")
+
+    async def enforce_task_retry_deadline(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        token_count: int = 0,
+        estimated_cost: Decimal = Decimal(0),
+    ) -> TaskRetrySettlementResult | None:
+        """Atomically terminalize an owned attempt only when store time exhausted it.
+
+        Returning ``None`` is positive store evidence that the cumulative deadline
+        had not elapsed at this check. Retry-capable custom stores must override
+        this operation so workers never substitute their own wall clock.
+        """
+
+        raise NotImplementedError("This TaskStore does not support task retry deadlines.")
+
+    async def task_retry_deadline_elapsed(
+        self,
+        task_id: str,
+        worker_id: str,
+    ) -> bool:
+        """Return store-authoritative elapsed evidence without releasing ownership."""
+
+        raise NotImplementedError("This TaskStore does not support task retry deadlines.")
+
     @abstractmethod
     async def cancel_task(
         self,
         task_id: str,
         error: dict[str, Any] | None = None,
     ) -> Task:
-        """Mark a pending or running task as cancelled."""
+        """Cancel idle work or durably request cancellation from its live owner.
+
+        Retry-series attempts with a live worker remain fenced until that worker
+        proves its dispatched work quiescent and commits the cancellation receipt.
+        """
 
     @abstractmethod
     async def pause_task(
@@ -1298,6 +1895,7 @@ class InMemoryTaskStore(TaskStore):
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
+    supports_task_retry_series: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
@@ -1305,6 +1903,7 @@ class InMemoryTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._tasks: dict[str, Task] = {}
         self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
+        self._retry_settlements: dict[tuple[str, str], TaskRetrySettlementResult] = {}
         self._task_keys_by_session: dict[str, list[tuple[datetime, str]]] = {}
         self._task_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
 
@@ -1313,7 +1912,12 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             task_id = request.task_id or str(uuid4())
             parent = self._task_parent_for_create(request, task_id=task_id)
-            task = _task_from_create(request, task_id=task_id, parent_task=parent)
+            task = _task_from_create(
+                request,
+                task_id=task_id,
+                parent_task=parent,
+                retry_started_at=self._clock(),
+            )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
             self._store_task(task)
@@ -1335,6 +1939,7 @@ class InMemoryTaskStore(TaskStore):
                 task_id=task_id,
                 parent_task=parent,
                 session_invocation=session_binding,
+                retry_started_at=self._clock(),
             )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
@@ -1501,6 +2106,7 @@ class InMemoryTaskStore(TaskStore):
         session_binding = _copy_optional_session_binding(session_invocation)
         async with self._lock:
             task = self._require_task(task_id)
+            _ensure_retry_series_queue_attempt(task.retry_series)
             now = datetime.now(UTC)
             _ensure_can_transition(task, TaskStatus.RUNNING)
             effective_session_id = _task_session_id_for_start(
@@ -1538,6 +2144,7 @@ class InMemoryTaskStore(TaskStore):
         session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
             task = self._require_task(task_id)
+            _ensure_retry_series_queue_attempt(task.retry_series)
             now = datetime.now(UTC)
             if not _can_attach_claimed_task(task, worker_id=worker_id, now=now):
                 _raise_task_claim_attach_error(task, worker_id, now=now)
@@ -1654,6 +2261,106 @@ class InMemoryTaskStore(TaskStore):
                 committed_at=receipt.committed_at,
             )
 
+    async def settle_task_retry_attempt(
+        self,
+        request: TaskRetrySettlementRequest,
+    ) -> TaskRetrySettlementResult:
+        request, request_sha256 = prepare_task_retry_settlement(request)
+        receipt_key = (request.task_id, request.idempotency_key)
+        async with self._lock:
+            existing = self._retry_settlements.get(receipt_key)
+            if existing is not None:
+                return _replay_task_retry_settlement(
+                    request_sha256=request_sha256,
+                    receipt=existing,
+                    current_task=self._tasks.get(request.task_id),
+                )
+            task = self._require_task(request.task_id)
+            now = datetime.now(UTC)
+            _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+            if task.retry_series is None:
+                raise ValueError("Task does not belong to a retry series.")
+            settled, successor = _settled_task_retry_attempt(
+                task,
+                request,
+                now=now,
+                series_now=self._clock(),
+            )
+            if successor is not None and successor.id in self._tasks:
+                raise TaskTerminalizationConflict(
+                    "Task retry successor identity is already occupied."
+                )
+            self._store_task(settled)
+            if successor is not None:
+                self._store_task(successor)
+            receipt = TaskRetrySettlementResult(
+                task_id=request.task_id,
+                idempotency_key=request.idempotency_key,
+                request_sha256=request_sha256,
+                task=settled,
+                successor=successor,
+                events=_task_retry_events(settled, occurred_at=now),
+                committed_at=now,
+            )
+            self._retry_settlements[receipt_key] = receipt
+            return receipt.model_copy(deep=True)
+
+    async def enforce_task_retry_deadline(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        token_count: int = 0,
+        estimated_cost: Decimal = Decimal(0),
+    ) -> TaskRetrySettlementResult | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        token_count, estimated_cost = _validated_task_retry_terminal_accounting(
+            token_count=token_count,
+            estimated_cost=estimated_cost,
+        )
+        async with self._lock:
+            task = self._require_task(task_id)
+            lease_now = datetime.now(UTC)
+            _ensure_owned_active_task_lease(task, worker_id, now=lease_now)
+            series_now = self._clock()
+            if not _claimed_task_retry_attempt_elapsed(task, series_now=series_now):
+                return None
+            receipt = _elapsed_claimed_task_retry_settlement(
+                task,
+                committed_at=lease_now,
+                token_count=token_count,
+                estimated_cost=estimated_cost,
+            )
+            self._store_task(receipt.task)
+            self._retry_settlements[(receipt.task_id, receipt.idempotency_key)] = receipt
+            return receipt.model_copy(deep=True)
+
+    async def task_retry_deadline_elapsed(
+        self,
+        task_id: str,
+        worker_id: str,
+    ) -> bool:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        async with self._lock:
+            task = self._require_task(task_id)
+            _ensure_owned_active_task_lease(task, worker_id, now=datetime.now(UTC))
+            return _claimed_task_retry_attempt_elapsed(task, series_now=self._clock())
+
+    async def load_task_retry_settlement(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskRetrySettlementResult | None:
+        task_id, idempotency_key = prepare_task_terminalization_receipt_lookup(
+            task_id,
+            idempotency_key,
+        )
+        async with self._lock:
+            receipt = self._retry_settlements.get((task_id, idempotency_key))
+            return None if receipt is None else receipt.model_copy(deep=True)
+
     async def cancel_task(
         self,
         task_id: str,
@@ -1746,12 +2453,22 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             availability_now = self._clock()
             now = datetime.now(UTC)
+            for task in tuple(self._tasks.values()):
+                if _task_retry_attempt_elapsed(task, series_now=availability_now):
+                    receipt = _expired_task_retry_settlement(
+                        task,
+                        committed_at=now,
+                        series_now=availability_now,
+                    )
+                    self._store_task(receipt.task)
+                    self._retry_settlements[(receipt.task_id, receipt.idempotency_key)] = receipt
             candidates = [
                 task
                 for task in self._tasks.values()
                 if task.status is TaskStatus.PENDING
                 and task.session_id is None
                 and (task.available_at is None or task.available_at <= availability_now)
+                and not _task_retry_attempt_elapsed(task, series_now=availability_now)
                 and _task_matches_claim_filter(task, query)
             ]
             if not candidates:
@@ -1804,6 +2521,10 @@ class InMemoryTaskStore(TaskStore):
                 )
             if task.status is not TaskStatus.CLAIMED:
                 raise ValueError(f"Task {task.id} is not claimed.")
+            if _task_retry_cancellation_requested(task):
+                raise TaskTerminalizationConflict(
+                    "Task retry cancellation is still draining under its current owner."
+                )
             now = datetime.now(UTC)
             _ensure_active_task_lease(task, worker_id, now=now)
             updated = task.model_copy(
@@ -1856,6 +2577,7 @@ class InMemoryTaskStore(TaskStore):
                 for task in self._tasks.values()
                 if task.status is TaskStatus.CLAIMED
                 and task.session_id is None
+                and not _task_retry_cancellation_requested(task)
                 and task.lease_expires_at is not None
                 and task.lease_expires_at <= now
                 and _task_matches_claim_filter(task, query)
@@ -1922,6 +2644,30 @@ class InMemoryTaskStore(TaskStore):
             _ensure_active_task_lease(task, worker_id)
         _ensure_can_transition(task, status)
         now = datetime.now(UTC)
+        if task.retry_series is not None:
+            if status is not TaskStatus.CANCELLED:
+                raise ValueError(
+                    "Retry-series tasks require settle_task_retry_attempt for "
+                    "completion or failure."
+                )
+            if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                cancellation_requested = _task_retry_cancellation_requested_task(
+                    task,
+                    error=error,
+                    updated_at=now,
+                )
+                self._store_task(cancellation_requested)
+                return cancellation_requested.model_copy(deep=True)
+            cancellation = _cancelled_task_retry_settlement(
+                task,
+                error=error,
+                committed_at=now,
+            )
+            self._store_task(cancellation.task)
+            self._retry_settlements[(cancellation.task_id, cancellation.idempotency_key)] = (
+                cancellation
+            )
+            return cancellation.task.model_copy(deep=True)
         updated = task.model_copy(
             update={
                 "status": status,
@@ -1934,6 +2680,7 @@ class InMemoryTaskStore(TaskStore):
                 "started_at": task.started_at or now,
                 "completed_at": now,
                 "updated_at": now,
+                "retry_series": None,
             }
         )
         self._store_task(updated)
@@ -2480,6 +3227,90 @@ def copy_task(task: Task) -> Task:
         started_at=task.started_at,
         completed_at=task.completed_at,
         invocation=copy_task_invocation(task.invocation),
+        retry_series=(
+            None
+            if task.retry_series is None
+            else _copy_task_retry_series_snapshot(task.retry_series)
+        ),
+    )
+
+
+def _copy_task_retry_policy(policy: TaskRetryPolicy) -> TaskRetryPolicy:
+    if type(policy) is not TaskRetryPolicy:
+        raise TypeError("Task retry policy must be a TaskRetryPolicy instance.")
+    return TaskRetryPolicy(
+        max_attempts=policy.max_attempts,
+        max_elapsed_seconds=policy.max_elapsed_seconds,
+        max_total_tokens=policy.max_total_tokens,
+        max_estimated_cost=policy.max_estimated_cost,
+        cost_currency=policy.cost_currency,
+        initial_backoff_seconds=policy.initial_backoff_seconds,
+        backoff_multiplier=policy.backoff_multiplier,
+        max_backoff_seconds=policy.max_backoff_seconds,
+    )
+
+
+def _copy_task_retry_series_snapshot(
+    series: TaskRetrySeriesSnapshot,
+) -> TaskRetrySeriesSnapshot:
+    if type(series) is not TaskRetrySeriesSnapshot:
+        raise TypeError("Task retry authority must be a TaskRetrySeriesSnapshot instance.")
+    return TaskRetrySeriesSnapshot(
+        series_id=series.series_id,
+        causal_budget_id=series.causal_budget_id,
+        authority_sha256=series.authority_sha256,
+        attempt=series.attempt,
+        policy=_copy_task_retry_policy(series.policy),
+        started_at=series.started_at,
+        cumulative_tokens=series.cumulative_tokens,
+        cumulative_estimated_cost=series.cumulative_estimated_cost,
+        attempts_remaining=series.attempts_remaining,
+        tokens_remaining=series.tokens_remaining,
+        estimated_cost_remaining=series.estimated_cost_remaining,
+        elapsed_deadline=series.elapsed_deadline,
+        disposition=series.disposition,
+        predecessor_task_id=series.predecessor_task_id,
+        successor_task_id=series.successor_task_id,
+        next_eligible_at=series.next_eligible_at,
+    )
+
+
+def _copy_task_retry_event(event: TaskRetryEvent) -> TaskRetryEvent:
+    if type(event) is not TaskRetryEvent:
+        raise TypeError("Task retry events must be TaskRetryEvent instances.")
+    return TaskRetryEvent(
+        id=event.id,
+        type=event.type,
+        task_id=event.task_id,
+        series_id=event.series_id,
+        causal_budget_id=event.causal_budget_id,
+        attempt=event.attempt,
+        disposition=event.disposition,
+        occurred_at=event.occurred_at,
+        attempts_remaining=event.attempts_remaining,
+        tokens_remaining=event.tokens_remaining,
+        estimated_cost_remaining=event.estimated_cost_remaining,
+        cost_currency=event.cost_currency,
+        elapsed_deadline=event.elapsed_deadline,
+        next_eligible_at=event.next_eligible_at,
+    )
+
+
+def _copy_task_retry_settlement_result(
+    receipt: TaskRetrySettlementResult,
+) -> TaskRetrySettlementResult:
+    if type(receipt) is not TaskRetrySettlementResult:
+        raise TypeError(
+            "Task retry settlement loads must return TaskRetrySettlementResult instances."
+        )
+    return TaskRetrySettlementResult(
+        task_id=receipt.task_id,
+        idempotency_key=receipt.idempotency_key,
+        request_sha256=receipt.request_sha256,
+        task=copy_task(receipt.task),
+        successor=None if receipt.successor is None else copy_task(receipt.successor),
+        events=tuple(_copy_task_retry_event(event) for event in receipt.events),
+        committed_at=receipt.committed_at,
     )
 
 
@@ -2506,6 +3337,835 @@ def prepare_task_terminalization(
         canonical_durable_json_bytes(material, "task_terminalization")
     ).hexdigest()
     return copied, request_sha256
+
+
+def prepare_task_retry_settlement(
+    request: TaskRetrySettlementRequest,
+) -> tuple[TaskRetrySettlementRequest, str]:
+    """Detach and digest one typed retry-attempt report."""
+
+    if type(request) is not TaskRetrySettlementRequest:
+        raise TypeError("Task retry settlements require a TaskRetrySettlementRequest.")
+    copied = TaskRetrySettlementRequest.model_validate(
+        request.model_dump(mode="python", warnings=False)
+    )
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(
+            {
+                "schema": "cayu.task-retry-settlement.v1",
+                **copied.model_dump(mode="json", warnings=False),
+            },
+            "task_retry_settlement",
+        )
+    ).hexdigest()
+    return copied, request_sha256
+
+
+def _replay_task_retry_settlement(
+    *,
+    request_sha256: str,
+    receipt: TaskRetrySettlementResult,
+    current_task: Task | None,
+) -> TaskRetrySettlementResult:
+    receipt = _copy_task_retry_settlement_result(receipt)
+    current_task = None if current_task is None else copy_task(current_task)
+    if receipt.request_sha256 != request_sha256:
+        raise TaskTerminalizationConflict(
+            "Task retry settlement idempotency key is bound to another intent."
+        )
+    if current_task != receipt.task:
+        raise TaskTerminalizationConflict(
+            "Task retry settlement receipt conflicts with the current terminal attempt."
+        )
+    return receipt
+
+
+def _validate_task_retry_settlement_receipt_identity(
+    receipt: TaskRetrySettlementResult,
+    *,
+    request: TaskRetrySettlementRequest,
+    request_sha256: str,
+) -> TaskRetrySettlementResult:
+    receipt = _copy_task_retry_settlement_result(receipt)
+    if (
+        receipt.task_id != request.task_id
+        or receipt.idempotency_key != request.idempotency_key
+        or receipt.request_sha256 != request_sha256
+    ):
+        raise TaskTerminalizationConflict(
+            "Task retry settlement receipt conflicts with the requested operation."
+        )
+    return receipt
+
+
+def _task_retry_series_id(task_id: str) -> str:
+    material = canonical_durable_json_bytes(
+        {"schema": "cayu.task-retry-series.v1", "first_task_id": task_id},
+        "task_retry_series_id",
+    )
+    return f"task-retry-series:v1:{sha256(material).hexdigest()}"
+
+
+def _task_retry_successor_id(series_id: str, attempt: int) -> str:
+    material = canonical_durable_json_bytes(
+        {"schema": "cayu.task-retry-attempt.v1", "series_id": series_id, "attempt": attempt},
+        "task_retry_successor_id",
+    )
+    return f"task-retry-attempt:v1:{sha256(material).hexdigest()}"
+
+
+def _task_retry_attempt_authority_sha256(
+    *,
+    task_id: str,
+    task_type: str,
+    title: str | None,
+    description: str | None,
+    parent_task_id: str | None,
+    assigned_agent_name: str | None,
+    available_at: datetime | None,
+    created_at: datetime,
+    task_input: dict[str, Any],
+    metadata: dict[str, Any],
+    invocation: TaskInvocation,
+    series_id: str,
+    causal_budget_id: str,
+    attempt: int,
+    policy: TaskRetryPolicy,
+    started_at: datetime,
+    cumulative_tokens: int,
+    cumulative_estimated_cost: Decimal,
+    predecessor_task_id: str | None,
+) -> str:
+    """Bind one attempt to its complete immutable and cumulative authority."""
+
+    material = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-retry-attempt-authority.v1",
+            "task_id": task_id,
+            "task_type": task_type,
+            "title": title,
+            "description": description,
+            "parent_task_id": parent_task_id,
+            "assigned_agent_name": assigned_agent_name,
+            "available_at": (
+                None
+                if available_at is None
+                else normalize_utc_datetime(available_at, "available_at").isoformat()
+            ),
+            "created_at": normalize_utc_datetime(created_at, "created_at").isoformat(),
+            "input": task_input,
+            "metadata": metadata,
+            "invocation": invocation.model_dump(mode="json", warnings=False),
+            "series_id": series_id,
+            "causal_budget_id": causal_budget_id,
+            "attempt": attempt,
+            "policy": policy.model_dump(mode="json", warnings=False),
+            "started_at": normalize_utc_datetime(started_at, "started_at").isoformat(),
+            "cumulative_tokens": cumulative_tokens,
+            "cumulative_estimated_cost": str(cumulative_estimated_cost),
+            "predecessor_task_id": predecessor_task_id,
+        },
+        "task_retry_attempt_authority",
+    )
+    return sha256(material).hexdigest()
+
+
+def _task_retry_runtime_idempotency_key(task: Task, operation: str) -> str:
+    series = task.retry_series
+    if series is None:
+        raise ValueError("Task does not belong to a retry series.")
+    operation = require_clean_nonblank(operation, "operation")
+    material = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-retry-runtime-settlement.v1",
+            "operation": operation,
+            "series_id": series.series_id,
+            "task_id": task.id,
+            "attempt": series.attempt,
+        },
+        "task_retry_runtime_idempotency_key",
+    )
+    return f"task-retry-{operation}:v1:{sha256(material).hexdigest()}"
+
+
+def _task_retry_cancellation_requested(task: Task) -> bool:
+    """Return whether an owned retry attempt carries a durable cancel request."""
+
+    return task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+
+
+def _task_retry_cancellation_requested_task(
+    task: Task,
+    *,
+    error: dict[str, Any] | None,
+    updated_at: datetime,
+) -> Task:
+    """Fence an active attempt while its worker proves dispatched work quiescent."""
+
+    series = task.retry_series
+    if (
+        series is None
+        or series.disposition is not TaskRetrySeriesDisposition.ACTIVE
+        or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+        or task.worker_id is None
+        or task.lease_expires_at is None
+    ):
+        raise TaskTerminalizationConflict("Task retry attempt cannot drain cancellation.")
+    if _task_retry_cancellation_requested(task):
+        return task.model_copy(deep=True)
+    cancellation_error = (
+        {"code": TaskRetrySeriesDisposition.CANCELLED.value}
+        if error is None
+        else copy_durable_json_object(error, "error")
+    )
+    return task.model_copy(
+        update={
+            "status_reason": _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
+            "status_payload": {
+                "settlement_idempotency_key": _task_retry_runtime_idempotency_key(
+                    task,
+                    "cancellation",
+                ),
+                "error": cancellation_error,
+            },
+            "updated_at": normalize_utc_datetime(updated_at, "updated_at"),
+        },
+        deep=True,
+    )
+
+
+def _task_retry_requested_cancellation_settlement(
+    task: Task,
+    *,
+    worker_id: str,
+    token_count: int = 0,
+    estimated_cost: Decimal = Decimal(0),
+) -> TaskRetrySettlementRequest | None:
+    """Reconstruct the exact cancellation intent owned by a draining attempt."""
+
+    if not _task_retry_cancellation_requested(task):
+        return None
+    series = task.retry_series
+    payload = task.status_payload
+    if (
+        task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+        or series is None
+        or series.disposition is not TaskRetrySeriesDisposition.ACTIVE
+        or task.worker_id != worker_id
+        or type(payload) is not dict
+        or set(payload) != {"settlement_idempotency_key", "error"}
+        or type(payload.get("settlement_idempotency_key")) is not str
+        or type(payload.get("error")) is not dict
+    ):
+        raise TaskTerminalizationConflict(
+            "Task retry cancellation request conflicts with active ownership."
+        )
+    expected_key = _task_retry_runtime_idempotency_key(task, "cancellation")
+    if payload["settlement_idempotency_key"] != expected_key:
+        raise TaskTerminalizationConflict(
+            "Task retry cancellation request conflicts with its attempt identity."
+        )
+    return TaskRetrySettlementRequest(
+        task_id=task.id,
+        worker_id=worker_id,
+        idempotency_key=expected_key,
+        causal_budget_id=series.causal_budget_id,
+        disposition=TaskRetryAttemptDisposition.CANCELLED,
+        error=copy_durable_json_object(payload["error"], "error"),
+        token_count=token_count,
+        estimated_cost=estimated_cost,
+    )
+
+
+def _validated_task_retry_terminal_accounting(
+    *,
+    token_count: int,
+    estimated_cost: Decimal,
+) -> tuple[int, Decimal]:
+    """Validate the accounting copied into a runtime-owned terminal settlement."""
+
+    report = TaskRetryAttemptReport(
+        idempotency_key="task-retry-terminal-accounting",
+        disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+        error={"code": "runtime_terminal"},
+        token_count=token_count,
+        estimated_cost=estimated_cost,
+    )
+    return report.token_count, report.estimated_cost
+
+
+def _task_retry_attempt_elapsed(task: Task, *, series_now: datetime) -> bool:
+    series_now = normalize_utc_datetime(series_now, "series_now")
+    series = task.retry_series
+    return bool(
+        task.status is TaskStatus.PENDING
+        and task.session_id is None
+        and series is not None
+        and series.disposition is TaskRetrySeriesDisposition.ACTIVE
+        and series.elapsed_deadline is not None
+        and series.elapsed_deadline <= series_now
+    )
+
+
+def _claimed_task_retry_attempt_elapsed(task: Task, *, series_now: datetime) -> bool:
+    series_now = normalize_utc_datetime(series_now, "series_now")
+    series = task.retry_series
+    return bool(
+        task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+        and task.session_id is None
+        and not _task_retry_cancellation_requested(task)
+        and series is not None
+        and series.disposition is TaskRetrySeriesDisposition.ACTIVE
+        and series.elapsed_deadline is not None
+        and series.elapsed_deadline <= series_now
+    )
+
+
+def _elapsed_claimed_task_retry_settlement(
+    task: Task,
+    *,
+    committed_at: datetime,
+    token_count: int = 0,
+    estimated_cost: Decimal = Decimal(0),
+) -> TaskRetrySettlementResult:
+    """Finalize a live claimed attempt after store time proves elapsed authority."""
+
+    return _runtime_task_retry_terminal_settlement(
+        task,
+        operation="elapsed",
+        request_disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+        series_disposition=TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED,
+        status=TaskStatus.FAILED,
+        error={"code": TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED.value},
+        committed_at=committed_at,
+        token_count=token_count,
+        estimated_cost=estimated_cost,
+    )
+
+
+def _expired_task_retry_settlement(
+    task: Task,
+    *,
+    committed_at: datetime,
+    series_now: datetime,
+) -> TaskRetrySettlementResult:
+    """Finalize an unclaimed attempt whose cumulative elapsed authority expired."""
+
+    committed_at = normalize_utc_datetime(committed_at, "committed_at")
+    series_now = normalize_utc_datetime(series_now, "series_now")
+    if not _task_retry_attempt_elapsed(task, series_now=series_now):
+        raise TaskTerminalizationConflict("Task retry attempt has not elapsed.")
+    return _runtime_task_retry_terminal_settlement(
+        task,
+        operation="expiration",
+        request_disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+        series_disposition=TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED,
+        status=TaskStatus.FAILED,
+        error={"code": TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED.value},
+        committed_at=committed_at,
+    )
+
+
+def _cancelled_task_retry_settlement(
+    task: Task,
+    *,
+    error: dict[str, Any] | None,
+    committed_at: datetime,
+) -> TaskRetrySettlementResult:
+    series = task.retry_series
+    if (
+        series is None
+        or series.disposition is not TaskRetrySeriesDisposition.ACTIVE
+        or task.status in _TERMINAL_TASK_STATUSES
+    ):
+        raise TaskTerminalizationConflict("Task retry attempt is not cancellable.")
+    return _runtime_task_retry_terminal_settlement(
+        task,
+        operation="cancellation",
+        request_disposition=TaskRetryAttemptDisposition.CANCELLED,
+        series_disposition=TaskRetrySeriesDisposition.CANCELLED,
+        status=TaskStatus.CANCELLED,
+        error=(
+            {"code": TaskRetrySeriesDisposition.CANCELLED.value}
+            if error is None
+            else copy_durable_json_object(error, "error")
+        ),
+        committed_at=committed_at,
+    )
+
+
+def _runtime_task_retry_terminal_settlement(
+    task: Task,
+    *,
+    operation: str,
+    request_disposition: TaskRetryAttemptDisposition,
+    series_disposition: TaskRetrySeriesDisposition,
+    status: TaskStatus,
+    error: dict[str, Any],
+    committed_at: datetime,
+    token_count: int = 0,
+    estimated_cost: Decimal = Decimal(0),
+) -> TaskRetrySettlementResult:
+    committed_at = normalize_utc_datetime(committed_at, "committed_at")
+    series = task.retry_series
+    if series is None or series.disposition is not TaskRetrySeriesDisposition.ACTIVE:
+        raise TaskTerminalizationConflict("Task retry attempt is not active.")
+    request, request_sha256 = _task_retry_runtime_terminal_request(
+        task,
+        operation=operation,
+        request_disposition=request_disposition,
+        error=error,
+        token_count=token_count,
+        estimated_cost=estimated_cost,
+    )
+    idempotency_key = request.idempotency_key
+    cumulative_tokens = series.cumulative_tokens + request.token_count
+    if cumulative_tokens > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Task retry cumulative token count exceeds durable bounds.")
+    cumulative_estimated_cost = series.cumulative_estimated_cost + request.estimated_cost
+    _bounded_task_retry_decimal(
+        cumulative_estimated_cost,
+        "cumulative_estimated_cost",
+        max_digits=_TASK_RETRY_TOTAL_COST_MAX_DIGITS,
+    )
+    settled_authority_sha256 = _task_retry_attempt_authority_sha256(
+        task_id=task.id,
+        task_type=task.type,
+        title=task.title,
+        description=task.description,
+        parent_task_id=task.parent_task_id,
+        assigned_agent_name=task.assigned_agent_name,
+        available_at=task.available_at,
+        created_at=task.created_at,
+        task_input=task.input,
+        metadata=task.metadata,
+        invocation=task.invocation,
+        series_id=series.series_id,
+        causal_budget_id=series.causal_budget_id,
+        attempt=series.attempt,
+        policy=series.policy,
+        started_at=series.started_at,
+        cumulative_tokens=cumulative_tokens,
+        cumulative_estimated_cost=cumulative_estimated_cost,
+        predecessor_task_id=series.predecessor_task_id,
+    )
+    settled_series = _task_retry_series_snapshot(
+        series_id=series.series_id,
+        causal_budget_id=series.causal_budget_id,
+        authority_sha256=settled_authority_sha256,
+        attempt=series.attempt,
+        policy=series.policy,
+        started_at=series.started_at,
+        cumulative_tokens=cumulative_tokens,
+        cumulative_estimated_cost=cumulative_estimated_cost,
+        disposition=series_disposition,
+        predecessor_task_id=series.predecessor_task_id,
+    )
+    settled = task.model_copy(
+        update={
+            "status": status,
+            "status_reason": series_disposition.value,
+            "status_payload": {
+                "retry_series_id": series.series_id,
+                "attempt": series.attempt,
+                "disposition": series_disposition.value,
+                "settlement_idempotency_key": idempotency_key,
+                "causal_budget_id": series.causal_budget_id,
+                "cumulative_tokens": cumulative_tokens,
+                "cumulative_estimated_cost": str(cumulative_estimated_cost),
+                "cost_currency": series.policy.cost_currency,
+                "next_eligible_at": None,
+            },
+            "result": None,
+            "error": deepcopy(error),
+            "worker_id": None,
+            "lease_expires_at": None,
+            "started_at": task.started_at or committed_at,
+            "completed_at": committed_at,
+            "updated_at": committed_at,
+            "retry_series": settled_series,
+        },
+        deep=True,
+    )
+    return TaskRetrySettlementResult(
+        task_id=task.id,
+        idempotency_key=idempotency_key,
+        request_sha256=request_sha256,
+        task=settled,
+        events=_task_retry_events(settled, occurred_at=committed_at),
+        committed_at=committed_at,
+    )
+
+
+def _task_retry_runtime_terminal_request(
+    task: Task,
+    *,
+    operation: str,
+    request_disposition: TaskRetryAttemptDisposition,
+    error: dict[str, Any],
+    token_count: int = 0,
+    estimated_cost: Decimal = Decimal(0),
+) -> tuple[TaskRetrySettlementRequest, str]:
+    """Build the exact request identity shared by mutation and reconciliation."""
+
+    series = task.retry_series
+    if series is None or series.disposition is not TaskRetrySeriesDisposition.ACTIVE:
+        raise TaskTerminalizationConflict("Task retry attempt is not active.")
+    operation = require_clean_nonblank(operation, "operation")
+    return prepare_task_retry_settlement(
+        TaskRetrySettlementRequest(
+            task_id=task.id,
+            worker_id=f"cayu-runtime-retry-{operation}",
+            idempotency_key=_task_retry_runtime_idempotency_key(task, operation),
+            causal_budget_id=series.causal_budget_id,
+            disposition=request_disposition,
+            error=error,
+            token_count=token_count,
+            estimated_cost=estimated_cost,
+            retry_after_seconds=(
+                0.0
+                if request_disposition is TaskRetryAttemptDisposition.RETRYABLE_FAILURE
+                else None
+            ),
+        )
+    )
+
+
+def _task_retry_backoff_seconds(policy: TaskRetryPolicy, completed_attempt: int) -> float:
+    delay = policy.initial_backoff_seconds
+    for _ in range(max(0, completed_attempt - 1)):
+        if delay >= policy.max_backoff_seconds:
+            return policy.max_backoff_seconds
+        delay = min(policy.max_backoff_seconds, delay * policy.backoff_multiplier)
+    return min(delay, policy.max_backoff_seconds)
+
+
+def _task_retry_series_snapshot(
+    *,
+    series_id: str,
+    causal_budget_id: str,
+    authority_sha256: str,
+    attempt: int,
+    policy: TaskRetryPolicy,
+    started_at: datetime,
+    cumulative_tokens: int = 0,
+    cumulative_estimated_cost: Decimal = Decimal(0),
+    disposition: TaskRetrySeriesDisposition = TaskRetrySeriesDisposition.ACTIVE,
+    predecessor_task_id: str | None = None,
+    successor_task_id: str | None = None,
+    next_eligible_at: datetime | None = None,
+) -> TaskRetrySeriesSnapshot:
+    return TaskRetrySeriesSnapshot(
+        series_id=series_id,
+        causal_budget_id=causal_budget_id,
+        authority_sha256=authority_sha256,
+        attempt=attempt,
+        policy=policy,
+        started_at=started_at,
+        cumulative_tokens=cumulative_tokens,
+        cumulative_estimated_cost=cumulative_estimated_cost,
+        attempts_remaining=max(0, policy.max_attempts - attempt),
+        tokens_remaining=(
+            None
+            if policy.max_total_tokens is None
+            else max(0, policy.max_total_tokens - cumulative_tokens)
+        ),
+        estimated_cost_remaining=(
+            None
+            if policy.max_estimated_cost is None
+            else max(Decimal(0), policy.max_estimated_cost - cumulative_estimated_cost)
+        ),
+        elapsed_deadline=(
+            None
+            if policy.max_elapsed_seconds is None
+            else started_at + timedelta(seconds=policy.max_elapsed_seconds)
+        ),
+        disposition=disposition,
+        predecessor_task_id=predecessor_task_id,
+        successor_task_id=successor_task_id,
+        next_eligible_at=next_eligible_at,
+    )
+
+
+def _task_retry_event_id(
+    *,
+    series_id: str,
+    attempt: int,
+    event_type: TaskRetryEventType,
+) -> str:
+    material = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-retry-event.v1",
+            "series_id": series_id,
+            "attempt": attempt,
+            "type": event_type.value,
+        },
+        "task_retry_event_id",
+    )
+    return f"task-retry-event:v1:{sha256(material).hexdigest()}"
+
+
+def _task_retry_events(
+    task: Task,
+    *,
+    occurred_at: datetime,
+) -> tuple[TaskRetryEvent, TaskRetryEvent]:
+    series = task.retry_series
+    if series is None:  # pragma: no cover - internal construction invariant
+        raise AssertionError("Retry settlement event requires retry-series evidence.")
+    event_fields = {
+        "task_id": task.id,
+        "series_id": series.series_id,
+        "causal_budget_id": series.causal_budget_id,
+        "attempt": series.attempt,
+        "disposition": series.disposition,
+        "occurred_at": occurred_at,
+        "attempts_remaining": series.attempts_remaining,
+        "tokens_remaining": series.tokens_remaining,
+        "estimated_cost_remaining": series.estimated_cost_remaining,
+        "cost_currency": series.policy.cost_currency,
+        "elapsed_deadline": series.elapsed_deadline,
+        "next_eligible_at": series.next_eligible_at,
+    }
+    outcome_type = (
+        TaskRetryEventType.RETRY_SCHEDULED
+        if series.disposition is TaskRetrySeriesDisposition.RETRY_SCHEDULED
+        else TaskRetryEventType.SERIES_TERMINAL
+    )
+    return (
+        TaskRetryEvent(
+            id=_task_retry_event_id(
+                series_id=series.series_id,
+                attempt=series.attempt,
+                event_type=TaskRetryEventType.ATTEMPT_SETTLED,
+            ),
+            type=TaskRetryEventType.ATTEMPT_SETTLED,
+            **event_fields,
+        ),
+        TaskRetryEvent(
+            id=_task_retry_event_id(
+                series_id=series.series_id,
+                attempt=series.attempt,
+                event_type=outcome_type,
+            ),
+            type=outcome_type,
+            **event_fields,
+        ),
+    )
+
+
+def _settled_task_retry_attempt(
+    task: Task,
+    request: TaskRetrySettlementRequest,
+    *,
+    now: datetime,
+    series_now: datetime,
+) -> tuple[Task, Task | None]:
+    series = task.retry_series
+    if series is None:
+        raise ValueError("Task does not belong to a retry series.")
+    if series.disposition is not TaskRetrySeriesDisposition.ACTIVE:
+        raise TaskTerminalizationConflict("Task retry attempt is not active.")
+    now = normalize_utc_datetime(now, "now")
+    series_now = normalize_utc_datetime(series_now, "series_now")
+    if request.causal_budget_id != series.causal_budget_id:
+        raise TaskTerminalizationConflict(
+            "Task retry settlement conflicts with the series causal budget."
+        )
+    requested_cancellation = _task_retry_requested_cancellation_settlement(
+        task,
+        worker_id=request.worker_id,
+        token_count=request.token_count,
+        estimated_cost=request.estimated_cost,
+    )
+    if requested_cancellation is not None and request != requested_cancellation:
+        raise TaskTerminalizationConflict("Task retry attempt has a pending cancellation request.")
+    token_authority_exceeded = (
+        series.tokens_remaining is not None and request.token_count > series.tokens_remaining
+    )
+    cost_authority_exceeded = (
+        series.estimated_cost_remaining is not None
+        and request.estimated_cost > series.estimated_cost_remaining
+    )
+    cumulative_tokens = series.cumulative_tokens + request.token_count
+    if cumulative_tokens > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Task retry cumulative token count exceeds durable bounds.")
+    cumulative_cost = series.cumulative_estimated_cost + request.estimated_cost
+    _bounded_task_retry_decimal(
+        cumulative_cost,
+        "cumulative_estimated_cost",
+        max_digits=_TASK_RETRY_TOTAL_COST_MAX_DIGITS,
+    )
+
+    disposition: TaskRetrySeriesDisposition
+    successor: Task | None = None
+    next_eligible_at: datetime | None = None
+    successor_task_id: str | None = None
+    outcome_result = deepcopy(request.result)
+    outcome_error = deepcopy(request.error)
+    elapsed_deadline = series.elapsed_deadline
+    if requested_cancellation is not None:
+        status = TaskStatus.CANCELLED
+        disposition = TaskRetrySeriesDisposition.CANCELLED
+    elif elapsed_deadline is not None and series_now >= elapsed_deadline:
+        status = TaskStatus.FAILED
+        disposition = TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED
+        outcome_result = None
+        outcome_error = {"code": disposition.value}
+    elif token_authority_exceeded:
+        status = TaskStatus.FAILED
+        disposition = TaskRetrySeriesDisposition.TOKENS_EXHAUSTED
+        outcome_result = None
+        outcome_error = {"code": disposition.value}
+    elif cost_authority_exceeded:
+        status = TaskStatus.FAILED
+        disposition = TaskRetrySeriesDisposition.COST_EXHAUSTED
+        outcome_result = None
+        outcome_error = {"code": disposition.value}
+    elif request.disposition is TaskRetryAttemptDisposition.SUCCEEDED:
+        status = TaskStatus.COMPLETED
+        disposition = TaskRetrySeriesDisposition.SUCCEEDED
+    elif request.disposition is TaskRetryAttemptDisposition.CANCELLED:
+        status = TaskStatus.CANCELLED
+        disposition = TaskRetrySeriesDisposition.CANCELLED
+    elif request.disposition is TaskRetryAttemptDisposition.NON_RETRYABLE_FAILURE:
+        status = TaskStatus.FAILED
+        disposition = TaskRetrySeriesDisposition.NON_RETRYABLE_FAILURE
+    else:
+        status = TaskStatus.FAILED
+        policy = series.policy
+        backoff_seconds = max(
+            _task_retry_backoff_seconds(policy, series.attempt),
+            request.retry_after_seconds or 0.0,
+        )
+        next_eligible_at = series_now + timedelta(seconds=backoff_seconds)
+        if series.attempt >= policy.max_attempts:
+            disposition = TaskRetrySeriesDisposition.ATTEMPTS_EXHAUSTED
+        elif elapsed_deadline is not None and next_eligible_at >= elapsed_deadline:
+            disposition = TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED
+        elif policy.max_total_tokens is not None and cumulative_tokens >= policy.max_total_tokens:
+            disposition = TaskRetrySeriesDisposition.TOKENS_EXHAUSTED
+        elif policy.max_estimated_cost is not None and cumulative_cost >= policy.max_estimated_cost:
+            disposition = TaskRetrySeriesDisposition.COST_EXHAUSTED
+        else:
+            disposition = TaskRetrySeriesDisposition.RETRY_SCHEDULED
+            successor_task_id = _task_retry_successor_id(series.series_id, series.attempt + 1)
+
+    settled_authority_sha256 = _task_retry_attempt_authority_sha256(
+        task_id=task.id,
+        task_type=task.type,
+        title=task.title,
+        description=task.description,
+        parent_task_id=task.parent_task_id,
+        assigned_agent_name=task.assigned_agent_name,
+        available_at=task.available_at,
+        created_at=task.created_at,
+        task_input=task.input,
+        metadata=task.metadata,
+        invocation=task.invocation,
+        series_id=series.series_id,
+        causal_budget_id=series.causal_budget_id,
+        attempt=series.attempt,
+        policy=series.policy,
+        started_at=series.started_at,
+        cumulative_tokens=cumulative_tokens,
+        cumulative_estimated_cost=cumulative_cost,
+        predecessor_task_id=series.predecessor_task_id,
+    )
+    settled_series = _task_retry_series_snapshot(
+        series_id=series.series_id,
+        causal_budget_id=series.causal_budget_id,
+        authority_sha256=settled_authority_sha256,
+        attempt=series.attempt,
+        policy=series.policy,
+        started_at=series.started_at,
+        cumulative_tokens=cumulative_tokens,
+        cumulative_estimated_cost=cumulative_cost,
+        disposition=disposition,
+        predecessor_task_id=series.predecessor_task_id,
+        successor_task_id=successor_task_id,
+        next_eligible_at=next_eligible_at if successor_task_id is not None else None,
+    )
+    settled = task.model_copy(
+        update={
+            "status": status,
+            "status_reason": disposition.value,
+            "status_payload": {
+                "retry_series_id": series.series_id,
+                "attempt": series.attempt,
+                "disposition": disposition.value,
+                "settlement_idempotency_key": request.idempotency_key,
+                "causal_budget_id": series.causal_budget_id,
+                "cumulative_tokens": cumulative_tokens,
+                "cumulative_estimated_cost": str(cumulative_cost),
+                "cost_currency": series.policy.cost_currency,
+                "next_eligible_at": (
+                    None
+                    if settled_series.next_eligible_at is None
+                    else settled_series.next_eligible_at.isoformat()
+                ),
+            },
+            "result": outcome_result,
+            "error": outcome_error,
+            "worker_id": None,
+            "lease_expires_at": None,
+            "started_at": task.started_at or now,
+            "completed_at": now,
+            "updated_at": now,
+            "retry_series": settled_series,
+        },
+        deep=True,
+    )
+    if successor_task_id is not None:
+        successor_authority_sha256 = _task_retry_attempt_authority_sha256(
+            task_id=successor_task_id,
+            task_type=task.type,
+            title=task.title,
+            description=task.description,
+            parent_task_id=task.parent_task_id,
+            assigned_agent_name=task.assigned_agent_name,
+            available_at=next_eligible_at,
+            created_at=now,
+            task_input=task.input,
+            metadata=task.metadata,
+            invocation=task.invocation,
+            series_id=series.series_id,
+            causal_budget_id=series.causal_budget_id,
+            attempt=series.attempt + 1,
+            policy=series.policy,
+            started_at=series.started_at,
+            cumulative_tokens=cumulative_tokens,
+            cumulative_estimated_cost=cumulative_cost,
+            predecessor_task_id=task.id,
+        )
+        successor_series = _task_retry_series_snapshot(
+            series_id=series.series_id,
+            causal_budget_id=series.causal_budget_id,
+            authority_sha256=successor_authority_sha256,
+            attempt=series.attempt + 1,
+            policy=series.policy,
+            started_at=series.started_at,
+            cumulative_tokens=cumulative_tokens,
+            cumulative_estimated_cost=cumulative_cost,
+            predecessor_task_id=task.id,
+        )
+        successor = Task(
+            id=successor_task_id,
+            type=task.type,
+            title=task.title,
+            description=task.description,
+            status=TaskStatus.PENDING,
+            parent_task_id=task.parent_task_id,
+            assigned_agent_name=task.assigned_agent_name,
+            available_at=next_eligible_at,
+            input=copy_durable_json_object(task.input, "input"),
+            metadata=copy_durable_json_object(task.metadata, "metadata"),
+            created_at=now,
+            updated_at=now,
+            invocation=copy_task_invocation(task.invocation),
+            retry_series=successor_series,
+        )
+    return settled, successor
 
 
 def prepare_task_terminalization_receipt_lookup(
@@ -2665,6 +4325,106 @@ async def terminalize_task_with_retry(
     raise AssertionError("Task terminalization retry loop exited without an outcome.")
 
 
+async def settle_task_retry_attempt_with_retry(
+    task_store: TaskStore,
+    request: TaskRetrySettlementRequest,
+    *,
+    policy: TaskTerminalizationRetryPolicy | None = None,
+) -> TaskRetrySettlementResult:
+    """Settle once, reconciling only acknowledgement-ambiguous store failures."""
+
+    if not isinstance(task_store, TaskStore):
+        raise TypeError("task_store must be a TaskStore instance.")
+    if not task_store.supports_task_retry_series:
+        raise ValueError("task_store must support atomic task retry-series settlement.")
+    request, request_sha256 = prepare_task_retry_settlement(request)
+    if policy is None:
+        policy = TaskTerminalizationRetryPolicy()
+    elif type(policy) is not TaskTerminalizationRetryPolicy:
+        raise TypeError("policy must be a TaskTerminalizationRetryPolicy instance.")
+    else:
+        policy = TaskTerminalizationRetryPolicy.model_validate(
+            policy.model_dump(mode="python", warnings=False)
+        )
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    applied_backoff_seconds = 0.0
+    delay = min(policy.initial_backoff_seconds, policy.max_backoff_seconds)
+    last_error_category = "store_error"
+    for attempt in range(1, policy.max_attempts + 1):
+        try:
+            receipt = await asyncio.wait_for(
+                task_store.settle_task_retry_attempt(
+                    TaskRetrySettlementRequest.model_validate(
+                        request.model_dump(mode="python", warnings=False)
+                    )
+                ),
+                timeout=policy.attempt_timeout_seconds,
+            )
+            return _validate_task_retry_settlement_receipt_identity(
+                receipt,
+                request=request,
+                request_sha256=request_sha256,
+            )
+        except Exception as exc:
+            if not _task_terminalization_error_is_acknowledgement_ambiguous(exc):
+                raise
+            last_error_category = _task_terminalization_error_category(exc)
+
+        try:
+            receipt = await asyncio.wait_for(
+                task_store.load_task_retry_settlement(
+                    request.task_id,
+                    request.idempotency_key,
+                ),
+                timeout=policy.attempt_timeout_seconds,
+            )
+        except Exception as exc:
+            if not _task_terminalization_error_is_acknowledgement_ambiguous(exc):
+                raise
+            last_error_category = _task_terminalization_error_category(exc)
+            receipt = None
+
+        if receipt is not None:
+            receipt = _validate_task_retry_settlement_receipt_identity(
+                receipt,
+                request=request,
+                request_sha256=request_sha256,
+            )
+            try:
+                current_task = await asyncio.wait_for(
+                    task_store.load_task(request.task_id),
+                    timeout=policy.attempt_timeout_seconds,
+                )
+            except Exception as exc:
+                if not _task_terminalization_error_is_acknowledgement_ambiguous(exc):
+                    raise
+                last_error_category = _task_terminalization_error_category(exc)
+            else:
+                return _replay_task_retry_settlement(
+                    request_sha256=request_sha256,
+                    receipt=receipt,
+                    current_task=current_task,
+                )
+
+        if attempt == policy.max_attempts:
+            raise TaskTerminalizationUncertain(
+                task_id=request.task_id,
+                idempotency_key=request.idempotency_key,
+                attempt_count=attempt,
+                error_category=last_error_category,
+                elapsed_seconds=max(0.0, loop.time() - started_at),
+                applied_backoff_seconds=applied_backoff_seconds,
+            )
+        if delay > 0:
+            await asyncio.sleep(delay)
+            applied_backoff_seconds += delay
+        delay = min(delay * policy.backoff_multiplier, policy.max_backoff_seconds)
+
+    raise AssertionError("Task retry settlement loop exited without an outcome.")
+
+
 async def _terminalize_claimed_task(
     task_store: TaskStore,
     request: TaskTerminalizationRequest,
@@ -2776,6 +4536,13 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         available_at=request.available_at,
         input=copy_durable_json_object(request.input, "input"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
+        retry_policy=(
+            None
+            if request.retry_policy is None
+            else TaskRetryPolicy.model_validate(
+                request.retry_policy.model_dump(mode="python", warnings=False)
+            )
+        ),
         invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
     )
     copied._verified_invocation_origin = (
@@ -3047,8 +4814,54 @@ def _task_from_create(
     task_id: str,
     parent_task: Task | TaskInvocationSnapshot | None,
     session_invocation: SessionInvocationBinding | None = None,
+    retry_started_at: datetime | None = None,
 ) -> Task:
     now = datetime.now(UTC)
+    retry_started_at = (
+        now
+        if retry_started_at is None
+        else normalize_utc_datetime(retry_started_at, "retry_started_at")
+    )
+    invocation = task_invocation_for_create(
+        request,
+        task_id=task_id,
+        parent_task=parent_task,
+        session_invocation=session_invocation,
+    )
+    retry_policy = request.retry_policy
+    if retry_policy is None:
+        retry_series = None
+    else:
+        retry_series_id = _task_retry_series_id(task_id)
+        authority_sha256 = _task_retry_attempt_authority_sha256(
+            task_id=task_id,
+            task_type=request.type,
+            title=request.title,
+            description=request.description,
+            parent_task_id=request.parent_task_id,
+            assigned_agent_name=request.assigned_agent_name,
+            available_at=request.available_at,
+            created_at=now,
+            task_input=request.input,
+            metadata=request.metadata,
+            invocation=invocation,
+            series_id=retry_series_id,
+            causal_budget_id=retry_series_id,
+            attempt=1,
+            policy=retry_policy,
+            started_at=retry_started_at,
+            cumulative_tokens=0,
+            cumulative_estimated_cost=Decimal(0),
+            predecessor_task_id=None,
+        )
+        retry_series = _task_retry_series_snapshot(
+            series_id=retry_series_id,
+            causal_budget_id=retry_series_id,
+            authority_sha256=authority_sha256,
+            attempt=1,
+            policy=retry_policy,
+            started_at=retry_started_at,
+        )
     return Task(
         id=task_id,
         type=request.type,
@@ -3063,12 +4876,8 @@ def _task_from_create(
         metadata=copy_durable_json_object(request.metadata, "metadata"),
         created_at=now,
         updated_at=now,
-        invocation=task_invocation_for_create(
-            request,
-            task_id=task_id,
-            parent_task=parent_task,
-            session_invocation=session_invocation,
-        ),
+        invocation=invocation,
+        retry_series=retry_series,
     )
 
 
@@ -3078,12 +4887,14 @@ def _running_task_from_create(
     task_id: str,
     parent_task: Task | TaskInvocationSnapshot | None,
     session_invocation: SessionInvocationBinding,
+    retry_started_at: datetime | None = None,
 ) -> Task:
     task = _task_from_create(
         request,
         task_id=task_id,
         parent_task=parent_task,
         session_invocation=session_invocation,
+        retry_started_at=retry_started_at,
     )
     if task.session_id is None:
         raise ValueError("TaskCreate.session_id is required to create a running task.")
@@ -3097,6 +4908,15 @@ def _running_task_from_create(
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
     _ensure_task_status_can_transition(task.id, task.status, next_status)
+
+
+def _ensure_retry_series_queue_attempt(
+    retry_series: TaskRetrySeriesSnapshot | None,
+) -> None:
+    if retry_series is not None:
+        raise ValueError(
+            "Retry-series attempts are settled by task workers and cannot attach to sessions."
+        )
 
 
 def _ensure_task_status_can_transition(
@@ -3118,6 +4938,10 @@ def _ensure_can_hold_task(task: Task, next_status: TaskStatus) -> None:
     if next_status not in _HELD_TASK_STATUSES:
         raise ValueError(f"Task {task.id} cannot be held as {next_status}.")
     _ensure_not_terminal(task)
+    if _task_retry_cancellation_requested(task):
+        raise TaskTerminalizationConflict(
+            "Task retry cancellation is still draining under its current owner."
+        )
     if task.status is TaskStatus.RUNNING and task.session_id is not None:
         raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
     if task.status not in {

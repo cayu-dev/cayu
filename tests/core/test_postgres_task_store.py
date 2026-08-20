@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
 
@@ -41,6 +42,10 @@ from cayu import (
     TaskInvocation,
     TaskOrder,
     TaskQuery,
+    TaskRetryAttemptDisposition,
+    TaskRetryPolicy,
+    TaskRetrySeriesDisposition,
+    TaskRetrySettlementRequest,
     TaskStatus,
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
@@ -63,6 +68,7 @@ _TABLES = (
     "cayu_knowledge_embeddings",
     "cayu_knowledge_index_readiness_current",
     "cayu_knowledge_index_readiness_events",
+    "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
@@ -99,6 +105,11 @@ _TABLES = (
 )
 
 
+def _retry_causal_budget_id(task: Task) -> str:
+    assert task.retry_series is not None
+    return task.retry_series.causal_budget_id
+
+
 def test_postgres_task_store_replays_terminalization_and_receipt(postgres_dsn):
     async def ops(store):
         await store.create_task(TaskCreate(task_id="task_terminal", type="review"))
@@ -126,6 +137,450 @@ def test_postgres_task_store_replays_terminalization_and_receipt(postgres_dsn):
         )
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_task_retry_series_success_budget_and_duplicate_conformance(
+    postgres_dsn,
+):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        clock = _MutableClock(datetime(2026, 8, 19, 12, tzinfo=UTC))
+        store = _new_store(postgres_dsn, clock=clock)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-success",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        initial_backoff_seconds=0,
+                        max_total_tokens=10,
+                        max_estimated_cost=Decimal("1.00"),
+                    ),
+                )
+            )
+            first_claim = await store.claim_task("worker-a")
+            assert first_claim is not None
+            retry_request = TaskRetrySettlementRequest(
+                task_id="retry-success",
+                worker_id="worker-a",
+                idempotency_key="attempt-one",
+                causal_budget_id=_retry_causal_budget_id(first_claim),
+                disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                error={"code": "temporary"},
+                token_count=3,
+                estimated_cost=Decimal("0.25"),
+            )
+            receipts = await asyncio.gather(
+                *(store.settle_task_retry_attempt(retry_request) for _ in range(4))
+            )
+            assert all(receipt == receipts[0] for receipt in receipts)
+            assert receipts[0].successor is not None
+            second = await store.claim_task("worker-b")
+            assert second is not None
+            completed = await store.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id=second.id,
+                    worker_id="worker-b",
+                    idempotency_key="attempt-two",
+                    causal_budget_id=_retry_causal_budget_id(second),
+                    disposition=TaskRetryAttemptDisposition.SUCCEEDED,
+                    result={"ok": True},
+                    token_count=2,
+                    estimated_cost=Decimal("0.10"),
+                )
+            )
+            assert completed.task.retry_series is not None
+            assert completed.task.retry_series.disposition is TaskRetrySeriesDisposition.SUCCEEDED
+            assert completed.task.retry_series.cumulative_tokens == 5
+
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-budget",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=3,
+                        initial_backoff_seconds=0,
+                        max_total_tokens=4,
+                    ),
+                )
+            )
+            budget_claim = await store.claim_task("worker-c")
+            assert budget_claim is not None
+            exhausted = await store.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id="retry-budget",
+                    worker_id="worker-c",
+                    idempotency_key="budget-attempt",
+                    causal_budget_id=_retry_causal_budget_id(budget_claim),
+                    disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                    error={"code": "temporary"},
+                    token_count=4,
+                )
+            )
+            assert exhausted.successor is None
+            assert exhausted.task.retry_series is not None
+            assert (
+                exhausted.task.retry_series.disposition
+                is TaskRetrySeriesDisposition.TOKENS_EXHAUSTED
+            )
+
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-overspend",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        max_total_tokens=5,
+                        max_estimated_cost=Decimal("0.25"),
+                    ),
+                )
+            )
+            overspend_claim = await store.claim_task("worker-d")
+            assert overspend_claim is not None
+            overspend = await store.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id="retry-overspend",
+                    worker_id="worker-d",
+                    idempotency_key="overspend-attempt",
+                    causal_budget_id=_retry_causal_budget_id(overspend_claim),
+                    disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                    error={"code": "temporary"},
+                    token_count=6,
+                )
+            )
+            assert overspend.successor is None
+            assert overspend.task.retry_series is not None
+            assert (
+                overspend.task.retry_series.disposition
+                is TaskRetrySeriesDisposition.TOKENS_EXHAUSTED
+            )
+            assert overspend.task.retry_series.cumulative_tokens == 6
+            assert overspend.task.retry_series.tokens_remaining == 0
+            assert (
+                await store.load_task_retry_settlement(
+                    "retry-overspend",
+                    "overspend-attempt",
+                )
+                == overspend
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_series_restart_cancellation_and_claim_race(
+    postgres_dsn,
+):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        started_at = datetime(2026, 8, 19, 13, tzinfo=UTC)
+        clock = _MutableClock(started_at)
+        producer = _new_store(postgres_dsn, clock=clock)
+        try:
+            await producer.create_task(
+                TaskCreate(
+                    task_id="retry-restart",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        initial_backoff_seconds=30,
+                    ),
+                )
+            )
+            claimed = await producer.claim_task("worker-a")
+            assert claimed is not None
+            retry = await producer.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id="retry-restart",
+                    worker_id="worker-a",
+                    idempotency_key="restart-attempt",
+                    causal_budget_id=_retry_causal_budget_id(claimed),
+                    disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                    error={"code": "temporary"},
+                )
+            )
+            assert retry.successor is not None
+            successor_id = retry.successor.id
+        finally:
+            await producer.close()
+
+        clock.value = started_at + timedelta(seconds=30)
+        first = _new_store(postgres_dsn, clock=clock)
+        second = _new_store(postgres_dsn, clock=clock)
+        try:
+            claims = await asyncio.gather(
+                first.claim_task("worker-b"),
+                second.claim_task("worker-c"),
+            )
+            assert sum(claim is not None for claim in claims) == 1
+            winner = next(claim for claim in claims if claim is not None)
+            assert winner.id == successor_id
+            await (first if winner.worker_id == "worker-b" else second).release_task(
+                successor_id,
+                winner.worker_id,
+            )
+            cancelled = await first.cancel_task(successor_id, {"code": "operator"})
+            assert cancelled.retry_series is not None
+            assert cancelled.retry_series.disposition is TaskRetrySeriesDisposition.CANCELLED
+            assert cancelled.status_payload is not None
+            receipt_key = cancelled.status_payload["settlement_idempotency_key"]
+            assert isinstance(receipt_key, str)
+            receipt = await second.load_task_retry_settlement(successor_id, receipt_key)
+            assert receipt is not None
+            assert receipt.task == cancelled
+            assert receipt.successor is None
+            assert await second.claim_task("worker-d") is None
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_active_cancellation_retains_owner_until_settlement(
+    postgres_dsn,
+) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-active-cancellation",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(max_attempts=2),
+                )
+            )
+            claimed = await store.claim_task("worker-a")
+            assert claimed is not None
+            requested = await store.cancel_task(
+                claimed.id,
+                {"code": "operator"},
+            )
+            assert requested.status is TaskStatus.CLAIMED
+            assert requested.worker_id == "worker-a"
+            assert requested.status_reason == "retry_cancellation_requested"
+            assert requested.status_payload is not None
+            key = requested.status_payload["settlement_idempotency_key"]
+            assert isinstance(key, str)
+
+            for action in (
+                store.pause_task,
+                store.block_task,
+                store.mark_task_needs_attention,
+            ):
+                with pytest.raises(TaskTerminalizationConflict, match="still draining"):
+                    await action(claimed.id)
+                assert await store.load_task(claimed.id) == requested
+            with pytest.raises(TaskTerminalizationConflict, match="still draining"):
+                await store.release_task(claimed.id, "worker-a")
+            assert await store.load_task(claimed.id) == requested
+
+            receipt = await store.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id=claimed.id,
+                    worker_id="worker-a",
+                    idempotency_key=key,
+                    causal_budget_id=_retry_causal_budget_id(claimed),
+                    disposition=TaskRetryAttemptDisposition.CANCELLED,
+                    error={"code": "operator"},
+                )
+            )
+            assert receipt.task.status is TaskStatus.CANCELLED
+            assert receipt.task.worker_id is None
+            assert receipt.task.retry_series is not None
+            assert receipt.task.retry_series.disposition is TaskRetrySeriesDisposition.CANCELLED
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_concurrent_cancellation_is_first_writer_wins(
+    postgres_dsn,
+) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-concurrent-cancellation",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(max_attempts=2),
+                )
+            )
+            claimed = await store.claim_task("worker-a")
+            assert claimed is not None
+
+            first, second = await asyncio.gather(
+                store.cancel_task(claimed.id, {"code": "first"}),
+                store.cancel_task(claimed.id, {"code": "second"}),
+            )
+
+            assert first == second
+            assert first.status_reason == "retry_cancellation_requested"
+            assert first.status_payload is not None
+            accepted_error = first.status_payload["error"]
+            assert accepted_error in ({"code": "first"}, {"code": "second"})
+            persisted = await store.load_task(claimed.id)
+            assert persisted == first
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_series_expires_before_late_claim(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        started_at = datetime(2026, 8, 19, 14, tzinfo=UTC)
+        clock = _MutableClock(started_at)
+        store = _new_store(postgres_dsn, clock=clock)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-elapsed",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=3,
+                        max_elapsed_seconds=10,
+                        initial_backoff_seconds=2,
+                    ),
+                )
+            )
+            claimed = await store.claim_task("worker-a")
+            assert claimed is not None
+            first = await store.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id="retry-elapsed",
+                    worker_id="worker-a",
+                    idempotency_key="elapsed-attempt-one",
+                    causal_budget_id=_retry_causal_budget_id(claimed),
+                    disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                    error={"code": "temporary"},
+                )
+            )
+            assert first.successor is not None
+            successor_id = first.successor.id
+
+            clock.value = started_at + timedelta(seconds=11)
+            assert await store.claim_task("late-worker") is None
+            expired = await store.load_task(successor_id)
+            assert expired is not None
+            assert expired.status is TaskStatus.FAILED
+            assert expired.retry_series is not None
+            assert expired.retry_series.disposition is TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED
+            assert expired.status_payload is not None
+            receipt_key = expired.status_payload["settlement_idempotency_key"]
+            assert isinstance(receipt_key, str)
+            receipt = await store.load_task_retry_settlement(successor_id, receipt_key)
+            assert receipt is not None
+            assert receipt.task == expired
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_series_enforces_active_deadline_with_store_clock(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        started_at = datetime(2026, 8, 19, 14, tzinfo=UTC)
+        clock = _MutableClock(started_at)
+        store = _new_store(postgres_dsn, clock=clock)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-active-elapsed",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        max_elapsed_seconds=10,
+                    ),
+                )
+            )
+            claimed = await store.claim_task("worker-a")
+            assert claimed is not None
+            assert not await store.task_retry_deadline_elapsed(claimed.id, "worker-a")
+            assert await store.enforce_task_retry_deadline(claimed.id, "worker-a") is None
+
+            clock.value = started_at + timedelta(seconds=11)
+            assert await store.task_retry_deadline_elapsed(claimed.id, "worker-a")
+            still_owned = await store.load_task(claimed.id)
+            assert still_owned is not None
+            assert still_owned.status is TaskStatus.CLAIMED
+            assert still_owned.worker_id == "worker-a"
+            receipt = await store.enforce_task_retry_deadline(
+                claimed.id,
+                "worker-a",
+                token_count=17,
+                estimated_cost=Decimal("4.25"),
+            )
+            assert receipt is not None
+            assert receipt.successor is None
+            assert receipt.task.status is TaskStatus.FAILED
+            assert receipt.task.retry_series is not None
+            assert (
+                receipt.task.retry_series.disposition
+                is TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED
+            )
+            assert receipt.task.retry_series.cumulative_tokens == 17
+            assert receipt.task.retry_series.cumulative_estimated_cost == Decimal("4.25")
+            assert (
+                await store.load_task_retry_settlement(
+                    claimed.id,
+                    receipt.idempotency_key,
+                )
+                == receipt
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_deadline_probe_rechecks_lease_after_lock_wait(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-deadline-lock-wait",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        max_elapsed_seconds=0.1,
+                    ),
+                )
+            )
+            claimed = await store.claim_task("worker-a", lease_seconds=1)
+            assert claimed is not None
+
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as lock_conn:
+                async with lock_conn.cursor() as lock_cur:
+                    await lock_cur.execute(
+                        "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                        (claimed.id,),
+                    )
+                    probe = asyncio.create_task(
+                        store.task_retry_deadline_elapsed(claimed.id, "worker-a")
+                    )
+                    await asyncio.sleep(1.1)
+                    assert not probe.done()
+                await lock_conn.commit()
+
+            with pytest.raises(TaskClaimLost):
+                await probe
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
 
 def test_postgres_task_store_terminalization_acknowledgement_conformance(postgres_dsn):

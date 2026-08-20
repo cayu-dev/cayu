@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -52,6 +53,9 @@ from cayu import (
     SQLiteSessionStore,
     Task,
     TaskCreate,
+    TaskRetryAttemptDisposition,
+    TaskRetryPolicy,
+    TaskRetrySettlementRequest,
     TaskStatus,
     TextPart,
     ThinkingPart,
@@ -1987,6 +1991,177 @@ def test_server_task_endpoints_serialize_availability_in_canonical_utc() -> None
     assert task_detail.status_code == 200
     assert task_list.json()[0]["available_at"] == "2026-08-08T04:00:00+00:00"
     assert task_detail.json()["available_at"] == "2026-08-08T04:00:00+00:00"
+
+
+def test_server_task_endpoints_project_retry_series_authority() -> None:
+    task_store = InMemoryTaskStore()
+    asyncio.run(
+        task_store.create_task(
+            TaskCreate(
+                task_id="retry_task",
+                type="review",
+                retry_policy=TaskRetryPolicy(
+                    max_attempts=3,
+                    max_elapsed_seconds=60,
+                    max_total_tokens=100,
+                    max_estimated_cost=Decimal("1.25"),
+                    cost_currency="usd",
+                    initial_backoff_seconds=2,
+                ),
+            )
+        )
+    )
+
+    client = TestClient(create_server(CayuApp(task_store=task_store), config=_LOCAL_SERVER_CONFIG))
+    projected = client.get("/api/tasks").json()[0]["retry_series"]
+    detail = client.get("/api/tasks/retry_task").json()["retry_series"]
+
+    assert detail == projected
+    assert projected["attempt"] == 1
+    assert projected["causal_budget_id"] == projected["series_id"]
+    assert projected["attempts_remaining"] == 2
+    assert projected["tokens_remaining"] == "100"
+    assert projected["estimated_cost_remaining"] == "1.25"
+    assert projected["elapsed_deadline"] is not None
+    assert projected["next_eligible_at"] is None
+    assert projected["disposition"] == "active"
+    assert projected["policy"]["cost_currency"] == "USD"
+
+
+@pytest.mark.parametrize("secret", ["1.25", "0"])
+def test_server_task_retry_numeric_authority_survives_secret_collisions(secret: str) -> None:
+    task_store = InMemoryTaskStore()
+    asyncio.run(
+        task_store.create_task(
+            TaskCreate(
+                task_id=f"retry_numeric_secret_{secret.replace('.', '_')}",
+                type="review",
+                retry_policy=TaskRetryPolicy(
+                    max_attempts=2,
+                    max_total_tokens=100,
+                    max_estimated_cost=Decimal("1.25"),
+                ),
+            )
+        )
+    )
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    list_response = client.get("/api/tasks")
+    detail_response = client.get(f"/api/tasks/retry_numeric_secret_{secret.replace('.', '_')}")
+
+    assert list_response.status_code == 200
+    assert detail_response.status_code == 200
+    for projected in (
+        list_response.json()[0]["retry_series"],
+        detail_response.json()["retry_series"],
+    ):
+        assert projected["cumulative_tokens"] == "0"
+        assert projected["tokens_remaining"] == "100"
+        assert projected["cumulative_estimated_cost"] == "0"
+        assert projected["estimated_cost_remaining"] == "1.25"
+        assert projected["policy"]["max_total_tokens"] == "100"
+        assert projected["policy"]["max_estimated_cost"] == "1.25"
+
+
+def test_server_task_retry_series_redacts_opaque_causal_budget_authority() -> None:
+    secret = "TASK_RETRY_CAUSAL_BUDGET_SECRET_CANARY"
+    task_store = InMemoryTaskStore()
+    task = asyncio.run(
+        task_store.create_task(
+            TaskCreate(
+                task_id="retry_secret",
+                type="review",
+                retry_policy=TaskRetryPolicy(max_attempts=2),
+            )
+        )
+    )
+    assert task.retry_series is not None
+    task_store._tasks[task.id] = task.model_copy(
+        update={"retry_series": task.retry_series.model_copy(update={"causal_budget_id": secret})}
+    )
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    response = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)).get(
+        "/api/tasks/retry_secret"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["retry_series"]["causal_budget_id"] == "[REDACTED_SECRET]"
+    assert secret not in response.text
+
+
+def test_server_task_retry_series_redacts_caller_controlled_currency(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "secretcurrency"
+    task_store = InMemoryTaskStore()
+
+    async def create_and_settle() -> None:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="retry_currency_secret",
+                type="review",
+                retry_policy=TaskRetryPolicy(
+                    max_attempts=2,
+                    cost_currency=secret,
+                ),
+            )
+        )
+        claimed = await task_store.claim_task("currency-worker")
+        assert claimed is not None
+        assert claimed.retry_series is not None
+        await task_store.settle_task_retry_attempt(
+            TaskRetrySettlementRequest(
+                task_id=claimed.id,
+                worker_id="currency-worker",
+                idempotency_key="currency-settlement",
+                causal_budget_id=claimed.retry_series.causal_budget_id,
+                disposition=TaskRetryAttemptDisposition.SUCCEEDED,
+                result={"ok": True},
+            )
+        )
+
+    asyncio.run(create_and_settle())
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    responses = [
+        client.get("/api/tasks"),
+        client.get("/api/tasks/retry_currency_secret"),
+    ]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert responses[0].json()[0]["retry_series"]["policy"]["cost_currency"] == (
+        "[REDACTED_SECRET]"
+    )
+    assert responses[1].json()["retry_series"]["policy"]["cost_currency"] == ("[REDACTED_SECRET]")
+    assert responses[0].json()[0]["status_payload"]["cost_currency"] == "[REDACTED_SECRET]"
+    assert responses[1].json()["status_payload"]["cost_currency"] == "[REDACTED_SECRET]"
+    captured = capsys.readouterr()
+    diagnostic_text = "\n".join(
+        [
+            *(record.getMessage() for record in caplog.records),
+            *(str(warning.message) for warning in recwarn),
+            captured.out,
+            captured.err,
+            *(response.text for response in responses),
+        ]
+    )
+    assert secret not in diagnostic_text.casefold()
 
 
 def test_server_task_list_filters_lifecycle_states() -> None:

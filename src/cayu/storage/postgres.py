@@ -359,6 +359,7 @@ from cayu.runtime.sessions import (
     validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
+    _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
     TaskAggregateFilter,
@@ -367,6 +368,10 @@ from cayu.runtime.tasks import (
     TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
+    TaskRetrySeriesDisposition,
+    TaskRetrySeriesSnapshot,
+    TaskRetrySettlementRequest,
+    TaskRetrySettlementResult,
     TaskStatus,
     TaskStatusCounts,
     TaskStore,
@@ -381,28 +386,39 @@ from cayu.runtime.tasks import (
     _allocate_task_topology_branch_limits,
     _bounded_optional_task_topology_parent_id,
     _can_attach_claimed_task_state,
+    _cancelled_task_retry_settlement,
+    _claimed_task_retry_attempt_elapsed,
     _copy_optional_session_binding,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
     _copy_required_session_binding,
+    _elapsed_claimed_task_retry_settlement,
     _ensure_can_hold_task,
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
+    _ensure_retry_series_queue_attempt,
     _ensure_task_status_can_transition,
+    _expired_task_retry_settlement,
     _raise_task_claim_attach_error,
+    _replay_task_retry_settlement,
     _replay_task_terminalization_receipt,
     _running_task_from_create,
+    _settled_task_retry_attempt,
     _task_from_create,
     _task_invocation_for_attachment,
+    _task_retry_cancellation_requested_task,
+    _task_retry_events,
     _task_session_id_for_start,
     _validate_task_topology_ancestry,
+    _validated_task_retry_terminal_accounting,
     build_task_topology_result,
     copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_task_retry_settlement,
     prepare_task_terminalization,
     prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
@@ -536,7 +552,7 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 40
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 40
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 45
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -567,7 +583,7 @@ _TASK_RETURNING_COLUMNS = (
     "task.parent_task_id, task.assigned_agent_name, task.available_at, task.worker_id, "
     "task.lease_expires_at, task.status_reason, task.status_payload, task.input, task.result, "
     "task.error, task.metadata, task.created_at, task.updated_at, task.started_at, "
-    "task.completed_at, task.invocation"
+    "task.completed_at, task.invocation, task.retry_series"
 )
 _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
@@ -1790,6 +1806,19 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_knowledge_index_readiness_events("
         "entry_id, entry_revision, chunk_id, projection_type, "
         "embedding_model, dimensions, sequence)",
+    ),
+    45: (
+        "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS retry_series JSONB",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_task_retry_settlements (
+            task_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            receipt_json JSONB NOT NULL,
+            committed_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (task_id, idempotency_key)
+        )
+        """,
     ),
 }
 
@@ -3071,6 +3100,8 @@ class _PostgresStoreBase:
                             await self._validate_knowledge_change_schema(cur)
                         if self._min_required_revision >= 44:
                             await self._validate_knowledge_index_readiness_schema(cur)
+                        if self._min_required_revision >= 45:
+                            await self._validate_task_retry_series_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3226,6 +3257,10 @@ class _PostgresStoreBase:
             )
         if self._min_required_revision >= 43:
             await self._validate_knowledge_change_schema(cur)
+        if self._min_required_revision >= 44:
+            await self._validate_knowledge_index_readiness_schema(cur)
+        if self._min_required_revision >= 45:
+            await self._validate_task_retry_series_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3302,6 +3337,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_change_schema(cur)
         if revision.revision == 44:
             await self._validate_knowledge_index_readiness_schema(cur)
+        if revision.revision == 45:
+            await self._validate_task_retry_series_schema(cur)
 
     async def _validate_knowledge_publication_access_snapshot_column(
         self,
@@ -3584,6 +3621,7 @@ class _PostgresStoreBase:
                     " ".join(str(definition).lower().split()),
                 )
             )
+
         for table, expected in expected_constraints.items():
             remaining = list(actual_constraints.get(table, ()))
             for constraint_type, fragments in expected:
@@ -4213,6 +4251,59 @@ class _PostgresStoreBase:
             "evidence and atomic change contract. Recreate or migrate the Cayu "
             "database from a known-good revision-43 schema."
         )
+
+    async def _validate_task_retry_series_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_tasks'
+              AND column_name = 'retry_series'
+            """
+        )
+        task_column = await cur.fetchone()
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_task_retry_settlements'
+            ORDER BY ordinal_position
+            """
+        )
+        receipt_columns = tuple(await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_task_retry_settlements'
+              AND constraint_record.contype = 'p'
+            """
+        )
+        primary_keys = tuple(row[0] for row in await cur.fetchall())
+        expected = (
+            ("task_id", "text", "NO"),
+            ("idempotency_key", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("receipt_json", "jsonb", "NO"),
+            ("committed_at", "timestamp with time zone", "NO"),
+        )
+        if (
+            task_column != ("jsonb", "YES")
+            or receipt_columns != expected
+            or primary_keys != ("PRIMARY KEY (task_id, idempotency_key)",)
+        ):
+            raise RuntimeError(
+                "Postgres task retry-series schema conflicts with Cayu's revision-45 "
+                "durability contract. Run `cayu storage migrate` or restore the "
+                "database from a known-good backup."
+            )
 
     @staticmethod
     def _raise_knowledge_revision_schema_error(name: str) -> NoReturn:
@@ -19191,6 +19282,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
+    supports_task_retry_series: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
 
@@ -19249,6 +19341,13 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await cur.execute("SELECT transaction_timestamp()")
+                    transaction_timestamp_row = await cur.fetchone()
+                    if transaction_timestamp_row is None:
+                        raise RuntimeError("Postgres did not return a transaction timestamp.")
+                    retry_started_at = (
+                        self._clock() if self._clock_is_injected else transaction_timestamp_row[0]
+                    )
                     parent: TaskInvocationSnapshot | None = None
                     if request.parent_task_id is not None:
                         if request.parent_task_id == task_id:
@@ -19283,12 +19382,14 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                             task_id=task_id,
                             parent_task=parent,
                             session_invocation=session_invocation,
+                            retry_started_at=retry_started_at,
                         )
                     else:
                         task = _task_from_create(
                             request,
                             task_id=task_id,
                             parent_task=parent,
+                            retry_started_at=retry_started_at,
                         )
                     await cur.execute(
                         f"""
@@ -19296,7 +19397,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s
+                            %s, %s, %s, %s, %s
                         )
                         """,
                         pg_support.task_insert_values(task),
@@ -19707,12 +19808,18 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         now = datetime.now(UTC)
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "SELECT status, session_id, invocation FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                "SELECT status, session_id, invocation, retry_series FROM cayu_tasks "
+                "WHERE id = %s FOR UPDATE",
                 (task_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Task not found: {task_id}")
+            _ensure_retry_series_queue_attempt(
+                None
+                if row[3] is None
+                else TaskRetrySeriesSnapshot.model_validate(_json_obj(row[3]))
+            )
             _ensure_task_status_can_transition(
                 task_id,
                 TaskStatus(row[0]),
@@ -19774,7 +19881,8 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT status, session_id, worker_id, lease_expires_at, invocation
+                SELECT status, session_id, worker_id, lease_expires_at, invocation,
+                       retry_series
                 FROM cayu_tasks
                 WHERE id = %s
                 FOR UPDATE
@@ -19784,6 +19892,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Task not found: {task_id}")
+            _ensure_retry_series_queue_attempt(
+                None
+                if row[5] is None
+                else TaskRetrySeriesSnapshot.model_validate(_json_obj(row[5]))
+            )
             if not _can_attach_claimed_task_state(
                 status=TaskStatus(row[0]),
                 session_id=row[1],
@@ -19891,6 +20004,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         return replayed
 
                     task = pg_support.task_from_row(task_row)
+                    if task.retry_series is not None:
+                        raise ValueError(
+                            "Retry-series tasks require settle_task_retry_attempt for "
+                            "completion or failure."
+                        )
                     if task.status in {
                         TaskStatus.COMPLETED,
                         TaskStatus.FAILED,
@@ -19993,6 +20111,283 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             idempotency_key=idempotency_key,
             row=row,
         )
+
+    async def settle_task_retry_attempt(
+        self,
+        request: TaskRetrySettlementRequest,
+    ) -> TaskRetrySettlementResult:
+        request, request_sha256 = prepare_task_retry_settlement(request)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT transaction_timestamp()")
+                    transaction_timestamp_row = await cur.fetchone()
+                    if transaction_timestamp_row is None:
+                        raise RuntimeError("Postgres did not return a transaction timestamp.")
+                    now = transaction_timestamp_row[0]
+                    series_now = self._clock() if self._clock_is_injected else now
+                    await cur.execute(
+                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
+                        "WHERE id = %s FOR UPDATE",
+                        (request.task_id,),
+                    )
+                    task_row = await cur.fetchone()
+                    if task_row is None:
+                        raise KeyError(f"Task not found: {request.task_id}")
+                    await cur.execute(
+                        "SELECT request_sha256, receipt_json "
+                        "FROM cayu_task_retry_settlements "
+                        "WHERE task_id = %s AND idempotency_key = %s",
+                        (request.task_id, request.idempotency_key),
+                    )
+                    receipt_row = await cur.fetchone()
+                    if receipt_row is not None:
+                        receipt = TaskRetrySettlementResult.model_validate(
+                            _json_obj(receipt_row[1])
+                        )
+                        replayed = _replay_task_retry_settlement(
+                            request_sha256=request_sha256,
+                            receipt=receipt,
+                            current_task=pg_support.task_from_row(task_row),
+                        )
+                        await conn.commit()
+                        return replayed
+
+                    task = pg_support.task_from_row(task_row)
+                    _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+                    settled, successor = _settled_task_retry_attempt(
+                        task,
+                        request,
+                        now=now,
+                        series_now=series_now,
+                    )
+                    assert settled.retry_series is not None
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET status = %s, status_reason = %s, status_payload = %s,
+                            result = %s, error = %s, worker_id = NULL,
+                            lease_expires_at = NULL, started_at = %s,
+                            completed_at = %s, updated_at = %s, retry_series = %s
+                        WHERE id = %s AND status IN (%s, %s) AND worker_id = %s
+                          AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            str(settled.status),
+                            settled.status_reason,
+                            _dumps(settled.status_payload),
+                            None if settled.result is None else _dumps(settled.result),
+                            None if settled.error is None else _dumps(settled.error),
+                            settled.started_at,
+                            settled.completed_at,
+                            settled.updated_at,
+                            _dumps(settled.retry_series.model_dump(mode="json")),
+                            request.task_id,
+                            str(TaskStatus.CLAIMED),
+                            str(TaskStatus.RUNNING),
+                            request.worker_id,
+                            now,
+                        ),
+                    )
+                    settled_row = await cur.fetchone()
+                    if settled_row is None:
+                        await self._raise_task_active_lease_error(
+                            cur,
+                            request.task_id,
+                            request.worker_id,
+                        )
+                    assert settled_row is not None
+                    durable_task = pg_support.task_from_row(settled_row)
+                    if successor is not None:
+                        await cur.execute(
+                            f"""
+                            INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
+                            VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s
+                            )
+                            """,
+                            pg_support.task_insert_values(successor),
+                        )
+                    receipt = TaskRetrySettlementResult(
+                        task_id=request.task_id,
+                        idempotency_key=request.idempotency_key,
+                        request_sha256=request_sha256,
+                        task=durable_task,
+                        successor=successor,
+                        events=_task_retry_events(durable_task, occurred_at=now),
+                        committed_at=now,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_task_retry_settlements "
+                        "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            request.task_id,
+                            request.idempotency_key,
+                            request_sha256,
+                            _dumps(receipt.model_dump(mode="json")),
+                            receipt.committed_at,
+                        ),
+                    )
+                await conn.commit()
+                return receipt.model_copy(deep=True)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_task_retry_settlement(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskRetrySettlementResult | None:
+        task_id, idempotency_key = prepare_task_terminalization_receipt_lookup(
+            task_id,
+            idempotency_key,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT receipt_json FROM cayu_task_retry_settlements "
+                "WHERE task_id = %s AND idempotency_key = %s",
+                (task_id, idempotency_key),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return TaskRetrySettlementResult.model_validate(_json_obj(row[0]))
+
+    async def enforce_task_retry_deadline(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        token_count: int = 0,
+        estimated_cost: Decimal = Decimal(0),
+    ) -> TaskRetrySettlementResult | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        token_count, estimated_cost = _validated_task_retry_terminal_accounting(
+            token_count=token_count,
+            estimated_cost=estimated_cost,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
+                        "WHERE id = %s FOR UPDATE",
+                        (task_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise KeyError(f"Task not found: {task_id}")
+                    await cur.execute("SELECT clock_timestamp()")
+                    timestamp_row = await cur.fetchone()
+                    if timestamp_row is None:
+                        raise RuntimeError("Postgres did not return a current timestamp.")
+                    lease_now = timestamp_row[0]
+                    series_now = self._clock() if self._clock_is_injected else lease_now
+                    task = pg_support.task_from_row(row)
+                    _ensure_owned_active_task_lease(task, worker_id, now=lease_now)
+                    if not _claimed_task_retry_attempt_elapsed(task, series_now=series_now):
+                        await conn.commit()
+                        return None
+                    receipt = _elapsed_claimed_task_retry_settlement(
+                        task,
+                        committed_at=lease_now,
+                        token_count=token_count,
+                        estimated_cost=estimated_cost,
+                    )
+                    settled = receipt.task
+                    assert settled.retry_series is not None
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET status = %s, status_reason = %s, status_payload = %s,
+                            result = NULL, error = %s, worker_id = NULL,
+                            lease_expires_at = NULL, started_at = %s,
+                            completed_at = %s, updated_at = %s, retry_series = %s
+                        WHERE id = %s AND status IN (%s, %s) AND worker_id = %s
+                          AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            str(settled.status),
+                            settled.status_reason,
+                            _dumps(settled.status_payload),
+                            _dumps(settled.error),
+                            settled.started_at,
+                            settled.completed_at,
+                            settled.updated_at,
+                            _dumps(settled.retry_series.model_dump(mode="json")),
+                            task_id,
+                            str(TaskStatus.CLAIMED),
+                            str(TaskStatus.RUNNING),
+                            worker_id,
+                            lease_now,
+                        ),
+                    )
+                    if await cur.fetchone() is None:
+                        await self._raise_task_active_lease_error(cur, task_id, worker_id)
+                    await cur.execute(
+                        "INSERT INTO cayu_task_retry_settlements "
+                        "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            receipt.task_id,
+                            receipt.idempotency_key,
+                            receipt.request_sha256,
+                            _dumps(receipt.model_dump(mode="json")),
+                            receipt.committed_at,
+                        ),
+                    )
+                await conn.commit()
+                return receipt.model_copy(deep=True)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def task_retry_deadline_elapsed(
+        self,
+        task_id: str,
+        worker_id: str,
+    ) -> bool:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
+                        "WHERE id = %s FOR UPDATE",
+                        (task_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise KeyError(f"Task not found: {task_id}")
+                    await cur.execute("SELECT clock_timestamp()")
+                    timestamp_row = await cur.fetchone()
+                    if timestamp_row is None:
+                        raise RuntimeError("Postgres did not return a current timestamp.")
+                    lease_now = timestamp_row[0]
+                    series_now = self._clock() if self._clock_is_injected else lease_now
+                    task = pg_support.task_from_row(row)
+                    _ensure_owned_active_task_lease(task, worker_id, now=lease_now)
+                    elapsed = _claimed_task_retry_attempt_elapsed(
+                        task,
+                        series_now=series_now,
+                    )
+                await conn.commit()
+                return elapsed
+            except BaseException:
+                await conn.rollback()
+                raise
 
     async def cancel_task(
         self,
@@ -20099,8 +20494,17 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             return None
         clauses, params = self._task_filter_clauses(query)
         if self._clock_is_injected:
+            series_now = self._clock()
             availability_clause = "(available_at IS NULL OR available_at <= %s)"
-            availability_params: list[Any] = [self._clock()]
+            availability_params: list[Any] = [series_now]
+            retry_deadline_clause = (
+                "(retry_series IS NULL "
+                "OR retry_series->>'elapsed_deadline' IS NULL "
+                "OR (retry_series->>'elapsed_deadline')::timestamptz > %s)"
+            )
+            retry_deadline_params: list[Any] = [series_now]
+            expiration_deadline_clause = "(retry_series->>'elapsed_deadline')::timestamptz <= %s"
+            expiration_deadline_params: list[Any] = [series_now]
         else:
             # Production eligibility and lease timestamps share PostgreSQL's
             # transaction clock. A skewed worker clock must never make a
@@ -20109,6 +20513,17 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 "(available_at IS NULL OR available_at <= transaction_timestamp())"
             )
             availability_params = []
+            retry_deadline_clause = (
+                "(retry_series IS NULL "
+                "OR retry_series->>'elapsed_deadline' IS NULL "
+                "OR (retry_series->>'elapsed_deadline')::timestamptz "
+                "> transaction_timestamp())"
+            )
+            retry_deadline_params = []
+            expiration_deadline_clause = (
+                "(retry_series->>'elapsed_deadline')::timestamptz <= transaction_timestamp()"
+            )
+            expiration_deadline_params = []
         lease_expires_sql = "transaction_timestamp() + (%s * INTERVAL '1 second')"
         updated_at_sql = "transaction_timestamp()"
         mutation_params = [lease_seconds]
@@ -20117,6 +20532,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 "status = %s",
                 "session_id IS NULL",
                 availability_clause,
+                retry_deadline_clause,
                 *clauses,
             ]
         )
@@ -20126,6 +20542,79 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                await cur.execute("SELECT transaction_timestamp()")
+                transaction_timestamp_row = await cur.fetchone()
+                if transaction_timestamp_row is None:
+                    raise RuntimeError("Postgres did not return a transaction timestamp.")
+                now = transaction_timestamp_row[0]
+                authoritative_series_now = series_now if self._clock_is_injected else now
+                await cur.execute(
+                    f"""
+                        SELECT {pg_support.TASK_COLUMNS}
+                        FROM cayu_tasks
+                        WHERE status = %s
+                          AND session_id IS NULL
+                          AND retry_series IS NOT NULL
+                          AND retry_series->>'disposition' = %s
+                          AND retry_series->>'elapsed_deadline' IS NOT NULL
+                          AND {expiration_deadline_clause}
+                        ORDER BY created_at ASC, id ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 100
+                        """,
+                    [
+                        str(TaskStatus.PENDING),
+                        str(TaskRetrySeriesDisposition.ACTIVE),
+                        *expiration_deadline_params,
+                    ],
+                )
+                expired_rows = await cur.fetchall()
+                for expired_row in expired_rows:
+                    expired_task = pg_support.task_from_row(expired_row)
+                    expiration = _expired_task_retry_settlement(
+                        expired_task,
+                        committed_at=now,
+                        series_now=authoritative_series_now,
+                    )
+                    assert expiration.task.retry_series is not None
+                    await cur.execute(
+                        """
+                        UPDATE cayu_tasks
+                        SET status = %s, status_reason = %s, status_payload = %s,
+                            result = NULL, error = %s, worker_id = NULL,
+                            lease_expires_at = NULL, started_at = %s, completed_at = %s,
+                            updated_at = %s, retry_series = %s
+                        WHERE id = %s AND status = %s AND session_id IS NULL
+                        """,
+                        (
+                            str(expiration.task.status),
+                            expiration.task.status_reason,
+                            _dumps(expiration.task.status_payload),
+                            _dumps(expiration.task.error),
+                            expiration.task.started_at,
+                            expiration.task.completed_at,
+                            expiration.task.updated_at,
+                            _dumps(expiration.task.retry_series.model_dump(mode="json")),
+                            expiration.task_id,
+                            str(TaskStatus.PENDING),
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise TaskTerminalizationConflict(
+                            "Elapsed task retry attempt changed during claim admission."
+                        )
+                    await cur.execute(
+                        "INSERT INTO cayu_task_retry_settlements "
+                        "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            expiration.task_id,
+                            expiration.idempotency_key,
+                            expiration.request_sha256,
+                            _dumps(expiration.model_dump(mode="json")),
+                            expiration.committed_at,
+                        ),
+                    )
                 await cur.execute(
                     cast(
                         "LiteralString",
@@ -20151,6 +20640,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     [
                         str(TaskStatus.PENDING),
                         *availability_params,
+                        *retry_deadline_params,
                         *params,
                         str(TaskStatus.CLAIMED),
                         worker_id,
@@ -20223,6 +20713,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         updated_at = %s
                     WHERE id = %s AND worker_id = %s AND status = %s
                       AND session_id IS NULL
+                      AND status_reason IS DISTINCT FROM %s
                       AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
@@ -20232,6 +20723,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         task_id,
                         worker_id,
                         str(TaskStatus.CLAIMED),
+                        _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         now,
                     ),
                 )
@@ -20300,6 +20792,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 "session_id IS NULL",
                 "lease_expires_at IS NOT NULL",
                 "lease_expires_at <= %s",
+                "status_reason IS DISTINCT FROM %s",
                 *clauses,
             ]
         )
@@ -20333,6 +20826,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     [
                         str(TaskStatus.CLAIMED),
                         now,
+                        _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         *params,
                         max_reclaims,
                         str(TaskStatus.PENDING),
@@ -20378,6 +20872,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         OR status = %s
                         OR (status = %s AND session_id IS NULL)
                       )
+                      AND status_reason IS DISTINCT FROM %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
                     (
@@ -20392,6 +20887,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         str(TaskStatus.BLOCKED),
                         str(TaskStatus.NEEDS_ATTENTION),
                         str(TaskStatus.RUNNING),
+                        _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                     ),
                 )
                 row = await cur.fetchone()
@@ -20427,28 +20923,104 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
+                    f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                    (task_id,),
+                )
+                task_row = await cur.fetchone()
+                if task_row is None:
+                    raise KeyError(f"Task not found: {task_id}")
+                task = pg_support.task_from_row(task_row)
+                cancellation = None
+                if task.retry_series is not None:
+                    if status is not TaskStatus.CANCELLED:
+                        raise ValueError(
+                            "Retry-series tasks require settle_task_retry_attempt for "
+                            "completion or failure."
+                        )
+                    if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                        cancellation_requested = _task_retry_cancellation_requested_task(
+                            task,
+                            error=error,
+                            updated_at=now,
+                        )
+                        await cur.execute(
+                            f"""
+                            UPDATE cayu_tasks
+                            SET status_reason = %s, status_payload = %s, updated_at = %s
+                            WHERE id = %s AND status IN (%s, %s)
+                            RETURNING {pg_support.TASK_COLUMNS}
+                            """,
+                            (
+                                cancellation_requested.status_reason,
+                                _dumps(cancellation_requested.status_payload),
+                                cancellation_requested.updated_at,
+                                task_id,
+                                str(TaskStatus.CLAIMED),
+                                str(TaskStatus.RUNNING),
+                            ),
+                        )
+                        row = await cur.fetchone()
+                        if row is None:
+                            raise TaskTerminalizationConflict(
+                                "Task retry cancellation lost active ownership."
+                            )
+                        updated = pg_support.task_from_row(row)
+                        await conn.commit()
+                        return updated.model_copy(deep=True)
+                    cancellation = _cancelled_task_retry_settlement(
+                        task,
+                        error=error,
+                        committed_at=now,
+                    )
+                    terminal_task = cancellation.task
+                else:
+                    terminal_task = task.model_copy(
+                        update={
+                            "status": status,
+                            "status_reason": None,
+                            "status_payload": None,
+                            "result": result,
+                            "error": error,
+                            "started_at": task.started_at or now,
+                            "completed_at": now,
+                            "updated_at": now,
+                        }
+                    )
+                await cur.execute(
                     f"""
                     UPDATE cayu_tasks
                     SET status = %s,
-                        status_reason = NULL,
-                        status_payload = NULL,
+                        status_reason = %s,
+                        status_payload = %s,
                         result = %s,
                         error = %s,
                         worker_id = NULL,
                         lease_expires_at = NULL,
                         started_at = COALESCE(started_at, %s),
                         completed_at = %s,
-                        updated_at = %s
+                        updated_at = %s,
+                        retry_series = %s
                     WHERE id = %s
                       AND status NOT IN (%s, %s, %s){owner_clause}
                     """,
                     (
                         str(status),
-                        None if result is None else _dumps(result),
-                        None if error is None else _dumps(error),
-                        now,
-                        now,
-                        now,
+                        terminal_task.status_reason,
+                        (
+                            None
+                            if terminal_task.status_payload is None
+                            else _dumps(terminal_task.status_payload)
+                        ),
+                        None if terminal_task.result is None else _dumps(terminal_task.result),
+                        None if terminal_task.error is None else _dumps(terminal_task.error),
+                        terminal_task.started_at,
+                        terminal_task.completed_at,
+                        terminal_task.updated_at,
+                        (
+                            None
+                            if terminal_task.retry_series is None
+                            else _dumps(terminal_task.retry_series.model_dump(mode="json"))
+                        ),
                         task_id,
                         str(TaskStatus.COMPLETED),
                         str(TaskStatus.FAILED),
@@ -20462,6 +21034,19 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     task = await self._require_task(cur, task_id)
                     _ensure_can_transition(task, status)
                     raise ValueError(f"Task {task.id} cannot transition from {task.status}")
+                if cancellation is not None:
+                    await cur.execute(
+                        "INSERT INTO cayu_task_retry_settlements "
+                        "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            cancellation.task_id,
+                            cancellation.idempotency_key,
+                            cancellation.request_sha256,
+                            _dumps(cancellation.model_dump(mode="json")),
+                            cancellation.committed_at,
+                        ),
+                    )
                 updated = await self._require_task(cur, task_id)
             await conn.commit()
             return updated.model_copy(deep=True)
@@ -20521,6 +21106,10 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.status is not TaskStatus.CLAIMED:
             raise ValueError(f"Task {task.id} is not claimed.")
+        if task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON:
+            raise TaskTerminalizationConflict(
+                "Task retry cancellation is still draining under its current owner."
+            )
         raise RuntimeError(f"Task {task.id} active claim could not be released.")
 
     async def _raise_attached_task_worker_release_error(

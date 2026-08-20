@@ -3102,9 +3102,48 @@ async def _exercise_session_discovery(
     await asyncio.sleep(0.4)
     await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
 
-    await page.get_by_label("Filter by status").select_option("completed")
-    await page.get_by_label("Filter by debug state").select_option("tool_issue")
-    await page.get_by_label("Sort sessions").select_option("created_at_asc")
+    async def select_session_filter(
+        label: str,
+        value: str,
+        expected_query: dict[str, str],
+    ) -> None:
+        async with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and urlsplit(response.url).path == "/api/sessions/summary"
+                and all(
+                    parse_qs(urlsplit(response.url).query).get(field) == [expected]
+                    for field, expected in expected_query.items()
+                )
+            )
+        ) as response_info:
+            await page.get_by_label(label).select_option(value)
+        response = await response_info.value
+        require_equal(response.status, 200, f"{label} session summary response")
+
+    await select_session_filter(
+        "Filter by status",
+        "completed",
+        {"status": "completed", "order_by": "updated_at_desc"},
+    )
+    await select_session_filter(
+        "Filter by debug state",
+        "tool_issue",
+        {
+            "status": "completed",
+            "debug_state": "tool_issue",
+            "order_by": "updated_at_desc",
+        },
+    )
+    await select_session_filter(
+        "Sort sessions",
+        "created_at_asc",
+        {
+            "status": "completed",
+            "debug_state": "tool_issue",
+            "order_by": "created_at_asc",
+        },
+    )
     final_query = parse_qs(urlsplit(page.url).query)
     require_equal(final_query.get("status"), ["completed"], "status filter URL state")
     require_equal(final_query.get("debug_state"), ["tool_issue"], "debug filter URL state")
