@@ -27,6 +27,7 @@ from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
 
 if TYPE_CHECKING:
     from cayu.runtime.loop_policies import LoopPolicy
+    from cayu.runtime.tool_exposure import RegisteredToolCapability
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class RegisteredAgent:
 class RegisteredAgentState:
     spec: AgentSpec
     tools: Mapping[str, RegisteredTool]
+    tool_capabilities: tuple[RegisteredToolCapability, ...]
     context_policy: ContextPolicy
     context_overflow_policy: ContextPolicy | None
     tool_policy: ToolPolicy

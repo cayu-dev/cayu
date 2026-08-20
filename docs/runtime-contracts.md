@@ -1323,6 +1323,63 @@ Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positi
 
 `BoundWorkspace.snapshot` and a `WorkspaceBinding.finalize(...)` return value can carry `WorkspaceSnapshot` records. A snapshot is non-secret durable identity for a concrete workspace version: for example a git commit, S3 object generation, EFS snapshot id, sandbox filesystem generation, or app-owned sync token. `environment.binding.completed` includes `bound_snapshot` when the binding knows the version made visible to the runner. `environment.binding.finalize_completed` includes `final_snapshot` when finalization syncs or persists a new version after the session. Snapshots do not implement storage, copying, mounting, or cleanup by themselves; those behaviors remain in the binding/workspace/runner implementation. Apps should treat snapshot metadata as observability and replay/debug context, not as a place for secrets.
 
+## Tool exposure selection contracts
+
+Tool exposure is distinct from registration and authorization. A registered
+tool is an application-owned implementation available to the runtime; an
+exposed tool is a definition selected for one prepared model request; an
+authorized tool is an exact returned call that later passes `ToolPolicy` and
+the rest of the execution boundary. Selecting or hiding a definition never
+authorizes a call.
+
+The public planning substrate consists of:
+
+- `RegisteredToolCapability`, a deeply immutable, callable-free summary of a
+  registered tool's name, description, exact input schema, concurrency and
+  effect declarations, argument-publication behavior, and workspace-mutation
+  classification;
+- `ToolExposurePolicyRequest`, a bounded immutable view of session, agent,
+  provider, model, step, transcript cursor, registered capabilities, effective
+  capability ceiling, previous profile, and application metadata;
+- `ToolExposureDecision`, a named decision containing registered tool names
+  and bounded JSON-safe metadata; and
+- `ResolvedToolExposure`, the canonical registration-ordered subset with exact
+  descriptor fingerprints and registered/ceiling counts.
+
+`resolve_tool_exposure(...)` defensively revalidates application policy output,
+rejects unknown and out-of-ceiling names, observes a declared policy identity
+before and after selection, and canonicalizes the selected set to registration
+order. It gives the policy a detached request, retains the pre-selection
+capability ceiling as authority, and fails closed if the policy mutates declared
+request authority or selected-capability state. Policy input contains no live
+tool, policy, runner, environment, credential, or secret handle. Capability
+summaries are derived once at agent registration and reused by execution-profile
+resolution rather than rehashed on every admission check.
+`AllRegisteredToolsExposurePolicy` preserves the compatibility behavior inside
+the effective ceiling. `StaticToolExposurePolicy` defines one stable named
+allow-list and supports an empty tool-free profile.
+`ToolExposureDecision` is deliberately distinct from the future
+`ToolExposure` evidence record, which will describe definitions actually made
+visible to a model request.
+Custom policies implement synchronous `select(...)`; they must be local,
+deterministic, and side-effect-free and must not call a model or remote service.
+The resolved fingerprint covers the profile id and exact ordered definitions;
+diagnostic metadata is bounded but intentionally does not change tool identity
+or confer authority. Profile ids and metadata are application declarations and
+must contain stable non-secret labels, never credentials, prompts, schemas, or
+free-form policy reasoning.
+
+Narrowing tool exposure changes only the definitions sent for a model step. It
+does not remove sensitive text already present in the transcript, system
+projection, attachments, or other selected context; applications that need
+context isolation must enforce that through their context-selection boundary.
+
+This contract-only slice does not yet install a policy through
+`CayuApp.register_agent(...)` or change provider requests. The current runtime
+continues to expose all registered tools. Model-step policy invocation, frozen
+retry snapshots, and unexposed-call enforcement land together so Cayu never
+accepts a policy configuration that it silently ignores.
+
 ## Execution profiles
 
 Every fresh `CayuApp.run(...)` freezes a versioned `ExecutionProfileIdentity` in runtime-owned session metadata in the same transaction that creates the running session. The immutable `baseline` is that creation profile; the `expected` profile is the identity a later invocation must match. The invocation snapshot is the candidate profile resolved once by a particular public run or resume before admission and then held fixed for that invocation. The profile is a sorted set of typed component identities covering the runtime, provider/model target, durable system projection, direct tool declarations, tool implementations, tool-view grants, registered execution policies, invocation policies, ordered hooks, environment and runner semantics, and effect authority. The system component fingerprints the fully rendered system message, including statically resolvable workspace instructions, that is subsequently persisted in the authoritative transcript. If factory materialization would change that projection after the profile is frozen, setup fails closed before model or tool work.

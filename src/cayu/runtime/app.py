@@ -324,6 +324,7 @@ from cayu.runtime.tasks import (
     copy_task_create,
     task_create_with_runtime_invocation,
 )
+from cayu.runtime.tool_exposure import RegisteredToolCapability
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     ToolPolicy,
@@ -1645,9 +1646,22 @@ class CayuApp:
             tools_by_name[registered_tool.name] = registered_tool
 
         registration_source, registration_symbol = _registration_site()
+        tool_capabilities = tuple(
+            RegisteredToolCapability(
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.schema,
+                parallel_safe=tool.parallel_safe,
+                effect=tool.effect,
+                publishes_arguments=tool.publish_arguments,
+                workspace_mutation=tool.workspace_mutation,
+            )
+            for tool in tools_by_name.values()
+        )
         self._agents[stored_spec.name] = runtime_records.RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
+            tool_capabilities=tool_capabilities,
             context_policy=stored_context_policy,
             context_overflow_policy=stored_context_overflow_policy,
             tool_policy=stored_tool_policy,
@@ -1720,6 +1734,7 @@ class CayuApp:
                 deep=True,
             ),
             tools=MappingProxyType({}),
+            tool_capabilities=(),
             context_policy=DefaultContextPolicy(),
             context_overflow_policy=None,
             tool_policy=AllowAllToolPolicy(),

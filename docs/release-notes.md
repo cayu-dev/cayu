@@ -89,6 +89,23 @@ guard.
 
 ## Unreleased
 
+### Tool exposure now has a bounded planning contract
+
+Cayu now provides immutable `RegisteredToolCapability` summaries, bounded
+`ToolExposurePolicyRequest` and `ToolExposureDecision` records, deterministic
+expose-all and static named-profile policies, and `resolve_tool_exposure(...)`.
+Resolution uses detached policy input, accepts names only, rejects policy
+mutation and unknown or out-of-ceiling selections, restores canonical
+registration order, and binds the resolved profile to exact schema and
+definition fingerprints without exposing live tool or environment objects.
+Capability summaries are derived once at agent registration and reused by
+execution-profile resolution.
+
+This is the contract-only first slice of dynamic tool exposure. It deliberately
+does not change provider payloads or add a `tool_exposure_policy` argument to
+`CayuApp.register_agent(...)`; registered tools continue to be exposed exactly
+as before until model-step enforcement lands in the next slice.
+
 ### Bounded fork groups are durable public runtime operations
 
 `CayuApp.run_fork_group(...)` now freezes one terminal source checkpoint and

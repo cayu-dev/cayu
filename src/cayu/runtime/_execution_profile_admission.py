@@ -99,12 +99,12 @@ def resolve_execution_profile_identity(
         {
             "name": tool.name,
             "description": tool.description,
-            "schema": tool.schema,
+            "schema": tool.input_schema,
             "parallel_safe": tool.parallel_safe,
             "effect": tool.effect.value,
             **({"workspace_mutation": True} if tool.workspace_mutation else {}),
         }
-        for tool in registered_agent.tools.values()
+        for tool in registered_agent.tool_capabilities
     ]
     tool_implementations = []
     tool_implementations_process_local = False
