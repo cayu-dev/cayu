@@ -6496,7 +6496,8 @@ Postgres embedding operational contract:
 
 - `KnowledgeEntry`: one immutable revision snapshot of a reusable logical
   knowledge record. Its positive `revision` (bounded by
-  `MAX_KNOWLEDGE_REVISION`) participates in identity alongside `id`; `namespace`
+  `MAX_KNOWLEDGE_REVISION`) participates in identity alongside `id`, which is
+  bounded by `MAX_KNOWLEDGE_ENTRY_ID_BYTES` UTF-8 bytes; `namespace`
   and `created_at` remain fixed across revisions. The snapshot
   carries `labels`,
   extensible `kind`, visibility, status, source refs, audit timestamps,
@@ -6504,7 +6505,8 @@ Postgres embedding operational contract:
 - `KnowledgeChunk`: bounded readable chunks for one exact entry revision. Its
   positive `entry_revision` must equal the owning entry revision. Stores may
   keep one default chunk for short entries or publish a complete custom chunk
-  set with a new revision. A chunk ID identifies one chunk across the entire
+  set with a new revision. A chunk ID, bounded by
+  `MAX_KNOWLEDGE_CHUNK_ID_BYTES` UTF-8 bytes, identifies one chunk across the entire
   store, not merely within an entry. A write that would reuse a chunk ID owned
   by another entry fails atomically: the existing entry and chunks remain
   unchanged, and the conflicting entry is not created. Built-in in-memory,
@@ -6676,30 +6678,43 @@ Apps may also register `RememberKnowledgeTool` when an agent should be allowed
 to propose new durable knowledge. The tool is proposal-only: it does not accept
 an `entry_id` and cannot arbitrarily edit, archive, or delete entries. It writes
 through `KnowledgeIndexer` and the store's operation-owned publication boundary
-so entry text, chunks, and immutable receipt evidence become visible atomically.
+so entry text, chunks, revision evidence, metadata-only change, and immutable
+receipt become visible atomically.
 The runtime tool-call idempotency key is the publication operation identity.
 Exact retries return the existing receipt; reuse with different entry or chunk
 material fails as a conflict. A matching non-live deterministic entry advances
 through a CAS-guarded successor revision; unrelated occupied identities are
 never overwritten. Built-in memory, SQLite, and PostgreSQL stores implement this
-boundary. Existing custom stores remain importable, but `remember_knowledge`
-fails closed with a fixed, content-free error unless both owned-publication
-hooks are implemented. This prevents a check-then-write race from overwriting an unrelated
+boundary. Custom stores must implement the current evidence/change-aware
+`KnowledgeStore` contract; `remember_knowledge` fails closed with a fixed,
+content-free error unless both owned-publication hooks are implemented. This
+prevents a check-then-write race from overwriting an unrelated
 writer that concurrently occupies the deterministic entry id.
+
+Each `KnowledgeChange` is selected through immutable before/after access
+audiences. Before access lets a scope observe relabel, tombstone, hard-delete,
+and expiration signals needed to remove material it previously indexed; after
+access lets a newly authorized scope materialize the successor. Expiration
+eligibility is fixed when the change commits instead of being reevaluated at
+read time. `read_changes(...)` reports the greatest accessible committed
+sequence as its high-water independently of the caller's continuation cursor,
+rejects a cursor beyond the store's actual current sequence, and accepts at
+most `MAX_KNOWLEDGE_CHANGE_LIMIT` records per page.
 
 `publish_entry_revision` and `load_entry_publication_receipt` are optional,
 non-abstract `KnowledgeStore` extension hooks. A custom implementation must
 create revision 1 or append exactly `expected_revision + 1`, commit its complete
-ordered chunk set, advance the current pointer, and insert one immutable receipt
-in a single atomic mutation; retain the receipt across entry deletion; reject a
-stale expected revision; bind the receipt digest to the expected revision plus
-the complete normalized entry and chunks; keep receipt operation and entry
-identities within 256 UTF-8 bytes; and
+ordered chunk and evidence sets, advance the current pointer, and insert one
+metadata-only `KnowledgeChange` plus one immutable receipt in a single atomic
+mutation; retain the receipt across entry deletion; reject a stale expected
+revision; bind the receipt digest to the expected revision plus the complete
+normalized entry, chunks, and evidence; keep the receipt operation identity
+within 256 UTF-8 bytes; and
 return the same committed timestamps with `replayed=true` for an exact operation
 replay (`replayed=false` is reserved for the transaction that inserted it).
 Custom stores must call the public `prepare_knowledge_publication(...)` helper
 before their transaction and persist the returned copied entry, ordered chunks,
-and canonical request digest. The helper is available from both `cayu` and
+ordered evidence, and canonical request digest. The helper is available from both `cayu` and
 `cayu.storage`; independently reproducing its serialization envelope is not part
 of the extension contract.
 The receipt is historical commit evidence: later review, successor publication, or
@@ -6724,6 +6739,12 @@ revision view, search structures, and required indexes—rather than trusting th
 migration ledger or a small column subset. Revision advancement is bounded by
 `MAX_KNOWLEDGE_REVISION`; exhaustion fails before a lifecycle mutation or
 backend write is attempted.
+
+Revision 43 is the breaking evidence/change boundary. It preserves revision-42
+knowledge and receipts, adds no fabricated historical changes, and requires
+custom stores to provide bounded evidence reads, bounded access-filtered change
+pages, full-scan consumer baseline initialization, and scope-bound fenced
+consumer leases. Failed writes and exact receipt replays publish no change.
 
 `RememberKnowledgePolicy` controls
 the actual stored status, namespace, visibility, required labels, and allowed

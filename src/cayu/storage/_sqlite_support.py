@@ -42,6 +42,10 @@ from cayu.runtime.tasks import (
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
+from cayu.storage.memory import (
+    MAX_KNOWLEDGE_CHUNK_ID_BYTES,
+    MAX_KNOWLEDGE_ENTRY_ID_BYTES,
+)
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -1514,6 +1518,12 @@ _MIGRATION_STEPS: dict[int, str] = {
             ) IS NOT NULL;
     """,
     42: """
+        DROP TABLE IF EXISTS cayu_knowledge_change_acknowledgements;
+        DROP TABLE IF EXISTS cayu_knowledge_change_consumers;
+        DROP TABLE IF EXISTS cayu_knowledge_change_labels;
+        DROP TABLE IF EXISTS cayu_knowledge_change_audiences;
+        DROP TABLE IF EXISTS cayu_knowledge_changes;
+        DROP TABLE IF EXISTS cayu_knowledge_evidence;
         DROP VIEW IF EXISTS cayu_knowledge_current_entries;
         DROP TABLE IF EXISTS cayu_knowledge_chunks_fts;
         DROP TABLE IF EXISTS cayu_knowledge_publication_receipts;
@@ -1683,6 +1693,164 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_knowledge_chunks(entry_id, entry_revision, chunk_index);
         CREATE INDEX idx_cayu_knowledge_publication_receipts_entry_revision
             ON cayu_knowledge_publication_receipts(entry_id, entry_revision);
+    """,
+    43: """
+        CREATE UNIQUE INDEX idx_cayu_knowledge_chunks_identity_owner
+            ON cayu_knowledge_chunks(id, entry_id, entry_revision);
+
+        CREATE TABLE cayu_knowledge_evidence (
+            id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            chunk_id TEXT,
+            role TEXT NOT NULL CHECK (role IN ('origin', 'supporting')),
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            source_uri TEXT,
+            source_revision TEXT,
+            source_hash TEXT,
+            locator_json TEXT NOT NULL,
+            disposition TEXT NOT NULL
+                CHECK (disposition IN ('live', 'detached', 'retained')),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            CHECK (source_id IS NOT NULL OR source_uri IS NOT NULL),
+            CHECK (source_revision IS NOT NULL OR source_hash IS NOT NULL),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE,
+            FOREIGN KEY (chunk_id, entry_id, entry_revision)
+                REFERENCES cayu_knowledge_chunks(id, entry_id, entry_revision)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_cayu_knowledge_evidence_entry_revision
+            ON cayu_knowledge_evidence(entry_id, entry_revision, id COLLATE BINARY);
+        CREATE INDEX idx_cayu_knowledge_evidence_source
+            ON cayu_knowledge_evidence(source_type, source_id, entry_id, entry_revision);
+
+        CREATE TABLE cayu_knowledge_changes (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT
+                CHECK (sequence > 0 AND sequence <= 9223372036854775807),
+            id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK (
+                kind IN (
+                    'created',
+                    'revision_appended',
+                    'status_transitioned',
+                    'tombstoned',
+                    'hard_deleted',
+                    'expired'
+                )
+            ),
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            committed_at TEXT NOT NULL,
+            operation_id TEXT
+        );
+
+        CREATE TABLE cayu_knowledge_change_audiences (
+            change_sequence INTEGER NOT NULL,
+            audience_kind TEXT NOT NULL CHECK (audience_kind IN ('before', 'after')),
+            namespace TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            source_type TEXT,
+            source_id TEXT,
+            status TEXT NOT NULL,
+            requires_include_expired INTEGER NOT NULL CHECK (
+                requires_include_expired IN (0, 1)
+            ),
+            PRIMARY KEY (change_sequence, audience_kind),
+            FOREIGN KEY (change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_cayu_knowledge_changes_entry_revision
+            ON cayu_knowledge_changes(entry_id, entry_revision, sequence);
+        CREATE UNIQUE INDEX idx_cayu_knowledge_changes_operation
+            ON cayu_knowledge_changes(operation_id)
+            WHERE operation_id IS NOT NULL;
+
+        CREATE INDEX idx_cayu_knowledge_change_audiences_namespace
+            ON cayu_knowledge_change_audiences(namespace, change_sequence, audience_kind);
+        CREATE INDEX idx_cayu_knowledge_change_audiences_status
+            ON cayu_knowledge_change_audiences(status, change_sequence, audience_kind);
+        CREATE INDEX idx_cayu_knowledge_change_audiences_source
+            ON cayu_knowledge_change_audiences(
+                source_type, source_id, change_sequence, audience_kind
+            );
+
+        CREATE TABLE cayu_knowledge_change_labels (
+            change_sequence INTEGER NOT NULL,
+            audience_kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (change_sequence, audience_kind, key),
+            FOREIGN KEY (change_sequence, audience_kind)
+                REFERENCES cayu_knowledge_change_audiences(
+                    change_sequence, audience_kind
+                ) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_cayu_knowledge_change_labels_lookup
+            ON cayu_knowledge_change_labels(
+                key, value, change_sequence, audience_kind
+            );
+
+        CREATE TABLE cayu_knowledge_change_consumers (
+            consumer_id TEXT PRIMARY KEY,
+            access_scope_sha256 TEXT NOT NULL,
+            cursor_sequence INTEGER NOT NULL DEFAULT 0
+                CHECK (cursor_sequence >= 0),
+            pending_change_sequence INTEGER,
+            pending_claim_id TEXT,
+            pending_worker_id TEXT,
+            pending_attempt INTEGER NOT NULL DEFAULT 0
+                CHECK (pending_attempt >= 0),
+            claimed_at TEXT,
+            lease_expires_at TEXT,
+            last_acknowledged_claim_id TEXT,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (pending_change_sequence IS NULL
+                    AND pending_claim_id IS NULL
+                    AND pending_worker_id IS NULL
+                    AND claimed_at IS NULL
+                    AND lease_expires_at IS NULL)
+                OR
+                (pending_change_sequence IS NOT NULL
+                    AND pending_change_sequence > cursor_sequence
+                    AND pending_claim_id IS NOT NULL
+                    AND pending_worker_id IS NOT NULL
+                    AND pending_attempt > 0
+                    AND claimed_at IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at > claimed_at)
+            ),
+            FOREIGN KEY (pending_change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence)
+        );
+
+        CREATE INDEX idx_cayu_knowledge_change_consumers_lease
+            ON cayu_knowledge_change_consumers(lease_expires_at)
+            WHERE pending_change_sequence IS NOT NULL;
+
+        CREATE TABLE cayu_knowledge_change_acknowledgements (
+            consumer_id TEXT NOT NULL,
+            claim_id TEXT NOT NULL,
+            claim_sha256 TEXT NOT NULL CHECK (
+                length(claim_sha256) = 64
+                AND claim_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            change_sequence INTEGER NOT NULL,
+            acknowledged_at TEXT NOT NULL,
+            PRIMARY KEY (consumer_id, claim_id),
+            FOREIGN KEY (consumer_id)
+                REFERENCES cayu_knowledge_change_consumers(consumer_id) ON DELETE CASCADE,
+            FOREIGN KEY (change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence)
+        );
     """,
 }
 
@@ -2150,6 +2318,15 @@ def _sqlite_has_unique_index(
     table: str,
     columns: tuple[str, ...],
 ) -> bool:
+    primary_key_columns = tuple(
+        str(row[1])
+        for row in sorted(
+            (row for row in connection.execute(f"PRAGMA table_info({table})") if row[5]),
+            key=lambda row: int(row[5]),
+        )
+    )
+    if primary_key_columns == columns:
+        return True
     for row in connection.execute(f"PRAGMA index_list({table})"):
         if not bool(row[2]):
             continue
@@ -2758,6 +2935,8 @@ def reconcile_schema(
         _validate_revision_37_knowledge_fts_schema(connection)
     if current.revision >= 42:
         _validate_revision_42_knowledge_schema(connection)
+    if current.revision >= 43:
+        _validate_revision_43_knowledge_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
@@ -3059,6 +3238,330 @@ def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> No
             _raise_revision_42_sqlite_schema_error(table)
 
 
+def _validate_revision_43_knowledge_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "cayu_knowledge_evidence": (
+            "id",
+            "entry_id",
+            "entry_revision",
+            "chunk_id",
+            "role",
+            "source_type",
+            "source_id",
+            "source_uri",
+            "source_revision",
+            "source_hash",
+            "locator_json",
+            "disposition",
+            "created_at",
+            "metadata_json",
+        ),
+        "cayu_knowledge_changes": (
+            "sequence",
+            "id",
+            "kind",
+            "entry_id",
+            "entry_revision",
+            "committed_at",
+            "operation_id",
+        ),
+        "cayu_knowledge_change_audiences": (
+            "change_sequence",
+            "audience_kind",
+            "namespace",
+            "visibility",
+            "source_type",
+            "source_id",
+            "status",
+            "requires_include_expired",
+        ),
+        "cayu_knowledge_change_consumers": (
+            "consumer_id",
+            "access_scope_sha256",
+            "cursor_sequence",
+            "pending_change_sequence",
+            "pending_claim_id",
+            "pending_worker_id",
+            "pending_attempt",
+            "claimed_at",
+            "lease_expires_at",
+            "last_acknowledged_claim_id",
+            "updated_at",
+        ),
+        "cayu_knowledge_change_acknowledgements": (
+            "consumer_id",
+            "claim_id",
+            "claim_sha256",
+            "change_sequence",
+            "acknowledged_at",
+        ),
+        "cayu_knowledge_change_labels": (
+            "change_sequence",
+            "audience_kind",
+            "key",
+            "value",
+        ),
+    }
+    for table, columns in expected_columns.items():
+        if _sqlite_table_columns(connection, table) != columns:
+            _raise_revision_43_sqlite_schema_error(table)
+
+    evidence_foreign_keys = tuple(
+        sorted(
+            (
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                str(row[6]).upper(),
+            )
+            for row in connection.execute("PRAGMA foreign_key_list(cayu_knowledge_evidence)")
+        )
+    )
+    if evidence_foreign_keys != tuple(
+        sorted(
+            (
+                ("cayu_knowledge_chunks", "chunk_id", "id", "CASCADE"),
+                ("cayu_knowledge_chunks", "entry_id", "entry_id", "CASCADE"),
+                (
+                    "cayu_knowledge_chunks",
+                    "entry_revision",
+                    "entry_revision",
+                    "CASCADE",
+                ),
+                ("cayu_knowledge_revisions", "entry_id", "entry_id", "CASCADE"),
+                (
+                    "cayu_knowledge_revisions",
+                    "entry_revision",
+                    "revision",
+                    "CASCADE",
+                ),
+            )
+        )
+    ):
+        _raise_revision_43_sqlite_schema_error("cayu_knowledge_evidence")
+
+    change_audience_foreign_keys = tuple(
+        (
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[6]).upper(),
+        )
+        for row in connection.execute("PRAGMA foreign_key_list(cayu_knowledge_change_audiences)")
+    )
+    if change_audience_foreign_keys != (
+        ("cayu_knowledge_changes", "change_sequence", "sequence", "CASCADE"),
+    ):
+        _raise_revision_43_sqlite_schema_error("cayu_knowledge_change_audiences")
+
+    change_label_foreign_keys = tuple(
+        sorted(
+            (
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                str(row[6]).upper(),
+            )
+            for row in connection.execute("PRAGMA foreign_key_list(cayu_knowledge_change_labels)")
+        )
+    )
+    if change_label_foreign_keys != tuple(
+        sorted(
+            (
+                (
+                    "cayu_knowledge_change_audiences",
+                    "change_sequence",
+                    "change_sequence",
+                    "CASCADE",
+                ),
+                (
+                    "cayu_knowledge_change_audiences",
+                    "audience_kind",
+                    "audience_kind",
+                    "CASCADE",
+                ),
+            )
+        )
+    ):
+        _raise_revision_43_sqlite_schema_error("cayu_knowledge_change_labels")
+
+    consumer_foreign_keys = tuple(
+        (
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[6]).upper(),
+        )
+        for row in connection.execute("PRAGMA foreign_key_list(cayu_knowledge_change_consumers)")
+    )
+    if consumer_foreign_keys != (
+        ("cayu_knowledge_changes", "pending_change_sequence", "sequence", "NO ACTION"),
+    ):
+        _raise_revision_43_sqlite_schema_error("cayu_knowledge_change_consumers")
+
+    acknowledgement_foreign_keys = tuple(
+        sorted(
+            (
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                str(row[6]).upper(),
+            )
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(cayu_knowledge_change_acknowledgements)"
+            )
+        )
+    )
+    if acknowledgement_foreign_keys != tuple(
+        sorted(
+            (
+                (
+                    "cayu_knowledge_change_consumers",
+                    "consumer_id",
+                    "consumer_id",
+                    "CASCADE",
+                ),
+                (
+                    "cayu_knowledge_changes",
+                    "change_sequence",
+                    "sequence",
+                    "NO ACTION",
+                ),
+            )
+        )
+    ):
+        _raise_revision_43_sqlite_schema_error("cayu_knowledge_change_acknowledgements")
+
+    for table, key in (
+        ("cayu_knowledge_evidence", ("id",)),
+        ("cayu_knowledge_changes", ("sequence",)),
+        ("cayu_knowledge_changes", ("id",)),
+        (
+            "cayu_knowledge_change_audiences",
+            ("change_sequence", "audience_kind"),
+        ),
+        ("cayu_knowledge_change_consumers", ("consumer_id",)),
+        (
+            "cayu_knowledge_change_acknowledgements",
+            ("consumer_id", "claim_id"),
+        ),
+        (
+            "cayu_knowledge_change_labels",
+            ("change_sequence", "audience_kind", "key"),
+        ),
+        (
+            "cayu_knowledge_chunks",
+            ("id", "entry_id", "entry_revision"),
+        ),
+    ):
+        if not _sqlite_has_unique_index(connection, table, key):
+            _raise_revision_43_sqlite_schema_error(table)
+
+    required_indexes = {
+        "idx_cayu_knowledge_evidence_entry_revision": (
+            "cayu_knowledge_evidence",
+            ("entry_id", "entry_revision", "id"),
+        ),
+        "idx_cayu_knowledge_evidence_source": (
+            "cayu_knowledge_evidence",
+            ("source_type", "source_id", "entry_id", "entry_revision"),
+        ),
+        "idx_cayu_knowledge_changes_entry_revision": (
+            "cayu_knowledge_changes",
+            ("entry_id", "entry_revision", "sequence"),
+        ),
+        "idx_cayu_knowledge_change_audiences_namespace": (
+            "cayu_knowledge_change_audiences",
+            ("namespace", "change_sequence", "audience_kind"),
+        ),
+        "idx_cayu_knowledge_change_audiences_status": (
+            "cayu_knowledge_change_audiences",
+            ("status", "change_sequence", "audience_kind"),
+        ),
+        "idx_cayu_knowledge_change_audiences_source": (
+            "cayu_knowledge_change_audiences",
+            ("source_type", "source_id", "change_sequence", "audience_kind"),
+        ),
+        "idx_cayu_knowledge_changes_operation": (
+            "cayu_knowledge_changes",
+            ("operation_id",),
+        ),
+        "idx_cayu_knowledge_change_consumers_lease": (
+            "cayu_knowledge_change_consumers",
+            ("lease_expires_at",),
+        ),
+        "idx_cayu_knowledge_change_labels_lookup": (
+            "cayu_knowledge_change_labels",
+            ("key", "value", "change_sequence", "audience_kind"),
+        ),
+        "idx_cayu_knowledge_chunks_identity_owner": (
+            "cayu_knowledge_chunks",
+            ("id", "entry_id", "entry_revision"),
+        ),
+    }
+    for index, (table, columns) in required_indexes.items():
+        row = connection.execute(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        ).fetchone()
+        actual_columns = tuple(
+            str(column[2]) for column in connection.execute(f"PRAGMA index_info({index})")
+        )
+        if row is None or str(row[0]) != table or actual_columns != columns:
+            _raise_revision_43_sqlite_schema_error(index)
+        normalized = _normalize_sqlite_schema_sql(row[1])
+        if index == "idx_cayu_knowledge_evidence_entry_revision" and (
+            "id collate binary" not in normalized
+        ):
+            _raise_revision_43_sqlite_schema_error(index)
+        if index == "idx_cayu_knowledge_changes_operation" and (
+            "where operation_id is not null" not in normalized
+        ):
+            _raise_revision_43_sqlite_schema_error(index)
+        if index == "idx_cayu_knowledge_change_consumers_lease" and (
+            "where pending_change_sequence is not null" not in normalized
+        ):
+            _raise_revision_43_sqlite_schema_error(index)
+
+    required_sql = {
+        "cayu_knowledge_evidence": (
+            "check (entry_revision > 0 and entry_revision <= 2147483647)",
+            "check (role in ('origin', 'supporting'))",
+            "check (source_id is not null or source_uri is not null)",
+            "check (source_revision is not null or source_hash is not null)",
+            "check (disposition in ('live', 'detached', 'retained'))",
+        ),
+        "cayu_knowledge_changes": (
+            "check (sequence > 0 and sequence <= 9223372036854775807)",
+            "check (entry_revision > 0 and entry_revision <= 2147483647)",
+            "kind in ( 'created', 'revision_appended', 'status_transitioned', "
+            "'tombstoned', 'hard_deleted', 'expired' )",
+        ),
+        "cayu_knowledge_change_audiences": (
+            "check (audience_kind in ('before', 'after'))",
+            "check ( requires_include_expired in (0, 1) )",
+        ),
+        "cayu_knowledge_change_consumers": (
+            "check (cursor_sequence >= 0)",
+            "check (pending_attempt >= 0)",
+            "pending_change_sequence > cursor_sequence",
+            "lease_expires_at > claimed_at",
+        ),
+        "cayu_knowledge_change_acknowledgements": (
+            "length(claim_sha256) = 64",
+            "claim_sha256 not glob '*[^0-9a-f]*'",
+        ),
+    }
+    for table, fragments in required_sql.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+        if any(fragment not in normalized for fragment in fragments):
+            _raise_revision_43_sqlite_schema_error(table)
+
+
 def _normalize_sqlite_schema_sql(value: object | None) -> str:
     return " ".join(str(value or "").lower().split())
 
@@ -3069,6 +3572,38 @@ def _raise_revision_42_sqlite_schema_error(name: str) -> NoReturn:
         "knowledge contract. Recreate the Cayu database from a known-good "
         "revision-42 schema."
     )
+
+
+def _raise_revision_43_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        f"SQLite schema object {name!r} conflicts with Cayu's knowledge evidence "
+        "and atomic change contract. Recreate or migrate the Cayu database from "
+        "a known-good revision-43 schema."
+    )
+
+
+def _reject_revision_43_knowledge_identity_overflow(
+    connection: sqlite3.Connection,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM cayu_knowledge_entries
+        WHERE length(CAST(id AS BLOB)) > ?
+        UNION ALL
+        SELECT 1
+        FROM cayu_knowledge_chunks
+        WHERE length(CAST(id AS BLOB)) > ?
+        LIMIT 1
+        """,
+        (MAX_KNOWLEDGE_ENTRY_ID_BYTES, MAX_KNOWLEDGE_CHUNK_ID_BYTES),
+    ).fetchone()
+    if row is not None:
+        raise schema.SchemaTooOld(
+            "Storage revision 43 bounds knowledge entry and chunk identities for "
+            "portable indexed storage. Shorten out-of-contract revision-42 identities "
+            "or recreate the Cayu database before migration."
+        )
 
 
 def _validate_knowledge_publication_access_snapshot_column(
@@ -3370,6 +3905,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             # destructive reset DDL. A legacy writer cannot populate an empty
             # table between the refusal check and the schema replacement.
             _reject_populated_pre_knowledge_revision_database(connection)
+        if rev.revision == 43:
+            _reject_revision_43_knowledge_identity_overflow(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -3385,6 +3922,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_knowledge_publication_access_snapshot_column(connection)
         if rev.revision == 42:
             _validate_revision_42_knowledge_schema(connection)
+        if rev.revision == 43:
+            _validate_revision_43_knowledge_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

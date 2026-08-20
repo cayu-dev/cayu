@@ -1629,6 +1629,7 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support knowledge publication receipts."
         )
 
+    @abstractmethod
     async def read_evidence(
         self,
         entry_id: str,
@@ -1639,8 +1640,6 @@ class KnowledgeStore(ABC):
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> KnowledgeEvidenceResult | None:
         """Read evidence for the current or one exact authorized revision."""
-
-        raise NotImplementedError("This KnowledgeStore does not support knowledge evidence.")
 
     @abstractmethod
     async def read_chunks(
@@ -1674,6 +1673,7 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeListResult:
         """List entries/facets for discovery without requiring a lexical search term."""
 
+    @abstractmethod
     async def read_changes(
         self,
         *,
@@ -1683,8 +1683,7 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeChangeBatch:
         """Read one bounded ordered page of accessible canonical changes."""
 
-        raise NotImplementedError("This KnowledgeStore does not support knowledge changes.")
-
+    @abstractmethod
     async def initialize_change_consumer(
         self,
         consumer_id: str,
@@ -1694,8 +1693,7 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeChangeConsumerState:
         """Bind a consumer and its cursor to a captured full-scan high-water mark."""
 
-        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
-
+    @abstractmethod
     async def claim_change(
         self,
         consumer_id: str,
@@ -1706,8 +1704,7 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeChangeClaim | None:
         """Lease the consumer's next accessible change with at-least-once semantics."""
 
-        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
-
+    @abstractmethod
     async def acknowledge_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -1716,8 +1713,7 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeChangeConsumerState:
         """Fenced acknowledgement that advances one consumer cursor."""
 
-        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
-
+    @abstractmethod
     async def release_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -1726,8 +1722,7 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeChangeConsumerState:
         """Release a live claim without advancing its consumer cursor."""
 
-        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
-
+    @abstractmethod
     async def load_change_consumer_state(
         self,
         consumer_id: str,
@@ -1735,8 +1730,6 @@ class KnowledgeStore(ABC):
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeChangeConsumerState | None:
         """Load one scope-bound consumer cursor and lease state."""
-
-        raise NotImplementedError("This KnowledgeStore does not support change consumers.")
 
     async def prune_expired(
         self,

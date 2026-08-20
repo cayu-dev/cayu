@@ -146,6 +146,53 @@ unproven workspace lineage without claiming an isolated derived revision. The
 new evidence is additive JSON in existing events and round-trips through all
 built-in session stores; no storage migration is required.
 
+### Knowledge revisions carry evidence and publish atomic changes
+
+Knowledge create, append, and owned-publication operations now accept immutable
+`KnowledgeEvidence` bound to an exact entry revision and optional exact chunk.
+Lifecycle-only successors inherit and rebind evidence; content-changing
+successors require callers to supply it explicitly. Evidence participates in
+publication idempotency, bounded authorized reads, defensive copying, and
+global collision protection across the in-memory, SQLite, and PostgreSQL
+backends. Revision-42 publication receipts remain replayable after migration
+when the retry carries no evidence; evidence-bearing requests never use the
+older entry-and-chunks-only digest.
+
+Every successful canonical knowledge mutation now emits one metadata-only,
+before/after-audience-bound `KnowledgeChange` in the same transaction. A scope
+that loses access still receives the removal/update signal needed to clear stale
+derived state; expiration cannot make already-published work disappear. Bounded
+change pages accept at most `MAX_KNOWLEDGE_CHANGE_LIMIT` records, expose an
+honest store-owned accessible high-water mark, and reject
+cursors beyond the current store sequence, while scope-bound leased consumers
+can initialize from a full-scan baseline and provide fenced at-least-once
+delivery with durable SQLite/PostgreSQL cursors. Failed writes, exact
+publication replays, authorization denials, and rolled-back transactions emit
+no change.
+
+Change-consumer leases now use store-authoritative time (the database clock on
+PostgreSQL), and durable acknowledgement receipts keep exact retries
+idempotent even after the consumer advances again.
+
+Evidence prefixes and multi-entry expiration changes now use portable scalar
+identity ordering across the in-memory, SQLite, and PostgreSQL backends, so
+bounded results and cleanup publication do not depend on database locale or
+insertion order.
+
+Entry IDs and chunk IDs now have explicit portable UTF-8 byte limits shared by
+canonical models, referenced evidence/receipts/changes, and every built-in
+backend. Revision-43 migration rejects out-of-contract revision-42 identities
+before applying DDL, avoiding backend-specific index failures. The revision-43
+migration timestamp also preserves cleanup delivery for migrated entries that
+expire after the outbox baseline without widening access to entries that were
+already expired.
+
+Breaking schema revision 43 adds evidence, ordered-change, and consumer-state
+tables without rewriting revision-42 knowledge or fabricating historical
+events. Stop pre-43 knowledge writers, run `cayu storage migrate`, and confirm
+revision 43 before starting this build. Mixed revision-42/revision-43 knowledge
+writers are unsupported.
+
 ### Fork and workspace branch authority fails closed
 
 `CURRENT_CHILD` session forks now require an attributable application authority

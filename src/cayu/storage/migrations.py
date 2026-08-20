@@ -248,6 +248,12 @@ REVISIONS: tuple[Revision, ...] = (
     # refuses populated pre-revision knowledge databases instead of maintaining
     # a backfill or dual read/write path.
     Revision(revision=42, kind=RevisionKind.BREAKING, compatible_from=42),
+    # Every canonical knowledge mutation now writes revision-bound evidence and
+    # one metadata-only ordered change in the same transaction. Pre-43 writers
+    # do not maintain that outbox, so mixed-version knowledge writers are unsafe.
+    # The DDL is additive and preserves revision-42 knowledge; no historical
+    # changes are fabricated during migration.
+    Revision(revision=43, kind=RevisionKind.BREAKING, compatible_from=43),
 )
 
 #: The revision an empty database is initialized to.

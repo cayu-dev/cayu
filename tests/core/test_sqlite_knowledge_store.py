@@ -27,12 +27,17 @@ from tests.core.knowledge_publication_conformance import (
 from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu.core.tools import ToolContext
 from cayu.storage import (
+    MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,
     KnowledgeAccessScope,
+    KnowledgeChangeKind,
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeEvidence,
     KnowledgeListGroup,
     KnowledgeListQuery,
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeRevisionConflict,
     KnowledgeRevisionResetRequired,
@@ -43,7 +48,9 @@ from cayu.storage import (
     SQLiteSessionStore,
 )
 from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import knowledge_sqlite as knowledge_sqlite_storage
 from cayu.storage import migrations as schema_migrations
+from cayu.storage.memory import _knowledge_publication_v1_request_sha256
 from cayu.tools import RememberKnowledgeTool
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
@@ -65,6 +72,21 @@ def _reconcile_sqlite_through_revision_41(connection: sqlite3.Connection) -> Non
             connection,
             schema_migrations.SchemaMode.MIGRATE,
             app_min_supported=41,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+
+
+def _reconcile_sqlite_through_revision_42(connection: sqlite3.Connection) -> None:
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 42
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+            app_min_supported=42,
         )
     finally:
         schema_migrations.REVISIONS = revisions
@@ -1358,6 +1380,237 @@ def test_sqlite_knowledge_schema_migrates_and_coexists_with_session_store(tmp_pa
     assert knowledge_table is not None
     assert knowledge_fts is not None
     assert publication_receipts is not None
+
+
+def test_sqlite_revision_43_preserves_revision_42_knowledge_without_fabricated_changes(
+    tmp_path,
+) -> None:
+    database = tmp_path / "revision-42-to-43.sqlite"
+    connection = sqlite_support.connect(database)
+    timestamp = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
+    entry = KnowledgeEntry(
+        id="preserved-entry",
+        text="Revision 42 knowledge survives.",
+        labels={"project": "cayu"},
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    chunk = KnowledgeChunk(
+        id="preserved-entry:r1:0",
+        entry_id=entry.id,
+        entry_revision=1,
+        chunk_index=0,
+        text=entry.text,
+    )
+    operation_id = "preserved-revision-42-publication"
+    receipt = KnowledgePublicationReceipt(
+        operation_id=operation_id,
+        entry_id=entry.id,
+        entry_revision=entry.revision,
+        expected_revision=None,
+        request_sha256=_knowledge_publication_v1_request_sha256(
+            entry,
+            [chunk],
+            expected_revision=None,
+        ),
+        entry_created_at=entry.created_at,
+        entry_updated_at=entry.updated_at,
+        committed_at=timestamp,
+    )
+    try:
+        _reconcile_sqlite_through_revision_42(connection)
+        seed_store = SQLiteKnowledgeStore.__new__(SQLiteKnowledgeStore)
+        seed_store._connection = connection
+        with sqlite_support._transaction(connection):
+            seed_store._insert_entry_unlocked(entry)
+            seed_store._insert_chunks_unlocked(entry, [chunk])
+            seed_store._insert_publication_receipt_unlocked(receipt, entry)
+    finally:
+        connection.close()
+
+    async def verify() -> None:
+        store = SQLiteKnowledgeStore(
+            database,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            replay = await store.publish_entry_revision(
+                entry,
+                [chunk],
+                operation_id=operation_id,
+            )
+            assert replay.replayed is True
+            assert replay.committed_at == receipt.committed_at
+            with pytest.raises(KnowledgePublicationConflict):
+                await store.publish_entry_revision(
+                    entry,
+                    [chunk],
+                    evidence=[
+                        KnowledgeEvidence(
+                            id="new-evidence-cannot-replay-v1",
+                            entry_id=entry.id,
+                            entry_revision=entry.revision,
+                            chunk_id=chunk.id,
+                            source_type="document",
+                            source_id="new-source",
+                            source_revision="1",
+                        )
+                    ],
+                    operation_id=operation_id,
+                )
+            assert await store.get_entry(entry.id) == entry
+            assert await store.read_chunks(entry.id) == [chunk]
+            evidence = await store.read_evidence(entry.id)
+            assert evidence is not None
+            assert evidence.evidence == []
+            assert evidence.total_evidence_known == 0
+            assert (await store.read_changes()).changes == []
+        finally:
+            await store.close()
+
+    asyncio.run(verify())
+
+
+def test_sqlite_revision_43_preserves_migrated_expiration_cleanup_audiences(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "revision-42-expiration-audiences.sqlite"
+    connection = sqlite_support.connect(database)
+    baseline = datetime.now(UTC)
+    future_expiry = baseline + timedelta(hours=1)
+    entries = (
+        KnowledgeEntry(
+            id="migrated-future-expiry",
+            text="Visible when the outbox baseline was established.",
+            labels={"expiry": "future"},
+            created_at=baseline,
+            updated_at=baseline,
+            expires_at=future_expiry,
+        ),
+        KnowledgeEntry(
+            id="migrated-past-expiry",
+            text="Already expired when the outbox baseline was established.",
+            labels={"expiry": "past"},
+            created_at=baseline - timedelta(hours=2),
+            updated_at=baseline - timedelta(hours=2),
+            expires_at=baseline - timedelta(hours=1),
+        ),
+    )
+    try:
+        _reconcile_sqlite_through_revision_42(connection)
+        seed_store = SQLiteKnowledgeStore.__new__(SQLiteKnowledgeStore)
+        seed_store._connection = connection
+        with sqlite_support._transaction(connection):
+            for entry in entries:
+                seed_store._insert_entry_unlocked(entry)
+    finally:
+        connection.close()
+
+    async def verify() -> None:
+        store = SQLiteKnowledgeStore(
+            database,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+            access_scope=None,
+        )
+        future_scope = KnowledgeAccessScope.for_namespace(
+            "default",
+            required_labels={"expiry": "future"},
+        )
+        past_scope = KnowledgeAccessScope.for_namespace(
+            "default",
+            required_labels={"expiry": "past"},
+        )
+        after_expiry = future_expiry + timedelta(hours=1)
+
+        class PostExpiryDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return after_expiry if tz is not None else after_expiry.replace(tzinfo=None)
+
+        try:
+            assert (
+                await store.get_entry(
+                    entries[0].id,
+                    access_scope=future_scope,
+                )
+                == entries[0]
+            )
+            assert await store.get_entry(entries[1].id, access_scope=past_scope) is None
+            monkeypatch.setattr(knowledge_sqlite_storage, "datetime", PostExpiryDatetime)
+            assert (
+                await store.prune_expired(
+                    access_scope=_ACCESS_SCOPE,
+                    now=after_expiry,
+                )
+                == 2
+            )
+            future_changes = await store.read_changes(access_scope=future_scope)
+            assert [change.kind for change in future_changes.changes] == [
+                KnowledgeChangeKind.EXPIRED
+            ]
+            assert future_changes.changes[0].entry_id == entries[0].id
+            assert (await store.read_changes(access_scope=past_scope)).changes == []
+        finally:
+            await store.close()
+
+    asyncio.run(verify())
+
+
+def test_sqlite_revision_43_rejects_out_of_contract_revision_42_identities(
+    tmp_path,
+) -> None:
+    database = tmp_path / "revision-42-oversized-identity.sqlite"
+    connection = sqlite_support.connect(database)
+    entry = KnowledgeEntry(id="bounded-entry", text="Valid revision-42 entry.")
+    oversized_chunk_id = "c" * (MAX_KNOWLEDGE_CHUNK_ID_BYTES + 1)
+    try:
+        _reconcile_sqlite_through_revision_42(connection)
+        seed_store = SQLiteKnowledgeStore.__new__(SQLiteKnowledgeStore)
+        seed_store._connection = connection
+        with sqlite_support._transaction(connection):
+            seed_store._insert_entry_unlocked(entry)
+            connection.execute(
+                """
+                INSERT INTO cayu_knowledge_chunks (
+                    id, entry_id, entry_revision, chunk_index,
+                    text, content_hash, source_uri, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    oversized_chunk_id,
+                    entry.id,
+                    entry.revision,
+                    0,
+                    entry.text,
+                    None,
+                    None,
+                    "{}",
+                ),
+            )
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="bounds knowledge"):
+        SQLiteKnowledgeStore(
+            database,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+
+    connection = sqlite_support.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_cayu_knowledge_chunks_identity_owner'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
 
 
 def test_sqlite_revision_migration_refuses_populated_legacy_knowledge_unchanged(

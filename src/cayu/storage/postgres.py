@@ -415,13 +415,25 @@ from cayu.storage.knowledge_transition import require_empty_knowledge_revision_t
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    MAX_KNOWLEDGE_CHUNK_ID_BYTES,
+    MAX_KNOWLEDGE_ENTRY_ID_BYTES,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeActorType,
+    KnowledgeChange,
+    KnowledgeChangeBatch,
+    KnowledgeChangeClaim,
+    KnowledgeChangeConsumerConflict,
+    KnowledgeChangeConsumerState,
+    KnowledgeChangeKind,
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgeEvidence,
+    KnowledgeEvidenceConflict,
+    KnowledgeEvidenceDisposition,
+    KnowledgeEvidenceResult,
+    KnowledgeEvidenceRole,
     KnowledgeFacet,
     KnowledgeHit,
     KnowledgeListGroup,
@@ -437,10 +449,21 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _bounded_knowledge_evidence,
     _copy_chunks_for_revision,
+    _copy_entry_evidence,
+    _copy_evidence_for_revision,
+    _initialize_knowledge_change_consumer_state,
+    _knowledge_access_scope_sha256,
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
+    _knowledge_change_audiences,
+    _knowledge_change_claim_sha256,
+    _knowledge_change_identity,
+    _knowledge_change_lease_seconds,
+    _knowledge_change_now,
     _knowledge_chunk_content_hash,
+    _knowledge_entry_id,
     _knowledge_publication_operation_id,
     _knowledge_scope_allows_snapshot,
     _next_knowledge_revision,
@@ -450,6 +473,8 @@ from cayu.storage.memory import (
     _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
+    _validate_knowledge_change_limit,
+    _validate_knowledge_change_sequence,
     _validate_knowledge_publication_replay,
     _validate_knowledge_revision,
     _validate_nonnegative_float,
@@ -458,6 +483,8 @@ from cayu.storage.memory import (
     _validate_revision_successor,
     _validate_unit_float,
     copy_knowledge_access_scope,
+    copy_knowledge_change_claim,
+    copy_knowledge_change_consumer_state,
     copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_list_query,
@@ -1355,6 +1382,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "DROP CONSTRAINT IF EXISTS cayu_knowledge_embeddings_chunk_id_fkey",
         "ALTER TABLE IF EXISTS cayu_knowledge_embeddings "
         "DROP CONSTRAINT IF EXISTS cayu_knowledge_embeddings_entry_id_fkey",
+        "DROP TABLE IF EXISTS cayu_knowledge_change_acknowledgements",
+        "DROP TABLE IF EXISTS cayu_knowledge_change_consumers",
+        "DROP TABLE IF EXISTS cayu_knowledge_change_labels",
+        "DROP TABLE IF EXISTS cayu_knowledge_change_audiences",
+        "DROP TABLE IF EXISTS cayu_knowledge_changes",
+        "DROP TABLE IF EXISTS cayu_knowledge_evidence",
         "DROP VIEW IF EXISTS cayu_knowledge_current_entries",
         "DROP TABLE IF EXISTS cayu_knowledge_publication_receipts",
         "DROP TABLE IF EXISTS cayu_knowledge_chunks",
@@ -1539,6 +1572,158 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_knowledge_chunks USING GIN (to_tsvector('simple', text))",
         "CREATE INDEX idx_cayu_knowledge_publication_receipts_entry_revision "
         "ON cayu_knowledge_publication_receipts(entry_id, entry_revision)",
+    ),
+    43: (
+        "ALTER TABLE cayu_knowledge_chunks "
+        "ADD CONSTRAINT cayu_knowledge_chunks_identity_owner_key "
+        "UNIQUE (id, entry_id, entry_revision)",
+        """
+        CREATE TABLE cayu_knowledge_evidence (
+            id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            chunk_id TEXT,
+            role TEXT NOT NULL CHECK (role IN ('origin', 'supporting')),
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            source_uri TEXT,
+            source_revision TEXT,
+            source_hash TEXT,
+            locator JSONB NOT NULL,
+            disposition TEXT NOT NULL
+                CHECK (disposition IN ('live', 'detached', 'retained')),
+            created_at TIMESTAMPTZ NOT NULL,
+            metadata JSONB NOT NULL,
+            CHECK (source_id IS NOT NULL OR source_uri IS NOT NULL),
+            CHECK (source_revision IS NOT NULL OR source_hash IS NOT NULL),
+            FOREIGN KEY (entry_id, entry_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE,
+            FOREIGN KEY (chunk_id, entry_id, entry_revision)
+                REFERENCES cayu_knowledge_chunks(id, entry_id, entry_revision)
+                ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX idx_cayu_knowledge_evidence_entry_revision "
+        'ON cayu_knowledge_evidence(entry_id, entry_revision, id COLLATE "C")',
+        "CREATE INDEX idx_cayu_knowledge_evidence_source "
+        "ON cayu_knowledge_evidence(source_type, source_id, entry_id, entry_revision)",
+        """
+        CREATE TABLE cayu_knowledge_changes (
+            sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+                CHECK (sequence > 0),
+            id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK (
+                kind IN (
+                    'created',
+                    'revision_appended',
+                    'status_transitioned',
+                    'tombstoned',
+                    'hard_deleted',
+                    'expired'
+                )
+            ),
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            committed_at TIMESTAMPTZ NOT NULL,
+            operation_id TEXT
+        )
+        """,
+        """
+        CREATE TABLE cayu_knowledge_change_audiences (
+            change_sequence BIGINT NOT NULL,
+            audience_kind TEXT NOT NULL CHECK (audience_kind IN ('before', 'after')),
+            namespace TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            source_type TEXT,
+            source_id TEXT,
+            status TEXT NOT NULL,
+            requires_include_expired BOOLEAN NOT NULL,
+            PRIMARY KEY (change_sequence, audience_kind),
+            FOREIGN KEY (change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX idx_cayu_knowledge_changes_entry_revision "
+        "ON cayu_knowledge_changes(entry_id, entry_revision, sequence)",
+        "CREATE UNIQUE INDEX idx_cayu_knowledge_changes_operation "
+        "ON cayu_knowledge_changes(operation_id) WHERE operation_id IS NOT NULL",
+        "CREATE INDEX idx_cayu_knowledge_change_audiences_namespace "
+        "ON cayu_knowledge_change_audiences(namespace, change_sequence, audience_kind)",
+        "CREATE INDEX idx_cayu_knowledge_change_audiences_status "
+        "ON cayu_knowledge_change_audiences(status, change_sequence, audience_kind)",
+        "CREATE INDEX idx_cayu_knowledge_change_audiences_source "
+        "ON cayu_knowledge_change_audiences("
+        "source_type, source_id, change_sequence, audience_kind)",
+        """
+        CREATE TABLE cayu_knowledge_change_labels (
+            change_sequence BIGINT NOT NULL,
+            audience_kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (change_sequence, audience_kind, key),
+            FOREIGN KEY (change_sequence, audience_kind)
+                REFERENCES cayu_knowledge_change_audiences(
+                    change_sequence, audience_kind
+                ) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX idx_cayu_knowledge_change_labels_lookup "
+        "ON cayu_knowledge_change_labels("
+        "key, value, change_sequence, audience_kind)",
+        """
+        CREATE TABLE cayu_knowledge_change_consumers (
+            consumer_id TEXT PRIMARY KEY,
+            access_scope_sha256 TEXT NOT NULL,
+            cursor_sequence BIGINT NOT NULL DEFAULT 0
+                CHECK (cursor_sequence >= 0),
+            pending_change_sequence BIGINT,
+            pending_claim_id TEXT,
+            pending_worker_id TEXT,
+            pending_attempt INTEGER NOT NULL DEFAULT 0
+                CHECK (pending_attempt >= 0),
+            claimed_at TIMESTAMPTZ,
+            lease_expires_at TIMESTAMPTZ,
+            last_acknowledged_claim_id TEXT,
+            updated_at TIMESTAMPTZ NOT NULL,
+            CHECK (
+                (pending_change_sequence IS NULL
+                    AND pending_claim_id IS NULL
+                    AND pending_worker_id IS NULL
+                    AND claimed_at IS NULL
+                    AND lease_expires_at IS NULL)
+                OR
+                (pending_change_sequence IS NOT NULL
+                    AND pending_change_sequence > cursor_sequence
+                    AND pending_claim_id IS NOT NULL
+                    AND pending_worker_id IS NOT NULL
+                    AND pending_attempt > 0
+                    AND claimed_at IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at > claimed_at)
+            ),
+            FOREIGN KEY (pending_change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence)
+        )
+        """,
+        "CREATE INDEX idx_cayu_knowledge_change_consumers_lease "
+        "ON cayu_knowledge_change_consumers(lease_expires_at) "
+        "WHERE pending_change_sequence IS NOT NULL",
+        """
+        CREATE TABLE cayu_knowledge_change_acknowledgements (
+            consumer_id TEXT NOT NULL,
+            claim_id TEXT NOT NULL,
+            claim_sha256 TEXT NOT NULL CHECK (claim_sha256 ~ '^[0-9a-f]{64}$'),
+            change_sequence BIGINT NOT NULL,
+            acknowledged_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (consumer_id, claim_id),
+            FOREIGN KEY (consumer_id)
+                REFERENCES cayu_knowledge_change_consumers(consumer_id) ON DELETE CASCADE,
+            FOREIGN KEY (change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence)
+        )
+        """,
     ),
 }
 
@@ -2539,6 +2724,30 @@ async def _reject_populated_pre_knowledge_revision_database(cur: Any) -> None:
     )
 
 
+async def _reject_revision_43_knowledge_identity_overflow(cur: Any) -> None:
+    await cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM cayu_knowledge_entries
+            WHERE octet_length(id) > %s
+            UNION ALL
+            SELECT 1
+            FROM cayu_knowledge_chunks
+            WHERE octet_length(id) > %s
+        )
+        """,
+        (MAX_KNOWLEDGE_ENTRY_ID_BYTES, MAX_KNOWLEDGE_CHUNK_ID_BYTES),
+    )
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 43 bounds knowledge entry and chunk identities for "
+            "portable indexed storage. Shorten out-of-contract revision-42 identities "
+            "or recreate the Cayu database before migration."
+        )
+
+
 async def _transcript_cursor(cur: Any, session_id: str) -> int:
     """Return the permanent next transcript position, independent of retention."""
 
@@ -2788,7 +2997,12 @@ class _PostgresStoreBase:
                         if self._min_required_revision >= 41:
                             await self._validate_knowledge_publication_access_snapshot_column(cur)
                         if self._min_required_revision >= 42:
-                            await self._validate_knowledge_revision_schema(cur)
+                            await self._validate_knowledge_revision_schema(
+                                cur,
+                                allow_revision_43=current_state.revision >= 43,
+                            )
+                        if self._min_required_revision >= 43:
+                            await self._validate_knowledge_change_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -2799,6 +3013,8 @@ class _PostgresStoreBase:
                         recorded_indexes = _required_concurrent_indexes(current_state.revision)
                     else:
                         revision = pending[0]
+                        if revision.revision == 43:
+                            await _reject_revision_43_knowledge_identity_overflow(cur)
                         concurrent_indexes = _CONCURRENT_INDEX_MIGRATIONS.get(
                             revision.revision,
                             (),
@@ -2936,7 +3152,12 @@ class _PostgresStoreBase:
         if self._min_required_revision >= 41:
             await self._validate_knowledge_publication_access_snapshot_column(cur)
         if self._min_required_revision >= 42:
-            await self._validate_knowledge_revision_schema(cur)
+            await self._validate_knowledge_revision_schema(
+                cur,
+                allow_revision_43=state.revision >= 43,
+            )
+        if self._min_required_revision >= 43:
+            await self._validate_knowledge_change_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3009,6 +3230,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_publication_access_snapshot_column(cur)
         if revision.revision == 42:
             await self._validate_knowledge_revision_schema(cur)
+        if revision.revision == 43:
+            await self._validate_knowledge_change_schema(cur)
 
     async def _validate_knowledge_publication_access_snapshot_column(
         self,
@@ -3031,7 +3254,12 @@ class _PostgresStoreBase:
                 "database from a known-good revision-41 schema."
             )
 
-    async def _validate_knowledge_revision_schema(self, cur: Any) -> None:
+    async def _validate_knowledge_revision_schema(
+        self,
+        cur: Any,
+        *,
+        allow_revision_43: bool = False,
+    ) -> None:
         expected_columns = {
             "cayu_knowledge_entries": (
                 ("id", "text", "NO"),
@@ -3301,6 +3529,18 @@ class _PostgresStoreBase:
                 if match is None:
                     self._raise_knowledge_revision_schema_error(table)
                 remaining.remove(match)
+            if allow_revision_43 and table == "cayu_knowledge_chunks":
+                revision_43_constraint = next(
+                    (
+                        candidate
+                        for candidate in remaining
+                        if candidate[0] == "u"
+                        and "unique (id, entry_id, entry_revision)" in candidate[1]
+                    ),
+                    None,
+                )
+                if revision_43_constraint is not None:
+                    remaining.remove(revision_43_constraint)
             if remaining:
                 self._raise_knowledge_revision_schema_error(table)
 
@@ -3406,6 +3646,328 @@ class _PostgresStoreBase:
                 or any(fragment not in actual[3] for fragment in fragments[1:])
             ):
                 self._raise_knowledge_revision_schema_error(index)
+
+    async def _validate_knowledge_change_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_knowledge_evidence": (
+                ("id", "text", "NO", "NO"),
+                ("entry_id", "text", "NO", "NO"),
+                ("entry_revision", "integer", "NO", "NO"),
+                ("chunk_id", "text", "YES", "NO"),
+                ("role", "text", "NO", "NO"),
+                ("source_type", "text", "NO", "NO"),
+                ("source_id", "text", "YES", "NO"),
+                ("source_uri", "text", "YES", "NO"),
+                ("source_revision", "text", "YES", "NO"),
+                ("source_hash", "text", "YES", "NO"),
+                ("locator", "jsonb", "NO", "NO"),
+                ("disposition", "text", "NO", "NO"),
+                ("created_at", "timestamp with time zone", "NO", "NO"),
+                ("metadata", "jsonb", "NO", "NO"),
+            ),
+            "cayu_knowledge_changes": (
+                ("sequence", "bigint", "NO", "YES"),
+                ("id", "text", "NO", "NO"),
+                ("kind", "text", "NO", "NO"),
+                ("entry_id", "text", "NO", "NO"),
+                ("entry_revision", "integer", "NO", "NO"),
+                ("committed_at", "timestamp with time zone", "NO", "NO"),
+                ("operation_id", "text", "YES", "NO"),
+            ),
+            "cayu_knowledge_change_audiences": (
+                ("change_sequence", "bigint", "NO", "NO"),
+                ("audience_kind", "text", "NO", "NO"),
+                ("namespace", "text", "NO", "NO"),
+                ("visibility", "text", "NO", "NO"),
+                ("source_type", "text", "YES", "NO"),
+                ("source_id", "text", "YES", "NO"),
+                ("status", "text", "NO", "NO"),
+                ("requires_include_expired", "boolean", "NO", "NO"),
+            ),
+            "cayu_knowledge_change_consumers": (
+                ("consumer_id", "text", "NO", "NO"),
+                ("access_scope_sha256", "text", "NO", "NO"),
+                ("cursor_sequence", "bigint", "NO", "NO"),
+                ("pending_change_sequence", "bigint", "YES", "NO"),
+                ("pending_claim_id", "text", "YES", "NO"),
+                ("pending_worker_id", "text", "YES", "NO"),
+                ("pending_attempt", "integer", "NO", "NO"),
+                ("claimed_at", "timestamp with time zone", "YES", "NO"),
+                ("lease_expires_at", "timestamp with time zone", "YES", "NO"),
+                ("last_acknowledged_claim_id", "text", "YES", "NO"),
+                ("updated_at", "timestamp with time zone", "NO", "NO"),
+            ),
+            "cayu_knowledge_change_acknowledgements": (
+                ("consumer_id", "text", "NO", "NO"),
+                ("claim_id", "text", "NO", "NO"),
+                ("claim_sha256", "text", "NO", "NO"),
+                ("change_sequence", "bigint", "NO", "NO"),
+                ("acknowledged_at", "timestamp with time zone", "NO", "NO"),
+            ),
+            "cayu_knowledge_change_labels": (
+                ("change_sequence", "bigint", "NO", "NO"),
+                ("audience_kind", "text", "NO", "NO"),
+                ("key", "text", "NO", "NO"),
+                ("value", "text", "NO", "NO"),
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_name, column_name, data_type, is_nullable, is_identity
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = ANY(%s)
+            ORDER BY table_name, ordinal_position
+            """,
+            (list(expected_columns),),
+        )
+        actual: dict[str, list[tuple[str, str, str, str]]] = {}
+        for table, column, data_type, nullable, identity in await cur.fetchall():
+            actual.setdefault(str(table), []).append(
+                (str(column), str(data_type), str(nullable), str(identity))
+            )
+        for table, columns in expected_columns.items():
+            if tuple(actual.get(table, ())) != columns:
+                self._raise_knowledge_change_schema_error(table)
+
+        await cur.execute(
+            """
+            SELECT table_record.relname, constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = ANY(%s)
+            """,
+            (
+                [
+                    "cayu_knowledge_chunks",
+                    "cayu_knowledge_evidence",
+                    "cayu_knowledge_changes",
+                    "cayu_knowledge_change_audiences",
+                    "cayu_knowledge_change_consumers",
+                    "cayu_knowledge_change_acknowledgements",
+                    "cayu_knowledge_change_labels",
+                ],
+            ),
+        )
+        constraints: dict[str, list[tuple[str, str]]] = {}
+        for table, kind, definition in await cur.fetchall():
+            constraints.setdefault(str(table), []).append(
+                (str(kind), " ".join(str(definition).lower().split()))
+            )
+        required_constraints = {
+            "cayu_knowledge_chunks": (("u", ("unique (id, entry_id, entry_revision)",)),),
+            "cayu_knowledge_evidence": (
+                ("p", ("primary key (id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (entry_id, entry_revision)",
+                        "references cayu_knowledge_revisions(entry_id, revision)",
+                        "on delete cascade",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (chunk_id, entry_id, entry_revision)",
+                        "references cayu_knowledge_chunks(id, entry_id, entry_revision)",
+                        "on delete cascade",
+                    ),
+                ),
+                ("c", ("entry_revision > 0", "2147483647")),
+                ("c", ("source_id is not null", "source_uri is not null")),
+                ("c", ("source_revision is not null", "source_hash is not null")),
+                ("c", ("role", "origin", "supporting")),
+                ("c", ("disposition", "live", "detached", "retained")),
+            ),
+            "cayu_knowledge_changes": (
+                ("p", ("primary key (sequence)",)),
+                ("u", ("unique (id)",)),
+                ("c", ("sequence > 0",)),
+                ("c", ("entry_revision > 0", "2147483647")),
+                (
+                    "c",
+                    (
+                        "kind",
+                        "created",
+                        "revision_appended",
+                        "status_transitioned",
+                        "tombstoned",
+                        "hard_deleted",
+                        "expired",
+                    ),
+                ),
+            ),
+            "cayu_knowledge_change_audiences": (
+                ("p", ("primary key (change_sequence, audience_kind)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (change_sequence)",
+                        "references cayu_knowledge_changes(sequence)",
+                        "on delete cascade",
+                    ),
+                ),
+                ("c", ("audience_kind", "before", "after")),
+            ),
+            "cayu_knowledge_change_consumers": (
+                ("p", ("primary key (consumer_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (pending_change_sequence)",
+                        "references cayu_knowledge_changes(sequence)",
+                    ),
+                ),
+                ("c", ("cursor_sequence >= 0",)),
+                ("c", ("pending_attempt >= 0",)),
+                (
+                    "c",
+                    (
+                        "pending_change_sequence > cursor_sequence",
+                        "lease_expires_at > claimed_at",
+                    ),
+                ),
+            ),
+            "cayu_knowledge_change_acknowledgements": (
+                ("p", ("primary key (consumer_id, claim_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (consumer_id)",
+                        "references cayu_knowledge_change_consumers(consumer_id)",
+                        "on delete cascade",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (change_sequence)",
+                        "references cayu_knowledge_changes(sequence)",
+                    ),
+                ),
+                ("c", ("claim_sha256", "[0-9a-f]{64}")),
+            ),
+            "cayu_knowledge_change_labels": (
+                ("p", ("primary key (change_sequence, audience_kind, key)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (change_sequence, audience_kind)",
+                        "references cayu_knowledge_change_audiences(change_sequence, "
+                        "audience_kind)",
+                        "on delete cascade",
+                    ),
+                ),
+            ),
+        }
+        for table, required in required_constraints.items():
+            candidates = list(constraints.get(table, []))
+            for kind, fragments in required:
+                match = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate[0] == kind
+                        and all(fragment in candidate[1] for fragment in fragments)
+                    ),
+                    None,
+                )
+                if match is None:
+                    self._raise_knowledge_change_schema_error(table)
+                candidates.remove(match)
+            if table != "cayu_knowledge_chunks" and candidates:
+                self._raise_knowledge_change_schema_error(table)
+
+        expected_indexes = {
+            "idx_cayu_knowledge_evidence_entry_revision": (
+                "cayu_knowledge_evidence",
+                'using btree (entry_id, entry_revision, id collate "c")',
+            ),
+            "idx_cayu_knowledge_evidence_source": (
+                "cayu_knowledge_evidence",
+                "using btree (source_type, source_id, entry_id, entry_revision)",
+            ),
+            "idx_cayu_knowledge_changes_entry_revision": (
+                "cayu_knowledge_changes",
+                "using btree (entry_id, entry_revision, sequence)",
+            ),
+            "idx_cayu_knowledge_change_audiences_namespace": (
+                "cayu_knowledge_change_audiences",
+                "using btree (namespace, change_sequence, audience_kind)",
+            ),
+            "idx_cayu_knowledge_change_audiences_status": (
+                "cayu_knowledge_change_audiences",
+                "using btree (status, change_sequence, audience_kind)",
+            ),
+            "idx_cayu_knowledge_change_audiences_source": (
+                "cayu_knowledge_change_audiences",
+                "using btree (source_type, source_id, change_sequence, audience_kind)",
+            ),
+            "idx_cayu_knowledge_changes_operation": (
+                "cayu_knowledge_changes",
+                "using btree (operation_id)",
+                "where (operation_id is not null)",
+            ),
+            "idx_cayu_knowledge_change_consumers_lease": (
+                "cayu_knowledge_change_consumers",
+                "using btree (lease_expires_at)",
+                "where (pending_change_sequence is not null)",
+            ),
+            "idx_cayu_knowledge_change_labels_lookup": (
+                "cayu_knowledge_change_labels",
+                "using btree (key, value, change_sequence, audience_kind)",
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_record.relname, index_record.relname,
+                   index_state.indisvalid, index_state.indisready,
+                   pg_get_indexdef(index_record.oid)
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND index_record.relname = ANY(%s)
+            """,
+            (list(expected_indexes),),
+        )
+        indexes = {
+            str(index): (
+                str(table),
+                bool(valid),
+                bool(ready),
+                " ".join(str(definition).lower().split()),
+            )
+            for table, index, valid, ready, definition in await cur.fetchall()
+        }
+        for name, fragments in expected_indexes.items():
+            value = indexes.get(name)
+            if (
+                value is None
+                or value[0] != fragments[0]
+                or not value[1]
+                or not value[2]
+                or any(fragment not in value[3] for fragment in fragments[1:])
+            ):
+                self._raise_knowledge_change_schema_error(name)
+
+    @staticmethod
+    def _raise_knowledge_change_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            f"Postgres schema object {name!r} conflicts with Cayu's knowledge "
+            "evidence and atomic change contract. Recreate or migrate the Cayu "
+            "database from a known-good revision-43 schema."
+        )
 
     @staticmethod
     def _raise_knowledge_revision_schema_error(name: str) -> NoReturn:
@@ -3705,6 +4267,8 @@ class _PostgresStoreBase:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
         for rev in schema.pending(current):
+            if rev.revision == 43:
+                await _reject_revision_43_knowledge_identity_overflow(cur)
             for statement in _MIGRATION_STEPS.get(rev.revision, ()):
                 await cur.execute(statement)
             # Fresh CREATE owns empty tables under the schema lock, so hot-table
@@ -5230,6 +5794,7 @@ async def _lock_knowledge_write_identities(
     *,
     entry_ids: tuple[str, ...] = (),
     chunk_ids: tuple[str, ...] = (),
+    evidence_ids: tuple[str, ...] = (),
     operation_ids: tuple[str, ...] = (),
 ) -> None:
     """Serialize overlapping knowledge writes in one global lock order."""
@@ -5237,6 +5802,7 @@ async def _lock_knowledge_write_identities(
     identities = {
         *(f"knowledge-entry:{entry_id}" for entry_id in entry_ids),
         *(f"knowledge-chunk:{chunk_id}" for chunk_id in chunk_ids),
+        *(f"knowledge-evidence:{evidence_id}" for evidence_id in evidence_ids),
         *(f"knowledge-operation:{operation_id}" for operation_id in operation_ids),
     }
     if not identities:
@@ -5261,10 +5827,18 @@ async def _begin_knowledge_read_snapshot(cur: Any) -> None:
     await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
 
 
+async def _lock_knowledge_change_sequence(cur: Any) -> None:
+    """Serialize sequence allocation so visible changes cannot later develop gaps."""
+
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('cayu-knowledge-change-sequence', 0))"
+    )
+
+
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
-    _min_required_revision = 42
+    _min_required_revision = 43
 
     def __init__(
         self,
@@ -5276,10 +5850,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
         read_only: bool = False,
         access_scope: KnowledgeAccessScope | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._default_access_scope = (
             None if access_scope is None else copy_knowledge_access_scope(access_scope)
         )
+        self._clock = utc_clock(clock)
+        self._clock_is_injected = clock is not None
         super().__init__(
             conninfo,
             pool=pool,
@@ -5297,10 +5874,6 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        if evidence:
-            raise NotImplementedError(
-                "PostgresKnowledgeStore does not support knowledge evidence yet."
-            )
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=None)
@@ -5310,18 +5883,28 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             if chunks is None
             else _copy_knowledge_entry_chunks(entry.id, entry.revision, chunks)
         )
+        copied_evidence = _copy_entry_evidence(
+            entry.id,
+            entry.revision,
+            evidence or [],
+            chunks=copied_chunks,
+        )
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     # Every mutation acquires identity categories in the same
-                    # order: operation (when present), entry, then chunks.
+                    # order: operation (when present), entry, chunks, evidence, then change.
                     # Appends sometimes discover inherited chunk ids only after
                     # locking/loading the current entry, so combining categories
                     # here would permit an entry/chunk advisory-lock deadlock.
                     await _lock_knowledge_entry(cur, entry.id)
                     await _lock_knowledge_write_identities(
                         cur, chunk_ids=tuple(chunk.id for chunk in copied_chunks)
+                    )
+                    await _lock_knowledge_write_identities(
+                        cur,
+                        evidence_ids=tuple(item.id for item in copied_evidence),
                     )
                     existing_entry = await self._load_entry(cur, entry.id)
                     if existing_entry is not None:
@@ -5341,8 +5924,21 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         access_scope=scope,
                         operation="create_entry",
                     )
+                    await self._require_evidence_ids_available(
+                        cur,
+                        copied_evidence,
+                        access_scope=scope,
+                        operation="create_entry",
+                    )
                     await self._insert_entry(cur, entry)
                     await self._insert_chunks(cur, entry, copied_chunks)
+                    await self._insert_evidence(cur, copied_evidence)
+                    await self._insert_change(
+                        cur,
+                        before_entry=None,
+                        after_entry=entry,
+                        kind=KnowledgeChangeKind.CREATED,
+                    )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -5358,10 +5954,6 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        if evidence:
-            raise NotImplementedError(
-                "PostgresKnowledgeStore does not support knowledge evidence yet."
-            )
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=expected_revision)
@@ -5375,8 +5967,11 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         entry,
                         expected_revision=expected_revision,
                         chunks=chunks,
+                        evidence=evidence,
                         access_scope=scope,
                         operation="append_entry_revision",
+                        change_kind=KnowledgeChangeKind.REVISION_APPENDED,
+                        inherit_evidence=False,
                     )
                 await conn.commit()
             except Exception:
@@ -5392,7 +5987,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
-        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        entry_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
         await self._ensure_ready()
@@ -5417,7 +6012,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
-        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        entry_id = _knowledge_entry_id(entry_id)
         _validate_knowledge_revision(expected_revision, "expected_revision")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
@@ -5478,8 +6073,15 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         loaded,
                         expected_revision=expected_revision,
                         chunks=None,
+                        evidence=None,
                         access_scope=scope,
                         operation="transition_entry_status",
+                        change_kind=(
+                            KnowledgeChangeKind.TOMBSTONED
+                            if to_status is KnowledgeStatus.DELETED
+                            else KnowledgeChangeKind.STATUS_TRANSITIONED
+                        ),
+                        inherit_evidence=True,
                     )
                 await conn.commit()
             except Exception:
@@ -5498,7 +6100,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         hard: bool = False,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
-        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        entry_id = _knowledge_entry_id(entry_id)
         _validate_knowledge_revision(expected_revision, "expected_revision")
         if type(hard) is not bool:
             raise ValueError("`hard` must be a boolean.")
@@ -5519,6 +6121,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             actual_revision=entry.revision,
                         )
                     if hard:
+                        await self._insert_change(
+                            cur,
+                            before_entry=entry,
+                            after_entry=None,
+                            kind=KnowledgeChangeKind.HARD_DELETED,
+                        )
                         await cur.execute(
                             "DELETE FROM cayu_knowledge_entries WHERE id = %s",
                             (entry_id,),
@@ -5541,8 +6149,11 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         loaded,
                         expected_revision=expected_revision,
                         chunks=None,
+                        evidence=None,
                         access_scope=scope,
                         operation="delete_entry",
+                        change_kind=KnowledgeChangeKind.TOMBSTONED,
+                        inherit_evidence=True,
                     )
                 await conn.commit()
             except Exception:
@@ -5559,7 +6170,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         now: datetime | None = None,
     ) -> int:
         scope = self._operation_access_scope(access_scope)
-        cutoff = datetime.now(UTC) if now is None else now
+        cutoff = _knowledge_change_now(now)
         access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(
             scope,
             now=cutoff,
@@ -5568,20 +6179,47 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    # The entries DELETE cascades (ON DELETE CASCADE) to chunks, labels, aspects, and
-                    # — for the embedding subclass — cayu_knowledge_embeddings, so no override is needed.
                     await cur.execute(
                         cast(
                             "LiteralString",
-                            "DELETE FROM cayu_knowledge_entries AS logical "
-                            "USING cayu_knowledge_current_entries AS e "
-                            "WHERE logical.id = e.id "
+                            "SELECT e.id FROM cayu_knowledge_current_entries AS e "
+                            "WHERE TRUE "
                             "AND e.expires_at IS NOT NULL AND e.expires_at <= %s "
                             f"{access_sql}",
                         ),
                         (cutoff, *access_params),
                     )
-                    pruned = cur.rowcount
+                    candidate_ids = sorted(str(row[0]) for row in await cur.fetchall())
+                    await _lock_knowledge_write_identities(
+                        cur,
+                        entry_ids=tuple(candidate_ids),
+                    )
+                    entries = await self._load_entries(cur, candidate_ids)
+                    eligible = [
+                        entry
+                        for entry_id in candidate_ids
+                        if (entry := entries.get(entry_id)) is not None
+                        and entry.expires_at is not None
+                        and entry.expires_at <= cutoff
+                        and _knowledge_scope_allows_snapshot(
+                            scope,
+                            _knowledge_access_snapshot(entry),
+                            now=cutoff,
+                        )
+                    ]
+                    for entry in eligible:
+                        await self._insert_change(
+                            cur,
+                            before_entry=entry,
+                            after_entry=None,
+                            kind=KnowledgeChangeKind.EXPIRED,
+                        )
+                    if eligible:
+                        await cur.execute(
+                            "DELETE FROM cayu_knowledge_entries WHERE id = ANY(%s)",
+                            ([entry.id for entry in eligible],),
+                        )
+                    pruned = len(eligible)
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -5612,10 +6250,6 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             operation_id=operation_id,
             expected_revision=expected_revision,
         )
-        if copied_evidence:
-            raise NotImplementedError(
-                "PostgresKnowledgeStore does not support knowledge evidence yet."
-            )
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
         await self._ensure_ready()
         async with self._pool.connection() as conn:
@@ -5625,6 +6259,10 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     await _lock_knowledge_entry(cur, copied_entry.id)
                     await _lock_knowledge_write_identities(
                         cur, chunk_ids=tuple(chunk.id for chunk in copied_chunks)
+                    )
+                    await _lock_knowledge_write_identities(
+                        cur,
+                        evidence_ids=tuple(item.id for item in copied_evidence),
                     )
                     existing_receipt = await self._load_publication_receipt(
                         cur,
@@ -5667,6 +6305,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         access_scope=scope,
                         operation="publish_entry_revision",
                     )
+                    await self._require_evidence_ids_available(
+                        cur,
+                        copied_evidence,
+                        access_scope=scope,
+                        operation="publish_entry_revision",
+                    )
+                    await _lock_knowledge_change_sequence(cur)
                     receipt = KnowledgePublicationReceipt(
                         operation_id=operation_id,
                         entry_id=copied_entry.id,
@@ -5688,6 +6333,19 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             expected_revision=expected_revision,
                         )
                     await self._insert_chunks(cur, copied_entry, copied_chunks)
+                    await self._insert_evidence(cur, copied_evidence)
+                    await self._insert_change(
+                        cur,
+                        before_entry=existing_entry,
+                        after_entry=copied_entry,
+                        kind=(
+                            KnowledgeChangeKind.CREATED
+                            if existing_entry is None
+                            else KnowledgeChangeKind.REVISION_APPENDED
+                        ),
+                        operation_id=operation_id,
+                        committed_at=receipt.committed_at,
+                    )
                     await self._insert_publication_receipt(cur, receipt, copied_entry)
                 await conn.commit()
                 return copy_knowledge_publication_receipt(receipt)
@@ -5711,6 +6369,449 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
+    async def read_evidence(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+        max_records: int = DEFAULT_KNOWLEDGE_LIMIT,
+        max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
+    ) -> KnowledgeEvidenceResult | None:
+        scope = self._operation_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry_id)
+        if revision is not None:
+            _validate_knowledge_revision(revision, "revision")
+        _validate_positive_int(max_records, "max_records")
+        _validate_positive_int(max_bytes, "max_bytes")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            entry = await self._load_entry_in_scope(
+                cur,
+                entry_id,
+                scope,
+                revision=revision,
+            )
+            if entry is None:
+                return None
+            await cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM cayu_knowledge_evidence
+                WHERE entry_id = %s AND entry_revision = %s
+                """,
+                (entry.id, entry.revision),
+            )
+            total_row = await cur.fetchone()
+            total_evidence_known = 0 if total_row is None else int(total_row[0])
+            stored = await self._load_evidence(
+                cur,
+                entry.id,
+                revision=entry.revision,
+                limit=max_records,
+            )
+        selected = _bounded_knowledge_evidence(
+            stored,
+            max_records=max_records,
+            max_bytes=max_bytes,
+        )
+        return KnowledgeEvidenceResult(
+            entry_id=entry.id,
+            entry_revision=entry.revision,
+            evidence=selected,
+            truncated=len(selected) < total_evidence_known,
+            limit=max_records,
+            max_bytes=max_bytes,
+            total_evidence_known=total_evidence_known,
+        )
+
+    async def read_changes(
+        self,
+        *,
+        after_sequence: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeBatch:
+        scope = self._operation_access_scope(access_scope)
+        _validate_knowledge_change_sequence(after_sequence, "after_sequence")
+        _validate_knowledge_change_limit(limit)
+        access_sql, access_params = _postgres_knowledge_change_access_scope_filter_sql(
+            scope,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    "SELECT COALESCE(MAX(change_record.sequence), 0) "
+                    "FROM cayu_knowledge_changes AS change_record "
+                    f"WHERE TRUE {access_sql}",
+                ),
+                access_params,
+            )
+            high_water_row = await cur.fetchone()
+            high_water = 0 if high_water_row is None else int(high_water_row[0])
+            if after_sequence > high_water:
+                await cur.execute("SELECT COALESCE(MAX(sequence), 0) FROM cayu_knowledge_changes")
+                current_sequence_row = await cur.fetchone()
+                current_sequence = (
+                    0 if current_sequence_row is None else int(current_sequence_row[0])
+                )
+                if after_sequence > current_sequence:
+                    raise ValueError(
+                        "`after_sequence` cannot exceed the current knowledge change sequence."
+                    )
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    """
+                    SELECT
+                        change_record.id,
+                        change_record.sequence,
+                        change_record.kind,
+                        change_record.entry_id,
+                        change_record.entry_revision,
+                        change_record.committed_at,
+                        change_record.operation_id
+                    FROM cayu_knowledge_changes AS change_record
+                    WHERE change_record.sequence > %s
+                      AND change_record.sequence <= %s
+                    """
+                    + access_sql
+                    + " ORDER BY change_record.sequence LIMIT %s",
+                ),
+                (after_sequence, high_water, *access_params, limit + 1),
+            )
+            rows = await cur.fetchall()
+        changes = [_knowledge_change_from_row(row) for row in rows[:limit]]
+        truncated = len(rows) > limit
+        next_after = changes[-1].sequence if truncated else max(after_sequence, high_water)
+        return KnowledgeChangeBatch(
+            changes=changes,
+            after_sequence=after_sequence,
+            next_after_sequence=next_after,
+            high_water_sequence=high_water,
+            truncated=truncated,
+            limit=limit,
+        )
+
+    async def claim_change(
+        self,
+        consumer_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 300.0,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeClaim | None:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        worker_id = _knowledge_change_identity(worker_id, "worker_id")
+        lease_seconds = _knowledge_change_lease_seconds(lease_seconds)
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        access_sql, access_params = _postgres_knowledge_change_access_scope_filter_sql(
+            scope,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    state = await self._lock_or_create_change_consumer(
+                        cur,
+                        consumer_id,
+                        access_scope_sha256=scope_sha256,
+                    )
+                    current_time = await self._change_consumer_now(cur)
+                    if state.access_scope_sha256 != scope_sha256:
+                        raise KnowledgeChangeConsumerConflict("access_scope_mismatch")
+                    if state.pending_change_sequence is not None:
+                        await cur.execute(
+                            cast(
+                                "LiteralString",
+                                """
+                                SELECT
+                                    change_record.id,
+                                    change_record.sequence,
+                                    change_record.kind,
+                                    change_record.entry_id,
+                                    change_record.entry_revision,
+                                    change_record.committed_at,
+                                    change_record.operation_id
+                                FROM cayu_knowledge_changes AS change_record
+                                WHERE change_record.sequence = %s
+                                """
+                                + access_sql,
+                            ),
+                            (state.pending_change_sequence, *access_params),
+                        )
+                        row = await cur.fetchone()
+                        stored_change = None if row is None else _knowledge_change_from_row(row)
+                        assert state.lease_expires_at is not None
+                        if stored_change is not None and state.lease_expires_at > current_time:
+                            if state.pending_worker_id != worker_id:
+                                await conn.commit()
+                                return None
+                            assert state.pending_claim_id is not None
+                            assert state.claimed_at is not None
+                            claim = KnowledgeChangeClaim(
+                                consumer_id=consumer_id,
+                                worker_id=worker_id,
+                                claim_id=state.pending_claim_id,
+                                change=stored_change,
+                                attempt=state.pending_attempt,
+                                claimed_at=state.claimed_at,
+                                lease_expires_at=state.lease_expires_at,
+                            )
+                            await conn.commit()
+                            return claim
+                        state = state.model_copy(
+                            update={
+                                "pending_change_sequence": None,
+                                "pending_claim_id": None,
+                                "pending_worker_id": None,
+                                "claimed_at": None,
+                                "lease_expires_at": None,
+                                "pending_attempt": (
+                                    state.pending_attempt if stored_change is not None else 0
+                                ),
+                                "updated_at": current_time,
+                            }
+                        )
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            """
+                            SELECT
+                                change_record.id,
+                                change_record.sequence,
+                                change_record.kind,
+                                change_record.entry_id,
+                                change_record.entry_revision,
+                                change_record.committed_at,
+                                change_record.operation_id
+                            FROM cayu_knowledge_changes AS change_record
+                            WHERE change_record.sequence > %s
+                            """
+                            + access_sql
+                            + " ORDER BY change_record.sequence LIMIT 1",
+                        ),
+                        (state.cursor_sequence, *access_params),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        await self._save_change_consumer(cur, state)
+                        await conn.commit()
+                        return None
+                    change = _knowledge_change_from_row(row)
+                    claim_id = f"kclaim_{uuid4().hex}"
+                    claimed_at = current_time
+                    lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
+                    attempt = state.pending_attempt + 1
+                    state = state.model_copy(
+                        update={
+                            "pending_change_sequence": change.sequence,
+                            "pending_claim_id": claim_id,
+                            "pending_worker_id": worker_id,
+                            "pending_attempt": attempt,
+                            "claimed_at": claimed_at,
+                            "lease_expires_at": lease_expires_at,
+                            "updated_at": current_time,
+                        }
+                    )
+                    await self._save_change_consumer(cur, state)
+                    claim = KnowledgeChangeClaim(
+                        consumer_id=consumer_id,
+                        worker_id=worker_id,
+                        claim_id=claim_id,
+                        change=change,
+                        attempt=attempt,
+                        claimed_at=claimed_at,
+                        lease_expires_at=lease_expires_at,
+                    )
+                await conn.commit()
+                return claim
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def initialize_change_consumer(
+        self,
+        consumer_id: str,
+        *,
+        baseline_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        _validate_knowledge_change_sequence(baseline_sequence, "baseline_sequence")
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM cayu_knowledge_changes"
+                    )
+                    row = await cur.fetchone()
+                    current_sequence = 0 if row is None else int(row[0])
+                    if baseline_sequence > current_sequence:
+                        raise ValueError(
+                            "`baseline_sequence` cannot exceed the current knowledge "
+                            "change sequence."
+                        )
+                    state = await self._lock_or_create_change_consumer(
+                        cur,
+                        consumer_id,
+                        access_scope_sha256=scope_sha256,
+                    )
+                    current_time = await self._change_consumer_now(cur)
+                    state = _initialize_knowledge_change_consumer_state(
+                        state,
+                        consumer_id=consumer_id,
+                        access_scope_sha256=scope_sha256,
+                        baseline_sequence=baseline_sequence,
+                        now=current_time,
+                    )
+                    await self._save_change_consumer(cur, state)
+                await conn.commit()
+                return copy_knowledge_change_consumer_state(state)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def acknowledge_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        claim = copy_knowledge_change_claim(claim)
+        claim_sha256 = _knowledge_change_claim_sha256(claim)
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    state = await self._load_change_consumer(
+                        cur,
+                        claim.consumer_id,
+                        for_update=True,
+                    )
+                    if state is None or state.access_scope_sha256 != scope_sha256:
+                        raise KnowledgeChangeConsumerConflict("unknown_consumer")
+                    acknowledged = await self._load_change_acknowledgement(
+                        cur,
+                        claim.consumer_id,
+                        claim.claim_id,
+                    )
+                    if acknowledged is not None:
+                        if acknowledged != (claim_sha256, claim.change.sequence):
+                            raise KnowledgeChangeConsumerConflict("stale_claim")
+                        if state.cursor_sequence < claim.change.sequence:
+                            raise RuntimeError(
+                                "Knowledge change acknowledgement is ahead of its consumer."
+                            )
+                        await conn.commit()
+                        return copy_knowledge_change_consumer_state(state)
+                    current_time = await self._change_consumer_now(cur)
+                    await self._require_live_change_claim(
+                        cur,
+                        state,
+                        claim,
+                        now=current_time,
+                    )
+                    state = state.model_copy(
+                        update={
+                            "cursor_sequence": claim.change.sequence,
+                            "pending_change_sequence": None,
+                            "pending_claim_id": None,
+                            "pending_worker_id": None,
+                            "pending_attempt": 0,
+                            "claimed_at": None,
+                            "lease_expires_at": None,
+                            "last_acknowledged_claim_id": claim.claim_id,
+                            "updated_at": current_time,
+                        }
+                    )
+                    await self._save_change_consumer(cur, state)
+                    await self._insert_change_acknowledgement(
+                        cur,
+                        claim,
+                        claim_sha256=claim_sha256,
+                        acknowledged_at=current_time,
+                    )
+                await conn.commit()
+                return copy_knowledge_change_consumer_state(state)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def release_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        claim = copy_knowledge_change_claim(claim)
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    state = await self._load_change_consumer(
+                        cur,
+                        claim.consumer_id,
+                        for_update=True,
+                    )
+                    if state is None or state.access_scope_sha256 != scope_sha256:
+                        raise KnowledgeChangeConsumerConflict("unknown_consumer")
+                    current_time = await self._change_consumer_now(cur)
+                    await self._require_live_change_claim(
+                        cur,
+                        state,
+                        claim,
+                        now=current_time,
+                    )
+                    state = state.model_copy(
+                        update={
+                            "pending_change_sequence": None,
+                            "pending_claim_id": None,
+                            "pending_worker_id": None,
+                            "claimed_at": None,
+                            "lease_expires_at": None,
+                            "updated_at": current_time,
+                        }
+                    )
+                    await self._save_change_consumer(cur, state)
+                await conn.commit()
+                return copy_knowledge_change_consumer_state(state)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def load_change_consumer_state(
+        self,
+        consumer_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState | None:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            state = await self._load_change_consumer(
+                cur,
+                consumer_id,
+                for_update=False,
+            )
+        if state is None or state.access_scope_sha256 != scope_sha256:
+            return None
+        return copy_knowledge_change_consumer_state(state)
+
     async def read_chunks(
         self,
         entry_id: str,
@@ -5723,7 +6824,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
         scope = self._operation_access_scope(access_scope)
-        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        entry_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
         if chunk_index is not None:
@@ -5988,8 +7089,11 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         *,
         expected_revision: int,
         chunks: list[KnowledgeChunk] | None,
+        evidence: list[KnowledgeEvidence] | None,
         access_scope: KnowledgeAccessScope,
         operation: str,
+        change_kind: KnowledgeChangeKind,
+        inherit_evidence: bool,
     ) -> None:
         _validate_revision_append(entry, expected_revision=expected_revision)
         current = await self._load_entry(cur, entry.id)
@@ -6023,9 +7127,29 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             copied_chunks = [_default_chunk_for_entry(entry)]
         else:
             copied_chunks = _copy_chunks_for_revision(previous_chunks, entry)
+        if inherit_evidence:
+            if evidence is not None:
+                raise ValueError("Lifecycle evidence inheritance cannot accept evidence.")
+            copied_evidence = _copy_evidence_for_revision(
+                await self._load_evidence(cur, entry.id, revision=current.revision),
+                entry=entry,
+                previous_chunks=previous_chunks,
+                chunks=copied_chunks,
+            )
+        else:
+            copied_evidence = _copy_entry_evidence(
+                entry.id,
+                entry.revision,
+                evidence or [],
+                chunks=copied_chunks,
+            )
         await _lock_knowledge_write_identities(
             cur,
             chunk_ids=tuple(chunk.id for chunk in copied_chunks),
+        )
+        await _lock_knowledge_write_identities(
+            cur,
+            evidence_ids=tuple(item.id for item in copied_evidence),
         )
         await self._require_chunk_ids_available(
             cur,
@@ -6033,12 +7157,25 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             access_scope=access_scope,
             operation=operation,
         )
+        await self._require_evidence_ids_available(
+            cur,
+            copied_evidence,
+            access_scope=access_scope,
+            operation=operation,
+        )
         await self._insert_revision(cur, entry)
         await self._insert_chunks(cur, entry, copied_chunks)
+        await self._insert_evidence(cur, copied_evidence)
         await self._advance_current_revision(
             cur,
             entry,
             expected_revision=expected_revision,
+        )
+        await self._insert_change(
+            cur,
+            before_entry=current,
+            after_entry=entry,
+            kind=change_kind,
         )
 
     async def _load_publication_receipt(
@@ -6185,6 +7322,473 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             """,
             [_knowledge_chunk_row_values(chunk) for chunk in chunks],
         )
+
+    async def _insert_evidence(
+        self,
+        cur: Any,
+        evidence: list[KnowledgeEvidence],
+    ) -> None:
+        if not evidence:
+            return
+        await cur.executemany(
+            """
+            INSERT INTO cayu_knowledge_evidence (
+                id,
+                entry_id,
+                entry_revision,
+                chunk_id,
+                role,
+                source_type,
+                source_id,
+                source_uri,
+                source_revision,
+                source_hash,
+                locator,
+                disposition,
+                created_at,
+                metadata
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s::jsonb, %s, %s, %s::jsonb
+            )
+            """,
+            [_knowledge_evidence_row_values(item) for item in evidence],
+        )
+
+    async def _load_evidence(
+        self,
+        cur: Any,
+        entry_id: str,
+        *,
+        revision: int,
+        limit: int | None = None,
+    ) -> list[KnowledgeEvidence]:
+        limit_sql = "" if limit is None else " LIMIT %s"
+        params: tuple[object, ...] = (
+            (entry_id, revision) if limit is None else (entry_id, revision, limit)
+        )
+        await cur.execute(
+            cast(
+                "LiteralString",
+                """
+            SELECT
+                id,
+                entry_id,
+                entry_revision,
+                chunk_id,
+                role,
+                source_type,
+                source_id,
+                source_uri,
+                source_revision,
+                source_hash,
+                locator,
+                disposition,
+                created_at,
+                metadata
+            FROM cayu_knowledge_evidence
+            WHERE entry_id = %s AND entry_revision = %s
+            ORDER BY id COLLATE "C"
+            """
+                + limit_sql,
+            ),
+            params,
+        )
+        return [_knowledge_evidence_from_row(row) for row in await cur.fetchall()]
+
+    async def _require_evidence_ids_available(
+        self,
+        cur: Any,
+        evidence: list[KnowledgeEvidence],
+        *,
+        access_scope: KnowledgeAccessScope,
+        operation: str,
+    ) -> None:
+        proposed_ids = sorted({item.id for item in evidence})
+        if not proposed_ids:
+            return
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(access_scope)
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                WITH occupied AS (
+                    SELECT DISTINCT entry_id
+                    FROM cayu_knowledge_evidence
+                    WHERE id = ANY(%s)
+                )
+                SELECT
+                    occupied.entry_id,
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_current_entries AS e
+                        WHERE e.id = occupied.entry_id
+                        {access_sql}
+                    ) AS authorized
+                FROM occupied
+                ORDER BY occupied.entry_id
+                """,
+            ),
+            (proposed_ids, *access_params),
+        )
+        occupied = [(str(row[0]), bool(row[1])) for row in await cur.fetchall()]
+        if any(not authorized for _, authorized in occupied):
+            raise KnowledgeAccessDenied(operation)
+        if occupied:
+            raise KnowledgeEvidenceConflict(operation)
+
+    async def _insert_change(
+        self,
+        cur: Any,
+        *,
+        before_entry: KnowledgeEntry | None,
+        after_entry: KnowledgeEntry | None,
+        kind: KnowledgeChangeKind,
+        operation_id: str | None = None,
+        committed_at: datetime | None = None,
+    ) -> KnowledgeChange:
+        entry = after_entry if after_entry is not None else before_entry
+        if entry is None:
+            raise ValueError("A knowledge change requires a before or after entry.")
+        await _lock_knowledge_change_sequence(cur)
+        change_id = f"kchg_{uuid4().hex}"
+        committed_at = datetime.now(UTC) if committed_at is None else committed_at
+        before_requires_include_expired: bool | None = None
+        if (
+            before_entry is not None
+            and before_entry.expires_at is not None
+            and before_entry.expires_at <= committed_at
+        ):
+            await cur.execute(
+                """
+                SELECT audience.requires_include_expired
+                FROM cayu_knowledge_changes AS change_record
+                JOIN cayu_knowledge_change_audiences AS audience
+                  ON audience.change_sequence = change_record.sequence
+                 AND audience.audience_kind = 'after'
+                WHERE change_record.entry_id = %s
+                  AND change_record.entry_revision = %s
+                ORDER BY change_record.sequence DESC
+                LIMIT 1
+                """,
+                (before_entry.id, before_entry.revision),
+            )
+            audience_row = await cur.fetchone()
+            if audience_row is not None:
+                before_requires_include_expired = bool(audience_row[0])
+            else:
+                await cur.execute(
+                    "SELECT applied_at FROM cayu_schema_migrations WHERE revision = 43"
+                )
+                baseline_row = await cur.fetchone()
+                if baseline_row is None:
+                    raise RuntimeError("Postgres knowledge outbox baseline is missing.")
+                before_requires_include_expired = before_entry.expires_at <= baseline_row[0]
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_changes (
+                id,
+                kind,
+                entry_id,
+                entry_revision,
+                committed_at,
+                operation_id
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING sequence
+            """,
+            (
+                change_id,
+                kind.value,
+                entry.id,
+                entry.revision,
+                pg_support.to_utc(committed_at),
+                operation_id,
+            ),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("Postgres did not return a knowledge change sequence.")
+        sequence = int(row[0])
+        change = KnowledgeChange(
+            id=change_id,
+            sequence=sequence,
+            kind=kind,
+            entry_id=entry.id,
+            entry_revision=entry.revision,
+            committed_at=committed_at,
+            operation_id=operation_id,
+        )
+        audiences = _knowledge_change_audiences(
+            change,
+            before_entry=before_entry,
+            after_entry=after_entry,
+            before_requires_include_expired=before_requires_include_expired,
+        )
+        await cur.executemany(
+            """
+            INSERT INTO cayu_knowledge_change_audiences (
+                change_sequence,
+                audience_kind,
+                namespace,
+                visibility,
+                source_type,
+                source_id,
+                status,
+                requires_include_expired
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    sequence,
+                    audience.kind,
+                    audience.snapshot.namespace,
+                    audience.snapshot.visibility.value,
+                    audience.snapshot.source_type,
+                    audience.snapshot.source_id,
+                    audience.snapshot.status.value,
+                    audience.requires_include_expired,
+                )
+                for audience in audiences
+            ],
+        )
+        label_rows = [
+            (sequence, audience.kind, key, value)
+            for audience in audiences
+            for key, value in sorted(audience.snapshot.labels.items())
+        ]
+        if label_rows:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_change_labels (
+                    change_sequence, audience_kind, key, value
+                )
+                VALUES (%s, %s, %s, %s)
+                """,
+                label_rows,
+            )
+        return change
+
+    async def _load_change(
+        self,
+        cur: Any,
+        sequence: int,
+    ) -> KnowledgeChange | None:
+        await cur.execute(
+            """
+            SELECT id, sequence, kind, entry_id, entry_revision, committed_at, operation_id
+            FROM cayu_knowledge_changes
+            WHERE sequence = %s
+            """,
+            (sequence,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else _knowledge_change_from_row(row)
+
+    async def _load_change_consumer(
+        self,
+        cur: Any,
+        consumer_id: str,
+        *,
+        for_update: bool,
+    ) -> KnowledgeChangeConsumerState | None:
+        lock_sql = " FOR UPDATE" if for_update else ""
+        await cur.execute(
+            cast(
+                "LiteralString",
+                """
+                SELECT
+                    consumer_id,
+                    access_scope_sha256,
+                    cursor_sequence,
+                    pending_change_sequence,
+                    pending_claim_id,
+                    pending_worker_id,
+                    pending_attempt,
+                    claimed_at,
+                    lease_expires_at,
+                    last_acknowledged_claim_id,
+                    updated_at
+                FROM cayu_knowledge_change_consumers
+                WHERE consumer_id = %s
+                """
+                + lock_sql,
+            ),
+            (consumer_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else _knowledge_change_consumer_from_row(row)
+
+    async def _save_change_consumer(
+        self,
+        cur: Any,
+        state: KnowledgeChangeConsumerState,
+    ) -> None:
+        state = copy_knowledge_change_consumer_state(state)
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_change_consumers (
+                consumer_id,
+                access_scope_sha256,
+                cursor_sequence,
+                pending_change_sequence,
+                pending_claim_id,
+                pending_worker_id,
+                pending_attempt,
+                claimed_at,
+                lease_expires_at,
+                last_acknowledged_claim_id,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (consumer_id) DO UPDATE SET
+                access_scope_sha256 = EXCLUDED.access_scope_sha256,
+                cursor_sequence = EXCLUDED.cursor_sequence,
+                pending_change_sequence = EXCLUDED.pending_change_sequence,
+                pending_claim_id = EXCLUDED.pending_claim_id,
+                pending_worker_id = EXCLUDED.pending_worker_id,
+                pending_attempt = EXCLUDED.pending_attempt,
+                claimed_at = EXCLUDED.claimed_at,
+                lease_expires_at = EXCLUDED.lease_expires_at,
+                last_acknowledged_claim_id = EXCLUDED.last_acknowledged_claim_id,
+                updated_at = EXCLUDED.updated_at
+            """,
+            (
+                state.consumer_id,
+                state.access_scope_sha256,
+                state.cursor_sequence,
+                state.pending_change_sequence,
+                state.pending_claim_id,
+                state.pending_worker_id,
+                state.pending_attempt,
+                pg_support.to_utc_optional(state.claimed_at),
+                pg_support.to_utc_optional(state.lease_expires_at),
+                state.last_acknowledged_claim_id,
+                pg_support.to_utc(state.updated_at),
+            ),
+        )
+
+    async def _lock_or_create_change_consumer(
+        self,
+        cur: Any,
+        consumer_id: str,
+        *,
+        access_scope_sha256: str,
+    ) -> KnowledgeChangeConsumerState:
+        state = await self._load_change_consumer(cur, consumer_id, for_update=True)
+        if state is None:
+            if self._clock_is_injected:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_knowledge_change_consumers (
+                        consumer_id, access_scope_sha256, updated_at
+                    )
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (consumer_id) DO NOTHING
+                    """,
+                    (consumer_id, access_scope_sha256, self._clock()),
+                )
+            else:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_knowledge_change_consumers (
+                        consumer_id, access_scope_sha256, updated_at
+                    )
+                    VALUES (%s, %s, clock_timestamp())
+                    ON CONFLICT (consumer_id) DO NOTHING
+                    """,
+                    (consumer_id, access_scope_sha256),
+                )
+            state = await self._load_change_consumer(cur, consumer_id, for_update=True)
+            if state is None:
+                raise RuntimeError("Postgres did not persist a knowledge change consumer.")
+        return state
+
+    async def _change_consumer_now(self, cur: Any) -> datetime:
+        if self._clock_is_injected:
+            return self._clock()
+        await cur.execute("SELECT clock_timestamp()")
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("Postgres did not return its knowledge consumer clock.")
+        return pg_support.to_utc(row[0])
+
+    async def _load_change_acknowledgement(
+        self,
+        cur: Any,
+        consumer_id: str,
+        claim_id: str,
+    ) -> tuple[str, int] | None:
+        await cur.execute(
+            """
+            SELECT claim_sha256, change_sequence
+            FROM cayu_knowledge_change_acknowledgements
+            WHERE consumer_id = %s AND claim_id = %s
+            """,
+            (consumer_id, claim_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return str(row[0]), int(row[1])
+
+    async def _insert_change_acknowledgement(
+        self,
+        cur: Any,
+        claim: KnowledgeChangeClaim,
+        *,
+        claim_sha256: str,
+        acknowledged_at: datetime,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_change_acknowledgements (
+                consumer_id,
+                claim_id,
+                claim_sha256,
+                change_sequence,
+                acknowledged_at
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                claim.consumer_id,
+                claim.claim_id,
+                claim_sha256,
+                claim.change.sequence,
+                acknowledged_at,
+            ),
+        )
+
+    async def _require_matching_change_claim(
+        self,
+        cur: Any,
+        state: KnowledgeChangeConsumerState,
+        claim: KnowledgeChangeClaim,
+    ) -> None:
+        stored_change = await self._load_change(cur, claim.change.sequence)
+        if (
+            state.pending_change_sequence != claim.change.sequence
+            or state.pending_claim_id != claim.claim_id
+            or state.pending_worker_id != claim.worker_id
+            or state.pending_attempt != claim.attempt
+            or stored_change != claim.change
+        ):
+            raise KnowledgeChangeConsumerConflict("stale_claim")
+
+    async def _require_live_change_claim(
+        self,
+        cur: Any,
+        state: KnowledgeChangeConsumerState,
+        claim: KnowledgeChangeClaim,
+        *,
+        now: datetime,
+    ) -> None:
+        await self._require_matching_change_claim(cur, state, claim)
+        if state.lease_expires_at is None or state.lease_expires_at <= now:
+            raise KnowledgeChangeConsumerConflict("expired_claim")
 
     async def _require_chunk_ids_available(
         self,
@@ -6879,6 +8483,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         embedding_model: str,
         embedding_dimensions: int,
         access_scope: KnowledgeAccessScope | None = None,
+        clock: Callable[[], datetime] | None = None,
         hybrid_keyword_weight: float = 0.35,
         semantic_min_score: float = 0.55,
     ) -> None:
@@ -6905,6 +8510,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             max_size=max_size,
             schema_mode=schema_mode,
             access_scope=access_scope,
+            clock=clock,
         )
 
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
@@ -6930,6 +8536,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk] | None = None,
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
@@ -6937,6 +8544,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             entry,
             access_scope=scope,
             chunks=chunks,
+            evidence=evidence,
         )
         await self._embed_entry_chunks_best_effort(
             stored.id,
@@ -6951,6 +8559,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         chunks: list[KnowledgeChunk] | None = None,
         *,
         expected_revision: int,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
@@ -6959,6 +8568,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             expected_revision=expected_revision,
             access_scope=scope,
             chunks=chunks,
+            evidence=evidence,
         )
         await self._embed_entry_chunks_best_effort(
             stored.id,
@@ -7023,6 +8633,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
+        evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
@@ -7031,6 +8642,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         receipt = await super().publish_entry_revision(
             entry,
             chunks,
+            evidence=evidence,
             access_scope=scope,
             operation_id=operation_id,
             expected_revision=expected_revision,
@@ -17684,6 +19296,74 @@ def _knowledge_chunk_from_row(row: tuple[Any, ...]) -> KnowledgeChunk:
     )
 
 
+def _knowledge_evidence_row_values(evidence: KnowledgeEvidence) -> tuple[object, ...]:
+    return (
+        evidence.id,
+        evidence.entry_id,
+        evidence.entry_revision,
+        evidence.chunk_id,
+        evidence.role.value,
+        evidence.source_type,
+        evidence.source_id,
+        evidence.source_uri,
+        evidence.source_revision,
+        evidence.source_hash,
+        _dumps(evidence.locator),
+        evidence.disposition.value,
+        pg_support.to_utc(evidence.created_at),
+        _dumps(evidence.metadata),
+    )
+
+
+def _knowledge_evidence_from_row(row: tuple[Any, ...]) -> KnowledgeEvidence:
+    return KnowledgeEvidence(
+        id=row[0],
+        entry_id=row[1],
+        entry_revision=row[2],
+        chunk_id=row[3],
+        role=KnowledgeEvidenceRole(row[4]),
+        source_type=row[5],
+        source_id=row[6],
+        source_uri=row[7],
+        source_revision=row[8],
+        source_hash=row[9],
+        locator=_json_obj(row[10]),
+        disposition=KnowledgeEvidenceDisposition(row[11]),
+        created_at=pg_support.to_utc(row[12]),
+        metadata=_json_obj(row[13]),
+    )
+
+
+def _knowledge_change_from_row(row: tuple[Any, ...]) -> KnowledgeChange:
+    return KnowledgeChange(
+        id=row[0],
+        sequence=row[1],
+        kind=KnowledgeChangeKind(row[2]),
+        entry_id=row[3],
+        entry_revision=row[4],
+        committed_at=pg_support.to_utc(row[5]),
+        operation_id=row[6],
+    )
+
+
+def _knowledge_change_consumer_from_row(
+    row: tuple[Any, ...],
+) -> KnowledgeChangeConsumerState:
+    return KnowledgeChangeConsumerState(
+        consumer_id=row[0],
+        access_scope_sha256=row[1],
+        cursor_sequence=row[2],
+        pending_change_sequence=row[3],
+        pending_claim_id=row[4],
+        pending_worker_id=row[5],
+        pending_attempt=row[6],
+        claimed_at=pg_support.to_utc_optional(row[7]),
+        lease_expires_at=pg_support.to_utc_optional(row[8]),
+        last_acknowledged_claim_id=row[9],
+        updated_at=pg_support.to_utc(row[10]),
+    )
+
+
 def _copy_knowledge_entry_chunks(
     entry_id: str,
     entry_revision: int,
@@ -17810,6 +19490,52 @@ def _postgres_knowledge_access_scope_filter_sql(
             clauses.append(f"({entry_alias}.expires_at IS NULL OR {entry_alias}.expires_at > %s)")
             params.append(now)
     return " AND " + " AND ".join(clauses), params
+
+
+def _postgres_knowledge_change_access_scope_filter_sql(
+    scope: KnowledgeAccessScope,
+) -> tuple[str, list[object]]:
+    alias = "change_record"
+    audience_alias = "access_audience"
+    clauses: list[str] = []
+    params: list[object] = []
+    if not scope.allow_all_namespaces:
+        clauses.append(f"{audience_alias}.namespace = ANY(%s)")
+        params.append(list(scope.allowed_namespaces))
+    for key, value in scope.required_labels.items():
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_change_labels AS access_label
+                WHERE access_label.change_sequence = {alias}.sequence
+                  AND access_label.audience_kind = {audience_alias}.audience_kind
+                  AND access_label.key = %s
+                  AND access_label.value = %s
+            )
+            """
+        )
+        params.extend([key, value])
+    clauses.append(f"{audience_alias}.visibility = ANY(%s)")
+    params.append([visibility.value for visibility in scope.allowed_visibilities])
+    clauses.append(f"{audience_alias}.status = ANY(%s)")
+    params.append([status.value for status in scope.allowed_statuses])
+    if scope.allowed_source_types is not None:
+        clauses.append(f"{audience_alias}.source_type = ANY(%s)")
+        params.append(list(scope.allowed_source_types))
+    if scope.allowed_source_ids is not None:
+        clauses.append(f"{audience_alias}.source_id = ANY(%s)")
+        params.append(list(scope.allowed_source_ids))
+    if not scope.include_expired:
+        clauses.append(f"NOT {audience_alias}.requires_include_expired")
+    audience_filter = " AND ".join(clauses)
+    return (
+        " AND EXISTS ("
+        "SELECT 1 FROM cayu_knowledge_change_audiences AS access_audience "
+        f"WHERE {audience_alias}.change_sequence = {alias}.sequence "
+        f"AND {audience_filter})",
+        params,
+    )
 
 
 def _postgres_knowledge_metadata_filter_sql(

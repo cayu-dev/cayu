@@ -4,10 +4,13 @@ import asyncio
 import json
 import re
 import sqlite3
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
+from cayu._clock import utc_clock
 from cayu._validation import (
     copy_label_map,
     require_nonblank,
@@ -23,10 +26,20 @@ from cayu.storage.memory import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeActorType,
+    KnowledgeChange,
+    KnowledgeChangeBatch,
+    KnowledgeChangeClaim,
+    KnowledgeChangeConsumerConflict,
+    KnowledgeChangeConsumerState,
+    KnowledgeChangeKind,
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgeEvidence,
+    KnowledgeEvidenceConflict,
+    KnowledgeEvidenceDisposition,
+    KnowledgeEvidenceResult,
+    KnowledgeEvidenceRole,
     KnowledgeFacet,
     KnowledgeHit,
     KnowledgeListGroup,
@@ -42,20 +55,35 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _bounded_knowledge_evidence,
     _copy_chunks_for_revision,
+    _copy_entry_evidence,
+    _copy_evidence_for_revision,
+    _initialize_knowledge_change_consumer_state,
+    _knowledge_access_scope_sha256,
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
+    _knowledge_change_audiences,
+    _knowledge_change_claim_sha256,
+    _knowledge_change_identity,
+    _knowledge_change_lease_seconds,
+    _knowledge_change_now,
+    _knowledge_entry_id,
     _knowledge_publication_operation_id,
     _knowledge_scope_allows_snapshot,
     _next_knowledge_revision,
     _parse_knowledge_access_snapshot_json,
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
+    _validate_knowledge_change_limit,
+    _validate_knowledge_change_sequence,
     _validate_knowledge_publication_replay,
     _validate_knowledge_revision,
     _validate_revision_append,
     _validate_revision_successor,
     copy_knowledge_access_scope,
+    copy_knowledge_change_claim,
+    copy_knowledge_change_consumer_state,
     copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_list_query,
@@ -67,7 +95,8 @@ from cayu.storage.memory import (
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
 _CHUNK_ID_LOOKUP_BATCH_SIZE = 400
-_SQLITE_MIN_REQUIRED_REVISION = 42
+_EVIDENCE_ID_LOOKUP_BATCH_SIZE = 400
+_SQLITE_MIN_REQUIRED_REVISION = 43
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -79,6 +108,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
         access_scope: KnowledgeAccessScope | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -92,6 +122,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         self._default_access_scope = (
             None if access_scope is None else copy_knowledge_access_scope(access_scope)
         )
+        self._clock = utc_clock(clock)
         self._schema_mode = schema_mode
         self._lock = asyncio.Lock()
         self._connection = sqlite_support.connect(db_path)
@@ -113,10 +144,6 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        if evidence:
-            raise NotImplementedError(
-                "SQLiteKnowledgeStore does not support knowledge evidence yet."
-            )
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=None)
@@ -125,6 +152,12 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             [_default_chunk_for_entry(entry)]
             if chunks is None
             else _copy_entry_chunks(entry.id, entry.revision, chunks)
+        )
+        copied_evidence = _copy_entry_evidence(
+            entry.id,
+            entry.revision,
+            evidence or [],
+            chunks=copied_chunks,
         )
         async with self._lock:
             with sqlite_support._transaction(self._connection):
@@ -145,8 +178,19 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     access_scope=scope,
                     operation="create_entry",
                 )
+                self._require_evidence_ids_available_unlocked(
+                    copied_evidence,
+                    access_scope=scope,
+                    operation="create_entry",
+                )
                 self._insert_entry_unlocked(entry)
                 self._insert_chunks_unlocked(entry, copied_chunks)
+                self._insert_evidence_unlocked(copied_evidence)
+                self._insert_change_unlocked(
+                    before_entry=None,
+                    after_entry=entry,
+                    kind=KnowledgeChangeKind.CREATED,
+                )
             return copy_knowledge_entry(entry)
 
     async def append_entry_revision(
@@ -158,10 +202,6 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         evidence: list[KnowledgeEvidence] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry:
-        if evidence:
-            raise NotImplementedError(
-                "SQLiteKnowledgeStore does not support knowledge evidence yet."
-            )
         scope = self._operation_access_scope(access_scope)
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=expected_revision)
@@ -171,8 +211,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     entry,
                     expected_revision=expected_revision,
                     chunks=chunks,
+                    evidence=evidence,
                     access_scope=scope,
                     operation="append_entry_revision",
+                    change_kind=KnowledgeChangeKind.REVISION_APPENDED,
+                    inherit_evidence=False,
                 )
         return copy_knowledge_entry(entry)
 
@@ -184,7 +227,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
         async with self._lock:
@@ -211,7 +254,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         _validate_knowledge_revision(expected_revision, "expected_revision")
         if not isinstance(from_status, KnowledgeStatus):
             raise ValueError("from_status must be a KnowledgeStatus.")
@@ -268,8 +311,15 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     target,
                     expected_revision=expected_revision,
                     chunks=None,
+                    evidence=None,
                     access_scope=scope,
                     operation="transition_entry_status",
+                    change_kind=(
+                        KnowledgeChangeKind.TOMBSTONED
+                        if to_status is KnowledgeStatus.DELETED
+                        else KnowledgeChangeKind.STATUS_TRANSITIONED
+                    ),
+                    inherit_evidence=True,
                 )
                 return copy_knowledge_entry(target)
 
@@ -282,7 +332,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         hard: bool = False,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         _validate_knowledge_revision(expected_revision, "expected_revision")
         if type(hard) is not bool:
             raise ValueError("`hard` must be a boolean.")
@@ -299,6 +349,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         actual_revision=entry.revision,
                     )
                 if hard:
+                    self._insert_change_unlocked(
+                        before_entry=entry,
+                        after_entry=None,
+                        kind=KnowledgeChangeKind.HARD_DELETED,
+                    )
                     self._delete_chunks_unlocked(clean_id)
                     self._connection.execute(
                         "DELETE FROM cayu_knowledge_entries WHERE id = ?",
@@ -320,8 +375,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     target,
                     expected_revision=expected_revision,
                     chunks=None,
+                    evidence=None,
                     access_scope=scope,
                     operation="delete_entry",
+                    change_kind=KnowledgeChangeKind.TOMBSTONED,
+                    inherit_evidence=True,
                 )
                 return copy_knowledge_entry(target)
 
@@ -332,7 +390,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         now: datetime | None = None,
     ) -> int:
         scope = self._operation_access_scope(access_scope)
-        cutoff = datetime.now(UTC) if now is None else now
+        cutoff = _knowledge_change_now(now)
         access_sql, access_params = _knowledge_access_scope_filter_sql(
             scope,
             now=cutoff,
@@ -342,7 +400,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 rows = self._connection.execute(
                     "SELECT id FROM cayu_knowledge_current_entries "
                     "AS e WHERE expires_at IS NOT NULL AND expires_at <= ? "
-                    f"{access_sql}",
+                    f"{access_sql} ORDER BY e.id COLLATE BINARY",
                     [sqlite_support.format_datetime(cutoff), *access_params],
                 ).fetchall()
                 expired_ids = [str(row["id"]) for row in rows]
@@ -351,6 +409,16 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 # FTS is a virtual table (no FK cascade), so clear chunks/FTS explicitly; the
                 # entries DELETE then cascades to labels/aspects/impact_targets.
                 for entry_id in expired_ids:
+                    entry = self._load_entry_unlocked(entry_id)
+                    if entry is None:
+                        raise RuntimeError(
+                            "SQLite knowledge entry disappeared during expiration pruning."
+                        )
+                    self._insert_change_unlocked(
+                        before_entry=entry,
+                        after_entry=None,
+                        kind=KnowledgeChangeKind.EXPIRED,
+                    )
                     self._delete_chunks_unlocked(entry_id)
                 self._connection.executemany(
                     "DELETE FROM cayu_knowledge_entries WHERE id = ?",
@@ -382,10 +450,6 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             operation_id=operation_id,
             expected_revision=expected_revision,
         )
-        if copied_evidence:
-            raise NotImplementedError(
-                "SQLiteKnowledgeStore does not support knowledge evidence yet."
-            )
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
         async with self._lock:
             with sqlite_support._transaction(self._connection):
@@ -427,6 +491,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     access_scope=scope,
                     operation="publish_entry_revision",
                 )
+                self._require_evidence_ids_available_unlocked(
+                    copied_evidence,
+                    access_scope=scope,
+                    operation="publish_entry_revision",
+                )
                 receipt = KnowledgePublicationReceipt(
                     operation_id=operation_id,
                     entry_id=copied_entry.id,
@@ -447,6 +516,18 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         expected_revision=expected_revision,
                     )
                 self._insert_chunks_unlocked(copied_entry, copied_chunks)
+                self._insert_evidence_unlocked(copied_evidence)
+                self._insert_change_unlocked(
+                    before_entry=existing_entry,
+                    after_entry=copied_entry,
+                    kind=(
+                        KnowledgeChangeKind.CREATED
+                        if existing_entry is None
+                        else KnowledgeChangeKind.REVISION_APPENDED
+                    ),
+                    operation_id=operation_id,
+                    committed_at=receipt.committed_at,
+                )
                 self._insert_publication_receipt_unlocked(receipt, copied_entry)
             return copy_knowledge_publication_receipt(receipt)
 
@@ -462,6 +543,318 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             receipt = self._load_publication_receipt_in_scope_unlocked(operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
+    async def read_evidence(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+        max_records: int = DEFAULT_KNOWLEDGE_LIMIT,
+        max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
+    ) -> KnowledgeEvidenceResult | None:
+        scope = self._operation_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry_id)
+        if revision is not None:
+            _validate_knowledge_revision(revision, "revision")
+        _validate_positive_int(max_records, "max_records")
+        _validate_positive_int(max_bytes, "max_bytes")
+        async with self._lock:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                entry = self._load_entry_in_scope_unlocked(
+                    entry_id,
+                    scope,
+                    revision=revision,
+                )
+                if entry is None:
+                    return None
+                total_evidence_known = self._count_evidence_unlocked(
+                    entry.id,
+                    revision=entry.revision,
+                )
+                stored = self._load_evidence_unlocked(
+                    entry.id,
+                    revision=entry.revision,
+                    limit=max_records,
+                )
+        selected = _bounded_knowledge_evidence(
+            stored,
+            max_records=max_records,
+            max_bytes=max_bytes,
+        )
+        return KnowledgeEvidenceResult(
+            entry_id=entry.id,
+            entry_revision=entry.revision,
+            evidence=selected,
+            truncated=len(selected) < total_evidence_known,
+            limit=max_records,
+            max_bytes=max_bytes,
+            total_evidence_known=total_evidence_known,
+        )
+
+    async def read_changes(
+        self,
+        *,
+        after_sequence: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeBatch:
+        scope = self._operation_access_scope(access_scope)
+        _validate_knowledge_change_sequence(after_sequence, "after_sequence")
+        _validate_knowledge_change_limit(limit)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                high_water = self._accessible_change_high_water_unlocked(scope)
+                if after_sequence > high_water:
+                    row = self._connection.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) AS current_sequence "
+                        "FROM cayu_knowledge_changes"
+                    ).fetchone()
+                    current_sequence = 0 if row is None else int(row["current_sequence"])
+                    if after_sequence > current_sequence:
+                        raise ValueError(
+                            "`after_sequence` cannot exceed the current knowledge change sequence."
+                        )
+                rows = self._load_accessible_change_rows_unlocked(
+                    scope,
+                    after_sequence=after_sequence,
+                    through_sequence=high_water,
+                    limit=limit + 1,
+                )
+        changes = [_change_from_row(row) for row in rows[:limit]]
+        truncated = len(rows) > limit
+        next_after = changes[-1].sequence if truncated else max(after_sequence, high_water)
+        return KnowledgeChangeBatch(
+            changes=changes,
+            after_sequence=after_sequence,
+            next_after_sequence=next_after,
+            high_water_sequence=high_water,
+            truncated=truncated,
+            limit=limit,
+        )
+
+    async def claim_change(
+        self,
+        consumer_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 300.0,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeClaim | None:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        worker_id = _knowledge_change_identity(worker_id, "worker_id")
+        lease_seconds = _knowledge_change_lease_seconds(lease_seconds)
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                current_time = self._clock()
+                state = self._load_change_consumer_unlocked(consumer_id)
+                if state is None:
+                    state = KnowledgeChangeConsumerState(
+                        consumer_id=consumer_id,
+                        access_scope_sha256=scope_sha256,
+                        updated_at=current_time,
+                    )
+                elif state.access_scope_sha256 != scope_sha256:
+                    raise KnowledgeChangeConsumerConflict("access_scope_mismatch")
+                if state.pending_change_sequence is not None:
+                    stored_change = self._load_change_in_scope_unlocked(
+                        state.pending_change_sequence,
+                        scope,
+                    )
+                    assert state.lease_expires_at is not None
+                    if stored_change is not None and state.lease_expires_at > current_time:
+                        if state.pending_worker_id != worker_id:
+                            self._save_change_consumer_unlocked(state)
+                            return None
+                        assert state.pending_claim_id is not None
+                        assert state.claimed_at is not None
+                        self._save_change_consumer_unlocked(state)
+                        return KnowledgeChangeClaim(
+                            consumer_id=consumer_id,
+                            worker_id=worker_id,
+                            claim_id=state.pending_claim_id,
+                            change=stored_change,
+                            attempt=state.pending_attempt,
+                            claimed_at=state.claimed_at,
+                            lease_expires_at=state.lease_expires_at,
+                        )
+                    state = state.model_copy(
+                        update={
+                            "pending_change_sequence": None,
+                            "pending_claim_id": None,
+                            "pending_worker_id": None,
+                            "claimed_at": None,
+                            "lease_expires_at": None,
+                            "pending_attempt": (
+                                state.pending_attempt if stored_change is not None else 0
+                            ),
+                            "updated_at": current_time,
+                        }
+                    )
+                change = self._next_accessible_change_unlocked(
+                    scope,
+                    after_sequence=state.cursor_sequence,
+                )
+                if change is None:
+                    self._save_change_consumer_unlocked(state)
+                    return None
+                claim_id = f"kclaim_{uuid4().hex}"
+                claimed_at = current_time
+                lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
+                attempt = state.pending_attempt + 1
+                state = state.model_copy(
+                    update={
+                        "pending_change_sequence": change.sequence,
+                        "pending_claim_id": claim_id,
+                        "pending_worker_id": worker_id,
+                        "pending_attempt": attempt,
+                        "claimed_at": claimed_at,
+                        "lease_expires_at": lease_expires_at,
+                        "updated_at": current_time,
+                    }
+                )
+                self._save_change_consumer_unlocked(state)
+                return KnowledgeChangeClaim(
+                    consumer_id=consumer_id,
+                    worker_id=worker_id,
+                    claim_id=claim_id,
+                    change=change,
+                    attempt=attempt,
+                    claimed_at=claimed_at,
+                    lease_expires_at=lease_expires_at,
+                )
+
+    async def initialize_change_consumer(
+        self,
+        consumer_id: str,
+        *,
+        baseline_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        _validate_knowledge_change_sequence(baseline_sequence, "baseline_sequence")
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                current_time = self._clock()
+                row = self._connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) AS current_sequence "
+                    "FROM cayu_knowledge_changes"
+                ).fetchone()
+                current_sequence = 0 if row is None else int(row["current_sequence"])
+                if baseline_sequence > current_sequence:
+                    raise ValueError(
+                        "`baseline_sequence` cannot exceed the current knowledge change sequence."
+                    )
+                state = _initialize_knowledge_change_consumer_state(
+                    self._load_change_consumer_unlocked(consumer_id),
+                    consumer_id=consumer_id,
+                    access_scope_sha256=_knowledge_access_scope_sha256(scope),
+                    baseline_sequence=baseline_sequence,
+                    now=current_time,
+                )
+                self._save_change_consumer_unlocked(state)
+                return copy_knowledge_change_consumer_state(state)
+
+    async def acknowledge_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        claim = copy_knowledge_change_claim(claim)
+        claim_sha256 = _knowledge_change_claim_sha256(claim)
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                current_time = self._clock()
+                state = self._load_change_consumer_unlocked(claim.consumer_id)
+                if state is None or state.access_scope_sha256 != scope_sha256:
+                    raise KnowledgeChangeConsumerConflict("unknown_consumer")
+                acknowledged = self._load_change_acknowledgement_unlocked(
+                    claim.consumer_id,
+                    claim.claim_id,
+                )
+                if acknowledged is not None:
+                    if acknowledged != (claim_sha256, claim.change.sequence):
+                        raise KnowledgeChangeConsumerConflict("stale_claim")
+                    if state.cursor_sequence < claim.change.sequence:
+                        raise RuntimeError(
+                            "Knowledge change acknowledgement is ahead of its consumer."
+                        )
+                    return copy_knowledge_change_consumer_state(state)
+                self._require_live_change_claim_unlocked(state, claim, now=current_time)
+                state = state.model_copy(
+                    update={
+                        "cursor_sequence": claim.change.sequence,
+                        "pending_change_sequence": None,
+                        "pending_claim_id": None,
+                        "pending_worker_id": None,
+                        "pending_attempt": 0,
+                        "claimed_at": None,
+                        "lease_expires_at": None,
+                        "last_acknowledged_claim_id": claim.claim_id,
+                        "updated_at": current_time,
+                    }
+                )
+                self._save_change_consumer_unlocked(state)
+                self._insert_change_acknowledgement_unlocked(
+                    claim,
+                    claim_sha256=claim_sha256,
+                    acknowledged_at=current_time,
+                )
+                return copy_knowledge_change_consumer_state(state)
+
+    async def release_change(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState:
+        scope = self._operation_access_scope(access_scope)
+        claim = copy_knowledge_change_claim(claim)
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                current_time = self._clock()
+                state = self._load_change_consumer_unlocked(claim.consumer_id)
+                if state is None or state.access_scope_sha256 != scope_sha256:
+                    raise KnowledgeChangeConsumerConflict("unknown_consumer")
+                self._require_live_change_claim_unlocked(
+                    state,
+                    claim,
+                    now=current_time,
+                )
+                state = state.model_copy(
+                    update={
+                        "pending_change_sequence": None,
+                        "pending_claim_id": None,
+                        "pending_worker_id": None,
+                        "claimed_at": None,
+                        "lease_expires_at": None,
+                        "updated_at": current_time,
+                    }
+                )
+                self._save_change_consumer_unlocked(state)
+                return copy_knowledge_change_consumer_state(state)
+
+    async def load_change_consumer_state(
+        self,
+        consumer_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeChangeConsumerState | None:
+        scope = self._operation_access_scope(access_scope)
+        consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
+        scope_sha256 = _knowledge_access_scope_sha256(scope)
+        async with self._lock:
+            state = self._load_change_consumer_unlocked(consumer_id)
+        if state is None or state.access_scope_sha256 != scope_sha256:
+            return None
+        return copy_knowledge_change_consumer_state(state)
+
     async def read_chunks(
         self,
         entry_id: str,
@@ -474,7 +867,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
         scope = self._operation_access_scope(access_scope)
-        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
         if chunk_index is not None:
@@ -921,8 +1314,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         expected_revision: int,
         chunks: list[KnowledgeChunk] | None,
+        evidence: list[KnowledgeEvidence] | None,
         access_scope: KnowledgeAccessScope,
         operation: str,
+        change_kind: KnowledgeChangeKind,
+        inherit_evidence: bool,
     ) -> None:
         _validate_revision_append(entry, expected_revision=expected_revision)
         current = self._load_entry_unlocked(entry.id)
@@ -951,16 +1347,43 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             copied_chunks = [_default_chunk_for_entry(entry)]
         else:
             copied_chunks = _copy_chunks_for_revision(previous_chunks, entry)
+        if inherit_evidence:
+            if evidence is not None:
+                raise ValueError("Lifecycle evidence inheritance cannot accept evidence.")
+            copied_evidence = _copy_evidence_for_revision(
+                self._load_evidence_unlocked(entry.id, revision=current.revision),
+                entry=entry,
+                previous_chunks=previous_chunks,
+                chunks=copied_chunks,
+            )
+        else:
+            copied_evidence = _copy_entry_evidence(
+                entry.id,
+                entry.revision,
+                evidence or [],
+                chunks=copied_chunks,
+            )
         self._require_chunk_ids_available_unlocked(
             copied_chunks,
             access_scope=access_scope,
             operation=operation,
         )
+        self._require_evidence_ids_available_unlocked(
+            copied_evidence,
+            access_scope=access_scope,
+            operation=operation,
+        )
         self._insert_revision_unlocked(entry)
         self._insert_chunks_unlocked(entry, copied_chunks)
+        self._insert_evidence_unlocked(copied_evidence)
         self._advance_current_revision_unlocked(
             entry,
             expected_revision=expected_revision,
+        )
+        self._insert_change_unlocked(
+            before_entry=current,
+            after_entry=entry,
+            kind=change_kind,
         )
 
     def _insert_chunks_unlocked(
@@ -985,6 +1408,489 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             [_chunk_row_values(chunk) for chunk in chunks],
         )
         self._insert_entry_fts_unlocked(entry, chunks)
+
+    def _insert_evidence_unlocked(self, evidence: list[KnowledgeEvidence]) -> None:
+        if not evidence:
+            return
+        self._connection.executemany(
+            """
+            INSERT INTO cayu_knowledge_evidence (
+                id,
+                entry_id,
+                entry_revision,
+                chunk_id,
+                role,
+                source_type,
+                source_id,
+                source_uri,
+                source_revision,
+                source_hash,
+                locator_json,
+                disposition,
+                created_at,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_evidence_row_values(item) for item in evidence],
+        )
+
+    def _load_evidence_unlocked(
+        self,
+        entry_id: str,
+        *,
+        revision: int,
+        limit: int | None = None,
+    ) -> list[KnowledgeEvidence]:
+        limit_sql = "" if limit is None else " LIMIT ?"
+        params: tuple[object, ...] = (
+            (entry_id, revision) if limit is None else (entry_id, revision, limit)
+        )
+        rows = self._connection.execute(
+            f"""
+            SELECT
+                id,
+                entry_id,
+                entry_revision,
+                chunk_id,
+                role,
+                source_type,
+                source_id,
+                source_uri,
+                source_revision,
+                source_hash,
+                locator_json,
+                disposition,
+                created_at,
+                metadata_json
+            FROM cayu_knowledge_evidence
+            WHERE entry_id = ? AND entry_revision = ?
+            ORDER BY id COLLATE BINARY
+            {limit_sql}
+            """,
+            params,
+        ).fetchall()
+        return [_evidence_from_row(row) for row in rows]
+
+    def _count_evidence_unlocked(self, entry_id: str, *, revision: int) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS evidence_count
+            FROM cayu_knowledge_evidence
+            WHERE entry_id = ? AND entry_revision = ?
+            """,
+            (entry_id, revision),
+        ).fetchone()
+        return 0 if row is None else int(row["evidence_count"])
+
+    def _require_evidence_ids_available_unlocked(
+        self,
+        evidence: list[KnowledgeEvidence],
+        *,
+        access_scope: KnowledgeAccessScope,
+        operation: str,
+    ) -> None:
+        proposed_ids = sorted({item.id for item in evidence})
+        occupied_entry_ids: set[str] = set()
+        for offset in range(0, len(proposed_ids), _EVIDENCE_ID_LOOKUP_BATCH_SIZE):
+            batch = proposed_ids[offset : offset + _EVIDENCE_ID_LOOKUP_BATCH_SIZE]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = self._connection.execute(
+                f"""
+                SELECT DISTINCT entry_id
+                FROM cayu_knowledge_evidence
+                WHERE id IN ({placeholders})
+                ORDER BY entry_id
+                """,
+                batch,
+            ).fetchall()
+            occupied_entry_ids.update(str(row["entry_id"]) for row in rows)
+        for occupied_entry_id in sorted(occupied_entry_ids):
+            owner = self._load_entry_unlocked(occupied_entry_id)
+            if owner is None:
+                raise KnowledgeEvidenceConflict(operation)
+            _require_knowledge_entry_access(
+                access_scope,
+                owner,
+                operation=operation,
+            )
+        if occupied_entry_ids:
+            raise KnowledgeEvidenceConflict(operation)
+
+    def _insert_change_unlocked(
+        self,
+        *,
+        before_entry: KnowledgeEntry | None,
+        after_entry: KnowledgeEntry | None,
+        kind: KnowledgeChangeKind,
+        operation_id: str | None = None,
+        committed_at: datetime | None = None,
+    ) -> KnowledgeChange:
+        entry = after_entry if after_entry is not None else before_entry
+        if entry is None:
+            raise ValueError("A knowledge change requires a before or after entry.")
+        change_id = f"kchg_{uuid4().hex}"
+        committed_at = datetime.now(UTC) if committed_at is None else committed_at
+        before_requires_include_expired: bool | None = None
+        if (
+            before_entry is not None
+            and before_entry.expires_at is not None
+            and before_entry.expires_at <= committed_at
+        ):
+            audience_row = self._connection.execute(
+                """
+                SELECT audience.requires_include_expired
+                FROM cayu_knowledge_changes AS change_record
+                JOIN cayu_knowledge_change_audiences AS audience
+                  ON audience.change_sequence = change_record.sequence
+                 AND audience.audience_kind = 'after'
+                WHERE change_record.entry_id = ?
+                  AND change_record.entry_revision = ?
+                ORDER BY change_record.sequence DESC
+                LIMIT 1
+                """,
+                (before_entry.id, before_entry.revision),
+            ).fetchone()
+            if audience_row is not None:
+                before_requires_include_expired = bool(audience_row["requires_include_expired"])
+            else:
+                baseline_row = self._connection.execute(
+                    "SELECT applied_at FROM cayu_schema_migrations WHERE revision = 43"
+                ).fetchone()
+                if baseline_row is None:
+                    raise RuntimeError("SQLite knowledge outbox baseline is missing.")
+                before_requires_include_expired = (
+                    before_entry.expires_at
+                    <= sqlite_support.parse_datetime(baseline_row["applied_at"])
+                )
+        cursor = self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_changes (
+                id,
+                kind,
+                entry_id,
+                entry_revision,
+                committed_at,
+                operation_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                change_id,
+                kind.value,
+                entry.id,
+                entry.revision,
+                sqlite_support.format_datetime(committed_at),
+                operation_id,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return a knowledge change sequence.")
+        sequence = int(cursor.lastrowid)
+        change = KnowledgeChange(
+            id=change_id,
+            sequence=sequence,
+            kind=kind,
+            entry_id=entry.id,
+            entry_revision=entry.revision,
+            committed_at=committed_at,
+            operation_id=operation_id,
+        )
+        audiences = _knowledge_change_audiences(
+            change,
+            before_entry=before_entry,
+            after_entry=after_entry,
+            before_requires_include_expired=before_requires_include_expired,
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO cayu_knowledge_change_audiences (
+                change_sequence,
+                audience_kind,
+                namespace,
+                visibility,
+                source_type,
+                source_id,
+                status,
+                requires_include_expired
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    sequence,
+                    audience.kind,
+                    audience.snapshot.namespace,
+                    audience.snapshot.visibility.value,
+                    audience.snapshot.source_type,
+                    audience.snapshot.source_id,
+                    audience.snapshot.status.value,
+                    int(audience.requires_include_expired),
+                )
+                for audience in audiences
+            ],
+        )
+        label_rows = [
+            (sequence, audience.kind, key, value)
+            for audience in audiences
+            for key, value in sorted(audience.snapshot.labels.items())
+        ]
+        if label_rows:
+            self._connection.executemany(
+                """
+                INSERT INTO cayu_knowledge_change_labels (
+                    change_sequence, audience_kind, key, value
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                label_rows,
+            )
+        return change
+
+    def _accessible_change_high_water_unlocked(
+        self,
+        scope: KnowledgeAccessScope,
+    ) -> int:
+        access_sql, access_params = _sqlite_change_access_scope_filter_sql(
+            scope,
+            alias="change_record",
+        )
+        row = self._connection.execute(
+            "SELECT COALESCE(MAX(change_record.sequence), 0) AS high_water "
+            "FROM cayu_knowledge_changes AS change_record "
+            f"WHERE 1 = 1 {access_sql}",
+            access_params,
+        ).fetchone()
+        return 0 if row is None else int(row["high_water"])
+
+    def _load_accessible_change_rows_unlocked(
+        self,
+        scope: KnowledgeAccessScope,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        access_sql, access_params = _sqlite_change_access_scope_filter_sql(
+            scope,
+            alias="change_record",
+        )
+        return self._connection.execute(
+            """
+            SELECT
+                change_record.id,
+                change_record.sequence,
+                change_record.kind,
+                change_record.entry_id,
+                change_record.entry_revision,
+                change_record.committed_at,
+                change_record.operation_id
+            FROM cayu_knowledge_changes AS change_record
+            WHERE change_record.sequence > ?
+              AND change_record.sequence <= ?
+            """
+            f"{access_sql} "
+            "ORDER BY change_record.sequence LIMIT ?",
+            (after_sequence, through_sequence, *access_params, limit),
+        ).fetchall()
+
+    def _load_change_in_scope_unlocked(
+        self,
+        sequence: int,
+        scope: KnowledgeAccessScope,
+    ) -> KnowledgeChange | None:
+        access_sql, access_params = _sqlite_change_access_scope_filter_sql(
+            scope,
+            alias="change_record",
+        )
+        row = self._connection.execute(
+            """
+            SELECT
+                change_record.id,
+                change_record.sequence,
+                change_record.kind,
+                change_record.entry_id,
+                change_record.entry_revision,
+                change_record.committed_at,
+                change_record.operation_id
+            FROM cayu_knowledge_changes AS change_record
+            WHERE change_record.sequence = ?
+            """
+            f"{access_sql}",
+            (sequence, *access_params),
+        ).fetchone()
+        return None if row is None else _change_from_row(row)
+
+    def _next_accessible_change_unlocked(
+        self,
+        scope: KnowledgeAccessScope,
+        *,
+        after_sequence: int,
+    ) -> KnowledgeChange | None:
+        high_water = self._accessible_change_high_water_unlocked(scope)
+        rows = self._load_accessible_change_rows_unlocked(
+            scope,
+            after_sequence=after_sequence,
+            through_sequence=high_water,
+            limit=1,
+        )
+        return None if not rows else _change_from_row(rows[0])
+
+    def _load_change_consumer_unlocked(
+        self,
+        consumer_id: str,
+    ) -> KnowledgeChangeConsumerState | None:
+        row = self._connection.execute(
+            """
+            SELECT
+                consumer_id,
+                access_scope_sha256,
+                cursor_sequence,
+                pending_change_sequence,
+                pending_claim_id,
+                pending_worker_id,
+                pending_attempt,
+                claimed_at,
+                lease_expires_at,
+                last_acknowledged_claim_id,
+                updated_at
+            FROM cayu_knowledge_change_consumers
+            WHERE consumer_id = ?
+            """,
+            (consumer_id,),
+        ).fetchone()
+        return None if row is None else _change_consumer_from_row(row)
+
+    def _save_change_consumer_unlocked(self, state: KnowledgeChangeConsumerState) -> None:
+        state = copy_knowledge_change_consumer_state(state)
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_change_consumers (
+                consumer_id,
+                access_scope_sha256,
+                cursor_sequence,
+                pending_change_sequence,
+                pending_claim_id,
+                pending_worker_id,
+                pending_attempt,
+                claimed_at,
+                lease_expires_at,
+                last_acknowledged_claim_id,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (consumer_id) DO UPDATE SET
+                access_scope_sha256 = excluded.access_scope_sha256,
+                cursor_sequence = excluded.cursor_sequence,
+                pending_change_sequence = excluded.pending_change_sequence,
+                pending_claim_id = excluded.pending_claim_id,
+                pending_worker_id = excluded.pending_worker_id,
+                pending_attempt = excluded.pending_attempt,
+                claimed_at = excluded.claimed_at,
+                lease_expires_at = excluded.lease_expires_at,
+                last_acknowledged_claim_id = excluded.last_acknowledged_claim_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                state.consumer_id,
+                state.access_scope_sha256,
+                state.cursor_sequence,
+                state.pending_change_sequence,
+                state.pending_claim_id,
+                state.pending_worker_id,
+                state.pending_attempt,
+                (
+                    None
+                    if state.claimed_at is None
+                    else sqlite_support.format_datetime(state.claimed_at)
+                ),
+                (
+                    None
+                    if state.lease_expires_at is None
+                    else sqlite_support.format_datetime(state.lease_expires_at)
+                ),
+                state.last_acknowledged_claim_id,
+                sqlite_support.format_datetime(state.updated_at),
+            ),
+        )
+
+    def _load_change_acknowledgement_unlocked(
+        self,
+        consumer_id: str,
+        claim_id: str,
+    ) -> tuple[str, int] | None:
+        row = self._connection.execute(
+            """
+            SELECT claim_sha256, change_sequence
+            FROM cayu_knowledge_change_acknowledgements
+            WHERE consumer_id = ? AND claim_id = ?
+            """,
+            (consumer_id, claim_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["claim_sha256"]), int(row["change_sequence"])
+
+    def _insert_change_acknowledgement_unlocked(
+        self,
+        claim: KnowledgeChangeClaim,
+        *,
+        claim_sha256: str,
+        acknowledged_at: datetime,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_change_acknowledgements (
+                consumer_id,
+                claim_id,
+                claim_sha256,
+                change_sequence,
+                acknowledged_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                claim.consumer_id,
+                claim.claim_id,
+                claim_sha256,
+                claim.change.sequence,
+                sqlite_support.format_datetime(acknowledged_at),
+            ),
+        )
+
+    def _require_matching_change_claim_unlocked(
+        self,
+        state: KnowledgeChangeConsumerState,
+        claim: KnowledgeChangeClaim,
+    ) -> None:
+        row = self._connection.execute(
+            """
+            SELECT id, sequence, kind, entry_id, entry_revision, committed_at, operation_id
+            FROM cayu_knowledge_changes
+            WHERE sequence = ?
+            """,
+            (claim.change.sequence,),
+        ).fetchone()
+        stored_change = None if row is None else _change_from_row(row)
+        if (
+            state.pending_change_sequence != claim.change.sequence
+            or state.pending_claim_id != claim.claim_id
+            or state.pending_worker_id != claim.worker_id
+            or state.pending_attempt != claim.attempt
+            or stored_change != claim.change
+        ):
+            raise KnowledgeChangeConsumerConflict("stale_claim")
+
+    def _require_live_change_claim_unlocked(
+        self,
+        state: KnowledgeChangeConsumerState,
+        claim: KnowledgeChangeClaim,
+        *,
+        now: datetime,
+    ) -> None:
+        self._require_matching_change_claim_unlocked(state, claim)
+        if state.lease_expires_at is None or state.lease_expires_at <= now:
+            raise KnowledgeChangeConsumerConflict("expired_claim")
 
     def _require_chunk_ids_available_unlocked(
         self,
@@ -1963,6 +2869,132 @@ def _chunk_from_row(row: sqlite3.Row) -> KnowledgeChunk:
         content_hash=row["content_hash"],
         source_uri=row["source_uri"],
         metadata=json.loads(row["metadata_json"]),
+    )
+
+
+def _evidence_row_values(evidence: KnowledgeEvidence) -> tuple[object, ...]:
+    return (
+        evidence.id,
+        evidence.entry_id,
+        evidence.entry_revision,
+        evidence.chunk_id,
+        evidence.role.value,
+        evidence.source_type,
+        evidence.source_id,
+        evidence.source_uri,
+        evidence.source_revision,
+        evidence.source_hash,
+        sqlite_support.json_dumps(evidence.locator),
+        evidence.disposition.value,
+        sqlite_support.format_datetime(evidence.created_at),
+        sqlite_support.json_dumps(evidence.metadata),
+    )
+
+
+def _evidence_from_row(row: sqlite3.Row) -> KnowledgeEvidence:
+    return KnowledgeEvidence(
+        id=row["id"],
+        entry_id=row["entry_id"],
+        entry_revision=row["entry_revision"],
+        chunk_id=row["chunk_id"],
+        role=KnowledgeEvidenceRole(row["role"]),
+        source_type=row["source_type"],
+        source_id=row["source_id"],
+        source_uri=row["source_uri"],
+        source_revision=row["source_revision"],
+        source_hash=row["source_hash"],
+        locator=json.loads(row["locator_json"]),
+        disposition=KnowledgeEvidenceDisposition(row["disposition"]),
+        created_at=sqlite_support.parse_datetime(row["created_at"]),
+        metadata=json.loads(row["metadata_json"]),
+    )
+
+
+def _change_from_row(row: sqlite3.Row) -> KnowledgeChange:
+    return KnowledgeChange(
+        id=row["id"],
+        sequence=row["sequence"],
+        kind=KnowledgeChangeKind(row["kind"]),
+        entry_id=row["entry_id"],
+        entry_revision=row["entry_revision"],
+        committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+        operation_id=row["operation_id"],
+    )
+
+
+def _change_consumer_from_row(row: sqlite3.Row) -> KnowledgeChangeConsumerState:
+    return KnowledgeChangeConsumerState(
+        consumer_id=row["consumer_id"],
+        access_scope_sha256=row["access_scope_sha256"],
+        cursor_sequence=row["cursor_sequence"],
+        pending_change_sequence=row["pending_change_sequence"],
+        pending_claim_id=row["pending_claim_id"],
+        pending_worker_id=row["pending_worker_id"],
+        pending_attempt=row["pending_attempt"],
+        claimed_at=sqlite_support.parse_optional_datetime(row["claimed_at"]),
+        lease_expires_at=sqlite_support.parse_optional_datetime(row["lease_expires_at"]),
+        last_acknowledged_claim_id=row["last_acknowledged_claim_id"],
+        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+    )
+
+
+def _sqlite_change_access_scope_filter_sql(
+    scope: KnowledgeAccessScope,
+    *,
+    alias: str,
+) -> tuple[str, list[object]]:
+    if alias != "change_record":
+        raise ValueError("Unsupported knowledge change access-filter alias.")
+    audience_alias = "access_audience"
+    clauses: list[str] = []
+    params: list[object] = []
+    if not scope.allow_all_namespaces:
+        placeholders = ", ".join("?" for _ in scope.allowed_namespaces)
+        clauses.append(f"{audience_alias}.namespace IN ({placeholders})")
+        params.extend(scope.allowed_namespaces)
+    for key, value in scope.required_labels.items():
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_change_labels AS access_label
+                WHERE access_label.change_sequence = {alias}.sequence
+                  AND access_label.audience_kind = {audience_alias}.audience_kind
+                  AND access_label.key = ?
+                  AND access_label.value = ?
+            )
+            """
+        )
+        params.extend([key, value])
+    placeholders = ", ".join("?" for _ in scope.allowed_visibilities)
+    clauses.append(f"{audience_alias}.visibility IN ({placeholders})")
+    params.extend(visibility.value for visibility in scope.allowed_visibilities)
+    placeholders = ", ".join("?" for _ in scope.allowed_statuses)
+    clauses.append(f"{audience_alias}.status IN ({placeholders})")
+    params.extend(status.value for status in scope.allowed_statuses)
+    if scope.allowed_source_types is not None:
+        if scope.allowed_source_types:
+            placeholders = ", ".join("?" for _ in scope.allowed_source_types)
+            clauses.append(f"{audience_alias}.source_type IN ({placeholders})")
+            params.extend(scope.allowed_source_types)
+        else:
+            clauses.append("0")
+    if scope.allowed_source_ids is not None:
+        if scope.allowed_source_ids:
+            placeholders = ", ".join("?" for _ in scope.allowed_source_ids)
+            clauses.append(f"{audience_alias}.source_id IN ({placeholders})")
+            params.extend(scope.allowed_source_ids)
+        else:
+            clauses.append("0")
+    if not scope.include_expired:
+        clauses.append(f"{audience_alias}.requires_include_expired = 0")
+    audience_filter = " AND ".join(clauses)
+    return (
+        " AND EXISTS ("
+        "SELECT 1 FROM cayu_knowledge_change_audiences AS access_audience "
+        f"WHERE {audience_alias}.change_sequence = {alias}.sequence "
+        f"AND {audience_filter})",
+        params,
     )
 
 

@@ -29,8 +29,10 @@ from cayu.embeddings import (
     TextEmbeddingResult,
 )
 from cayu.storage import (
+    MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,
     KnowledgeAccessScope,
+    KnowledgeChangeKind,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListGroup,
@@ -42,6 +44,11 @@ from cayu.storage import (
     KnowledgeVisibility,
 )
 from cayu.storage import migrations as schema_migrations
+from cayu.storage.memory import (
+    _knowledge_access_snapshot,
+    _knowledge_access_snapshot_json,
+    _knowledge_publication_v1_request_sha256,
+)
 from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, SchemaMode
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -51,6 +58,12 @@ _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 _TABLES = (
     "cayu_knowledge_embeddings",
     "cayu_task_terminalization_receipts",
+    "cayu_knowledge_change_acknowledgements",
+    "cayu_knowledge_change_consumers",
+    "cayu_knowledge_change_labels",
+    "cayu_knowledge_change_audiences",
+    "cayu_knowledge_changes",
+    "cayu_knowledge_evidence",
     "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
@@ -2715,6 +2728,386 @@ async def _embedding_foreign_keys(dsn: str) -> tuple[tuple[str, str], ...]:
             """
         )
         return tuple((str(name), str(definition)) for name, definition in await cur.fetchall())
+
+
+def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated_changes(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu.storage import postgres as postgres_storage
+
+        await _drop_all(postgres_dsn)
+        revisions = schema_migrations.REVISIONS
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 42
+        )
+        revision_42_schema = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            await revision_42_schema.ensure_schema()
+        finally:
+            await revision_42_schema.close()
+            schema_migrations.REVISIONS = revisions
+
+        timestamp = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
+        entry = KnowledgeEntry(
+            id="preserved-entry",
+            text="Revision 42 knowledge survives.",
+            labels={"project": "cayu"},
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        chunk = KnowledgeChunk(
+            id="preserved-entry:r1:0",
+            entry_id=entry.id,
+            entry_revision=1,
+            chunk_index=0,
+            text=entry.text,
+        )
+        operation_id = "preserved-revision-42-publication"
+        request_sha256 = _knowledge_publication_v1_request_sha256(
+            entry,
+            [chunk],
+            expected_revision=None,
+        )
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_entries (
+                    id, namespace, current_revision, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (entry.id, entry.namespace, 1, timestamp, timestamp),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_revisions (
+                    entry_id, revision, text, kind, visibility, status,
+                    created_by_type, created_by, created_at, updated_at,
+                    source_type, source_uri, source_id, source_hash,
+                    importance, importance_source, confidence, last_used_at,
+                    expires_at, title, metadata
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                """,
+                postgres_storage._knowledge_entry_row_values(entry),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_labels (
+                    entry_id, entry_revision, key, value
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (entry.id, 1, "project", "cayu"),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_chunks (
+                    id, entry_id, entry_revision, chunk_index,
+                    text, content_hash, source_uri, metadata
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                postgres_storage._knowledge_chunk_row_values(chunk),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_publication_receipts (
+                    operation_id, entry_id, entry_revision, expected_revision,
+                    request_sha256, entry_created_at, entry_updated_at,
+                    committed_at, access_snapshot
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    operation_id,
+                    entry.id,
+                    entry.revision,
+                    None,
+                    request_sha256,
+                    entry.created_at,
+                    entry.updated_at,
+                    timestamp,
+                    _knowledge_access_snapshot_json(_knowledge_access_snapshot(entry)),
+                ),
+            )
+            await connection.commit()
+
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            replay = await store.publish_entry_revision(
+                entry,
+                [chunk],
+                operation_id=operation_id,
+            )
+            assert replay.replayed is True
+            assert replay.committed_at == timestamp
+            assert await store.get_entry(entry.id) == entry
+            assert await store.read_chunks(entry.id) == [chunk]
+            evidence = await store.read_evidence(entry.id)
+            assert evidence is not None
+            assert evidence.evidence == []
+            assert evidence.total_evidence_known == 0
+            assert (await store.read_changes()).changes == []
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_revision_43_preserves_migrated_expiration_cleanup_audiences(
+    postgres_dsn: str,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu.storage import postgres as postgres_storage
+
+        await _drop_all(postgres_dsn)
+        revisions = schema_migrations.REVISIONS
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 42
+        )
+        revision_42_schema = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            await revision_42_schema.ensure_schema()
+        finally:
+            await revision_42_schema.close()
+            schema_migrations.REVISIONS = revisions
+
+        baseline = datetime.now(UTC)
+        future_expiry = baseline + timedelta(hours=1)
+        entries = (
+            KnowledgeEntry(
+                id="migrated-future-expiry",
+                text="Visible when the outbox baseline was established.",
+                labels={"expiry": "future"},
+                created_at=baseline,
+                updated_at=baseline,
+                expires_at=future_expiry,
+            ),
+            KnowledgeEntry(
+                id="migrated-past-expiry",
+                text="Already expired when the outbox baseline was established.",
+                labels={"expiry": "past"},
+                created_at=baseline - timedelta(hours=2),
+                updated_at=baseline - timedelta(hours=2),
+                expires_at=baseline - timedelta(hours=1),
+            ),
+        )
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            for entry in entries:
+                await cursor.execute(
+                    """
+                    INSERT INTO cayu_knowledge_entries (
+                        id, namespace, current_revision, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (entry.id, entry.namespace, 1, entry.created_at, entry.updated_at),
+                )
+                await cursor.execute(
+                    """
+                    INSERT INTO cayu_knowledge_revisions (
+                        entry_id, revision, text, kind, visibility, status,
+                        created_by_type, created_by, created_at, updated_at,
+                        source_type, source_uri, source_id, source_hash,
+                        importance, importance_source, confidence, last_used_at,
+                        expires_at, title, metadata
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                    )
+                    """,
+                    postgres_storage._knowledge_entry_row_values(entry),
+                )
+                await cursor.execute(
+                    """
+                    INSERT INTO cayu_knowledge_labels (
+                        entry_id, entry_revision, key, value
+                    ) VALUES (%s, %s, %s, %s)
+                    """,
+                    (entry.id, 1, "expiry", entry.labels["expiry"]),
+                )
+            await connection.commit()
+
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=None,
+        )
+        future_scope = KnowledgeAccessScope.for_namespace(
+            "default",
+            required_labels={"expiry": "future"},
+        )
+        past_scope = KnowledgeAccessScope.for_namespace(
+            "default",
+            required_labels={"expiry": "past"},
+        )
+        after_expiry = future_expiry + timedelta(hours=1)
+
+        class PostExpiryDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return after_expiry if tz is not None else after_expiry.replace(tzinfo=None)
+
+        try:
+            assert (
+                await store.get_entry(
+                    entries[0].id,
+                    access_scope=future_scope,
+                )
+                == entries[0]
+            )
+            assert await store.get_entry(entries[1].id, access_scope=past_scope) is None
+            monkeypatch.setattr(postgres_storage, "datetime", PostExpiryDatetime)
+            assert (
+                await store.prune_expired(
+                    access_scope=_ACCESS_SCOPE,
+                    now=after_expiry,
+                )
+                == 2
+            )
+            future_changes = await store.read_changes(access_scope=future_scope)
+            assert [change.kind for change in future_changes.changes] == [
+                KnowledgeChangeKind.EXPIRED
+            ]
+            assert future_changes.changes[0].entry_id == entries[0].id
+            assert (await store.read_changes(access_scope=past_scope)).changes == []
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_revision_43_rejects_out_of_contract_revision_42_identities(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu.storage import postgres as postgres_storage
+
+        await _drop_all(postgres_dsn)
+        revisions = schema_migrations.REVISIONS
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 42
+        )
+        revision_42_schema = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            await revision_42_schema.ensure_schema()
+        finally:
+            await revision_42_schema.close()
+            schema_migrations.REVISIONS = revisions
+
+        entry = KnowledgeEntry(id="bounded-entry", text="Valid revision-42 entry.")
+        oversized_chunk_id = "c" * (MAX_KNOWLEDGE_CHUNK_ID_BYTES + 1)
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_entries (
+                    id, namespace, current_revision, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (entry.id, entry.namespace, 1, entry.created_at, entry.updated_at),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_revisions (
+                    entry_id, revision, text, kind, visibility, status,
+                    created_by_type, created_by, created_at, updated_at,
+                    source_type, source_uri, source_id, source_hash,
+                    importance, importance_source, confidence, last_used_at,
+                    expires_at, title, metadata
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                """,
+                postgres_storage._knowledge_entry_row_values(entry),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_chunks (
+                    id, entry_id, entry_revision, chunk_index,
+                    text, content_hash, source_uri, metadata
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    oversized_chunk_id,
+                    entry.id,
+                    entry.revision,
+                    0,
+                    entry.text,
+                    None,
+                    None,
+                    "{}",
+                ),
+            )
+            await connection.commit()
+
+        migration = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(schema_migrations.SchemaTooOld, match="bounds knowledge"):
+                await migration.ensure_schema()
+        finally:
+            await migration.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert (await cursor.fetchone())[0] == 42
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_evidence')")
+            assert (await cursor.fetchone())[0] is None
+        await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
 
 
 def test_postgres_revision_migration_refuses_populated_legacy_knowledge_unchanged(
