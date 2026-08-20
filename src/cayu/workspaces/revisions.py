@@ -19,6 +19,8 @@ from pydantic import (
 from cayu._validation import require_durable_clean_nonblank
 from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
 
+_WORKSPACE_ATTRIBUTION_TEXT_MAX_CHARS = 256
+
 
 class WorkspaceRevisionObservationLimits(BaseModel):
     """Hard collection limits for workspace revision evidence."""
@@ -59,6 +61,163 @@ class WorkspaceRevisionDeltaStatus(StrEnum):
     FAILED = "failed"
     INCOMPLETE = "incomplete"
     TRUNCATED = "truncated"
+
+
+class WorkspaceMutationAttributionConfidence(StrEnum):
+    """How confidently an observed workspace change can be assigned."""
+
+    EXCLUSIVE_TOOL = "exclusive_tool"
+    CONCURRENT_AMBIGUITY = "concurrent_ambiguity"
+    EXTERNAL_OR_UNKNOWN = "external_or_unknown"
+    UNATTRIBUTED_FINALIZATION_CHANGE = "unattributed_finalization_change"
+
+
+class WorkspaceWriterIsolationStatus(StrEnum):
+    """Adapter evidence about writers outside one Cayu mutation window."""
+
+    EXCLUSIVE = "exclusive"
+    SHARED = "shared"
+    UNKNOWN = "unknown"
+
+
+class WorkspaceForkLineageStatus(StrEnum):
+    """Relationship between source and child workspaces at session fork."""
+
+    DERIVED = "derived"
+    SHARED_OR_AMBIGUOUS = "shared_or_ambiguous"
+    UNPROVEN = "unproven"
+
+
+class WorkspaceForkLineage(BaseModel):
+    """Bounded workspace lineage evidence for a transcript/session fork."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    status: WorkspaceForkLineageStatus
+    source_workspace_revision: str | None = None
+    detail_code: str = Field(max_length=_WORKSPACE_ATTRIBUTION_TEXT_MAX_CHARS)
+
+    @field_validator("source_workspace_revision")
+    @classmethod
+    def validate_optional_revision(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "source_workspace_revision")
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_lineage_detail(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "detail_code")
+
+    @model_validator(mode="after")
+    def validate_lineage_shape(self) -> WorkspaceForkLineage:
+        derived = self.status is WorkspaceForkLineageStatus.DERIVED
+        if derived != (self.source_workspace_revision is not None):
+            raise ValueError(
+                "Only demonstrably derived workspace lineage may carry a source revision."
+            )
+        return self
+
+
+class WorkspaceWriterIsolationEvidence(BaseModel):
+    """Bounded adapter evidence for workspace-writer isolation.
+
+    ``EXCLUSIVE`` is an adapter contract, not an inference from serialized tool
+    execution.  The same non-secret generation must be observed at both ends
+    of a mutation window before the runtime may use it for exact attribution.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    status: WorkspaceWriterIsolationStatus = WorkspaceWriterIsolationStatus.UNKNOWN
+    mechanism: str | None = Field(
+        default=None,
+        max_length=_WORKSPACE_ATTRIBUTION_TEXT_MAX_CHARS,
+    )
+    generation: str | None = Field(
+        default=None,
+        max_length=_WORKSPACE_ATTRIBUTION_TEXT_MAX_CHARS,
+    )
+    detail_code: str | None = Field(
+        default="writer_isolation_unavailable",
+        max_length=_WORKSPACE_ATTRIBUTION_TEXT_MAX_CHARS,
+    )
+
+    @field_validator("mechanism", "generation", "detail_code")
+    @classmethod
+    def validate_optional_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_evidence_shape(self) -> WorkspaceWriterIsolationEvidence:
+        if self.status is WorkspaceWriterIsolationStatus.EXCLUSIVE:
+            if self.mechanism is None or self.generation is None:
+                raise ValueError(
+                    "Exclusive workspace-writer isolation requires a mechanism and generation."
+                )
+            if self.detail_code is not None:
+                raise ValueError(
+                    "Exclusive workspace-writer isolation cannot carry a failure detail."
+                )
+        elif self.generation is not None:
+            raise ValueError("Non-exclusive workspace-writer isolation cannot carry a generation.")
+        return self
+
+
+class WorkspaceDirectMutationReconciliation(StrEnum):
+    """Agreement between direct workspace operations and observed revisions."""
+
+    NOT_OBSERVED = "not_observed"
+    CONSISTENT = "consistent"
+    INCOMPLETE = "incomplete"
+    CONTRADICTORY = "contradictory"
+    TRUNCATED = "truncated"
+
+
+class WorkspaceMutationAttribution(BaseModel):
+    """Conservative attribution attached to an observed workspace delta."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    confidence: WorkspaceMutationAttributionConfidence
+    writer_isolation: WorkspaceWriterIsolationStatus
+    overlap_detected: StrictBool = False
+    direct_reconciliation: WorkspaceDirectMutationReconciliation = (
+        WorkspaceDirectMutationReconciliation.NOT_OBSERVED
+    )
+    detail_code: str = Field(max_length=_WORKSPACE_ATTRIBUTION_TEXT_MAX_CHARS)
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "detail_code")
+
+    @model_validator(mode="after")
+    def validate_attribution_shape(self) -> WorkspaceMutationAttribution:
+        if (
+            self.confidence is WorkspaceMutationAttributionConfidence.EXCLUSIVE_TOOL
+            and self.writer_isolation is not WorkspaceWriterIsolationStatus.EXCLUSIVE
+        ):
+            raise ValueError("Exclusive tool attribution requires exclusive writer isolation.")
+        if (
+            self.confidence is WorkspaceMutationAttributionConfidence.EXCLUSIVE_TOOL
+            and self.overlap_detected
+        ):
+            raise ValueError("An overlapping mutation window cannot have exclusive attribution.")
+        if (
+            self.confidence is WorkspaceMutationAttributionConfidence.EXCLUSIVE_TOOL
+            and self.direct_reconciliation is WorkspaceDirectMutationReconciliation.CONTRADICTORY
+        ):
+            raise ValueError("Contradictory direct evidence cannot have exclusive attribution.")
+        if (
+            self.confidence
+            is WorkspaceMutationAttributionConfidence.UNATTRIBUTED_FINALIZATION_CHANGE
+            and self.writer_isolation is WorkspaceWriterIsolationStatus.EXCLUSIVE
+        ):
+            raise ValueError("Finalization-only change cannot claim tool-writer isolation.")
+        return self
 
 
 class WorkspaceIdentity(BaseModel):
@@ -355,7 +514,7 @@ _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS = frozenset({"change"})
 
 
 class WorkspaceRevisionDelta(BaseModel):
-    """Bounded attributable change between two observed revisions."""
+    """Bounded observed change between two revisions; it does not imply causation."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 

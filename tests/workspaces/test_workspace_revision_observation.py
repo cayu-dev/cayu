@@ -19,16 +19,79 @@ from cayu.workspaces import (
     LocalWorkspace,
     RunnerWorkspace,
     Workspace,
+    WorkspaceDirectMutationReconciliation,
+    WorkspaceForkLineage,
+    WorkspaceForkLineageStatus,
     WorkspaceIdentity,
     WorkspaceListResult,
+    WorkspaceMutationAttribution,
+    WorkspaceMutationAttributionConfidence,
     WorkspacePathRevision,
     WorkspaceReadResult,
     WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
+    WorkspaceWriterIsolationEvidence,
+    WorkspaceWriterIsolationStatus,
     compare_workspace_revisions,
 )
+
+
+def test_workspace_writer_isolation_defaults_to_unknown(tmp_path) -> None:
+    workspace = LocalWorkspace(tmp_path, workspace_id="workspace-1")
+    binding = DeterministicWorkspaceBinding()
+
+    async def bind():
+        return await binding.bind(workspace, None, session_id="session-1")
+
+    evidence = binding.observe_writer_isolation(asyncio.run(bind()))
+
+    assert evidence == WorkspaceWriterIsolationEvidence()
+    assert evidence.status is WorkspaceWriterIsolationStatus.UNKNOWN
+
+
+def test_workspace_writer_isolation_requires_inspectable_exclusive_generation() -> None:
+    with pytest.raises(ValidationError, match="requires a mechanism and generation"):
+        WorkspaceWriterIsolationEvidence(
+            status=WorkspaceWriterIsolationStatus.EXCLUSIVE,
+            detail_code=None,
+        )
+
+
+def test_workspace_writer_isolation_evidence_is_text_bounded() -> None:
+    with pytest.raises(ValidationError):
+        WorkspaceWriterIsolationEvidence(
+            status=WorkspaceWriterIsolationStatus.EXCLUSIVE,
+            mechanism="m" * 257,
+            generation="generation-1",
+            detail_code=None,
+        )
+
+
+def test_workspace_attribution_rejects_false_exclusive_causality() -> None:
+    with pytest.raises(ValidationError, match="requires exclusive writer isolation"):
+        WorkspaceMutationAttribution(
+            confidence=WorkspaceMutationAttributionConfidence.EXCLUSIVE_TOOL,
+            writer_isolation=WorkspaceWriterIsolationStatus.UNKNOWN,
+            direct_reconciliation=WorkspaceDirectMutationReconciliation.CONSISTENT,
+            detail_code="invalid_test_claim",
+        )
+
+
+def test_workspace_fork_lineage_only_allows_revision_for_proven_derivation() -> None:
+    shared = WorkspaceForkLineage(
+        status=WorkspaceForkLineageStatus.SHARED_OR_AMBIGUOUS,
+        detail_code="shared_live_workspace_not_isolated",
+    )
+    assert shared.source_workspace_revision is None
+
+    with pytest.raises(ValidationError, match="Only demonstrably derived"):
+        WorkspaceForkLineage(
+            status=WorkspaceForkLineageStatus.SHARED_OR_AMBIGUOUS,
+            source_workspace_revision="revision-1",
+            detail_code="invalid_shared_revision",
+        )
 
 
 def test_workspace_observation_rejects_duplicate_paths() -> None:

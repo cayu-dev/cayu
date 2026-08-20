@@ -44,6 +44,7 @@ from cayu.workspaces import (
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
+    WorkspaceWriterIsolationEvidence,
 )
 from cayu.workspaces._tar import tar_archive_size_bound
 from cayu.workspaces.revisions import (
@@ -489,6 +490,22 @@ class WorkspaceBinding(ABC):
             workspace_id=workspace_id,
             observer=type(self).__name__,
         )
+
+    def observe_writer_isolation(
+        self,
+        bound: BoundWorkspace,
+    ) -> WorkspaceWriterIsolationEvidence:
+        """Report inspectable writer-isolation evidence for one mutation window.
+
+        The compatibility default is deliberately unknown. Serial tool
+        dispatch, a process-local lock, or a stable workspace identity does not
+        prove that users, sibling processes, or background services cannot
+        mutate the same resource.
+        """
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("Workspace writer-isolation observation requires a BoundWorkspace.")
+        return WorkspaceWriterIsolationEvidence()
 
     async def _bind_for_environment_lifecycle(
         self,

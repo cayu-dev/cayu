@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -297,6 +297,7 @@ class InvocationWorkspaceHandle(Workspace):
 
     __slots__ = (
         "__capture_observer",
+        "__direct_mutation_observer",
         "__mutation_owner",
         "__redactor_snapshot_provider",
         "__workspace",
@@ -309,6 +310,7 @@ class InvocationWorkspaceHandle(Workspace):
         redactor_snapshot_provider: Callable[[], Any],
         capture_observer: Callable[[int], None],
         mutation_owner: InvocationWorkspaceMutationOwner | None = None,
+        direct_mutation_observer: Callable[[str, str, object], None] | None = None,
     ) -> None:
         if not isinstance(workspace, Workspace):
             raise TypeError("Invocation workspace delegate must implement Workspace.")
@@ -321,10 +323,13 @@ class InvocationWorkspaceHandle(Workspace):
             and type(mutation_owner) is not InvocationWorkspaceMutationOwner
         ):
             raise TypeError("Invocation workspace mutation owner is invalid.")
+        if direct_mutation_observer is not None and not callable(direct_mutation_observer):
+            raise TypeError("Invocation workspace mutation observer must be callable.")
         self.__workspace = workspace
         self.__redactor_snapshot_provider = redactor_snapshot_provider
         self.__capture_observer = capture_observer
         self.__mutation_owner = mutation_owner
+        self.__direct_mutation_observer = direct_mutation_observer
         self.id = workspace.id
 
     async def read_bytes(
@@ -433,13 +438,25 @@ class InvocationWorkspaceHandle(Workspace):
         return self.__workspace.bounded_read_limit(max_bytes)
 
     async def write_bytes(self, path: str, content: bytes) -> None:
-        await self._run_mutation(lambda: self.__workspace.write_bytes(path, content))
+        await self._run_mutation(
+            lambda: self.__workspace.write_bytes(path, content),
+            method="write_bytes",
+            path=path,
+        )
 
     async def delete(self, path: str) -> None:
-        await self._run_mutation(lambda: self.__workspace.delete(path))
+        await self._run_mutation(
+            lambda: self.__workspace.delete(path),
+            method="delete",
+            path=path,
+        )
 
     async def create_bytes(self, path: str, content: bytes):
-        return await self._run_mutation(lambda: self.__workspace.create_bytes(path, content))
+        return await self._run_mutation(
+            lambda: self.__workspace.create_bytes(path, content),
+            method="create_bytes",
+            path=path,
+        )
 
     async def replace_bytes(self, path: str, content: bytes, *, expected_revision: str):
         return await self._run_mutation(
@@ -447,7 +464,9 @@ class InvocationWorkspaceHandle(Workspace):
                 path,
                 content,
                 expected_revision=expected_revision,
-            )
+            ),
+            method="replace_bytes",
+            path=path,
         )
 
     async def delete_if_revision(self, path: str, *, expected_revision: str):
@@ -455,13 +474,30 @@ class InvocationWorkspaceHandle(Workspace):
             lambda: self.__workspace.delete_if_revision(
                 path,
                 expected_revision=expected_revision,
-            )
+            ),
+            method="delete_if_revision",
+            path=path,
         )
 
-    async def _run_mutation(self, operation_factory: Callable[[], Awaitable[Any]]) -> Any:
-        if self.__mutation_owner is None:
-            return await operation_factory()
-        return await self.__mutation_owner.run(operation_factory)
+    async def _run_mutation(
+        self,
+        operation_factory: Callable[[], Awaitable[Any]],
+        *,
+        method: str,
+        path: str,
+    ) -> Any:
+        result = (
+            await operation_factory()
+            if self.__mutation_owner is None
+            else await self.__mutation_owner.run(operation_factory)
+        )
+        if self.__direct_mutation_observer is not None:
+            # Evidence collection is best-effort after the delegate has
+            # authoritatively completed. It must never turn a committed
+            # workspace mutation into a reported tool failure.
+            with suppress(Exception):
+                self.__direct_mutation_observer(method, path, result)
+        return result
 
     async def list(self, pattern: str = "**/*", *, limit: int | None = None):
         return await self.__workspace.list(pattern, limit=limit)
@@ -862,6 +898,7 @@ def invocation_workspace_handle(
     redactor_snapshot_provider: Callable[[], Any],
     capture_observer: Callable[[int], None],
     mutation_owner: InvocationWorkspaceMutationOwner | None = None,
+    direct_mutation_observer: Callable[[str, str, object], None] | None = None,
 ) -> InvocationWorkspaceHandle | None:
     if workspace is None:
         return None
@@ -870,6 +907,7 @@ def invocation_workspace_handle(
         redactor_snapshot_provider=redactor_snapshot_provider,
         capture_observer=capture_observer,
         mutation_owner=mutation_owner,
+        direct_mutation_observer=direct_mutation_observer,
     )
 
 

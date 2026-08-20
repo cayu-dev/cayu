@@ -1503,6 +1503,28 @@ def test_read_file_wrapper_composes_expanded_redaction_read_with_backend_bound(t
     assert secret not in json.dumps(result.model_dump(mode="json"))
 
 
+def test_workspace_mutation_observer_failure_does_not_replace_completed_write(tmp_path) -> None:
+    observed: list[tuple[str, str]] = []
+
+    def fail_observation(method: str, path: str, result: object) -> None:
+        del result
+        observed.append((method, path))
+        raise ValueError("synthetic direct-evidence failure")
+
+    workspace = InvocationWorkspaceHandle(
+        LocalWorkspace(tmp_path),
+        redactor_snapshot_provider=lambda: None,
+        capture_observer=lambda _captured: None,
+        direct_mutation_observer=fail_observation,
+    )
+
+    result = asyncio.run(workspace.create_bytes(" leading.txt", b"committed"))
+
+    assert result.operation == "create"
+    assert observed == [("create_bytes", " leading.txt")]
+    assert (tmp_path / " leading.txt").read_bytes() == b"committed"
+
+
 def test_read_file_resolves_combined_caller_and_workspace_utf8_limits(tmp_path):
     secret = "TOKEN"
     (tmp_path / "four-byte.txt").write_text(f"😀{'x' * 40}")
