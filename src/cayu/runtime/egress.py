@@ -118,7 +118,12 @@ from cayu.runners.base import (
     runner_pending_command_settlement_cancellation_safe,
     runner_workspace_mutation_settlement,
 )
-from cayu.runners.workloads import BROWSER_FETCH_WORKLOAD_NAME, PINNED_BROWSER_FETCH_WORKLOAD
+from cayu.runners.workloads import (
+    BROWSER_FETCH_WORKLOAD_NAME,
+    BROWSER_SESSION_WORKLOAD_NAME,
+    PINNED_BROWSER_FETCH_WORKLOAD,
+    PINNED_BROWSER_SESSION_WORKLOAD,
+)
 from cayu.runtime._binding_cleanup import (
     BindingFinalizeFailure,
     binding_finalize_explicit_cancellation,
@@ -516,13 +521,19 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     def workload_authority(self, name: str):
         """Bind the built-in Docker factory to its exact selected workload image."""
 
-        if (
-            name != BROWSER_FETCH_WORKLOAD_NAME
-            or self._runner_kind != "docker"
-            or self._image != PINNED_BROWSER_FETCH_WORKLOAD.image
-        ):
+        if self._runner_kind != "docker":
             return None
-        return PINNED_BROWSER_FETCH_WORKLOAD
+        if (
+            name == BROWSER_FETCH_WORKLOAD_NAME
+            and self._image == PINNED_BROWSER_FETCH_WORKLOAD.image
+        ):
+            return PINNED_BROWSER_FETCH_WORKLOAD
+        if (
+            name == BROWSER_SESSION_WORKLOAD_NAME
+            and self._image == PINNED_BROWSER_SESSION_WORKLOAD.image
+        ):
+            return PINNED_BROWSER_SESSION_WORKLOAD
+        return None
 
     @property
     def configured_artifact_store(self) -> ArtifactStore | None:
@@ -657,6 +668,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 image=self._image,
                 binding=binding,
                 env_overlay=env_overlay,
+                env_overlay_secret_values_present=bool(grants),
                 ca_cert_host_path=ca_host,
                 guest_ca_path=guest_ca_path,
                 setup_commands=self._setup_commands,
@@ -1333,6 +1345,13 @@ class _EgressManagedRunner(Runner):
         """Forward an exact workload declaration owned by the inner runner."""
 
         return self._runner.workload_authority(name)
+
+    def output_secret_values_present(self) -> bool | None:
+        """Combine virtual-egress grants with the inner runner's authority."""
+
+        if self._output_redactor.has_values:
+            return True
+        return self._runner.output_secret_values_present()
 
     @property
     def closed(self) -> bool:

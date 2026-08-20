@@ -12,6 +12,11 @@ from cayu.tools.browser import (
     BrowserWebFetchAdapter,
     ScreenshotPageTool,
 )
+from cayu.tools.browser_session import (
+    BROWSER_SESSION_PROTOCOL_VERSION,
+    BROWSER_SESSION_WORKER_VERSION,
+    BrowserSessionTool,
+)
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (
     CommandPolicy,
@@ -74,6 +79,7 @@ from cayu.tools.web import (
 )
 from cayu.tools.webbridge import (
     DEFAULT_WEBBRIDGE_BROWSER_IMAGE,
+    DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
     WebBridge,
     WebBridgeCredentialAuthority,
     WebBridgeCredentialAuthorityProvider,
@@ -84,15 +90,19 @@ __all__ = [
     "BROWSER_FETCH_PLAYWRIGHT_VERSION",
     "BROWSER_FETCH_PROTOCOL_VERSION",
     "BROWSER_FETCH_WORKER_VERSION",
+    "BROWSER_SESSION_PROTOCOL_VERSION",
+    "BROWSER_SESSION_WORKER_VERSION",
     "DEFAULT_BROWSER_FETCH_MAX_DOM_NODES",
     "DEFAULT_BROWSER_FETCH_MAX_REQUESTS",
     "DEFAULT_BROWSER_FETCH_WORKER_COMMAND",
     "DEFAULT_WEBBRIDGE_BROWSER_IMAGE",
+    "DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE",
     "MAX_BROWSER_FETCH_MAX_DOM_NODES",
     "MAX_BROWSER_FETCH_MAX_REQUESTS",
     "ArtifactReadRequest",
     "ArtifactReader",
     "BackgroundSubagentTaskRegistry",
+    "BrowserSessionTool",
     "BrowserWebFetchAdapter",
     "CommandPolicy",
     "CommandPolicyDecision",

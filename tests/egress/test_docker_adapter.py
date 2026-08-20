@@ -146,6 +146,46 @@ def test_create_runner_forwards_explicit_docker_cli_grants(monkeypatch) -> None:
     assert observed["kwargs"]["docker_cli_env_allowlist"] == ("AWS_PROFILE",)
 
 
+@pytest.mark.parametrize("output_secret_values_present", (False, True))
+def test_create_runner_forwards_runtime_owned_overlay_secret_authority(
+    monkeypatch,
+    output_secret_values_present: bool,
+) -> None:
+    observed: dict[str, object] = {}
+    expected_runner = object()
+
+    class FakeDockerRunner:
+        @classmethod
+        async def create(cls, name: str, **kwargs):
+            observed.update(name=name, kwargs=kwargs)
+            return expected_runner
+
+    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", FakeDockerRunner)
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        proxy_host="127.0.0.1",
+    )
+    request = VirtualEgressRunnerRequest(
+        name="browser-worker",
+        runner_kind="docker",
+        image="cayu-browser-fetch:2",
+        binding=EgressBinding(runner_kind="docker", network="internal"),
+        env_overlay={"HTTPS_PROXY": "http://proxy:8080"},
+        env_overlay_secret_values_present=output_secret_values_present,
+        ca_cert_host_path="/tmp/ca.pem",
+        guest_ca_path=GUEST_CA_PATH,
+        setup_commands=(),
+        egress_destinations=(),
+    )
+
+    runner = asyncio.run(adapter.create_runner(request))
+
+    assert runner is expected_runner
+    assert observed["kwargs"]["_env_overlay_secret_values_present"] is (
+        output_secret_values_present
+    )
+
+
 def test_create_runner_forwards_explicit_seccomp_profile(monkeypatch, tmp_path) -> None:
     observed: dict[str, object] = {}
     expected_runner = object()

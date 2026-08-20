@@ -806,6 +806,15 @@ class Runner(ABC):
                 vars(self)["_cayu_execution_environment_authority"] = authority
         return authority
 
+    def output_secret_values_present(self) -> bool | None:
+        """Report whether command output can contain runner-owned secret values.
+
+        ``None`` is fail-closed unknown authority. Wrappers must merge their own
+        secret registry with the wrapped runner's declaration.
+        """
+
+        return None
+
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
         """Return a stable application declaration, or ``None`` when non-portable."""

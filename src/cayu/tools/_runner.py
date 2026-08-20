@@ -276,6 +276,14 @@ class InvocationRunnerHandle:
             profile_identity=authority.profile_identity,
         )
 
+    def output_secret_values_present(self) -> bool | None:
+        """Return detached runner output-secret authority without any values."""
+
+        present = self.__runner.output_secret_values_present()
+        if present is not None and type(present) is not bool:
+            raise TypeError("Runner output_secret_values_present() must return bool or None.")
+        return present
+
     async def exec(
         self,
         command: ExecCommand,

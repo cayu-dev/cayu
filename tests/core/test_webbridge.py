@@ -40,7 +40,9 @@ from cayu.environments import (
 from cayu.proxies import ProxyAuthorizationResult
 from cayu.runners import (
     BROWSER_FETCH_WORKLOAD_NAME,
+    BROWSER_SESSION_WORKLOAD_NAME,
     PINNED_BROWSER_FETCH_WORKLOAD,
+    PINNED_BROWSER_SESSION_WORKLOAD,
     ExecCommand,
     ExecResult,
     Runner,
@@ -86,10 +88,12 @@ class _BrowserRunner(Runner):
         candidate: ExecutionAdmissionCandidate | None = None,
         *,
         environment_authority: ExecutionEnvironmentAuthority = _BROWSER_ENVIRONMENT_AUTHORITY,
+        interactive: bool = False,
     ) -> None:
         super().__init__()
         self._candidate = candidate or _browser_candidate()
         self._environment_authority = environment_authority
+        self._interactive = interactive
 
     async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
         del command, kwargs
@@ -102,9 +106,11 @@ class _BrowserRunner(Runner):
         return self._environment_authority
 
     def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None:
-        if name != BROWSER_FETCH_WORKLOAD_NAME:
-            return None
-        return PINNED_BROWSER_FETCH_WORKLOAD
+        if self._interactive and name == BROWSER_SESSION_WORKLOAD_NAME:
+            return PINNED_BROWSER_SESSION_WORKLOAD
+        if not self._interactive and name == BROWSER_FETCH_WORKLOAD_NAME:
+            return PINNED_BROWSER_FETCH_WORKLOAD
+        return None
 
 
 class _ImplicitAuthorityBrowserRunner(_BrowserRunner):
@@ -538,7 +544,7 @@ def test_sandboxed_profile_validates_and_binds_setup_authorities(tmp_path: Path)
 
     bridge = WebBridge.sandboxed_browser(
         environment=environment,
-        browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
     )
 
     assert bridge.kind is WebBridgeProfileKind.SANDBOXED_BROWSER
@@ -562,7 +568,7 @@ def test_sandboxed_static_profile_binds_one_exact_runner_instance(tmp_path: Path
             runner=configured_runner,
             artifact_store=LocalArtifactStore(tmp_path / "artifacts"),
         ),
-        browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
     )
 
     assert bridge.environment_authority == configured_runner.execution_environment_authority()
@@ -570,6 +576,92 @@ def test_sandboxed_static_profile_binds_one_exact_runner_instance(tmp_path: Path
         bridge.environment_authority
         != _ImplicitAuthorityBrowserRunner().execution_environment_authority()
     )
+
+
+def test_sandboxed_interactive_profile_exposes_one_closed_browser_session_tool(
+    tmp_path: Path,
+) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "interactive-artifacts")
+    environment = Environment(
+        EnvironmentSpec(name="browser"),
+        runner=_BrowserRunner(interactive=True),
+        artifact_store=artifact_store,
+    )
+
+    bridge = WebBridge.sandboxed_browser(
+        environment=environment,
+        browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+        interactive=True,
+        interactive_options={
+            "max_dom_nodes": 500,
+            "max_parent_sessions": 2,
+            "max_sessions": 1,
+            "max_operations": 32,
+        },
+    )
+
+    assert [tool.spec.name for tool in bridge.tools] == ["browser_session"]
+    assert bridge.browser_protocol == "cayu.browser-session.v1"
+    assert bridge.browser_worker_version == "4"
+    assert bridge.playwright_version == BROWSER_FETCH_PLAYWRIGHT_VERSION
+    tool = bridge.tools[0]
+    assert tool.max_dom_nodes == 500
+    assert tool.max_parent_sessions == 2
+    assert tool.max_sessions == 1
+    assert tool.max_operations == 32
+
+    with pytest.raises(ValueError, match="cannot override"):
+        WebBridge.sandboxed_browser(
+            environment=Environment(
+                EnvironmentSpec(name="browser-fetch"),
+                runner=_BrowserRunner(),
+                artifact_store=artifact_store,
+            ),
+            browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
+            screenshot_options={"max_sessions": 1},
+        )
+
+
+def test_sandboxed_interactive_profile_rejects_different_environment_authority(
+    tmp_path: Path,
+) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "interactive-artifacts")
+    configured_runner = _BrowserRunner(interactive=True)
+    bridge = WebBridge.sandboxed_browser(
+        environment=Environment(
+            EnvironmentSpec(name="browser"),
+            runner=configured_runner,
+            artifact_store=artifact_store,
+        ),
+        browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+        interactive=True,
+    )
+    active_runner = _BrowserRunner(
+        environment_authority=ExecutionEnvironmentAuthority(
+            identity="different-browser-environment",
+            profile_identity="different-browser-profile",
+        ),
+        interactive=True,
+    )
+
+    result = asyncio.run(
+        bridge.tools[0].run(
+            ToolContext(
+                session_id="mismatch",
+                artifact_store_id=artifact_store.id,
+                artifact_store=artifact_store,
+                runner=active_runner,
+            ),
+            {
+                "operation": "navigate",
+                "url": "https://docs.example.com/",
+                "operation_id": "navigate-mismatch-1",
+            },
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured["error"] == "capability_refused"
 
 
 def test_sandboxed_profile_registers_with_factory_backed_virtual_egress(
@@ -590,13 +682,13 @@ def test_sandboxed_profile_registers_with_factory_backed_virtual_egress(
             )
         ],
         runner_kind="docker",
-        image="cayu-browser-fetch:3-playwright-1.62.0",
+        image=PINNED_BROWSER_FETCH_WORKLOAD.image,
         artifact_store=artifact_store,
     )
 
     bridge = WebBridge.sandboxed_browser(
         environment=factory,
-        browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
     )
     app = CayuApp(enable_logging=False)
     app.register_environment_factory(
@@ -637,7 +729,7 @@ def test_sandboxed_profile_rejects_same_candidate_from_different_factory_authori
             )
         ],
         runner_kind="docker",
-        image="cayu-browser-fetch:3-playwright-1.62.0",
+        image=PINNED_BROWSER_FETCH_WORKLOAD.image,
         artifact_store=configured_store,
         execution_profile_identity=shared_profile_identity,
     )
@@ -659,13 +751,13 @@ def test_sandboxed_profile_rejects_same_candidate_from_different_factory_authori
             ),
         ],
         runner_kind="docker",
-        image="cayu-browser-fetch:3-playwright-1.62.0",
+        image=PINNED_BROWSER_FETCH_WORKLOAD.image,
         artifact_store=configured_store,
         execution_profile_identity=shared_profile_identity,
     )
     bridge = WebBridge.sandboxed_browser(
         environment=restrictive,
-        browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
     )
     active_runner = _BrowserRunner(environment_authority=broader.execution_environment_authority())
 
@@ -704,13 +796,13 @@ def test_sandboxed_profile_reconstructs_fetch_and_screenshot_identity_after_rest
                 )
             ],
             runner_kind="docker",
-            image="cayu-browser-fetch:3-playwright-1.62.0",
+            image=PINNED_BROWSER_FETCH_WORKLOAD.image,
             artifact_store=artifact_store,
             execution_profile_identity=profile_identity,
         )
         bridge = WebBridge.sandboxed_browser(
             environment=factory,
-            browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+            browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
         )
         app = CayuApp(enable_logging=False)
         app.register_provider(ScriptedModelProvider([]), default=True)
@@ -747,6 +839,39 @@ def test_sandboxed_profile_reconstructs_fetch_and_screenshot_identity_after_rest
     assert first.execution_profile == restarted.execution_profile
 
 
+def test_interactive_profile_registers_with_factory_without_allocating(
+    tmp_path: Path,
+) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "interactive-factory-artifacts")
+    factory = VirtualEgressEnvironmentFactory(
+        policies={
+            "public-docs": BrowserEgressPolicy(
+                name="public-docs",
+                allowed_hosts=["docs.example.com"],
+                allowed_path_prefixes=["/"],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="docs.example.com",
+                policy_name="public-docs",
+            )
+        ],
+        runner_kind="docker",
+        image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+        artifact_store=artifact_store,
+    )
+
+    bridge = WebBridge.sandboxed_browser(
+        environment=factory,
+        browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+        interactive=True,
+    )
+
+    assert [tool.spec.name for tool in bridge.tools] == ["browser_session"]
+    assert bridge.artifact_store_id == artifact_store.id
+
+
 def test_sandboxed_profile_never_dispatches_a_different_runner_candidate(
     tmp_path: Path,
 ) -> None:
@@ -757,7 +882,7 @@ def test_sandboxed_profile_never_dispatches_a_different_runner_candidate(
             runner=_BrowserRunner(),
             artifact_store=configured_store,
         ),
-        browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
     )
     active_runner = _BrowserRunner(_browser_candidate(identity="other-browser-runner"))
 
@@ -781,7 +906,7 @@ def test_sandboxed_profile_revalidates_materialized_worker_authority(
             runner=_BrowserRunner(),
             artifact_store=LocalArtifactStore(tmp_path / "configured-artifacts"),
         ),
-        browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
     )
 
     result = asyncio.run(
@@ -826,7 +951,7 @@ def test_sandboxed_profile_never_publishes_to_a_different_artifact_store(
             runner=_BrowserRunner(),
             artifact_store=configured_store,
         ),
-        browser_image="cayu-browser-fetch:3-playwright-1.62.0",
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
     )
 
     result = asyncio.run(
@@ -852,7 +977,7 @@ def test_sandboxed_profile_never_publishes_to_a_different_artifact_store(
                 EnvironmentSpec(name="browser"),
                 artifact_store=LocalArtifactStore(tmp_path / "missing-runner"),
             ),
-            "cayu-browser-fetch:3-playwright-1.62.0",
+            PINNED_BROWSER_FETCH_WORKLOAD.image,
             "runner",
         ),
         (
@@ -861,7 +986,7 @@ def test_sandboxed_profile_never_publishes_to_a_different_artifact_store(
                 runner=_BrowserRunner(_browser_candidate(omit="brokered_egress")),
                 artifact_store=LocalArtifactStore(tmp_path / "bad-runner"),
             ),
-            "cayu-browser-fetch:3-playwright-1.62.0",
+            PINNED_BROWSER_FETCH_WORKLOAD.image,
             "brokered browser execution",
         ),
         (
@@ -869,7 +994,7 @@ def test_sandboxed_profile_never_publishes_to_a_different_artifact_store(
                 EnvironmentSpec(name="browser"),
                 runner=_BrowserRunner(),
             ),
-            "cayu-browser-fetch:3-playwright-1.62.0",
+            PINNED_BROWSER_FETCH_WORKLOAD.image,
             "artifact store",
         ),
         (
@@ -887,7 +1012,7 @@ def test_sandboxed_profile_never_publishes_to_a_different_artifact_store(
                 runner=_RunnerWithoutBrowserWorkerAuthority(),
                 artifact_store=LocalArtifactStore(tmp_path / "missing-worker"),
             ),
-            "cayu-browser-fetch:3-playwright-1.62.0",
+            PINNED_BROWSER_FETCH_WORKLOAD.image,
             "image and worker",
         ),
     ],

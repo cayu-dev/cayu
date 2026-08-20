@@ -43,9 +43,25 @@ def test_docker_runner_declares_browser_workload_only_for_exact_image() -> None:
         image="browser:latest",
         docker_path="/usr/bin/docker",
     )
+    credentialed = DockerRunner(
+        "credentialed-browser",
+        image=PINNED_BROWSER_FETCH_WORKLOAD.image,
+        docker_path="/usr/bin/docker",
+        secret_env={"AUTH_TOKEN": SecretRef(name="browser_auth")},
+        secret_resolver=StaticVault({"browser_auth": "browser-secret-canary"}),
+    )
+    overlaid = DockerRunner(
+        "overlaid-browser",
+        image=PINNED_BROWSER_FETCH_WORKLOAD.image,
+        docker_path="/usr/bin/docker",
+        env_overlay={"WORKLOAD_TOKEN": "overlay-secret-canary"},
+    )
 
     assert pinned.workload_authority(BROWSER_FETCH_WORKLOAD_NAME) == (PINNED_BROWSER_FETCH_WORKLOAD)
     assert other.workload_authority(BROWSER_FETCH_WORKLOAD_NAME) is None
+    assert pinned.output_secret_values_present() is False
+    assert credentialed.output_secret_values_present() is True
+    assert overlaid.output_secret_values_present() is True
 
 
 def test_docker_cli_helper_environment_is_operationally_allowlisted(monkeypatch):

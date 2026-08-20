@@ -29,6 +29,7 @@ from cayu.core import (
     ToolSpec,
 )
 from cayu.egress import (
+    ApprovedEgressDestination,
     CapturedRequest,
     CapturedResponse,
     CredentialMode,
@@ -97,6 +98,7 @@ from cayu.workspaces import (
 pytest.importorskip("cryptography")
 
 from cayu.egress.adapter import (
+    VirtualEgressRunnerRequest,
     _await_bounded_cleanup_task,
     _raise_primary_with_cleanup_cancellation,
 )
@@ -1109,6 +1111,69 @@ def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch)
         assert event.agent_name == "agent"
         assert event.payload["execution_profile_fingerprint"] == "a" * 64
         assert REAL_SECRET not in str(event.payload)
+
+
+@pytest.mark.parametrize(
+    ("credentials", "expected_present"),
+    (((), False), ((_credential_spec(),), True)),
+)
+def test_factory_propagates_overlay_secret_authority_through_managed_handle(
+    credentials: tuple[VirtualCredentialSpec, ...],
+    expected_present: bool,
+) -> None:
+    class _AuthorityRunner(_FakeDockerRunner):
+        def output_secret_values_present(self) -> bool | None:
+            return self.kwargs.get("env_overlay_secret_values_present")
+
+    async def runner_factory(request: VirtualEgressRunnerRequest) -> Runner:
+        return _AuthorityRunner(
+            request.name,
+            env_overlay_secret_values_present=request.env_overlay_secret_values_present,
+        )
+
+    adapter = _RecordingAdapter(runner_factory=runner_factory)
+
+    async def run() -> tuple[bool | None, bool | None, bool | None]:
+        result = await _virtual_factory(
+            adapter=adapter,
+            credentials=credentials,
+            approved_destinations=(
+                ApprovedEgressDestination(
+                    destination="api.stripe.com",
+                    policy_name=POLICY_NAME,
+                ),
+            ),
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id=f"sess_output_secret_authority_{expected_present}",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        handle = InvocationRunnerHandle(
+            runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+        )
+        try:
+            request = adapter.captured["runner_request"]
+            return (
+                request.env_overlay_secret_values_present,
+                runner.output_secret_values_present(),
+                handle.output_secret_values_present(),
+            )
+        finally:
+            await runner.close()
+
+    assert asyncio.run(run()) == (
+        expected_present,
+        expected_present,
+        expected_present,
+    )
 
 
 def test_egress_wrapped_runner_failure_preserves_backend_identity() -> None:

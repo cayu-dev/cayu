@@ -19,6 +19,7 @@ import pytest
 from cayu import (
     ApprovedEgressDestination,
     BrowserEgressPolicy,
+    BrowserSessionTool,
     BrowserWebFetchAdapter,
     ExecCommand,
     LocalArtifactStore,
@@ -30,6 +31,7 @@ from cayu.egress import CapturedRequest, CapturedResponse, HttpxUpstream
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.environments import EnvironmentFactoryRequest
 from cayu.runners.docker import DockerRunner
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime.egress import VirtualEgressEnvironmentFactory
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
@@ -37,7 +39,7 @@ from cayu.vaults import SecretRedactor
 
 _BROWSER_IMAGE = os.environ.get(
     "CAYU_BROWSER_FETCH_IMAGE",
-    "cayu-browser-fetch:3-playwright-1.62.0-test",
+    PINNED_BROWSER_SESSION_WORKLOAD.image,
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SECCOMP_PROFILE = _REPOSITORY_ROOT / "examples" / "browser_fetch" / "seccomp_profile.json"
@@ -141,6 +143,24 @@ class _BrowserFixtureHandler(http.server.BaseHTTPRequestHandler):
 </main></body></html>"""
             self._send(200, "text/html; charset=utf-8", body)
             return
+        if self.path == "/interactive":
+            body = b"""<!doctype html>
+<html><head><title>Interactive form</title></head>
+<body><main>
+<label for="name">Name</label><input id="name" aria-label="Name">
+<button type="button" id="save">Save</button>
+<p id="result">Not saved</p>
+<script>
+document.querySelector('#save').addEventListener('click', () => {
+  const value = document.querySelector('#name').value;
+  document.querySelector('#result').textContent = `Saved ${value}`;
+  document.title = `Saved ${value}`;
+  localStorage.setItem('saved-name', value);
+});
+</script>
+</main></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
         if self.path == "/navigation":
             body = b"""<!doctype html>
 <html><head><title>Navigation</title></head>
@@ -190,6 +210,34 @@ for (let index = 0; index < 8; index += 1) {
 <html><body><script>
 window.open('https://docs.browser.test/popup-target');
 </script><main>primary page</main></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/interactive-popup-guard":
+            body = b"""<!doctype html>
+<html><head><base target="_blank"><title>Popup guard</title></head>
+<body><a href="https://docs.browser.test/interactive-popup-target">Open target</a><script>
+Window.prototype.open.call(window, 'https://docs.browser.test/interactive-popup-target');
+document.querySelector('a').click();
+</script></body></html>"""
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/interactive-accessibility-amplification":
+            label = "x" * 100_000
+            controls = '<button aria-labelledby="label"></button>' * 500
+            body = (
+                "<!doctype html><html><head><title>Amplified accessibility</title></head>"
+                f'<body><div id="label">{label}</div>{controls}</body></html>'
+            ).encode()
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/interactive-accessibility-url-amplification":
+            body = b"""<!doctype html><html><head><title>URL amplification</title></head>
+<body><a id="large-link">Open deployment console</a><script>
+document.querySelector('#large-link').setAttribute(
+  'href',
+  'https://docs.browser.test/' + 'x'.repeat(300000),
+);
+</script></body></html>"""
             self._send(200, "text/html; charset=utf-8", body)
             return
         if self.path == "/mutating-extraction":
@@ -384,6 +432,187 @@ async def _drive_browser_fetch() -> dict[str, Any]:
         assert type(screenshot_artifact_id) is str
         screenshot_read = await artifact_store.read_bytes(
             screenshot_artifact_id,
+        )
+        browser_session_tool = BrowserSessionTool(
+            expected_runner_candidate="docker",
+            max_snapshot_bytes=32 * 1024,
+            max_refs=64,
+            max_artifact_bytes=1024 * 1024,
+            max_wait_ms=30_000,
+        )
+        interactive_context = ToolContext(
+            session_id="browser-fetch-e2e",
+            agent_name="agent",
+            environment_name="browser",
+            idempotency_key="browser-interactive-e2e",
+            runner=handle,
+            artifact_store=environment_artifact_store,
+        )
+        interactive_navigate = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive",
+                "operation_id": "interactive-navigate-1",
+            },
+        )
+        assert interactive_navigate.is_error is False
+        interactive_open = dict(interactive_navigate.structured or {})
+        interactive_popup_guard = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive-popup-guard",
+                "operation_id": "interactive-popup-guard-1",
+            },
+        )
+        assert interactive_popup_guard.is_error is False
+        popup_guard_open = dict(interactive_popup_guard.structured or {})
+        interactive_popup_close = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "close",
+                "session_id": popup_guard_open["session_id"],
+                "operation_id": "interactive-popup-close-1",
+            },
+        )
+        interactive_accessibility_amplification = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive-accessibility-amplification",
+                "operation_id": "interactive-accessibility-amplification-1",
+            },
+        )
+        interactive_accessibility_url_amplification = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive-accessibility-url-amplification",
+                "operation_id": "interactive-accessibility-url-amplification-1",
+            },
+        )
+        idle_browser_session_tool = BrowserSessionTool(
+            expected_runner_candidate="docker",
+            max_sessions=1,
+            max_snapshot_bytes=32 * 1024,
+            max_refs=64,
+            max_artifact_bytes=1024 * 1024,
+            max_wait_ms=30_000,
+            idle_timeout_seconds=1,
+        )
+        idle_navigate = await idle_browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive",
+                "operation_id": "interactive-idle-navigate-1",
+            },
+        )
+        assert idle_navigate.is_error is False
+        idle_open = dict(idle_navigate.structured or {})
+        assert idle_open["idle_timeout_seconds"] == 1
+        await asyncio.sleep(4)
+        idle_expired = await idle_browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "observe",
+                "session_id": idle_open["session_id"],
+                "page_id": idle_open["page_id"],
+            },
+        )
+        idle_replacement = await idle_browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive",
+                "operation_id": "interactive-idle-replacement-1",
+            },
+        )
+        assert idle_replacement.is_error is False
+        idle_replacement_open = dict(idle_replacement.structured or {})
+        idle_replacement_close = await idle_browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "close",
+                "session_id": idle_replacement_open["session_id"],
+                "operation_id": "interactive-idle-replacement-close-1",
+            },
+        )
+        name_ref = _snapshot_ref(interactive_open["snapshot"], "Name")
+        interactive_fill = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "fill",
+                "session_id": interactive_open["session_id"],
+                "page_id": interactive_open["page_id"],
+                "expected_revision": interactive_open["revision"],
+                "ref": name_ref,
+                "value": "Alice",
+                "operation_id": "interactive-fill-1",
+            },
+        )
+        assert interactive_fill.is_error is False
+        interactive_filled = dict(interactive_fill.structured or {})
+        save_ref = _snapshot_ref(interactive_filled["snapshot"], "Save")
+        interactive_click = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "click",
+                "session_id": interactive_filled["session_id"],
+                "page_id": interactive_filled["page_id"],
+                "expected_revision": interactive_filled["revision"],
+                "ref": save_ref,
+                "operation_id": "interactive-click-1",
+            },
+        )
+        assert interactive_click.is_error is False
+        interactive_clicked = dict(interactive_click.structured or {})
+        interactive_screenshot = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "screenshot",
+                "session_id": interactive_clicked["session_id"],
+                "page_id": interactive_clicked["page_id"],
+                "expected_revision": interactive_clicked["revision"],
+                "operation_id": "interactive-screenshot-1",
+            },
+        )
+        assert interactive_screenshot.is_error is False
+        interactive_shot = dict(interactive_screenshot.structured or {})
+        interactive_close = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "close",
+                "session_id": interactive_clicked["session_id"],
+                "operation_id": "interactive-close-1",
+            },
+        )
+        interactive_denied = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://blocked.browser.test/private",
+                "operation_id": "interactive-denied-1",
+            },
+        )
+        interactive_replacement = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive",
+                "operation_id": "interactive-replacement-1",
+            },
+        )
+        assert interactive_replacement.is_error is False
+        interactive_replacement_open = dict(interactive_replacement.structured or {})
+        interactive_replacement_close = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "close",
+                "session_id": interactive_replacement_open["session_id"],
+                "operation_id": "interactive-replacement-close-1",
+            },
         )
         screenshot_denied = await screenshot_tool.run(
             ToolContext(
@@ -685,6 +914,26 @@ asyncio.run(main())
             "worker_integrity_probe": worker_integrity_probe,
             "network_probe": network_probe,
             "screenshot_stability_probe": screenshot_stability_probe,
+            "interactive_navigate": interactive_navigate,
+            "interactive_popup_guard": interactive_popup_guard,
+            "interactive_popup_close": interactive_popup_close,
+            "interactive_accessibility_amplification": (interactive_accessibility_amplification),
+            "interactive_accessibility_url_amplification": (
+                interactive_accessibility_url_amplification
+            ),
+            "idle_expired": idle_expired,
+            "idle_replacement": idle_replacement,
+            "idle_replacement_close": idle_replacement_close,
+            "interactive_fill": interactive_fill,
+            "interactive_click": interactive_click,
+            "interactive_screenshot": interactive_screenshot,
+            "interactive_screenshot_artifact": await artifact_store.read_bytes(
+                interactive_shot["artifacts"][0]["artifact_id"]
+            ),
+            "interactive_close": interactive_close,
+            "interactive_denied": interactive_denied,
+            "interactive_replacement": interactive_replacement,
+            "interactive_replacement_close": interactive_replacement_close,
             "requests": tuple((request.host, request.path) for request in upstream.requests),
         }
     finally:
@@ -704,6 +953,13 @@ asyncio.run(main())
 def browser_fetch_results(browser_fetch_image: None) -> dict[str, Any]:
     del browser_fetch_image
     return asyncio.run(_drive_browser_fetch())
+
+
+def _snapshot_ref(snapshot: str, label: str) -> str:
+    for line in snapshot.splitlines():
+        if label in line and "[ref=" in line:
+            return line.split("[ref=", 1)[1].split("]", 1)[0]
+    raise AssertionError(f"Missing {label!r} ref in interactive browser snapshot: {snapshot}")
 
 
 def test_browser_fetch_renders_javascript_through_managed_virtual_egress(
@@ -730,6 +986,83 @@ def test_browser_fetch_renders_javascript_through_managed_virtual_egress(
     assert ("docs.browser.test", "/start") in browser_fetch_results["requests"]
     assert ("docs.browser.test", "/guide") in browser_fetch_results["requests"]
     assert ("static.browser.test", "/render.js") in browser_fetch_results["requests"]
+
+
+def test_interactive_browser_preserves_state_and_publishes_artifacts(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    navigated = browser_fetch_results["interactive_navigate"]
+    filled = browser_fetch_results["interactive_fill"]
+    clicked = browser_fetch_results["interactive_click"]
+    screenshot = browser_fetch_results["interactive_screenshot"]
+
+    assert navigated.structured["backend_identity"]["backend"] == "playwright"
+    assert navigated.structured["backend_identity"]["backend_version"] == "1.62.0"
+    assert filled.structured["revision"] != navigated.structured["revision"]
+    assert clicked.structured["title"] == "Saved Alice"
+    assert "Saved Alice" in clicked.structured["snapshot"]
+    assert len(screenshot.artifacts) == 1
+    stored = browser_fetch_results["interactive_screenshot_artifact"]
+    assert stored.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert browser_fetch_results["interactive_close"].structured["closed"] is True
+    denied = browser_fetch_results["interactive_denied"].structured
+    assert set(denied) == {"error", "execution", "session_id", "page_id"}
+    assert denied["error"] == "destination_denied"
+    assert denied["execution"] == {
+        "admission": "admitted",
+        "dispatch": "completed",
+        "observation": "not_published",
+        "terminal": "settled",
+    }
+    assert denied["session_id"].startswith("bs_")
+    assert denied["page_id"].startswith("bp_")
+    assert ("blocked.browser.test", "/private") not in browser_fetch_results["requests"]
+
+
+def test_interactive_browser_blocks_inherited_and_prototype_popup_entrances(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    opened = browser_fetch_results["interactive_popup_guard"]
+    closed = browser_fetch_results["interactive_popup_close"]
+
+    assert opened.is_error is False
+    assert opened.structured["url"] == "https://docs.browser.test/interactive-popup-guard"
+    assert closed.structured["closed"] is True
+    assert ("docs.browser.test", "/interactive-popup-target") not in browser_fetch_results[
+        "requests"
+    ]
+
+
+def test_interactive_browser_rejects_accessibility_amplification_before_snapshot(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["interactive_accessibility_amplification"]
+
+    assert result.is_error is True
+    assert result.structured["error"] == "oversized_snapshot"
+
+
+def test_interactive_browser_rejects_url_materialization_before_snapshot(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["interactive_accessibility_url_amplification"]
+
+    assert result.is_error is True
+    assert result.structured["error"] == "oversized_snapshot"
+
+
+def test_interactive_browser_releases_capacity_after_idle_and_initial_failure(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    idle_expired = browser_fetch_results["idle_expired"]
+    denied = browser_fetch_results["interactive_denied"]
+
+    assert idle_expired.structured["error"] == "session_closed"
+    assert browser_fetch_results["idle_replacement"].is_error is False
+    assert browser_fetch_results["idle_replacement_close"].structured["closed"] is True
+    assert denied.structured["error"] == "destination_denied"
+    assert browser_fetch_results["interactive_replacement"].is_error is False
+    assert browser_fetch_results["interactive_replacement_close"].structured["closed"] is True
 
 
 def test_screenshot_page_returns_an_artifact_backed_model_image_without_bypassing_egress(

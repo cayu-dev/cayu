@@ -413,6 +413,7 @@ class VirtualEgressRunnerRequest:
     parent_session_id: str | None = None
     reconnect_metadata: Mapping[str, Any] = field(default_factory=dict)
     environment_name: str | None = None
+    env_overlay_secret_values_present: bool | None = None
 
 
 class SandboxEgressAdapter(ABC):

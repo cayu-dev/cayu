@@ -51,7 +51,12 @@ from cayu.runners.base import (
     attach_cancellation_artifacts,
     copy_exec_command,
 )
-from cayu.runners.workloads import BROWSER_FETCH_WORKLOAD_NAME, PINNED_BROWSER_FETCH_WORKLOAD
+from cayu.runners.workloads import (
+    BROWSER_FETCH_WORKLOAD_NAME,
+    BROWSER_SESSION_WORKLOAD_NAME,
+    PINNED_BROWSER_FETCH_WORKLOAD,
+    PINNED_BROWSER_SESSION_WORKLOAD,
+)
 from cayu.vaults import (
     SecretEnv,
     SecretRedactor,
@@ -373,6 +378,7 @@ class DockerRunner(Runner):
         credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
         allow_raw_secret_env: bool = True,
         env_overlay: Mapping[str, str] | None = None,
+        _env_overlay_secret_values_present: bool | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
         image: str | None = None,
     ) -> None:
@@ -392,6 +398,16 @@ class DockerRunner(Runner):
         # Trusted egress overlay (proxy vars + CA trust). Applied last on every
         # exec so model-controlled env cannot unset the enforced egress path.
         self.env_overlay = dict(env_overlay) if env_overlay else {}
+        if (
+            _env_overlay_secret_values_present is not None
+            and type(_env_overlay_secret_values_present) is not bool
+        ):
+            raise TypeError("_env_overlay_secret_values_present must be bool or None.")
+        self._env_overlay_secret_values_present = (
+            bool(self.env_overlay)
+            if _env_overlay_secret_values_present is None
+            else _env_overlay_secret_values_present
+        )
         self.docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(docker_cli_env_allowlist)
         self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
         self.cancellation_cleanup = validate_runner_cleanup_policy(
@@ -422,6 +438,7 @@ class DockerRunner(Runner):
         network: str | None = None,
         extra_hosts: Sequence[str] = (),
         env_overlay: Mapping[str, str] | None = None,
+        _env_overlay_secret_values_present: bool | None = None,
         ca_mount: tuple[str, str] | None = None,
         seccomp_profile: str | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
@@ -580,15 +597,29 @@ class DockerRunner(Runner):
             credential_mode=mode,
             allow_raw_secret_env=allow_raw_secret_env,
             env_overlay=env_overlay,
+            _env_overlay_secret_values_present=_env_overlay_secret_values_present,
             docker_cli_env_allowlist=docker_cli_allowlist,
         )
 
     def workload_authority(self, name: str):
         """Declare a shipped workload only for its exact selected image."""
 
-        if name != BROWSER_FETCH_WORKLOAD_NAME or self.image != PINNED_BROWSER_FETCH_WORKLOAD.image:
-            return None
-        return PINNED_BROWSER_FETCH_WORKLOAD
+        if (
+            name == BROWSER_FETCH_WORKLOAD_NAME
+            and self.image == PINNED_BROWSER_FETCH_WORKLOAD.image
+        ):
+            return PINNED_BROWSER_FETCH_WORKLOAD
+        if (
+            name == BROWSER_SESSION_WORKLOAD_NAME
+            and self.image == PINNED_BROWSER_SESSION_WORKLOAD.image
+        ):
+            return PINNED_BROWSER_SESSION_WORKLOAD
+        return None
+
+    def output_secret_values_present(self) -> bool:
+        """Declare whether Docker resolves runner-owned secret environment values."""
+
+        return bool(self.secret_env) or self._env_overlay_secret_values_present
 
     async def exec(
         self,

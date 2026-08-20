@@ -138,11 +138,18 @@ Prefer `WebBridge.sandboxed_browser(environment=..., browser_image=...)` for
 application setup. It validates those runner claims and artifact storage before
 agent registration, binds their identities plus the exact environment/factory
 egress authority into the constructed tools, and
-requires the pinned `cayu-browser-fetch:3-playwright-1.62.0` image declaration.
+requires the pinned `cayu-browser-fetch:4-playwright-1.62.0` image declaration.
 The versioned worker handshake still verifies protocol, worker, and Playwright
 versions on every dispatch. Browser inspection needs no mutable workspace; the
 profile records `workspace_requirement="none"` instead of silently depending
 on an ambient host directory.
+
+For stateful interaction, select the same image through
+`WebBridge.sandboxed_browser(..., interactive=True)`. That profile exposes one
+closed `browser_session` tool rather than the one-shot fetch/screenshot pair.
+It preserves a bounded live page across model turns, uses revision-bound opaque
+refs, and publishes screenshots/downloads through ArtifactStore. It never
+falls back to host browsing. See [Stateful browser sessions](browser-session.md).
 
 The browser worker returns compact readable `text` for ordinary pages. It
 deterministically selects `accessibility` when links, tables, forms, navigation

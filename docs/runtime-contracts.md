@@ -4917,6 +4917,43 @@ screenshot publication revalidates the artifact-store identity. Missing or
 failed browser/provider capability never falls back to trusted host HTTP or a
 different provider.
 
+The opt-in interactive sandboxed profile exposes one ordinary
+`browser_session` tool backed by `cayu.browser-session.v1` in the same pinned
+Playwright/Chromium worker image. Cayu owns browser session and page identities.
+Each bounded AI-mode ARIA observation produces a new opaque revision and opaque
+refs; ref actions require that exact revision plus a stable operation id and
+invalidate the old refs before dispatch. Stale revisions, unknown refs, and
+operation-id conflicts fail before runner interaction. Runner acknowledgement
+loss after dispatch is projected as `outcome_ambiguous` and is never blindly
+replayed. Screenshots and downloads publish only bounded ArtifactStore
+references and fail closed when the invocation secret registry is nonempty or
+changes during capture, or when the runner cannot prove its output has no
+runner-owned/virtual-egress secret values. Cayu never attempts to redact
+rendered pixels or binary downloads. The runner candidate, exact workload,
+egress admission, and artifact
+store are revalidated at dispatch. Requests, redirect hops, response bytes,
+URL/title bytes, DOM nodes, snapshot depth and bytes, refs, waits, screenshot
+dimensions and pixels, artifacts, live allocations, parent state, and operation
+identities are independently bounded. DOM-node and accessibility-source
+admission share one script-and-animation-frozen page window before Playwright AI snapshot
+materialization; a conservative node/source/escaping envelope also rejects
+computed-content and repeated-name amplification before that call. Explicit close has separately bounded idempotency
+evidence and acknowledges only after browser/context/driver cleanup settles.
+The application-owned idle deadline defaults to 900 seconds, resets after each
+completed response, and never expires through an active operation. Every
+positively settled daemon exit, including startup failure and idle cleanup,
+records positive guest-owned retirement evidence. Initial launch retains a
+separate bounded startup-cleanup settlement window after the ordinary
+connection deadline so late positive retirement evidence reaches the parent;
+absence of that evidence remains ambiguous and capacity-bearing. Live
+page/cookie/storage/tab continuity lasts only for the admitted allocation
+lifetime; this initial profile admits one page, restores Chromium popup
+blocking, and installs a pre-document popup guard for explicit and inherited
+targets plus ordinary and prototype popup APIs. Any unexpected second page
+is a fail-safe resource violation that retires the allocation.
+Reconstruction after Cayu worker loss is not supported by this contract. See
+`docs/browser-session.md`.
+
 Tool policy authorizes a model call, and URL validation bounds the requested
 destination, but neither is a process or network-isolation boundary. Only the
 selected adapter's execution location and the admitted environment establish

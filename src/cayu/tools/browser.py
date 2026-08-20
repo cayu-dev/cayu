@@ -157,6 +157,11 @@ class _WorkloadAwareRunnerHandle(Protocol):
     def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None: ...
 
 
+@runtime_checkable
+class _OutputSecretAwareRunnerHandle(Protocol):
+    def output_secret_values_present(self) -> bool | None: ...
+
+
 class _BrowserRedirect(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 

@@ -20,6 +20,7 @@ from cayu import (
     AgentSpec,
     BeforeStopContext,
     BeforeStopDecision,
+    BrowserSessionTool,
     BrowserWebFetchAdapter,
     BudgetLimit,
     BudgetPolicy,
@@ -2816,6 +2817,107 @@ def test_browser_adapter_dom_limit_changes_implementation_profile_before_work() 
             ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
         )
         assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_browser_session_dom_node_limit_changes_implementation_profile_before_work() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-browser-session-response-limit"
+        store = InMemorySessionStore()
+
+        def configured_app(*, max_dom_nodes: int) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[BrowserSessionTool(max_dom_nodes=max_dom_nodes)],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app(max_dom_nodes=100)
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        unchanged_app, _unchanged_provider = configured_app(max_dom_nodes=100)
+        resumed = await _collect(
+            unchanged_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "same browser limit")],
+                )
+            )
+        )
+        assert resumed[0].type is EventType.INTERACTION_STARTED
+
+        changed_app, changed_provider = configured_app(max_dom_nodes=101)
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed browser limit")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        )
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
+def test_browser_session_mutated_limit_cannot_claim_shipped_backend_profile() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-mutated-browser-session-limit"
+        store = InMemorySessionStore()
+        original_provider = _completed_provider()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(original_provider, default=True)
+        mutated_tool = BrowserSessionTool(max_response_bytes=1024)
+        mutated_tool.max_response_bytes = 1025
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[mutated_tool],
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        replacement_provider = _completed_provider()
+        replacement_app = CayuApp(session_store=store, enable_logging=False)
+        replacement_app.register_provider(replacement_provider, default=True)
+        replacement_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[BrowserSessionTool(max_response_bytes=1025)],
+        )
+
+        with pytest.raises(ExecutionProfileMismatchError):
+            await _collect(
+                replacement_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "must not adopt mismatched backend")],
+                    )
+                )
+            )
+        assert replacement_provider.requests == []
 
     asyncio.run(exercise())
 

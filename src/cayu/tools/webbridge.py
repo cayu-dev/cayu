@@ -19,7 +19,12 @@ from cayu.environments.admission import (
     ExecutionEnvironmentAuthority,
     ExecutionRequirements,
 )
-from cayu.runners import BROWSER_FETCH_WORKLOAD_NAME, PINNED_BROWSER_FETCH_WORKLOAD
+from cayu.runners import (
+    BROWSER_FETCH_WORKLOAD_NAME,
+    BROWSER_SESSION_WORKLOAD_NAME,
+    PINNED_BROWSER_FETCH_WORKLOAD,
+    PINNED_BROWSER_SESSION_WORKLOAD,
+)
 from cayu.tools.browser import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     BROWSER_FETCH_PROTOCOL_VERSION,
@@ -27,6 +32,11 @@ from cayu.tools.browser import (
     BrowserWebFetchAdapter,
     ScreenshotPageTool,
     _browser_runner_is_admitted,
+)
+from cayu.tools.browser_session import (
+    BROWSER_SESSION_PROTOCOL_VERSION,
+    BROWSER_SESSION_WORKER_VERSION,
+    BrowserSessionTool,
 )
 from cayu.tools.web import (
     WebFetchAdapter,
@@ -42,6 +52,7 @@ if TYPE_CHECKING:
     from cayu.runtime.app import CayuApp
 
 DEFAULT_WEBBRIDGE_BROWSER_IMAGE = PINNED_BROWSER_FETCH_WORKLOAD.image
+DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE = PINNED_BROWSER_SESSION_WORKLOAD.image
 _WEBBRIDGE_CONSTRUCTION_TOKEN = object()
 _FETCH_OPTION_NAMES = frozenset(
     {"max_response_bytes", "max_content_bytes", "timeout_seconds", "max_redirects"}
@@ -68,6 +79,25 @@ _SCREENSHOT_OPTION_NAMES = frozenset(
         "max_page_width",
         "max_page_height",
         "max_page_pixels",
+    }
+)
+_INTERACTIVE_OPTION_NAMES = frozenset(
+    {
+        "max_snapshot_bytes",
+        "max_dom_nodes",
+        "max_refs",
+        "max_artifact_bytes",
+        "max_page_width",
+        "max_page_height",
+        "max_page_pixels",
+        "max_wait_ms",
+        "idle_timeout_seconds",
+        "max_redirects",
+        "max_requests",
+        "max_response_bytes",
+        "max_parent_sessions",
+        "max_sessions",
+        "max_operations",
     }
 )
 
@@ -281,21 +311,38 @@ class WebBridge:
         browser_image: str,
         fetch_options: dict[str, Any] | None = None,
         screenshot_options: dict[str, Any] | None = None,
+        interactive: bool = False,
+        interactive_options: dict[str, Any] | None = None,
     ) -> WebBridge:
         """Build browser tools for a static or factory-backed environment."""
 
         if not isinstance(environment, Environment | EnvironmentFactory):
             raise TypeError("environment must be an Environment or EnvironmentFactory.")
-        if type(browser_image) is not str or browser_image != DEFAULT_WEBBRIDGE_BROWSER_IMAGE:
+        if type(interactive) is not bool:
+            raise TypeError("interactive must be a boolean.")
+        selected_workload = (
+            PINNED_BROWSER_SESSION_WORKLOAD if interactive else PINNED_BROWSER_FETCH_WORKLOAD
+        )
+        selected_workload_name = (
+            BROWSER_SESSION_WORKLOAD_NAME if interactive else BROWSER_FETCH_WORKLOAD_NAME
+        )
+        expected_image = selected_workload.image
+        if type(browser_image) is not str or browser_image != expected_image:
             raise ValueError(
-                "sandboxed WebBridge requires the pinned browser image "
-                f"{DEFAULT_WEBBRIDGE_BROWSER_IMAGE!r}."
+                f"sandboxed WebBridge requires the pinned browser image {expected_image!r}."
             )
+        if interactive and (fetch_options is not None or screenshot_options is not None):
+            raise ValueError(
+                "interactive WebBridge configuration uses interactive_options, not one-shot "
+                "fetch or screenshot options."
+            )
+        if not interactive and interactive_options is not None:
+            raise ValueError("interactive_options require interactive=True.")
         if isinstance(environment, Environment):
             runner = environment.runner
             if runner is None:
                 raise ValueError("sandboxed WebBridge requires a configured runner.")
-            configured_worker = runner.workload_authority(BROWSER_FETCH_WORKLOAD_NAME)
+            configured_worker = runner.workload_authority(selected_workload_name)
             artifact_store = environment.artifact_store
             environment_authority = runner.execution_environment_authority()
             stage = "pre_exposure"
@@ -306,7 +353,7 @@ class WebBridge:
                     "sandboxed WebBridge could not inspect runner admission evidence."
                 ) from exc
         else:
-            configured_worker = environment.workload_authority(BROWSER_FETCH_WORKLOAD_NAME)
+            configured_worker = environment.workload_authority(selected_workload_name)
             artifact_store = environment.configured_artifact_store
             environment_authority = environment.execution_environment_authority()
             stage = "pre_create"
@@ -316,7 +363,7 @@ class WebBridge:
                 raise ValueError(
                     "sandboxed WebBridge could not inspect factory admission evidence."
                 ) from exc
-        if configured_worker != PINNED_BROWSER_FETCH_WORKLOAD:
+        if configured_worker != selected_workload:
             raise ValueError(
                 "sandboxed WebBridge environment does not prove the selected pinned browser "
                 "image and worker."
@@ -340,29 +387,49 @@ class WebBridge:
         if type(artifact_store_id) is not str or not artifact_store_id:
             raise ValueError("sandboxed WebBridge artifact store must have a stable id.")
         expected_candidate = candidate.candidate
-        browser_adapter = BrowserWebFetchAdapter(
-            expected_runner_candidate=expected_candidate,
-            expected_environment_authority=owned_environment_authority,
-            expected_workload_authority=PINNED_BROWSER_FETCH_WORKLOAD,
-        )
-        web_fetch = WebFetchTool(
-            adapter=browser_adapter,
-            **_profile_options(fetch_options, _FETCH_OPTION_NAMES, "fetch"),
-        )
-        screenshot = ScreenshotPageTool(
-            expected_runner_candidate=expected_candidate,
-            expected_environment_authority=owned_environment_authority,
-            expected_workload_authority=PINNED_BROWSER_FETCH_WORKLOAD,
-            expected_artifact_store_id=artifact_store_id,
-            **_profile_options(
-                screenshot_options,
-                _SCREENSHOT_OPTION_NAMES,
-                "screenshot",
-            ),
-        )
+        if interactive:
+            tools = (
+                BrowserSessionTool(
+                    expected_runner_candidate=expected_candidate,
+                    expected_environment_authority=owned_environment_authority,
+                    expected_workload_authority=PINNED_BROWSER_SESSION_WORKLOAD,
+                    expected_artifact_store_id=artifact_store_id,
+                    **_profile_options(
+                        interactive_options,
+                        _INTERACTIVE_OPTION_NAMES,
+                        "interactive browser",
+                    ),
+                ),
+            )
+            browser_protocol = BROWSER_SESSION_PROTOCOL_VERSION
+            browser_worker_version = BROWSER_SESSION_WORKER_VERSION
+        else:
+            browser_adapter = BrowserWebFetchAdapter(
+                expected_runner_candidate=expected_candidate,
+                expected_environment_authority=owned_environment_authority,
+                expected_workload_authority=PINNED_BROWSER_FETCH_WORKLOAD,
+            )
+            web_fetch = WebFetchTool(
+                adapter=browser_adapter,
+                **_profile_options(fetch_options, _FETCH_OPTION_NAMES, "fetch"),
+            )
+            screenshot = ScreenshotPageTool(
+                expected_runner_candidate=expected_candidate,
+                expected_environment_authority=owned_environment_authority,
+                expected_workload_authority=PINNED_BROWSER_FETCH_WORKLOAD,
+                expected_artifact_store_id=artifact_store_id,
+                **_profile_options(
+                    screenshot_options,
+                    _SCREENSHOT_OPTION_NAMES,
+                    "screenshot",
+                ),
+            )
+            tools = (web_fetch, screenshot)
+            browser_protocol = BROWSER_FETCH_PROTOCOL_VERSION
+            browser_worker_version = BROWSER_FETCH_WORKER_VERSION
         return cls(
             kind=WebBridgeProfileKind.SANDBOXED_BROWSER,
-            tools=(web_fetch, screenshot),
+            tools=tools,
             execution_requirements=ExecutionRequirements.trusted(
                 network_access="brokered_egress",
                 cancellation="confirmed",
@@ -374,8 +441,8 @@ class WebBridge:
             workspace_requirement="none",
             environment_authority=owned_environment_authority,
             artifact_store_id=artifact_store_id,
-            browser_protocol=BROWSER_FETCH_PROTOCOL_VERSION,
-            browser_worker_version=BROWSER_FETCH_WORKER_VERSION,
+            browser_protocol=browser_protocol,
+            browser_worker_version=browser_worker_version,
             playwright_version=BROWSER_FETCH_PLAYWRIGHT_VERSION,
             _construction_token=_WEBBRIDGE_CONSTRUCTION_TOKEN,
         )

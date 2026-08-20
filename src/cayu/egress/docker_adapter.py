@@ -464,6 +464,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             credential_mode=CredentialMode.VIRTUAL_EGRESS,
             network=network,
             env_overlay=dict(request.env_overlay),
+            _env_overlay_secret_values_present=(request.env_overlay_secret_values_present),
             ca_mount=(request.ca_cert_host_path, request.guest_ca_path),
             seccomp_profile=self._seccomp_profile,
             setup_commands=request.setup_commands,
