@@ -254,6 +254,11 @@ REVISIONS: tuple[Revision, ...] = (
     # The DDL is additive and preserves revision-42 knowledge; no historical
     # changes are fabricated during migration.
     Revision(revision=43, kind=RevisionKind.BREAKING, compatible_from=43),
+    # Derived knowledge projections now use complete immutable embedding
+    # identities and independently sequenced, CAS-fenced readiness events.
+    # Canonical revision-43 knowledge is preserved, while pre-identity vector
+    # rows are rebuildable derived data and are deliberately discarded.
+    Revision(revision=44, kind=RevisionKind.BREAKING, compatible_from=44),
 )
 
 #: The revision an empty database is initialized to.

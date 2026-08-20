@@ -9,6 +9,9 @@ from pydantic import ValidationError
 from tests.core.knowledge_access_scope_conformance import (
     assert_knowledge_access_scope_conformance,
 )
+from tests.core.knowledge_index_readiness_conformance import (
+    assert_index_readiness_conformance,
+)
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
 )
@@ -34,6 +37,7 @@ from cayu.storage import (
     MAX_KNOWLEDGE_CHANGE_LIMIT,
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,
+    MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
     MAX_KNOWLEDGE_ENTRY_ID_BYTES,
     MAX_KNOWLEDGE_EVIDENCE_BYTES,
     MAX_KNOWLEDGE_REVISION,
@@ -44,10 +48,14 @@ from cayu.storage import (
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeChunkConflict,
+    KnowledgeEmbeddingProjection,
+    KnowledgeEmbeddingProjectionConflict,
     KnowledgeEntry,
     KnowledgeEvidence,
     KnowledgeFacet,
     KnowledgeHit,
+    KnowledgeIndexReadinessUpdate,
+    KnowledgeIndexState,
     KnowledgeListGroup,
     KnowledgeListItem,
     KnowledgeListQuery,
@@ -59,6 +67,7 @@ from cayu.storage import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    knowledge_chunk_embedding_identity,
 )
 from cayu.storage.memory import (
     copy_knowledge_entry,
@@ -67,6 +76,78 @@ from cayu.storage.memory import (
 )
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
+
+def test_in_memory_index_readiness_conformance() -> None:
+    asyncio.run(
+        assert_index_readiness_conformance(InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE))
+    )
+
+
+def test_embedding_identity_hashes_exact_projected_text() -> None:
+    first = KnowledgeChunk(
+        id="projection-hash-chunk",
+        entry_id="projection-hash-entry",
+        text="first projected text",
+        chunk_index=0,
+        content_hash="caller-supplied-source-hash",
+    )
+    second = first.model_copy(update={"text": "second projected text"})
+
+    first_identity = knowledge_chunk_embedding_identity(
+        first,
+        embedding_model="test-embedding",
+        dimensions=3,
+    )
+    second_identity = knowledge_chunk_embedding_identity(
+        second,
+        embedding_model="test-embedding",
+        dimensions=3,
+    )
+
+    assert first_identity.projection_content_hash.startswith("sha256:")
+    assert first_identity.projection_content_hash != second_identity.projection_content_hash
+    with pytest.raises(ValidationError, match="dimensions.*less than or equal"):
+        knowledge_chunk_embedding_identity(
+            first,
+            embedding_model="test-embedding",
+            dimensions=2**31,
+        )
+
+
+def test_embedding_projection_rejects_malformed_vectors() -> None:
+    identity = knowledge_chunk_embedding_identity(
+        KnowledgeChunk(
+            id="projection-validation-chunk",
+            entry_id="projection-validation-entry",
+            text="projected text",
+            chunk_index=0,
+        ),
+        embedding_model="test-embedding",
+        dimensions=3,
+    )
+
+    with pytest.raises(ValidationError, match="length must equal"):
+        KnowledgeEmbeddingProjection(
+            identity=identity,
+            readiness_sequence=1,
+            attempt_id="projection-validation",
+            vector=[1.0, 0.0],
+        )
+    with pytest.raises(ValidationError, match=r"vector\[0\].*number"):
+        KnowledgeEmbeddingProjection(
+            identity=identity,
+            readiness_sequence=1,
+            attempt_id="projection-validation",
+            vector=[True, 0.0, 0.0],
+        )
+    with pytest.raises(ValidationError, match=r"vector\[0\].*finite"):
+        KnowledgeEmbeddingProjection(
+            identity=identity,
+            readiness_sequence=1,
+            attempt_id="projection-validation",
+            vector=[float("nan"), 0.0, 0.0],
+        )
 
 
 def test_knowledge_evidence_enforces_utf8_and_total_serialized_byte_limits() -> None:
@@ -739,12 +820,13 @@ def test_in_memory_knowledge_store_prune_expired_removes_expired_entries() -> No
 
 
 def test_in_memory_embedding_store_prune_expired_drops_embeddings() -> None:
-    # MEM-05: the embedding subclass must also reclaim the vector, not just the entry/chunks.
+    # MEM-05: the derived-index consumer reclaims vectors after canonical pruning.
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
             access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(
             KnowledgeEntry(
@@ -754,8 +836,10 @@ def test_in_memory_embedding_store_prune_expired_drops_embeddings() -> None:
                 expires_at=datetime.now(UTC) - timedelta(seconds=1),
             )
         )
+        await store.process_embedding_changes("embedding-prune", "worker")
         embeddings_before = len(store._chunk_embeddings)
         pruned = await store.prune_expired()
+        await store.process_embedding_changes("embedding-prune", "worker")
         return (
             embeddings_before,
             pruned,
@@ -777,6 +861,7 @@ def test_in_memory_embedding_lifecycle_revisions_replace_stale_derived_rows() ->
             access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         created = await store.create_entry(
             KnowledgeEntry(id="lifecycle-embedding", text="GitHub credential proxy.")
@@ -792,13 +877,14 @@ def test_in_memory_embedding_lifecycle_revisions_replace_stale_derived_rows() ->
             expected_revision=archived.revision,
         )
         assert deleted is not None
+        await store.process_embedding_changes("embedding-lifecycle", "worker")
         return archived, deleted, dict(store._chunk_embeddings)
 
     archived, deleted, embeddings = asyncio.run(run())
 
     assert archived.revision == 2
     assert deleted.revision == 3
-    assert list(embeddings) == ["lifecycle-embedding:r3:0"]
+    assert embeddings == {}
 
 
 def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider_awaits() -> None:
@@ -828,6 +914,7 @@ def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider
         store = InMemoryEmbeddingKnowledgeStore(
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         privileged = KnowledgeAccessScope.privileged()
         tenant_scope = KnowledgeAccessScope.for_namespace("tenant-a")
@@ -845,6 +932,11 @@ def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider
         await store.create_entry(
             original,
             [original_chunk],
+            access_scope=privileged,
+        )
+        await store.process_embedding_changes(
+            "snapshot-index",
+            "worker",
             access_scope=privileged,
         )
 
@@ -898,7 +990,7 @@ def test_in_memory_semantic_search_keeps_one_authorized_snapshot_across_provider
     assert chunk.text == "Tenant A credential policy."
 
 
-def test_in_memory_owned_publication_does_not_apply_stale_derived_embeddings() -> None:
+def test_in_memory_embedding_worker_does_not_apply_stale_derived_embeddings() -> None:
     class FirstCallBlockingEmbeddingProvider(TextEmbeddingProvider):
         name = "blocking-keyword-test"
 
@@ -926,17 +1018,22 @@ def test_in_memory_owned_publication_does_not_apply_stale_derived_embeddings() -
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         old_entry, old_chunks = publication_material(
             entry_id="reused_embedding_publication",
             text="GitHub credential proxy policy.",
         )
         old_chunks = [old_chunks[0].model_copy(update={"id": "old-publication-chunk"})]
+        await store.publish_entry_revision(
+            old_entry,
+            old_chunks,
+            operation_id="old-embedding-publication",
+        )
         old_task = asyncio.create_task(
-            store.publish_entry_revision(
-                old_entry,
-                old_chunks,
-                operation_id="old-embedding-publication",
+            store.process_embedding_changes(
+                "stale-embedding-worker",
+                "worker",
             )
         )
         await asyncio.wait_for(provider.first_started.wait(), timeout=2)
@@ -957,16 +1054,76 @@ def test_in_memory_owned_publication_does_not_apply_stale_derived_embeddings() -
             operation_id="new-embedding-publication",
         )
         provider.release_first.set()
-        await old_task
-        return dict(store._chunk_embeddings), new_chunks[0]
+        worker_result = await old_task
+        return dict(store._chunk_embeddings), new_chunks[0], worker_result
 
-    embeddings, new_chunk = asyncio.run(run())
+    embeddings, new_chunk, worker_result = asyncio.run(run())
 
-    assert "old-publication-chunk" not in embeddings
-    assert embeddings["new-publication-chunk"]["content_hash"] == new_chunk.content_hash
+    identities = [stored["identity"] for stored in embeddings.values()]
+    assert all(identity.chunk_id != "old-publication-chunk" for identity in identities)
+    assert [identity.chunk_id for identity in identities] == [new_chunk.id]
+    assert worker_result.acknowledged_changes == 3
 
 
-def test_in_memory_owned_publication_replay_does_not_repeat_failed_embedding() -> None:
+def test_in_memory_embedding_worker_fences_superseded_attempt_vector_write() -> None:
+    class FirstCallBlockingEmbeddingProvider(TextEmbeddingProvider):
+        name = "blocking-attempt-fence-test"
+
+        def __init__(self) -> None:
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            call = self.call_count
+            if call == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            vector = [1.0, 0.0, 0.0] if call == 1 else [0.0, 1.0, 0.0]
+            return TextEmbeddingResult(
+                model=request.model,
+                embeddings=[
+                    TextEmbedding(index=index, vector=vector)
+                    for index, _ in enumerate(request.texts)
+                ],
+            )
+
+    async def run() -> tuple[list[float], int]:
+        provider = FirstCallBlockingEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        entry, chunks = publication_material(
+            entry_id="embedding-attempt-fence",
+            text="GitHub credential proxy policy.",
+        )
+        await store.publish_entry_revision(
+            entry,
+            chunks,
+            operation_id="embedding-attempt-fence-publication",
+        )
+        slow = asyncio.create_task(
+            store.process_embedding_changes("slow-attempt-index", "worker-a")
+        )
+        await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+        fast = await store.process_embedding_changes("fast-attempt-index", "worker-b")
+        provider.release_first.set()
+        await slow
+        assert fast.indexed_records == 1
+        stored = next(iter(store._chunk_embeddings.values()))
+        return list(stored["vector"]), provider.call_count
+
+    vector, call_count = asyncio.run(run())
+
+    assert vector == [0.0, 1.0, 0.0]
+    assert call_count == 2
+
+
+def test_in_memory_publication_replay_does_not_repeat_failed_embedding_work() -> None:
     class CountingFailingEmbeddingProvider(TextEmbeddingProvider):
         name = "counting-failing-test"
 
@@ -983,28 +1140,40 @@ def test_in_memory_owned_publication_replay_does_not_repeat_failed_embedding() -
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         entry, chunks = publication_material(
             entry_id="failed-derived-replay",
             text="Durable source publication survives derived work failure.",
         )
-        with pytest.raises(RuntimeError, match="embedding provider is unavailable"):
-            await store.publish_entry_revision(
-                entry,
-                chunks,
-                operation_id="failed-derived-replay-operation",
-            )
+        first_receipt = await store.publish_entry_revision(
+            entry,
+            chunks,
+            operation_id="failed-derived-replay-operation",
+        )
         receipt = await store.publish_entry_revision(
             entry,
             chunks,
             operation_id="failed-derived-replay-operation",
         )
-        return provider.call_count, receipt, await store.get_entry(entry.id)
+        worker_result = await store.process_embedding_changes(
+            "failed-embedding-worker",
+            "worker",
+        )
+        return (
+            provider.call_count,
+            first_receipt,
+            receipt,
+            worker_result,
+            await store.get_entry(entry.id),
+        )
 
-    call_count, receipt, stored_entry = asyncio.run(run())
+    call_count, first_receipt, receipt, worker_result, stored_entry = asyncio.run(run())
 
     assert call_count == 1
+    assert first_receipt.replayed is False
     assert receipt.replayed is True
+    assert worker_result.failed_records == 1
     assert stored_entry is not None
 
 
@@ -1114,6 +1283,7 @@ def test_in_memory_embedding_knowledge_store_semantic_search() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(
             KnowledgeEntry(
@@ -1129,6 +1299,7 @@ def test_in_memory_embedding_knowledge_store_semantic_search() -> None:
                 kind="procedure",
             )
         )
+        await store.process_embedding_changes("semantic-index", "worker")
         result = await store.search(
             KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
         )
@@ -1143,6 +1314,396 @@ def test_in_memory_embedding_knowledge_store_semantic_search() -> None:
     assert len(calls) == 3
 
 
+def test_in_memory_embedding_worker_continues_one_change_within_record_budget() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        entry = KnowledgeEntry(id="bounded-embedding-change", text="Bounded embedding work.")
+        chunks = [
+            KnowledgeChunk(
+                id=f"bounded-embedding-change:{index}",
+                entry_id=entry.id,
+                chunk_index=index,
+                text=text,
+            )
+            for index, text in enumerate(("github auth", "invoice payment", "refund approval"))
+        ]
+        await store.create_entry(entry, chunks)
+        first = await store.process_embedding_changes(
+            "bounded-embedding-index",
+            "worker",
+            limit=1,
+            record_limit=2,
+        )
+        second = await store.process_embedding_changes(
+            "bounded-embedding-index",
+            "worker",
+            limit=1,
+            record_limit=2,
+        )
+        state = await store.load_change_consumer_state("bounded-embedding-index")
+        return first, second, state, provider.calls
+
+    first, second, state, calls = asyncio.run(run())
+
+    assert first.processed_records == 2
+    assert first.claimed_changes == 1
+    assert first.acknowledged_changes == 0
+    assert second.processed_records == 1
+    assert second.claimed_changes == 1
+    assert second.acknowledged_changes == 1
+    assert state is not None
+    assert state.cursor_sequence == 1
+    assert calls == [["github auth", "invoice payment"], ["refund approval"]]
+
+
+def test_in_memory_embedding_worker_pages_stale_cleanup_within_record_budget() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        entry = KnowledgeEntry(id="bounded-cleanup", text="Old projection set.")
+        await store.create_entry(
+            entry,
+            [
+                KnowledgeChunk(
+                    id=f"bounded-cleanup:{index}",
+                    entry_id=entry.id,
+                    chunk_index=index,
+                    text=f"old projection {index}",
+                )
+                for index in range(5)
+            ],
+        )
+        await store.process_embedding_changes(
+            "bounded-cleanup-index",
+            "worker",
+            record_limit=10,
+        )
+        await store.append_entry_revision(
+            entry.model_copy(update={"revision": 2, "text": "Current projection."}),
+            [
+                KnowledgeChunk(
+                    id="bounded-cleanup:current",
+                    entry_id=entry.id,
+                    entry_revision=2,
+                    chunk_index=0,
+                    text="current projection",
+                )
+            ],
+            expected_revision=1,
+        )
+        results = []
+        for _ in range(4):
+            result = await store.process_embedding_changes(
+                "bounded-cleanup-index",
+                "worker",
+                limit=1,
+                record_limit=2,
+            )
+            results.append(result)
+            if result.acknowledged_changes:
+                break
+        return results, len(store._chunk_embeddings)
+
+    results, remaining = asyncio.run(run())
+
+    assert all(result.processed_records <= 2 for result in results)
+    assert sum(result.removed_records for result in results) == 5
+    assert results[-1].acknowledged_changes == 1
+    assert remaining == 1
+
+
+def test_in_memory_embedding_backfill_retries_failed_projections_with_a_bounded_result() -> None:
+    class ToggleEmbeddingProvider(KeywordEmbeddingProvider):
+        fail = True
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            if self.fail:
+                raise RuntimeError("embedding provider unavailable")
+            return await super().embed_texts(request)
+
+    async def run():
+        provider = ToggleEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        await store.create_entry(KnowledgeEntry(id="retry-failed", text="GitHub proxy."))
+        failed = await store.process_embedding_changes("retry-failed-index", "worker")
+        provider.fail = False
+        recovered = await store.backfill_embeddings(limit=1)
+        result = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
+        with pytest.raises(ValueError, match="limit.*less than or equal"):
+            await store.backfill_embeddings(limit=MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT + 1)
+        return failed, recovered, result
+
+    failed, recovered, result = asyncio.run(run())
+
+    assert failed.failed_records == 1
+    assert recovered.model_dump() == {
+        "scanned_records": 1,
+        "indexed_records": 1,
+        "failed_records": 0,
+        "skipped_records": 0,
+        "limit": 1,
+        "refresh_existing": False,
+        "next_cursor": None,
+    }
+    assert [hit.entry.id for hit in result.hits] == ["retry-failed"]
+
+
+def test_in_memory_accepts_precomputed_projection_only_for_current_pending_attempt() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        await store.create_entry(KnowledgeEntry(id="external-projection", text="GitHub proxy."))
+        chunk = (await store.read_chunks("external-projection"))[0]
+        identity = knowledge_chunk_embedding_identity(
+            chunk,
+            embedding_model="test-embedding",
+            dimensions=3,
+        )
+        pending = await store.publish_index_readiness(
+            KnowledgeIndexReadinessUpdate(
+                identity=identity,
+                state=KnowledgeIndexState.PENDING,
+                attempt_id="external-attempt",
+            ),
+            expected_sequence=None,
+            operation_id="external-projection:pending",
+        )
+        vector = [1.0, 0.0, 0.0]
+        projection = KnowledgeEmbeddingProjection(
+            identity=identity,
+            readiness_sequence=pending.sequence,
+            attempt_id=pending.attempt_id,
+            vector=vector,
+        )
+        vector[0] = 0.0
+        stored = await store.store_embedding_projections([projection])
+        replayed = await store.store_embedding_projections([projection])
+        with pytest.raises(KnowledgeEmbeddingProjectionConflict) as raised:
+            await store.store_embedding_projections(
+                [projection.model_copy(update={"vector": [0.0, 1.0, 0.0]})]
+            )
+        await store.publish_index_readiness(
+            KnowledgeIndexReadinessUpdate(
+                identity=identity,
+                state=KnowledgeIndexState.READY,
+                attempt_id=pending.attempt_id,
+            ),
+            expected_sequence=pending.sequence,
+            operation_id="external-projection:ready",
+        )
+        stale = await store.store_embedding_projections([projection])
+        result = await store.search(
+            KnowledgeQuery(text="github", mode=KnowledgeSearchMode.SEMANTIC, min_score=0.0)
+        )
+        return projection, stored, replayed, raised.value, stale, result, provider.calls
+
+    projection, stored, replayed, conflict, stale, result, provider_calls = asyncio.run(run())
+
+    assert projection.vector == [1.0, 0.0, 0.0]
+    assert stored.stored_identities == [projection.identity]
+    assert replayed.stored_identities == [projection.identity]
+    assert conflict.reason == "attempt_vector_conflict"
+    assert stale.stored_identities == []
+    assert [hit.entry.id for hit in result.hits] == ["external-projection"]
+    assert provider_calls == [["github"]]
+
+
+def test_in_memory_embedding_refresh_continues_across_bounded_pages() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        for index, text in enumerate(("GitHub proxy.", "Invoice policy.", "SendGrid email.")):
+            await store.create_entry(
+                KnowledgeEntry(
+                    id=f"refresh-page-{index}",
+                    text=text,
+                    importance=1.0 - index / 10,
+                    created_at=observed_at,
+                    updated_at=observed_at,
+                )
+            )
+        await store.process_embedding_changes("refresh-pages", "worker")
+        provider.calls.clear()
+
+        first = await store.backfill_embeddings(limit=1, refresh_existing=True)
+        assert first.next_cursor is not None
+        with pytest.raises(ValueError, match="does not match"):
+            await store.backfill_embeddings(
+                KnowledgeListQuery(namespace="different"),
+                limit=1,
+                refresh_existing=True,
+                cursor=first.next_cursor,
+            )
+        second = await store.backfill_embeddings(
+            limit=1,
+            refresh_existing=True,
+            cursor=first.next_cursor,
+        )
+        assert second.next_cursor is not None
+        third = await store.backfill_embeddings(
+            limit=1,
+            refresh_existing=True,
+            cursor=second.next_cursor,
+        )
+        return first, second, third, provider.calls
+
+    first, second, third, calls = asyncio.run(run())
+
+    assert [first.scanned_records, second.scanned_records, third.scanned_records] == [1, 1, 1]
+    assert [first.indexed_records, second.indexed_records, third.indexed_records] == [1, 1, 1]
+    assert third.next_cursor is None
+    assert sorted(call[0] for call in calls) == [
+        "GitHub proxy.",
+        "Invoice policy.",
+        "SendGrid email.",
+    ]
+
+
+def test_in_memory_embedding_search_reports_partial_coverage_without_index_mutation() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        await store.create_entry(KnowledgeEntry(id="ready", text="GitHub credential proxy."))
+        await store.create_entry(KnowledgeEntry(id="pending", text="Invoice payment policy."))
+        calls_after_writes = list(provider.calls)
+        worker_result = await store.process_embedding_changes(
+            "partial-coverage-index",
+            "worker",
+            limit=1,
+        )
+        provider.calls.clear()
+        search_result = await store.search(
+            KnowledgeQuery(
+                text="auth broker",
+                mode=KnowledgeSearchMode.SEMANTIC,
+                min_score=0.0,
+            )
+        )
+        return calls_after_writes, worker_result, search_result, provider.calls
+
+    calls_after_writes, worker_result, search_result, search_calls = asyncio.run(run())
+
+    assert calls_after_writes == []
+    assert worker_result.indexed_records == 1
+    assert [hit.entry.id for hit in search_result.hits] == ["ready"]
+    assert search_result.index_coverage[0].model_dump() == {
+        "projection_type": "knowledge_chunk_text",
+        "embedding_model": "test-embedding",
+        "dimensions": 3,
+        "preprocessing_version": "cayu:knowledge-chunk-text:v1",
+        "generator": "cayu:canonical-knowledge-chunk",
+        "generator_version": "1",
+        "index_representation_version": "float32-cosine-v1",
+        "eligible_records": 2,
+        "ready_records": 1,
+        "pending_records": 1,
+        "failed_records": 0,
+        "high_water_sequence": 2,
+        "complete": False,
+    }
+    assert search_calls == [["auth broker"]]
+
+
+def test_in_memory_embedding_worker_repairs_vector_committed_before_ready() -> None:
+    class CrashAfterVectorStore(InMemoryEmbeddingKnowledgeStore):
+        fail_ready_once = True
+
+        async def publish_index_readiness(self, update, **kwargs):
+            if self.fail_ready_once and update.state is KnowledgeIndexState.READY:
+                self.fail_ready_once = False
+                raise RuntimeError("simulated crash after vector commit")
+            return await super().publish_index_readiness(update, **kwargs)
+
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = CrashAfterVectorStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        await store.create_entry(KnowledgeEntry(id="crash-window", text="GitHub proxy."))
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await store.process_embedding_changes("crash-window-index", "worker-a")
+        calls_after_crash = list(provider.calls)
+        retry = await store.process_embedding_changes("crash-window-index", "worker-b")
+        result = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
+        return calls_after_crash, provider.calls, retry, result
+
+    calls_after_crash, all_calls, retry, result = asyncio.run(run())
+
+    assert calls_after_crash == [["GitHub proxy."]]
+    assert all_calls == [["GitHub proxy."], ["auth"]]
+    assert retry.indexed_records == 1
+    assert retry.acknowledged_changes == 1
+    assert [hit.entry.id for hit in result.hits] == ["crash-window"]
+    assert result.index_coverage[0].complete is True
+
+
+def test_in_memory_embedding_worker_replays_ready_projection_after_ack_failure() -> None:
+    class AckFailureStore(InMemoryEmbeddingKnowledgeStore):
+        fail_ack_once = True
+
+        async def acknowledge_change(self, claim, **kwargs):
+            if self.fail_ack_once:
+                self.fail_ack_once = False
+                raise RuntimeError("simulated crash before outbox acknowledgement")
+            return await super().acknowledge_change(claim, **kwargs)
+
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = AckFailureStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        await store.create_entry(KnowledgeEntry(id="ack-window", text="GitHub proxy."))
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await store.process_embedding_changes("ack-window-index", "worker-a")
+        calls_after_crash = list(provider.calls)
+        retry = await store.process_embedding_changes("ack-window-index", "worker-b")
+        return calls_after_crash, provider.calls, retry
+
+    calls_after_crash, all_calls, retry = asyncio.run(run())
+
+    assert calls_after_crash == [["GitHub proxy."]]
+    assert all_calls == calls_after_crash
+    assert retry.indexed_records == 0
+    assert retry.acknowledged_changes == 1
+
+
 def test_in_memory_embedding_knowledge_store_auto_uses_hybrid_search() -> None:
     async def run():
         provider = KeywordEmbeddingProvider()
@@ -1150,11 +1711,13 @@ def test_in_memory_embedding_knowledge_store_auto_uses_hybrid_search() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(
             KnowledgeEntry(id="credential_policy", text="Use a credential proxy.")
         )
         await store.create_entry(KnowledgeEntry(id="email_policy", text="SendGrid email guide."))
+        await store.process_embedding_changes("auto-index", "worker")
         result = await store.search(KnowledgeQuery(text="credential"))
         return result
 
@@ -1172,9 +1735,11 @@ def test_in_memory_embedding_knowledge_store_hybrid_labels_keyword_only_hits() -
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
             semantic_min_score=1.0,
         )
         await store.create_entry(KnowledgeEntry(id="deploy", text="Deployment checklist."))
+        await store.process_embedding_changes("hybrid-index", "worker")
         return await store.search(KnowledgeQuery(text="deployment"))
 
     result = asyncio.run(run())
@@ -1191,10 +1756,12 @@ def test_in_memory_embedding_knowledge_store_min_score_uses_normalized_score() -
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
             semantic_min_score=0.70,
         )
         await store.create_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
         await store.create_entry(KnowledgeEntry(id="unrelated", text="Deployment checklist."))
+        await store.process_embedding_changes("min-score-index", "worker")
         return await store.search(
             KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
         )
@@ -1212,10 +1779,12 @@ def test_in_memory_embedding_knowledge_store_query_min_score_overrides_store_def
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
             semantic_min_score=1.0,
         )
         await store.create_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
         await store.create_entry(KnowledgeEntry(id="orthogonal", text="Invoice payment policy."))
+        await store.process_embedding_changes("override-index", "worker")
         return await store.search(
             KnowledgeQuery(
                 text="auth broker",
@@ -1238,8 +1807,10 @@ def test_in_memory_embedding_knowledge_store_refreshes_changed_chunks() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(KnowledgeEntry(id="policy", text="GitHub token policy."))
+        await store.process_embedding_changes("refresh-index", "worker")
         first = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         current = await store.get_entry("policy")
         assert current is not None
@@ -1249,6 +1820,7 @@ def test_in_memory_embedding_knowledge_store_refreshes_changed_chunks() -> None:
             ),
             expected_revision=current.revision,
         )
+        await store.process_embedding_changes("refresh-index", "worker")
         second = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         third = await store.search(KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC))
         return first, second, third
@@ -1267,6 +1839,7 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(
             KnowledgeEntry(id="policy", text="Policy summary."),
@@ -1276,6 +1849,7 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
                 )
             ],
         )
+        await store.process_embedding_changes("custom-chunk-index", "worker")
         first = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         current = await store.get_entry("policy")
         assert current is not None
@@ -1292,6 +1866,7 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
             ],
             expected_revision=current.revision,
         )
+        await store.process_embedding_changes("custom-chunk-index", "worker")
         second = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         third = await store.search(KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC))
         return first, second, third
@@ -1314,6 +1889,7 @@ def test_in_memory_embedding_store_rejects_cross_entry_chunk_id_collision_atomic
             access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(
             KnowledgeEntry(id="alpha", text="GitHub auth policy."),
@@ -1326,6 +1902,7 @@ def test_in_memory_embedding_store_rejects_cross_entry_chunk_id_collision_atomic
                 )
             ],
         )
+        await store.process_embedding_changes("collision-index", "worker")
         embeddings_before = dict(store._chunk_embeddings)
 
         with pytest.raises(KnowledgeChunkConflict):
@@ -1388,11 +1965,13 @@ def test_in_memory_embedding_knowledge_store_honors_none_terms() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
         await store.create_entry(
             KnowledgeEntry(id="excluded", text="GitHub credential proxy deprecated.")
         )
+        await store.process_embedding_changes("none-index", "worker")
         return await store.search(
             KnowledgeQuery(
                 text="auth broker",
@@ -1406,13 +1985,14 @@ def test_in_memory_embedding_knowledge_store_honors_none_terms() -> None:
     assert [hit.entry.id for hit in result.hits] == ["safe"]
 
 
-def test_in_memory_embedding_knowledge_store_does_not_embed_none_term_candidates() -> None:
+def test_in_memory_embedding_search_does_not_mutate_index_for_none_term_candidates() -> None:
     async def run():
         provider = KeywordEmbeddingProvider()
         store = InMemoryEmbeddingKnowledgeStore(
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
         await store.create_entry(
@@ -1433,8 +2013,8 @@ def test_in_memory_embedding_knowledge_store_does_not_embed_none_term_candidates
             ],
             expected_revision=current.revision,
         )
+        await store.process_embedding_changes("none-mutation-index", "worker")
         provider.calls.clear()
-        store._chunk_embeddings.clear()
         result = await store.search(
             KnowledgeQuery(
                 text="auth broker",
@@ -1447,7 +2027,7 @@ def test_in_memory_embedding_knowledge_store_does_not_embed_none_term_candidates
     result, calls = asyncio.run(run())
 
     assert [hit.entry.id for hit in result.hits] == ["safe"]
-    assert ["GitHub auth proxy."] in calls
+    assert ["GitHub auth proxy."] not in calls
     assert ["GitHub credential proxy deprecated."] not in calls
     assert ["auth broker"] in calls
 
@@ -1459,6 +2039,7 @@ def test_in_memory_embedding_knowledge_store_empty_candidates_do_not_embed_query
             access_scope=_ACCESS_SCOPE,
             embedding_provider=provider,
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await store.create_entry(
             KnowledgeEntry(
@@ -1467,6 +2048,7 @@ def test_in_memory_embedding_knowledge_store_empty_candidates_do_not_embed_query
                 labels={"project": "cayu"},
             )
         )
+        await store.process_embedding_changes("empty-candidate-index", "worker")
         provider.calls.clear()
         result = await store.search(
             KnowledgeQuery(
@@ -1493,10 +2075,18 @@ def test_in_memory_embedding_knowledge_store_rejects_wrong_dimensions() -> None:
             embedding_model="test-embedding",
             embedding_dimensions=2,
         )
-        with pytest.raises(ValueError, match="unexpected dimension"):
-            await store.create_entry(KnowledgeEntry(id="policy", text="GitHub credential proxy."))
+        await store.create_entry(KnowledgeEntry(id="policy", text="GitHub credential proxy."))
+        worker_result = await store.process_embedding_changes("dimension-index", "worker")
+        search_result = await store.search(
+            KnowledgeQuery(text="GitHub", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        return worker_result, search_result
 
-    asyncio.run(run())
+    worker_result, search_result = asyncio.run(run())
+
+    assert worker_result.failed_records == 1
+    assert search_result.hits == []
+    assert search_result.index_coverage[0].failed_records == 1
 
 
 def test_text_embedding_usage_rejects_bool_token_counts() -> None:
@@ -1622,6 +2212,7 @@ def test_in_memory_knowledge_stores_apply_none_terms_to_the_complete_entry(
                 access_scope=_ACCESS_SCOPE,
                 embedding_provider=KeywordEmbeddingProvider(),
                 embedding_model="test-embedding",
+                embedding_dimensions=3,
             )
         await assert_entry_wide_none_terms_conformance(store, mode=mode)
 

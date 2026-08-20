@@ -145,7 +145,94 @@ progress. Lease eligibility uses a store-owned clock; PostgreSQL uses its
 database clock in production so worker clock skew cannot extend or revive a
 claim. SQLite/PostgreSQL cursor and acknowledgement state survives restart.
 This change stream is canonical mutation publication, not derived-index
-readiness; index workers add their readiness protocol in the following slice.
+readiness.
+
+## Derived-index identity and readiness
+
+Every comparable durable embedding uses one immutable
+`KnowledgeEmbeddingIdentity`. The identity binds the logical entry and exact
+revision, optional exact chunk, projection type and the SHA-256 of the exact
+projected UTF-8 text, embedding model and dimensions, preprocessing version,
+generator and generator version, and index-representation version. The
+projection hash is computed by Cayu rather than trusted from optional chunk
+metadata. A content hash by itself is never a safe reuse key. Changing any
+component creates a different projection space; an old row may remain auditable
+but cannot be returned as a hit for the new identity.
+
+`KnowledgeIndexReadiness` is a separate append-only publication sequence. A
+new identity starts `pending`; the same attempt may then become `ready` or
+`failed`. A retry publishes a new `pending` attempt through compare-and-swap
+against the latest readiness sequence. Exact operation replay is idempotent,
+while stale sequences, old attempts, and operation-ID reuse fail with
+`KnowledgeIndexReadinessConflict`. Readiness publication is allowed only while
+the named entry revision and optional chunk still match current canonical
+state, so a slow worker cannot make an obsolete projection ready.
+
+`read_index_readiness(...)` returns bounded, authorized event pages through a
+store-owned high-water mark. `load_index_readiness(...)` resolves the latest
+state for one exact identity. These are optional, non-abstract extension hooks:
+lexical-only custom stores remain valid, while stores advertising semantic
+search must implement equivalent identity, fencing, and readiness semantics.
+Canonical knowledge commits do not claim readiness, and readiness publication
+never creates or changes a canonical revision.
+
+The built-in embedding stores consume that boundary explicitly with bounded
+`process_embedding_changes(consumer_id, worker_id, limit=..., record_limit=...)`
+calls. `limit` bounds canonical changes and `record_limit` independently bounds
+the total chunk projections written, failed, or removed by one call. When one
+change exceeds that budget, its claim is released without advancing the cursor;
+the next call deterministically skips exact ready identities, retries failed
+identities, and continues with the next chunk or stale-vector cleanup page.
+Canonical writes first commit an outbox change
+without calling an embedding provider. A worker claims the change, publishes
+`pending`, commits the exact-identity vector, publishes `ready`, and only then
+acknowledges the change. A crash after the vector commit leaves it invisible
+behind `pending`; replay repairs `ready` without paying for the vector again. A
+crash after `ready` replays without a duplicate visible projection. Provider
+failures publish a non-sensitive `failed` state and can be retried through an
+explicit bounded backfill.
+
+`store_embedding_projections(...)` is the public persistence boundary for
+already-computed vectors. Each submitted `KnowledgeEmbeddingProjection` binds
+the vector to its complete identity plus the exact pending readiness sequence
+and attempt. The store accepts it only if that identity is still current and
+authorized and that pending attempt has not been superseded; stale records are
+omitted from the typed write result. The caller then publishes `ready`
+separately. Replaying the same attempt and vector is idempotent. Reusing that
+attempt marker with a different vector raises
+`KnowledgeEmbeddingProjectionConflict` and leaves the whole request unchanged;
+the vector becomes replaceable only after a newer pending attempt wins the
+readiness compare-and-swap. This allows an external projection service to
+compute vectors without duplicating private store logic, while the built-in
+workers use the same fenced path. `backfill_embeddings(...)` returns the same
+portable bounded result shape for the in-memory and PostgreSQL embedding stores.
+When more eligible records remain, `next_cursor` is an opaque keyset
+continuation bound to the exact query, access scope, projection configuration,
+and refresh mode. Pass it back as `cursor=...` to advance a large same-identity
+refresh without revisiting the first page.
+
+Semantic and hybrid reads never mutate the index. Each result carries
+`KnowledgeIndexCoverage` for the exact eligible chunk set and complete
+comparable projection space: model, dimensions, preprocessing, generator, and
+index representation; ready vectors, pending or missing projections, failed
+attempts, and the greatest matching readiness sequence. `complete` is true only
+when every eligible record is ready.
+Keyword lanes remain available during partial semantic coverage, but callers
+can distinguish that result from a complete semantic search.
+
+PostgreSQL materializes the complete readiness identity as typed columns for
+bounded coverage and rebuild scans. Each vector row also records the exact
+pending readiness sequence and attempt that accepted it, so a stale batch
+cannot masquerade as the current write. HNSW indexes are partial to one complete
+compatible projection space; vectors from different models, generators,
+preprocessing versions, dimensions, or index representations never share an
+ANN graph. Schema validation rejects a cross-space HNSW index.
+
+Breaking schema revision 44 adds the readiness event log and current pointer.
+It preserves revision-43 canonical entries, revisions, chunks, evidence,
+changes, consumers, and receipts. Pre-identity vector rows are deliberately
+discarded as rebuildable derived data; the migration does not fabricate
+readiness or retain a compatibility projection shape.
 
 Evidence prefixes and multi-entry expiration changes use the same scalar
 identity ordering in every built-in backend. SQLite makes its binary collation

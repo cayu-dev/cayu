@@ -43,6 +43,8 @@ from cayu.storage import (
     InMemoryEmbeddingKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
+    KnowledgeQuery,
+    KnowledgeSearchMode,
 )
 from cayu.tools import CommandRequest
 from cayu.vaults import SecretRef, StaticVault
@@ -140,16 +142,26 @@ class _UnvalidatedEmbeddingProvider(TextEmbeddingProvider):
 
 
 def test_embedding_store_revalidates_provider_results() -> None:
-    provider = _UnvalidatedEmbeddingProvider()
-    store = InMemoryEmbeddingKnowledgeStore(
-        access_scope=KnowledgeAccessScope.privileged(),
-        embedding_provider=provider,
-        embedding_model="embedding-model",
-        embedding_dimensions=1,
-    )
+    async def run():
+        provider = _UnvalidatedEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=KnowledgeAccessScope.privileged(),
+            embedding_provider=provider,
+            embedding_model="embedding-model",
+            embedding_dimensions=1,
+        )
+        await store.create_entry(KnowledgeEntry(id="entry-1", text="portable text"))
+        worker_result = await store.process_embedding_changes("validation-index", "worker")
+        search_result = await store.search(
+            KnowledgeQuery(text="portable", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        return worker_result, search_result
 
-    with pytest.raises(ValidationError, match="finite"):
-        asyncio.run(store.create_entry(KnowledgeEntry(id="entry-1", text="portable text")))
+    worker_result, search_result = asyncio.run(run())
+
+    assert worker_result.failed_records == 1
+    assert search_result.hits == []
+    assert search_result.index_coverage[0].failed_records == 1
 
 
 def _session() -> Session:

@@ -109,6 +109,10 @@ async def assert_entry_wide_none_terms_conformance(
     ]
     for entry, chunks in cases:
         await store.create_entry(entry, chunks)
+    if mode is not KnowledgeSearchMode.KEYWORD:
+        process_embedding_changes = getattr(store, "process_embedding_changes", None)
+        if process_embedding_changes is not None:
+            await process_embedding_changes("none-terms-conformance", "worker")
 
     wide = await store.search(
         KnowledgeQuery(

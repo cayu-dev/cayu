@@ -1852,6 +1852,64 @@ _MIGRATION_STEPS: dict[int, str] = {
                 REFERENCES cayu_knowledge_changes(sequence)
         );
     """,
+    44: """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_index_readiness_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT
+                CHECK (sequence > 0 AND sequence <= 9223372036854775807),
+            identity_sha256 TEXT NOT NULL CHECK (
+                length(identity_sha256) = 64
+                AND identity_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            chunk_id TEXT,
+            projection_type TEXT NOT NULL,
+            projection_content_hash TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+            preprocessing_version TEXT NOT NULL,
+            generator TEXT NOT NULL,
+            generator_version TEXT NOT NULL,
+            index_representation_version TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'ready', 'failed')),
+            attempt_id TEXT NOT NULL,
+            failure_code TEXT,
+            operation_id TEXT NOT NULL UNIQUE,
+            update_sha256 TEXT NOT NULL CHECK (
+                length(update_sha256) = 64
+                AND update_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            published_at TEXT NOT NULL,
+            CHECK (
+                (state = 'failed' AND failure_code IS NOT NULL)
+                OR (state <> 'failed' AND failure_code IS NULL)
+            ),
+            UNIQUE (identity_sha256, sequence)
+        );
+
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_index_readiness_current (
+            identity_sha256 TEXT PRIMARY KEY,
+            sequence INTEGER NOT NULL UNIQUE,
+            FOREIGN KEY (identity_sha256, sequence)
+                REFERENCES cayu_knowledge_index_readiness_events(
+                    identity_sha256, sequence
+                )
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_index_readiness_identity_sequence
+            ON cayu_knowledge_index_readiness_events(identity_sha256, sequence);
+        CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_index_readiness_entry_revision
+            ON cayu_knowledge_index_readiness_events(
+                entry_id, entry_revision, projection_type, sequence
+            );
+        CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_index_readiness_projection_lookup
+            ON cayu_knowledge_index_readiness_events(
+                entry_id, entry_revision, chunk_id, projection_type,
+                embedding_model, dimensions, sequence
+            );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2937,6 +2995,8 @@ def reconcile_schema(
         _validate_revision_42_knowledge_schema(connection)
     if current.revision >= 43:
         _validate_revision_43_knowledge_schema(connection)
+    if current.revision >= 44:
+        _validate_revision_44_knowledge_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
@@ -3566,6 +3626,124 @@ def _normalize_sqlite_schema_sql(value: object | None) -> str:
     return " ".join(str(value or "").lower().split())
 
 
+def _validate_revision_44_knowledge_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "cayu_knowledge_index_readiness_events": (
+            "sequence",
+            "identity_sha256",
+            "entry_id",
+            "entry_revision",
+            "chunk_id",
+            "projection_type",
+            "projection_content_hash",
+            "embedding_model",
+            "dimensions",
+            "preprocessing_version",
+            "generator",
+            "generator_version",
+            "index_representation_version",
+            "state",
+            "attempt_id",
+            "failure_code",
+            "operation_id",
+            "update_sha256",
+            "published_at",
+        ),
+        "cayu_knowledge_index_readiness_current": (
+            "identity_sha256",
+            "sequence",
+        ),
+    }
+    for table, columns in expected_columns.items():
+        if _sqlite_table_columns(connection, table) != columns:
+            _raise_revision_44_sqlite_schema_error(table)
+
+    foreign_keys = tuple(
+        (
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            str(row[6]).upper(),
+        )
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(cayu_knowledge_index_readiness_current)"
+        )
+    )
+    if foreign_keys != (
+        (
+            "cayu_knowledge_index_readiness_events",
+            "identity_sha256",
+            "identity_sha256",
+            "CASCADE",
+        ),
+        ("cayu_knowledge_index_readiness_events", "sequence", "sequence", "CASCADE"),
+    ):
+        _raise_revision_44_sqlite_schema_error("cayu_knowledge_index_readiness_current")
+
+    for table, key in (
+        ("cayu_knowledge_index_readiness_events", ("sequence",)),
+        ("cayu_knowledge_index_readiness_events", ("operation_id",)),
+        ("cayu_knowledge_index_readiness_events", ("identity_sha256", "sequence")),
+        ("cayu_knowledge_index_readiness_current", ("identity_sha256",)),
+        ("cayu_knowledge_index_readiness_current", ("sequence",)),
+    ):
+        if not _sqlite_has_unique_index(connection, table, key):
+            _raise_revision_44_sqlite_schema_error(table)
+
+    required_indexes = {
+        "idx_cayu_knowledge_index_readiness_identity_sequence": (
+            "cayu_knowledge_index_readiness_events",
+            ("identity_sha256", "sequence"),
+        ),
+        "idx_cayu_knowledge_index_readiness_entry_revision": (
+            "cayu_knowledge_index_readiness_events",
+            ("entry_id", "entry_revision", "projection_type", "sequence"),
+        ),
+        "idx_cayu_knowledge_index_readiness_projection_lookup": (
+            "cayu_knowledge_index_readiness_events",
+            (
+                "entry_id",
+                "entry_revision",
+                "chunk_id",
+                "projection_type",
+                "embedding_model",
+                "dimensions",
+                "sequence",
+            ),
+        ),
+    }
+    for index, (table, columns) in required_indexes.items():
+        row = connection.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        ).fetchone()
+        actual_columns = tuple(
+            str(column[2]) for column in connection.execute(f"PRAGMA index_info({index})")
+        )
+        if row is None or str(row[0]) != table or actual_columns != columns:
+            _raise_revision_44_sqlite_schema_error(index)
+
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'cayu_knowledge_index_readiness_events'"
+    ).fetchone()
+    normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+    required_fragments = (
+        "check (sequence > 0 and sequence <= 9223372036854775807)",
+        "length(identity_sha256) = 64",
+        "identity_sha256 not glob '*[^0-9a-f]*'",
+        "check (entry_revision > 0 and entry_revision <= 2147483647)",
+        "check (dimensions > 0)",
+        "check (state in ('pending', 'ready', 'failed'))",
+        "length(update_sha256) = 64",
+        "update_sha256 not glob '*[^0-9a-f]*'",
+        "state = 'failed' and failure_code is not null",
+        "state <> 'failed' and failure_code is null",
+    )
+    if any(fragment not in normalized for fragment in required_fragments):
+        _raise_revision_44_sqlite_schema_error("cayu_knowledge_index_readiness_events")
+
+
 def _raise_revision_42_sqlite_schema_error(name: str) -> NoReturn:
     raise RuntimeError(
         f"SQLite schema object {name!r} conflicts with Cayu's revision-first "
@@ -3579,6 +3757,14 @@ def _raise_revision_43_sqlite_schema_error(name: str) -> NoReturn:
         f"SQLite schema object {name!r} conflicts with Cayu's knowledge evidence "
         "and atomic change contract. Recreate or migrate the Cayu database from "
         "a known-good revision-43 schema."
+    )
+
+
+def _raise_revision_44_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        f"SQLite schema object {name!r} conflicts with Cayu's derived-index "
+        "identity and readiness contract. Recreate or migrate the Cayu database "
+        "from a known-good revision-44 schema."
     )
 
 
@@ -3924,6 +4110,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_42_knowledge_schema(connection)
         if rev.revision == 43:
             _validate_revision_43_knowledge_schema(connection)
+        if rev.revision == 44:
+            _validate_revision_44_knowledge_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

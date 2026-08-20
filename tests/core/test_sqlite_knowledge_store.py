@@ -9,6 +9,9 @@ from pydantic import ValidationError
 from tests.core.knowledge_access_scope_conformance import (
     assert_knowledge_access_scope_conformance,
 )
+from tests.core.knowledge_index_readiness_conformance import (
+    assert_index_readiness_conformance,
+)
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
@@ -60,6 +63,20 @@ async def _close(store) -> None:
     close = getattr(store, "close", None)
     if close is not None:
         await close()
+
+
+def test_sqlite_index_readiness_conformance(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(
+            tmp_path / "index-readiness.sqlite",
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await assert_index_readiness_conformance(store)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
 
 def _reconcile_sqlite_through_revision_41(connection: sqlite3.Connection) -> None:

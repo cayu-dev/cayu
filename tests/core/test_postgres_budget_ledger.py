@@ -37,9 +37,18 @@ from cayu.runtime.sessions import BudgetReservationIdentityConflict
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_knowledge_embeddings",
+    "cayu_knowledge_index_readiness_current",
+    "cayu_knowledge_index_readiness_events",
     "cayu_budget_settlements",
     "cayu_budget_reservations",
     "cayu_task_terminalization_receipts",
+    "cayu_knowledge_change_acknowledgements",
+    "cayu_knowledge_change_consumers",
+    "cayu_knowledge_change_labels",
+    "cayu_knowledge_change_audiences",
+    "cayu_knowledge_changes",
+    "cayu_knowledge_evidence",
     "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",

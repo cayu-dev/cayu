@@ -635,12 +635,13 @@ def test_remember_knowledge_rejects_truncated_index_without_writing() -> None:
     assert search.hits == []
 
 
-def test_remember_knowledge_preserves_entry_on_embedding_write_failure() -> None:
+def test_remember_knowledge_is_independent_of_embedding_provider_failure() -> None:
     async def run():
         store = InMemoryEmbeddingKnowledgeStore(
             access_scope=_ACCESS_SCOPE,
             embedding_provider=FailingEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         result = await RememberKnowledgeTool().run(
             ToolContext(session_id="session_1", knowledge_store=store),
@@ -654,17 +655,22 @@ def test_remember_knowledge_preserves_entry_on_embedding_write_failure() -> None
             max_chunks=5,
             max_bytes=20_000,
         )
-        return result, entry, chunks
+        worker_result = await store.process_embedding_changes(
+            "remember-embedding",
+            "worker",
+        )
+        return result, entry, chunks, worker_result
 
-    result, entry, chunks = asyncio.run(run())
+    result, entry, chunks, worker_result = asyncio.run(run())
 
     assert result.is_error is False
-    assert result.structured["post_write_error"] == "publication_acknowledgement_lost"
+    assert "post_write_error" not in result.structured
     assert "embedding service unavailable" not in result.content
     assert "Knowledge stored as pending" in result.content
     assert entry is not None
     assert entry.status is KnowledgeStatus.PENDING
     assert len(chunks) == 1
+    assert worker_result.failed_records == 1
 
 
 def test_remember_knowledge_reconciles_acknowledgement_loss_without_exposing_error() -> None:
@@ -1692,6 +1698,7 @@ def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
@@ -1710,6 +1717,7 @@ def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
                 text="Invoice refunds require approval before payment.",
             )
         )
+        await store.process_embedding_changes("semantic-tool-index", "worker")
         return await SearchKnowledgeTool().run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {
@@ -1726,6 +1734,23 @@ def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
     assert result.structured is not None
     assert result.structured["query"]["mode"] == "semantic"
     assert result.structured["search_modes"] == ["auto", "keyword", "semantic", "hybrid"]
+    assert result.structured["index_coverage"] == [
+        {
+            "projection_type": "knowledge_chunk_text",
+            "embedding_model": "test-embedding",
+            "dimensions": 3,
+            "preprocessing_version": "cayu:knowledge-chunk-text:v1",
+            "generator": "cayu:canonical-knowledge-chunk",
+            "generator_version": "1",
+            "index_representation_version": "float32-cosine-v1",
+            "eligible_records": 2,
+            "ready_records": 2,
+            "pending_records": 0,
+            "failed_records": 0,
+            "high_water_sequence": 4,
+            "complete": True,
+        }
+    ]
     assert [hit["entry_id"] for hit in result.structured["hits"]] == ["remote_git_credentials"]
     assert result.structured["hits"][0]["score_kind"] == "inmemory_semantic"
     assert "chunk_index=0" in result.content
@@ -1737,6 +1762,7 @@ def test_search_knowledge_auto_filters_weak_semantic_neighbors_by_default() -> N
             access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=2,
             semantic_min_score=0.0,
         )
         await KnowledgeIndexer(store).index_text(
@@ -1756,6 +1782,7 @@ def test_search_knowledge_auto_filters_weak_semantic_neighbors_by_default() -> N
                 text="For SendGrid, prefer a trusted email delivery configuration.",
             )
         )
+        await store.process_embedding_changes("auto-tool-index", "worker")
         return await SearchKnowledgeTool().run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {
@@ -1782,6 +1809,7 @@ def test_search_knowledge_auto_min_score_zero_keeps_weak_semantic_neighbors() ->
             access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=2,
             semantic_min_score=0.0,
         )
         await KnowledgeIndexer(store).index_text(
@@ -1798,6 +1826,7 @@ def test_search_knowledge_auto_min_score_zero_keeps_weak_semantic_neighbors() ->
                 text="For SendGrid, prefer a trusted credential proxy outside the sandbox.",
             )
         )
+        await store.process_embedding_changes("override-tool-index", "worker")
         return await SearchKnowledgeTool(allow_score_override=True).run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {
@@ -1831,6 +1860,7 @@ def test_search_knowledge_auto_min_score_preserves_unscored_keyword_hits() -> No
             access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=2,
             semantic_min_score=0.75,
         )
         await KnowledgeIndexer(store).index_text(
@@ -1847,6 +1877,7 @@ def test_search_knowledge_auto_min_score_preserves_unscored_keyword_hits() -> No
                 text="Remote sandbox auth runbook uses a documented fallback procedure.",
             )
         )
+        await store.process_embedding_changes("keyword-tool-index", "worker")
         return await SearchKnowledgeTool().run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {
@@ -1875,6 +1906,7 @@ def test_search_knowledge_default_rejects_score_override_argument() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=2,
             semantic_min_score=0.0,
         )
         await KnowledgeIndexer(store).index_text(
@@ -2276,6 +2308,7 @@ def test_list_knowledge_advertises_embedding_search_modes() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=3,
         )
         await KnowledgeIndexer(store).index_text(
             KnowledgeIndexRequest(
@@ -3014,6 +3047,7 @@ def test_search_knowledge_forwards_min_score_in_store_query() -> None:
             access_scope=_ACCESS_SCOPE,
             embedding_provider=WeightedEmbeddingProvider(),
             embedding_model="test-embedding",
+            embedding_dimensions=2,
             semantic_min_score=0.0,
         )
         await KnowledgeIndexer(store).index_text(

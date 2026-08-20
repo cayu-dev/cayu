@@ -734,7 +734,7 @@ def test_knowledge_embedding_contract_requires_expected_semantic_top_hit() -> No
         knowledge_embedding_live._run_contract(
             provider=provider,
             embedding_model="embedding-live-model",
-            dimensions=None,
+            dimensions=3,
         )
     )
 
@@ -746,6 +746,7 @@ def test_knowledge_embedding_contract_requires_expected_semantic_top_hit() -> No
     assert evidence["hit_count"] > 0
     assert provider.calls
     assert {request.model for request in provider.calls} == {"embedding-live-model"}
+    assert {request.dimensions for request in provider.calls} == {3}
     assert provider.calls[-1].texts == [knowledge_embedding_live.QUERY]
 
 

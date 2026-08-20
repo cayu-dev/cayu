@@ -157,6 +157,33 @@ unproven workspace lineage without claiming an isolated derived revision. The
 new evidence is additive JSON in existing events and round-trips through all
 built-in session stores; no storage migration is required.
 
+### Derived knowledge indexes publish exact identity and readiness
+
+`KnowledgeEmbeddingIdentity` now binds every comparable derived embedding to
+its exact entry revision, optional chunk, projection content, embedding space,
+preprocessing, generator, and index representation. Independent
+`KnowledgeIndexReadiness` events use compare-and-swap sequence fencing,
+attempt fencing, idempotent operation replay, bounded authorized high-water
+pages, and durable restart behavior across in-memory, SQLite, and PostgreSQL.
+Lexical-only custom stores keep optional extension hooks instead of pretending
+to support embeddings.
+
+`InMemoryEmbeddingKnowledgeStore` and `PostgresEmbeddingKnowledgeStore` now keep
+canonical publication provider-free and consume committed changes through
+bounded `process_embedding_changes(...)` workers with independent change and
+projection-record budgets plus deterministic continuation. The crash-safe order is
+pending readiness, vector commit, ready readiness, then outbox acknowledgement.
+Semantic/hybrid search is read-only, rejects non-ready or incompatible rows,
+and returns machine-readable `KnowledgeIndexCoverage`; explicit bounded
+backfill retries failed or missing projections.
+
+Breaking storage revision 44 preserves canonical revision-43 knowledge and
+adds the readiness event/current tables. PostgreSQL drops pre-identity
+`cayu_knowledge_embeddings` rows during migration because vectors are derived
+and cannot be safely assigned the missing identity. Stop older workers, migrate
+once, and rebuild semantic projections; Cayu does not add a legacy read path or
+fabricate readiness.
+
 ### Knowledge revisions carry evidence and publish atomic changes
 
 Knowledge create, append, and owned-publication operations now accept immutable

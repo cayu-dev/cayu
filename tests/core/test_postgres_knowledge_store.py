@@ -7,6 +7,9 @@ import pytest
 from tests.core.knowledge_access_scope_conformance import (
     assert_knowledge_access_scope_conformance,
 )
+from tests.core.knowledge_index_readiness_conformance import (
+    assert_index_readiness_conformance,
+)
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
@@ -31,11 +34,16 @@ from cayu.embeddings import (
 from cayu.storage import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,
+    MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
     KnowledgeAccessScope,
     KnowledgeChangeKind,
     KnowledgeChunk,
+    KnowledgeEmbeddingProjection,
+    KnowledgeEmbeddingProjectionConflict,
     KnowledgeEntry,
     KnowledgeEvidence,
+    KnowledgeIndexReadinessUpdate,
+    KnowledgeIndexState,
     KnowledgeListGroup,
     KnowledgeListQuery,
     KnowledgeQuery,
@@ -48,6 +56,7 @@ from cayu.storage import migrations as schema_migrations
 from cayu.storage.memory import (
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
+    _knowledge_chunk_content_hash,
     _knowledge_publication_v1_request_sha256,
 )
 from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, SchemaMode
@@ -58,6 +67,8 @@ _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 
 _TABLES = (
     "cayu_knowledge_embeddings",
+    "cayu_knowledge_index_readiness_current",
+    "cayu_knowledge_index_readiness_events",
     "cayu_task_terminalization_receipts",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
@@ -235,12 +246,13 @@ def _new_embedding_store(
     provider: TextEmbeddingProvider,
     *,
     max_size: int = 4,
+    access_scope: KnowledgeAccessScope | None = _ACCESS_SCOPE,
 ):
     from cayu import PostgresEmbeddingKnowledgeStore
 
     return PostgresEmbeddingKnowledgeStore(
         dsn,
-        access_scope=_ACCESS_SCOPE,
+        access_scope=access_scope,
         min_size=1,
         max_size=max_size,
         schema_mode=SchemaMode.CREATE,
@@ -259,6 +271,19 @@ def test_postgres_knowledge_store_owned_publication_conformance(postgres_dsn: st
             await assert_owned_publication_conformance(store)
             await assert_concurrent_publication_conformance(store)
             await assert_stale_operation_cannot_replace_newer_publication(store)
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_index_readiness_conformance(postgres_dsn: str) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await assert_index_readiness_conformance(store)
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
@@ -454,6 +479,10 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
         privileged = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
         try:
             await privileged.create_entry(original, [original_chunk])
+            await privileged.process_embedding_changes(
+                "snapshot-postgres-index",
+                "worker",
+            )
         finally:
             await privileged.close()
 
@@ -571,6 +600,10 @@ def test_postgres_hybrid_lanes_share_one_read_snapshot(postgres_dsn: str) -> Non
         privileged = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
         try:
             await privileged.create_entry(original, [original_chunk])
+            await privileged.process_embedding_changes(
+                "hybrid-snapshot-postgres-index",
+                "worker",
+            )
         finally:
             await privileged.close()
 
@@ -643,7 +676,7 @@ def test_postgres_hybrid_lanes_share_one_read_snapshot(postgres_dsn: str) -> Non
     asyncio.run(run())
 
 
-def test_postgres_owned_publication_does_not_apply_stale_derived_embeddings(
+def test_postgres_embedding_worker_does_not_apply_stale_derived_embeddings(
     postgres_dsn: str,
 ) -> None:
     class FirstCallBlockingEmbeddingProvider(TextEmbeddingProvider):
@@ -681,11 +714,15 @@ def test_postgres_owned_publication_does_not_apply_stale_derived_embeddings(
                 text="GitHub credential proxy policy.",
             )
             old_chunks = [old_chunks[0].model_copy(update={"id": "old-publication-chunk"})]
+            await store.publish_entry_revision(
+                old_entry,
+                old_chunks,
+                operation_id="old-embedding-publication",
+            )
             old_task = asyncio.create_task(
-                store.publish_entry_revision(
-                    old_entry,
-                    old_chunks,
-                    operation_id="old-embedding-publication",
+                store.process_embedding_changes(
+                    "stale-postgres-index",
+                    "worker",
                 )
             )
             await asyncio.wait_for(provider.first_started.wait(), timeout=2)
@@ -713,7 +750,7 @@ def test_postgres_owned_publication_does_not_apply_stale_derived_embeddings(
             ):
                 await cur.execute(
                     """
-                    SELECT chunk_id, content_hash
+                    SELECT chunk_id, projection_content_hash
                     FROM cayu_knowledge_embeddings
                     WHERE entry_id = %s
                     ORDER BY chunk_id
@@ -721,7 +758,7 @@ def test_postgres_owned_publication_does_not_apply_stale_derived_embeddings(
                     (old_entry.id,),
                 )
                 rows = [(str(row[0]), str(row[1])) for row in await cur.fetchall()]
-            return new_chunks[0].content_hash or "", rows
+            return _knowledge_chunk_content_hash(new_chunks[0]), rows
         finally:
             provider.release_first.set()
             if old_task is not None and not old_task.done():
@@ -732,6 +769,79 @@ def test_postgres_owned_publication_does_not_apply_stale_derived_embeddings(
     expected_hash, rows = asyncio.run(run())
 
     assert rows == [("new-publication-chunk", expected_hash)]
+
+
+def test_postgres_embedding_worker_fences_superseded_attempt_vector_write(
+    postgres_dsn: str,
+) -> None:
+    class FirstCallBlockingEmbeddingProvider(TextEmbeddingProvider):
+        name = "blocking-attempt-fence-test"
+
+        def __init__(self) -> None:
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            call = self.call_count
+            if call == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            vector = [1.0, 0.0, 0.0] if call == 1 else [0.0, 1.0, 0.0]
+            return TextEmbeddingResult(
+                model=request.model,
+                embeddings=[
+                    TextEmbedding(index=index, vector=vector)
+                    for index, _ in enumerate(request.texts)
+                ],
+            )
+
+    async def run() -> tuple[str, int]:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = FirstCallBlockingEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        slow: asyncio.Task | None = None
+        try:
+            entry, chunks = publication_material(
+                entry_id="embedding-attempt-fence",
+                text="GitHub credential proxy policy.",
+            )
+            await store.publish_entry_revision(
+                entry,
+                chunks,
+                operation_id="embedding-attempt-fence-publication",
+            )
+            slow = asyncio.create_task(
+                store.process_embedding_changes("slow-attempt-index", "worker-a")
+            )
+            await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+            fast = await store.process_embedding_changes("fast-attempt-index", "worker-b")
+            provider.release_first.set()
+            await slow
+            assert fast.indexed_records == 1
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute("SELECT embedding::text FROM cayu_knowledge_embeddings")
+                row = await cur.fetchone()
+            assert row is not None
+            return str(row[0]), provider.call_count
+        finally:
+            provider.release_first.set()
+            if slow is not None and not slow.done():
+                await asyncio.gather(slow, return_exceptions=True)
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    vector, call_count = asyncio.run(run())
+
+    assert vector == "[0,1,0]"
+    assert call_count == 2
 
 
 def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
@@ -745,17 +855,23 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
             self.cleanup_started = asyncio.Event()
             self.release_cleanup = asyncio.Event()
 
-        async def _delete_entry_embeddings(self, entry_id: str) -> None:
-            self.cleanup_started.set()
-            await self.release_cleanup.wait()
-            async with self._pool.connection() as conn, conn.cursor() as cur:
-                await cur.execute(
-                    "DELETE FROM cayu_knowledge_embeddings WHERE entry_id = %s",
-                    (entry_id,),
-                )
-                await conn.commit()
+        async def _drop_entry_embeddings(
+            self,
+            entry_id: str,
+            *,
+            expected_deleted_revision: int | None,
+            limit: int,
+        ) -> tuple[int, bool]:
+            if not self.cleanup_started.is_set():
+                self.cleanup_started.set()
+                await self.release_cleanup.wait()
+            return await super()._drop_entry_embeddings(
+                entry_id,
+                expected_deleted_revision=expected_deleted_revision,
+                limit=limit,
+            )
 
-    async def run() -> tuple[bool, str, list[tuple[str, str]]]:
+    async def run() -> tuple[str, list[tuple[str, str]]]:
         import psycopg
 
         await _drop_all(postgres_dsn)
@@ -763,14 +879,12 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
         store = DelayedDeleteCleanupStore(
             postgres_dsn,
             access_scope=_ACCESS_SCOPE,
+            schema_mode=SchemaMode.CREATE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
             embedding_dimensions=3,
-            semantic_min_score=0.70,
-            schema_mode=SchemaMode.CREATE,
         )
-        delete_task: asyncio.Task | None = None
-        cleanup_wait: asyncio.Task | None = None
+        stale_cleanup: asyncio.Task | None = None
         try:
             old_entry, old_chunks = publication_material(
                 entry_id="delete-republication",
@@ -782,43 +896,33 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
                 old_chunks,
                 operation_id="old-delete-operation",
             )
-            delete_task = asyncio.create_task(
-                store.delete_entry(
-                    old_entry.id,
-                    expected_revision=old_entry.revision,
-                    hard=True,
-                )
+            await store.process_embedding_changes("delete-republication-index", "worker")
+            await store.delete_entry(
+                old_entry.id,
+                expected_revision=old_entry.revision,
+                hard=True,
             )
-            cleanup_wait = asyncio.create_task(store.cleanup_started.wait())
-            done, _ = await asyncio.wait(
-                {delete_task, cleanup_wait},
-                return_when=asyncio.FIRST_COMPLETED,
+            stale_cleanup = asyncio.create_task(
+                store.process_embedding_changes("delete-republication-index", "old-worker")
             )
-
+            await asyncio.wait_for(store.cleanup_started.wait(), timeout=2)
             new_entry, new_chunks = publication_material(
                 entry_id=old_entry.id,
                 text="New invoice payment policy.",
                 timestamp_offset=1,
             )
             new_chunks = [new_chunks[0].model_copy(update={"id": "new-delete-chunk"})]
-            if cleanup_wait in done:
-                # Reproduce the historical race: the source delete committed,
-                # then its redundant derived cleanup stalled while a new source
-                # and embedding were published under the same entry identity.
-                await store.publish_entry_revision(
-                    new_entry,
-                    new_chunks,
-                    operation_id="new-delete-operation",
-                )
-                store.release_cleanup.set()
-                await delete_task
-            else:
-                await delete_task
-                await store.publish_entry_revision(
-                    new_entry,
-                    new_chunks,
-                    operation_id="new-delete-operation",
-                )
+            await store.publish_entry_revision(
+                new_entry,
+                new_chunks,
+                operation_id="new-delete-operation",
+            )
+            await store.process_embedding_changes(
+                "republication-index",
+                "new-worker",
+            )
+            store.release_cleanup.set()
+            await stale_cleanup
 
             async with (
                 await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
@@ -826,7 +930,7 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
             ):
                 await cur.execute(
                     """
-                    SELECT chunk_id, content_hash
+                    SELECT chunk_id, projection_content_hash
                     FROM cayu_knowledge_embeddings
                     WHERE entry_id = %s
                     ORDER BY chunk_id
@@ -834,24 +938,16 @@ def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
                     (old_entry.id,),
                 )
                 rows = [(str(row[0]), str(row[1])) for row in await cur.fetchall()]
-            return (
-                store.cleanup_started.is_set(),
-                new_chunks[0].content_hash or "",
-                rows,
-            )
+            return _knowledge_chunk_content_hash(new_chunks[0]), rows
         finally:
             store.release_cleanup.set()
-            if cleanup_wait is not None and not cleanup_wait.done():
-                cleanup_wait.cancel()
-                await asyncio.gather(cleanup_wait, return_exceptions=True)
-            if delete_task is not None and not delete_task.done():
-                await asyncio.gather(delete_task, return_exceptions=True)
+            if stale_cleanup is not None and not stale_cleanup.done():
+                await asyncio.gather(stale_cleanup, return_exceptions=True)
             await store.close()
             await _drop_all(postgres_dsn)
 
-    cleanup_started, expected_hash, rows = asyncio.run(run())
+    expected_hash, rows = asyncio.run(run())
 
-    assert cleanup_started is False
     assert rows == [("new-delete-chunk", expected_hash)]
 
 
@@ -931,7 +1027,7 @@ def test_postgres_remember_knowledge_reports_failed_embedding_without_repeating_
             self.call_count += 1
             raise RuntimeError("secret canary embedding failure")
 
-    async def run() -> tuple[object, object, int]:
+    async def run() -> tuple[object, object, object, int]:
         from cayu import RememberKnowledgeTool, ToolContext
 
         await _drop_all(postgres_dsn)
@@ -949,16 +1045,20 @@ def test_postgres_remember_knowledge_reports_failed_embedding_without_repeating_
             }
             first = await RememberKnowledgeTool().run(context, arguments)
             replay = await RememberKnowledgeTool().run(context, arguments)
-            return first, replay, provider.call_count
+            worker_result = await store.process_embedding_changes(
+                "failed-postgres-index",
+                "worker",
+            )
+            return first, replay, worker_result, provider.call_count
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
 
-    first, replay, call_count = asyncio.run(run())
+    first, replay, worker_result, call_count = asyncio.run(run())
 
     assert first.is_error is False
     assert first.structured is not None
-    assert first.structured["post_write_error"] == "publication_acknowledgement_lost"
+    assert "post_write_error" not in first.structured
     assert "secret canary" not in first.content
     assert "secret canary" not in repr(first.structured)
     assert replay.is_error is False
@@ -967,6 +1067,7 @@ def test_postgres_remember_knowledge_reports_failed_embedding_without_repeating_
     assert replay.structured["already_known"] is None
     assert replay.structured["publication_replayed"] is True
     assert replay.structured["status"] is None
+    assert worker_result.failed_records == 1
     assert call_count == 1
 
 
@@ -1187,6 +1288,7 @@ def test_postgres_embedding_knowledge_store_persists_semantic_vectors(postgres_d
                     aspects=["invoices"],
                 )
             )
+            await store.process_embedding_changes("persistence-index", "worker")
             result = await store.search(
                 KnowledgeQuery(
                     text="auth broker",
@@ -1226,6 +1328,183 @@ def test_postgres_embedding_knowledge_store_persists_semantic_vectors(postgres_d
     ]
 
 
+def test_postgres_embedding_worker_continues_one_change_within_record_budget(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        try:
+            entry = KnowledgeEntry(
+                id="bounded-postgres-embedding-change",
+                text="Bounded embedding work.",
+            )
+            chunks = [
+                KnowledgeChunk(
+                    id=f"bounded-postgres-embedding-change:{index}",
+                    entry_id=entry.id,
+                    chunk_index=index,
+                    text=text,
+                )
+                for index, text in enumerate(("github auth", "invoice payment", "refund approval"))
+            ]
+            await store.create_entry(entry, chunks)
+            first = await store.process_embedding_changes(
+                "bounded-postgres-embedding-index",
+                "worker",
+                limit=1,
+                record_limit=2,
+            )
+            second = await store.process_embedding_changes(
+                "bounded-postgres-embedding-index",
+                "worker",
+                limit=1,
+                record_limit=2,
+            )
+            state = await store.load_change_consumer_state("bounded-postgres-embedding-index")
+            return first, second, state, provider.calls
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    first, second, state, calls = asyncio.run(ops())
+
+    assert first.processed_records == 2
+    assert first.claimed_changes == 1
+    assert first.acknowledged_changes == 0
+    assert second.processed_records == 1
+    assert second.claimed_changes == 1
+    assert second.acknowledged_changes == 1
+    assert state is not None
+    assert state.cursor_sequence == 1
+    assert calls == [["github auth", "invoice payment"], ["refund approval"]]
+
+
+def test_postgres_embedding_worker_pages_stale_cleanup_within_record_budget(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            entry = KnowledgeEntry(id="bounded-postgres-cleanup", text="Old projection set.")
+            await store.create_entry(
+                entry,
+                [
+                    KnowledgeChunk(
+                        id=f"bounded-postgres-cleanup:{index}",
+                        entry_id=entry.id,
+                        chunk_index=index,
+                        text=f"old projection {index}",
+                    )
+                    for index in range(5)
+                ],
+            )
+            await store.process_embedding_changes(
+                "bounded-postgres-cleanup-index",
+                "worker",
+                record_limit=10,
+            )
+            await store.append_entry_revision(
+                entry.model_copy(update={"revision": 2, "text": "Current projection."}),
+                [
+                    KnowledgeChunk(
+                        id="bounded-postgres-cleanup:current",
+                        entry_id=entry.id,
+                        entry_revision=2,
+                        chunk_index=0,
+                        text="current projection",
+                    )
+                ],
+                expected_revision=1,
+            )
+            results = []
+            for _ in range(4):
+                result = await store.process_embedding_changes(
+                    "bounded-postgres-cleanup-index",
+                    "worker",
+                    limit=1,
+                    record_limit=2,
+                )
+                results.append(result)
+                if result.acknowledged_changes:
+                    break
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute("SELECT COUNT(*) FROM cayu_knowledge_embeddings")
+                remaining = int((await cur.fetchone())[0])
+            return results, remaining
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    results, remaining = asyncio.run(ops())
+
+    assert all(result.processed_records <= 2 for result in results)
+    assert sum(result.removed_records for result in results) == 5
+    assert results[-1].acknowledged_changes == 1
+    assert remaining == 1
+
+
+def test_postgres_embedding_worker_repairs_committed_vector_after_restart(
+    postgres_dsn: str,
+) -> None:
+    from cayu import PostgresEmbeddingKnowledgeStore
+
+    class CrashAfterVectorStore(PostgresEmbeddingKnowledgeStore):
+        fail_ready_once = True
+
+        async def publish_index_readiness(self, update, **kwargs):
+            if self.fail_ready_once and update.state is KnowledgeIndexState.READY:
+                self.fail_ready_once = False
+                raise RuntimeError("simulated crash after vector commit")
+            return await super().publish_index_readiness(update, **kwargs)
+
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = CrashAfterVectorStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="crash-window", text="GitHub credential proxy.")
+            )
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                await store.process_embedding_changes("crash-postgres-index", "worker-a")
+        finally:
+            await store.close()
+
+        reopened = _new_embedding_store(postgres_dsn, provider)
+        try:
+            retry = await reopened.process_embedding_changes(
+                "crash-postgres-index",
+                "worker-b",
+            )
+            result = await reopened.search(
+                KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
+            )
+        finally:
+            await reopened.close()
+        return retry, result, provider.calls
+
+    retry, result, calls = asyncio.run(ops())
+
+    assert retry.indexed_records == 1
+    assert retry.acknowledged_changes == 1
+    assert [hit.entry.id for hit in result.hits] == ["crash-window"]
+    assert result.index_coverage[0].complete is True
+    assert calls == [["GitHub credential proxy."], ["auth"]]
+
+
 def test_postgres_embedding_knowledge_store_query_min_score_overrides_store_default(
     postgres_dsn: str,
 ) -> None:
@@ -1240,6 +1519,7 @@ def test_postgres_embedding_knowledge_store_query_min_score_overrides_store_defa
             await store.create_entry(
                 KnowledgeEntry(id="orthogonal", text="Invoice payment policy.")
             )
+            await store.process_embedding_changes("min-score-postgres-index", "worker")
             return await store.search(
                 KnowledgeQuery(
                     text="auth broker",
@@ -1281,6 +1561,7 @@ def test_postgres_embedding_lifecycle_revisions_replace_stale_derived_rows(
                 expected_revision=archived.revision,
             )
             assert deleted is not None
+            await store.process_embedding_changes("lifecycle-postgres-index", "worker")
         finally:
             await store.close()
 
@@ -1307,7 +1588,7 @@ def test_postgres_embedding_lifecycle_revisions_replace_stale_derived_rows(
 
     assert archived.revision == 2
     assert deleted.revision == 3
-    assert rows == [("lifecycle-embedding:r3:0", 3)]
+    assert rows == []
 
 
 def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
@@ -1339,13 +1620,27 @@ def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
             await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
             conn.cursor() as cur,
         ):
-            await cur.execute("SELECT to_regclass('idx_cayu_knowledge_embeddings_embedding_hnsw')")
+            await cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM pg_catalog.pg_index AS index_state
+                JOIN pg_catalog.pg_class AS index_record
+                  ON index_record.oid = index_state.indexrelid
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = index_state.indrelid
+                JOIN pg_catalog.pg_am AS access_method
+                  ON access_method.oid = index_record.relam
+                WHERE table_record.relname = 'cayu_knowledge_embeddings'
+                  AND access_method.amname = 'hnsw'
+                """
+            )
             row = await cur.fetchone()
-        return None if row is None else row[0]
+        assert row is not None
+        return int(row[0])
 
-    index_name = asyncio.run(ops())
+    index_count = asyncio.run(ops())
 
-    assert index_name is None
+    assert index_count == 0
 
 
 def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_indexing(
@@ -1382,10 +1677,56 @@ def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_in
             embedding_dimensions=3,
         )
         try:
-            with pytest.raises(RuntimeError, match="dimension mismatch"):
+            with pytest.raises(RuntimeError, match="embedding schema does not match"):
                 await second._ensure_ready()
         finally:
             await second.close()
+
+    asyncio.run(ops())
+
+
+def test_postgres_embedding_schema_rejects_cross_space_hnsw_index(
+    postgres_dsn: str,
+) -> None:
+    async def ops() -> None:
+        import psycopg
+
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        created = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await created._ensure_ready()
+        finally:
+            await created.close()
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                """
+                CREATE INDEX invalid_cross_space_hnsw
+                ON cayu_knowledge_embeddings
+                USING hnsw (embedding vector_cosine_ops)
+                """
+            )
+            await conn.commit()
+
+        validated = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            schema_mode=SchemaMode.VALIDATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="must isolate one complete"):
+                await validated._ensure_ready()
+        finally:
+            await validated.close()
+            await _drop_all(postgres_dsn)
 
     asyncio.run(ops())
 
@@ -1432,7 +1773,7 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
         store = _new_embedding_store(postgres_dsn, provider)
         try:
             # Explicit bounded backfill embeds the missing chunks one page at a
-            # time; searches are exercised separately (they now lazily backfill).
+            # time; semantic searches remain read-only and are exercised separately.
             first_backfill = await store.backfill_embeddings(
                 KnowledgeListQuery(
                     namespace="ops",
@@ -1454,13 +1795,23 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
                 ),
                 limit=10,
             )
-            refresh = await store.backfill_embeddings(
+            first_refresh = await store.backfill_embeddings(
                 KnowledgeListQuery(
                     namespace="ops",
                     labels={"project": "cayu"},
                 ),
-                limit=10,
+                limit=1,
                 refresh_existing=True,
+            )
+            assert first_refresh.next_cursor is not None
+            second_refresh = await store.backfill_embeddings(
+                KnowledgeListQuery(
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                ),
+                limit=1,
+                refresh_existing=True,
+                cursor=first_refresh.next_cursor,
             )
         finally:
             await store.close()
@@ -1468,32 +1819,42 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
             first_backfill,
             second_backfill,
             third_backfill,
-            refresh,
+            first_refresh,
+            second_refresh,
             provider.calls,
         )
 
-    first_backfill, second_backfill, third_backfill, refresh, calls = asyncio.run(ops())
+    first_backfill, second_backfill, third_backfill, first_refresh, second_refresh, calls = (
+        asyncio.run(ops())
+    )
 
-    assert first_backfill.scanned_chunks == 1
-    assert first_backfill.embedded_chunks == 1
-    assert first_backfill.skipped_current_chunks == 0
-    assert second_backfill.scanned_chunks == 1
-    assert second_backfill.embedded_chunks == 1
-    assert second_backfill.skipped_current_chunks == 0
-    assert third_backfill.scanned_chunks == 0
-    assert third_backfill.embedded_chunks == 0
-    assert third_backfill.skipped_current_chunks == 0
-    assert refresh.scanned_chunks == 2
-    assert refresh.embedded_chunks == 2
+    assert first_backfill.scanned_records == 1
+    assert first_backfill.indexed_records == 1
+    assert first_backfill.failed_records == 0
+    assert first_backfill.skipped_records == 0
+    assert second_backfill.scanned_records == 1
+    assert second_backfill.indexed_records == 1
+    assert second_backfill.failed_records == 0
+    assert second_backfill.skipped_records == 0
+    assert third_backfill.scanned_records == 0
+    assert third_backfill.indexed_records == 0
+    assert third_backfill.failed_records == 0
+    assert third_backfill.skipped_records == 0
+    assert first_refresh.scanned_records == 1
+    assert first_refresh.indexed_records == 1
+    assert first_refresh.failed_records == 0
+    assert first_refresh.next_cursor is not None
+    assert second_refresh.scanned_records == 1
+    assert second_refresh.indexed_records == 1
+    assert second_refresh.failed_records == 0
+    assert second_refresh.next_cursor is None
     cayu_texts = {
         "GitHub token pushes should use the broker.",
         "Use a credential broker for GitHub auth from remote sandboxes.",
     }
     single_calls = sorted(tuple(call) for call in calls if len(call) == 1)
-    assert single_calls == sorted((text,) for text in cayu_texts)
-    refresh_calls = [call for call in calls if len(call) == 2]
-    assert len(refresh_calls) == 1
-    assert set(refresh_calls[0]) == cayu_texts
+    assert len(single_calls) == 4
+    assert {call[0] for call in single_calls} == cayu_texts
 
 
 class FlakyEmbeddingProvider(TextEmbeddingProvider):
@@ -1518,7 +1879,7 @@ class FlakyEmbeddingProvider(TextEmbeddingProvider):
         )
 
 
-def test_postgres_embedding_store_flags_and_continues_then_lazily_backfills(
+def test_postgres_embedding_failure_is_visible_until_explicit_backfill_recovers(
     postgres_dsn: str,
 ) -> None:
     async def ops():
@@ -1539,8 +1900,7 @@ def test_postgres_embedding_store_flags_and_continues_then_lazily_backfills(
             semantic_min_score=0.70,
         )
         try:
-            # Provider is down while the durable write happens: the entry must be
-            # stored and returned even though embedding fails (flag-and-continue).
+            # Canonical publication never invokes the embedding provider.
             provider.fail = True
             stored = await store.create_entry(
                 KnowledgeEntry(
@@ -1560,11 +1920,25 @@ def test_postgres_embedding_store_flags_and_continues_then_lazily_backfills(
                     mode=KnowledgeSearchMode.KEYWORD,
                 )
             )
+            failed_worker = await store.process_embedding_changes(
+                "flaky-postgres-index",
+                "worker",
+            )
             embedded_calls_during_outage = list(provider.calls)
 
-            # Provider recovers: a semantic search lazily backfills the missing
-            # embedding and then finds the previously-invisible entry.
+            # Semantic reads report the failed projection but never mutate it.
             provider.fail = False
+            before_recovery = await store.search(
+                KnowledgeQuery(
+                    text="auth broker",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+            backfill = await store.backfill_embeddings(
+                KnowledgeListQuery(namespace="ops", labels={"project": "cayu"})
+            )
             semantic_hit = await store.search(
                 KnowledgeQuery(
                     text="auth broker",
@@ -1579,22 +1953,250 @@ def test_postgres_embedding_store_flags_and_continues_then_lazily_backfills(
             stored,
             loaded,
             keyword_hit,
+            failed_worker,
             embedded_calls_during_outage,
+            before_recovery,
+            backfill,
             semantic_hit,
         )
 
-    stored, loaded, keyword_hit, outage_calls, semantic_hit = asyncio.run(ops())
+    (
+        stored,
+        loaded,
+        keyword_hit,
+        failed_worker,
+        outage_calls,
+        before_recovery,
+        backfill,
+        semantic_hit,
+    ) = asyncio.run(ops())
 
     # The write succeeded and returned the entry despite the embedding failure.
     assert stored.id == "git_policy"
     assert loaded is not None
     # No embeddings were persisted during the outage.
     assert outage_calls == []
+    assert failed_worker.failed_records == 1
     # Keyword search still surfaces the durable entry with no embeddings present.
     assert [hit.entry.id for hit in keyword_hit.hits] == ["git_policy"]
-    # After recovery the semantic search lazily backfilled and now finds it.
+    assert before_recovery.hits == []
+    assert before_recovery.index_coverage[0].failed_records == 1
+    assert backfill.indexed_records == 1
+    assert backfill.failed_records == 0
+    # After explicit repair the semantic search finds it.
     assert [hit.entry.id for hit in semantic_hit.hits] == ["git_policy"]
     assert semantic_hit.hits[0].score_kind == "postgres_semantic"
+
+
+def test_postgres_accepts_precomputed_projection_only_for_current_pending_attempt(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="external-postgres-projection", text="GitHub proxy.")
+            )
+            chunk = (await store.read_chunks("external-postgres-projection"))[0]
+            from cayu import knowledge_chunk_embedding_identity
+
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model="test-embedding",
+                dimensions=3,
+            )
+            pending = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.PENDING,
+                    attempt_id="external-postgres-attempt",
+                ),
+                expected_sequence=None,
+                operation_id="external-postgres-projection:pending",
+            )
+            projection = KnowledgeEmbeddingProjection(
+                identity=identity,
+                readiness_sequence=pending.sequence,
+                attempt_id=pending.attempt_id,
+                vector=[1.0, 0.0, 0.0],
+            )
+            stored = await store.store_embedding_projections([projection])
+            replayed = await store.store_embedding_projections([projection])
+            with pytest.raises(KnowledgeEmbeddingProjectionConflict) as raised:
+                await store.store_embedding_projections(
+                    [projection.model_copy(update={"vector": [0.0, 1.0, 0.0]})]
+                )
+            await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.READY,
+                    attempt_id=pending.attempt_id,
+                ),
+                expected_sequence=pending.sequence,
+                operation_id="external-postgres-projection:ready",
+            )
+            stale = await store.store_embedding_projections([projection])
+            result = await store.search(
+                KnowledgeQuery(
+                    text="github",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                    min_score=0.0,
+                )
+            )
+            with pytest.raises(ValueError, match="limit.*less than or equal"):
+                await store.backfill_embeddings(limit=MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT + 1)
+            return stored, replayed, raised.value, stale, result, provider.calls
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    stored, replayed, conflict, stale, result, provider_calls = asyncio.run(ops())
+
+    assert [identity.entry_id for identity in stored.stored_identities] == [
+        "external-postgres-projection"
+    ]
+    assert replayed.stored_identities == stored.stored_identities
+    assert conflict.reason == "attempt_vector_conflict"
+    assert stale.stored_identities == []
+    assert [hit.entry.id for hit in result.hits] == ["external-postgres-projection"]
+    assert provider_calls == [["github"]]
+
+
+def test_postgres_projection_write_result_reapplies_per_call_access_scope(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(
+            postgres_dsn,
+            KeywordEmbeddingProvider(),
+            access_scope=None,
+        )
+        privileged = KnowledgeAccessScope.privileged()
+        unauthorized = KnowledgeAccessScope.for_namespace("tenant-b")
+        try:
+            await store.create_entry(
+                KnowledgeEntry(
+                    id="scope-fenced-projection",
+                    namespace="tenant-a",
+                    text="GitHub proxy.",
+                ),
+                access_scope=privileged,
+            )
+            chunk = (
+                await store.read_chunks(
+                    "scope-fenced-projection",
+                    access_scope=privileged,
+                )
+            )[0]
+            from cayu import knowledge_chunk_embedding_identity
+
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model="test-embedding",
+                dimensions=3,
+            )
+            pending = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.PENDING,
+                    attempt_id="scope-fenced-attempt",
+                ),
+                expected_sequence=None,
+                operation_id="scope-fenced-projection:pending",
+                access_scope=privileged,
+            )
+            projection = KnowledgeEmbeddingProjection(
+                identity=identity,
+                readiness_sequence=pending.sequence,
+                attempt_id=pending.attempt_id,
+                vector=[1.0, 0.0, 0.0],
+            )
+            authorized = await store.store_embedding_projections(
+                [projection],
+                access_scope=privileged,
+            )
+            rejected = await store.store_embedding_projections(
+                [projection],
+                access_scope=unauthorized,
+            )
+            return authorized, rejected
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    authorized, rejected = asyncio.run(ops())
+
+    assert [identity.entry_id for identity in authorized.stored_identities] == [
+        "scope-fenced-projection"
+    ]
+    assert rejected.stored_identities == []
+
+
+def test_postgres_concurrent_projection_writers_cannot_replace_one_attempt_vector(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(
+            postgres_dsn,
+            KeywordEmbeddingProvider(),
+            max_size=2,
+        )
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="concurrent-projection", text="GitHub proxy.")
+            )
+            chunk = (await store.read_chunks("concurrent-projection"))[0]
+            from cayu import knowledge_chunk_embedding_identity
+
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model="test-embedding",
+                dimensions=3,
+            )
+            pending = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.PENDING,
+                    attempt_id="concurrent-projection-attempt",
+                ),
+                expected_sequence=None,
+                operation_id="concurrent-projection:pending",
+            )
+            first = KnowledgeEmbeddingProjection(
+                identity=identity,
+                readiness_sequence=pending.sequence,
+                attempt_id=pending.attempt_id,
+                vector=[1.0, 0.0, 0.0],
+            )
+            second = first.model_copy(update={"vector": [0.0, 1.0, 0.0]})
+            return await asyncio.gather(
+                store.store_embedding_projections([first]),
+                store.store_embedding_projections([second]),
+                return_exceptions=True,
+            )
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    results = asyncio.run(ops())
+
+    conflicts = [
+        result for result in results if isinstance(result, KnowledgeEmbeddingProjectionConflict)
+    ]
+    accepted = [result for result in results if not isinstance(result, BaseException)]
+    assert len(conflicts) == 1
+    assert conflicts[0].reason == "attempt_vector_conflict"
+    assert len(accepted) == 1
+    assert [identity.entry_id for identity in accepted[0].stored_identities] == [
+        "concurrent-projection"
+    ]
 
 
 def test_postgres_knowledge_store_defaults_hide_inactive_and_expired(
@@ -1794,8 +2396,14 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
     postgres_dsn: str,
 ) -> None:
     async def ops() -> tuple[list[str], int | None, bool]:
+        from cayu.storage.memory import (
+            KNOWLEDGE_CHUNK_TEXT_GENERATOR,
+            KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+            KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+            KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+            KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
+        )
         from cayu.storage.postgres import (
-            _EMBEDDING_SPACE_VERSION,
             _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER,
             _postgres_knowledge_filter_sql,
             _postgres_knowledge_none_filter_sql,
@@ -1827,6 +2435,11 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
                     text="Invoice payment instructions for the valid lower-ranked candidate.",
                 )
             )
+            await store.process_embedding_changes(
+                "none-candidate-postgres-index",
+                "worker",
+                limit=100,
+            )
             query = KnowledgeQuery(
                 text="github",
                 none_terms=["deprecated"],
@@ -1845,22 +2458,37 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
                 SELECT e.id
                 FROM cayu_knowledge_embeddings AS emb
                 JOIN cayu_knowledge_chunks AS c
-                  ON c.id = emb.chunk_id AND c.entry_id = emb.entry_id
+                  ON c.id = emb.chunk_id
+                 AND c.entry_id = emb.entry_id
+                 AND c.entry_revision = emb.entry_revision
                 JOIN cayu_knowledge_current_entries AS e
                   ON e.id = emb.entry_id AND e.revision = c.entry_revision
-                WHERE emb.model = %s
+                JOIN cayu_knowledge_index_readiness_current AS readiness_current
+                  ON readiness_current.identity_sha256 = emb.identity_sha256
+                JOIN cayu_knowledge_index_readiness_events AS readiness
+                  ON readiness.sequence = readiness_current.sequence
+                 AND readiness.identity_sha256 = emb.identity_sha256
+                 AND readiness.state = 'ready'
+                WHERE emb.projection_type = %s
+                  AND emb.embedding_model = %s
                   AND emb.dimensions = %s
-                  AND emb.embedding_space_version = %s
-                  AND (emb.content_hash = c.content_hash OR c.content_hash IS NULL)
+                  AND emb.preprocessing_version = %s
+                  AND emb.generator = %s
+                  AND emb.generator_version = %s
+                  AND emb.index_representation_version = %s
                 {where_sql}
                 {none_sql}
                 ORDER BY emb.embedding <=> %s::vector
                 LIMIT %s
             """
             hnsw_params = [
+                KNOWLEDGE_CHUNK_TEXT_PROJECTION,
                 store.embedding_model,
                 store.embedding_dimensions,
-                _EMBEDDING_SPACE_VERSION,
+                KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+                KNOWLEDGE_CHUNK_TEXT_GENERATOR,
+                KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+                KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
                 *params,
                 *none_params,
                 vector_literal,
@@ -1878,7 +2506,7 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
                 await cur.execute(hnsw_query, hnsw_params)
                 raw_hnsw_entry_ids = [str(row[0]) for row in await cur.fetchall()]
                 await cur.execute("SET enable_sort = on")
-            assert "idx_cayu_knowledge_embeddings_embedding_hnsw" in plan
+            assert store._embedding_hnsw_index_name() in plan
             assert raw_hnsw_entry_ids == []
 
             result = await store.search(query)
@@ -1902,11 +2530,91 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
     assert asyncio.run(ops()) == (["safe"], 1, False)
 
 
-def test_postgres_embedding_lazy_backfill_filters_none_terms_before_limit(
+def test_postgres_embedding_access_filters_cannot_hide_ready_hnsw_candidates(
     postgres_dsn: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def ops() -> tuple[list[str], list[str]]:
+    async def ops():
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        privileged = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            for index in range(64):
+                await privileged.create_entry(
+                    KnowledgeEntry(
+                        id=f"tenant-b-nearer-{index}",
+                        namespace="tenant-b",
+                        text=f"GitHub credential instructions {index}.",
+                    )
+                )
+            await privileged.create_entry(
+                KnowledgeEntry(
+                    id="tenant-a-authorized",
+                    namespace="tenant-a",
+                    text="Invoice payment instructions for the authorized tenant.",
+                )
+            )
+            await privileged.process_embedding_changes(
+                "filtered-hnsw-postgres-index",
+                "worker",
+                limit=100,
+            )
+        finally:
+            await privileged.close()
+
+        store = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            access_scope=KnowledgeAccessScope.for_namespace("tenant-a"),
+            min_size=1,
+            max_size=1,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+            semantic_min_score=0.0,
+        )
+        try:
+            await store._ensure_ready()
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute("ANALYZE cayu_knowledge_embeddings")
+                await cur.execute("SET enable_seqscan = off")
+                await cur.execute("SET enable_sort = off")
+                await cur.execute("SET hnsw.ef_search = 1")
+            result = await store.search(
+                KnowledgeQuery(
+                    text="github",
+                    namespace="tenant-a",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                    min_score=0.0,
+                    limit=1,
+                )
+            )
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute("SHOW enable_seqscan")
+                enable_seqscan = str((await cur.fetchone())[0])
+                await cur.execute("SHOW enable_indexscan")
+                enable_indexscan = str((await cur.fetchone())[0])
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+        return result, enable_seqscan, enable_indexscan
+
+    result, enable_seqscan, enable_indexscan = asyncio.run(ops())
+
+    assert [hit.entry.id for hit in result.hits] == ["tenant-a-authorized"]
+    assert result.total_hits_known == 1
+    assert result.truncated is False
+    assert result.index_coverage[0].ready_records == 1
+    assert result.index_coverage[0].complete is True
+    assert enable_seqscan == "off"
+    assert enable_indexscan == "on"
+
+
+def test_postgres_embedding_search_reports_filtered_pending_coverage_without_backfill(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
         await _drop_all(postgres_dsn)
         base_store = _new_store(postgres_dsn)
         try:
@@ -1942,9 +2650,6 @@ def test_postgres_embedding_lazy_backfill_filters_none_terms_before_limit(
             await base_store.close()
 
         await _skip_if_pgvector_unavailable(postgres_dsn)
-        import cayu.storage.postgres as postgres_storage
-
-        monkeypatch.setattr(postgres_storage, "_PGVECTOR_LAZY_BACKFILL_LIMIT", 1)
         provider = KeywordEmbeddingProvider()
         store = _new_embedding_store(postgres_dsn, provider)
         try:
@@ -1957,14 +2662,15 @@ def test_postgres_embedding_lazy_backfill_filters_none_terms_before_limit(
             )
         finally:
             await store.close()
-        embedded_texts = [text for call in provider.calls for text in call]
-        return [hit.entry.id for hit in result.hits], embedded_texts
+        return result, provider.calls
 
-    hit_ids, embedded_texts = asyncio.run(ops())
+    result, calls = asyncio.run(ops())
 
-    assert hit_ids == ["safe"]
-    assert any("safe-marker" in text for text in embedded_texts)
-    assert all("excluded-marker" not in text for text in embedded_texts)
+    assert result.hits == []
+    assert result.index_coverage[0].eligible_records == 1
+    assert result.index_coverage[0].pending_records == 1
+    assert result.index_coverage[0].complete is False
+    assert calls == [["github"]]
 
 
 def test_postgres_knowledge_store_searches_entry_text_with_custom_chunks(
@@ -2652,6 +3358,7 @@ def test_postgres_embedding_store_prune_expired_cascades_to_embeddings(postgres_
                     expires_at=datetime.now(UTC) - timedelta(seconds=1),
                 )
             )
+            await store.process_embedding_changes("prune-postgres-index", "worker")
             before = await _count_embeddings(postgres_dsn)
             pruned = await store.prune_expired()
             after = await _count_embeddings(postgres_dsn)
@@ -2666,9 +3373,9 @@ def test_postgres_embedding_store_prune_expired_cascades_to_embeddings(postgres_
     assert after == 0
 
 
-def test_postgres_embedding_store_stamps_embedding_space_version(postgres_dsn: str) -> None:
-    # MEM-08: writes stamp the current embedding-space version, reads filter on it, and semantic
-    # search still resolves the current-version vectors.
+def test_postgres_embedding_store_persists_complete_projection_identity(
+    postgres_dsn: str,
+) -> None:
     async def ops():
         import psycopg
 
@@ -2679,6 +3386,7 @@ def test_postgres_embedding_store_stamps_embedding_space_version(postgres_dsn: s
             await store.create_entry(
                 KnowledgeEntry(id="doc", text="GitHub credential proxy runbook.")
             )
+            await store.process_embedding_changes("identity-postgres-index", "worker")
             result = await store.search(
                 KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
             )
@@ -2690,39 +3398,76 @@ def test_postgres_embedding_store_stamps_embedding_space_version(postgres_dsn: s
             conn.cursor() as cur,
         ):
             await cur.execute(
-                "SELECT DISTINCT embedding_space_version FROM cayu_knowledge_embeddings"
+                """
+                SELECT DISTINCT projection_type, embedding_model, dimensions,
+                       preprocessing_version, generator, generator_version,
+                       index_representation_version, entry_revision
+                FROM cayu_knowledge_embeddings
+                """
             )
-            versions = sorted(row[0] for row in await cur.fetchall())
-        return [hit.entry.id for hit in result.hits], versions
+            identities = await cur.fetchall()
+        return [hit.entry.id for hit in result.hits], identities
 
-    hit_ids, versions = asyncio.run(ops())
+    hit_ids, identities = asyncio.run(ops())
 
     assert hit_ids == ["doc"]
-    assert versions == [1]
+    assert identities == [
+        (
+            "knowledge_chunk_text",
+            "test-embedding",
+            3,
+            "cayu:knowledge-chunk-text:v1",
+            "cayu:canonical-knowledge-chunk",
+            "1",
+            "float32-cosine-v1",
+            1,
+        )
+    ]
 
 
-async def _distinct_embedding_versions(dsn: str) -> list[int]:
+async def _distinct_embedding_models(dsn: str) -> list[str]:
     import psycopg
 
     async with (
         await psycopg.AsyncConnection.connect(dsn) as conn,
         conn.cursor() as cur,
     ):
-        await cur.execute("SELECT DISTINCT embedding_space_version FROM cayu_knowledge_embeddings")
-        return sorted(int(row[0]) for row in await cur.fetchall())
+        await cur.execute("SELECT DISTINCT embedding_model FROM cayu_knowledge_embeddings")
+        return sorted(str(row[0]) for row in await cur.fetchall())
 
 
-def test_postgres_embedding_store_excludes_and_reembeds_other_space_versions(
-    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+async def _embedding_hnsw_predicates(dsn: str) -> list[tuple[str, str]]:
+    import psycopg
+
+    async with (
+        await psycopg.AsyncConnection.connect(dsn) as conn,
+        conn.cursor() as cur,
+    ):
+        await cur.execute(
+            """
+            SELECT index_record.relname,
+                   pg_get_expr(index_state.indpred, index_state.indrelid)
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_am AS access_method
+              ON access_method.oid = index_record.relam
+            WHERE table_record.relname = 'cayu_knowledge_embeddings'
+              AND access_method.amname = 'hnsw'
+            ORDER BY index_record.relname
+            """
+        )
+        return [(str(row[0]), str(row[1])) for row in await cur.fetchall()]
+
+
+def test_postgres_embedding_store_segregates_models_until_explicit_reindex(
+    postgres_dsn: str,
 ) -> None:
-    # MEM-08 checklist Finding 1: prove the version column actually SEGREGATES spaces. Bumping
-    # _EMBEDDING_SPACE_VERSION must (a) exclude prior-version vectors from the semantic read filter AND
-    # the missing-embedding check, and (b) make a full search re-embed them at the new version. The stamp
-    # test alone would pass even if a read-site predicate were missing (v1 == v1 matches everywhere).
-    import cayu.storage.postgres as pg
-    from cayu.storage.postgres import _semantic_query_text
-
     async def ops():
+        from cayu import PostgresEmbeddingKnowledgeStore
+
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
         store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
@@ -2730,77 +3475,59 @@ def test_postgres_embedding_store_excludes_and_reembeds_other_space_versions(
             await store.create_entry(
                 KnowledgeEntry(id="doc", text="GitHub credential proxy runbook.")
             )
-            version_before = await _distinct_embedding_versions(postgres_dsn)
-
-            # Prior rows are now a different embedding space.
-            monkeypatch.setattr(pg, "_EMBEDDING_SPACE_VERSION", 2)
-            query = KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
-
-            # (a1) semantic read filter excludes the v1 row (call the internal directly → no backfill).
-            query_vector = await store._embed_query(query, _semantic_query_text(query))
-            raw_rows, _, _ = await store._semantic_search_rows(
-                query,
-                query_vector,
-                access_scope=_ACCESS_SCOPE,
-            )
-
-            # (a2) the missing-embedding check treats the v1 chunk as missing under v2.
-            missing = await store._missing_embedding_chunks(await store.read_chunks("doc"))
-
-            # (b) a full search re-embeds the doc at v2 (upsert) and finds it.
-            result = await store.search(query)
-            version_after = await _distinct_embedding_versions(postgres_dsn)
+            await store.process_embedding_changes("model-v1-postgres-index", "worker")
         finally:
             await store.close()
+
+        models_before = await _distinct_embedding_models(postgres_dsn)
+        other = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="other-embedding-model",
+            embedding_dimensions=3,
+        )
+        try:
+            query = KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
+            before_reindex = await other.search(query)
+            backfill = await other.backfill_embeddings()
+            after_reindex = await other.search(query)
+        finally:
+            await other.close()
         return (
-            version_before,
-            [row[0] for row in raw_rows],
-            len(missing),
-            [hit.entry.id for hit in result.hits],
-            version_after,
+            models_before,
+            before_reindex,
+            backfill,
+            after_reindex,
+            await _distinct_embedding_models(postgres_dsn),
+            await _embedding_hnsw_predicates(postgres_dsn),
         )
 
-    version_before, excluded_ids, missing_count, hit_ids, version_after = asyncio.run(ops())
+    (
+        models_before,
+        before_reindex,
+        backfill,
+        after_reindex,
+        models_after,
+        hnsw_indexes,
+    ) = asyncio.run(ops())
 
-    assert version_before == [1]
-    assert excluded_ids == []  # v1 vector excluded by the v2 read filter, no backfill
-    assert missing_count == 1  # v1 chunk seen as missing under v2
-    assert hit_ids == ["doc"]  # full search re-embeds then finds it
-    assert version_after == [2]  # row migrated to the new space version
-
-
-async def _embedding_space_version_column_exists(dsn: str) -> bool:
-    import psycopg
-
-    async with (
-        await psycopg.AsyncConnection.connect(dsn) as conn,
-        conn.cursor() as cur,
-    ):
-        await cur.execute(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'cayu_knowledge_embeddings' "
-            "AND column_name = 'embedding_space_version'"
-        )
-        return await cur.fetchone() is not None
-
-
-async def _embedding_foreign_keys(dsn: str) -> tuple[tuple[str, str], ...]:
-    import psycopg
-
-    async with (
-        await psycopg.AsyncConnection.connect(dsn) as conn,
-        conn.cursor() as cur,
-    ):
-        await cur.execute(
-            """
-            SELECT conname, pg_get_constraintdef(oid)
-            FROM pg_constraint
-            WHERE conrelid = 'cayu_knowledge_embeddings'::regclass
-              AND contype = 'f'
-            ORDER BY conname
-            """
-        )
-        return tuple((str(name), str(definition)) for name, definition in await cur.fetchall())
+    assert models_before == ["test-embedding"]
+    assert before_reindex.hits == []
+    assert before_reindex.index_coverage[0].pending_records == 1
+    assert backfill.indexed_records == 1
+    assert [hit.entry.id for hit in after_reindex.hits] == ["doc"]
+    assert models_after == ["other-embedding-model", "test-embedding"]
+    assert len(hnsw_indexes) == 2
+    assert len({name for name, _ in hnsw_indexes}) == 2
+    assert all(
+        "embedding_model =" in predicate
+        and "dimensions = 3" in predicate
+        and "generator_version =" in predicate
+        and "index_representation_version =" in predicate
+        for _, predicate in hnsw_indexes
+    )
 
 
 def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated_changes(
@@ -3332,75 +4059,100 @@ def test_postgres_revision_migration_refuses_unversioned_knowledge_before_ddl(
         asyncio.run(_drop_all(postgres_dsn))
 
 
-def test_postgres_storage_migrate_adds_embedding_space_version_to_existing_table(
+def test_postgres_revision_44_preserves_canonical_knowledge_and_rebuilds_derived_index(
     postgres_dsn: str,
 ) -> None:
-    # Finding 2 (nurazem): the standard `cayu storage migrate` deploy step runs PostgresSessionStore
-    # migrations only. An embeddings table created before this column must still get it from that path
-    # (revision 12), or the app strands in the default VALIDATE mode at startup.
     async def ops():
         import psycopg
 
-        from cayu import PostgresEmbeddingKnowledgeStore, PostgresSessionStore
+        from cayu import (
+            PostgresEmbeddingKnowledgeStore,
+            PostgresKnowledgeStore,
+            PostgresSessionStore,
+        )
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
-
-        # Build the full schema + embeddings table, then simulate a pre-column DB: drop the column and
-        # roll the recorded schema revision back below 12 so the column addition is pending.
-        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        store = _new_store(postgres_dsn)
         try:
-            await store._ensure_ready()
+            await store.create_entry(
+                KnowledgeEntry(id="revision-44-doc", text="GitHub credential proxy runbook.")
+            )
         finally:
             await store.close()
+
+        # Simulate revision 43 with one populated pre-identity derived table.
         async with (
             await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
             conn.cursor() as cur,
         ):
+            await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            await cur.execute("DROP TABLE cayu_knowledge_index_readiness_current")
+            await cur.execute("DROP TABLE cayu_knowledge_index_readiness_events")
             await cur.execute(
-                "ALTER TABLE cayu_knowledge_embeddings DROP COLUMN embedding_space_version"
+                """
+                CREATE TABLE cayu_knowledge_embeddings (
+                    chunk_id TEXT PRIMARY KEY,
+                    entry_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    embedding vector(3) NOT NULL,
+                    embedding_space_version INTEGER NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                )
+                """
             )
-            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 12")
+            await cur.execute(
+                """
+                INSERT INTO cayu_knowledge_embeddings VALUES (
+                    'revision-44-doc:r1:0', 'revision-44-doc', 'legacy-hash',
+                    'legacy-model', 3, '[1,0,0]'::vector, 1, NOW(), NOW()
+                )
+                """
+            )
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 44")
             await conn.commit()
-        column_before = await _embedding_space_version_column_exists(postgres_dsn)
 
-        # The documented deploy step migrates via the session store only.
         session_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
         try:
             await session_store.ensure_schema()
         finally:
             await session_store.close()
-        column_after = await _embedding_space_version_column_exists(postgres_dsn)
-        foreign_keys = await _embedding_foreign_keys(postgres_dsn)
 
-        # And the embedding store now opens clean in the default VALIDATE mode.
-        validate_store = PostgresEmbeddingKnowledgeStore(
+        canonical = PostgresKnowledgeStore(
             postgres_dsn,
             access_scope=_ACCESS_SCOPE,
             schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            loaded = await canonical.get_entry("revision-44-doc")
+            readiness = await canonical.read_index_readiness(limit=10)
+        finally:
+            await canonical.close()
+
+        rebuilt = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            schema_mode=SchemaMode.CREATE,
             embedding_provider=KeywordEmbeddingProvider(),
             embedding_model="test-embedding",
             embedding_dimensions=3,
         )
         try:
-            await validate_store._ensure_ready()
-            validated = True
+            backfill = await rebuilt.backfill_embeddings()
+            result = await rebuilt.search(
+                KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
+            )
         finally:
-            await validate_store.close()
-        return column_before, column_after, foreign_keys, validated
+            await rebuilt.close()
+        return loaded, readiness, backfill, result
 
-    column_before, column_after, foreign_keys, validated = asyncio.run(ops())
+    loaded, readiness, backfill, result = asyncio.run(ops())
 
-    assert column_before is False  # sanity: we really simulated a pre-column table
-    assert column_after is True  # the deploy migrate path added it
-    assert foreign_keys == (
-        (
-            "cayu_knowledge_embeddings_chunk_id_fkey",
-            "FOREIGN KEY (chunk_id) REFERENCES cayu_knowledge_chunks(id) ON DELETE CASCADE",
-        ),
-        (
-            "cayu_knowledge_embeddings_entry_id_fkey",
-            "FOREIGN KEY (entry_id) REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE",
-        ),
-    )
-    assert validated  # VALIDATE-mode startup no longer strands
+    assert loaded is not None
+    assert loaded.text == "GitHub credential proxy runbook."
+    assert readiness.readiness == []
+    assert backfill.indexed_records == 1
+    assert [hit.entry.id for hit in result.hits] == ["revision-44-doc"]

@@ -32,8 +32,7 @@ async def main() -> None:
     if not os.environ.get("OPENAI_API_KEY"):
         raise SystemExit("Set OPENAI_API_KEY to run knowledge_embedding_live.py.")
     embedding_model = os.environ.get("CAYU_EMBEDDING_MODEL", "text-embedding-3-small")
-    dimensions_raw = os.environ.get("CAYU_EMBEDDING_DIMENSIONS")
-    dimensions = int(dimensions_raw) if dimensions_raw else None
+    dimensions = int(os.environ.get("CAYU_EMBEDDING_DIMENSIONS", "1536"))
 
     provider = OpenAIProvider()
     evidence = await _run_contract(
@@ -53,7 +52,7 @@ async def _run_contract(
     *,
     provider: TextEmbeddingProvider,
     embedding_model: str,
-    dimensions: int | None,
+    dimensions: int,
 ) -> dict[str, object]:
     store = InMemoryEmbeddingKnowledgeStore(
         access_scope=KnowledgeAccessScope.for_namespace("default"),
@@ -97,6 +96,11 @@ async def _run_contract(
             ),
         )
     )
+    worker_result = await store.process_embedding_changes(
+        "knowledge-embedding-live",
+        "live-worker",
+    )
+    require(worker_result.failed_records == 0, "embedding index worker reported failures")
 
     result = await store.search(
         KnowledgeQuery(
@@ -134,6 +138,7 @@ async def _run_contract(
         "score_kind": top_hit.score_kind,
         "score_normalized": top_hit.score_normalized,
         "hit_count": len(result.hits),
+        "index_coverage": [coverage.model_dump(mode="json") for coverage in result.index_coverage],
     }
 
 

@@ -23,6 +23,7 @@ from cayu.storage import migrations as schema
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    KNOWLEDGE_CHUNK_TEXT_PROJECTION,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeActorType,
@@ -34,6 +35,7 @@ from cayu.storage.memory import (
     KnowledgeChangeKind,
     KnowledgeChunk,
     KnowledgeChunkConflict,
+    KnowledgeEmbeddingIdentity,
     KnowledgeEntry,
     KnowledgeEvidence,
     KnowledgeEvidenceConflict,
@@ -42,6 +44,11 @@ from cayu.storage.memory import (
     KnowledgeEvidenceRole,
     KnowledgeFacet,
     KnowledgeHit,
+    KnowledgeIndexReadiness,
+    KnowledgeIndexReadinessBatch,
+    KnowledgeIndexReadinessConflict,
+    KnowledgeIndexReadinessUpdate,
+    KnowledgeIndexState,
     KnowledgeListGroup,
     KnowledgeListItem,
     KnowledgeListQuery,
@@ -56,6 +63,7 @@ from cayu.storage.memory import (
     KnowledgeStore,
     KnowledgeVisibility,
     _bounded_knowledge_evidence,
+    _bounded_knowledge_index_identity,
     _copy_chunks_for_revision,
     _copy_entry_evidence,
     _copy_evidence_for_revision,
@@ -68,7 +76,10 @@ from cayu.storage.memory import (
     _knowledge_change_identity,
     _knowledge_change_lease_seconds,
     _knowledge_change_now,
+    _knowledge_chunk_content_hash,
+    _knowledge_embedding_identity_sha256,
     _knowledge_entry_id,
+    _knowledge_index_readiness_update_sha256,
     _knowledge_publication_operation_id,
     _knowledge_scope_allows_snapshot,
     _next_knowledge_revision,
@@ -77,6 +88,9 @@ from cayu.storage.memory import (
     _require_knowledge_successor_access,
     _validate_knowledge_change_limit,
     _validate_knowledge_change_sequence,
+    _validate_knowledge_index_readiness_limit,
+    _validate_knowledge_index_readiness_transition,
+    _validate_knowledge_index_sequence,
     _validate_knowledge_publication_replay,
     _validate_knowledge_revision,
     _validate_revision_append,
@@ -85,7 +99,9 @@ from cayu.storage.memory import (
     copy_knowledge_change_claim,
     copy_knowledge_change_consumer_state,
     copy_knowledge_chunk,
+    copy_knowledge_embedding_identity,
     copy_knowledge_entry,
+    copy_knowledge_index_readiness_update,
     copy_knowledge_list_query,
     copy_knowledge_publication_receipt,
     copy_knowledge_query,
@@ -96,7 +112,7 @@ _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
 _CHUNK_ID_LOOKUP_BATCH_SIZE = 400
 _EVIDENCE_ID_LOOKUP_BATCH_SIZE = 400
-_SQLITE_MIN_REQUIRED_REVISION = 43
+_SQLITE_MIN_REQUIRED_REVISION = 44
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -854,6 +870,280 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         if state is None or state.access_scope_sha256 != scope_sha256:
             return None
         return copy_knowledge_change_consumer_state(state)
+
+    async def publish_index_readiness(
+        self,
+        update: KnowledgeIndexReadinessUpdate,
+        *,
+        expected_sequence: int | None,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadiness:
+        scope = self._operation_access_scope(access_scope)
+        update = copy_knowledge_index_readiness_update(update)
+        operation_id = _bounded_knowledge_index_identity(operation_id, "operation_id")
+        if expected_sequence is not None:
+            _validate_knowledge_index_sequence(
+                expected_sequence,
+                "expected_sequence",
+                allow_zero=False,
+            )
+        identity_sha256 = _knowledge_embedding_identity_sha256(update.identity)
+        update_sha256 = _knowledge_index_readiness_update_sha256(update)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                replay_row = self._connection.execute(
+                    "SELECT * FROM cayu_knowledge_index_readiness_events WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if replay_row is not None:
+                    if str(replay_row["update_sha256"]) != update_sha256:
+                        raise KnowledgeIndexReadinessConflict("operation_reuse")
+                    if not self._index_identity_is_accessible_unlocked(
+                        scope,
+                        update.identity,
+                    ):
+                        raise KnowledgeAccessDenied("publish_index_readiness")
+                    return _index_readiness_from_row(replay_row)
+                if not self._index_identity_is_accessible_unlocked(
+                    scope,
+                    update.identity,
+                    require_current=True,
+                ):
+                    raise KnowledgeIndexReadinessConflict("stale_identity")
+                current_row = self._connection.execute(
+                    """
+                    SELECT event.*
+                    FROM cayu_knowledge_index_readiness_current AS current
+                    JOIN cayu_knowledge_index_readiness_events AS event
+                      ON event.sequence = current.sequence
+                     AND event.identity_sha256 = current.identity_sha256
+                    WHERE current.identity_sha256 = ?
+                    """,
+                    (identity_sha256,),
+                ).fetchone()
+                current = None if current_row is None else _index_readiness_from_row(current_row)
+                _validate_knowledge_index_readiness_transition(
+                    current,
+                    update,
+                    expected_sequence=expected_sequence,
+                )
+                published_at = self._clock()
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO cayu_knowledge_index_readiness_events (
+                        identity_sha256,
+                        entry_id,
+                        entry_revision,
+                        chunk_id,
+                        projection_type,
+                        projection_content_hash,
+                        embedding_model,
+                        dimensions,
+                        preprocessing_version,
+                        generator,
+                        generator_version,
+                        index_representation_version,
+                        state,
+                        attempt_id,
+                        failure_code,
+                        operation_id,
+                        update_sha256,
+                        published_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        identity_sha256,
+                        update.identity.entry_id,
+                        update.identity.entry_revision,
+                        update.identity.chunk_id,
+                        update.identity.projection_type,
+                        update.identity.projection_content_hash,
+                        update.identity.embedding_model,
+                        update.identity.dimensions,
+                        update.identity.preprocessing_version,
+                        update.identity.generator,
+                        update.identity.generator_version,
+                        update.identity.index_representation_version,
+                        str(update.state),
+                        update.attempt_id,
+                        update.failure_code,
+                        operation_id,
+                        update_sha256,
+                        sqlite_support.format_datetime(published_at),
+                    ),
+                )
+                if cursor.lastrowid is None:  # pragma: no cover - sqlite invariant
+                    raise RuntimeError("SQLite did not return an index readiness sequence.")
+                sequence = cursor.lastrowid
+                if current is None:
+                    self._connection.execute(
+                        "INSERT INTO cayu_knowledge_index_readiness_current "
+                        "(identity_sha256, sequence) VALUES (?, ?)",
+                        (identity_sha256, sequence),
+                    )
+                else:
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE cayu_knowledge_index_readiness_current
+                        SET sequence = ?
+                        WHERE identity_sha256 = ? AND sequence = ?
+                        """,
+                        (sequence, identity_sha256, current.sequence),
+                    )
+                    if cursor.rowcount != 1:  # pragma: no cover - writer lock invariant
+                        raise KnowledgeIndexReadinessConflict("stale_sequence")
+                return KnowledgeIndexReadiness(
+                    sequence=sequence,
+                    identity=update.identity,
+                    state=update.state,
+                    attempt_id=update.attempt_id,
+                    failure_code=update.failure_code,
+                    operation_id=operation_id,
+                    published_at=published_at,
+                )
+
+    async def load_index_readiness(
+        self,
+        identity: KnowledgeEmbeddingIdentity,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadiness | None:
+        scope = self._operation_access_scope(access_scope)
+        identity = copy_knowledge_embedding_identity(identity)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                if not self._index_identity_is_accessible_unlocked(scope, identity):
+                    return None
+                row = self._connection.execute(
+                    """
+                    SELECT event.*
+                    FROM cayu_knowledge_index_readiness_current AS current
+                JOIN cayu_knowledge_index_readiness_events AS event
+                  ON event.sequence = current.sequence
+                 AND event.identity_sha256 = current.identity_sha256
+                    WHERE current.identity_sha256 = ?
+                    """,
+                    (_knowledge_embedding_identity_sha256(identity),),
+                ).fetchone()
+        if row is None:
+            return None
+        readiness = _index_readiness_from_row(row)
+        if readiness.identity != identity:
+            raise RuntimeError("Knowledge index readiness identity digest collision.")
+        return readiness
+
+    async def read_index_readiness(
+        self,
+        *,
+        after_sequence: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadinessBatch:
+        scope = self._operation_access_scope(access_scope)
+        _validate_knowledge_index_sequence(after_sequence, "after_sequence")
+        _validate_knowledge_index_readiness_limit(limit)
+        exact_access_sql, exact_access_params = _knowledge_access_scope_filter_sql(
+            scope,
+            entry_alias="e",
+        )
+        current_access_sql, current_access_params = _knowledge_access_scope_filter_sql(
+            scope,
+            entry_alias="current_entry",
+        )
+        accessible_from = """
+            FROM cayu_knowledge_index_readiness_events AS event
+            JOIN cayu_knowledge_entries AS logical
+              ON logical.id = event.entry_id
+            JOIN cayu_knowledge_revisions AS e
+              ON e.entry_id = event.entry_id
+             AND e.revision = event.entry_revision
+            JOIN cayu_knowledge_current_entries AS current_entry
+              ON current_entry.id = event.entry_id
+            WHERE TRUE
+        """
+        access_params = [*exact_access_params, *current_access_params]
+        async with self._lock:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                high_water_row = self._connection.execute(
+                    "SELECT COALESCE(MAX(event.sequence), 0) AS high_water "
+                    + accessible_from
+                    + exact_access_sql
+                    + current_access_sql,
+                    access_params,
+                ).fetchone()
+                high_water = 0 if high_water_row is None else int(high_water_row["high_water"])
+                if after_sequence > high_water:
+                    current_row = self._connection.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) AS current_sequence "
+                        "FROM cayu_knowledge_index_readiness_events"
+                    ).fetchone()
+                    current_sequence = (
+                        0 if current_row is None else int(current_row["current_sequence"])
+                    )
+                    if after_sequence > current_sequence:
+                        raise ValueError(
+                            "`after_sequence` cannot exceed the current knowledge "
+                            "index readiness sequence."
+                        )
+                rows = self._connection.execute(
+                    "SELECT event.* "
+                    + accessible_from
+                    + " AND event.sequence > ? AND event.sequence <= ?"
+                    + exact_access_sql
+                    + current_access_sql
+                    + " ORDER BY event.sequence LIMIT ?",
+                    [after_sequence, high_water, *access_params, limit + 1],
+                ).fetchall()
+        readiness = [_index_readiness_from_row(row) for row in rows[:limit]]
+        truncated = len(rows) > limit
+        next_after = readiness[-1].sequence if truncated else max(after_sequence, high_water)
+        return KnowledgeIndexReadinessBatch(
+            readiness=readiness,
+            after_sequence=after_sequence,
+            next_after_sequence=next_after,
+            high_water_sequence=high_water,
+            truncated=truncated,
+            limit=limit,
+        )
+
+    def _index_identity_is_accessible_unlocked(
+        self,
+        scope: KnowledgeAccessScope,
+        identity: KnowledgeEmbeddingIdentity,
+        *,
+        require_current: bool = False,
+    ) -> bool:
+        current = self._load_entry_in_scope_unlocked(identity.entry_id, scope)
+        if current is None:
+            return False
+        if require_current and current.revision != identity.entry_revision:
+            return False
+        revision = self._load_entry_in_scope_unlocked(
+            identity.entry_id,
+            scope,
+            revision=identity.entry_revision,
+        )
+        if revision is None:
+            return False
+        if identity.chunk_id is None:
+            return True
+        row = self._connection.execute(
+            """
+            SELECT id, entry_id, entry_revision, chunk_index, text,
+                   content_hash, source_uri, metadata_json
+            FROM cayu_knowledge_chunks
+            WHERE id = ? AND entry_id = ? AND entry_revision = ?
+            """,
+            (identity.chunk_id, identity.entry_id, identity.entry_revision),
+        ).fetchone()
+        if row is None:
+            return False
+        if identity.projection_type == KNOWLEDGE_CHUNK_TEXT_PROJECTION:
+            return identity.projection_content_hash == _knowledge_chunk_content_hash(
+                _chunk_from_row(row)
+            )
+        return True
 
     async def read_chunks(
         self,
@@ -2869,6 +3159,33 @@ def _chunk_from_row(row: sqlite3.Row) -> KnowledgeChunk:
         content_hash=row["content_hash"],
         source_uri=row["source_uri"],
         metadata=json.loads(row["metadata_json"]),
+    )
+
+
+def _index_readiness_from_row(row: sqlite3.Row) -> KnowledgeIndexReadiness:
+    identity = KnowledgeEmbeddingIdentity(
+        entry_id=str(row["entry_id"]),
+        entry_revision=int(row["entry_revision"]),
+        chunk_id=None if row["chunk_id"] is None else str(row["chunk_id"]),
+        projection_type=str(row["projection_type"]),
+        projection_content_hash=str(row["projection_content_hash"]),
+        embedding_model=str(row["embedding_model"]),
+        dimensions=int(row["dimensions"]),
+        preprocessing_version=str(row["preprocessing_version"]),
+        generator=str(row["generator"]),
+        generator_version=str(row["generator_version"]),
+        index_representation_version=str(row["index_representation_version"]),
+    )
+    if _knowledge_embedding_identity_sha256(identity) != str(row["identity_sha256"]):
+        raise RuntimeError("SQLite knowledge index readiness identity is inconsistent.")
+    return KnowledgeIndexReadiness(
+        sequence=int(row["sequence"]),
+        identity=identity,
+        state=KnowledgeIndexState(str(row["state"])),
+        attempt_id=str(row["attempt_id"]),
+        failure_code=(None if row["failure_code"] is None else str(row["failure_code"])),
+        operation_id=str(row["operation_id"]),
+        published_at=sqlite_support.parse_datetime(str(row["published_at"])),
     )
 
 

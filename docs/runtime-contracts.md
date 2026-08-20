@@ -6575,23 +6575,35 @@ tests, demos, and small single-process apps. It uses a configured
 `TextEmbeddingProvider`, keeps vectors outside chunk metadata, supports
 `semantic` mode with cosine similarity, reports `score_normalized` as `(cosine +
 1) / 2`, compares `semantic_min_score` against that normalized score, and uses a
-bounded keyword boost for `hybrid` and `auto` mode. It does not persist vectors.
+bounded keyword boost for `hybrid` and `auto` mode. It requires explicit
+`embedding_dimensions` and does not persist vectors.
+It supports the same bounded explicit embedding backfill and precomputed-vector
+persistence contracts as the durable backend, but all derived state disappears
+with the process.
 `PostgresEmbeddingKnowledgeStore` is the durable Postgres semantic backend. It
 requires the pgvector `vector` extension, a configured `TextEmbeddingProvider`,
 and explicit `embedding_dimensions` because the pgvector column type includes the
 dimension. It keeps embeddings in a derived `cayu_knowledge_embeddings` table,
-updates vectors on entry/chunk writes, reuses persisted vectors across process
-restarts, and leaves plain `PostgresKnowledgeStore` usable without pgvector.
-Semantic search uses chunks that already have vectors, with pgvector HNSW
+reuses ready persisted vectors across process restarts, and leaves plain
+`PostgresKnowledgeStore` usable without pgvector. Canonical entry/chunk writes
+never call the embedding provider. A bounded `process_embedding_changes(...)`
+worker consumes the canonical change outbox and performs the fenced sequence
+`pending readiness -> vector commit -> ready readiness -> change acknowledgement`.
+Semantic search uses only exact-identity vectors with current `ready` evidence,
+with pgvector HNSW
 indexing when `embedding_dimensions <= 2000`; larger dimensions use exact
-pgvector search. Semantic queries with `none_terms` also use an exact vector
-scan so excluded entries cannot consume HNSW's bounded internal candidate list;
-the entry-wide negative filter remains inside indexed Postgres SQL before
-Cayu's semantic candidate limit. Bulk backfill for existing knowledge is
+pgvector search. A filtered HNSW search that returns fewer candidates than the
+number of eligible ready vectors is rerun as an exact scan inside the same read
+snapshot. This prevents namespace, lifecycle, authorization, and entry-wide
+negative filters from hiding a valid lower-ranked vector behind excluded nearer
+candidates. Bulk backfill for existing knowledge is
 explicit via `backfill_embeddings(..., limit=N)`, which embeds a bounded batch
 of matching chunks. By default backfill only embeds missing or stale vectors;
 pass `refresh_existing=True` to re-embed chunks whose current vector already
-matches the configured model and dimensions.
+matches the configured model and dimensions. A result with `next_cursor` has
+another deterministic keyset page; pass it as `cursor=result.next_cursor` with
+the same query, scope, configuration, and refresh mode. Mismatched or malformed
+cursors fail closed.
 
 Postgres embedding operational contract:
 
@@ -6605,23 +6617,50 @@ Postgres embedding operational contract:
   derived embedding table before starting a store with the new dimensions.
 - The embedding table is derived data. Rebuilding it is safe when source
   knowledge remains in `cayu_knowledge_entries` and `cayu_knowledge_chunks`.
-- Semantic search lazily backfills a bounded set of missing embeddings inside
-  the authorized query scope so a transient write-time provider outage does not
-  permanently hide canonical knowledge. Use bounded
-  `backfill_embeddings(KnowledgeListQuery(...), limit=N)` jobs for deliberate
-  bulk indexing. Repeated default backfills advance through missing/stale chunks;
-  use `refresh_existing=True` only when intentionally re-embedding current rows
-  for the configured model and dimensions. Switching to another embedding model
-  with the same dimensions is a bounded re-indexing job; switching dimensions is
-  a schema rebuild.
+- Search never creates, repairs, or refreshes stored vectors. It reports
+  `KnowledgeIndexCoverage` for the exact authorized/filter-eligible chunk set
+  and complete comparable model/generator/representation space;
+  missing readiness, pending work, and a `ready` record without its vector count
+  as pending, while terminal failed attempts count as failed. `complete=true`
+  means every eligible chunk is ready in the requested projection space.
+- Use a stable scope-bound consumer ID with bounded
+  `process_embedding_changes(..., limit=N, record_limit=M)` calls for normal
+  outbox indexing. The two limits independently bound changes and chunk
+  projections and stale-vector removals; an oversized change continues
+  deterministically on the next call without acknowledging its cursor early.
+  Provider failure publishes `failed` without exposing provider details and
+  acknowledges the canonical change; a bounded
+  `backfill_embeddings(KnowledgeListQuery(...), limit=N)` explicitly retries or
+  bootstraps missing/failed projections. Repeated default backfills advance
+  through non-ready chunks; `refresh_existing=True` starts a new fenced attempt
+  for already-ready chunks. Follow `next_cursor` to traverse every bounded
+  refresh page; beginning again without a cursor intentionally starts again at
+  the highest-priority page.
+- External projection services can submit already-computed vectors through
+  `store_embedding_projections(...)`. Every vector carries its complete
+  `KnowledgeEmbeddingIdentity`, pending readiness sequence, and attempt ID.
+  The store returns only identities whose exact current authorized pending
+  attempt accepted the vector; stale or superseded records remain unpublished.
+  An identical vector replay is accepted idempotently, while a different vector
+  for the same attempt raises `KnowledgeEmbeddingProjectionConflict` and rolls
+  back the complete persistence request. A newer pending attempt may replace
+  the previous vector. Publishing `ready` is a separate compare-and-swap step.
+  Built-in workers use this same public persistence boundary.
 - Search embeds the query text, then searches persisted chunk vectors matching
-  the configured model, dimensions, current entry revision, and chunk content
-  hash. Appending a revision derives vectors for its exact chunk set.
+  the configured model, dimensions, current entry revision, Cayu-computed hash
+  of the exact projected chunk text,
+  preprocessing/generator versions, index representation, and current ready
+  identity. Appending a revision makes the old vector ineligible immediately;
+  cleanup may occur later.
 - HNSW is created for `vector(N)` when `N <= 2000`, matching pgvector's HNSW
-  limit for the `vector` type. Larger dimensions are valid for exact pgvector
-  search, but do not get the HNSW index in this store.
+  limit for the `vector` type. Each HNSW index is partial to one complete model,
+  generator, preprocessing, dimensions, projection, and representation space;
+  incompatible vectors never share an ANN graph. Larger dimensions are valid
+  for exact pgvector search, but do not get an HNSW index in this store.
 - Embedding calls are provider calls. Apps should account for provider latency,
-  rate limits, retention, and billing when writing entries or running backfill.
+  rate limits, retention, and billing when running workers, backfills, or
+  semantic queries; canonical knowledge publication has no embedding-provider
+  dependency.
 
 - `KnowledgeEntry`: one immutable revision snapshot of a reusable logical
   knowledge record. Its positive `revision` (bounded by
@@ -6874,6 +6913,24 @@ knowledge and receipts, adds no fabricated historical changes, and requires
 custom stores to provide bounded evidence reads, bounded access-filtered change
 pages, full-scan consumer baseline initialization, and scope-bound fenced
 consumer leases. Failed writes and exact receipt replays publish no change.
+
+Revision 44 is the derived-index identity/readiness boundary. A
+`KnowledgeEmbeddingIdentity` contains the exact entry revision, optional chunk,
+projection type and Cayu-computed projected-text hash, embedding model and dimensions,
+preprocessing version, generator identity/version, and index-representation
+version. `KnowledgeIndexReadinessUpdate` publishes `pending`, `ready`, or
+`failed` through compare-and-swap against the current readiness sequence; a new
+attempt fences an older worker, and an exact operation replay returns its
+original immutable `KnowledgeIndexReadiness`. Readiness has its own global
+high-water sequence and does not impersonate a canonical `KnowledgeChange`.
+Built-in stores retain authorized readiness history but reject new publication
+for a non-current revision, missing/replaced chunk, or mismatched canonical
+chunk-text hash. Lexical-only custom stores may keep the non-abstract readiness
+hooks unimplemented. Stores that advertise semantic search must enforce the
+complete identity and expose `KnowledgeIndexCoverage` in semantic/hybrid search
+results. The migration preserves canonical revision-43 knowledge and discards
+pre-identity vector rows as rebuildable derived data; it creates no fabricated
+readiness or legacy compatibility path.
 
 `RememberKnowledgePolicy` controls
 the actual stored status, namespace, visibility, required labels, and allowed

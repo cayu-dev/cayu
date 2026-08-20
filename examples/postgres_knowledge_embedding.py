@@ -113,10 +113,12 @@ async def main() -> None:
         "backfill",
         json.dumps(
             {
-                "scanned_chunks": backfill.scanned_chunks,
-                "embedded_chunks": backfill.embedded_chunks,
-                "skipped_current_chunks": backfill.skipped_current_chunks,
+                "scanned_records": backfill.scanned_records,
+                "indexed_records": backfill.indexed_records,
+                "failed_records": backfill.failed_records,
+                "skipped_records": backfill.skipped_records,
                 "refresh_existing": backfill.refresh_existing,
+                "next_cursor": backfill.next_cursor,
             },
             sort_keys=True,
         ),

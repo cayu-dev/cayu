@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
@@ -38,6 +42,7 @@ DEFAULT_KNOWLEDGE_NAMESPACE = "default"
 DEFAULT_KNOWLEDGE_KIND = "fact"
 DEFAULT_KNOWLEDGE_LIMIT = 10
 DEFAULT_KNOWLEDGE_MAX_BYTES = 20_000
+DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT = 500
 MAX_KNOWLEDGE_CHANGE_LIMIT = 1_000
 MAX_KNOWLEDGE_CHANGE_SEQUENCE = 2**63 - 1
 MAX_KNOWLEDGE_CHUNK_ID_BYTES = 512
@@ -46,8 +51,18 @@ MAX_KNOWLEDGE_ENTRY_ID_BYTES = 256
 MAX_KNOWLEDGE_REVISION = 2**31 - 1
 MAX_KNOWLEDGE_EVIDENCE_BYTES = DEFAULT_KNOWLEDGE_MAX_BYTES
 MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES = 16_384
+MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS = 2**31 - 1
+MAX_KNOWLEDGE_INDEX_READINESS_LIMIT = 1_000
+MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT = 10_000
+_MAX_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_BYTES = 2_048
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
+_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_VERSION = 1
+KNOWLEDGE_CHUNK_TEXT_PROJECTION = "knowledge_chunk_text"
+KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION = "cayu:knowledge-chunk-text:v1"
+KNOWLEDGE_CHUNK_TEXT_GENERATOR = "cayu:canonical-knowledge-chunk"
+KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION = "1"
+KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION = "float32-cosine-v1"
 
 BUILTIN_KNOWLEDGE_KINDS = (
     "fact",
@@ -72,11 +87,11 @@ class _SearchTerms(TypedDict):
 
 
 class _StoredChunkEmbedding(TypedDict):
-    entry_id: str
-    content_hash: str
-    model: str
-    dimensions: int | None
+    identity: KnowledgeEmbeddingIdentity
     vector: list[float]
+    vector_sha256: str
+    readiness_sequence: int
+    attempt_id: str
 
 
 class KnowledgeStatus(StrEnum):
@@ -132,6 +147,14 @@ class KnowledgeChangeKind(StrEnum):
     TOMBSTONED = "tombstoned"
     HARD_DELETED = "hard_deleted"
     EXPIRED = "expired"
+
+
+class KnowledgeIndexState(StrEnum):
+    """Publication state for one exact derived-index identity."""
+
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
 
 
 class KnowledgeListGroup(StrEnum):
@@ -197,6 +220,22 @@ class KnowledgeChangeConsumerConflict(RuntimeError):
     def __init__(self, reason: str) -> None:
         self.reason = require_clean_nonblank(reason, "reason")
         super().__init__("Knowledge change consumer conflicts with durable state.")
+
+
+class KnowledgeIndexReadinessConflict(RuntimeError):
+    """A readiness publication conflicts with its identity or sequence fence."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge index readiness conflicts with durable state.")
+
+
+class KnowledgeEmbeddingProjectionConflict(RuntimeError):
+    """A projection attempt was reused with a different immutable vector payload."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge embedding projection conflicts with durable state.")
 
 
 class KnowledgeAccessScope(BaseModel):
@@ -714,6 +753,578 @@ class KnowledgeEvidenceResult(BaseModel):
         return self
 
 
+class KnowledgeEmbeddingIdentity(BaseModel):
+    """Complete identity of one durable knowledge embedding projection.
+
+    Content hashes alone are not sufficient reuse keys. Comparable vectors must
+    agree on the canonical revision, projected content, embedding space, the
+    projection generator, preprocessing, and the stored index representation.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    entry_id: str
+    entry_revision: int
+    chunk_id: str | None = None
+    projection_type: str
+    projection_content_hash: str
+    embedding_model: str
+    dimensions: int
+    preprocessing_version: str
+    generator: str
+    generator_version: str
+    index_representation_version: str
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
+        return value
+
+    @field_validator("chunk_id")
+    @classmethod
+    def validate_chunk_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _knowledge_chunk_id(value)
+
+    @field_validator(
+        "projection_type",
+        "projection_content_hash",
+        "embedding_model",
+        "preprocessing_version",
+        "generator",
+        "generator_version",
+        "index_representation_version",
+    )
+    @classmethod
+    def validate_identity_component(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 512:
+            raise ValueError(f"`{info.field_name}` must be at most 512 UTF-8 bytes.")
+        return value
+
+    @field_validator("dimensions")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        _validate_positive_int(value, "dimensions")
+        if value > MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"`dimensions` must be less than or equal to {MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS}."
+            )
+        return value
+
+
+class KnowledgeEmbeddingProjection(BaseModel):
+    """One externally computed vector fenced to an exact pending projection attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    identity: KnowledgeEmbeddingIdentity
+    readiness_sequence: int
+    attempt_id: str
+    vector: list[float]
+
+    @field_validator("identity", mode="before")
+    @classmethod
+    def copy_identity(cls, value: KnowledgeEmbeddingIdentity) -> KnowledgeEmbeddingIdentity:
+        return copy_knowledge_embedding_identity(value)
+
+    @field_validator("readiness_sequence")
+    @classmethod
+    def validate_readiness_sequence(cls, value: int) -> int:
+        _validate_knowledge_index_sequence(
+            value,
+            "readiness_sequence",
+            allow_zero=False,
+        )
+        return value
+
+    @field_validator("attempt_id")
+    @classmethod
+    def validate_attempt_id(cls, value: str) -> str:
+        return _bounded_knowledge_index_identity(value, "attempt_id")
+
+    @field_validator("vector", mode="before")
+    @classmethod
+    def copy_vector(cls, value) -> list[float]:
+        if type(value) is not list:
+            raise ValueError("`vector` must be a list.")
+        result: list[float] = []
+        for index, component in enumerate(value):
+            if isinstance(component, bool) or not isinstance(component, int | float):
+                raise ValueError(f"`vector[{index}]` must be a number.")
+            result.append(require_finite(float(component), f"vector[{index}]"))
+        return result
+
+    @model_validator(mode="after")
+    def validate_vector_dimensions(self) -> KnowledgeEmbeddingProjection:
+        if len(self.vector) != self.identity.dimensions:
+            raise ValueError("`vector` length must equal `identity.dimensions`.")
+        return self
+
+
+class KnowledgeEmbeddingProjectionWriteResult(BaseModel):
+    """Accepted identities from one bounded projection persistence request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    submitted_records: int
+    stored_identities: list[KnowledgeEmbeddingIdentity] = Field(default_factory=list)
+
+    @field_validator("submitted_records")
+    @classmethod
+    def validate_submitted_records(cls, value: int) -> int:
+        _validate_nonnegative_int(value, "submitted_records")
+        if value > MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT:
+            raise ValueError(
+                "`submitted_records` must be less than or equal to "
+                f"{MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT}."
+            )
+        return value
+
+    @field_validator("stored_identities", mode="before")
+    @classmethod
+    def copy_stored_identities(
+        cls,
+        value,
+    ) -> list[KnowledgeEmbeddingIdentity]:
+        if type(value) is not list:
+            raise ValueError("`stored_identities` must be a list.")
+        return [copy_knowledge_embedding_identity(identity) for identity in value]
+
+    @model_validator(mode="after")
+    def validate_stored_partition(self) -> KnowledgeEmbeddingProjectionWriteResult:
+        if len(self.stored_identities) > self.submitted_records:
+            raise ValueError("Stored projection identities cannot exceed submitted records.")
+        identity_sha256s = {
+            _knowledge_embedding_identity_sha256(identity) for identity in self.stored_identities
+        }
+        if len(identity_sha256s) != len(self.stored_identities):
+            raise ValueError("`stored_identities` cannot contain duplicates.")
+        return self
+
+
+class KnowledgeEmbeddingBackfillResult(BaseModel):
+    """Portable outcome from one bounded embedding repair/backfill pass."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    scanned_records: int
+    indexed_records: int
+    failed_records: int
+    skipped_records: int
+    limit: int
+    refresh_existing: bool
+    next_cursor: str | None = None
+
+    @field_validator(
+        "scanned_records",
+        "indexed_records",
+        "failed_records",
+        "skipped_records",
+    )
+    @classmethod
+    def validate_count(cls, value: int, info) -> int:
+        _validate_nonnegative_int(value, info.field_name)
+        return value
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, value: int) -> int:
+        _validate_knowledge_embedding_work_record_limit(value, field_name="limit")
+        return value
+
+    @field_validator("refresh_existing", mode="before")
+    @classmethod
+    def validate_refresh_existing(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`refresh_existing` must be a boolean.")
+        return value
+
+    @field_validator("next_cursor")
+    @classmethod
+    def validate_next_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_knowledge_embedding_backfill_cursor(value, "next_cursor")
+
+    @model_validator(mode="after")
+    def validate_partition(self) -> KnowledgeEmbeddingBackfillResult:
+        if self.scanned_records > self.limit:
+            raise ValueError("`scanned_records` cannot exceed `limit`.")
+        if self.indexed_records + self.failed_records + self.skipped_records != (
+            self.scanned_records
+        ):
+            raise ValueError("Backfill outcomes must partition all scanned records.")
+        return self
+
+
+class _KnowledgeEmbeddingBackfillCursor(BaseModel):
+    """Validated keyset state carried inside an opaque backfill cursor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    version: int
+    fingerprint: str
+    importance: float
+    updated_at: datetime
+    entry_id: str
+    chunk_index: int
+    chunk_id: str
+
+    @field_validator("version")
+    @classmethod
+    def validate_version(cls, value: int) -> int:
+        if type(value) is not int or value != _KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_VERSION:
+            raise ValueError("Unsupported knowledge embedding backfill cursor version.")
+        return value
+
+    @field_validator("fingerprint")
+    @classmethod
+    def validate_fingerprint(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "fingerprint")
+        if _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("Backfill cursor fingerprint must be a SHA-256 digest.")
+        return value
+
+    @field_validator("importance", mode="before")
+    @classmethod
+    def validate_importance(cls, value) -> float:
+        return _validate_unit_float(value, "importance")
+
+    @field_validator("updated_at")
+    @classmethod
+    def validate_updated_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`updated_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value, "entry_id")
+
+    @field_validator("chunk_index")
+    @classmethod
+    def validate_chunk_index(cls, value: int) -> int:
+        _validate_nonnegative_int(value, "chunk_index")
+        if value > MAX_KNOWLEDGE_CHUNK_INDEX:
+            raise ValueError(
+                f"`chunk_index` must be less than or equal to {MAX_KNOWLEDGE_CHUNK_INDEX}."
+            )
+        return value
+
+    @field_validator("chunk_id")
+    @classmethod
+    def validate_chunk_id(cls, value: str) -> str:
+        return _knowledge_chunk_id(value, "chunk_id")
+
+
+class KnowledgeIndexReadinessUpdate(BaseModel):
+    """One requested state transition for an exact embedding identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    identity: KnowledgeEmbeddingIdentity
+    state: KnowledgeIndexState
+    attempt_id: str
+    failure_code: str | None = None
+
+    @field_validator("identity", mode="before")
+    @classmethod
+    def copy_identity(cls, value: KnowledgeEmbeddingIdentity) -> KnowledgeEmbeddingIdentity:
+        if type(value) is not KnowledgeEmbeddingIdentity:
+            raise TypeError("Index readiness requires a KnowledgeEmbeddingIdentity.")
+        return value.model_copy(deep=True)
+
+    @field_validator("attempt_id")
+    @classmethod
+    def validate_attempt_id(cls, value: str) -> str:
+        return _bounded_knowledge_index_identity(value, "attempt_id")
+
+    @field_validator("failure_code")
+    @classmethod
+    def validate_failure_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_knowledge_index_identity(value, "failure_code")
+
+    @model_validator(mode="after")
+    def validate_failure_state(self) -> KnowledgeIndexReadinessUpdate:
+        if self.state is KnowledgeIndexState.FAILED and self.failure_code is None:
+            raise ValueError("Failed index readiness requires `failure_code`.")
+        if self.state is not KnowledgeIndexState.FAILED and self.failure_code is not None:
+            raise ValueError("`failure_code` is valid only for failed index readiness.")
+        return self
+
+
+class KnowledgeIndexReadiness(BaseModel):
+    """Immutable sequenced evidence of one derived-index state transition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    sequence: int
+    identity: KnowledgeEmbeddingIdentity
+    state: KnowledgeIndexState
+    attempt_id: str
+    failure_code: str | None = None
+    operation_id: str
+    published_at: datetime
+
+    @field_validator("sequence")
+    @classmethod
+    def validate_sequence(cls, value: int) -> int:
+        _validate_knowledge_index_sequence(value, "sequence", allow_zero=False)
+        return value
+
+    @field_validator("identity", mode="before")
+    @classmethod
+    def copy_identity(cls, value: KnowledgeEmbeddingIdentity) -> KnowledgeEmbeddingIdentity:
+        if type(value) is not KnowledgeEmbeddingIdentity:
+            raise TypeError("Index readiness requires a KnowledgeEmbeddingIdentity.")
+        return value.model_copy(deep=True)
+
+    @field_validator("attempt_id", "operation_id")
+    @classmethod
+    def validate_required_identity(cls, value: str, info) -> str:
+        return _bounded_knowledge_index_identity(value, info.field_name)
+
+    @field_validator("failure_code")
+    @classmethod
+    def validate_failure_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_knowledge_index_identity(value, "failure_code")
+
+    @field_validator("published_at")
+    @classmethod
+    def validate_published_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`published_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_failure_state(self) -> KnowledgeIndexReadiness:
+        KnowledgeIndexReadinessUpdate(
+            identity=self.identity,
+            state=self.state,
+            attempt_id=self.attempt_id,
+            failure_code=self.failure_code,
+        )
+        return self
+
+
+class KnowledgeIndexReadinessBatch(BaseModel):
+    """Bounded ordered readiness events through one captured high-water mark."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    readiness: list[KnowledgeIndexReadiness] = Field(default_factory=list)
+    after_sequence: int = 0
+    next_after_sequence: int = 0
+    high_water_sequence: int = 0
+    truncated: bool = False
+    limit: int
+
+    @field_validator("readiness", mode="before")
+    @classmethod
+    def copy_readiness(cls, value: list[KnowledgeIndexReadiness]) -> list[KnowledgeIndexReadiness]:
+        return [copy_knowledge_index_readiness(item) for item in value]
+
+    @field_validator("after_sequence", "next_after_sequence", "high_water_sequence")
+    @classmethod
+    def validate_sequences(cls, value: int, info) -> int:
+        _validate_knowledge_index_sequence(value, info.field_name)
+        return value
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, value: int) -> int:
+        _validate_knowledge_index_readiness_limit(value)
+        return value
+
+    @field_validator("truncated", mode="before")
+    @classmethod
+    def validate_truncated(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`truncated` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page(self) -> KnowledgeIndexReadinessBatch:
+        if self.next_after_sequence < self.after_sequence:
+            raise ValueError("`next_after_sequence` cannot precede `after_sequence`.")
+        if len(self.readiness) > self.limit:
+            raise ValueError("`readiness` cannot contain more records than `limit`.")
+        sequences = [item.sequence for item in self.readiness]
+        if sequences != sorted(sequences) or len(sequences) != len(set(sequences)):
+            raise ValueError("Index readiness records must have unique ascending sequences.")
+        if any(sequence <= self.after_sequence for sequence in sequences):
+            raise ValueError("Index readiness records fall outside the page frontier.")
+        if sequences and sequences[-1] > self.high_water_sequence:
+            raise ValueError("Index readiness records cannot exceed `high_water_sequence`.")
+        if self.truncated and not self.readiness:
+            raise ValueError("A truncated readiness page must contain a continuation record.")
+        expected_next = (
+            self.readiness[-1].sequence
+            if self.truncated
+            else max(self.after_sequence, self.high_water_sequence)
+        )
+        if self.next_after_sequence != expected_next:
+            raise ValueError("`next_after_sequence` does not match readiness page semantics.")
+        return self
+
+
+class KnowledgeIndexCoverage(BaseModel):
+    """Machine-readable semantic-index coverage for one search projection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    projection_type: str
+    embedding_model: str
+    dimensions: int
+    preprocessing_version: str
+    generator: str
+    generator_version: str
+    index_representation_version: str
+    eligible_records: int
+    ready_records: int
+    pending_records: int
+    failed_records: int
+    high_water_sequence: int
+    complete: bool
+
+    @field_validator(
+        "projection_type",
+        "embedding_model",
+        "preprocessing_version",
+        "generator",
+        "generator_version",
+        "index_representation_version",
+    )
+    @classmethod
+    def validate_space_identity(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 512:
+            raise ValueError(f"`{info.field_name}` must be at most 512 UTF-8 bytes.")
+        return value
+
+    @field_validator("dimensions")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        _validate_positive_int(value, "dimensions")
+        if value > MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"`dimensions` must be less than or equal to {MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS}."
+            )
+        return value
+
+    @field_validator(
+        "eligible_records",
+        "ready_records",
+        "pending_records",
+        "failed_records",
+    )
+    @classmethod
+    def validate_counts(cls, value: int, info) -> int:
+        _validate_nonnegative_int(value, info.field_name)
+        return value
+
+    @field_validator("high_water_sequence")
+    @classmethod
+    def validate_high_water_sequence(cls, value: int) -> int:
+        _validate_knowledge_index_sequence(value, "high_water_sequence")
+        return value
+
+    @field_validator("complete", mode="before")
+    @classmethod
+    def validate_complete(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`complete` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_complete_partition(self) -> KnowledgeIndexCoverage:
+        if self.ready_records + self.pending_records + self.failed_records != (
+            self.eligible_records
+        ):
+            raise ValueError("Index coverage states must partition all eligible records.")
+        if self.complete != (
+            self.ready_records == self.eligible_records
+            and self.pending_records == 0
+            and self.failed_records == 0
+        ):
+            raise ValueError("`complete` must reflect complete ready index coverage.")
+        return self
+
+
+class KnowledgeEmbeddingWorkerResult(BaseModel):
+    """Bounded outcome from consuming canonical changes into one embedding index."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    consumer_id: str
+    worker_id: str
+    claimed_changes: int
+    acknowledged_changes: int
+    indexed_records: int
+    failed_records: int
+    removed_records: int
+    limit: int
+    processed_records: int
+    record_limit: int
+
+    @field_validator("consumer_id", "worker_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _knowledge_change_identity(value, info.field_name)
+
+    @field_validator(
+        "claimed_changes",
+        "acknowledged_changes",
+        "indexed_records",
+        "failed_records",
+        "removed_records",
+        "processed_records",
+    )
+    @classmethod
+    def validate_count(cls, value: int, info) -> int:
+        _validate_nonnegative_int(value, info.field_name)
+        return value
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, value: int) -> int:
+        _validate_knowledge_change_limit(value)
+        return value
+
+    @field_validator("record_limit")
+    @classmethod
+    def validate_record_limit(cls, value: int) -> int:
+        _validate_knowledge_embedding_work_record_limit(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_claims(self) -> KnowledgeEmbeddingWorkerResult:
+        if self.claimed_changes > self.limit:
+            raise ValueError("`claimed_changes` cannot exceed `limit`.")
+        if self.acknowledged_changes > self.claimed_changes:
+            raise ValueError("`acknowledged_changes` cannot exceed `claimed_changes`.")
+        if self.processed_records > self.record_limit:
+            raise ValueError("`processed_records` cannot exceed `record_limit`.")
+        if self.indexed_records + self.failed_records + self.removed_records > (
+            self.processed_records
+        ):
+            raise ValueError("Embedding outcomes cannot exceed processed records.")
+        return self
+
+
 class KnowledgeQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -985,6 +1596,7 @@ class KnowledgeSearchResult(BaseModel):
     limit: int
     max_bytes: int
     total_hits_known: int | None = None
+    index_coverage: list[KnowledgeIndexCoverage] = Field(default_factory=list)
 
     @field_validator("query")
     @classmethod
@@ -995,6 +1607,13 @@ class KnowledgeSearchResult(BaseModel):
     @classmethod
     def copy_hits(cls, value):
         return [copy_knowledge_hit(hit) for hit in value]
+
+    @field_validator("index_coverage", mode="before")
+    @classmethod
+    def copy_index_coverage(
+        cls, value: list[KnowledgeIndexCoverage]
+    ) -> list[KnowledgeIndexCoverage]:
+        return [copy_knowledge_index_coverage(item) for item in value]
 
     @field_validator("limit", "max_bytes")
     @classmethod
@@ -1031,6 +1650,20 @@ class KnowledgeSearchResult(BaseModel):
         ranks = [hit.rank for hit in self.hits if hit.rank is not None]
         if len(ranks) != len(set(ranks)):
             raise ValueError("Knowledge hit ranks must be unique when present.")
+        projection_spaces = [
+            (
+                item.projection_type,
+                item.embedding_model,
+                item.dimensions,
+                item.preprocessing_version,
+                item.generator,
+                item.generator_version,
+                item.index_representation_version,
+            )
+            for item in self.index_coverage
+        ]
+        if len(projection_spaces) != len(set(projection_spaces)):
+            raise ValueError("Index coverage projection spaces must be unique.")
         return self
 
 
@@ -1731,6 +2364,80 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeChangeConsumerState | None:
         """Load one scope-bound consumer cursor and lease state."""
 
+    async def publish_index_readiness(
+        self,
+        update: KnowledgeIndexReadinessUpdate,
+        *,
+        expected_sequence: int | None,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadiness:
+        """Publish one fenced derived-index state transition.
+
+        This hook is intentionally optional so lexical-only custom stores do not
+        have to pretend they own derived indexes. Implementations that advertise
+        semantic retrieval must provide equivalent durable semantics.
+        """
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support index readiness publication."
+        )
+
+    async def load_index_readiness(
+        self,
+        identity: KnowledgeEmbeddingIdentity,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadiness | None:
+        """Load the latest accessible readiness for one exact identity."""
+
+        raise NotImplementedError("This KnowledgeStore does not support index readiness reads.")
+
+    async def store_embedding_projections(
+        self,
+        projections: list[KnowledgeEmbeddingProjection],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEmbeddingProjectionWriteResult:
+        """Persist already-computed vectors for exact current pending attempts.
+
+        Stale, superseded, and unauthorized projections are omitted from the
+        returned accepted identities. Readiness remains a separate fenced
+        publication step so a vector cannot become searchable prematurely.
+        """
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support embedding projection persistence."
+        )
+
+    async def backfill_embeddings(
+        self,
+        query: KnowledgeListQuery | None = None,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        limit: int = DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
+        refresh_existing: bool = False,
+        cursor: str | None = None,
+    ) -> KnowledgeEmbeddingBackfillResult:
+        """Repair one bounded page of current embedding projections.
+
+        Pass the previous result's ``next_cursor`` to continue the exact same
+        query, scope, projection configuration, and refresh mode.
+        """
+
+        raise NotImplementedError("This KnowledgeStore does not support embedding backfill.")
+
+    async def read_index_readiness(
+        self,
+        *,
+        after_sequence: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadinessBatch:
+        """Read accessible readiness events through a captured high-water mark."""
+
+        raise NotImplementedError("This KnowledgeStore does not support index readiness reads.")
+
     async def prune_expired(
         self,
         *,
@@ -1775,6 +2482,13 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._next_change_sequence = 1
         self._change_consumers: dict[str, KnowledgeChangeConsumerState] = {}
         self._acknowledged_change_claims: dict[tuple[str, str], tuple[str, int]] = {}
+        self._index_readiness: list[KnowledgeIndexReadiness] = []
+        self._index_readiness_by_identity: dict[str, KnowledgeIndexReadiness] = {}
+        self._index_readiness_operations: dict[
+            str,
+            tuple[str, KnowledgeIndexReadiness],
+        ] = {}
+        self._next_index_readiness_sequence = 1
         if entries:
             for entry in entries:
                 copied = copy_knowledge_entry(entry)
@@ -2641,6 +3355,148 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_change_consumer_state(state)
 
+    async def publish_index_readiness(
+        self,
+        update: KnowledgeIndexReadinessUpdate,
+        *,
+        expected_sequence: int | None,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadiness:
+        scope = self._operation_access_scope(access_scope)
+        update = copy_knowledge_index_readiness_update(update)
+        operation_id = _bounded_knowledge_index_identity(operation_id, "operation_id")
+        if expected_sequence is not None:
+            _validate_knowledge_index_sequence(
+                expected_sequence,
+                "expected_sequence",
+                allow_zero=False,
+            )
+        update_sha256 = _knowledge_index_readiness_update_sha256(update)
+        replay = self._index_readiness_operations.get(operation_id)
+        if replay is not None:
+            stored_sha256, readiness = replay
+            if stored_sha256 != update_sha256:
+                raise KnowledgeIndexReadinessConflict("operation_reuse")
+            if not self._index_identity_is_accessible(scope, update.identity):
+                raise KnowledgeAccessDenied("publish_index_readiness")
+            return copy_knowledge_index_readiness(readiness)
+        if not self._index_identity_is_accessible(
+            scope,
+            update.identity,
+            require_current=True,
+        ):
+            raise KnowledgeIndexReadinessConflict("stale_identity")
+        identity_sha256 = _knowledge_embedding_identity_sha256(update.identity)
+        current = self._index_readiness_by_identity.get(identity_sha256)
+        _validate_knowledge_index_readiness_transition(
+            current,
+            update,
+            expected_sequence=expected_sequence,
+        )
+        sequence = self._next_index_readiness_sequence
+        if sequence > MAX_KNOWLEDGE_CHANGE_SEQUENCE:
+            raise OverflowError("Knowledge index readiness sequence is exhausted.")
+        readiness = KnowledgeIndexReadiness(
+            sequence=sequence,
+            identity=update.identity,
+            state=update.state,
+            attempt_id=update.attempt_id,
+            failure_code=update.failure_code,
+            operation_id=operation_id,
+            published_at=self._clock(),
+        )
+        self._next_index_readiness_sequence += 1
+        self._index_readiness.append(readiness)
+        self._index_readiness_by_identity[identity_sha256] = readiness
+        self._index_readiness_operations[operation_id] = (update_sha256, readiness)
+        return copy_knowledge_index_readiness(readiness)
+
+    async def load_index_readiness(
+        self,
+        identity: KnowledgeEmbeddingIdentity,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadiness | None:
+        scope = self._operation_access_scope(access_scope)
+        identity = copy_knowledge_embedding_identity(identity)
+        if not self._index_identity_is_accessible(scope, identity):
+            return None
+        readiness = self._index_readiness_by_identity.get(
+            _knowledge_embedding_identity_sha256(identity)
+        )
+        if readiness is None:
+            return None
+        return copy_knowledge_index_readiness(readiness)
+
+    async def read_index_readiness(
+        self,
+        *,
+        after_sequence: int = 0,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeIndexReadinessBatch:
+        scope = self._operation_access_scope(access_scope)
+        _validate_knowledge_index_sequence(after_sequence, "after_sequence")
+        _validate_knowledge_index_readiness_limit(limit)
+        current_sequence = self._next_index_readiness_sequence - 1
+        if after_sequence > current_sequence:
+            raise ValueError(
+                "`after_sequence` cannot exceed the current knowledge index readiness sequence."
+            )
+        accessible = [
+            item
+            for item in self._index_readiness
+            if self._index_identity_is_accessible(scope, item.identity)
+        ]
+        high_water = max((item.sequence for item in accessible), default=0)
+        selected = [item for item in accessible if item.sequence > after_sequence]
+        truncated = len(selected) > limit
+        selected = selected[:limit]
+        next_after = selected[-1].sequence if truncated else max(after_sequence, high_water)
+        return KnowledgeIndexReadinessBatch(
+            readiness=selected,
+            after_sequence=after_sequence,
+            next_after_sequence=next_after,
+            high_water_sequence=high_water,
+            truncated=truncated,
+            limit=limit,
+        )
+
+    def _index_identity_is_accessible(
+        self,
+        scope: KnowledgeAccessScope,
+        identity: KnowledgeEmbeddingIdentity,
+        *,
+        require_current: bool = False,
+    ) -> bool:
+        current = self._current_entry(identity.entry_id)
+        if current is None or not _knowledge_scope_allows_entry(scope, current):
+            return False
+        if require_current and current.revision != identity.entry_revision:
+            return False
+        revision = self._entry_revision(identity.entry_id, identity.entry_revision)
+        if revision is None or not _knowledge_scope_allows_entry(scope, revision):
+            return False
+        if identity.chunk_id is None:
+            return True
+        chunk = next(
+            (
+                candidate
+                for candidate in self._chunks.get(
+                    (identity.entry_id, identity.entry_revision),
+                    [],
+                )
+                if candidate.id == identity.chunk_id
+            ),
+            None,
+        )
+        if chunk is None:
+            return False
+        if identity.projection_type == KNOWLEDGE_CHUNK_TEXT_PROJECTION:
+            return identity.projection_content_hash == _knowledge_chunk_content_hash(chunk)
+        return True
+
     def _require_matching_change_claim(
         self,
         state: KnowledgeChangeConsumerState,
@@ -2859,7 +3715,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         *,
         embedding_provider: TextEmbeddingProvider,
         embedding_model: str,
-        embedding_dimensions: int | None = None,
+        embedding_dimensions: int,
         entries: list[KnowledgeEntry] | None = None,
         access_scope: KnowledgeAccessScope | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -2870,8 +3726,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             raise TypeError("embedding_provider must implement TextEmbeddingProvider.")
         self.embedding_provider = embedding_provider
         self.embedding_model = require_clean_nonblank(embedding_model, "embedding_model")
-        if embedding_dimensions is not None:
-            _validate_positive_int(embedding_dimensions, "embedding_dimensions")
+        _validate_positive_int(embedding_dimensions, "embedding_dimensions")
         self.embedding_dimensions = embedding_dimensions
         self.hybrid_keyword_weight = _validate_nonnegative_float(
             hybrid_keyword_weight,
@@ -2892,130 +3747,308 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             KnowledgeSearchMode.HYBRID,
         )
 
-    async def create_entry(
+    async def process_embedding_changes(
         self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk] | None = None,
+        consumer_id: str,
+        worker_id: str,
         *,
-        evidence: list[KnowledgeEvidence] | None = None,
+        limit: int = DEFAULT_KNOWLEDGE_LIMIT,
+        record_limit: int = DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
+        lease_seconds: float = 300.0,
         access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        stored = await super().create_entry(
-            entry,
-            access_scope=access_scope,
-            chunks=chunks,
-            evidence=evidence,
-        )
-        await self._embed_entry_chunks(stored.id, stored.revision)
-        return stored
+    ) -> KnowledgeEmbeddingWorkerResult:
+        """Consume a bounded page of canonical changes into the embedding index."""
 
-    async def append_entry_revision(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk] | None = None,
-        *,
-        expected_revision: int,
-        evidence: list[KnowledgeEvidence] | None = None,
-        access_scope: KnowledgeAccessScope | None = None,
-    ) -> KnowledgeEntry:
-        stored = await super().append_entry_revision(
-            entry,
-            expected_revision=expected_revision,
-            access_scope=access_scope,
-            chunks=chunks,
-            evidence=evidence,
-        )
-        await self._embed_entry_chunks(stored.id, stored.revision)
-        self._drop_stale_entry_embeddings(stored.id)
-        return stored
-
-    async def transition_entry_status(
-        self,
-        entry_id: str,
-        *,
-        expected_revision: int,
-        access_scope: KnowledgeAccessScope | None = None,
-        from_status: KnowledgeStatus,
-        to_status: KnowledgeStatus,
-        expected_namespace: str | None = None,
-        expected_labels: dict[str, str] | None = None,
-    ) -> KnowledgeEntry:
-        stored = await super().transition_entry_status(
-            entry_id,
-            expected_revision=expected_revision,
-            access_scope=access_scope,
-            from_status=from_status,
-            to_status=to_status,
-            expected_namespace=expected_namespace,
-            expected_labels=expected_labels,
-        )
-        await self._embed_entry_chunks(stored.id, stored.revision)
-        self._drop_stale_entry_embeddings(stored.id)
-        return stored
-
-    async def delete_entry(
-        self,
-        entry_id: str,
-        *,
-        expected_revision: int,
-        access_scope: KnowledgeAccessScope | None = None,
-        hard: bool = False,
-    ) -> KnowledgeEntry | None:
-        deleted = await super().delete_entry(
-            entry_id,
-            expected_revision=expected_revision,
-            access_scope=access_scope,
-            hard=hard,
-        )
-        if hard and deleted is not None:
-            self._drop_entry_embeddings(deleted.id)
-        return deleted
-
-    async def prune_expired(
-        self,
-        *,
-        access_scope: KnowledgeAccessScope | None = None,
-        now: datetime | None = None,
-    ) -> int:
+        _validate_knowledge_change_limit(limit)
+        _validate_knowledge_embedding_work_record_limit(record_limit)
         scope = self._operation_access_scope(access_scope)
-        cutoff = _knowledge_change_now(now)
-        expired_ids = sorted(
-            entry_id
-            for entry_id in self._entries
-            if (entry := self._current_entry(entry_id)) is not None
-            if entry.expires_at is not None
-            and entry.expires_at <= cutoff
-            and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
+        claimed_changes = 0
+        acknowledged_changes = 0
+        indexed_records = 0
+        failed_records = 0
+        removed_records = 0
+        processed_records = 0
+        for _ in range(limit):
+            claim = await self.claim_change(
+                consumer_id,
+                worker_id,
+                lease_seconds=lease_seconds,
+                access_scope=scope,
+            )
+            if claim is None:
+                break
+            claimed_changes += 1
+            try:
+                current = self._current_entry(claim.change.entry_id)
+                remaining = record_limit - processed_records
+                if current is None or current.status is KnowledgeStatus.DELETED:
+                    removed, cleanup_truncated = self._drop_entry_embeddings(
+                        claim.change.entry_id,
+                        limit=remaining,
+                    )
+                    removed_records += removed
+                    processed_records += removed
+                elif (
+                    current.revision != claim.change.entry_revision
+                    or not _knowledge_scope_allows_entry(scope, current)
+                ):
+                    removed, cleanup_truncated = self._drop_stale_entry_embeddings(
+                        current.id,
+                        limit=remaining,
+                    )
+                    removed_records += removed
+                    processed_records += removed
+                else:
+                    chunks = [
+                        copy_knowledge_chunk(chunk)
+                        for chunk in self._chunks.get(
+                            (current.id, current.revision),
+                            [],
+                        )
+                    ]
+                    chunks, truncated = self._embedding_work_candidates(
+                        chunks,
+                        limit=record_limit - processed_records,
+                    )
+                    indexed, failed = await self._index_chunks_with_readiness(
+                        chunks,
+                        attempt_id=claim.claim_id,
+                        operation_prefix=f"kidx:{claim.claim_id}",
+                        access_scope=scope,
+                    )
+                    indexed_records += indexed
+                    failed_records += failed
+                    processed_records += len(chunks)
+                    removed, cleanup_truncated = self._drop_stale_entry_embeddings(
+                        current.id,
+                        limit=record_limit - processed_records,
+                    )
+                    removed_records += removed
+                    processed_records += removed
+                    cleanup_truncated = truncated or cleanup_truncated
+                if cleanup_truncated:
+                    await self.release_change(claim, access_scope=scope)
+                    break
+                await self.acknowledge_change(claim, access_scope=scope)
+                acknowledged_changes += 1
+                if processed_records >= record_limit:
+                    break
+            except Exception:
+                with suppress(KnowledgeChangeConsumerConflict):
+                    await self.release_change(claim, access_scope=scope)
+                raise
+        return KnowledgeEmbeddingWorkerResult(
+            consumer_id=consumer_id,
+            worker_id=worker_id,
+            claimed_changes=claimed_changes,
+            acknowledged_changes=acknowledged_changes,
+            indexed_records=indexed_records,
+            failed_records=failed_records,
+            removed_records=removed_records,
+            limit=limit,
+            processed_records=processed_records,
+            record_limit=record_limit,
         )
-        pruned = await super().prune_expired(access_scope=scope, now=cutoff)
-        for entry_id in expired_ids:
-            self._drop_entry_embeddings(entry_id)
-        return pruned
 
-    async def publish_entry_revision(
+    def _embedding_work_candidates(
         self,
-        entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         *,
-        evidence: list[KnowledgeEvidence] | None = None,
+        limit: int,
+    ) -> tuple[list[KnowledgeChunk], bool]:
+        candidates: list[KnowledgeChunk] = []
+        for chunk in chunks:
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model=self.embedding_model,
+                dimensions=self.embedding_dimensions,
+            )
+            identity_sha256 = _knowledge_embedding_identity_sha256(identity)
+            readiness = self._index_readiness_by_identity.get(identity_sha256)
+            stored = self._chunk_embeddings.get(identity_sha256)
+            if (
+                readiness is not None
+                and readiness.state is KnowledgeIndexState.READY
+                and stored is not None
+                and stored["identity"] == identity
+            ):
+                continue
+            candidates.append(copy_knowledge_chunk(chunk))
+            if len(candidates) > limit:
+                break
+        return candidates[:limit], len(candidates) > limit
+
+    async def backfill_embeddings(
+        self,
+        query: KnowledgeListQuery | None = None,
+        *,
         access_scope: KnowledgeAccessScope | None = None,
-        operation_id: str,
-        expected_revision: int | None = None,
-    ) -> KnowledgePublicationReceipt:
-        receipt = await super().publish_entry_revision(
-            entry,
-            chunks,
-            evidence=evidence,
-            access_scope=access_scope,
-            operation_id=operation_id,
-            expected_revision=expected_revision,
+        limit: int = DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
+        refresh_existing: bool = False,
+        cursor: str | None = None,
+    ) -> KnowledgeEmbeddingBackfillResult:
+        """Repair or refresh one bounded deterministic page of current chunk vectors."""
+
+        _validate_knowledge_embedding_work_record_limit(limit, field_name="limit")
+        if type(refresh_existing) is not bool:
+            raise ValueError("`refresh_existing` must be a boolean.")
+        scope = self._operation_access_scope(access_scope)
+        knowledge_query = copy_knowledge_list_query(query or KnowledgeListQuery())
+        fingerprint = _knowledge_embedding_backfill_fingerprint(
+            knowledge_query,
+            scope,
+            refresh_existing=refresh_existing,
+            embedding_model=self.embedding_model,
+            embedding_dimensions=self.embedding_dimensions,
         )
-        if receipt.replayed:
-            return receipt
-        stored_chunks = self._chunks.get((receipt.entry_id, receipt.entry_revision), [])
-        await self._embed_chunks(stored_chunks)
-        self._drop_stale_entry_embeddings(receipt.entry_id)
-        return receipt
+        after = _decode_knowledge_embedding_backfill_cursor(
+            cursor,
+            fingerprint=fingerprint,
+        )
+        after_key = (
+            None
+            if after is None
+            else _knowledge_embedding_backfill_sort_key(
+                importance=after.importance,
+                updated_at=after.updated_at,
+                entry_id=after.entry_id,
+                chunk_index=after.chunk_index,
+                chunk_id=after.chunk_id,
+            )
+        )
+        entries = [
+            entry
+            for entry_id in self._entries
+            if (entry := self._current_entry(entry_id)) is not None
+            if _knowledge_scope_allows_entry(scope, entry)
+            if _entry_matches_list_query(entry, knowledge_query)
+        ]
+        entries.sort(
+            key=lambda entry: _knowledge_embedding_backfill_sort_key(
+                importance=entry.importance or 0.0,
+                updated_at=entry.updated_at,
+                entry_id=entry.id,
+                chunk_index=0,
+                chunk_id="",
+            )
+        )
+        candidates: list[tuple[KnowledgeEntry, KnowledgeChunk]] = []
+        for entry in entries:
+            for chunk in sorted(
+                self._chunks.get((entry.id, entry.revision), []),
+                key=lambda item: (item.chunk_index, item.id),
+            ):
+                candidate_key = _knowledge_embedding_backfill_sort_key(
+                    importance=entry.importance or 0.0,
+                    updated_at=entry.updated_at,
+                    entry_id=entry.id,
+                    chunk_index=chunk.chunk_index,
+                    chunk_id=chunk.id,
+                )
+                if after_key is not None and candidate_key <= after_key:
+                    continue
+                identity = knowledge_chunk_embedding_identity(
+                    chunk,
+                    embedding_model=self.embedding_model,
+                    dimensions=self.embedding_dimensions,
+                )
+                identity_sha256 = _knowledge_embedding_identity_sha256(identity)
+                readiness = self._index_readiness_by_identity.get(identity_sha256)
+                stored = self._chunk_embeddings.get(identity_sha256)
+                if (
+                    not refresh_existing
+                    and readiness is not None
+                    and readiness.state is KnowledgeIndexState.READY
+                    and stored is not None
+                    and stored["identity"] == identity
+                ):
+                    continue
+                candidates.append((entry, copy_knowledge_chunk(chunk)))
+                if len(candidates) > limit:
+                    break
+            if len(candidates) > limit:
+                break
+        page = candidates[:limit]
+        chunks = [chunk for _, chunk in page]
+        next_cursor = (
+            _encode_knowledge_embedding_backfill_cursor(
+                fingerprint=fingerprint,
+                importance=page[-1][0].importance or 0.0,
+                updated_at=page[-1][0].updated_at,
+                chunk=page[-1][1],
+            )
+            if len(candidates) > limit and page
+            else None
+        )
+        attempt_id = f"kbackfill_{uuid4().hex}"
+        indexed, failed = await self._index_chunks_with_readiness(
+            chunks,
+            attempt_id=attempt_id,
+            operation_prefix=f"kidx:{attempt_id}",
+            access_scope=scope,
+            refresh_existing=refresh_existing,
+        )
+        return KnowledgeEmbeddingBackfillResult(
+            scanned_records=len(chunks),
+            indexed_records=indexed,
+            failed_records=failed,
+            skipped_records=len(chunks) - indexed - failed,
+            limit=limit,
+            refresh_existing=refresh_existing,
+            next_cursor=next_cursor,
+        )
+
+    async def store_embedding_projections(
+        self,
+        projections: list[KnowledgeEmbeddingProjection],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeEmbeddingProjectionWriteResult:
+        """Persist vectors only while their exact authorized attempt is pending."""
+
+        scope = self._operation_access_scope(access_scope)
+        copied = _copy_knowledge_embedding_projections(projections)
+        accepted: list[tuple[str, KnowledgeEmbeddingProjection, str]] = []
+        writes: list[tuple[str, KnowledgeEmbeddingProjection, str]] = []
+        for projection in copied:
+            identity = projection.identity
+            if not self._embedding_identity_matches_configuration(identity):
+                raise ValueError("Embedding projection identity does not match this store.")
+            identity_sha256 = _knowledge_embedding_identity_sha256(identity)
+            readiness = self._index_readiness_by_identity.get(identity_sha256)
+            if (
+                readiness is None
+                or readiness.sequence != projection.readiness_sequence
+                or readiness.state is not KnowledgeIndexState.PENDING
+                or readiness.attempt_id != projection.attempt_id
+                or not self._index_identity_is_accessible(scope, identity)
+                or not self._embedding_identity_is_current(identity)
+            ):
+                continue
+            vector_sha256 = _knowledge_embedding_vector_sha256(projection.vector)
+            stored = self._chunk_embeddings.get(identity_sha256)
+            if (
+                stored is not None
+                and stored["readiness_sequence"] == projection.readiness_sequence
+                and stored["attempt_id"] == projection.attempt_id
+            ):
+                if stored["vector_sha256"] != vector_sha256:
+                    raise KnowledgeEmbeddingProjectionConflict("attempt_vector_conflict")
+            else:
+                writes.append((identity_sha256, projection, vector_sha256))
+            accepted.append((identity_sha256, projection, vector_sha256))
+        for identity_sha256, projection, vector_sha256 in writes:
+            self._chunk_embeddings[identity_sha256] = {
+                "identity": copy_knowledge_embedding_identity(projection.identity),
+                "vector": list(projection.vector),
+                "vector_sha256": vector_sha256,
+                "readiness_sequence": projection.readiness_sequence,
+                "attempt_id": projection.attempt_id,
+            }
+        return KnowledgeEmbeddingProjectionWriteResult(
+            submitted_records=len(copied),
+            stored_identities=[projection.identity for _, projection, _ in accepted],
+        )
 
     async def search(
         self,
@@ -3055,6 +4088,11 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                     [copy_knowledge_chunk(chunk) for chunk in chunks],
                 )
             )
+        candidate_chunks = [chunk for _, chunks in candidates for chunk in chunks]
+        candidate_embeddings, coverage = self._ready_embeddings_and_coverage(
+            candidate_chunks,
+            access_scope=scope,
+        )
         if not candidates:
             return KnowledgeSearchResult(
                 query=knowledge_query,
@@ -3063,12 +4101,14 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 limit=knowledge_query.limit,
                 max_bytes=knowledge_query.max_bytes,
                 total_hits_known=0,
+                index_coverage=[coverage],
             )
         semantic_query_text = _semantic_query_text(knowledge_query)
-        candidate_embeddings = await self._embed_chunks(
-            [chunk for _, chunks in candidates for chunk in chunks]
+        query_vector = (
+            await self._embed_query(knowledge_query, semantic_query_text)
+            if candidate_embeddings
+            else None
         )
-        query_vector = await self._embed_query(knowledge_query, semantic_query_text)
         semantic_min_score = (
             self.semantic_min_score
             if knowledge_query.min_score is None
@@ -3078,22 +4118,31 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]
         ] = []
         for entry, chunks in candidates:
-            semantic_score, chunk = self._best_semantic_score(
-                chunks,
-                candidate_embeddings,
-                query_vector,
+            semantic_score, chunk = (
+                (None, None)
+                if query_vector is None
+                else self._best_semantic_score(
+                    chunks,
+                    candidate_embeddings,
+                    query_vector,
+                )
             )
-            if semantic_score is None:
-                continue
-            normalized_semantic = _normalize_cosine_similarity(semantic_score)
-            semantic_matched = normalized_semantic >= semantic_min_score
-            score = normalized_semantic if semantic_matched else 0.0
-            semantic_reason = (
-                "semantic chunk match" if chunk is not None else "semantic entry match"
-            )
+            semantic_matched = False
+            score = 0.0
+            semantic_reason = "semantic projection not ready"
             reason = semantic_reason
-            preview_text = chunk.text if chunk is not None else entry.text
-            score_normalized = normalized_semantic if semantic_matched else None
+            preview_text = entry.text
+            score_normalized: float | None = None
+            if semantic_score is not None:
+                normalized_semantic = _normalize_cosine_similarity(semantic_score)
+                semantic_matched = normalized_semantic >= semantic_min_score
+                score = normalized_semantic if semantic_matched else 0.0
+                semantic_reason = (
+                    "semantic chunk match" if chunk is not None else "semantic entry match"
+                )
+                reason = semantic_reason
+                preview_text = chunk.text if chunk is not None else entry.text
+                score_normalized = normalized_semantic if semantic_matched else None
             if knowledge_query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
                 keyword_score, keyword_chunk, keyword_reason, keyword_preview = _score_entry(
                     entry,
@@ -3129,49 +4178,225 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             if knowledge_query.mode is KnowledgeSearchMode.SEMANTIC
             else "inmemory_hybrid"
         )
-        return _search_result_from_scored_embeddings(scored, knowledge_query, score_kind=score_kind)
+        return _search_result_from_scored_embeddings(
+            scored,
+            knowledge_query,
+            score_kind=score_kind,
+            index_coverage=[coverage],
+        )
 
-    async def _embed_entry_chunks(self, entry_id: str, revision: int) -> None:
-        await self._embed_chunks(self._chunks.get((entry_id, revision), []))
+    async def _index_chunks_with_readiness(
+        self,
+        chunks: list[KnowledgeChunk],
+        *,
+        attempt_id: str,
+        operation_prefix: str,
+        access_scope: KnowledgeAccessScope,
+        refresh_existing: bool = False,
+    ) -> tuple[int, int]:
+        """Index exact current identities and fence every visible vector with readiness."""
 
-    async def _embed_chunks(self, chunks: list[KnowledgeChunk]) -> dict[str, list[float]]:
-        vectors = {
-            chunk.id: list(self._chunk_embeddings[chunk.id]["vector"])
-            for chunk in chunks
-            if self._has_current_embedding(chunk)
-        }
-        missing = [chunk for chunk in chunks if not self._has_current_embedding(chunk)]
-        if not missing:
-            return vectors
-        result = copy_text_embedding_result(
-            await self.embedding_provider.embed_texts(
-                TextEmbeddingRequest(
-                    model=self.embedding_model,
-                    texts=[chunk.text for chunk in missing],
-                    dimensions=self.embedding_dimensions,
+        pending: list[
+            tuple[KnowledgeChunk, KnowledgeEmbeddingIdentity, KnowledgeIndexReadiness]
+        ] = []
+        indexed = 0
+        for chunk in chunks:
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model=self.embedding_model,
+                dimensions=self.embedding_dimensions,
+            )
+            identity_sha256 = _knowledge_embedding_identity_sha256(identity)
+            current = await self.load_index_readiness(
+                identity,
+                access_scope=access_scope,
+            )
+            stored = self._chunk_embeddings.get(identity_sha256)
+            if (
+                not refresh_existing
+                and current is not None
+                and current.state is KnowledgeIndexState.READY
+                and stored is not None
+                and stored["identity"] == identity
+            ):
+                continue
+            if (
+                current is not None
+                and current.state is KnowledgeIndexState.PENDING
+                and current.attempt_id == attempt_id
+            ):
+                readiness = current
+            else:
+                readiness = await self.publish_index_readiness(
+                    KnowledgeIndexReadinessUpdate(
+                        identity=identity,
+                        state=KnowledgeIndexState.PENDING,
+                        attempt_id=attempt_id,
+                    ),
+                    expected_sequence=None if current is None else current.sequence,
+                    operation_id=f"{operation_prefix}:{identity_sha256}:pending",
+                    access_scope=access_scope,
+                )
+            if not refresh_existing and stored is not None and stored["identity"] == identity:
+                if not self._chunk_is_current(chunk):
+                    continue
+                await self.publish_index_readiness(
+                    KnowledgeIndexReadinessUpdate(
+                        identity=identity,
+                        state=KnowledgeIndexState.READY,
+                        attempt_id=readiness.attempt_id,
+                    ),
+                    expected_sequence=readiness.sequence,
+                    operation_id=f"{operation_prefix}:{identity_sha256}:ready",
+                    access_scope=access_scope,
+                )
+                indexed += 1
+                continue
+            pending.append((chunk, identity, readiness))
+        if not pending:
+            return indexed, 0
+
+        try:
+            result = copy_text_embedding_result(
+                await self.embedding_provider.embed_texts(
+                    TextEmbeddingRequest(
+                        model=self.embedding_model,
+                        texts=[chunk.text for chunk, _, _ in pending],
+                        dimensions=self.embedding_dimensions,
+                    )
                 )
             )
+            if result.model != self.embedding_model:
+                raise ValueError("Embedding provider returned an unexpected model identity.")
+            if len(result.embeddings) != len(pending):
+                raise ValueError("Embedding provider returned a different number of embeddings.")
+            by_index = {embedding.index: embedding for embedding in result.embeddings}
+            if len(by_index) != len(result.embeddings):
+                raise ValueError("Embedding provider returned duplicate indexes.")
+            for index in range(len(pending)):
+                embedding = by_index.get(index)
+                if embedding is None:
+                    raise ValueError("Embedding provider did not return every requested index.")
+                self._validate_embedding_dimension(embedding.vector)
+        except Exception:
+            failed = 0
+            for chunk, identity, readiness in pending:
+                if not self._chunk_is_current(chunk):
+                    continue
+                identity_sha256 = _knowledge_embedding_identity_sha256(identity)
+                try:
+                    await self.publish_index_readiness(
+                        KnowledgeIndexReadinessUpdate(
+                            identity=identity,
+                            state=KnowledgeIndexState.FAILED,
+                            attempt_id=readiness.attempt_id,
+                            failure_code="embedding_provider_error",
+                        ),
+                        expected_sequence=readiness.sequence,
+                        operation_id=f"{operation_prefix}:{identity_sha256}:failed",
+                        access_scope=access_scope,
+                    )
+                except KnowledgeIndexReadinessConflict as conflict:
+                    if conflict.reason not in {"stale_identity", "stale_sequence"}:
+                        raise
+                else:
+                    failed += 1
+            return indexed, failed
+
+        projection_result = await self.store_embedding_projections(
+            [
+                KnowledgeEmbeddingProjection(
+                    identity=identity,
+                    readiness_sequence=readiness.sequence,
+                    attempt_id=readiness.attempt_id,
+                    vector=by_index[index].vector,
+                )
+                for index, (_, identity, readiness) in enumerate(pending)
+            ],
+            access_scope=access_scope,
         )
-        if len(result.embeddings) != len(missing):
-            raise ValueError("Embedding provider returned a different number of embeddings.")
-        by_index = {embedding.index: embedding for embedding in result.embeddings}
-        for index, chunk in enumerate(missing):
-            embedding = by_index.get(index)
-            if embedding is None:
-                raise ValueError("Embedding provider did not return every requested index.")
-            self._validate_embedding_dimension(embedding.vector)
-            vector = list(embedding.vector)
-            vectors[chunk.id] = vector
-            if not self._chunk_is_current(chunk):
+        stored_identity_sha256s = {
+            _knowledge_embedding_identity_sha256(identity)
+            for identity in projection_result.stored_identities
+        }
+        for _, identity, readiness in pending:
+            identity_sha256 = _knowledge_embedding_identity_sha256(identity)
+            if identity_sha256 not in stored_identity_sha256s:
                 continue
-            self._chunk_embeddings[chunk.id] = {
-                "entry_id": chunk.entry_id,
-                "content_hash": _knowledge_chunk_content_hash(chunk),
-                "model": self.embedding_model,
-                "dimensions": self.embedding_dimensions,
-                "vector": vector,
-            }
-        return vectors
+            try:
+                await self.publish_index_readiness(
+                    KnowledgeIndexReadinessUpdate(
+                        identity=identity,
+                        state=KnowledgeIndexState.READY,
+                        attempt_id=readiness.attempt_id,
+                    ),
+                    expected_sequence=readiness.sequence,
+                    operation_id=f"{operation_prefix}:{identity_sha256}:ready",
+                    access_scope=access_scope,
+                )
+            except KnowledgeIndexReadinessConflict as conflict:
+                if conflict.reason not in {"stale_identity", "stale_sequence"}:
+                    raise
+                continue
+            indexed += 1
+        return indexed, 0
+
+    def _ready_embeddings_and_coverage(
+        self,
+        chunks: list[KnowledgeChunk],
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> tuple[dict[str, list[float]], KnowledgeIndexCoverage]:
+        embeddings: dict[str, list[float]] = {}
+        ready = 0
+        failed = 0
+        eligible_identity_sha256s: set[str] = set()
+        for chunk in chunks:
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model=self.embedding_model,
+                dimensions=self.embedding_dimensions,
+            )
+            identity_sha256 = _knowledge_embedding_identity_sha256(identity)
+            eligible_identity_sha256s.add(identity_sha256)
+            readiness = self._index_readiness_by_identity.get(identity_sha256)
+            stored = self._chunk_embeddings.get(identity_sha256)
+            if (
+                readiness is not None
+                and readiness.state is KnowledgeIndexState.READY
+                and stored is not None
+                and stored["identity"] == identity
+            ):
+                embeddings[chunk.id] = list(stored["vector"])
+                ready += 1
+            elif readiness is not None and readiness.state is KnowledgeIndexState.FAILED:
+                failed += 1
+        eligible = len(chunks)
+        high_water = max(
+            (
+                item.sequence
+                for item in self._index_readiness
+                if _knowledge_embedding_identity_sha256(item.identity) in eligible_identity_sha256s
+                and self._index_identity_is_accessible(access_scope, item.identity)
+            ),
+            default=0,
+        )
+        pending = eligible - ready - failed
+        return embeddings, KnowledgeIndexCoverage(
+            projection_type=KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+            embedding_model=self.embedding_model,
+            dimensions=self.embedding_dimensions,
+            preprocessing_version=KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+            generator=KNOWLEDGE_CHUNK_TEXT_GENERATOR,
+            generator_version=KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+            index_representation_version=KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
+            eligible_records=eligible,
+            ready_records=ready,
+            pending_records=pending,
+            failed_records=failed,
+            high_water_sequence=high_water,
+            complete=ready == eligible and pending == 0 and failed == 0,
+        )
 
     async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
         result = copy_text_embedding_result(
@@ -3183,6 +4408,10 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 )
             )
         )
+        if result.model != self.embedding_model:
+            raise ValueError("Embedding provider returned an unexpected model identity.")
+        if len(result.embeddings) != 1:
+            raise ValueError("Embedding provider returned an unexpected query result count.")
         embedding = next((item for item in result.embeddings if item.index == 0), None)
         if embedding is None:
             raise ValueError("Embedding provider did not return query embedding index 0.")
@@ -3190,7 +4419,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         return list(embedding.vector)
 
     def _validate_embedding_dimension(self, vector: list[float]) -> None:
-        if self.embedding_dimensions is not None and len(vector) != self.embedding_dimensions:
+        if len(vector) != self.embedding_dimensions:
             raise ValueError("Embedding provider returned a vector with unexpected dimension.")
 
     def _best_semantic_score(
@@ -3211,42 +4440,87 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 best_chunk = chunk
         return best_score, best_chunk
 
-    def _has_current_embedding(self, chunk: KnowledgeChunk) -> bool:
-        stored = self._chunk_embeddings.get(chunk.id)
-        return (
-            stored is not None
-            and stored["entry_id"] == chunk.entry_id
-            and stored["content_hash"] == _knowledge_chunk_content_hash(chunk)
-            and stored["model"] == self.embedding_model
-            and stored["dimensions"] == self.embedding_dimensions
+    def _drop_entry_embeddings(self, entry_id: str, *, limit: int) -> tuple[int, bool]:
+        stale_ids = sorted(
+            identity_sha256
+            for identity_sha256, embedding in self._chunk_embeddings.items()
+            if embedding["identity"].entry_id == entry_id
         )
-
-    def _drop_entry_embeddings(self, entry_id: str) -> None:
-        stale_ids = [
-            chunk_id
-            for chunk_id, embedding in self._chunk_embeddings.items()
-            if embedding["entry_id"] == entry_id
-        ]
-        for chunk_id in stale_ids:
-            self._chunk_embeddings.pop(chunk_id, None)
+        selected = stale_ids[:limit]
+        for identity_sha256 in selected:
+            self._chunk_embeddings.pop(identity_sha256, None)
+        return len(selected), len(stale_ids) > limit
 
     def _drop_stale_entry_embeddings(
         self,
         entry_id: str,
-    ) -> None:
+        *,
+        limit: int,
+    ) -> tuple[int, bool]:
         current = self._current_entry(entry_id)
-        current_ids = (
+        current_identity_sha256 = (
             set()
             if current is None
-            else {chunk.id for chunk in self._chunks.get((entry_id, current.revision), [])}
+            else {
+                _knowledge_embedding_identity_sha256(
+                    knowledge_chunk_embedding_identity(
+                        chunk,
+                        embedding_model=self.embedding_model,
+                        dimensions=self.embedding_dimensions,
+                    )
+                )
+                for chunk in self._chunks.get((entry_id, current.revision), [])
+            }
         )
-        stale_ids = [
-            chunk_id
-            for chunk_id, embedding in self._chunk_embeddings.items()
-            if embedding["entry_id"] == entry_id and chunk_id not in current_ids
-        ]
-        for chunk_id in stale_ids:
-            self._chunk_embeddings.pop(chunk_id, None)
+        stale_ids = sorted(
+            identity_sha256
+            for identity_sha256, embedding in self._chunk_embeddings.items()
+            if embedding["identity"].entry_id == entry_id
+            and identity_sha256 not in current_identity_sha256
+        )
+        selected = stale_ids[:limit]
+        for identity_sha256 in selected:
+            self._chunk_embeddings.pop(identity_sha256, None)
+        return len(selected), len(stale_ids) > limit
+
+    def _embedding_identity_matches_configuration(
+        self,
+        identity: KnowledgeEmbeddingIdentity,
+    ) -> bool:
+        return (
+            identity.chunk_id is not None
+            and identity.projection_type == KNOWLEDGE_CHUNK_TEXT_PROJECTION
+            and identity.embedding_model == self.embedding_model
+            and identity.dimensions == self.embedding_dimensions
+            and identity.preprocessing_version == KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION
+            and identity.generator == KNOWLEDGE_CHUNK_TEXT_GENERATOR
+            and identity.generator_version == KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION
+            and identity.index_representation_version
+            == KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION
+        )
+
+    def _embedding_identity_is_current(self, identity: KnowledgeEmbeddingIdentity) -> bool:
+        current = self._current_entry(identity.entry_id)
+        if current is None or current.revision != identity.entry_revision:
+            return False
+        chunk = next(
+            (
+                item
+                for item in self._chunks.get((identity.entry_id, identity.entry_revision), [])
+                if item.id == identity.chunk_id
+            ),
+            None,
+        )
+        if chunk is None:
+            return False
+        return (
+            knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model=self.embedding_model,
+                dimensions=self.embedding_dimensions,
+            )
+            == identity
+        )
 
     def _chunk_is_current(self, chunk: KnowledgeChunk) -> bool:
         current = self._current_entry(chunk.entry_id)
@@ -3535,6 +4809,83 @@ def copy_knowledge_evidence(evidence: KnowledgeEvidence) -> KnowledgeEvidence:
         created_at=evidence.created_at,
         metadata=copy_durable_json_object(evidence.metadata, "metadata"),
     )
+
+
+def copy_knowledge_embedding_identity(
+    identity: KnowledgeEmbeddingIdentity,
+) -> KnowledgeEmbeddingIdentity:
+    if type(identity) is not KnowledgeEmbeddingIdentity:
+        raise TypeError("KnowledgeEmbeddingIdentity instances must not be subclasses.")
+    return KnowledgeEmbeddingIdentity(**identity.model_dump())
+
+
+def copy_knowledge_embedding_projection(
+    projection: KnowledgeEmbeddingProjection,
+) -> KnowledgeEmbeddingProjection:
+    if type(projection) is not KnowledgeEmbeddingProjection:
+        raise TypeError("KnowledgeEmbeddingProjection instances must not be subclasses.")
+    return KnowledgeEmbeddingProjection(
+        identity=projection.identity,
+        readiness_sequence=projection.readiness_sequence,
+        attempt_id=projection.attempt_id,
+        vector=list(projection.vector),
+    )
+
+
+def _copy_knowledge_embedding_projections(
+    projections: list[KnowledgeEmbeddingProjection],
+) -> list[KnowledgeEmbeddingProjection]:
+    if type(projections) is not list:
+        raise TypeError("`projections` must be a list.")
+    if len(projections) > MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT:
+        raise ValueError(
+            "`projections` must contain at most "
+            f"{MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT} records."
+        )
+    copied = [copy_knowledge_embedding_projection(projection) for projection in projections]
+    identity_sha256s = {
+        _knowledge_embedding_identity_sha256(projection.identity) for projection in copied
+    }
+    if len(identity_sha256s) != len(copied):
+        raise ValueError("`projections` cannot contain duplicate identities.")
+    return copied
+
+
+def copy_knowledge_index_readiness_update(
+    update: KnowledgeIndexReadinessUpdate,
+) -> KnowledgeIndexReadinessUpdate:
+    if type(update) is not KnowledgeIndexReadinessUpdate:
+        raise TypeError("KnowledgeIndexReadinessUpdate instances must not be subclasses.")
+    return KnowledgeIndexReadinessUpdate(
+        identity=copy_knowledge_embedding_identity(update.identity),
+        state=update.state,
+        attempt_id=update.attempt_id,
+        failure_code=update.failure_code,
+    )
+
+
+def copy_knowledge_index_readiness(
+    readiness: KnowledgeIndexReadiness,
+) -> KnowledgeIndexReadiness:
+    if type(readiness) is not KnowledgeIndexReadiness:
+        raise TypeError("KnowledgeIndexReadiness instances must not be subclasses.")
+    return KnowledgeIndexReadiness(
+        sequence=readiness.sequence,
+        identity=copy_knowledge_embedding_identity(readiness.identity),
+        state=readiness.state,
+        attempt_id=readiness.attempt_id,
+        failure_code=readiness.failure_code,
+        operation_id=readiness.operation_id,
+        published_at=readiness.published_at,
+    )
+
+
+def copy_knowledge_index_coverage(
+    coverage: KnowledgeIndexCoverage,
+) -> KnowledgeIndexCoverage:
+    if type(coverage) is not KnowledgeIndexCoverage:
+        raise TypeError("KnowledgeIndexCoverage instances must not be subclasses.")
+    return KnowledgeIndexCoverage(**coverage.model_dump())
 
 
 def copy_knowledge_change(change: KnowledgeChange) -> KnowledgeChange:
@@ -4249,6 +5600,7 @@ def _search_result_from_scored_embeddings(
     query: KnowledgeQuery,
     *,
     score_kind: str,
+    index_coverage: list[KnowledgeIndexCoverage] | None = None,
 ) -> KnowledgeSearchResult:
     hits: list[KnowledgeHit] = []
     remaining = query.max_bytes
@@ -4297,6 +5649,11 @@ def _search_result_from_scored_embeddings(
         limit=query.limit,
         max_bytes=query.max_bytes,
         total_hits_known=len(scored),
+        index_coverage=(
+            []
+            if index_coverage is None
+            else [copy_knowledge_index_coverage(item) for item in index_coverage]
+        ),
     )
 
 
@@ -4311,9 +5668,31 @@ def _semantic_query_text(query: KnowledgeQuery) -> str:
 
 
 def _knowledge_chunk_content_hash(chunk: KnowledgeChunk) -> str:
-    if chunk.content_hash is not None:
-        return chunk.content_hash
     return f"sha256:{sha256(chunk.text.encode('utf-8')).hexdigest()}"
+
+
+def knowledge_chunk_embedding_identity(
+    chunk: KnowledgeChunk,
+    *,
+    embedding_model: str,
+    dimensions: int,
+) -> KnowledgeEmbeddingIdentity:
+    """Build the built-in canonical chunk-text embedding identity."""
+
+    chunk = copy_knowledge_chunk(chunk)
+    return KnowledgeEmbeddingIdentity(
+        entry_id=chunk.entry_id,
+        entry_revision=chunk.entry_revision,
+        chunk_id=chunk.id,
+        projection_type=KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+        projection_content_hash=_knowledge_chunk_content_hash(chunk),
+        embedding_model=embedding_model,
+        dimensions=dimensions,
+        preprocessing_version=KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+        generator=KNOWLEDGE_CHUNK_TEXT_GENERATOR,
+        generator_version=KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+        index_representation_version=KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
+    )
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -4550,6 +5929,41 @@ def _validate_knowledge_change_sequence(value: int, field_name: str) -> None:
         raise ValueError(f"`{field_name}` must be at most {MAX_KNOWLEDGE_CHANGE_SEQUENCE}.")
 
 
+def _validate_knowledge_index_sequence(
+    value: int,
+    field_name: str,
+    *,
+    allow_zero: bool = True,
+) -> None:
+    if allow_zero:
+        _validate_nonnegative_int(value, field_name)
+    else:
+        _validate_positive_int(value, field_name)
+    if value > MAX_KNOWLEDGE_CHANGE_SEQUENCE:
+        raise ValueError(f"`{field_name}` must be at most {MAX_KNOWLEDGE_CHANGE_SEQUENCE}.")
+
+
+def _validate_knowledge_index_readiness_limit(value: int) -> None:
+    _validate_positive_int(value, "limit")
+    if value > MAX_KNOWLEDGE_INDEX_READINESS_LIMIT:
+        raise ValueError(
+            f"`limit` must be less than or equal to {MAX_KNOWLEDGE_INDEX_READINESS_LIMIT}."
+        )
+
+
+def _validate_knowledge_embedding_work_record_limit(
+    value: int,
+    *,
+    field_name: str = "record_limit",
+) -> None:
+    _validate_positive_int(value, field_name)
+    if value > MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT:
+        raise ValueError(
+            f"`{field_name}` must be less than or equal to "
+            f"{MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT}."
+        )
+
+
 def _knowledge_change_now(value: datetime | None) -> datetime:
     result = datetime.now(UTC) if value is None else value
     if result.tzinfo is None or result.utcoffset() is None:
@@ -4571,6 +5985,181 @@ def _knowledge_change_identity(value: str, field_name: str) -> str:
     if len(clean.encode("utf-8")) > 256:
         raise ValueError(f"`{field_name}` must be at most 256 UTF-8 bytes.")
     return clean
+
+
+def _bounded_knowledge_index_identity(value: str, field_name: str) -> str:
+    return _bounded_knowledge_identity(value, field_name, max_bytes=256)
+
+
+def _knowledge_embedding_identity_sha256(identity: KnowledgeEmbeddingIdentity) -> str:
+    identity = copy_knowledge_embedding_identity(identity)
+    return sha256(
+        canonical_durable_json_bytes(
+            identity.model_dump(mode="json"),
+            "knowledge embedding identity",
+        )
+    ).hexdigest()
+
+
+def _knowledge_embedding_vector_sha256(vector: list[float]) -> str:
+    """Fingerprint the validated vector payload before backend representation casts."""
+
+    return sha256(
+        canonical_durable_json_bytes(
+            [0.0 if component == 0.0 else component for component in vector],
+            "knowledge embedding vector",
+        )
+    ).hexdigest()
+
+
+def _bounded_knowledge_embedding_backfill_cursor(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > _MAX_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_BYTES:
+        raise ValueError(
+            f"`{field_name}` must be at most "
+            f"{_MAX_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_BYTES} UTF-8 bytes."
+        )
+    return value
+
+
+def _knowledge_embedding_backfill_fingerprint(
+    query: KnowledgeListQuery,
+    access_scope: KnowledgeAccessScope,
+    *,
+    refresh_existing: bool,
+    embedding_model: str,
+    embedding_dimensions: int,
+) -> str:
+    query = copy_knowledge_list_query(query)
+    access_scope = copy_knowledge_access_scope(access_scope)
+    material = {
+        "query": query.model_dump(mode="json"),
+        "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
+        "refresh_existing": refresh_existing,
+        "projection_type": KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+        "embedding_model": require_clean_nonblank(embedding_model, "embedding_model"),
+        "dimensions": embedding_dimensions,
+        "preprocessing_version": KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+        "generator": KNOWLEDGE_CHUNK_TEXT_GENERATOR,
+        "generator_version": KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+        "index_representation_version": KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
+    }
+    return sha256(
+        canonical_durable_json_bytes(material, "knowledge embedding backfill query")
+    ).hexdigest()
+
+
+def _encode_knowledge_embedding_backfill_cursor(
+    *,
+    fingerprint: str,
+    importance: float,
+    updated_at: datetime,
+    chunk: KnowledgeChunk,
+) -> str:
+    cursor = _KnowledgeEmbeddingBackfillCursor(
+        version=_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_VERSION,
+        fingerprint=fingerprint,
+        importance=importance,
+        updated_at=updated_at,
+        entry_id=chunk.entry_id,
+        chunk_index=chunk.chunk_index,
+        chunk_id=chunk.id,
+    )
+    raw = canonical_durable_json_bytes(
+        cursor.model_dump(mode="json"),
+        "knowledge embedding backfill cursor",
+    )
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return _bounded_knowledge_embedding_backfill_cursor(encoded, "next_cursor")
+
+
+def _decode_knowledge_embedding_backfill_cursor(
+    cursor: str | None,
+    *,
+    fingerprint: str,
+) -> _KnowledgeEmbeddingBackfillCursor | None:
+    if cursor is None:
+        return None
+    cursor = _bounded_knowledge_embedding_backfill_cursor(cursor, "cursor")
+    try:
+        encoded = cursor.encode("ascii")
+        padding = b"=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw).rstrip(b"=") != encoded:
+            raise ValueError("Non-canonical backfill cursor encoding.")
+        decoded = json.loads(raw.decode("utf-8"))
+        parsed = _KnowledgeEmbeddingBackfillCursor.model_validate(decoded)
+    except (
+        binascii.Error,
+        json.JSONDecodeError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
+        raise ValueError("Invalid knowledge embedding backfill cursor.") from exc
+    if parsed.fingerprint != fingerprint:
+        raise ValueError(
+            "Knowledge embedding backfill cursor does not match this query, scope, "
+            "projection configuration, and refresh mode."
+        )
+    return parsed
+
+
+def _knowledge_embedding_backfill_sort_key(
+    *,
+    importance: float,
+    updated_at: datetime,
+    entry_id: str,
+    chunk_index: int,
+    chunk_id: str,
+) -> tuple[float, int, str, int, str]:
+    updated_at = updated_at.astimezone(UTC)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    delta = updated_at - epoch
+    updated_at_microseconds = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return (
+        -importance,
+        -updated_at_microseconds,
+        entry_id,
+        chunk_index,
+        chunk_id,
+    )
+
+
+def _knowledge_index_readiness_update_sha256(
+    update: KnowledgeIndexReadinessUpdate,
+) -> str:
+    update = copy_knowledge_index_readiness_update(update)
+    return sha256(
+        canonical_durable_json_bytes(
+            update.model_dump(mode="json"),
+            "knowledge index readiness update",
+        )
+    ).hexdigest()
+
+
+def _validate_knowledge_index_readiness_transition(
+    current: KnowledgeIndexReadiness | None,
+    update: KnowledgeIndexReadinessUpdate,
+    *,
+    expected_sequence: int | None,
+) -> None:
+    if current is None:
+        if expected_sequence is not None:
+            raise KnowledgeIndexReadinessConflict("unknown_expected_sequence")
+        if update.state is not KnowledgeIndexState.PENDING:
+            raise KnowledgeIndexReadinessConflict("initial_state_must_be_pending")
+        return
+    if expected_sequence != current.sequence:
+        raise KnowledgeIndexReadinessConflict("stale_sequence")
+    if update.state is KnowledgeIndexState.PENDING:
+        if update.attempt_id == current.attempt_id:
+            raise KnowledgeIndexReadinessConflict("attempt_reuse")
+        return
+    if current.state is not KnowledgeIndexState.PENDING:
+        raise KnowledgeIndexReadinessConflict("terminal_state_requires_new_attempt")
+    if update.attempt_id != current.attempt_id:
+        raise KnowledgeIndexReadinessConflict("stale_attempt")
 
 
 def _initialize_knowledge_change_consumer_state(

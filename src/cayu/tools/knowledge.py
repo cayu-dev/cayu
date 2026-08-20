@@ -479,6 +479,9 @@ class SearchKnowledgeTool(Tool):
                 "max_bytes": result.max_bytes,
                 "preview_bytes": preview_bytes,
                 "total_hits_known": result.total_hits_known,
+                "index_coverage": [
+                    coverage.model_dump(mode="json") for coverage in result.index_coverage
+                ],
                 "search_modes": search_modes,
                 "min_score": effective_min_score,
                 "min_score_applied": min_score_applied,
