@@ -72,6 +72,20 @@ class GeneratorPlan(BaseModel):
     verification_commands: tuple[str, ...]
 
 
+class ServiceContextMigrationPlan(BaseModel):
+    """One reviewable migration for a generated maintained-service factory."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["9"] = GENERATOR_PLAN_SCHEMA_VERSION
+    status: Literal["ready", "conflict", "manual_action_required", "already_present"]
+    migration: Literal["service_context"] = "service_context"
+    edits: tuple[GeneratorEdit, ...]
+    preconditions: tuple[GeneratorPrecondition, ...] = ()
+    conflicts: tuple[dict[str, str], ...] = ()
+    verification_commands: tuple[str, ...]
+
+
 class GeneratorApplyError(RuntimeError):
     """The planned generator transaction could not be applied safely."""
 
@@ -149,6 +163,20 @@ def add_generate_parser(subparsers: Any) -> None:
     )
     tool_parser.add_argument("--dry-run", action="store_true", help="Plan without writes.")
     add_output_options(tool_parser)
+    service_context_parser = generators.add_parser(
+        "service-context",
+        help="Migrate a generated maintained service to Cayu project context assembly.",
+        description=(
+            "Safely add the framework-owned project_context pass-through required for "
+            "zero-code Control Plane features. Customized factories receive manual guidance."
+        ),
+    )
+    service_context_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan without writes.",
+    )
+    add_output_options(service_context_parser)
 
 
 def run_generate(args: argparse.Namespace) -> int:
@@ -161,7 +189,7 @@ def run_generate(args: argparse.Namespace) -> int:
 
 
 def _run_generate(args: argparse.Namespace) -> int:
-    if args.generate_command not in {"slice", "tool"}:
+    if args.generate_command not in {"slice", "tool", "service-context"}:
         return 2
     try:
         if args.generate_command == "slice":
@@ -170,12 +198,14 @@ def _run_generate(args: argparse.Namespace) -> int:
                 tool_name=args.tool,
                 effect=args.effect,
             )
-        else:
+        elif args.generate_command == "tool":
             plan = plan_tool(
                 tool_name=args.name,
                 agent_name=args.agent,
                 effect=args.effect,
             )
+        else:
+            plan = plan_service_context()
     except (ProjectError, ValueError, OSError) as exc:
         if args.output_format == "json":
             print(
@@ -194,7 +224,10 @@ def _run_generate(args: argparse.Namespace) -> int:
     should_apply = not args.dry_run and plan.status == "ready"
     if should_apply:
         try:
-            apply_slice_plan(plan)
+            if isinstance(plan, ServiceContextMigrationPlan):
+                apply_service_context_plan(plan)
+            else:
+                apply_slice_plan(plan)
         except (GeneratorApplyError, ProjectError, OSError) as exc:
             if args.output_format == "json":
                 print(
@@ -212,8 +245,231 @@ def _run_generate(args: argparse.Namespace) -> int:
     if args.output_format == "json":
         print(plan.model_dump_json(indent=2))
     else:
-        print(_render_plan(plan, applied=should_apply))
+        print(
+            _render_service_context_plan(plan, applied=should_apply)
+            if isinstance(plan, ServiceContextMigrationPlan)
+            else _render_plan(plan, applied=should_apply)
+        )
     return 0 if plan.status in {"ready", "already_present"} else 1
+
+
+def plan_service_context() -> ServiceContextMigrationPlan:
+    """Plan the narrow generated-service migration without rewriting user code."""
+
+    verification = (
+        "uv run cayu check --json",
+        "uv run pytest -q tests/test_public_service_security.py",
+    )
+    project = resolve_project(command="cayu generate service-context")
+    if project.service_target != "service:build_service":
+        return ServiceContextMigrationPlan(
+            status="manual_action_required",
+            edits=(),
+            conflicts=(
+                {
+                    "path": "pyproject.toml",
+                    "operation": "update_region",
+                    "reason": (
+                        "automatic migration supports the generated "
+                        'service_factory = "service:build_service" contract only'
+                    ),
+                },
+            ),
+            verification_commands=verification,
+        )
+    service_path = _generated_path(project.root, "service.py")
+    if not service_path.is_file():
+        return ServiceContextMigrationPlan(
+            status="manual_action_required",
+            edits=(),
+            conflicts=(
+                {
+                    "path": "service.py",
+                    "operation": "update_region",
+                    "reason": "the generated maintained-service module is missing",
+                },
+            ),
+            verification_commands=verification,
+        )
+    source = service_path.read_text(encoding="utf-8")
+    try:
+        updated = _service_context_migration_source(source)
+    except (SyntaxError, ValueError) as exc:
+        return ServiceContextMigrationPlan(
+            status="manual_action_required",
+            edits=(),
+            preconditions=(_file_precondition(project.root, "service.py"),),
+            conflicts=(
+                {
+                    "path": "service.py",
+                    "operation": "update_region",
+                    "reason": str(exc),
+                },
+            ),
+            verification_commands=verification,
+        )
+    if updated == source:
+        return ServiceContextMigrationPlan(
+            status="already_present",
+            edits=(),
+            preconditions=(_file_precondition(project.root, "service.py"),),
+            verification_commands=verification,
+        )
+    return ServiceContextMigrationPlan(
+        status="ready",
+        edits=(
+            _edit(
+                "service.py",
+                "update_region",
+                updated,
+                anchor="build_service/project_context",
+                preimage=source,
+            ),
+        ),
+        verification_commands=verification,
+    )
+
+
+def _service_context_migration_source(source: str) -> str:
+    tree = ast.parse(source, filename="service.py")
+    server_imports = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "cayu.server"
+    ]
+    factories = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_service"
+    ]
+    if len(server_imports) != 1 or len(factories) != 1:
+        raise ValueError("expected one top-level cayu.server import and one build_service function")
+    server_import = server_imports[0]
+    factory = factories[0]
+    calls = [
+        node
+        for node in ast.walk(factory)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_agent_service"
+    ]
+    if len(calls) != 1:
+        raise ValueError("expected one direct create_agent_service() call in build_service")
+    call = calls[0]
+
+    imported = any(
+        alias.name == "ProjectControlPlaneContext" and alias.asname is None
+        for alias in server_import.names
+    )
+    keyword_arguments = {argument.arg: argument for argument in factory.args.kwonlyargs}
+    declared = "project_context" in keyword_arguments
+    passed_keywords = [keyword for keyword in call.keywords if keyword.arg == "project_context"]
+    passed = (
+        len(passed_keywords) == 1
+        and isinstance(passed_keywords[0].value, ast.Name)
+        and passed_keywords[0].value.id == "project_context"
+    )
+    if imported and declared and passed:
+        return source
+    if passed_keywords and not passed:
+        raise ValueError("project_context is already passed with a customized value")
+    if declared:
+        argument = keyword_arguments["project_context"]
+        index = factory.args.kwonlyargs.index(argument)
+        default = factory.args.kw_defaults[index]
+        if not isinstance(default, ast.Constant) or default.value is not None:
+            raise ValueError("project_context must remain an optional keyword-only parameter")
+
+    lines = source.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in source else "\n"
+    insertions: list[tuple[int, str]] = []
+    if not imported:
+        if server_import.end_lineno is None or not server_import.names:
+            raise ValueError("cayu.server import does not expose stable source positions")
+        closing_index = server_import.end_lineno - 1
+        if lines[closing_index].strip() != ")":
+            raise ValueError("cayu.server imports must use the generated multiline form")
+        indentation = " " * server_import.names[0].col_offset
+        insertions.append((closing_index, f"{indentation}ProjectControlPlaneContext,{newline}"))
+    if not declared:
+        mode_arguments = [
+            argument for argument in factory.args.kwonlyargs if argument.arg == "mode"
+        ]
+        if len(mode_arguments) != 1:
+            raise ValueError("build_service must expose the generated keyword-only mode parameter")
+        mode_argument = mode_arguments[0]
+        mode_end_lineno = mode_argument.end_lineno
+        if mode_end_lineno is None:
+            raise ValueError("build_service mode parameter has no stable source position")
+        mode_line = lines[mode_end_lineno - 1]
+        if mode_line.strip() != "mode: ServiceMode,":
+            raise ValueError("build_service mode parameter uses a customized source layout")
+        indentation = " " * mode_argument.col_offset
+        insertions.append(
+            (
+                mode_end_lineno,
+                f"{indentation}project_context: ProjectControlPlaneContext | None = None,{newline}",
+            )
+        )
+    if not passed:
+        mode_keywords = [keyword for keyword in call.keywords if keyword.arg == "mode"]
+        if len(mode_keywords) != 1:
+            raise ValueError("create_agent_service must receive the generated mode keyword")
+        mode_keyword = mode_keywords[0]
+        mode_end_lineno = mode_keyword.end_lineno
+        if mode_end_lineno is None:
+            raise ValueError("create_agent_service mode keyword has no stable source position")
+        mode_line = lines[mode_end_lineno - 1]
+        if mode_line.strip() != "mode=mode,":
+            raise ValueError("create_agent_service mode keyword uses a customized source layout")
+        indentation = " " * mode_keyword.col_offset
+        insertions.append(
+            (mode_end_lineno, f"{indentation}project_context=project_context,{newline}")
+        )
+    for index, content in sorted(insertions, reverse=True):
+        lines.insert(index, content)
+    updated = "".join(lines)
+    if not _service_context_contract_present(updated):
+        raise ValueError("the proposed migration did not produce the complete context contract")
+    return updated
+
+
+def _service_context_contract_present(source: str) -> bool:
+    try:
+        tree = ast.parse(source, filename="service.py")
+    except SyntaxError:
+        return False
+    imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "cayu.server"
+        and any(
+            alias.name == "ProjectControlPlaneContext" and alias.asname is None
+            for alias in node.names
+        )
+        for node in tree.body
+    )
+    factories = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_service"
+    ]
+    if not imported or len(factories) != 1:
+        return False
+    factory = factories[0]
+    declared = any(argument.arg == "project_context" for argument in factory.args.kwonlyargs)
+    passed = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_agent_service"
+        and any(
+            keyword.arg == "project_context"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "project_context"
+            for keyword in node.keywords
+        )
+        for node in ast.walk(factory)
+    )
+    return declared and passed
 
 
 def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
@@ -1153,6 +1409,27 @@ def apply_slice_plan(plan: GeneratorPlan) -> None:
         shutil.rmtree(stage_root, ignore_errors=True)
 
 
+def apply_service_context_plan(plan: ServiceContextMigrationPlan) -> None:
+    """Apply a ready service-context migration through the generator transaction."""
+
+    if plan.status != "ready":
+        raise GeneratorApplyError(
+            f"Only ready service-context plans can be applied, not {plan.status}."
+        )
+    apply_slice_plan(
+        GeneratorPlan(
+            status="ready",
+            slice_name="service_context",
+            tool_name="service_context",
+            effect="none",
+            edits=plan.edits,
+            preconditions=plan.preconditions,
+            conflicts=plan.conflicts,
+            verification_commands=plan.verification_commands,
+        )
+    )
+
+
 def _validate_plan_preconditions(plan: GeneratorPlan, root: Path) -> None:
     seen: set[Path] = set()
     for precondition in plan.preconditions:
@@ -1786,6 +2063,21 @@ def _class_name(value: str) -> str:
 def _render_plan(plan: GeneratorPlan, *, applied: bool) -> str:
     action = "Applied" if applied else "Planned"
     lines = [f"{action} {plan.slice_name}: {plan.status}"]
+    lines.extend(f"  {edit.operation}: {edit.path}" for edit in plan.edits)
+    lines.extend(f"  conflict: {item['path']} — {item['reason']}" for item in plan.conflicts)
+    if applied:
+        lines.append("Verify:")
+        lines.extend(f"  {command}" for command in plan.verification_commands)
+    return "\n".join(lines)
+
+
+def _render_service_context_plan(
+    plan: ServiceContextMigrationPlan,
+    *,
+    applied: bool,
+) -> str:
+    action = "Applied" if applied else "Planned"
+    lines: list[str] = [f"{action} service-context: {plan.status}"]
     lines.extend(f"  {edit.operation}: {edit.path}" for edit in plan.edits)
     lines.extend(f"  conflict: {item['path']} — {item['reason']}" for item in plan.conflicts)
     if applied:

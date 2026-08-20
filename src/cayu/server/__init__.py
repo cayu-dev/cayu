@@ -35,6 +35,11 @@ from pathlib import Path
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, thaw_json_value
+from cayu.project_control_plane import (
+    ProjectControlPlaneContext,
+    ResolvedProjectControlPlaneContext,
+    resolve_project_control_plane_context,
+)
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook
 from cayu.runtime.loop_policies import LoopPolicy
@@ -145,6 +150,7 @@ __all__ = [
     "ProductRecoveryStatus",
     "ProductResultReceipt",
     "ProductResultReceiptConflict",
+    "ProjectControlPlaneContext",
     "PublicServiceManifest",
     "RuntimeStoreDurability",
     "ServerAccessConfig",
@@ -193,6 +199,7 @@ def create_server(
     app: CayuApp,
     *,
     config: ServerConfig,
+    project_context: ProjectControlPlaneContext | None = None,
     fastapi_options: Mapping[str, Any] | None = None,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -207,6 +214,9 @@ def create_server(
             policy's dependency returns ``AuthContext``; its ``tenant`` value is
             operator-action provenance only and does not filter Cayu data or
             provide tenant isolation.
+        project_context: Optional framework-owned project identity and storage
+            assembled by ``cayu serve``. Embedded servers continue to use the
+            explicit low-level Evals configuration APIs.
         fastapi_options: Optional non-policy FastAPI constructor options. Cayu
             validates the option names and retains ownership of its title,
             documentation routes, and lifespan composition.
@@ -217,6 +227,7 @@ def create_server(
     if type(config) is not ServerConfig:
         raise TypeError("config must be a resolved ServerConfig instance.")
     resolved_config = config
+    resolved_project_context = resolve_project_control_plane_context(project_context, app)
     api_auth = auth_dependency_for(resolved_config.access)
     dashboard_auth = auth_dependency_for(resolved_config.dashboard.access or resolved_config.access)
     lifecycle = resolved_config.lifecycle
@@ -268,16 +279,21 @@ def create_server(
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield
             finally:
-                await _stop_incomplete_session_startup_recovery(incomplete_session_recovery_task)
-                await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                await _drain_background_interruptions(
-                    app,
-                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                )
-                await _drain_environment_cleanups(
-                    app,
-                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                )
+                try:
+                    await _stop_incomplete_session_startup_recovery(
+                        incomplete_session_recovery_task
+                    )
+                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                    await _drain_background_interruptions(
+                        app,
+                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+                    )
+                    await _drain_environment_cleanups(
+                        app,
+                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+                    )
+                finally:
+                    await _close_project_control_plane_context(resolved_project_context)
             return
         async with user_lifespan(server) as state:
             try:
@@ -289,16 +305,21 @@ def create_server(
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state
             finally:
-                await _stop_incomplete_session_startup_recovery(incomplete_session_recovery_task)
-                await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                await _drain_background_interruptions(
-                    app,
-                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                )
-                await _drain_environment_cleanups(
-                    app,
-                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                )
+                try:
+                    await _stop_incomplete_session_startup_recovery(
+                        incomplete_session_recovery_task
+                    )
+                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                    await _drain_background_interruptions(
+                        app,
+                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+                    )
+                    await _drain_environment_cleanups(
+                        app,
+                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+                    )
+                finally:
+                    await _close_project_control_plane_context(resolved_project_context)
 
     resolved_fastapi_options["lifespan"] = cayu_lifespan
     resolved_fastapi_options["debug"] = False
@@ -314,6 +335,9 @@ def create_server(
     server = FastAPI(title=resolved_config.title, **resolved_fastapi_options)
     server.state.cayu_server_config = resolved_config
     server.state.cayu_server_config_summary = resolved_config.safe_summary()
+    server.state.cayu_project_control_plane_summary = (
+        None if resolved_project_context is None else resolved_project_context.safe_summary()
+    )
 
     if resolved_config.cors.allowed_origins:
         server.add_middleware(
@@ -366,6 +390,7 @@ def create_server(
             evaluation_promotion=resolved_config.evaluation_promotion,
             evaluation_promotion_pricing=evaluation_promotion_pricing,
             evals=resolved_config.evals,
+            _project_context=resolved_project_context,
         )
         server.include_router(router)
 
@@ -439,6 +464,7 @@ def mount_cayu(
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
     ) = None,
     name: str = "cayu-dashboard",
+    _project_context: ProjectControlPlaneContext | None = None,
 ) -> None:
     """Mount CAYU's control plane and dashboard into an existing FastAPI app.
 
@@ -467,6 +493,7 @@ def mount_cayu(
     trusted in-process policies to control-plane continuations; HTTP callers
     cannot supply or serialize those policies.
     """
+    resolved_project_context = resolve_project_control_plane_context(_project_context, app)
     auth = auth_dependency_for(access)
     mount_path = normalize_dashboard_path(path, field_name="path")
     api_path = _join_public_paths(mount_path, "api")
@@ -533,6 +560,7 @@ def mount_cayu(
         ),
         evals=evals,
         continuation_loop_policy_provider=continuation_loop_policy_provider,
+        _project_context=resolved_project_context,
     )
 
     # All caller-controlled values and route construction are validated before
@@ -543,6 +571,10 @@ def mount_cayu(
         timeout_s=interruption_shutdown_grace_seconds,
         recovery_inactive_after_seconds=interruption_recovery_inactive_after_seconds,
         side_effect_startup_timeout_s=event_side_effect_startup_timeout_seconds,
+        project_context=resolved_project_context,
+    )
+    server.state.cayu_project_control_plane_summary = (
+        None if resolved_project_context is None else resolved_project_context.safe_summary()
     )
     server.include_router(router)
     if prepared_dashboard is not None:
@@ -853,6 +885,7 @@ def _compose_interruption_drain_lifespan(
     timeout_s: float,
     recovery_inactive_after_seconds: int,
     side_effect_startup_timeout_s: float,
+    project_context: ResolvedProjectControlPlaneContext | None,
 ) -> None:
     existing_lifespan = server.router.lifespan_context
 
@@ -872,11 +905,21 @@ def _compose_interruption_drain_lifespan(
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state
             finally:
-                await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                await _drain_background_interruptions(app, timeout_s=timeout_s)
-                await _drain_environment_cleanups(app, timeout_s=timeout_s)
+                try:
+                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                    await _drain_background_interruptions(app, timeout_s=timeout_s)
+                    await _drain_environment_cleanups(app, timeout_s=timeout_s)
+                finally:
+                    await _close_project_control_plane_context(project_context)
 
     server.router.lifespan_context = lifespan
+
+
+async def _close_project_control_plane_context(
+    context: ResolvedProjectControlPlaneContext | None,
+) -> None:
+    if context is not None:
+        await context.owner.close()
 
 
 def _normalize_api_base_url(value: str) -> str:

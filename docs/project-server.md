@@ -46,6 +46,14 @@ AUTH = BasicAuth(
 profile even when the project also has deployment authentication configured.
 Host and port always reach uvicorn as concrete values.
 
+The command also assembles project identity, release identity, and durable
+Evals storage before it constructs the server. It reads `[project].name`,
+`CAYU_RELEASE_ID`, and the same `CAYU_DATABASE_URL` or
+`[tool.cayu.session_store]` declaration used by session tooling. Development
+may create the project-local `data/cayu.db` default; production without an
+explicit or already-discovered durable store keeps Evals storage gated rather
+than guessing. This does not yet select an executable eval target.
+
 Incomplete-session startup recovery is off by default. Opt in with both a
 bounded status set and an inactivity fence:
 
@@ -87,6 +95,13 @@ on the same listener as the separately mounted `/cayu/` operator control plane.
 The service factory, not `[tool.cayu.serve].auth`, owns the distinct customer
 and operator policies. Supplying both configurations is rejected rather than
 silently choosing one.
+
+Current generated factories also accept the optional, framework-owned
+`project_context` keyword and pass it to `create_agent_service(...)`. Older
+factories still start, but cannot receive automatic Evals project assembly.
+`cayu check --json` reports that exact migration state; use
+`cayu generate service-context --dry-run` and then
+`cayu generate service-context` for an unmodified generated factory.
 
 `cayu serve --dev` remains loopback-only and selects the generated development
 adapters. Without `--dev`, serving refuses to start if the service manifest

@@ -82,6 +82,27 @@ def test_serve_uses_the_maintained_service_factory_for_explicit_local_developmen
     assert manifest.mode == "development"
     assert manifest.product_access == "development"
     assert manifest.operator_access == "open"
+    service = launched["server"].state.cayu_public_service
+    assert service.project_control_plane_context_attached is True
+    summary = launched["server"].state.cayu_project_control_plane_summary
+    assert summary["project_id"] == "service"
+    assert summary["application_release_id"] == f"manifest-{summary['app_manifest_fingerprint']}"
+    assert summary["access"] == "trusted_local_development"
+    assert summary["eval_store"] == {
+        "configured": True,
+        "backend": "sqlite",
+        "source": "project",
+    }
+    with TestClient(launched["server"]) as client:
+        readiness = client.get("/cayu/api/contract").json()["capabilities"]["evals_readiness"]
+    assert readiness["catalog_read"] == {
+        "state": "gated",
+        "reason_code": "eval_target_not_configured",
+    }
+    assert readiness["captured_result_persistence"] == {
+        "state": "unsupported",
+        "reason_code": "captured_result_persistence_not_available",
+    }
     output = capsys.readouterr().out
     assert "Cayu product service: http://127.0.0.1:8123/api/operations" in output
     assert "Cayu operator control plane: http://127.0.0.1:8123/cayu/" in output
@@ -109,7 +130,7 @@ service_factory = "unused:build_service"
     monkeypatch.setattr(
         serve_cli,
         "build_project_service",
-        lambda _target, *, mode, command: service,
+        lambda _target, *, mode, command, project_context: service,
     )
     launched: dict[str, Any] = {}
     uvicorn = ModuleType("uvicorn")

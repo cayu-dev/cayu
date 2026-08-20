@@ -48,6 +48,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import Message
+from cayu.project_control_plane import ProjectControlPlaneContext
 from cayu.runtime.app import CayuApp
 from cayu.runtime.invocation import (
     InvocationOrigin,
@@ -82,6 +83,8 @@ from cayu.runtime.tasks import (
 from cayu.runtime.usage import is_conversational_model_completion_payload
 from cayu.server.config import (
     AuthenticatedAccess,
+    EvalsConfig,
+    EvaluationPromotionConfig,
     OpenAccess,
     ServerAccessConfig,
     _raise_redacted_config_error,
@@ -870,6 +873,7 @@ class CayuService:
         "_cayu_app",
         "_manifest",
         "_product_store",
+        "_project_control_plane_context",
         "_route_signature",
     )
 
@@ -881,6 +885,7 @@ class CayuService:
         manifest: PublicServiceManifest,
         product_store: ProductOperationStore,
         agent_name: str,
+        project_control_plane_context: ProjectControlPlaneContext | None = None,
         _assembly_token: object | None = None,
     ) -> None:
         if _assembly_token is not _SERVICE_ASSEMBLY_TOKEN:
@@ -890,6 +895,7 @@ class CayuService:
         self._manifest = manifest
         self._product_store = product_store
         self._agent_name = agent_name
+        self._project_control_plane_context = project_control_plane_context
         self._assembly_token = _assembly_token
         self._route_signature: tuple[object, ...] | None = None
 
@@ -912,6 +918,10 @@ class CayuService:
     @property
     def agent_name(self) -> str:
         return self._agent_name
+
+    @property
+    def project_control_plane_context_attached(self) -> bool:
+        return self._project_control_plane_context is not None
 
     async def _continuation_loop_policies(
         self,
@@ -2469,11 +2479,16 @@ def create_agent_service(
     product_store: ProductOperationStore,
     product_api_path: str = "/api",
     control_plane_path: str = "/cayu",
+    evaluation_promotion: EvaluationPromotionConfig | None = None,
+    evals: EvalsConfig | None = None,
+    project_context: ProjectControlPlaneContext | None = None,
 ) -> CayuService:
     """Assemble the maintained product API and separately protected control plane."""
 
     if not isinstance(app, CayuApp):
         raise TypeError("create_agent_service requires a CayuApp.")
+    if project_context is not None and type(project_context) is not ProjectControlPlaneContext:
+        raise TypeError("project_context must be a framework-owned ProjectControlPlaneContext.")
     agent_name = require_durable_clean_nonblank(agent_name, "agent_name")
     if agent_name not in app.list_agents():
         raise ValueError(f"agent_name must identify a registered agent: {agent_name}")
@@ -2537,6 +2552,7 @@ def create_agent_service(
         manifest=manifest,
         product_store=product_store,
         agent_name=agent_name,
+        project_control_plane_context=project_context,
         _assembly_token=_SERVICE_ASSEMBLY_TOKEN,
     )
     auth_dependency = _product_auth_dependency(
@@ -2706,7 +2722,10 @@ def create_agent_service(
         app,
         path=control_plane_path,
         access=operator_mount_access,
+        evaluation_promotion=evaluation_promotion,
+        evals=evals,
         continuation_loop_policy_provider=service._continuation_loop_policies,
+        _project_context=project_context,
     )
     server.state.cayu_public_service = service
     server.state.cayu_public_service_manifest = manifest

@@ -852,6 +852,33 @@ and performs execution.
 
 ### Server-attached durable execution
 
+When a project is started with `cayu serve`, Cayu assembles the non-executable
+part of this configuration from project-owned declarations:
+
+- `[project].name` becomes the normalized project identity.
+- `CAYU_RELEASE_ID` selects the application release identity. When it is
+  absent, Cayu uses the bounded public application-manifest fingerprint.
+- `CAYU_DATABASE_URL` or `[tool.cayu.session_store]` selects the durable
+  `EvalStore` backend. Trusted loopback `cayu serve --dev` may instead create
+  the project-local `data/cayu.db` default.
+
+This assembly does not deserialize or invent an executable eval target. Until
+the project target registry is available, automatic catalog and fresh-run
+operations remain visibly gated with `eval_target_not_configured`. An explicit
+`EvalsConfig` remains the complete low-level contract and takes precedence as
+one indivisible configuration; Cayu never merges its target with the
+automatically assembled store. Arbitrary embedded `create_server(...)` and
+`mount_cayu(...)` integrations continue to provide trusted runtime objects
+explicitly.
+
+Generated maintained-service factories carry an opaque
+`ProjectControlPlaneContext` into `create_agent_service(...)`. Existing
+factories continue to start unchanged, but `cayu check` reports
+`EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED` until they are updated. Run
+`cayu generate service-context --dry-run`, review the edit, then run
+`cayu generate service-context`. Customized factories fail closed for manual
+review instead of being rewritten heuristically.
+
 An authenticated Cayu server can attach exactly one trusted `CorpusTarget` to a
 durable `SQLiteEvalStore` or `PostgresEvalStore`. `EvalsConfig` is complete,
 programmatic runtime wiring and is off by default:
@@ -938,10 +965,10 @@ If catalog reads are not ready, the page renders a deterministic readiness
 shell and does not query absent Evals endpoints. Deployment-gated operations
 remain visible with their factual missing dependency, planned framework work is
 labeled separately from a genuine runtime incompatibility, and ready operations
-remain independently visible. This contract does not automatically assemble
-storage or execution targets; existing explicit Evals and evaluation promotion
-configuration remains supported while automatic project assembly is a planned
-extension.
+remain independently visible. Project serving automatically assembles durable
+storage and project/release identity when their declarations are available. It
+does not yet assemble an execution target. Existing explicit Evals and
+evaluation-promotion configuration remains supported and authoritative.
 
 When `surfaces.evals.read` and `evals_readiness.catalog_read` are enabled, the
 catalog pages through immutable corpus revisions, suites, and cases without

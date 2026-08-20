@@ -104,6 +104,42 @@ may accept caller-selected test identities and an open operator mount, so it is
 restricted to `cayu serve --dev` on a loopback listener. Build the same service
 factory with `mode="production"` before deployment.
 
+## evals-project-identity-not-configured
+
+`EVALS_PROJECT_IDENTITY_NOT_CONFIGURED` means automatic Evals assembly cannot
+derive a stable project identity. Add a valid PyPA distribution name under
+`[project]` in `pyproject.toml`; Cayu normalizes runs of `.`, `_`, and `-` to a
+single lowercase `-`. This warning does not disable an explicitly supplied
+`EvalsConfig`.
+
+Verify with `cayu check --json`.
+
+## evals-project-store-not-configured
+
+`EVALS_PROJECT_STORE_NOT_CONFIGURED` means production project serving cannot
+select durable Evals storage. Configure SQLite or PostgreSQL under
+`[tool.cayu.session_store]`, or set `CAYU_DATABASE_URL`. Production does not
+create a database merely to clear the warning. Explicit trusted-local
+`cayu serve --dev` may use the project-local `data/cayu.db` default.
+
+Connection strings and paths are excluded from the finding. Verify with
+`cayu check --json` in the intended deployment environment.
+
+## evals-service-factory-context-migration-required
+
+`EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED` means a maintained service
+factory still uses the older signature and therefore cannot carry Cayu's
+framework-owned Evals project context to `create_agent_service(...)`. The
+service remains compatible and starts normally; only automatic project
+assembly is unavailable through that factory.
+
+Run `cayu generate service-context --dry-run`, review the proposed edit, then
+run `cayu generate service-context`. The command modifies only the recognized
+previous generated form. If it reports `manual_action_required`, add an
+optional keyword-only `project_context: ProjectControlPlaneContext | None =
+None` parameter and pass it unchanged as `project_context=project_context` to
+`create_agent_service(...)`. Verify with `cayu check --json`.
+
 ## public-service-product-access-unsafe
 
 `PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE` means the maintained product API uses a

@@ -35,6 +35,9 @@ class ControlPlaneCapabilitySnapshot:
     terminal_session_evidence_supported: bool
     session_lineage_supported: bool
     evals_configured: bool
+    eval_store_configured: bool
+    eval_target_configured: bool
+    eval_project_identity_configured: bool
 
     @property
     def evaluation_promotion_supported(self) -> bool:
@@ -139,9 +142,23 @@ def inspect_control_plane_capabilities(
     terminal_session_evidence_supported: bool = False,
     session_lineage_supported: bool = False,
     evals_configured: bool = False,
+    eval_store_configured: bool | None = None,
+    eval_target_configured: bool | None = None,
+    eval_project_identity_configured: bool | None = None,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
+    eval_store_configured = (
+        evals_configured if eval_store_configured is None else eval_store_configured
+    )
+    eval_target_configured = (
+        evals_configured if eval_target_configured is None else eval_target_configured
+    )
+    eval_project_identity_configured = (
+        evals_configured
+        if eval_project_identity_configured is None
+        else eval_project_identity_configured
+    )
     for field_name, value in (
         ("dashboard_configured", dashboard_configured),
         ("tasks_configured", tasks_configured),
@@ -153,11 +170,18 @@ def inspect_control_plane_capabilities(
         ("terminal_session_evidence_supported", terminal_session_evidence_supported),
         ("session_lineage_supported", session_lineage_supported),
         ("evals_configured", evals_configured),
+        ("eval_store_configured", eval_store_configured),
+        ("eval_target_configured", eval_target_configured),
+        ("eval_project_identity_configured", eval_project_identity_configured),
     ):
         if type(value) is not bool:
             raise TypeError(f"{field_name} must be a bool.")
     if dashboard_pricing_configured and not dashboard_configured:
         raise ValueError("Dashboard pricing cannot be configured when the dashboard is disabled.")
+    if evals_configured and not (
+        eval_store_configured and eval_target_configured and eval_project_identity_configured
+    ):
+        raise ValueError("Configured Evals requires store, target, and project identity evidence.")
     return ControlPlaneCapabilitySnapshot(
         cayu_version=_cayu_distribution_version(),
         dashboard_configured=dashboard_configured,
@@ -170,6 +194,9 @@ def inspect_control_plane_capabilities(
         terminal_session_evidence_supported=terminal_session_evidence_supported,
         session_lineage_supported=session_lineage_supported,
         evals_configured=evals_configured,
+        eval_store_configured=eval_store_configured,
+        eval_target_configured=eval_target_configured,
+        eval_project_identity_configured=eval_project_identity_configured,
     )
 
 
@@ -250,28 +277,49 @@ def _evals_readiness(snapshot: ControlPlaneCapabilitySnapshot) -> EvalsReadiness
     else:
         captured_evaluation = EvalsOperationReadiness(state="ready", reason_code=None)
 
-    if snapshot.evals_configured:
+    store_ready = snapshot.eval_store_configured
+    target_ready = snapshot.eval_target_configured
+    identity_ready = snapshot.eval_project_identity_configured
+    if store_ready and target_ready and identity_ready:
         catalog = EvalsOperationReadiness(state="ready", reason_code=None)
-        fresh_launch = EvalsOperationReadiness(state="ready", reason_code=None)
         stored_result_operation = EvalsOperationReadiness(state="ready", reason_code=None)
+    else:
+        blocking_reason = (
+            "eval_store_not_configured" if not store_ready else "eval_target_not_configured"
+        )
+        catalog = EvalsOperationReadiness(
+            state="gated",
+            reason_code=blocking_reason,
+        )
+        stored_result_operation = EvalsOperationReadiness(
+            state="gated",
+            reason_code=blocking_reason,
+        )
+
+    if store_ready and target_ready and identity_ready:
+        fresh_launch = EvalsOperationReadiness(state="ready", reason_code=None)
+    else:
+        fresh_launch = EvalsOperationReadiness(
+            state="gated",
+            reason_code=(
+                "eval_target_not_configured"
+                if not target_ready or not identity_ready
+                else "eval_store_not_configured"
+            ),
+        )
+
+    if store_ready and identity_ready:
         captured_result_persistence = EvalsOperationReadiness(
             state="unsupported",
             reason_code="captured_result_persistence_not_available",
         )
     else:
-        catalog = EvalsOperationReadiness(
+        captured_result_persistence = EvalsOperationReadiness(
             state="gated",
-            reason_code="eval_store_not_configured",
+            reason_code=(
+                "eval_store_not_configured" if not store_ready else "eval_target_not_configured"
+            ),
         )
-        fresh_launch = EvalsOperationReadiness(
-            state="gated",
-            reason_code="eval_target_not_configured",
-        )
-        stored_result_operation = EvalsOperationReadiness(
-            state="gated",
-            reason_code="eval_store_not_configured",
-        )
-        captured_result_persistence = stored_result_operation.model_copy()
 
     return EvalsReadiness(
         captured_evaluation=captured_evaluation,

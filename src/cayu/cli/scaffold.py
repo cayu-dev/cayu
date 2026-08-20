@@ -405,6 +405,9 @@ uv run cayu serve --dev
 Then open `http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag enables
 unauthenticated trusted-local access only. It does not make the control plane
 the application's end-user UI or configure a production deployment.
+Project serving also derives Evals project/release identity and uses this
+project's durable `data/cayu.db` store automatically. Fresh Evals execution
+remains gated until a trusted eval target is available.
 Never mount it with unauthenticated open access on a public listener;
 client-IP checks are not authentication. Public or deployed control-plane
 access requires an authenticated access policy.
@@ -550,6 +553,7 @@ from cayu.server import (
     PlaceholderProductAccess,
     ProductOperationStore,
     ProductPrincipal,
+    ProjectControlPlaneContext,
     ServerAccessConfig,
     ServiceMode,
     create_agent_service,
@@ -657,6 +661,7 @@ def _production_operator_access() -> ServerAccessConfig | PlaceholderOperatorAcc
 def build_service(
     *,
     mode: ServiceMode,
+    project_context: ProjectControlPlaneContext | None = None,
     provider: ModelProvider | None = None,
     session_store: SessionStore | None = None,
     task_store: TaskStore | None = None,
@@ -699,6 +704,7 @@ def build_service(
         app,
         agent_name="__AGENT_NAME__",
         mode=mode,
+        project_context=project_context,
         product_access=selected_product_access,
         operator_access=selected_operator_access,
         product_store=selected_product_store,

@@ -170,6 +170,25 @@ local-development profile or a resolved authentication target; incomplete-
 session startup recovery remains disabled unless bounded statuses and an
 inactivity threshold are configured. See [project server](project-server.md).
 
+Before application or service assembly, project serving creates one opaque
+`ProjectControlPlaneContext`. The framework owns its lifetime and its optional
+durable `EvalStore`; applications may pass it through the maintained service
+factory seam but cannot construct it, replace its fields, inspect its storage
+location or connection, or use it as general application state. Resolution
+binds normalized `[project].name`, `CAYU_RELEASE_ID` or the public manifest
+fingerprint, and the selected project store to the exact `CayuApp`, then checks
+all public identity through the application's workload-secret redaction
+boundary. Construction or redaction failure occurs before the server starts,
+and framework-owned storage is closed during server shutdown and CLI cleanup.
+
+Only explicit loopback-validated `cayu serve --dev` context carries trusted
+local-development authority. A caller-created `OpenAccess` policy is not
+equivalent and cannot enable Evals execution. A complete explicit
+`EvalsConfig` remains authoritative and is never field-merged with automatic
+state. Automatic storage and identity without an executable target publish
+`eval_target_not_configured`; no Evals worker or mutation route is mounted from
+that partial state.
+
 A project may additionally declare a synchronous `service_factory` using
 Cayu's maintained public-agent service contract. The factory accepts the
 explicit `ServiceMode` selected by serving or deployment inspection and returns
@@ -3994,6 +4013,14 @@ probing absent endpoints and distinguishes planned framework work from a
 deployment dependency or runtime limitation. It does not grant authority or
 weaken route-level authentication, mutation policy, target admission, or
 execution preconditions.
+
+Its storage and target evidence are independent. Project serving may make
+durable storage and project/release identity available before it can resolve a
+trusted executable target. In that state catalog, launch, cancellation,
+comparison, and report operations remain gated by
+`eval_target_not_configured`; captured-result persistence remains a separately
+planned operation. A fully explicit `EvalsConfig` supplies all three pieces and
+preserves the existing ready projection.
 
 The protected `GET /api/system/diagnostics` response is a separate, manually
 requested operator snapshot. It repeats the capability projection so the

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Literal
@@ -25,6 +26,9 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
     "AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
     "APP_NO_AGENTS",
+    "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
+    "EVALS_PROJECT_STORE_NOT_CONFIGURED",
+    "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
     "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     "EXTERNAL_TOOL_UNGUARDED",
     "PUBLIC_SERVICE_DEVELOPMENT_MODE",
@@ -83,6 +87,21 @@ class ServiceCheckEvidence(BaseModel):
     security_verification_command: Literal["pytest -q tests/test_public_service_security.py"]
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectControlPlaneCheckEvidence:
+    """Safe project-bootstrap facts supplied by the CLI without runtime objects."""
+
+    project_identity_configured: bool
+    eval_store_configured: bool
+    service_context: Literal["not_applicable", "attached", "migration_required"]
+
+    def __post_init__(self) -> None:
+        if type(self.project_identity_configured) is not bool:
+            raise TypeError("project_identity_configured must be a bool.")
+        if type(self.eval_store_configured) is not bool:
+            raise TypeError("eval_store_configured must be a bool.")
+
+
 class ProjectCheckReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -96,6 +115,7 @@ def check_manifest(
     manifest: AppManifest,
     *,
     service_manifest: PublicServiceManifest | None = None,
+    project_control_plane: ProjectControlPlaneCheckEvidence | None = None,
     tags: frozenset[str] | None = None,
     deploy_only: bool = False,
 ) -> ProjectCheckReport:
@@ -103,6 +123,11 @@ def check_manifest(
 
     if not isinstance(manifest, AppManifest):
         raise TypeError("check_manifest requires an AppManifest.")
+    if (
+        project_control_plane is not None
+        and type(project_control_plane) is not ProjectControlPlaneCheckEvidence
+    ):
+        raise TypeError("project_control_plane must be ProjectControlPlaneCheckEvidence or None.")
     requested_tags = frozenset() if tags is None else frozenset(tags)
     unknown = requested_tags - AVAILABLE_CHECK_TAGS
     if unknown:
@@ -400,6 +425,9 @@ def check_manifest(
                 )
             )
 
+    if project_control_plane is not None:
+        diagnostics.extend(_check_project_control_plane(project_control_plane))
+
     selected = [
         diagnostic
         for diagnostic in diagnostics
@@ -416,6 +444,71 @@ def check_manifest(
         diagnostics=tuple(selected),
         service_evidence=_service_evidence(service_manifest, diagnostics),
     )
+
+
+def _check_project_control_plane(
+    evidence: ProjectControlPlaneCheckEvidence,
+) -> list[ProjectDiagnostic]:
+    diagnostics: list[ProjectDiagnostic] = []
+    if not evidence.project_identity_configured:
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
+                severity=DiagnosticSeverity.WARNING,
+                subject="evals",
+                path="project.name",
+                message=(
+                    "Automatic Evals target identity is unavailable because [project].name "
+                    "is not configured."
+                ),
+                hint="Add a valid name under [project] in pyproject.toml.",
+                tags=("configuration",),
+                documentation_anchor=(
+                    "cayu guide diagnostics#evals-project-identity-not-configured"
+                ),
+                verification_command="cayu check --json",
+            )
+        )
+    if not evidence.eval_store_configured:
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="EVALS_PROJECT_STORE_NOT_CONFIGURED",
+                severity=DiagnosticSeverity.WARNING,
+                subject="evals",
+                path="tool.cayu.session_store",
+                message=("Production Evals persistence has no declared durable project store."),
+                hint=(
+                    "Configure [tool.cayu.session_store] or CAYU_DATABASE_URL; trusted local "
+                    "development may use data/cayu.db automatically."
+                ),
+                tags=("configuration",),
+                documentation_anchor=("cayu guide diagnostics#evals-project-store-not-configured"),
+                verification_command="cayu check --json",
+            )
+        )
+    if evidence.service_context == "migration_required":
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
+                severity=DiagnosticSeverity.WARNING,
+                subject="service",
+                path="service_factory.project_context",
+                message=(
+                    "The maintained service factory does not carry Cayu's framework-owned "
+                    "project context into create_agent_service()."
+                ),
+                hint=(
+                    "Run `cayu generate service-context`, review the generated edit, and "
+                    "rerun `cayu check --json`."
+                ),
+                tags=("configuration",),
+                documentation_anchor=(
+                    "cayu guide diagnostics#evals-service-factory-context-migration-required"
+                ),
+                verification_command="cayu check --json",
+            )
+        )
+    return diagnostics
 
 
 def _check_public_service(manifest: PublicServiceManifest) -> list[ProjectDiagnostic]:

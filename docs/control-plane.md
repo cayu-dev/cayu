@@ -14,6 +14,38 @@ All three modes expose an operator surface. Public deployment requires explicit 
 and authorization; unauthenticated `ServerConfig.local_development()` access is for trusted
 loopback development only.
 
+## Project-owned Evals assembly
+
+`cayu serve` assembles the durable, non-executable Evals foundation without
+requiring an application to construct `EvalsConfig`: normalized project
+identity from `[project].name`, release identity from `CAYU_RELEASE_ID` or the
+public application-manifest fingerprint, and a matching SQLite or PostgreSQL
+`EvalStore` from the project's session-store declaration. Trusted loopback
+`cayu serve --dev` may create `data/cayu.db` as the local default; production
+does not invent a database.
+
+This slice deliberately stops before target assembly. The Evals page can report
+that storage and identity are ready while catalog and fresh execution remain
+gated by `eval_target_not_configured`. The browser never manufactures a live
+application, credentials, tools, environments, request templates, or other
+execution authority.
+
+New maintained-service factories accept Cayu's opaque project context and pass
+it unchanged to `create_agent_service(...)`. Existing factories remain
+compatible but do not receive automatic assembly until migrated. Use:
+
+```bash
+cayu check --json
+cayu generate service-context --dry-run
+cayu generate service-context
+```
+
+The generator edits only the previous generated shape it can prove safe;
+customized or conflicting code requires manual review. Explicit `EvalsConfig`
+continues to win as a complete configuration and is never partially combined
+with framework-assembled state. Direct embedded servers continue to wire their
+trusted objects explicitly.
+
 ## Eject and customize the matching source
 
 Every wheel and source distribution carries one deterministic dashboard-source bundle tied to

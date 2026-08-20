@@ -76,12 +76,55 @@ def resolve_session_store_target(
             source="explicit",
         )
 
+    target, pyproject = _resolve_project_session_store_target(
+        environ=environ,
+        start=start,
+        local_development=False,
+    )
+    if target is not None:
+        return target
+    raise _missing_target_error(pyproject)
+
+
+def resolve_project_session_store_target(
+    *,
+    environ: Mapping[str, str] | None = None,
+    start: Path | None = None,
+    local_development: bool,
+) -> SessionStoreTarget | None:
+    """Resolve project storage for automatic Control Plane assembly.
+
+    Unlike the ordinary CLI resolver, production may return ``None`` so the
+    server can retain preview-only behavior. Explicit malformed configuration
+    still fails. Trusted local development receives the documented project-local
+    SQLite default even before that file exists.
+    """
+
+    if type(local_development) is not bool:
+        raise TypeError("local_development must be a bool.")
+    target, _ = _resolve_project_session_store_target(
+        environ=environ,
+        start=start,
+        local_development=local_development,
+    )
+    return target
+
+
+def _resolve_project_session_store_target(
+    *,
+    environ: Mapping[str, str] | None,
+    start: Path | None,
+    local_development: bool,
+) -> tuple[SessionStoreTarget | None, Path | None]:
     environment = os.environ if environ is None else environ
     database_url = environment.get("CAYU_DATABASE_URL")
     if database_url is not None:
-        return _target_from_database_url(
-            database_url,
-            source="environment:CAYU_DATABASE_URL",
+        return (
+            _target_from_database_url(
+                database_url,
+                source="environment:CAYU_DATABASE_URL",
+            ),
+            None,
         )
 
     try:
@@ -92,25 +135,33 @@ def resolve_session_store_target(
     except ProjectError as exc:
         raise SessionStoreTargetError(str(exc)) from exc
     if project is None:
-        raise _missing_target_error()
+        return None, None
 
     configured = project.config.get("session_store")
     if configured is not None:
-        return _target_from_project_config(
-            configured,
-            pyproject=project.pyproject,
-            environ=environment,
+        return (
+            _target_from_project_config(
+                configured,
+                pyproject=project.pyproject,
+                environ=environment,
+            ),
+            project.pyproject,
         )
 
     canonical = project.root / CANONICAL_SQLITE_PATH
-    if canonical.is_file():
-        return SessionStoreTarget(
-            backend=SessionStoreBackend.SQLITE,
-            sqlite_path=canonical,
-            source="canonical-discovery",
-            config_path=project.pyproject,
+    if canonical.is_file() or local_development:
+        return (
+            SessionStoreTarget(
+                backend=SessionStoreBackend.SQLITE,
+                sqlite_path=canonical,
+                source=(
+                    "canonical-discovery" if canonical.is_file() else "local-development-default"
+                ),
+                config_path=project.pyproject,
+            ),
+            project.pyproject,
         )
-    raise _missing_target_error(project.pyproject)
+    return None, project.pyproject
 
 
 def _target_from_project_config(

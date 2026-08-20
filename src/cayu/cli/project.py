@@ -15,6 +15,7 @@ from types import ModuleType
 from typing import Any
 
 from cayu.cli._targets import TargetResolutionError, load_target
+from cayu.project_control_plane import ProjectControlPlaneContext
 from cayu.runtime.app import CayuApp
 
 
@@ -374,6 +375,7 @@ def build_project_service(
     *,
     mode: str,
     command: str = "Project",
+    project_context: ProjectControlPlaneContext | None = None,
 ):
     """Build one maintained public service using its explicit profile parameter."""
 
@@ -401,10 +403,20 @@ def build_project_service(
     mode_parameter = signature.parameters.get("mode")
     if mode_parameter is None or mode_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
         raise ProjectError(f"{command} service factory must accept a keyword 'mode' parameter.")
+    context_parameter = signature.parameters.get("project_context")
+    if (
+        context_parameter is not None
+        and context_parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+    ):
+        raise ProjectError(
+            f"{command} service factory project_context parameter must accept a keyword."
+        )
+    if project_context is not None and type(project_context) is not ProjectControlPlaneContext:
+        raise TypeError("project_context must be a framework-owned ProjectControlPlaneContext.")
     unexpected_required = [
         parameter.name
         for parameter in signature.parameters.values()
-        if parameter.name != "mode"
+        if parameter.name not in {"mode", "project_context"}
         and parameter.default is inspect.Parameter.empty
         and parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     ]
@@ -414,7 +426,10 @@ def build_project_service(
             f"{', '.join(unexpected_required)}."
         )
 
-    service = factory(mode=ServiceMode(mode))
+    factory_arguments: dict[str, object] = {"mode": ServiceMode(mode)}
+    if context_parameter is not None:
+        factory_arguments["project_context"] = project_context
+    service = factory(**factory_arguments)
     if inspect.iscoroutine(service):
         service.close()
     if inspect.isawaitable(service):

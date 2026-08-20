@@ -113,6 +113,7 @@ from cayu.evals.trajectory import (
     SessionTrajectoryErrorCode,
     trajectory_from_session,
 )
+from cayu.project_control_plane import ResolvedProjectControlPlaneContext
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
@@ -3406,6 +3407,7 @@ def create_router(
     continuation_loop_policy_provider: (
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
     ) = None,
+    _project_context: ResolvedProjectControlPlaneContext | None = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -3458,6 +3460,14 @@ def create_router(
         continuation_loop_policy_provider
     ):
         raise TypeError("continuation_loop_policy_provider must be callable or None.")
+    if (
+        _project_context is not None
+        and type(_project_context) is not ResolvedProjectControlPlaneContext
+    ):
+        raise TypeError("_project_context must be framework-owned project context or None.")
+    trusted_local_evals_access = (
+        _project_context is not None and _project_context.trusted_local_development
+    )
 
     if (
         isinstance(replay_idle_timeout_s, bool)
@@ -3471,7 +3481,7 @@ def create_router(
     if evaluation_promotion is not None:
         if type(evaluation_promotion) is not EvaluationPromotionConfig:
             raise TypeError("evaluation_promotion must be an EvaluationPromotionConfig or None.")
-        if auth is None:
+        if auth is None and not trusted_local_evals_access:
             raise ValueError("evaluation_promotion requires authenticated API access.")
         if evaluation_promotion.source_agent_name not in cayu_app.list_agents():
             raise ValueError("evaluation_promotion.source_agent_name is not registered.")
@@ -3509,7 +3519,7 @@ def create_router(
             )
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError("evals configuration is invalid.") from exc
-        if auth is None:
+        if auth is None and not trusted_local_evals_access:
             raise ValueError("evals requires authenticated API access.")
         if evals.target.app is not cayu_app:
             raise ValueError("evals.target must reference the attached CayuApp instance.")
@@ -3549,6 +3559,15 @@ def create_router(
         terminal_session_evidence_supported=session_store.supports_terminal_session_evidence,
         session_lineage_supported=session_store.supports_session_lineage,
         evals_configured=evals is not None,
+        eval_store_configured=(
+            evals is not None
+            or (_project_context is not None and _project_context.eval_store is not None)
+        ),
+        eval_target_configured=evals is not None,
+        eval_project_identity_configured=(
+            evals is not None
+            or (_project_context is not None and _project_context.project_id is not None)
+        ),
     )
     if dashboard_access_authenticated is None and dashboard_configured:
         dashboard_access_authenticated = auth is not None

@@ -13,10 +13,15 @@ from cayu.cli.project import (
     project_context,
     resolve_project,
 )
+from cayu.cli.project_control_plane import (
+    build_project_control_plane_context,
+    close_project_control_plane_context,
+)
 from cayu.runtime.checks import (
     AVAILABLE_CHECK_TAGS,
     DiagnosticSeverity,
     ProjectCheckReport,
+    ProjectControlPlaneCheckEvidence,
     check_manifest,
     severity_at_least,
 )
@@ -74,28 +79,50 @@ def _run_check(args: argparse.Namespace) -> int:
         return 2
     try:
         project = resolve_project(args.target, command="cayu check")
-        with project_context(project.root):
-            service = (
-                None
-                if project.service_target is None
-                else build_project_service(
-                    project.service_target,
-                    mode="production",
-                    command="Check",
-                )
-            )
-            app = (
-                build_project_app(project.target, command="Check")
-                if service is None
-                else service.cayu_app
-            )
-            manifest = app.describe(project_root=project.root)
-        report = check_manifest(
-            manifest,
-            service_manifest=None if service is None else service.manifest,
-            tags=requested_tags,
-            deploy_only=args.deploy,
+        control_plane_context = build_project_control_plane_context(
+            project.root,
+            mode="production",
         )
+        try:
+            with project_context(project.root):
+                service = (
+                    None
+                    if project.service_target is None
+                    else build_project_service(
+                        project.service_target,
+                        mode="production",
+                        command="Check",
+                        project_context=control_plane_context,
+                    )
+                )
+                app = (
+                    build_project_app(project.target, command="Check")
+                    if service is None
+                    else service.cayu_app
+                )
+                manifest = app.describe(project_root=project.root)
+            check_evidence = ProjectControlPlaneCheckEvidence(
+                project_identity_configured=(control_plane_context.project_identity_configured),
+                eval_store_configured=control_plane_context.eval_store_configured,
+                service_context=(
+                    "not_applicable"
+                    if service is None
+                    else (
+                        "attached"
+                        if service.project_control_plane_context_attached
+                        else "migration_required"
+                    )
+                ),
+            )
+            report = check_manifest(
+                manifest,
+                service_manifest=None if service is None else service.manifest,
+                project_control_plane=check_evidence,
+                tags=requested_tags,
+                deploy_only=args.deploy,
+            )
+        finally:
+            close_project_control_plane_context(control_plane_context)
     except Exception as exc:
         message = (
             str(exc)

@@ -31,6 +31,7 @@ from cayu import (
     check_manifest,
 )
 from cayu.runtime import BUILTIN_DIAGNOSTIC_CODES, PublicServiceManifest
+from cayu.runtime.checks import ProjectControlPlaneCheckEvidence
 
 
 class _ExternalTool(Tool):
@@ -91,6 +92,9 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
         "AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
         "APP_NO_AGENTS",
+        "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
+        "EVALS_PROJECT_STORE_NOT_CONFIGURED",
+        "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
         "EXTERNAL_TOOL_UNGUARDED",
         "PUBLIC_SERVICE_DEVELOPMENT_MODE",
@@ -482,6 +486,17 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
             ),
         ).diagnostics
     }
+    project_control_plane_codes = {
+        item.code
+        for item in check_manifest(
+            unconstrained.describe(),
+            project_control_plane=ProjectControlPlaneCheckEvidence(
+                project_identity_configured=False,
+                eval_store_configured=False,
+                service_context="migration_required",
+            ),
+        ).diagnostics
+    }
 
     assert (
         empty_codes
@@ -495,6 +510,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unconstrained_codes
         | public_service_codes
         | nondurable_task_service_codes
+        | project_control_plane_codes
         == set(BUILTIN_DIAGNOSTIC_CODES)
     )
 

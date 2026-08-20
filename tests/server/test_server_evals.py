@@ -30,6 +30,10 @@ from cayu import AgentSpec, CayuApp, ModelJudgeTarget, ModelProvider, ModelReque
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument
 from cayu.evals.execution import run_corpus_suite
 from cayu.evals.store import EvalRunRequest, EvalRunStatus, InMemoryEvalStore
+from cayu.project_control_plane import (
+    ProjectControlPlaneAccess,
+    _create_project_control_plane_context,
+)
 from cayu.server import (
     AuthContext,
     AuthenticatedAccess,
@@ -177,6 +181,53 @@ def test_evals_routes_are_absent_without_complete_configuration() -> None:
     )
     with TestClient(server) as client:
         assert client.get("/api/evals/corpora", headers=_AUTH_HEADERS).status_code == 404
+
+
+def test_framework_owned_local_context_allows_loopback_cli_evals_without_relaxing_v1(
+    tmp_path,
+) -> None:
+    target = _target(_provider())
+    automatic_path = tmp_path / "automatic.db"
+    automatic_store = SQLiteEvalStore(automatic_path)
+    explicit_store = SQLiteEvalStore(tmp_path / "explicit.db")
+    context = _create_project_control_plane_context(
+        project_root=tmp_path.resolve(),
+        project_id="local-project",
+        configured_release_id="local-release",
+        eval_store=automatic_store,
+        store_backend="sqlite",
+        store_source="project",
+        access=ProjectControlPlaneAccess.TRUSTED_LOCAL_DEVELOPMENT,
+    )
+    server = FastAPI()
+    mount_cayu(
+        server,
+        target.app,
+        dashboard=False,
+        access=OpenAccess(),
+        evals=_evals_config(target, explicit_store),
+        _project_context=context,
+    )
+    try:
+        corpus = _corpus()
+        with TestClient(server) as client:
+            imported = client.post(
+                "/cayu/api/evals/corpora",
+                json=corpus.model_dump(mode="json"),
+            )
+            assert imported.status_code == 201
+
+        assert [item.revision for item in asyncio.run(explicit_store.list_corpora()).items] == [
+            corpus.revision
+        ]
+        automatic_reader = SQLiteEvalStore(automatic_path)
+        try:
+            assert asyncio.run(automatic_reader.list_corpora()).items == ()
+        finally:
+            asyncio.run(automatic_reader.close())
+    finally:
+        asyncio.run(context.close())
+        asyncio.run(explicit_store.close())
 
 
 def test_evals_openapi_has_no_dangling_manual_request_schema_references(tmp_path) -> None:

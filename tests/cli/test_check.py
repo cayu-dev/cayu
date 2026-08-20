@@ -7,6 +7,34 @@ from pathlib import Path
 from cayu.cli import main
 
 
+def test_check_explicit_target_remains_supported_without_a_pyproject(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    (tmp_path / "explicit_app.py").write_text(
+        """from cayu import CayuApp
+
+
+def build_app():
+    return CayuApp(enable_logging=False)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("explicit_app", None)
+
+    assert main(["check", "explicit_app:build_app", "--json"]) == 1
+
+    report = json.loads(capsys.readouterr().out)
+    assert "error" not in report
+    assert [item["code"] for item in report["diagnostics"]] == [
+        "APP_NO_AGENTS",
+        "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
+        "EVALS_PROJECT_STORE_NOT_CONFIGURED",
+    ]
+
+
 def test_deploy_check_reports_supported_public_service_posture(
     tmp_path: Path,
     monkeypatch,
@@ -382,6 +410,8 @@ def build_app():
     }
     assert [item["code"] for item in report["diagnostics"]] == [
         "AGENT_PROVIDER_NOT_FOUND",
+        "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
+        "EVALS_PROJECT_STORE_NOT_CONFIGURED",
         "EXTERNAL_TOOL_UNGUARDED",
     ]
     provider_finding = report["diagnostics"][0]

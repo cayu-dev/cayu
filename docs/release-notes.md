@@ -89,6 +89,25 @@ guard.
 
 ## Unreleased
 
+### Project serving assembles the durable Evals foundation
+
+`cayu serve` now derives normalized project identity from `[project].name`,
+release identity from `CAYU_RELEASE_ID` or the public application-manifest
+fingerprint, and a durable Evals store from the project's existing SQLite or
+PostgreSQL session-store declaration. Explicit loopback `--dev` may create the
+project-local `data/cayu.db` default; production never invents storage. All
+public identity crosses the application's workload-secret redaction boundary,
+and Cayu owns and closes the assembled store.
+
+Generated maintained-service factories carry an opaque
+`ProjectControlPlaneContext` into the server assembler. Existing factories
+remain source-compatible and receive an actionable `cayu check` warning plus a
+conservative, idempotent `cayu generate service-context` migration. Explicit
+`EvalsConfig` remains authoritative and is never field-merged with automatic
+state. Execution-target assembly is a later slice, so automatically assembled
+projects currently report `eval_target_not_configured` and do not mount Evals
+mutation routes or workers.
+
 ### Control Plane Evals now publishes operation-level readiness
 
 The Evals navigation and direct route now remain discoverable even when a

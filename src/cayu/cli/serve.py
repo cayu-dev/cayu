@@ -18,6 +18,11 @@ from cayu.cli.project import (
     project_context,
     resolve_project,
 )
+from cayu.cli.project_control_plane import (
+    build_project_control_plane_context,
+    close_project_control_plane_context,
+)
+from cayu.project_control_plane import ProjectControlPlaneContext
 from cayu.runtime.sessions import SessionStatus
 
 
@@ -67,6 +72,8 @@ def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run_serve(args: argparse.Namespace) -> int:
+    project_control_plane: ProjectControlPlaneContext | None = None
+    exit_code = 0
     try:
         if args.dev:
             _require_loopback_dev_host(args.host)
@@ -93,6 +100,11 @@ def run_serve(args: argparse.Namespace) -> int:
                         "Cayu serve requires the server extra. "
                         'Install it with: pip install "cayu[server]"'
                     ) from exc
+                service_mode = "development" if args.dev else "production"
+                project_control_plane = build_project_control_plane_context(
+                    project.root,
+                    mode=service_mode,
+                )
                 if project.service_target is not None:
                     if args.auth is not None or settings.auth_target is not None:
                         raise ServeError(
@@ -101,8 +113,9 @@ def run_serve(args: argparse.Namespace) -> int:
                         )
                     service = build_project_service(
                         project.service_target,
-                        mode="development" if args.dev else "production",
+                        mode=service_mode,
                         command="Serve",
+                        project_context=project_control_plane,
                     )
                     if not args.dev:
                         from cayu.runtime.checks import check_public_service_deployment
@@ -128,7 +141,11 @@ def run_serve(args: argparse.Namespace) -> int:
                         if args.dev
                         else server_module.ServerConfig.protected(auth, lifecycle=lifecycle)
                     )
-                    server = server_module.create_server(app, config=config)
+                    server = server_module.create_server(
+                        app,
+                        config=config,
+                        project_context=project_control_plane,
+                    )
             except SystemExit as exc:
                 status = exc.code if type(exc.code) is int else 1
                 raise ServeError(
@@ -153,11 +170,17 @@ def run_serve(args: argparse.Namespace) -> int:
                     )
                 uvicorn.run(server, host=args.host, port=args.port)
             except SystemExit as exc:
-                return exc.code if isinstance(exc.code, int) else 1
+                exit_code = exc.code if isinstance(exc.code, int) else 1
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
-    return 0
+        exit_code = 1
+    finally:
+        try:
+            close_project_control_plane_context(project_control_plane)
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            exit_code = 1
+    return exit_code
 
 
 def _require_loopback_dev_host(host: str) -> None:

@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from cayu.cli import main
-from cayu.cli.generate import GeneratorApplyError, apply_slice_plan, plan_slice, plan_tool
+from cayu.cli.generate import (
+    GeneratorApplyError,
+    apply_slice_plan,
+    plan_service_context,
+    plan_slice,
+    plan_tool,
+)
 from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
 
 
@@ -40,6 +46,82 @@ def test_generate_slice_effect_help_routes_to_canonical_guide(capsys) -> None:
     output = capsys.readouterr().out
     assert "{none,idempotent,external}" in output
     assert "cayu guide tool-effects" in output
+
+
+def test_generate_service_context_migrates_the_previous_generated_factory(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "service", "--template", "service", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "service"
+    service_path = project / "service.py"
+    previous = (
+        service_path.read_text(encoding="utf-8")
+        .replace("    ProjectControlPlaneContext,\n", "")
+        .replace(
+            "    project_context: ProjectControlPlaneContext | None = None,\n",
+            "",
+        )
+        .replace("        project_context=project_context,\n", "")
+    )
+    service_path.write_text(previous, encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json"]) == 1
+    before_migration = json.loads(capsys.readouterr().out)
+    assert "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED" in {
+        item["code"] for item in before_migration["diagnostics"]
+    }
+
+    plan = plan_service_context()
+
+    assert plan.status == "ready"
+    assert plan.edits[0].path == "service.py"
+    assert main(["generate", "service-context", "--dry-run", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
+    assert service_path.read_text(encoding="utf-8") == previous
+
+    assert main(["generate", "service-context", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
+    migrated = service_path.read_text(encoding="utf-8")
+    assert "    ProjectControlPlaneContext,\n" in migrated
+    assert "    project_context: ProjectControlPlaneContext | None = None,\n" in migrated
+    assert "        project_context=project_context,\n" in migrated
+
+    assert main(["check", "--json"]) == 1
+    after_migration = json.loads(capsys.readouterr().out)
+    assert "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED" not in {
+        item["code"] for item in after_migration["diagnostics"]
+    }
+
+    assert main(["generate", "service-context", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "already_present"
+
+
+def test_generate_service_context_fails_closed_for_a_customized_factory(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "service", "--template", "service", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "service"
+    service_path = project / "service.py"
+    source = service_path.read_text(encoding="utf-8").replace(
+        "        project_context=project_context,\n",
+        "        project_context=None,\n",
+    )
+    service_path.write_text(source, encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    assert main(["generate", "service-context", "--json"]) == 1
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "manual_action_required"
+    assert "customized value" in result["conflicts"][0]["reason"]
+    assert service_path.read_text(encoding="utf-8") == source
 
 
 def test_generate_tool_attaches_first_tracer_bullet_to_scaffold_starter(

@@ -177,6 +177,9 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert "AuthenticatedAccess" in service_source
     assert "PlaceholderOperatorAccess" in service_source
     assert "ProductPrincipal" in service_source
+    assert "ProjectControlPlaneContext" in service_source
+    assert "project_context: ProjectControlPlaneContext | None = None" in service_source
+    assert "project_context=project_context" in service_source
     assert "PRODUCT_AUTH_TOKENS_JSON" in service_source
     assert "CAYU_OPERATOR_BEARER_TOKEN" in service_source
     assert "@app." not in service_source
