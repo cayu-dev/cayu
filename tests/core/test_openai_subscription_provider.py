@@ -9,7 +9,13 @@ import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import Message, __version__
-from cayu.providers import ModelContextOverflowError, ModelRequest, ModelStreamEventType
+from cayu.providers import (
+    HostedToolCapabilityError,
+    ModelContextOverflowError,
+    ModelRequest,
+    ModelStreamEventType,
+    OpenAIWebSearch,
+)
 from cayu.providers.openai_subscription import (
     OpenAISubscriptionAuthError,
     OpenAISubscriptionCredentials,
@@ -132,6 +138,130 @@ def test_subscription_provider_uses_codex_endpoint_with_honest_cayu_identity() -
     assert call["headers"]["user-agent"] == f"cayu/{__version__}"
     assert call["payload"]["store"] is False
     assert call["payload"]["stream"] is True
+
+
+def test_subscription_provider_projects_native_hosted_web_search() -> None:
+    transport = RecordingTransport()
+    provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)
+    request = ModelRequest(
+        model="gpt-5.6-luna",
+        messages=[Message.text("user", "Search official OpenAI documentation")],
+        hosted_tools=(
+            OpenAIWebSearch(
+                search_context_size="low",
+                external_web_access=False,
+                allowed_domains=("openai.com",),
+            ),
+        ),
+    )
+
+    async def collect():
+        return [event async for event in provider.stream(request)]
+
+    asyncio.run(collect())
+
+    assert transport.calls[0]["payload"]["tools"] == [
+        {
+            "type": "web_search",
+            "search_context_size": "low",
+            "external_web_access": False,
+            "filters": {"allowed_domains": ["openai.com"]},
+        }
+    ]
+    assert transport.calls[0]["payload"]["include"] == [
+        "reasoning.encrypted_content",
+        "web_search_call.action.sources",
+    ]
+
+
+def test_subscription_provider_maps_backend_hosted_tool_rejection_to_capability_error() -> None:
+    class RejectingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "unsupported_tool",
+                        "param": "tools[0].type",
+                        "message": "raw backend detail must not escape",
+                    }
+                },
+            }
+
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=RejectingTransport(),
+    )
+    request = ModelRequest(
+        model="gpt-5.6-luna",
+        messages=[Message.text("user", "Search")],
+        hosted_tools=(OpenAIWebSearch(),),
+    )
+
+    async def collect() -> None:
+        with pytest.raises(
+            HostedToolCapabilityError,
+            match="experimental OpenAI subscription backend rejected hosted web search",
+        ) as raised:
+            _ = [event async for event in provider.stream(request)]
+        assert "raw backend detail" not in str(raised.value)
+
+    asyncio.run(collect())
+
+
+@pytest.mark.parametrize(
+    ("param", "expect_capability_error"),
+    [
+        ("tools[0].type", True),
+        ("reasoning.effort", False),
+    ],
+)
+def test_subscription_provider_requires_tool_provenance_for_generic_value_rejection(
+    param: str,
+    expect_capability_error: bool,
+) -> None:
+    class RejectingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "invalid_value",
+                        "param": param,
+                        "message": "raw backend detail must not escape",
+                    }
+                },
+            }
+
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=RejectingTransport(),
+    )
+    request = ModelRequest(
+        model="gpt-5.6-luna",
+        messages=[Message.text("user", "Search")],
+        hosted_tools=(OpenAIWebSearch(),),
+    )
+
+    async def collect():
+        return [event async for event in provider.stream(request)]
+
+    if expect_capability_error:
+        with pytest.raises(
+            HostedToolCapabilityError,
+            match="experimental OpenAI subscription backend rejected hosted web search",
+        ):
+            asyncio.run(collect())
+        return
+
+    events = asyncio.run(collect())
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error"] == "OpenAI subscription provider failed."
+    assert "raw backend detail" not in str(events[0].payload)
 
 
 def test_subscription_provider_preserves_codex_end_turn_false() -> None:

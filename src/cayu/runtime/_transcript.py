@@ -8,7 +8,9 @@ from uuid import uuid4
 
 from cayu._validation import copy_json_value
 from cayu.core.messages import (
+    CitationPart,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -40,6 +42,11 @@ class AssistantThinkingPart:
     text: str
     provider_state: dict[str, Any] | None = None
     include: bool = True
+
+
+AssistantContentPart = (
+    AssistantTextPart | AssistantThinkingPart | ToolCallPart | HostedToolCallPart | CitationPart
+)
 
 
 def initial_messages(
@@ -176,11 +183,18 @@ def _part_matches_tool_round_identity(
 
 def assistant_message(
     *,
-    content_parts: list[AssistantTextPart | AssistantThinkingPart | ToolCallPart],
+    content_parts: list[AssistantContentPart],
     provider_state_parts: list[ProviderStatePart],
 ) -> Message | None:
     content: list[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart
     ] = []
     for part in content_parts:
         if type(part) is AssistantTextPart:
@@ -195,7 +209,16 @@ def assistant_message(
         if type(part) is ToolCallPart:
             content.append(copy_message_part(part))
             continue
-        raise TypeError("Assistant content must contain text buffers, thinking, or tool calls.")
+        if type(part) is HostedToolCallPart:
+            content.append(copy_message_part(part))
+            continue
+        if type(part) is CitationPart:
+            content.append(copy_message_part(part))
+            continue
+        raise TypeError(
+            "Assistant content must contain text buffers, thinking, tool calls, hosted calls, "
+            "or citations."
+        )
     content.extend(provider_state_parts)
     if not content:
         return None
@@ -214,7 +237,7 @@ def _materialize_thinking(part: AssistantThinkingPart) -> ThinkingPart | None:
 
 
 def append_assistant_text_delta(
-    content_parts: list[AssistantTextPart | AssistantThinkingPart | ToolCallPart],
+    content_parts: list[AssistantContentPart],
     delta: str,
 ) -> None:
     if not delta:
@@ -227,7 +250,7 @@ def append_assistant_text_delta(
 
 
 def append_assistant_thinking_delta(
-    content_parts: list[AssistantTextPart | AssistantThinkingPart | ToolCallPart],
+    content_parts: list[AssistantContentPart],
     delta: str,
     *,
     provider_state: dict[str, Any] | None = None,
@@ -341,7 +364,14 @@ def assistant_message_without_tool_round(
     identity = copy_tool_round_identity(identity)
     tool_call_seen = False
     content: list[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart
     ] = []
     for part in message.content:
         if type(part) is not ToolCallPart:

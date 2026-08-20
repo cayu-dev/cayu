@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Sequence
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     StrictBool,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -196,9 +199,236 @@ class FilePart(BaseModel):
         return FileAttachment.model_validate(copied).model_dump(mode="json")
 
 
+def _is_valid_url_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            ascii_hostname = hostname.removesuffix(".").encode("idna").decode("ascii")
+        except UnicodeError:
+            return False
+        labels = ascii_hostname.split(".")
+        return (
+            0 < len(ascii_hostname) <= 253
+            and all(0 < len(label) <= 63 for label in labels)
+            and all(label[0].isalnum() and label[-1].isalnum() for label in labels)
+            and all(
+                character.isalnum() or character == "-" for label in labels for character in label
+            )
+        )
+    return True
+
+
+class WebSearchSource(BaseModel):
+    """Bounded external source returned by a provider-hosted web search."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    type: Literal["url"] = "url"
+    url: str = Field(max_length=4096)
+    title: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        value = _require_clean_nonblank("url", value)
+        parsed = urlsplit(value)
+        try:
+            hostname = parsed.hostname
+            _port = parsed.port
+        except ValueError as exc:
+            raise ValueError("Web search source URLs must use a valid http or https host.") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or hostname is None
+            or not hostname
+            or not _is_valid_url_hostname(hostname)
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("Web search source URLs must use http or https.")
+        return value
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_nonblank("title", value)
+
+
+class WebSearchAction(BaseModel):
+    """Bounded provider-neutral terminal web-search action evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    type: Literal["search", "open_page", "find_in_page"]
+    query: str | None = Field(default=None, max_length=4096)
+    queries: tuple[str, ...] = Field(default=(), max_length=100)
+    url: str | None = Field(default=None, max_length=4096)
+    pattern: str | None = Field(default=None, max_length=4096)
+    sources: tuple[WebSearchSource, ...] = Field(default=(), max_length=100)
+
+    @field_validator("query", "pattern")
+    @classmethod
+    def validate_optional_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _require_nonblank(info.field_name, value)
+
+    @field_validator("url")
+    @classmethod
+    def validate_optional_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return WebSearchSource.validate_url(value)
+
+    @field_validator("queries", mode="before")
+    @classmethod
+    def copy_queries(cls, value: object) -> tuple[str, ...]:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("queries must be a list or tuple.")
+        queries: list[str] = []
+        for item in value:
+            if type(item) is not str:
+                raise ValueError("queries must contain strings.")
+            queries.append(_require_nonblank("query", item))
+        if any(len(query) > 4096 for query in queries):
+            raise ValueError("queries must contain bounded strings.")
+        return tuple(queries)
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def copy_sources(cls, value: object) -> tuple[WebSearchSource, ...]:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("sources must be a list or tuple.")
+        return tuple(WebSearchSource.model_validate(source) for source in value)
+
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> WebSearchAction:
+        if self.type == "search" and self.query is None and not self.queries:
+            raise ValueError("Search actions require query or queries.")
+        if self.type == "open_page" and self.url is None:
+            raise ValueError("Open-page actions require url.")
+        if self.type == "find_in_page" and (self.url is None or self.pattern is None):
+            raise ValueError("Find-in-page actions require url and pattern.")
+        return self
+
+
+class HostedToolCallPart(BaseModel):
+    """Terminal provider-hosted execution evidence in an assistant transcript."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    type: Literal["hosted_tool_call"] = "hosted_tool_call"
+    hosted_tool: Literal["web_search"] = "web_search"
+    call_id: str = Field(max_length=512)
+    status: Literal["completed", "incomplete", "failed", "outcome_unknown"]
+    action: WebSearchAction | None = None
+    provider_name: str = Field(max_length=128)
+    model: str = Field(max_length=512)
+    model_step_id: str
+    model_attempt_id: str
+
+    @field_validator("call_id", "provider_name", "model")
+    @classmethod
+    def validate_identity_text(cls, value: str, info) -> str:
+        return _require_clean_nonblank(info.field_name, value)
+
+    @field_validator("model_step_id", "model_attempt_id")
+    @classmethod
+    def validate_execution_identity(cls, value: str, info) -> str:
+        return require_execution_unit_id(value, info.field_name)
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def copy_action(cls, value: object) -> object:
+        if value is None:
+            return None
+        return WebSearchAction.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_terminal_action(self) -> HostedToolCallPart:
+        if self.status == "completed" and self.action is None:
+            raise ValueError("Completed hosted tool calls require terminal action evidence.")
+        return self
+
+
+class CitationProvenance(BaseModel):
+    """Trust label for provider-hosted citation evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    provider_name: str = Field(max_length=128)
+    hosted_tool: Literal["web_search"] = "web_search"
+    untrusted_external_evidence: Literal[True] = True
+
+    @field_validator("provider_name")
+    @classmethod
+    def validate_provider_name(cls, value: str) -> str:
+        return _require_clean_nonblank("provider_name", value)
+
+
+class CitationPart(BaseModel):
+    """Provider-neutral citation annotation over assistant text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    type: Literal["citation"] = "citation"
+    citation_type: Literal["url_citation"] = "url_citation"
+    url: str = Field(max_length=4096)
+    title: str | None = Field(default=None, max_length=1024)
+    start_index: StrictInt | None = Field(default=None, ge=0)
+    end_index: StrictInt | None = Field(default=None, gt=0)
+    provenance: CitationProvenance
+    model_step_id: str
+    model_attempt_id: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        return WebSearchSource.validate_url(value)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_nonblank("title", value)
+
+    @field_validator("model_step_id", "model_attempt_id")
+    @classmethod
+    def validate_execution_identity(cls, value: str, info) -> str:
+        return require_execution_unit_id(value, info.field_name)
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def copy_provenance(cls, value: object) -> CitationProvenance:
+        return CitationProvenance.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_offsets(self) -> CitationPart:
+        if (self.start_index is None) != (self.end_index is None):
+            raise ValueError("Citation offsets must be supplied together.")
+        if (
+            self.start_index is not None
+            and self.end_index is not None
+            and self.end_index <= self.start_index
+        ):
+            raise ValueError("Citation end_index must be greater than start_index.")
+        return self
+
+
 class _ValidatedContent(
     tuple[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart,
         ...,
     ]
 ):
@@ -231,7 +461,14 @@ class Message(BaseModel):
 
     role: MessageRole
     content: tuple[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart,
         ...,
     ] = ()
 
@@ -256,6 +493,8 @@ class Message(BaseModel):
                 ToolCallPart,
                 ProviderStatePart,
                 ThinkingPart,
+                HostedToolCallPart,
+                CitationPart,
             )
         elif self.role == MessageRole.TOOL:
             _require_parts(self.role, self.content, ToolResultPart)
@@ -278,7 +517,14 @@ class Message(BaseModel):
         calls: list[ToolCallPart] | None = None,
     ) -> Message:
         content: list[
-            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+            TextPart
+            | ToolCallPart
+            | ToolResultPart
+            | ProviderStatePart
+            | ThinkingPart
+            | FilePart
+            | HostedToolCallPart
+            | CitationPart
         ]
         if calls is not None:
             if any(
@@ -328,7 +574,14 @@ class Message(BaseModel):
         results: list[ToolResultPart] | None = None,
     ) -> Message:
         result_parts: list[
-            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+            TextPart
+            | ToolCallPart
+            | ToolResultPart
+            | ProviderStatePart
+            | ThinkingPart
+            | FilePart
+            | HostedToolCallPart
+            | CitationPart
         ]
         if not isinstance(content, str):
             raise ValueError("`content` must be a string.")
@@ -373,7 +626,14 @@ class Message(BaseModel):
 def _require_parts(
     role: MessageRole,
     content: Sequence[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart
     ],
     *allowed_types: (
         type[TextPart]
@@ -382,6 +642,8 @@ def _require_parts(
         | type[ProviderStatePart]
         | type[ThinkingPart]
         | type[FilePart]
+        | type[HostedToolCallPart]
+        | type[CitationPart]
     ),
 ) -> None:
     invalid_parts = [part.type for part in content if not isinstance(part, allowed_types)]
@@ -404,6 +666,8 @@ _MESSAGE_PART_TYPES = (
     ProviderStatePart,
     ThinkingPart,
     FilePart,
+    HostedToolCallPart,
+    CitationPart,
 )
 
 
@@ -440,8 +704,24 @@ def copy_message(message: Message) -> Message:
 
 
 def copy_message_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
-) -> TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart:
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
+) -> (
+    TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart
+):
     """Return an owned copy of `part`.
 
     Parts are frozen, but the caller that constructed a part may still hold

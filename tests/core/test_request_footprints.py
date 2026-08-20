@@ -18,6 +18,7 @@ from cayu import (
     ModelRequest,
     ModelStreamEvent,
     OpenAIProvider,
+    OpenAIWebSearch,
     PromptContributionAvailability,
     PromptContributionKind,
     RequestFingerprintAvailability,
@@ -296,6 +297,35 @@ def test_request_footprint_records_exact_content_free_shape() -> None:
         "attachment-secret-metadata",
     ):
         assert private_value not in serialized
+
+
+def test_request_footprint_binds_hosted_web_search_authority() -> None:
+    config = RequestFootprintConfig(
+        fingerprint_key_id="hosted-tool-key",
+        fingerprint_key=SecretStr("h" * 32),
+    )
+    baseline_request = _request()
+    hosted_request = baseline_request.model_copy(
+        update={
+            "hosted_tools": (
+                OpenAIWebSearch(
+                    search_context_size="high",
+                    external_web_access=False,
+                    blocked_domains=("example.com",),
+                ),
+            )
+        }
+    )
+
+    baseline = _build(baseline_request, config=config)
+    hosted = _build(hosted_request, config=config)
+
+    assert hosted.tools.count == baseline.tools.count + 1
+    assert (
+        hosted.fingerprints.provider_neutral_request.value
+        != baseline.fingerprints.provider_neutral_request.value
+    )
+    assert hosted.fingerprints.tool_manifest.value != baseline.fingerprints.tool_manifest.value
 
 
 def test_unknown_provider_option_values_do_not_affect_persisted_measurements() -> None:

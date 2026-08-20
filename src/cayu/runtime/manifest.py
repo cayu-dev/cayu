@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "8"
+APP_MANIFEST_SCHEMA_VERSION = "9"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -162,6 +162,18 @@ class ToolManifest(_ManifestModel):
     implementation_provenance: RegistrationProvenance
 
 
+class HostedToolManifest(_ManifestModel):
+    """Typed provider-hosted authority declared by one agent registration."""
+
+    type: Literal["openai_web_search"]
+    search_context_size: Literal["low", "medium", "high"]
+    external_web_access: bool
+    allowed_domains: tuple[str, ...]
+    blocked_domains: tuple[str, ...]
+    return_token_budget: Literal["default", "unlimited"]
+    include_sources: bool
+
+
 class AgentManifest(_ManifestModel):
     name: str
     model: str
@@ -174,6 +186,7 @@ class AgentManifest(_ManifestModel):
     authoring_state: AgentAuthoringState | None = None
     execution_requirements: ExecutionRequirements
     tools: tuple[ToolManifest, ...] = ()
+    hosted_tools: tuple[HostedToolManifest, ...] = ()
     tool_policy: str
     context_policy: str
     context_overflow_policy: str | None
@@ -260,7 +273,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["8"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["9"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -452,6 +465,10 @@ def _describe_agent(
                 implementation_provenance=_provenance(tool.tool, project_root),
             )
             for tool_name, tool in sorted(registration.tools.items())
+        ),
+        hosted_tools=tuple(
+            HostedToolManifest.model_validate(tool.model_dump(mode="python"))
+            for tool in registration.hosted_tools
         ),
         tool_policy=_type_name(registration.tool_policy),
         context_policy=_type_name(registration.context_policy),

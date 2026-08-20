@@ -19,6 +19,7 @@ from cayu.environments import (
     ExecutionRequirements,
 )
 from cayu.providers import ModelProvider, UsageDialect
+from cayu.providers.hosted import OpenAIWebSearch
 from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.context import ContextPolicy
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 class RegisteredAgent:
     spec: AgentSpec
     tools: Mapping[str, RegisteredTool]
+    hosted_tools: tuple[OpenAIWebSearch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,7 @@ class RegisteredAgentState:
     all_registered_tool_exposure: ResolvedToolExposure | None
     tool_exposure_policy: ToolExposurePolicy
     tool_exposure_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
+    hosted_tools: tuple[OpenAIWebSearch, ...]
     context_policy: ContextPolicy
     context_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     context_overflow_policy: ContextPolicy | None

@@ -784,6 +784,70 @@ function TranscriptPart({ part }: { part: Record<string, unknown> }) {
     )
   }
 
+  if (type === "citation") {
+    const url = typeof part.url === "string" ? part.url : ""
+    const title = typeof part.title === "string" ? part.title : url
+    return (
+      <div className="min-w-0 rounded border border-chart-3/25 bg-chart-3/5 px-3 py-2">
+        <div className="mb-1 flex items-center gap-2">
+          <Badge variant="outline">Web citation</Badge>
+          <span className="text-xs text-muted-foreground">Untrusted external evidence</span>
+        </div>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer nofollow"
+          className="break-all text-sm text-primary underline underline-offset-2"
+        >
+          {title || url}
+        </a>
+      </div>
+    )
+  }
+
+  if (type === "hosted_tool_call") {
+    const status = typeof part.status === "string" ? part.status : "unknown"
+    const action =
+      part.action && typeof part.action === "object"
+        ? (part.action as Record<string, unknown>)
+        : null
+    const sources = Array.isArray(action?.sources)
+      ? action.sources.filter(
+          (source): source is Record<string, unknown> =>
+            source !== null && typeof source === "object",
+        )
+      : []
+    return (
+      <div className="min-w-0 rounded border border-border bg-background/60 px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary">OpenAI hosted web search</Badge>
+          <Badge variant="outline">{status.replaceAll("_", " ")}</Badge>
+          <span className="text-xs text-muted-foreground">{sources.length} sources</span>
+        </div>
+        {sources.length > 0 && (
+          <ul className="mt-2 space-y-1 text-sm">
+            {sources.map((source) => {
+              const url = typeof source.url === "string" ? source.url : ""
+              const title = typeof source.title === "string" ? source.title : url
+              return (
+                <li key={`${url}:${String(source.title ?? "")}`}>
+                  <a
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer nofollow"
+                    className="break-all text-primary underline underline-offset-2"
+                  >
+                    {title || url}
+                  </a>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </div>
+    )
+  }
+
   return <PayloadViewer value={part} maxHeight="max-h-48" />
 }
 

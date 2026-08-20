@@ -273,6 +273,29 @@ also advance to schema version 2 so attempt-level cost and runtime evidence can
 identify the governing profile. These records remain content-free: they do not
 retain raw prompts, knowledge, credentials, secrets, or unbounded schemas.
 
+### OpenAI providers support native hosted web search
+
+Applications can grant one registered agent immutable, typed
+`OpenAIWebSearch` authority separately from Cayu-executed tools. Both the API-key
+and experimental subscription providers send the native Responses API tool,
+retain completed search actions, complete returned source lists, and URL
+citations, and publish bounded provider-owned lifecycle evidence. Search calls
+and unknown outcomes are accounted independently from tokens; current published
+OpenAI call pricing is represented with source provenance, while unavailable
+pricing remains explicitly unpriced. Strict budgets reject hosted search when a
+hard per-response call ceiling cannot be established.
+
+The public application manifest and generator plan advance from schema version
+8 to version 9 because hosted-tool authority participates in registration and
+execution identity. Regenerate committed manifests and generated plans; older
+schema documents are not interpreted as granting hosted search. The server
+contract advances from version 15 to version 16 because usage and cost
+projections add hosted-search resource fields. Upgrade independently deployed
+servers, packaged dashboards, and generated clients together. This change does
+not require a storage migration. Paired cost-quality reports advance from schema
+version 2 to version 3 so Compound and other comparison consumers retain hosted
+search calls, unknown outcomes, and their separately priced resource cost.
+
 ### Fork and workspace branch authority fails closed
 
 `CURRENT_CHILD` session forks now require an attributable application authority

@@ -74,9 +74,11 @@ from cayu.environments import (
 )
 from cayu.providers import (
     ModelProvider,
+    OpenAIWebSearch,
     ProviderOperationSnapshot,
     copy_usage_dialect,
 )
+from cayu.providers.hosted import copy_openai_web_search
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
@@ -1627,6 +1629,7 @@ class CayuApp:
         spec: AgentSpec,
         *,
         tools: Iterable[Tool] | None = None,
+        hosted_tools: Iterable[OpenAIWebSearch] | None = None,
         context_policy: ContextPolicy | None = None,
         context_overflow_policy: ContextPolicy | None = None,
         tool_exposure_policy: ToolExposurePolicy | None = None,
@@ -1704,6 +1707,23 @@ class CayuApp:
                 raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
             tools_by_name[registered_tool.name] = registered_tool
 
+        if hosted_tools is None:
+            stored_hosted_tools: tuple[OpenAIWebSearch, ...] = ()
+        else:
+            if isinstance(hosted_tools, str | bytes):
+                raise TypeError("Agent hosted_tools must be an iterable of hosted tool instances.")
+            try:
+                copied_hosted_tools = tuple(
+                    copy_openai_web_search(hosted_tool) for hosted_tool in hosted_tools
+                )
+            except TypeError as exc:
+                raise TypeError(
+                    "Agent hosted_tools must be an iterable of hosted tool instances."
+                ) from exc
+            if len(copied_hosted_tools) > 1:
+                raise ValueError("Duplicate OpenAI web search hosted tool registered for agent.")
+            stored_hosted_tools = copied_hosted_tools
+
         registration_source, registration_symbol = _registration_site()
         tool_capabilities = tuple(
             RegisteredToolCapability(
@@ -1746,6 +1766,7 @@ class CayuApp:
                     field_name=("tool_exposure_policy.execution_profile_identity"),
                 )
             ),
+            hosted_tools=stored_hosted_tools,
             context_policy=stored_context_policy,
             context_policy_execution_profile_identity=(
                 copy_secret_free_execution_profile_behavior_identity(
@@ -1823,6 +1844,7 @@ class CayuApp:
             if (
                 existing.tools
                 or existing.tool_capabilities
+                or existing.hosted_tools
                 or existing.spec.workflow_tool_names
                 or existing.runtime_hooks
                 or existing.loop_policies
@@ -1861,6 +1883,7 @@ class CayuApp:
                         field_name="context_policy.execution_profile_identity",
                     )
                 ),
+                hosted_tools=(),
                 context_overflow_policy=None,
                 context_overflow_policy_execution_profile_identity=None,
                 tool_policy=AllowAllToolPolicy(),
@@ -2114,6 +2137,9 @@ class CayuApp:
             tools={
                 name: _copy_registered_tool(tool) for name, tool in registered_agent.tools.items()
             },
+            hosted_tools=tuple(
+                copy_openai_web_search(tool) for tool in registered_agent.hosted_tools
+            ),
         )
 
     async def current_prompt_anatomy_sha256(
@@ -4172,11 +4198,15 @@ class CayuApp:
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
-        # Cost derives only from model.completed events; skip the rest of the log.
+        # Token cost derives from completions; independently terminal hosted
+        # calls also carry priceable resource evidence when completion is absent.
         cost_event_records = await self._query_all_event_records(
             EventQuery(
                 session_id=session_id,
-                event_type=EventType.MODEL_COMPLETED,
+                event_types=(
+                    EventType.MODEL_COMPLETED,
+                    EventType.MODEL_HOSTED_TOOL_CALL,
+                ),
             )
         )
         summary = estimate_session_cost(
@@ -4209,7 +4239,10 @@ class CayuApp:
         records = await self._query_all_event_records(
             EventQuery(
                 causal_budget_id=causal_budget_id,
-                event_type=EventType.MODEL_COMPLETED,
+                event_types=(
+                    EventType.MODEL_COMPLETED,
+                    EventType.MODEL_HOSTED_TOOL_CALL,
+                ),
             )
         )
         summary = estimate_causal_budget_cost(

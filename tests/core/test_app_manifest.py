@@ -18,6 +18,7 @@ from cayu import (
     EnvironmentSpec,
     ExecCommandTool,
     ExecutionRequirements,
+    OpenAIWebSearch,
     ProcessCommandPolicy,
     RequestFootprintConfig,
     ScriptedModelProvider,
@@ -153,7 +154,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "8"
+    assert manifest.schema_version == "9"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -202,6 +203,36 @@ def test_request_footprint_config_is_safely_manifested_and_fingerprinted() -> No
     assert disabled.runtime.request_footprint.enabled is False
     assert enabled.fingerprint != disabled.fingerprint
     assert "m" * 32 not in enabled.model_dump_json()
+
+
+def test_hosted_web_search_authority_is_manifested_and_fingerprinted() -> None:
+    low = CayuApp(enable_logging=False)
+    low.register_agent(
+        AgentSpec(name="researcher", model="gpt-5.6"),
+        hosted_tools=[
+            OpenAIWebSearch(
+                search_context_size="low",
+                external_web_access=False,
+                allowed_domains=("openai.com",),
+            )
+        ],
+    )
+    high = CayuApp(enable_logging=False)
+    high.register_agent(
+        AgentSpec(name="researcher", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch(search_context_size="high")],
+    )
+
+    assert low.describe().agents[0].hosted_tools[0].model_dump(mode="json") == {
+        "type": "openai_web_search",
+        "search_context_size": "low",
+        "external_web_access": False,
+        "allowed_domains": ["openai.com"],
+        "blocked_domains": [],
+        "return_token_budget": "default",
+        "include_sources": True,
+    }
+    assert low.describe().fingerprint != high.describe().fingerprint
 
 
 def test_tool_result_projection_policy_is_manifested_and_fingerprinted() -> None:
@@ -431,7 +462,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "8"
+    assert schema["properties"]["schema_version"]["const"] == "9"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -540,7 +571,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "8",
+                "schema_version": "9",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {

@@ -13,7 +13,9 @@ from cayu.artifacts import (
     resolved_file_attachments_from_options,
 )
 from cayu.core.messages import (
+    CitationPart,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -1504,7 +1506,7 @@ def _anthropic_message(
         # runtime assembles them first, so preserving content order keeps that ordering.
         content: list[dict[str, Any]] = []
         for part in message.content:
-            if type(part) is ProviderStatePart:
+            if type(part) in {ProviderStatePart, HostedToolCallPart, CitationPart}:
                 continue
             if type(part) is ThinkingPart:
                 thinking_block = _assistant_thinking_block(
@@ -1533,7 +1535,14 @@ def _anthropic_message(
 
 
 def _user_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
@@ -1560,7 +1569,14 @@ def _resolved_user_attachment(
 
 
 def _assistant_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
 ) -> dict[str, Any]:
     if type(part) is TextPart:
         return {"type": "text", "text": part.text}
@@ -1605,7 +1621,14 @@ def _assistant_thinking_block(
 
 
 def _tool_result_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:

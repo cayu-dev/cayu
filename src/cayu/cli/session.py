@@ -2000,6 +2000,12 @@ def _message_preview(serialized: dict[str, Any], *, max_bytes: int) -> str:
             previews.append(f"{part['tool_name']}: {part['content']}")
         elif kind == "file":
             previews.append("[file]")
+        elif kind == "citation":
+            previews.append(f"[citation: {part['url']}]")
+        elif kind == "hosted_tool_call":
+            action = part.get("action")
+            source_count = len(action.get("sources", [])) if isinstance(action, dict) else 0
+            previews.append(f"[hosted web search {part['status']}: {source_count} sources]")
         else:
             previews.append(f"[{kind}]")
     if len(content) > _MAX_TRANSCRIPT_SUMMARY_PARTS:

@@ -255,7 +255,66 @@ Applications can lower the trusted defaults with `max_response_bytes`,
 `max_content_bytes`, `timeout_seconds`, and `max_redirects`. Constructor limits
 have finite hard ceilings; none of these controls are exposed to the model.
 
-## Provider-neutral hosted search and fetch
+## OpenAI-hosted Responses search
+
+OpenAI's Responses API can execute `web_search` inside a model turn. Enable it
+as typed registration authority, separately from Cayu-executed tools:
+
+```python
+from cayu import AgentSpec, OpenAIWebSearch
+
+app.register_agent(
+    AgentSpec(name="researcher", model="gpt-5.6-luna"),
+    hosted_tools=[
+        OpenAIWebSearch(
+            search_context_size="medium",
+            external_web_access=True,
+            allowed_domains=("python.org",),
+            return_token_budget="default",
+            include_sources=True,
+        )
+    ],
+)
+```
+
+This is provider-owned execution. OpenAI owns the network request, results,
+retry behavior, quota, and billing; Cayu's local tool policy, approvals, runner,
+DNS policy, and egress proxy do not mediate it. User or model prose cannot
+enable search or widen its registration-time filters. Search results, source
+records, and citations are retained as untrusted external evidence.
+
+Cayu sends the native `{"type":"web_search"}` tool through `OpenAIProvider`
+and the experimental `OpenAISubscriptionProvider`. It preserves bounded
+lifecycle events, complete returned source metadata, inline URL citations,
+completed OpenAI replay state, exact provider token usage, and a distinct count
+for every terminal search call. A stream lost after search starts records an
+unknown outcome; a provider retry may search and bill again. This is not an
+exactly-once boundary.
+
+Lifecycle and citation events include a runtime-owned provider-operation ID in
+addition to model-step, attempt, provider, model, and hosted-call identity.
+Citation offsets are normalized over the final assembled assistant text even
+when OpenAI returns multiple `output_text` parts. Terminal lifecycle events are
+the aggregate usage source; the response-completion copy exists only to attach
+the same calls to per-attempt pricing, so the two durable views do not double
+count successful searches.
+
+`external_web_access=False` is sent exactly and means cache-only provider
+access. Domain filters use bare domain names. `include_sources=True` retains the
+complete source list independently of the subset cited inline. Strict cost
+budgets reject this capability because the Responses API provides no hard
+per-response search-call ceiling. Non-strict accounting reports completed calls
+at the configured price-book rate, or explicitly unpriced/unknown evidence.
+Preflight currently admits the reviewed `gpt-5.6` aliases and `chat-latest`;
+other model names fail closed until their native Responses web-search support
+is established. `return_token_budget="unlimited"` remains restricted to GPT-5.
+
+See [`examples/openai_hosted_web_search.py`](../examples/openai_hosted_web_search.py)
+for a live API-key example that prints durable citations, complete sources, and
+session usage. The subscription backend remains an experimental local-development
+path, not a documented OpenAI Platform API or API-credit substitute.
+
+## Provider-neutral Cayu-executed search and fetch
 
 `WebSearchTool` adds the provider-neutral `web_search` contract. Its closed
 model input contains a required `query` and optional `num_results`; the

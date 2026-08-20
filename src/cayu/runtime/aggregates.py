@@ -37,6 +37,7 @@ from cayu.runtime.usage import (
     AggregateCount,
     AggregateUsageMetrics,
     CacheUsageMetrics,
+    HostedToolUsageMetrics,
     PositiveAggregateCount,
     UsageMetrics,
     add_aggregate_usage,
@@ -216,6 +217,30 @@ def aggregate_usage_metrics_from_event_payload(
             cached_input_tokens=_aggregate_counter(raw_cache.get("cached_input_tokens")),
             uncached_input_tokens=_aggregate_counter(raw_cache.get("uncached_input_tokens")),
         ),
+        # Terminal model.hosted_tool_call events are the sole aggregate source
+        # for hosted-resource counters. Completion copies exist only to price a
+        # model attempt and must not double-count the lifecycle evidence.
+        hosted_tools=HostedToolUsageMetrics(),
+    )
+
+
+def aggregate_hosted_tool_usage_metrics_from_event_payload(
+    payload: dict[str, object],
+) -> UsageMetrics | None:
+    """Project independently durable terminal hosted-resource evidence."""
+
+    if payload.get("tool_type") != "web_search":
+        return None
+    status = payload.get("status")
+    if status not in {"completed", "incomplete", "failed", "outcome_unknown"}:
+        return None
+    return UsageMetrics(
+        provider_name=aggregate_identity_value(payload.get("provider_name")),
+        model=aggregate_identity_value(payload.get("model")),
+        hosted_tools=HostedToolUsageMetrics(
+            web_search_calls=int(status != "outcome_unknown"),
+            web_search_outcome_unknown=int(status == "outcome_unknown"),
+        ),
     )
 
 
@@ -248,11 +273,12 @@ def project_aggregate_usage_inspection_event(
     zero without discarding otherwise valid counters.
     """
 
-    metrics = (
-        aggregate_usage_metrics_from_event_payload(event.payload)
-        if event.type == EventType.MODEL_COMPLETED
-        else None
-    )
+    if event.type == EventType.MODEL_COMPLETED:
+        metrics = aggregate_usage_metrics_from_event_payload(event.payload)
+    elif event.type == EventType.MODEL_HOSTED_TOOL_CALL:
+        metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
+    else:
+        metrics = None
     payload = {"usage_metrics": metrics.model_dump(mode="json")} if metrics is not None else {}
     return event.model_copy(update={"payload": payload}), metrics
 
@@ -260,12 +286,22 @@ def project_aggregate_usage_inspection_event(
 def pricing_usage_metrics_from_event_payload(
     payload: dict[str, object],
     *,
+    event_type: EventType,
     max_bytes: int = MAX_USAGE_PRICING_INPUT_BYTES,
 ) -> UsageMetrics | None:
     """Return strict price-relevant metrics with unbounded evidence removed."""
 
     from cayu.runtime.usage import usage_metrics_from_event_payload
 
+    if event_type == EventType.MODEL_HOSTED_TOOL_CALL:
+        hosted_metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(payload)
+        if hosted_metrics is not None:
+            return hosted_metrics
+        # Native stores cross the memory boundary with a bounded normalized
+        # ``usage_metrics`` projection rather than the original event payload.
+        # Event authority still comes from the separately selected event type.
+    elif event_type != EventType.MODEL_COMPLETED:
+        return None
     if payload.get("usage_normalization_failed") is True:
         return None
     raw_metrics = payload.get("usage_metrics")
@@ -320,6 +356,8 @@ def _usage_metrics_within_aggregate_counter_limit(metrics: UsageMetrics) -> bool
             metrics.cache.write_unknown_ttl_tokens,
             metrics.cache.cached_input_tokens,
             metrics.cache.uncached_input_tokens,
+            metrics.hosted_tools.web_search_calls,
+            metrics.hosted_tools.web_search_outcome_unknown,
         )
     )
 
@@ -592,8 +630,19 @@ class UsageSessionAggregateBreakdown(BaseModel):
         return self
 
 
+UsagePricingEventType = Literal["model.completed", "model.hosted_tool_call"]
+
+
+def _usage_pricing_event_type(event_type: EventType) -> UsagePricingEventType:
+    if event_type == EventType.MODEL_COMPLETED:
+        return "model.completed"
+    if event_type == EventType.MODEL_HOSTED_TOOL_CALL:
+        return "model.hosted_tool_call"
+    raise ValueError("Event type is not price-relevant usage evidence.")
+
+
 class UsagePricingInput(BaseModel):
-    """One bounded group of identical, price-relevant model-step inputs."""
+    """One bounded group of identical, price-relevant event inputs."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -603,6 +652,7 @@ class UsagePricingInput(BaseModel):
     )
     effective_on: date
     occurrences: StrictInt = Field(ge=1)
+    event_type: UsagePricingEventType = "model.completed"
     metrics: UsageMetrics | None = None
 
     @field_validator("session_id")
@@ -624,12 +674,12 @@ def coalesce_usage_pricing_inputs(
     """Merge store-native candidate groups after canonical usage validation."""
 
     grouped: dict[
-        tuple[str | None, date, str | None],
+        tuple[str | None, date, UsagePricingEventType, str | None],
         tuple[int, UsageMetrics | None],
     ] = {}
     for item in inputs:
         metrics_key = usage_pricing_metrics_key(item.metrics)
-        key = (item.session_id, item.effective_on, metrics_key)
+        key = (item.session_id, item.effective_on, item.event_type, metrics_key)
         occurrences, _ = grouped.get(key, (0, item.metrics))
         grouped[key] = (occurrences + item.occurrences, item.metrics)
     return tuple(
@@ -639,15 +689,22 @@ def coalesce_usage_pricing_inputs(
                     session_id=session_id,
                     effective_on=effective_on,
                     occurrences=occurrences,
+                    event_type=event_type,
                     metrics=metrics,
                 )
-                for (session_id, effective_on, _), (occurrences, metrics) in grouped.items()
+                for (
+                    session_id,
+                    effective_on,
+                    event_type,
+                    _,
+                ), (occurrences, metrics) in grouped.items()
             ),
             key=lambda item: (
                 item.session_id is None,
                 item.session_id or "",
                 -item.occurrences,
                 item.effective_on,
+                item.event_type,
                 "" if item.metrics is None else usage_pricing_metrics_key(item.metrics) or "",
             ),
         )
@@ -661,7 +718,7 @@ class BoundedUsagePricingInputAccumulator:
     limit: int
     max_bytes: int = MAX_USAGE_PRICING_INPUT_BYTES
     _groups: dict[
-        tuple[str | None, date, str | None],
+        tuple[str | None, date, UsagePricingEventType, str | None],
         tuple[int, UsageMetrics | None],
     ] = dataclass_field(default_factory=dict, init=False)
     _retained_bytes: int = dataclass_field(default=0, init=False)
@@ -680,7 +737,7 @@ class BoundedUsagePricingInputAccumulator:
         if self.truncated:
             return
         metrics_key = usage_pricing_metrics_key(item.metrics)
-        key = (item.session_id, item.effective_on, metrics_key)
+        key = (item.session_id, item.effective_on, item.event_type, metrics_key)
         existing = self._groups.get(key)
         if existing is not None:
             self._groups[key] = (existing[0] + item.occurrences, existing[1])
@@ -694,8 +751,10 @@ class BoundedUsagePricingInputAccumulator:
             )
             return
         retained_bytes = (
-            0 if item.session_id is None else len(item.session_id.encode("utf-8"))
-        ) + (0 if metrics_key is None else len(metrics_key.encode("utf-8")))
+            (0 if item.session_id is None else len(item.session_id.encode("utf-8")))
+            + len(item.event_type.encode("ascii"))
+            + (0 if metrics_key is None else len(metrics_key.encode("utf-8")))
+        )
         if self._retained_bytes + retained_bytes > self.max_bytes:
             self._truncate(
                 group_count=observed_group_count,
@@ -709,6 +768,7 @@ class BoundedUsagePricingInputAccumulator:
     def add_payload(
         self,
         *,
+        event_type: EventType,
         session_id: str | None = None,
         effective_on: date,
         occurrences: int,
@@ -721,6 +781,7 @@ class BoundedUsagePricingInputAccumulator:
         try:
             metrics = pricing_usage_metrics_from_event_payload(
                 payload,
+                event_type=event_type,
                 max_bytes=self.max_bytes,
             )
         except _UsagePricingInputTooLarge:
@@ -731,6 +792,7 @@ class BoundedUsagePricingInputAccumulator:
                 session_id=session_id,
                 effective_on=effective_on,
                 occurrences=occurrences,
+                event_type=_usage_pricing_event_type(event_type),
                 metrics=metrics,
             )
         )
@@ -794,9 +856,15 @@ class BoundedUsagePricingInputAccumulator:
                 session_id=session_id,
                 effective_on=effective_on,
                 occurrences=occurrences,
+                event_type=event_type,
                 metrics=metrics,
             )
-            for (session_id, effective_on, _), (occurrences, metrics) in self._groups.items()
+            for (
+                session_id,
+                effective_on,
+                event_type,
+                _,
+            ), (occurrences, metrics) in self._groups.items()
         )
         return inputs, len(inputs), EXACT_AGGREGATE.model_copy()
 
@@ -805,23 +873,29 @@ def _session_pricing_remainder_groups(
     *,
     shared: tuple[UsagePricingInput, ...],
     retained: tuple[UsagePricingInput, ...],
-) -> dict[tuple[date, str | None], tuple[int, UsageMetrics | None]]:
+) -> dict[
+    tuple[date, UsagePricingEventType, str | None],
+    tuple[int, UsageMetrics | None],
+]:
     """Subtract retained occurrences without allocating another input projection."""
 
     shared_groups: dict[
-        tuple[date, str | None],
+        tuple[date, UsagePricingEventType, str | None],
         tuple[int, UsageMetrics | None],
     ] = {}
     for item in shared:
-        key = (item.effective_on, usage_pricing_metrics_key(item.metrics))
+        key = (item.effective_on, item.event_type, usage_pricing_metrics_key(item.metrics))
         occurrences, _ = shared_groups.get(key, (0, item.metrics))
         shared_groups[key] = occurrences + item.occurrences, item.metrics
-    retained_occurrences: dict[tuple[date, str | None], int] = {}
+    retained_occurrences: dict[tuple[date, UsagePricingEventType, str | None], int] = {}
     for item in retained:
-        key = (item.effective_on, usage_pricing_metrics_key(item.metrics))
+        key = (item.effective_on, item.event_type, usage_pricing_metrics_key(item.metrics))
         retained_occurrences[key] = retained_occurrences.get(key, 0) + item.occurrences
 
-    remainder: dict[tuple[date, str | None], tuple[int, UsageMetrics | None]] = {}
+    remainder: dict[
+        tuple[date, UsagePricingEventType, str | None],
+        tuple[int, UsageMetrics | None],
+    ] = {}
     for key, (shared_count, metrics) in shared_groups.items():
         retained_count = retained_occurrences.pop(key, 0)
         if retained_count > shared_count:
@@ -845,9 +919,10 @@ def _session_pricing_input_remainder(
         UsagePricingInput(
             effective_on=effective_on,
             occurrences=occurrences,
+            event_type=event_type,
             metrics=metrics,
         )
-        for (effective_on, _), (occurrences, metrics) in remainder.items()
+        for (effective_on, event_type, _), (occurrences, metrics) in remainder.items()
     )
 
 
@@ -869,7 +944,15 @@ def _scaled_pricing_usage(
         cache_write_unknown_ttl_tokens=(metrics.cache.write_unknown_ttl_tokens * occurrences),
         cached_input_tokens=metrics.cache.cached_input_tokens * occurrences,
         uncached_input_tokens=metrics.cache.uncached_input_tokens * occurrences,
+        web_search_calls=metrics.hosted_tools.web_search_calls * occurrences,
+        web_search_outcome_unknown=(metrics.hosted_tools.web_search_outcome_unknown * occurrences),
     )
+
+
+def _is_hosted_resource_pricing_input(item: UsagePricingInput) -> bool:
+    """Whether one pricing input has durable hosted-resource event authority."""
+
+    return item.event_type == "model.hosted_tool_call"
 
 
 def _aggregate_usage_counter_values(
@@ -889,6 +972,8 @@ def _aggregate_usage_counter_values(
         usage.cache.write_unknown_ttl_tokens,
         usage.cache.cached_input_tokens,
         usage.cache.uncached_input_tokens,
+        usage.hosted_tools.web_search_calls,
+        usage.hosted_tools.web_search_outcome_unknown,
     )
 
 
@@ -901,7 +986,7 @@ def _session_pricing_attribution_fingerprint(
     """Commit to every price-relevant field for one retained session."""
 
     digest = hashlib.sha256(_SESSION_PRICING_ATTRIBUTION_DOMAIN)
-    canonical_inputs: list[tuple[bytes, bytes, bytes]] = []
+    canonical_inputs: list[tuple[bytes, bytes, bytes, bytes]] = []
     for item in inputs:
         metrics_key = (
             b"\x00"
@@ -912,6 +997,7 @@ def _session_pricing_attribution_fingerprint(
             (
                 item.effective_on.isoformat().encode("ascii"),
                 str(item.occurrences).encode("ascii"),
+                item.event_type.encode("ascii"),
                 metrics_key,
             )
         )
@@ -1063,7 +1149,7 @@ class UsageRollupStoreResult(BaseModel):
         if any(item.session_id is not None for item in self.pricing_inputs):
             raise ValueError("Shared pricing inputs cannot retain session identity.")
         pricing_input_keys = [
-            (item.effective_on, usage_pricing_metrics_key(item.metrics))
+            (item.effective_on, item.event_type, usage_pricing_metrics_key(item.metrics))
             for item in self.pricing_inputs
         ]
         if len(set(pricing_input_keys)) != len(pricing_input_keys):
@@ -1071,7 +1157,12 @@ class UsageRollupStoreResult(BaseModel):
         if (
             self.pricing_inputs_included
             and self.pricing_inputs_accuracy.kind is AggregateAccuracyKind.EXACT
-            and sum(item.occurrences for item in self.pricing_inputs) != self.totals.model_steps
+            and sum(
+                item.occurrences
+                for item in self.pricing_inputs
+                if not _is_hosted_resource_pricing_input(item)
+            )
+            != self.totals.model_steps
         ):
             raise ValueError("Exact pricing inputs must account for every model step.")
         if self.session_pricing_input_group_count < len(self.session_pricing_inputs):
@@ -1117,6 +1208,7 @@ class UsageRollupStoreResult(BaseModel):
             (
                 item.session_id,
                 item.effective_on,
+                item.event_type,
                 usage_pricing_metrics_key(item.metrics),
             )
             for item in self.session_pricing_inputs
@@ -1298,14 +1390,17 @@ class UsageRollupStoreResult(BaseModel):
         for item in self.session_pricing_inputs:
             assert item.session_id is not None
             session_id = item.session_id
-            occurrences_by_session[session_id] = (
-                occurrences_by_session.get(session_id, 0) + item.occurrences
-            )
+            hosted_resource = _is_hosted_resource_pricing_input(item)
+            if not hosted_resource:
+                occurrences_by_session[session_id] = (
+                    occurrences_by_session.get(session_id, 0) + item.occurrences
+                )
             if item.metrics is None:
                 continue
-            valid_usage_steps_by_session[session_id] = (
-                valid_usage_steps_by_session.get(session_id, 0) + item.occurrences
-            )
+            if not hosted_resource:
+                valid_usage_steps_by_session[session_id] = (
+                    valid_usage_steps_by_session.get(session_id, 0) + item.occurrences
+                )
             known_usage_by_session[session_id] = add_aggregate_usage(
                 known_usage_by_session.get(
                     session_id,
@@ -1373,19 +1468,35 @@ class UsageRollupStoreResult(BaseModel):
             if self.session_breakdown.remainder is None
             else self.session_breakdown.remainder.totals.model_steps
         )
-        if sum(item[0] for item in remainder_groups.values()) != expected_remainder_steps:
+        if (
+            sum(
+                occurrences
+                for (
+                    _,
+                    event_type,
+                    _,
+                ), (occurrences, _) in remainder_groups.items()
+                if event_type != "model.hosted_tool_call"
+            )
+            != expected_remainder_steps
+        ):
             raise UsageRollupInconsistent(
                 "Exact session pricing inputs do not account for the shared usage projection."
             )
 
 
 class UsageCurrencyCost(BaseModel):
-    """Exact estimated cost for one currency; currencies are never combined."""
+    """Exact estimated model-step and hosted-resource cost for one currency."""
 
     model_config = ConfigDict(extra="forbid")
 
     currency: str
-    model_steps: PositiveAggregateCount = Field(ge=1)
+    model_steps: AggregateCount = Field(ge=0)
+    hosted_resources: AggregateCount = Field(
+        default=0,
+        ge=0,
+        exclude_if=lambda value: value == 0,
+    )
     total_cost: Decimal = Field(ge=0)
 
     @field_validator("currency")
@@ -1393,19 +1504,36 @@ class UsageCurrencyCost(BaseModel):
     def validate_currency(cls, value: str) -> str:
         return require_clean_nonblank(value, "currency").upper()
 
+    @model_validator(mode="after")
+    def validate_evidence_count(self) -> UsageCurrencyCost:
+        if self.model_steps == 0 and self.hosted_resources == 0:
+            raise ValueError("Currency cost requires model-step or hosted-resource evidence.")
+        return self
+
 
 class UsageUnpricedReason(BaseModel):
-    """Model-step count that could not be priced for one explicit reason."""
+    """Model-step and hosted-resource counts unpriced for one explicit reason."""
 
     model_config = ConfigDict(extra="forbid")
 
     reason: str
-    model_steps: PositiveAggregateCount = Field(ge=1)
+    model_steps: AggregateCount = Field(ge=0)
+    hosted_resources: AggregateCount = Field(
+        default=0,
+        ge=0,
+        exclude_if=lambda value: value == 0,
+    )
 
     @field_validator("reason")
     @classmethod
     def validate_reason(cls, value: str) -> str:
         return require_clean_nonblank(value, "reason")
+
+    @model_validator(mode="after")
+    def validate_evidence_count(self) -> UsageUnpricedReason:
+        if self.model_steps == 0 and self.hosted_resources == 0:
+            raise ValueError("An unpriced reason requires model-step or hosted-resource evidence.")
+        return self
 
 
 class UsageBillingIdentity(BaseModel):
@@ -1803,16 +1931,32 @@ def _estimate_usage_cost(
 
     currency_costs: dict[str, Decimal] = {}
     currency_steps: dict[str, int] = {}
-    unpriced_reasons: dict[str, int] = {}
+    currency_hosted_resources: dict[str, int] = {}
+    unpriced_reasons: dict[str, tuple[int, int]] = {}
     billing_groups: dict[str, _UsageBillingCostAccumulator] = {}
     priced_model_steps = 0
     unpriced_model_steps = 0
     for item in pricing_inputs:
+        hosted_resource_input = _is_hosted_resource_pricing_input(item)
         if item.metrics is None:
-            reason = "model.completed event has no valid normalized usage metrics"
-            unpriced_reasons[reason] = unpriced_reasons.get(reason, 0) + item.occurrences
-            unpriced_model_steps += item.occurrences
+            reason = (
+                "model.hosted_tool_call event has no valid normalized usage metrics"
+                if hosted_resource_input
+                else "model.completed event has no valid normalized usage metrics"
+            )
+            reason_steps, reason_resources = unpriced_reasons.get(reason, (0, 0))
+            unpriced_reasons[reason] = (
+                reason_steps + (0 if hosted_resource_input else item.occurrences),
+                reason_resources + (item.occurrences if hosted_resource_input else 0),
+            )
+            if not hosted_resource_input:
+                unpriced_model_steps += item.occurrences
             continue
+        model_step_occurrences = 0 if hosted_resource_input else item.occurrences
+        hosted_resource_occurrences = (
+            item.metrics.hosted_tools.web_search_calls
+            + item.metrics.hosted_tools.web_search_outcome_unknown
+        ) * item.occurrences
         estimate_key = (item.effective_on, usage_pricing_metrics_key(item.metrics))
         estimate = None if estimate_cache is None else estimate_cache.get(estimate_key)
         if estimate is None:
@@ -1826,7 +1970,7 @@ def _estimate_usage_cost(
         else:
             estimate = cast("ModelStepCostEstimate", estimate)
         pricing_identity = item.metrics.billing_identity
-        if pricing_identity is not None:
+        if pricing_identity is not None and model_step_occurrences:
             billing_identity = _billing_identity_for_breakdown(pricing_identity)
             group_key = json.dumps(
                 {
@@ -1852,20 +1996,27 @@ def _estimate_usage_cost(
                     missing_pricing_reason=estimate.missing_pricing_reason,
                 )
                 billing_groups[group_key] = group
-            group.model_steps += item.occurrences
+            group.model_steps += model_step_occurrences
             group.total_cost += estimate.total_cost * item.occurrences
         if not estimate.priced:
             reason = estimate.missing_pricing_reason or "no matching model pricing"
-            unpriced_reasons[reason] = unpriced_reasons.get(reason, 0) + item.occurrences
-            unpriced_model_steps += item.occurrences
+            reason_steps, reason_resources = unpriced_reasons.get(reason, (0, 0))
+            unpriced_reasons[reason] = (
+                reason_steps + model_step_occurrences,
+                reason_resources + hosted_resource_occurrences,
+            )
+            unpriced_model_steps += model_step_occurrences
             continue
         assert estimate.currency is not None
         currency = estimate.currency.upper()
         currency_costs[currency] = currency_costs.get(currency, Decimal(0)) + (
             estimate.total_cost * item.occurrences
         )
-        currency_steps[currency] = currency_steps.get(currency, 0) + item.occurrences
-        priced_model_steps += item.occurrences
+        currency_steps[currency] = currency_steps.get(currency, 0) + model_step_occurrences
+        currency_hosted_resources[currency] = (
+            currency_hosted_resources.get(currency, 0) + hosted_resource_occurrences
+        )
+        priced_model_steps += model_step_occurrences
 
     ordered_billing_groups = sorted(
         (
@@ -1935,16 +2086,21 @@ def _estimate_usage_cost(
         currencies=tuple(
             UsageCurrencyCost(
                 currency=currency,
-                model_steps=currency_steps[currency],
+                model_steps=currency_steps.get(currency, 0),
+                hosted_resources=currency_hosted_resources.get(currency, 0),
                 total_cost=currency_costs[currency],
             )
             for currency in sorted(currency_costs)
         ),
         unpriced_reasons=tuple(
-            UsageUnpricedReason(reason=reason, model_steps=model_steps)
-            for reason, model_steps in sorted(
+            UsageUnpricedReason(
+                reason=reason,
+                model_steps=model_steps,
+                hosted_resources=hosted_resources,
+            )
+            for reason, (model_steps, hosted_resources) in sorted(
                 unpriced_reasons.items(),
-                key=lambda item: (-item[1], item[0]),
+                key=lambda item: (-(item[1][0] + item[1][1]), item[0]),
             )
         ),
         billing_breakdown=UsageBillingCostBreakdown(
@@ -2045,7 +2201,11 @@ def estimate_usage_session_cost_breakdown(
             retained=result.session_pricing_inputs,
         )
         if (
-            sum(item.occurrences for item in remainder_inputs)
+            sum(
+                item.occurrences
+                for item in remainder_inputs
+                if not _is_hosted_resource_pricing_input(item)
+            )
             != result.session_breakdown.remainder.totals.model_steps
         ):
             raise ValueError("Session pricing remainder does not match omitted usage totals.")

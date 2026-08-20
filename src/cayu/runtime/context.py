@@ -52,7 +52,9 @@ from cayu.core.billing import (
 from cayu.core.events import EventType
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import (
+    CitationPart,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -4683,6 +4685,7 @@ def _detach_compaction_model_request(request: ModelRequest) -> ModelRequest:
         model=request.model,
         messages=request.messages,
         tools=request.tools,
+        hosted_tools=request.hosted_tools,
         options=request.options,
     )
 
@@ -6356,7 +6359,14 @@ def _strip_old_tool_result_attachments(
     message_index: int,
 ) -> Message:
     projected_parts: list[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart
     ] = []
     for part_index, part in enumerate(message.content):
         if type(part) is not ToolResultPart or (message_index, part_index) in keep_positions:
@@ -6396,7 +6406,14 @@ def _file_attachments_in_part(part: ToolResultPart) -> tuple[FileAttachment, ...
 
 def _strip_file_parts_from_user_message(message: Message) -> Message:
     kept_parts: list[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart
     ] = []
     stripped_attachments: list[FileAttachment] = []
     for part in message.content:
@@ -6435,7 +6452,14 @@ def noteify_unresolvable_prompt_files(
             projected.append(message)
             continue
         kept_parts: list[
-            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+            TextPart
+            | ToolCallPart
+            | ToolResultPart
+            | ProviderStatePart
+            | ThinkingPart
+            | FilePart
+            | HostedToolCallPart
+            | CitationPart
         ] = []
         removed_attachments: list[FileAttachment] = []
         for part in message.content:
@@ -7652,7 +7676,14 @@ def _message_digest(message: Message) -> str:
 
 
 def _message_part_digest(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
 ) -> str:
     if type(part) is TextPart:
         return part.text
@@ -7676,6 +7707,10 @@ def _message_part_digest(
         return "[thinking]"
     if type(part) is FilePart:
         return f"[file attachment={copy_json_value(part.attachment, 'attachment')}]"
+    if type(part) is HostedToolCallPart:
+        return f"[hosted_tool_call type={part.hosted_tool} status={part.status}]"
+    if type(part) is CitationPart:
+        return f"[citation url={part.url}]"
     raise TypeError("Unsupported message part.")
 
 

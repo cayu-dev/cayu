@@ -15,7 +15,7 @@ from cayu.runtime.budgets import (
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
-from cayu.runtime.costs import SessionCostSummary
+from cayu.runtime.costs import CostLineItem, SessionCostSummary
 
 
 def _budget_limit_id(value: int) -> str:
@@ -43,6 +43,34 @@ def _pricing_evidence(*, model: str = "model") -> dict[str, object]:
         "effective_through": None,
         "tier_max_input_tokens": None,
     }
+
+
+def _priced_session_cost_summary(*, session_id: str, amount: Decimal) -> SessionCostSummary:
+    return SessionCostSummary(
+        session_id=session_id,
+        currency="USD",
+        model_steps=1,
+        priced_model_steps=1,
+        unpriced_model_steps=0,
+        total_cost=amount,
+        line_items=(
+            CostLineItem(
+                model_step=1,
+                priced=True,
+                currency="USD",
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_input_tokens=0,
+                cache_write_input_tokens=0,
+                uncached_input_tokens=0,
+                input_cost=amount,
+                output_cost=Decimal("0"),
+                cache_read_input_cost=Decimal("0"),
+                cache_write_input_cost=Decimal("0"),
+                total_cost=amount,
+            ),
+        ),
+    )
 
 
 def _reservation_event(*, value: int) -> Event:
@@ -355,13 +383,9 @@ def test_budget_inspection_accepts_clean_exponent_decimals() -> None:
 def test_budget_inspection_uses_latest_fully_priced_checks_without_reservations() -> None:
     def checked_event(actual: str) -> Event:
         amount = Decimal(actual)
-        summary = SessionCostSummary(
+        summary = _priced_session_cost_summary(
             session_id="sess_checked",
-            currency="USD",
-            model_steps=1,
-            priced_model_steps=1,
-            unpriced_model_steps=0,
-            total_cost=amount,
+            amount=amount,
         )
         check = BudgetCheck(
             budget_limit_id=_budget_limit_id(1),
@@ -400,13 +424,9 @@ def test_budget_inspection_uses_latest_fully_priced_checks_without_reservations(
 
 def test_budget_inspection_retains_prior_spend_when_reservation_fails() -> None:
     actual = Decimal("0.25")
-    summary = SessionCostSummary(
+    summary = _priced_session_cost_summary(
         session_id="sess_checked_then_failed",
-        currency="USD",
-        model_steps=1,
-        priced_model_steps=1,
-        unpriced_model_steps=0,
-        total_cost=actual,
+        amount=actual,
     )
     check = BudgetCheck(
         budget_limit_id=_budget_limit_id(1),

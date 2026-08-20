@@ -423,6 +423,9 @@ def resolve_execution_profile_identity(
                 }
                 for tool in registered_agent.tools.values()
             ],
+            "provider_hosted_tools": [
+                tool.model_dump(mode="json") for tool in registered_agent.hosted_tools
+            ],
             "credential_authority": credential_authority,
             "egress_authority": registered_agent.execution_requirements.network_access,
             "real_secret_visibility": (

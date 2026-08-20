@@ -35,13 +35,18 @@ from cayu._validation import (
 from cayu.artifacts import LocalArtifactStore, file_attachment
 from cayu.core import (
     AgentSpec,
+    CitationPart,
+    CitationProvenance,
     Event,
     EventType,
     ExecutionProfileBehaviorIdentity,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ToolCallPart,
     ToolResultPart,
+    WebSearchAction,
+    WebSearchSource,
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import event_with_runtime_payload_authority
@@ -6212,6 +6217,33 @@ def test_session_store_conformance_inspection_uses_tolerant_usage_aggregates(
                     },
                 ),
             )
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        type=EventType.MODEL_HOSTED_TOOL_CALL,
+                        session_id=session_id,
+                        timestamp=timestamp + timedelta(milliseconds=50),
+                        payload={
+                            "tool_type": "web_search",
+                            "status": "failed",
+                            "provider_name": "openai",
+                            "model": "gpt-5.6",
+                        },
+                    ),
+                    Event(
+                        type=EventType.MODEL_HOSTED_TOOL_CALL,
+                        session_id=session_id,
+                        timestamp=timestamp + timedelta(milliseconds=100),
+                        payload={
+                            "tool_type": "web_search",
+                            "status": "outcome_unknown",
+                            "provider_name": "openai",
+                            "model": "gpt-5.6",
+                        },
+                    ),
+                ],
+            )
 
             inspection = await store.inspect_summary(session_id)
             native = await store.aggregate_usage(
@@ -6225,13 +6257,15 @@ def test_session_store_conformance_inspection_uses_tolerant_usage_aggregates(
             assert inspection.model_calls_with_usage == 1
             assert inspection.model_calls_with_usage == native.totals.model_steps_with_usage
             assert inspection.usage.usage == native.totals.usage
-            assert inspection.usage.provider_names == []
-            assert inspection.usage.models == ["valid-model"]
+            assert inspection.usage.provider_names == ["openai"]
+            assert inspection.usage.models == ["valid-model", "gpt-5.6"]
             assert inspection.usage.usage.input_tokens == 7
             assert inspection.usage.usage.output_tokens == 3
             assert inspection.usage.usage.reasoning_output_tokens == 0
             assert inspection.usage.usage.cache.read_tokens == 4
             assert inspection.usage.usage.cache.write_tokens == 0
+            assert inspection.usage.usage.hosted_tools.web_search_calls == 1
+            assert inspection.usage.usage.hosted_tools.web_search_outcome_unknown == 1
         finally:
             await _close_store(store)
 
@@ -7167,6 +7201,65 @@ def test_session_store_conformance_preserves_exact_portable_number_representatio
             checkpoint = await store.load_checkpoint(session_id)
             assert checkpoint is not None
             _assert_portable_number_probe(checkpoint["numbers"])
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_preserves_hosted_search_evidence(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = f"hosted-search-evidence-{session_store_case[0]}"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "search")],
+                ),
+                identity=_identity(),
+            )
+            message = Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    HostedToolCallPart(
+                        call_id="ws_1",
+                        status="completed",
+                        action=WebSearchAction(
+                            type="search",
+                            query="Cayu",
+                            sources=(
+                                WebSearchSource(
+                                    url="https://github.com/example/cayu",
+                                    title="Cayu",
+                                ),
+                            ),
+                        ),
+                        provider_name="openai",
+                        model="gpt-test",
+                        model_step_id="mstep_00000000000000000000000000000000",
+                        model_attempt_id="matt_00000000000000000000000000000000",
+                    ),
+                    Message.text("assistant", "Cayu").content[0],
+                    CitationPart(
+                        url="https://github.com/example/cayu",
+                        title="Cayu",
+                        start_index=0,
+                        end_index=4,
+                        provenance=CitationProvenance(provider_name="openai"),
+                        model_step_id="mstep_00000000000000000000000000000000",
+                        model_attempt_id="matt_00000000000000000000000000000000",
+                    ),
+                ],
+            )
+            await store.append_transcript_messages(session_id, [message])
+
+            store = await _reopen_store(session_store_case, store)
+
+            assert await store.load_transcript(session_id) == [message]
         finally:
             await _close_store(store)
 

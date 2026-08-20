@@ -740,9 +740,10 @@ def build_request_footprint(
         groups=message_groups,
         size=_request_size(message_payloads),
     )
+    tool_manifest, hosted_tool_payloads = _request_tool_manifest(model_request)
     tools = RequestComponentFootprint(
-        count=len(model_request.tools),
-        size=_request_size(model_request.tools),
+        count=len(model_request.tools) + len(hosted_tool_payloads),
+        size=_request_size(tool_manifest),
     )
     attachments = _attachment_footprint(attachment_occurrences)
     measurement_projection = _request_measurement_projection(
@@ -804,6 +805,8 @@ def build_request_footprint(
         "tools": model_request.tools,
         "options": measured_options,
     }
+    if hosted_tool_payloads:
+        measured_request_shape["hosted_tools"] = hosted_tool_payloads
     fingerprint_request_shape = {
         **measured_request_shape,
         "options": fingerprint_options,
@@ -868,10 +871,14 @@ def build_request_footprint(
             unavailable_reason="system_not_present" if not system_payloads else None,
         ),
         tool_manifest=_fingerprint(
-            model_request.tools,
+            tool_manifest,
             scope="tool-manifest",
             config=resolved_config,
-            unavailable_reason="tools_not_present" if not model_request.tools else None,
+            unavailable_reason=(
+                "tools_not_present"
+                if not model_request.tools and not hosted_tool_payloads
+                else None
+            ),
         ),
         conversation_prefix=_fingerprint(
             conversation_prefix,
@@ -1266,6 +1273,7 @@ def _estimate_projected_context_pressure(
         model=model_request.model,
         messages=messages,
         tools=model_request.tools,
+        hosted_tools=model_request.hosted_tools,
         options=measured_options,
     )
     pressure = estimate_model_request_context_pressure(
@@ -1494,6 +1502,16 @@ def _conversation_prefix_payload(
     return messages[:retained]
 
 
+def _request_tool_manifest(model_request: ModelRequest) -> tuple[Any, list[dict[str, Any]]]:
+    hosted_tools = [tool.model_dump(mode="json") for tool in model_request.hosted_tools]
+    if not hosted_tools:
+        return model_request.tools, hosted_tools
+    return {
+        "function_tools": model_request.tools,
+        "hosted_tools": hosted_tools,
+    }, hosted_tools
+
+
 def _cache_breakpoint_footprints(
     *,
     model_request: ModelRequest,
@@ -1506,19 +1524,20 @@ def _cache_breakpoint_footprints(
         return ()
     breakpoints = tuple(sorted(set(cache_policy.breakpoints), key=lambda item: item.value))
     ttl = "extended" if cache_policy.ttl == "extended" else "standard"
+    tool_manifest, hosted_tool_payloads = _request_tool_manifest(model_request)
     payloads: dict[CacheBreakpoint, tuple[Any, str | None]] = {
         CacheBreakpoint.SYSTEM_PROMPT: (
             {"system": system_payloads, "ttl": ttl},
             None if system_payloads else "system_not_present",
         ),
         CacheBreakpoint.TOOL_DEFINITIONS: (
-            {"system": system_payloads, "tools": model_request.tools, "ttl": ttl},
-            None if model_request.tools else "tools_not_present",
+            {"system": system_payloads, "tools": tool_manifest, "ttl": ttl},
+            (None if model_request.tools or hosted_tool_payloads else "tools_not_present"),
         ),
         CacheBreakpoint.CONVERSATION_PREFIX: (
             {
                 "system": system_payloads,
-                "tools": model_request.tools,
+                "tools": tool_manifest,
                 "messages": conversation_prefix,
                 "ttl": ttl,
             },

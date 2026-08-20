@@ -58,14 +58,17 @@ from cayu.providers.base import (
     _preflight_provider_portable_messages,
     privacy_safe_provider_option_projection,
 )
+from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 from cayu.providers.openai import (
     DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
     DEFAULT_OPENAI_TIMEOUT_SECONDS,
     OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN,
     HttpxOpenAITransport,
+    OpenAIAPIError,
     OpenAITransport,
     _effective_openai_request_options,
     _openai_tool,
+    _preflight_openai_hosted_tools,
     _validate_openai_tool_name,
     build_openai_payload,
     openai_stream_events,
@@ -647,6 +650,20 @@ class OpenAISubscriptionProvider(ModelProvider):
             tool_definition_validator=_openai_tool,
         )
 
+    def preflight_hosted_tools(
+        self,
+        *,
+        model: str,
+        hosted_tools: tuple[OpenAIWebSearch, ...],
+        options: dict[str, Any],
+    ) -> None:
+        _preflight_openai_hosted_tools(
+            model=model,
+            hosted_tools=hosted_tools,
+            options=options,
+            endpoint_supported=self.hosted_web_search_supported,
+        )
+
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         projected = privacy_safe_provider_option_projection(
             _effective_openai_request_options(request.options)
@@ -667,10 +684,25 @@ class OpenAISubscriptionProvider(ModelProvider):
         stream_idle_timeout_s: float = DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        hosted_web_search_supported: bool | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.auth = auth if auth is not None else OpenAISubscriptionAuth()
         self.base_url = validate_base_url(base_url, provider_label="OpenAI subscription")
+        if (
+            hosted_web_search_supported is not None
+            and type(hosted_web_search_supported) is not bool
+        ):
+            raise TypeError("hosted_web_search_supported must be a boolean or None.")
+        self.hosted_web_search_supported = (
+            self.base_url
+            == validate_base_url(
+                DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL,
+                provider_label="OpenAI subscription",
+            )
+            if hosted_web_search_supported is None
+            else hosted_web_search_supported
+        )
         if type(timeout_s) not in {int, float}:
             raise TypeError("timeout_s must be a number.")
         if timeout_s <= 0:
@@ -709,6 +741,7 @@ class OpenAISubscriptionProvider(ModelProvider):
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: ModelContextOverflowError | None = None
         post_completion_failure: ModelProviderError | None = None
+        capability_failure: HostedToolCapabilityError | None = None
         error_event: ModelStreamEvent | None = None
         completion_emitted = False
         try:
@@ -756,6 +789,29 @@ class OpenAISubscriptionProvider(ModelProvider):
                     credentials,
                     extra_header_values=tuple(self.extra_headers.values()),
                 )
+        except OpenAIAPIError as exc:
+            if request.hosted_tools and _is_subscription_hosted_tool_rejection(exc):
+                capability_failure = HostedToolCapabilityError(
+                    "The experimental OpenAI subscription backend rejected hosted web search "
+                    "for this target. Disable it or verify the current backend capability."
+                )
+            elif completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="OpenAI subscription",
+                    provider_name="openai",
+                    credential_values=credential_sanitization_values(
+                        *_subscription_credential_values(credentials),
+                        extra_headers=self.extra_headers,
+                    ),
+                    safe_message="OpenAI subscription provider failed.",
+                )
+            else:
+                error_event = _safe_subscription_error_event(
+                    exc,
+                    credentials,
+                    extra_header_values=tuple(self.extra_headers.values()),
+                )
         except Exception as exc:
             if completion_emitted:
                 post_completion_failure = credential_safe_post_completion_failure(
@@ -781,6 +837,8 @@ class OpenAISubscriptionProvider(ModelProvider):
             raise overflow_failure from None
         if post_completion_failure is not None:
             raise post_completion_failure from None
+        if capability_failure is not None:
+            raise capability_failure from None
         if error_event is not None:
             yield error_event
 
@@ -1091,6 +1149,19 @@ def _safe_subscription_error_event(
     if isinstance(exc, ProviderStreamCleanupError):
         payload["stream_cleanup_failed"] = True
     return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
+
+
+def _is_subscription_hosted_tool_rejection(exc: OpenAIAPIError) -> bool:
+    if exc.status_code not in {400, 404, 422}:
+        return False
+    param = "" if exc.param is None else exc.param.lower()
+    code = "" if exc.error_code is None else exc.error_code.lower()
+    tool_param = param == "tools" or param.startswith("tools[")
+    if code in {"invalid_tool", "unsupported_tool"}:
+        return True
+    if code in {"invalid_value", "unsupported_value"}:
+        return tool_param
+    return tool_param
 
 
 def _safe_subscription_context_overflow(

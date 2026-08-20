@@ -4333,6 +4333,280 @@ def test_estimate_session_cost_prices_each_model_step() -> None:
     assert summary.total_cost == Decimal("0.00684")
 
 
+def test_estimate_session_cost_prices_each_hosted_web_search_call() -> None:
+    event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="session_1",
+        payload={
+            "usage_metrics": {
+                "provider_name": "openai",
+                "model": "gpt-test",
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "total_tokens": 1100,
+                "reasoning_output_tokens": 0,
+                "cache": {
+                    "read_tokens": 0,
+                    "write_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "uncached_input_tokens": 1000,
+                },
+                "hosted_tools": {
+                    "web_search_calls": 3,
+                    "web_search_outcome_unknown": 0,
+                },
+            }
+        },
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="openai",
+                model="gpt-test",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+                web_search_per_thousand=Decimal("10"),
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(session_id="session_1", events=[event], pricing=pricing)
+
+    assert summary.priced_model_steps == 1
+    assert summary.line_items[0].web_search_calls == 3
+    assert summary.line_items[0].web_search_cost == Decimal("0.03")
+    assert summary.line_items[0].total_cost == Decimal("0.0312")
+
+
+@pytest.mark.parametrize(
+    ("hosted_tools", "reason"),
+    [
+        (
+            {"web_search_calls": 1, "web_search_outcome_unknown": 0},
+            "hosted web-search pricing is unavailable",
+        ),
+        (
+            {"web_search_calls": 0, "web_search_outcome_unknown": 1},
+            "hosted web-search outcome and billing are unknown",
+        ),
+    ],
+)
+def test_estimate_session_cost_marks_unpriceable_hosted_search_unpriced(
+    hosted_tools: dict[str, int], reason: str
+) -> None:
+    event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="session_1",
+        payload={
+            "usage_metrics": {
+                "provider_name": "openai",
+                "model": "gpt-test",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+                "reasoning_output_tokens": 0,
+                "cache": {
+                    "read_tokens": 0,
+                    "write_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "uncached_input_tokens": 1,
+                },
+                "hosted_tools": hosted_tools,
+            }
+        },
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="openai",
+                model="gpt-test",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(session_id="session_1", events=[event], pricing=pricing)
+
+    assert summary.unpriced_model_steps == 1
+    assert summary.line_items[0].missing_pricing_reason == reason
+
+
+def test_session_usage_counts_unknown_hosted_search_without_model_completion() -> None:
+    summary = session_usage_summary(
+        "session_1",
+        [
+            Event(
+                type=EventType.MODEL_HOSTED_TOOL_CALL,
+                session_id="session_1",
+                payload={
+                    "tool_type": "web_search",
+                    "call_id": "ws_1",
+                    "status": "outcome_unknown",
+                    "provider_name": "openai",
+                    "model": "gpt-5.6",
+                },
+            ),
+            Event(
+                type=EventType.MODEL_HOSTED_TOOL_CALL,
+                session_id="session_1",
+                payload={
+                    "tool_type": "future_hosted_tool",
+                    "call_id": "future_1",
+                    "status": "outcome_unknown",
+                },
+            ),
+        ],
+    )
+
+    assert summary.model_steps == 0
+    assert summary.usage.hosted_tools.web_search_calls == 0
+    assert summary.usage.hosted_tools.web_search_outcome_unknown == 1
+    assert summary.provider_names == ["openai"]
+    assert summary.models == ["gpt-5.6"]
+
+
+@pytest.mark.parametrize("status", ["completed", "incomplete", "failed"])
+def test_terminal_hosted_search_is_usage_and_cost_evidence_without_completion(
+    status: str,
+) -> None:
+    event = Event(
+        type=EventType.MODEL_HOSTED_TOOL_CALL,
+        session_id="session_1",
+        payload={
+            "tool_type": "web_search",
+            "call_id": "ws_1",
+            "status": status,
+            "provider_name": "openai",
+            "model": "gpt-test",
+            "model_attempt_id": "attempt_1",
+        },
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="openai",
+                model="gpt-test",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+                web_search_per_thousand=Decimal("10"),
+            ),
+        )
+    )
+
+    usage = session_usage_summary("session_1", [event])
+    cost = estimate_session_cost(session_id="session_1", events=[event], pricing=pricing)
+
+    assert usage.usage.hosted_tools.web_search_calls == 1
+    assert cost.model_steps == 0
+    assert cost.priced_model_steps == 0
+    assert cost.line_items[0].model_step == 0
+    assert cost.line_items[0].web_search_calls == 1
+    assert cost.line_items[0].web_search_cost == Decimal("0.01")
+
+
+def test_hosted_search_lifecycle_and_completion_cost_are_deduplicated() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_HOSTED_TOOL_CALL,
+            session_id="session_1",
+            payload={
+                "tool_type": "web_search",
+                "call_id": "ws_1",
+                "status": "completed",
+                "provider_name": "openai",
+                "model": "gpt-test",
+                "model_attempt_id": "attempt_1",
+            },
+        ),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "provider_name": "openai",
+                "requested_model": "gpt-test",
+                "model": "gpt-test",
+                "model_attempt_id": "attempt_1",
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "requested_model": "gpt-test",
+                    "model": "gpt-test",
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+                "hosted_tool_usage": {
+                    "web_search_calls": 1,
+                    "web_search_outcome_unknown": 0,
+                },
+            },
+        ),
+    ]
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="openai",
+                model="gpt-test",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+                web_search_per_thousand=Decimal("10"),
+            ),
+        )
+    )
+
+    usage = session_usage_summary("session_1", events)
+    cost = estimate_session_cost(session_id="session_1", events=events, pricing=pricing)
+
+    assert usage.usage.hosted_tools.web_search_calls == 1
+    assert cost.model_steps == 1
+    assert cost.line_items[0].web_search_calls == 1
+    assert cost.line_items[0].web_search_cost == Decimal("0.01")
+
+
+def test_terminal_search_remains_priceable_when_completion_has_no_token_usage() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_HOSTED_TOOL_CALL,
+            session_id="session_1",
+            payload={
+                "tool_type": "web_search",
+                "call_id": "ws_1",
+                "status": "completed",
+                "provider_name": "openai",
+                "model": "gpt-test",
+                "model_attempt_id": "attempt_1",
+            },
+        ),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "provider_name": "openai",
+                "requested_model": "gpt-test",
+                "model": "gpt-test",
+                "model_attempt_id": "attempt_1",
+            },
+        ),
+    ]
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="openai",
+                model="gpt-test",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+                web_search_per_thousand=Decimal("10"),
+            ),
+        )
+    )
+
+    cost = estimate_session_cost(session_id="session_1", events=events, pricing=pricing)
+
+    assert cost.model_steps == 1
+    assert cost.line_items[0].web_search_calls == 1
+    assert cost.line_items[0].web_search_cost == Decimal("0.01")
+
+
 def test_estimate_cost_marks_malformed_normalized_usage_unpriced() -> None:
     malformed = Event(
         type=EventType.MODEL_COMPLETED,
@@ -4969,28 +5243,43 @@ def test_cayu_app_get_session_cost_uses_durable_events() -> None:
         )
     )
     asyncio.run(
-        app.session_store.append_event(
+        app.session_store.append_events(
             "cost_session",
-            Event(
-                type=EventType.MODEL_COMPLETED,
-                session_id="cost_session",
-                payload={
-                    "usage_metrics": {
+            [
+                Event(
+                    type=EventType.MODEL_HOSTED_TOOL_CALL,
+                    session_id="cost_session",
+                    payload={
+                        "tool_type": "web_search",
+                        "call_id": "ws_1",
+                        "status": "failed",
                         "provider_name": "openai",
                         "model": "gpt-5.5",
-                        "input_tokens": 1000,
-                        "output_tokens": 100,
-                        "total_tokens": 1100,
-                        "reasoning_output_tokens": 0,
-                        "cache": {
-                            "read_tokens": 0,
-                            "write_tokens": 0,
-                            "cached_input_tokens": 0,
-                            "uncached_input_tokens": 1000,
+                        "model_attempt_id": "attempt_1",
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="cost_session",
+                    payload={
+                        "model_attempt_id": "attempt_1",
+                        "usage_metrics": {
+                            "provider_name": "openai",
+                            "model": "gpt-5.5",
+                            "input_tokens": 1000,
+                            "output_tokens": 100,
+                            "total_tokens": 1100,
+                            "reasoning_output_tokens": 0,
+                            "cache": {
+                                "read_tokens": 0,
+                                "write_tokens": 0,
+                                "cached_input_tokens": 0,
+                                "uncached_input_tokens": 1000,
+                            },
                         },
-                    }
-                },
-            ),
+                    },
+                ),
+            ],
         )
     )
     pricing = PriceBook(
@@ -5000,13 +5289,14 @@ def test_cayu_app_get_session_cost_uses_durable_events() -> None:
                 model="gpt-5.5",
                 input_per_million=Decimal("1"),
                 output_per_million=Decimal("10"),
+                web_search_per_thousand=Decimal("10"),
             ),
         )
     )
 
     summary = asyncio.run(app.get_session_cost("cost_session", pricing))
 
-    assert summary.total_cost == Decimal("0.002")
+    assert summary.total_cost == Decimal("0.012")
 
 
 def test_cayu_app_cost_methods_consume_the_price_book_directly() -> None:

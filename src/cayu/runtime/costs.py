@@ -31,9 +31,15 @@ from cayu._validation import (
 )
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.events import Event, EventType
-from cayu.runtime.usage import UsageMetrics, usage_metrics_from_event_payload
+from cayu.runtime.usage import (
+    HostedToolUsageMetrics,
+    UsageMetrics,
+    hosted_tool_usage_metrics_from_payload,
+    usage_metrics_from_event_payload,
+)
 
 _TOKENS_PER_MILLION = Decimal("1000000")
+_CALLS_PER_THOUSAND = Decimal("1000")
 
 _MatchT = TypeVar("_MatchT")
 
@@ -109,13 +115,22 @@ class TieredPricing(BaseModel):
     batch: PriceTier | None = None
     cache_write_5m_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_per_million: Decimal | None = Field(default=None, ge=0)
+    web_search_per_thousand: Decimal | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("currency")
     @classmethod
     def validate_currency(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("cache_write_5m_per_million", "cache_write_1h_per_million")
+    @field_validator(
+        "cache_write_5m_per_million",
+        "cache_write_1h_per_million",
+        "web_search_per_thousand",
+    )
     @classmethod
     def validate_decimal(cls, value: Decimal | None, info) -> Decimal | None:
         if value is None:
@@ -325,6 +340,7 @@ class ModelPrice(BaseModel):
         output_per_million: Decimal,
         cache_read_input_per_million: Decimal | None = None,
         cache_write_input_per_million: Decimal | None = None,
+        web_search_per_thousand: Decimal | None = None,
         currency: str = "USD",
         aliases: tuple[str, ...] = (),
         match: Literal["exact", "prefix"] = "prefix",
@@ -358,6 +374,7 @@ class ModelPrice(BaseModel):
                 PriceSchedule(
                     pricing=TieredPricing(
                         currency=currency,
+                        web_search_per_thousand=web_search_per_thousand,
                         standard=(
                             PriceTier(
                                 input_per_million=input_per_million,
@@ -819,11 +836,13 @@ def default_price_book() -> PriceBook:
 
 
 class CostLineItem(BaseModel):
-    """Estimated cost for one model.completed event."""
+    """Estimated cost for one model attempt or standalone hosted resource evidence."""
 
     model_config = ConfigDict(extra="forbid")
 
-    model_step: StrictInt = Field(ge=1)
+    # Zero identifies terminal hosted-resource evidence with no matching
+    # model.completed event; completed model steps remain one-based.
+    model_step: StrictInt = Field(ge=0)
     execution_profile_fingerprint: str | None = Field(
         default=None,
         max_length=64,
@@ -865,11 +884,14 @@ class CostLineItem(BaseModel):
         ge=0,
         exclude_if=lambda value: value == 0,
     )
+    web_search_calls: StrictInt = Field(default=0, ge=0)
+    web_search_outcome_unknown: StrictInt = Field(default=0, ge=0)
     uncached_input_tokens: StrictInt = Field(ge=0)
     input_cost: Decimal = Field(ge=0)
     output_cost: Decimal = Field(ge=0)
     cache_read_input_cost: Decimal = Field(ge=0)
     cache_write_input_cost: Decimal = Field(ge=0)
+    web_search_cost: Decimal = Field(default=Decimal("0"), ge=0)
     total_cost: Decimal = Field(ge=0)
     missing_pricing_reason: str | None = None
 
@@ -949,7 +971,7 @@ class ModelStepCostEstimate(BaseModel):
 
 
 class SessionCostSummary(BaseModel):
-    """Estimated session cost derived from durable model.completed events."""
+    """Estimated session cost derived from durable completion and resource evidence."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -970,6 +992,15 @@ class SessionCostSummary(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_step_accounting(self) -> SessionCostSummary:
+        if self.priced_model_steps + self.unpriced_model_steps != self.model_steps:
+            raise ValueError("Priced and unpriced steps must sum to model_steps.")
+        completed_steps = [item.model_step for item in self.line_items if item.model_step > 0]
+        if completed_steps != list(range(1, self.model_steps + 1)):
+            raise ValueError("Completion cost line items must cover each model step exactly once.")
+        return self
 
 
 class CausalBudgetCostSummary(BaseModel):
@@ -1051,11 +1082,45 @@ def _estimate_session_cost(
 ) -> SessionCostSummary:
     """Estimate one session from already validated scalar inputs and a pricing snapshot."""
 
+    from cayu.runtime.aggregates import (
+        aggregate_hosted_tool_usage_metrics_from_event_payload,
+    )
+
     line_items: list[CostLineItem] = []
-    model_step = 0
+    hosted_by_attempt: dict[str, tuple[UsageMetrics, datetime, str | None]] = {}
+    hosted_without_attempt: list[tuple[UsageMetrics, datetime, str | None]] = []
     for event in events:
         if type(event) is not Event:
             raise TypeError("events must contain Event instances.")
+        if event.type != EventType.MODEL_HOSTED_TOOL_CALL:
+            continue
+        hosted_metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
+        if hosted_metrics is None:
+            continue
+        model_attempt_id = _optional_nonblank(event.payload.get("model_attempt_id"))
+        execution_profile_fingerprint = _optional_execution_profile_fingerprint(
+            event.payload.get("execution_profile_fingerprint")
+        )
+        if model_attempt_id is None:
+            hosted_without_attempt.append(
+                (hosted_metrics, event.timestamp, execution_profile_fingerprint)
+            )
+            continue
+        existing = hosted_by_attempt.get(model_attempt_id)
+        hosted_by_attempt[model_attempt_id] = (
+            hosted_metrics
+            if existing is None
+            else _combine_hosted_cost_metrics(existing[0], hosted_metrics),
+            event.timestamp if existing is None else existing[1],
+            (
+                execution_profile_fingerprint
+                if existing is None
+                else (existing[2] if existing[2] == execution_profile_fingerprint else None)
+            ),
+        )
+
+    model_step = 0
+    for event in events:
         if event.type != EventType.MODEL_COMPLETED:
             continue
         model_step += 1
@@ -1063,6 +1128,12 @@ def _estimate_session_cost(
         execution_profile_fingerprint = _optional_execution_profile_fingerprint(
             event.payload.get("execution_profile_fingerprint")
         )
+        model_attempt_id = _optional_nonblank(event.payload.get("model_attempt_id"))
+        hosted_evidence = (
+            None if model_attempt_id is None else hosted_by_attempt.pop(model_attempt_id, None)
+        )
+        if hosted_evidence is not None:
+            metrics = _merge_hosted_cost_metrics(metrics, hosted_evidence[0])
         if metrics is None:
             line_items.append(
                 _unpriced_line_item(
@@ -1090,13 +1161,29 @@ def _estimate_session_cost(
             )
         )
 
+    remaining_hosted = [
+        *hosted_without_attempt,
+        *(evidence for evidence in hosted_by_attempt.values()),
+    ]
+    for hosted_metrics, timestamp, execution_profile_fingerprint in remaining_hosted:
+        line_items.append(
+            _cost_line_item(
+                model_step=0,
+                metrics=hosted_metrics,
+                pricing=pricing,
+                currency=currency,
+                effective_on=_effective_date(timestamp),
+                execution_profile_fingerprint=execution_profile_fingerprint,
+            )
+        )
+
     total_cost = sum((item.total_cost for item in line_items), Decimal("0"))
-    priced_model_steps = sum(1 for item in line_items if item.priced)
-    unpriced_model_steps = len(line_items) - priced_model_steps
+    priced_model_steps = sum(1 for item in line_items if item.model_step > 0 and item.priced)
+    unpriced_model_steps = sum(1 for item in line_items if item.model_step > 0 and not item.priced)
     return SessionCostSummary(
         session_id=session_id,
         currency=currency,
-        model_steps=len(line_items),
+        model_steps=model_step,
         priced_model_steps=priced_model_steps,
         unpriced_model_steps=unpriced_model_steps,
         total_cost=total_cost,
@@ -1191,6 +1278,10 @@ class _ResolvedPrice(NamedTuple):
         if self.tier.cache_write_input_per_million is not None:
             return self.tier.cache_write_input_per_million
         return self.schedule.pricing.cache_write_5m_per_million
+
+    @property
+    def web_search_per_thousand(self) -> Decimal | None:
+        return self.schedule.pricing.web_search_per_thousand
 
     @property
     def cache_write_1h_per_million(self) -> Decimal | None:
@@ -1376,6 +1467,29 @@ def _cost_line_item(
         )
     price = resolution.resolved
 
+    if metrics.hosted_tools.web_search_outcome_unknown:
+        return _unpriced_line_item(
+            model_step=model_step,
+            provider_name=metrics.provider_name,
+            requested_model=metrics.requested_model,
+            model=metrics.model,
+            currency=currency,
+            reason="hosted web-search outcome and billing are unknown",
+            metrics=metrics,
+            billing_identity=metrics.billing_identity,
+        )
+    if metrics.hosted_tools.web_search_calls and price.web_search_per_thousand is None:
+        return _unpriced_line_item(
+            model_step=model_step,
+            provider_name=metrics.provider_name,
+            requested_model=metrics.requested_model,
+            model=metrics.model,
+            currency=currency,
+            reason="hosted web-search pricing is unavailable",
+            metrics=metrics,
+            billing_identity=metrics.billing_identity,
+        )
+
     if price.currency.upper() != currency.upper():
         return _unpriced_line_item(
             model_step=model_step,
@@ -1429,7 +1543,12 @@ def _cost_line_item(
                 execution_profile_fingerprint=execution_profile_fingerprint,
             )
         cache_write_cost = ttl_resolution
-    total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost
+    web_search_cost = (
+        Decimal(metrics.hosted_tools.web_search_calls)
+        * (price.web_search_per_thousand or Decimal("0"))
+        / _CALLS_PER_THOUSAND
+    )
+    total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost + web_search_cost
 
     return CostLineItem(
         model_step=model_step,
@@ -1454,11 +1573,14 @@ def _cost_line_item(
         cache_write_5m_input_tokens=metrics.cache.write_5m_tokens,
         cache_write_1h_input_tokens=metrics.cache.write_1h_tokens,
         cache_write_unknown_ttl_input_tokens=metrics.cache.write_unknown_ttl_tokens,
+        web_search_calls=metrics.hosted_tools.web_search_calls,
+        web_search_outcome_unknown=metrics.hosted_tools.web_search_outcome_unknown,
         uncached_input_tokens=uncached_input_tokens,
         input_cost=input_cost,
         output_cost=output_cost,
         cache_read_input_cost=cache_read_cost,
         cache_write_input_cost=cache_write_cost,
+        web_search_cost=web_search_cost,
         total_cost=total_cost,
     )
 
@@ -1493,11 +1615,16 @@ def _unpriced_line_item(
         cache_write_unknown_ttl_input_tokens=(
             0 if metrics is None else metrics.cache.write_unknown_ttl_tokens
         ),
+        web_search_calls=0 if metrics is None else metrics.hosted_tools.web_search_calls,
+        web_search_outcome_unknown=(
+            0 if metrics is None else metrics.hosted_tools.web_search_outcome_unknown
+        ),
         uncached_input_tokens=0 if metrics is None else metrics.cache.uncached_input_tokens,
         input_cost=Decimal("0"),
         output_cost=Decimal("0"),
         cache_read_input_cost=Decimal("0"),
         cache_write_input_cost=Decimal("0"),
+        web_search_cost=Decimal("0"),
         total_cost=Decimal("0"),
         missing_pricing_reason=reason,
     )
@@ -1657,13 +1784,66 @@ def _cost_usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetr
         ):
             return None
         try:
-            return usage_metrics_from_event_payload(pricing_payload)
+            metrics = usage_metrics_from_event_payload(pricing_payload)
         except (TypeError, ValueError):
             return None
-    try:
-        return usage_metrics_from_event_payload(payload)
-    except (TypeError, ValueError):
+    else:
+        try:
+            metrics = usage_metrics_from_event_payload(payload)
+        except (TypeError, ValueError):
+            return None
+    hosted_tools = hosted_tool_usage_metrics_from_payload(payload)
+    if hosted_tools is None:
+        return metrics
+    if metrics is None:
+        return UsageMetrics(
+            provider_name=_optional_nonblank(payload.get("provider_name")),
+            requested_model=_optional_nonblank(payload.get("requested_model")),
+            model=_optional_nonblank(payload.get("model")),
+            hosted_tools=hosted_tools,
+        )
+    return metrics.model_copy(update={"hosted_tools": hosted_tools}, deep=True)
+
+
+def _combine_hosted_cost_metrics(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
+    def common_identity(left_value: str | None, right_value: str | None) -> str | None:
+        if left_value is None:
+            return right_value
+        if right_value is None or left_value == right_value:
+            return left_value
         return None
+
+    return UsageMetrics(
+        provider_name=common_identity(left.provider_name, right.provider_name),
+        requested_model=common_identity(left.requested_model, right.requested_model),
+        model=common_identity(left.model, right.model),
+        hosted_tools=HostedToolUsageMetrics(
+            web_search_calls=(
+                left.hosted_tools.web_search_calls + right.hosted_tools.web_search_calls
+            ),
+            web_search_outcome_unknown=(
+                left.hosted_tools.web_search_outcome_unknown
+                + right.hosted_tools.web_search_outcome_unknown
+            ),
+        ),
+    )
+
+
+def _merge_hosted_cost_metrics(
+    metrics: UsageMetrics | None,
+    hosted: UsageMetrics,
+) -> UsageMetrics:
+    if metrics is None:
+        return hosted
+    return metrics.model_copy(
+        update={
+            "provider_name": metrics.provider_name or hosted.provider_name,
+            "requested_model": metrics.requested_model or hosted.requested_model,
+            "model": metrics.model or hosted.model,
+            "hosted_tools": hosted.hosted_tools,
+        },
+        deep=True,
+    )
 
 
 def _missing_usage_pricing_reason(payload: dict[str, Any]) -> str:

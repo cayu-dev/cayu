@@ -863,6 +863,7 @@
             "cache_write_1h_per_million": null,
             "cache_write_5m_per_million": null,
             "currency": "USD",
+            "web_search_per_thousand": "10",
             "standard": [
               {
                 "cache_read_input_per_million": "0.02",
@@ -938,6 +939,7 @@
             "cache_write_1h_per_million": null,
             "cache_write_5m_per_million": null,
             "currency": "USD",
+            "web_search_per_thousand": "10",
             "standard": [
               {
                 "cache_read_input_per_million": "0.5",
@@ -1011,6 +1013,7 @@
             "cache_write_1h_per_million": null,
             "cache_write_5m_per_million": null,
             "currency": "USD",
+            "web_search_per_thousand": "10",
             "standard": [
               {
                 "cache_read_input_per_million": "0.2",

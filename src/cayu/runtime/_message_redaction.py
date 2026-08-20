@@ -43,12 +43,40 @@ _MESSAGE_PART_STRUCTURE_KEYS = {
     "provider_state": frozenset({"provider", "state", "type"}),
     "thinking": frozenset({"provider_state", "text", "type"}),
     "file": frozenset({"attachment", "type"}),
+    "hosted_tool_call": frozenset(
+        {
+            "action",
+            "call_id",
+            "hosted_tool",
+            "model",
+            "model_attempt_id",
+            "model_step_id",
+            "provider_name",
+            "status",
+            "type",
+        }
+    ),
+    "citation": frozenset(
+        {
+            "citation_type",
+            "end_index",
+            "model_attempt_id",
+            "model_step_id",
+            "provenance",
+            "start_index",
+            "title",
+            "type",
+            "url",
+        }
+    ),
 }
 _MESSAGE_PART_UNTRUSTED_CONTAINERS = {
     "tool_call": frozenset({"arguments"}),
     "tool_result": frozenset({"artifacts", "structured"}),
     "provider_state": frozenset({"state"}),
     "thinking": frozenset({"provider_state"}),
+    "hosted_tool_call": frozenset({"action"}),
+    "citation": frozenset({"provenance"}),
 }
 _FILE_ATTACHMENT_STRUCTURE_KEYS = frozenset(
     {
@@ -100,7 +128,11 @@ _MESSAGE_AUTHORITY_STRING_FIELDS = frozenset(
     {
         "model_attempt_id",
         "model_step_id",
+        "call_id",
+        "hosted_tool",
+        "model",
         "provider",
+        "provider_name",
         "tool_call_id",
         "tool_name",
         "tool_round_id",

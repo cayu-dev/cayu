@@ -750,6 +750,35 @@ def test_cache_write_ttl_subcategories_cannot_contradict_aggregate_usage(
     assert result.status is expected_status
 
 
+def test_hosted_search_usage_and_cost_survive_cost_quality_projection() -> None:
+    pair = _pair(baseline_tokens=50, candidate_tokens=20)
+    assert pair.candidate is not None
+    cost = _cost(session_id="candidate", input_tokens=20).model_copy(
+        update={
+            "web_search_calls": 2,
+            "web_search_cost": Decimal("20"),
+            "total_cost": Decimal("40"),
+        }
+    )
+    candidate_attempt = pair.candidate.attempts[0].model_copy(update={"cost": cost})
+    candidate = pair.candidate.model_copy(update={"attempts": (candidate_attempt,)})
+
+    result = compare_paired_cost_quality(
+        PairedCostQualityComparisonRequest(
+            pairs=(pair.model_copy(update={"candidate": candidate}),)
+        )
+    ).pairs[0]
+
+    assert result.status is CostQualityComparisonStatus.VERIFIED
+    assert result.candidate is not None
+    accepted = result.candidate.attempts[0].cost
+    assert accepted is not None
+    assert accepted.web_search_calls == 2
+    assert accepted.web_search_cost == Decimal("20")
+    assert result.candidate.whole_harness.web_search_calls == 2
+    assert result.candidate_cost == Decimal("40")
+
+
 def test_missing_attempt_identity_is_unavailable_instead_of_guessed() -> None:
     pair = _pair()
     assert pair.candidate is not None
@@ -1111,7 +1140,7 @@ def test_attempt_cost_evidence_is_detached_and_frozen() -> None:
         accepted_cost.total_cost = Decimal("1")
 
 
-def test_schema_v2_minimal_unavailable_report_has_a_locked_json_shape() -> None:
+def test_schema_v3_minimal_unavailable_report_has_a_locked_json_shape() -> None:
     report = compare_paired_cost_quality(
         PairedCostQualityComparisonRequest(
             pairs=(PairedCostQualityPair(pair_id="missing", baseline=None, candidate=None),)
@@ -1119,7 +1148,7 @@ def test_schema_v2_minimal_unavailable_report_has_a_locked_json_shape() -> None:
     )
 
     assert report.model_dump(mode="json") == {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "unavailable",
         "pairs": [
             {
@@ -1183,10 +1212,10 @@ def test_schema_v2_minimal_unavailable_report_has_a_locked_json_shape() -> None:
     }
 
 
-def test_schema_v2_full_verified_report_matches_golden_json() -> None:
+def test_schema_v3_full_verified_report_matches_golden_json() -> None:
     report = compare_paired_cost_quality(
         PairedCostQualityComparisonRequest(pairs=(_fully_attributed_pair(),))
     )
-    golden_path = Path(__file__).parents[1] / "fixtures" / "cost_quality_verified_v2.json"
+    golden_path = Path(__file__).parents[1] / "fixtures" / "cost_quality_verified_v3.json"
 
     assert report.model_dump(mode="json") == json.loads(golden_path.read_text())

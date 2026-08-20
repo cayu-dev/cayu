@@ -26,7 +26,7 @@ from cayu._validation import (
 )
 from cayu.runtime.costs import CostLineItem, Provenance
 
-COST_QUALITY_COMPARISON_SCHEMA_VERSION = 2
+COST_QUALITY_COMPARISON_SCHEMA_VERSION = 3
 
 _MAX_PAIRS = 256
 _MAX_ATTEMPTS_PER_SIDE = 2_048
@@ -115,11 +115,18 @@ class ComparisonCostLineItem(BaseModel):
         ge=0,
         le=MAX_DURABLE_JSON_INTEGER,
     )
+    web_search_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    web_search_outcome_unknown: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     uncached_input_tokens: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     input_cost: Decimal = Field(ge=0, le=_MAX_COST_VALUE)
     output_cost: Decimal = Field(ge=0, le=_MAX_COST_VALUE)
     cache_read_input_cost: Decimal = Field(ge=0, le=_MAX_COST_VALUE)
     cache_write_input_cost: Decimal = Field(ge=0, le=_MAX_COST_VALUE)
+    web_search_cost: Decimal = Field(default=Decimal("0"), ge=0, le=_MAX_COST_VALUE)
     total_cost: Decimal = Field(ge=0, le=_MAX_COST_VALUE)
     missing_pricing_reason: str | None = Field(default=None, max_length=_MAX_REFERENCE_CHARS)
 
@@ -153,11 +160,14 @@ class ComparisonCostLineItem(BaseModel):
             cache_write_5m_input_tokens=item.cache_write_5m_input_tokens,
             cache_write_1h_input_tokens=item.cache_write_1h_input_tokens,
             cache_write_unknown_ttl_input_tokens=item.cache_write_unknown_ttl_input_tokens,
+            web_search_calls=item.web_search_calls,
+            web_search_outcome_unknown=item.web_search_outcome_unknown,
             uncached_input_tokens=item.uncached_input_tokens,
             input_cost=item.input_cost,
             output_cost=item.output_cost,
             cache_read_input_cost=item.cache_read_input_cost,
             cache_write_input_cost=item.cache_write_input_cost,
+            web_search_cost=item.web_search_cost,
             total_cost=item.total_cost,
             missing_pricing_reason=item.missing_pricing_reason,
         )
@@ -200,6 +210,7 @@ class ComparisonCostLineItem(BaseModel):
         "output_cost",
         "cache_read_input_cost",
         "cache_write_input_cost",
+        "web_search_cost",
         "total_cost",
     )
     @classmethod
@@ -603,6 +614,8 @@ class CostAccountingTotals(BaseModel):
     output_tokens: StrictInt = Field(ge=0)
     cache_read_input_tokens: StrictInt = Field(ge=0)
     cache_write_input_tokens: StrictInt = Field(ge=0)
+    web_search_calls: StrictInt = Field(default=0, ge=0)
+    web_search_outcome_unknown: StrictInt = Field(default=0, ge=0)
     uncached_input_tokens: StrictInt = Field(ge=0)
     currencies: tuple[CostCurrencyTotal, ...] = ()
 
@@ -788,7 +801,7 @@ class PairedCostQualityComparisonReport(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[2] = COST_QUALITY_COMPARISON_SCHEMA_VERSION
+    schema_version: Literal[3] = COST_QUALITY_COMPARISON_SCHEMA_VERSION
     status: CostQualityComparisonStatus
     pairs: tuple[PairedCostQualityPairReport, ...]
     aggregate: CostQualityAggregateReport
@@ -1078,11 +1091,14 @@ def _cost_is_consistent(attempt: PairedCostAttempt) -> bool:
     )
     if cache_write_ttl_tokens and cache_write_ttl_tokens != cost.cache_write_input_tokens:
         return False
+    if cost.web_search_outcome_unknown and cost.priced:
+        return False
     component_cost = (
         cost.input_cost
         + cost.output_cost
         + cost.cache_read_input_cost
         + cost.cache_write_input_cost
+        + cost.web_search_cost
     )
     if component_cost != cost.total_cost:
         return False
@@ -1104,6 +1120,7 @@ def _cost_is_consistent(attempt: PairedCostAttempt) -> bool:
         and cost.output_cost == 0
         and cost.cache_read_input_cost == 0
         and cost.cache_write_input_cost == 0
+        and cost.web_search_cost == 0
         and cost.missing_pricing_reason is not None
     )
 
@@ -1172,6 +1189,8 @@ def _totals(attempts) -> CostAccountingTotals:
         "output_tokens": 0,
         "cache_read_input_tokens": 0,
         "cache_write_input_tokens": 0,
+        "web_search_calls": 0,
+        "web_search_outcome_unknown": 0,
         "uncached_input_tokens": 0,
     }
     priced_attempts = 0

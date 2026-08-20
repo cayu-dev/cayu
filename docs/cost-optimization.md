@@ -63,9 +63,10 @@ candidate attempts, provider-reported `CostLineItem` evidence, an explicit
 output budget, opaque generation-settings revision, pricing-catalog identity,
 and application-owned quality results.
 Cayu recomputes operation, session, branch, side, pair, and aggregate totals and
-returns a `PairedCostQualityComparisonReport` with `schema_version=2`. Version 2
+returns a `PairedCostQualityComparisonReport` with `schema_version=3`. Version 2
 links each cost line item to its governing execution profile when that durable
-authority is available.
+authority is available. Version 3 additionally retains hosted-search calls,
+unknown outcomes, and their separately priced resource cost.
 
 The status is the strongest wording supported by the evidence:
 

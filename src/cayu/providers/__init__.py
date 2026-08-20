@@ -56,6 +56,7 @@ from cayu.providers.chat_completions import (
     build_chat_completions_payload,
     chat_completions_stream_events,
 )
+from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 from cayu.providers.openai import (
     HttpxOpenAITransport,
     OpenAIAPIError,
@@ -128,6 +129,7 @@ __all__ = [
     "ChatCompletionsProtocolError",
     "ChatCompletionsProvider",
     "ChatCompletionsTransport",
+    "HostedToolCapabilityError",
     "HttpxAnthropicTransport",
     "HttpxChatCompletionsTransport",
     "HttpxOpenAISubscriptionOAuthTransport",
@@ -157,6 +159,7 @@ __all__ = [
     "OpenAISubscriptionCredentials",
     "OpenAISubscriptionProvider",
     "OpenAITransport",
+    "OpenAIWebSearch",
     "ProviderOperationAdapter",
     "ProviderOperationCancellationSupport",
     "ProviderOperationConnection",

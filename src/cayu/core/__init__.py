@@ -4,7 +4,10 @@ from cayu.core.agents import Agent, AgentAuthoringState, AgentSpec
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import (
+    CitationPart,
+    CitationProvenance,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -12,6 +15,8 @@ from cayu.core.messages import (
     ThinkingPart,
     ToolCallPart,
     ToolResultPart,
+    WebSearchAction,
+    WebSearchSource,
 )
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -22,10 +27,13 @@ __all__ = [
     "Agent",
     "AgentAuthoringState",
     "AgentSpec",
+    "CitationPart",
+    "CitationProvenance",
     "Event",
     "EventType",
     "ExecutionProfileBehaviorIdentity",
     "FilePart",
+    "HostedToolCallPart",
     "Message",
     "MessageRole",
     "ProviderStatePart",
@@ -39,6 +47,8 @@ __all__ = [
     "ToolResult",
     "ToolResultPart",
     "ToolSpec",
+    "WebSearchAction",
+    "WebSearchSource",
     "Workflow",
     "WorkflowSpec",
 ]

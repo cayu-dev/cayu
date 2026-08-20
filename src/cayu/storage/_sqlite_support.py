@@ -121,7 +121,7 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
     )
     connection.create_aggregate(
         "cayu_exact_usage_sum",
-        11,
+        13,
         cast("Any", _ExactUsageSum),
     )
 
@@ -134,7 +134,7 @@ class _ExactUsageSum:
     _DECIMAL_WIDTH = 38
 
     def __init__(self) -> None:
-        self._totals = [0] * 11
+        self._totals = [0] * 13
 
     def step(self, *values: object) -> None:
         for index, value in enumerate(values):

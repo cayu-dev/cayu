@@ -3617,8 +3617,10 @@ round-half-even to `0.01`. Zero baselines produce no percentage and the explicit
 `zero_baseline` state. Negative savings remain negative with
 `cost_direction="increased_cost"`.
 
-`PairedCostQualityComparisonReport.schema_version` is `2`. Version 2 adds the
-optional governing execution-profile fingerprint to each cost line item. JSON-mode dumps
+`PairedCostQualityComparisonReport.schema_version` is `3`. Version 2 adds the
+optional governing execution-profile fingerprint to each cost line item.
+Version 3 adds hosted-search calls, unknown outcomes, and their separately
+priced resource cost. JSON-mode dumps
 serialize decimal values as strings and have no prompt, message, model-output,
 credential, or arbitrary metadata field. Quality evidence references are
 opaque `sha256:` content identifiers, never artifact locations or arbitrary
@@ -3947,13 +3949,13 @@ model target. Server contract version 12 makes the exact knowledge revision
 required on entry and chunk projections. Server contract version 13 adds typed
 unavailable and ambiguous provider-operation inspection, a run-epoch-fenced
 resolution mutation, and its control-plane capability. Server contract version
-14 adds the required operation-level Evals readiness projection. Clients
-generated against contract version 1 through 13 must regenerate from the current
-OpenAPI document. Server contract version 15 adds the bounded retry-series projection to
-task list/detail responses. Its cumulative and remaining token counters use the
-same lossless decimal-string representation as aggregate counters. Clients
-generated against version 14 must regenerate before rendering task records from
-a version-15 server.
+14 adds the required operation-level Evals readiness projection. Server contract
+version 15 adds the bounded retry-series projection to task list/detail responses.
+Its cumulative and remaining token counters use the same lossless decimal-string
+representation as aggregate counters. Server contract version 16 adds exact
+hosted-tool usage counters and hosted web-search pricing evidence to usage and
+cost projections. Clients generated against contract version 1 through 15 must
+regenerate from the current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
@@ -4762,6 +4764,42 @@ Once a provider has completed a request, structurally invalid `provider_state` c
 `BedrockProvider` adapts Amazon Bedrock `ConverseStream` to the same transcript without requiring an Anthropic API key. Install `cayu[aws]`, configure the standard AWS credential chain and region (or pass `profile_name=` for a named Boto3 profile), and pass an explicit Bedrock model ID or inference-profile ARN through the agent's `model`; Cayu never guesses a provider from the model name. The caller needs `bedrock:CountTokens` and `bedrock:InvokeModel` for `CountTokens`, plus `bedrock:InvokeModelWithResponseStream` for streaming. System messages, reasoning text and its required signature/redacted round-trip state, tools/tool results, images/PDFs, tool-strategy structured output, stop reasons, `CountTokens`, cache-aware usage (including cache-write TTL details), effective service tier, and typed AWS errors are normalized behind the provider interface. `CountTokens` availability remains model-specific: some Claude models offered only through cross-Region inference require the separate Bedrock Mantle endpoint, which this adapter does not call. `ModelRequest.options["bedrock"]` accepts copied Converse options, including `serviceTier`, but the adapter owns `modelId`, `messages`, `system`, and `toolConfig`. AWS credentials are resolved by Boto3 and are never copied into events or request metadata. Native structured output is not claimed; use Cayu's provider-neutral tool strategy. Bedrock cost and reservation accounting use one durable identity containing the exact invoked resource, actual Boto client source region, requested tier (omission is Standard/`default`), and provider-reported effective tier. Unknown combinations are unpriced; opaque application-profile ARNs require an explicit price or mapping. `ModelCatalog` is never consulted for this billing decision.
 
 `OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces a provider-event idle timeout so a stalled stream fails the model step instead of leaving the session running indefinitely. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
+
+`OpenAIWebSearch` is immutable provider-hosted execution authority registered
+through `hosted_tools`, never a Cayu `Tool` or raw provider option. Its complete
+configuration participates in agent registration, execution-profile identity,
+request footprints and fingerprints, reconstruction, resume/fork identity, and
+provider-target preflight. OpenAI adapters project it as the native Responses
+`web_search` tool and merge source inclusion with encrypted-reasoning inclusion.
+Preflight admits only model families whose native web-search support Cayu has
+established; unknown models and unverified custom endpoints fail closed.
+Every search lifecycle record binds the provider/model, model step and attempt,
+runtime-owned `provider_operation_id`, and provider call ID. The operation ID is
+derived from the admitted model attempt, so retries receive distinct operation
+identity even when OpenAI reuses another response field. Only a completed
+`web_search_call` is replayable provider state; incomplete, failed, cancelled,
+or transport-ambiguous calls remain terminal evidence and cannot become a
+pending Cayu tool round.
+
+Hosted search delegates network, filtering, retry, quota, and billing execution
+to OpenAI. Cayu local approvals, tool policy, runners, DNS, and egress do not
+intercept it. Returned queries, sources, and URL citations are bounded and
+labeled untrusted external evidence. Token usage remains provider-reported;
+terminal lifecycle events are the authoritative resource counters, while the
+completion-side copy is used only for per-attempt pricing. This prevents a
+successful response from being counted twice and still meters a completed,
+incomplete, or failed call when token usage or the terminal response is absent.
+Standalone lifecycle pricing is resource evidence, not another model step:
+session line items use `model_step=0` when no completion exists, while aggregate
+currency and unpriced-reason entries report the separate `hosted_resources`
+count without changing evaluated/priced/unpriced model-step totals. Bounded
+pricing inputs retain their exact `model.completed` or
+`model.hosted_tool_call` event type through native-store grouping, session
+attribution, coalescing, and cost evaluation; counter shape never determines
+which kind of evidence an input represents.
+Transport loss after start is an unknown outcome. A retry may repeat the search and cost. Because OpenAI does
+not expose a hard per-response search-call ceiling, strict cost budgets reject
+hosted search before provider dispatch. See [`web-fetch.md`](web-fetch.md).
 
 `OpenAISubscriptionProvider` reuses that neutral Responses translation against
 the ChatGPT Codex backend after `cayu auth openai login`. It refreshes the

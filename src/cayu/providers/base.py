@@ -21,7 +21,9 @@ from cayu.artifacts.attachments import file_attachment_from_payload
 from cayu.core.billing import BillingIdentity
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import (
+    CitationPart,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -32,6 +34,11 @@ from cayu.core.messages import (
     detach_message,
 )
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
+from cayu.providers.hosted import (
+    HostedToolCapabilityError,
+    OpenAIWebSearch,
+    copy_openai_web_search,
+)
 from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationMode,
@@ -166,6 +173,10 @@ def _preflight_provider_portable_messages(
                 raise ValueError(
                     "Portable target messages cannot contain provider state or thinking parts."
                 )
+            if type(part) in {HostedToolCallPart, CitationPart}:
+                # Provider-neutral terminal evidence is not executable input.
+                # The assistant text remains the portable conversation surface.
+                continue
             raise TypeError("Portable target messages contain an unsupported message part.")
 
     if tools and not supports_tool_definitions:
@@ -192,6 +203,8 @@ class ModelStreamEventType(StrEnum):
     TEXT_DELTA = "text_delta"
     THINKING = "thinking"
     TOOL_CALL = "tool_call"
+    HOSTED_TOOL_CALL = "hosted_tool_call"
+    CITATION = "citation"
     COMPLETED = "completed"
     ERROR = "error"
 
@@ -513,6 +526,7 @@ class ModelRequest(BaseModel):
     model: str
     messages: list[Message]
     tools: list[dict[str, Any]] = Field(default_factory=list)
+    hosted_tools: tuple[OpenAIWebSearch, ...] = ()
     options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("messages")
@@ -524,6 +538,21 @@ class ModelRequest(BaseModel):
     @classmethod
     def copy_json_request_data(cls, value, info):
         return copy_durable_json_value(value, info.field_name)
+
+    @field_validator("hosted_tools", mode="before")
+    @classmethod
+    def copy_hosted_tools(cls, value: object) -> tuple[OpenAIWebSearch, ...]:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("hosted_tools must be a sequence of hosted tool instances.")
+        items = tuple(value)
+        if len(items) > 1:
+            raise ValueError("ModelRequest cannot contain duplicate OpenAI web search tools.")
+        copied: list[OpenAIWebSearch] = []
+        for item in items:
+            if not isinstance(item, OpenAIWebSearch):
+                raise TypeError("Hosted tools must be OpenAIWebSearch instances.")
+            copied.append(copy_openai_web_search(item))
+        return tuple(copied)
 
     @field_validator("model")
     @classmethod
@@ -658,6 +687,32 @@ class ModelStreamEvent(BaseModel):
         return cls(
             type=ModelStreamEventType.TOOL_CALL,
             payload=payload,
+            recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
+        )
+
+    @classmethod
+    def hosted_tool_call(
+        cls,
+        payload: dict[str, Any],
+        *,
+        recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
+    ) -> ModelStreamEvent:
+        return cls(
+            type=ModelStreamEventType.HOSTED_TOOL_CALL,
+            payload=copy_json_value(payload, "hosted_tool_call"),
+            recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
+        )
+
+    @classmethod
+    def citation(
+        cls,
+        payload: dict[str, Any],
+        *,
+        recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
+    ) -> ModelStreamEvent:
+        return cls(
+            type=ModelStreamEventType.CITATION,
+            payload=copy_json_value(payload, "citation"),
             recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
         )
 
@@ -986,6 +1041,32 @@ class ModelProvider(ABC):
             supports_tool_definitions=False,
             supports_file_attachments=False,
         )
+
+    def preflight_hosted_tools(
+        self,
+        *,
+        model: str,
+        hosted_tools: tuple[OpenAIWebSearch, ...],
+        options: dict[str, Any],
+    ) -> None:
+        """Reject provider-hosted authority this adapter cannot honor.
+
+        This hook is side-effect free and is called before a new session is
+        created. The conservative default rejects every hosted tool so custom
+        providers cannot silently omit registered execution authority.
+        """
+
+        require_clean_nonblank(model, "model")
+        if type(hosted_tools) is not tuple or any(
+            type(tool) is not OpenAIWebSearch for tool in hosted_tools
+        ):
+            raise TypeError("hosted_tools must contain exact OpenAIWebSearch instances.")
+        if type(options) is not dict:
+            raise TypeError("Hosted-tool provider options must be a dictionary.")
+        if hosted_tools:
+            raise HostedToolCapabilityError(
+                f"Provider-hosted web search is not supported by provider {self.name!r}."
+            )
 
     async def billing_identity_for_request(
         self,

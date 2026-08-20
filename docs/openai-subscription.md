@@ -74,6 +74,25 @@ app.register_provider(OpenAISubscriptionProvider(), default=True)
 app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
 ```
 
+The experimental adapter also supports the same typed native hosted-search
+authority as `OpenAIProvider` while the Codex backend continues to accept it:
+
+```python
+from cayu import OpenAIWebSearch
+
+app.register_agent(
+    AgentSpec(name="researcher", model="gpt-5.6-luna"),
+    hosted_tools=[OpenAIWebSearch(search_context_size="low")],
+)
+```
+
+This does not make the backend a public OpenAI contract. Upstream rejection is
+a capability failure, not permission to spoof a first-party identity or silently
+disable search. Opt-in live verification uses
+`CAYU_OPENAI_HOSTED_WEB_SEARCH_SUBSCRIPTION_LIVE=1`; it records only bounded
+structural evidence and never prints credentials, account identity, or response
+prose.
+
 ## Execution security boundary
 
 The subscription access token, refresh token, and account identifier are

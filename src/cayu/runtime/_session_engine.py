@@ -89,6 +89,7 @@ from cayu.environments import (
 from cayu.providers import (
     CacheBreakpoint,
     CachePolicy,
+    HostedToolCapabilityError,
     ModelProvider,
     ModelRequest,
     NativeStructuredOutputSchemaInvalid,
@@ -6284,6 +6285,14 @@ class SessionEngine:
             ):
                 del existing_session
                 raise ValueError(f"Session already exists: {prepared_session_id}")
+        registered_provider.provider.preflight_hosted_tools(
+            model=model,
+            hosted_tools=registered_agent.hosted_tools,
+            options=copy_json_value(
+                registered_agent.spec.provider_options,
+                "agent provider_options",
+            ),
+        )
         session_identity = _session_identity(
             provider_name=registered_provider.name,
             model=model,
@@ -14227,6 +14236,22 @@ class SessionEngine:
             agent_name=registered_agent.spec.name,
             causal_budget_id=session.causal_budget_id,
         )
+        hosted_search_budget_limits = (
+            *budget_limits,
+            *budget_limits_for_session(
+                policy=self._get_budget_policy(),
+                agent_name=registered_agent.spec.name,
+                causal_budget_id=session.causal_budget_id,
+            ),
+        )
+        if registered_agent.hosted_tools and any(
+            not limit.allow_unpriced for limit in hosted_search_budget_limits
+        ):
+            raise HostedToolCapabilityError(
+                "Strict cost budgets cannot admit OpenAI hosted web search because "
+                "the Responses API exposes no hard per-response search-call ceiling. "
+                "Use an explicitly allow_unpriced budget or disable hosted search."
+            )
         retry_policy = copy_retry_policy(retry_policy)
         structured_output = copy_structured_output_spec(structured_output)
         request_loop_policies = validate_loop_policies(

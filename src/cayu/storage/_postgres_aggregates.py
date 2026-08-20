@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, LiteralString, cast
 
+from cayu.core.events import EventType
 from cayu.runtime.aggregates import (
     _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
     _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
@@ -66,6 +67,14 @@ usage_events AS MATERIALIZED (
              ) = event.payload #>> '{{usage_metrics,provider_name}}'
              AND event.payload #>> '{{usage_metrics,provider_name}}' <> ''
             THEN event.payload #>> '{{usage_metrics,provider_name}}'
+            WHEN event.event_type = 'model.hosted_tool_call'
+             AND jsonb_typeof(event.payload -> 'provider_name') = 'string'
+             AND btrim(
+                 event.payload ->> 'provider_name',
+                 (SELECT identity_trim FROM scope)
+             ) = event.payload ->> 'provider_name'
+             AND event.payload ->> 'provider_name' <> ''
+            THEN event.payload ->> 'provider_name'
         END) COLLATE "C" AS provider_name,
         (CASE
             WHEN event.payload -> 'usage_normalization_failed'
@@ -77,6 +86,14 @@ usage_events AS MATERIALIZED (
              ) = event.payload #>> '{{usage_metrics,model}}'
              AND event.payload #>> '{{usage_metrics,model}}' <> ''
             THEN event.payload #>> '{{usage_metrics,model}}'
+            WHEN event.event_type = 'model.hosted_tool_call'
+             AND jsonb_typeof(event.payload -> 'model') = 'string'
+             AND btrim(
+                 event.payload ->> 'model',
+                 (SELECT identity_trim FROM scope)
+             ) = event.payload ->> 'model'
+             AND event.payload ->> 'model' <> ''
+            THEN event.payload ->> 'model'
         END) COLLATE "C" AS model,
         {input_tokens} AS input_tokens,
         {output_tokens} AS output_tokens,
@@ -88,13 +105,17 @@ usage_events AS MATERIALIZED (
         {cache_write_1h_tokens} AS cache_write_1h_tokens,
         {cache_write_unknown_tokens} AS cache_write_unknown_ttl_tokens,
         {cached_input_tokens} AS cached_input_tokens,
-        {uncached_input_tokens} AS uncached_input_tokens
+        {uncached_input_tokens} AS uncached_input_tokens,
+        {web_search_calls} AS web_search_calls,
+        {web_search_outcome_unknown} AS web_search_outcome_unknown
     FROM cayu_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     CROSS JOIN scope
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
-      AND event.event_type IN ('model.completed', 'tool.call.started')
+      AND event.event_type IN (
+          'model.completed', 'tool.call.started', 'model.hosted_tool_call'
+      )
 ),
 overall AS (
     SELECT
@@ -125,15 +146,19 @@ overall AS (
         COALESCE(SUM(cached_input_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
             AS cached_input_tokens,
         COALESCE(SUM(uncached_input_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
-            AS uncached_input_tokens
+            AS uncached_input_tokens,
+        COALESCE(SUM(web_search_calls), 0) AS web_search_calls,
+        COALESCE(SUM(web_search_outcome_unknown), 0) AS web_search_outcome_unknown
     FROM usage_events
 ),
 provider_grouped AS (
     SELECT
         provider_name,
         COUNT(DISTINCT session_id) AS session_count,
-        COUNT(*) AS model_steps,
-        SUM(has_usage) AS model_steps_with_usage,
+        COUNT(*) FILTER (WHERE event_type = 'model.completed') AS model_steps,
+        COUNT(*) FILTER (
+            WHERE event_type = 'model.completed' AND has_usage = 1
+        ) AS model_steps_with_usage,
         SUM(input_tokens) AS input_tokens,
         SUM(output_tokens) AS output_tokens,
         SUM(total_tokens) AS total_tokens,
@@ -144,9 +169,13 @@ provider_grouped AS (
         SUM(cache_write_1h_tokens) AS cache_write_1h_tokens,
         SUM(cache_write_unknown_ttl_tokens) AS cache_write_unknown_ttl_tokens,
         SUM(cached_input_tokens) AS cached_input_tokens,
-        SUM(uncached_input_tokens) AS uncached_input_tokens
+        SUM(uncached_input_tokens) AS uncached_input_tokens,
+        SUM(web_search_calls) AS web_search_calls,
+        SUM(web_search_outcome_unknown) AS web_search_outcome_unknown
     FROM usage_events
     WHERE event_type = 'model.completed'
+       OR web_search_calls > 0
+       OR web_search_outcome_unknown > 0
     GROUP BY provider_name
 ),
 provider_ranked AS (
@@ -162,8 +191,10 @@ provider_ranked AS (
 provider_remainder AS (
     SELECT
         COUNT(DISTINCT event.session_id) AS session_count,
-        COUNT(*) AS model_steps,
-        SUM(event.has_usage) AS model_steps_with_usage,
+        COUNT(*) FILTER (WHERE event.event_type = 'model.completed') AS model_steps,
+        COUNT(*) FILTER (
+            WHERE event.event_type = 'model.completed' AND event.has_usage = 1
+        ) AS model_steps_with_usage,
         SUM(event.input_tokens) AS input_tokens,
         SUM(event.output_tokens) AS output_tokens,
         SUM(event.total_tokens) AS total_tokens,
@@ -175,11 +206,15 @@ provider_remainder AS (
         SUM(event.cache_write_unknown_ttl_tokens) AS cache_write_unknown_ttl_tokens,
         SUM(event.cached_input_tokens) AS cached_input_tokens,
         SUM(event.uncached_input_tokens) AS uncached_input_tokens,
+        SUM(event.web_search_calls) AS web_search_calls,
+        SUM(event.web_search_outcome_unknown) AS web_search_outcome_unknown,
         MAX(ranked.total_groups) - (SELECT group_limit FROM scope) AS group_count
     FROM usage_events AS event
     JOIN provider_ranked AS ranked
       ON event.provider_name IS NOT DISTINCT FROM ranked.provider_name
-    WHERE event.event_type = 'model.completed'
+    WHERE (event.event_type = 'model.completed'
+           OR event.web_search_calls > 0
+           OR event.web_search_outcome_unknown > 0)
       AND ranked.group_rank > (SELECT group_limit FROM scope)
     HAVING COUNT(*) > 0
 ),
@@ -188,8 +223,10 @@ model_grouped AS (
         provider_name,
         model,
         COUNT(DISTINCT session_id) AS session_count,
-        COUNT(*) AS model_steps,
-        SUM(has_usage) AS model_steps_with_usage,
+        COUNT(*) FILTER (WHERE event_type = 'model.completed') AS model_steps,
+        COUNT(*) FILTER (
+            WHERE event_type = 'model.completed' AND has_usage = 1
+        ) AS model_steps_with_usage,
         SUM(input_tokens) AS input_tokens,
         SUM(output_tokens) AS output_tokens,
         SUM(total_tokens) AS total_tokens,
@@ -200,9 +237,13 @@ model_grouped AS (
         SUM(cache_write_1h_tokens) AS cache_write_1h_tokens,
         SUM(cache_write_unknown_ttl_tokens) AS cache_write_unknown_ttl_tokens,
         SUM(cached_input_tokens) AS cached_input_tokens,
-        SUM(uncached_input_tokens) AS uncached_input_tokens
+        SUM(uncached_input_tokens) AS uncached_input_tokens,
+        SUM(web_search_calls) AS web_search_calls,
+        SUM(web_search_outcome_unknown) AS web_search_outcome_unknown
     FROM usage_events
     WHERE event_type = 'model.completed'
+       OR web_search_calls > 0
+       OR web_search_outcome_unknown > 0
     GROUP BY provider_name, model
 ),
 model_ranked AS (
@@ -218,8 +259,10 @@ model_ranked AS (
 model_remainder AS (
     SELECT
         COUNT(DISTINCT event.session_id) AS session_count,
-        COUNT(*) AS model_steps,
-        SUM(event.has_usage) AS model_steps_with_usage,
+        COUNT(*) FILTER (WHERE event.event_type = 'model.completed') AS model_steps,
+        COUNT(*) FILTER (
+            WHERE event.event_type = 'model.completed' AND event.has_usage = 1
+        ) AS model_steps_with_usage,
         SUM(event.input_tokens) AS input_tokens,
         SUM(event.output_tokens) AS output_tokens,
         SUM(event.total_tokens) AS total_tokens,
@@ -231,12 +274,16 @@ model_remainder AS (
         SUM(event.cache_write_unknown_ttl_tokens) AS cache_write_unknown_ttl_tokens,
         SUM(event.cached_input_tokens) AS cached_input_tokens,
         SUM(event.uncached_input_tokens) AS uncached_input_tokens,
+        SUM(event.web_search_calls) AS web_search_calls,
+        SUM(event.web_search_outcome_unknown) AS web_search_outcome_unknown,
         MAX(ranked.total_groups) - (SELECT group_limit FROM scope) AS group_count
     FROM usage_events AS event
     JOIN model_ranked AS ranked
       ON event.provider_name IS NOT DISTINCT FROM ranked.provider_name
      AND event.model IS NOT DISTINCT FROM ranked.model
-    WHERE event.event_type = 'model.completed'
+    WHERE (event.event_type = 'model.completed'
+           OR event.web_search_calls > 0
+           OR event.web_search_outcome_unknown > 0)
       AND ranked.group_rank > (SELECT group_limit FROM scope)
     HAVING COUNT(*) > 0
 )
@@ -259,6 +306,8 @@ SELECT
     overall.cache_write_unknown_ttl_tokens,
     overall.cached_input_tokens,
     overall.uncached_input_tokens,
+    overall.web_search_calls,
+    overall.web_search_outcome_unknown,
     0::bigint AS group_count,
     NULL::date AS effective_on,
     0::bigint AS occurrences,
@@ -277,7 +326,8 @@ SELECT
     model_steps_with_usage, 0, input_tokens, output_tokens, total_tokens,
     reasoning_output_tokens, cache_read_tokens, cache_write_tokens,
     cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_ttl_tokens,
-    cached_input_tokens, uncached_input_tokens, total_groups, NULL, 0, NULL, NULL, 0, 0
+    cached_input_tokens, uncached_input_tokens, web_search_calls,
+    web_search_outcome_unknown, total_groups, NULL, 0, NULL, NULL, 0, 0
 FROM provider_ranked
 WHERE group_rank <= (SELECT group_limit FROM scope)
 UNION ALL
@@ -286,7 +336,8 @@ SELECT
     model_steps_with_usage, 0, input_tokens, output_tokens, total_tokens,
     reasoning_output_tokens, cache_read_tokens, cache_write_tokens,
     cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_ttl_tokens,
-    cached_input_tokens, uncached_input_tokens, group_count, NULL, 0, NULL, NULL, 0, 0
+    cached_input_tokens, uncached_input_tokens, web_search_calls,
+    web_search_outcome_unknown, group_count, NULL, 0, NULL, NULL, 0, 0
 FROM provider_remainder
 UNION ALL
 SELECT
@@ -294,7 +345,8 @@ SELECT
     model_steps_with_usage, 0, input_tokens, output_tokens, total_tokens,
     reasoning_output_tokens, cache_read_tokens, cache_write_tokens,
     cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_ttl_tokens,
-    cached_input_tokens, uncached_input_tokens, total_groups, NULL, 0, NULL, NULL, 0, 0
+    cached_input_tokens, uncached_input_tokens, web_search_calls,
+    web_search_outcome_unknown, total_groups, NULL, 0, NULL, NULL, 0, 0
 FROM model_ranked
 WHERE group_rank <= (SELECT group_limit FROM scope)
 UNION ALL
@@ -303,7 +355,8 @@ SELECT
     model_steps_with_usage, 0, input_tokens, output_tokens, total_tokens,
     reasoning_output_tokens, cache_read_tokens, cache_write_tokens,
     cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_ttl_tokens,
-    cached_input_tokens, uncached_input_tokens, group_count, NULL, 0, NULL, NULL, 0, 0
+    cached_input_tokens, uncached_input_tokens, web_search_calls,
+    web_search_outcome_unknown, group_count, NULL, 0, NULL, NULL, 0, 0
 FROM model_remainder
 """
 
@@ -319,6 +372,7 @@ matched_sessions AS MATERIALIZED (
 ),
 pricing_candidates AS (
     SELECT
+        event.event_type,
         (event.timestamp AT TIME ZONE 'UTC')::date AS effective_on,
         {usage_metrics_projection} AS usage_metrics,
         {billing_identity_projection} AS billing_identity
@@ -326,7 +380,16 @@ pricing_candidates AS (
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
-      AND event.event_type = 'model.completed'
+      AND (
+          event.event_type = 'model.completed'
+          OR (
+              event.event_type = 'model.hosted_tool_call'
+              AND event.payload ->> 'tool_type' = 'web_search'
+              AND event.payload ->> 'status' IN (
+                  'completed', 'incomplete', 'failed', 'outcome_unknown'
+              )
+          )
+      )
 ),
 measured_candidates AS (
     SELECT
@@ -337,6 +400,7 @@ measured_candidates AS (
 ),
 bounded_candidates AS (
     SELECT
+        event_type,
         effective_on,
         input_bytes > (SELECT max_input_bytes FROM scope) AS input_oversized,
         CASE
@@ -351,15 +415,17 @@ bounded_candidates AS (
 ),
 pricing_groups AS (
     SELECT
+        event_type,
         effective_on,
         usage_metrics,
         billing_identity,
         input_oversized,
         COUNT(*) AS occurrences
     FROM bounded_candidates
-    GROUP BY effective_on, usage_metrics, billing_identity, input_oversized
+    GROUP BY event_type, effective_on, usage_metrics, billing_identity, input_oversized
 )
 SELECT
+    event_type,
     effective_on,
     usage_metrics,
     billing_identity,
@@ -387,6 +453,7 @@ matched_sessions AS MATERIALIZED (
 ),
 pricing_candidates AS (
     SELECT
+        event.event_type,
         event.session_id,
         (event.timestamp AT TIME ZONE 'UTC')::date AS effective_on,
         {usage_metrics_projection} AS usage_metrics,
@@ -395,7 +462,16 @@ pricing_candidates AS (
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
-      AND event.event_type = 'model.completed'
+      AND (
+          event.event_type = 'model.completed'
+          OR (
+              event.event_type = 'model.hosted_tool_call'
+              AND event.payload ->> 'tool_type' = 'web_search'
+              AND event.payload ->> 'status' IN (
+                  'completed', 'incomplete', 'failed', 'outcome_unknown'
+              )
+          )
+      )
 ),
 measured_candidates AS (
     SELECT
@@ -407,6 +483,7 @@ measured_candidates AS (
 ),
 bounded_candidates AS (
     SELECT
+        event_type,
         session_id,
         effective_on,
         input_bytes > (SELECT max_input_bytes FROM scope) AS input_oversized,
@@ -422,6 +499,7 @@ bounded_candidates AS (
 ),
 pricing_groups AS (
     SELECT
+        event_type,
         session_id,
         effective_on,
         usage_metrics,
@@ -430,6 +508,7 @@ pricing_groups AS (
         COUNT(*) AS occurrences
     FROM bounded_candidates
     GROUP BY
+        event_type,
         session_id,
         effective_on,
         usage_metrics,
@@ -437,6 +516,7 @@ pricing_groups AS (
         input_oversized
 )
 SELECT
+    event_type,
     session_id,
     effective_on,
     usage_metrics,
@@ -479,12 +559,16 @@ usage_events AS MATERIALIZED (
         {cache_write_1h_tokens} AS cache_write_1h_tokens,
         {cache_write_unknown_tokens} AS cache_write_unknown_ttl_tokens,
         {cached_input_tokens} AS cached_input_tokens,
-        {uncached_input_tokens} AS uncached_input_tokens
+        {uncached_input_tokens} AS uncached_input_tokens,
+        {web_search_calls} AS web_search_calls,
+        {web_search_outcome_unknown} AS web_search_outcome_unknown
     FROM cayu_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
-      AND event.event_type IN ('model.completed', 'tool.call.started')
+      AND event.event_type IN (
+          'model.completed', 'tool.call.started', 'model.hosted_tool_call'
+      )
 ),
 session_grouped AS (
     SELECT
@@ -529,7 +613,9 @@ session_grouped AS (
         ), 0) AS cached_input_tokens,
         COALESCE(SUM(uncached_input_tokens) FILTER (
             WHERE event.event_type = 'model.completed'
-        ), 0) AS uncached_input_tokens
+        ), 0) AS uncached_input_tokens,
+        COALESCE(SUM(web_search_calls), 0) AS web_search_calls,
+        COALESCE(SUM(web_search_outcome_unknown), 0) AS web_search_outcome_unknown
     FROM matched_sessions AS session
     LEFT JOIN usage_events AS event ON event.session_id = session.id
     GROUP BY session.id, session.status
@@ -569,6 +655,9 @@ session_remainder AS (
             AS cache_write_unknown_ttl_tokens,
         COALESCE(SUM(session.cached_input_tokens), 0) AS cached_input_tokens,
         COALESCE(SUM(session.uncached_input_tokens), 0) AS uncached_input_tokens,
+        COALESCE(SUM(session.web_search_calls), 0) AS web_search_calls,
+        COALESCE(SUM(session.web_search_outcome_unknown), 0)
+            AS web_search_outcome_unknown,
         COUNT(*) AS group_count,
         COUNT(*) FILTER (WHERE session.active) AS active_session_count
     FROM session_grouped AS session
@@ -603,6 +692,8 @@ SELECT
     cache_write_unknown_ttl_tokens,
     cached_input_tokens,
     uncached_input_tokens,
+    web_search_calls,
+    web_search_outcome_unknown,
     0::bigint AS group_count,
     0::bigint AS active_session_count
 FROM retained_sessions
@@ -628,6 +719,8 @@ SELECT
     cache_write_unknown_ttl_tokens,
     cached_input_tokens,
     uncached_input_tokens,
+    web_search_calls,
+    web_search_outcome_unknown,
     group_count,
     active_session_count
 FROM session_remainder
@@ -667,6 +760,8 @@ _ROW_COLUMNS = (
     "cache_write_unknown_ttl_tokens",
     "cached_input_tokens",
     "uncached_input_tokens",
+    "web_search_calls",
+    "web_search_outcome_unknown",
     "group_count",
     "effective_on",
     "occurrences",
@@ -696,6 +791,8 @@ _SESSION_ROW_COLUMNS = (
     "cache_write_unknown_ttl_tokens",
     "cached_input_tokens",
     "uncached_input_tokens",
+    "web_search_calls",
+    "web_search_outcome_unknown",
     "group_count",
     "active_session_count",
 )
@@ -776,6 +873,8 @@ def usage_rollup_statement(
     sql = _RESULT_SQL.format(
         session_where_sql=session_plan.filter_where_sql,
         **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
+        web_search_calls=_web_search_terminal_count(),
+        web_search_outcome_unknown=_web_search_unknown_count(),
     )
     return (
         sql,
@@ -801,6 +900,8 @@ def session_breakdown_statement(
             session_where_sql=session_plan.filter_where_sql,
             session_id_max_bytes=MAX_USAGE_ROLLUP_SESSION_ID_BYTES,
             **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
+            web_search_calls=_web_search_terminal_count(),
+            web_search_outcome_unknown=_web_search_unknown_count(),
         ),
         (
             query.session_group_limit,
@@ -876,23 +977,44 @@ def _postgres_usage_metrics_projection() -> str:
     identity_path = (*metrics_path, "billing_identity")
     metrics = f"event.payload #> {_postgres_json_path(metrics_path)}"
     identity = _postgres_billing_identity_projection(identity_path)
+    projected_metrics = f"""
+        CASE
+            WHEN jsonb_typeof(
+                event.payload #> {_postgres_json_path(identity_path)}
+            ) = 'object'
+            THEN jsonb_set(
+                {metrics},
+                '{{billing_identity}}',
+                {identity},
+                false
+            )
+            ELSE {metrics}
+        END
+    """.strip()
     return f"""
         CASE
-            WHEN event.payload -> 'usage_normalization_failed'
+            WHEN event.event_type = 'model.hosted_tool_call'
+             AND event.payload ->> 'tool_type' = 'web_search'
+             AND event.payload ->> 'status' IN (
+                 'completed', 'incomplete', 'failed', 'outcome_unknown'
+             )
+            THEN jsonb_build_object(
+                'provider_name', event.payload -> 'provider_name',
+                'model', event.payload -> 'model',
+                'hosted_tools', jsonb_build_object(
+                    'web_search_calls', CASE
+                        WHEN event.payload ->> 'status' = 'outcome_unknown'
+                        THEN 0 ELSE 1 END,
+                    'web_search_outcome_unknown', CASE
+                        WHEN event.payload ->> 'status' = 'outcome_unknown'
+                        THEN 1 ELSE 0 END
+                )
+            )
+            WHEN event.event_type = 'model.completed'
+             AND event.payload -> 'usage_normalization_failed'
                      IS DISTINCT FROM 'true'::jsonb
              AND jsonb_typeof({metrics}) = 'object'
-            THEN CASE
-                WHEN jsonb_typeof(
-                    event.payload #> {_postgres_json_path(identity_path)}
-                ) = 'object'
-                THEN jsonb_set(
-                    {metrics},
-                    '{{billing_identity}}',
-                    {identity},
-                    false
-                )
-                ELSE {metrics}
-            END
+            THEN {projected_metrics}
         END
     """.strip()
 
@@ -976,6 +1098,30 @@ def _nonnegative_json_integer(path: str) -> str:
                  )
              )
             THEN (event.payload #>> '{path}')::numeric
+            ELSE 0::numeric
+        END
+    """.strip()
+
+
+def _web_search_unknown_count() -> str:
+    return """
+        CASE
+            WHEN event.event_type = 'model.hosted_tool_call'
+             AND event.payload ->> 'tool_type' = 'web_search'
+             AND event.payload ->> 'status' = 'outcome_unknown'
+            THEN 1::numeric
+            ELSE 0::numeric
+        END
+    """.strip()
+
+
+def _web_search_terminal_count() -> str:
+    return """
+        CASE
+            WHEN event.event_type = 'model.hosted_tool_call'
+             AND event.payload ->> 'tool_type' = 'web_search'
+             AND event.payload ->> 'status' IN ('completed', 'incomplete', 'failed')
+            THEN 1::numeric
             ELSE 0::numeric
         END
     """.strip()
@@ -1159,6 +1305,8 @@ def _totals_from_row(row: dict[str, Any]) -> UsageAggregateTotals:
             cache_write_unknown_ttl_tokens=int(row["cache_write_unknown_ttl_tokens"]),
             cached_input_tokens=int(row["cached_input_tokens"]),
             uncached_input_tokens=int(row["uncached_input_tokens"]),
+            web_search_calls=int(row["web_search_calls"]),
+            web_search_outcome_unknown=int(row["web_search_outcome_unknown"]),
         ),
     )
 
@@ -1181,6 +1329,7 @@ def _add_pricing_input_from_row(
     if row["billing_identity"] is not None:
         payload["billing_identity"] = row["billing_identity"]
     pricing.add_payload(
+        event_type=EventType(row["event_type"]),
         session_id=session_id,
         effective_on=row["effective_on"],
         occurrences=int(row["occurrences"]),
@@ -1193,6 +1342,7 @@ def _add_pricing_input_from_values(
     row: tuple[object, ...],
 ) -> None:
     (
+        event_type,
         effective_on,
         usage_metrics,
         billing_identity,
@@ -1203,6 +1353,7 @@ def _add_pricing_input_from_values(
     _add_pricing_input_from_row(
         pricing,
         {
+            "event_type": event_type,
             "effective_on": effective_on,
             "usage_metrics": usage_metrics,
             "billing_identity": billing_identity,
@@ -1218,6 +1369,7 @@ def _add_session_pricing_input_from_values(
     row: tuple[object, ...],
 ) -> None:
     (
+        event_type,
         session_id,
         effective_on,
         usage_metrics,
@@ -1229,6 +1381,7 @@ def _add_session_pricing_input_from_values(
     _add_pricing_input_from_row(
         pricing,
         {
+            "event_type": event_type,
             "effective_on": effective_on,
             "usage_metrics": usage_metrics,
             "billing_identity": billing_identity,

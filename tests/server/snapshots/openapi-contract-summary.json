@@ -190,12 +190,35 @@
       "title": "AggregateCostSummary",
       "type": "object"
     },
+    "AggregateHostedToolUsageMetrics": {
+      "additionalProperties": false,
+      "description": "Lossless aggregate provider-hosted resource counters.",
+      "properties": {
+        "web_search_calls": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Web Search Calls",
+          "type": "string"
+        },
+        "web_search_outcome_unknown": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Web Search Outcome Unknown",
+          "type": "string"
+        }
+      },
+      "title": "AggregateHostedToolUsageMetrics",
+      "type": "object"
+    },
     "AggregateUsageMetrics": {
       "additionalProperties": false,
       "description": "Lossless JSON projection of identity-free aggregate token counters.",
       "properties": {
         "cache": {
           "$ref": "#/components/schemas/AggregateCacheUsageMetrics"
+        },
+        "hosted_tools": {
+          "$ref": "#/components/schemas/AggregateHostedToolUsageMetrics"
         },
         "input_tokens": {
           "pattern": "^(0|[1-9]\\d*)$",
@@ -4460,7 +4483,7 @@
     },
     "CostLineItem": {
       "additionalProperties": false,
-      "description": "Estimated cost for one model.completed event.",
+      "description": "Estimated cost for one model attempt or standalone hosted resource evidence.",
       "properties": {
         "billing_identity": {
           "anyOf": [
@@ -4559,7 +4582,7 @@
           "title": "Model"
         },
         "model_step": {
-          "minimum": 1.0,
+          "minimum": 0.0,
           "title": "Model Step",
           "type": "integer"
         },
@@ -4690,6 +4713,24 @@
         "uncached_input_tokens": {
           "minimum": 0.0,
           "title": "Uncached Input Tokens",
+          "type": "integer"
+        },
+        "web_search_calls": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Web Search Calls",
+          "type": "integer"
+        },
+        "web_search_cost": {
+          "default": "0",
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Web Search Cost",
+          "type": "string"
+        },
+        "web_search_outcome_unknown": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Web Search Outcome Unknown",
           "type": "integer"
         }
       },
@@ -6515,7 +6556,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "15",
+          "default": "16",
           "title": "Contract Version",
           "type": "string"
         },
@@ -6642,7 +6683,7 @@
     },
     "SessionCostSummary": {
       "additionalProperties": false,
-      "description": "Estimated session cost derived from durable model.completed events.",
+      "description": "Estimated session cost derived from durable completion and resource evidence.",
       "properties": {
         "currency": {
           "title": "Currency",
@@ -8070,6 +8111,22 @@
           "minItems": 1,
           "title": "Standard",
           "type": "array"
+        },
+        "web_search_per_thousand": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Web Search Per Thousand"
         }
       },
       "required": [
@@ -9017,14 +9074,20 @@
     },
     "UsageCurrencyCost": {
       "additionalProperties": false,
-      "description": "Exact estimated cost for one currency; currencies are never combined.",
+      "description": "Exact estimated model-step and hosted-resource cost for one currency.",
       "properties": {
         "currency": {
           "title": "Currency",
           "type": "string"
         },
+        "hosted_resources": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Hosted Resources",
+          "type": "string"
+        },
         "model_steps": {
-          "pattern": "^[1-9]\\d*$",
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Model Steps",
           "type": "string"
         },
@@ -9454,10 +9517,16 @@
     },
     "UsageUnpricedReason": {
       "additionalProperties": false,
-      "description": "Model-step count that could not be priced for one explicit reason.",
+      "description": "Model-step and hosted-resource counts unpriced for one explicit reason.",
       "properties": {
+        "hosted_resources": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Hosted Resources",
+          "type": "string"
+        },
         "model_steps": {
-          "pattern": "^[1-9]\\d*$",
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Model Steps",
           "type": "string"
         },
@@ -9826,7 +9895,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "15",
+          "default": "16",
           "title": "Contract Version",
           "type": "string"
         }

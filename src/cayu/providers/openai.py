@@ -19,7 +19,9 @@ from cayu.artifacts import (
     resolved_file_attachments_from_options,
 )
 from cayu.core.messages import (
+    CitationPart,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -27,6 +29,8 @@ from cayu.core.messages import (
     ThinkingPart,
     ToolCallPart,
     ToolResultPart,
+    WebSearchAction,
+    WebSearchSource,
 )
 from cayu.embeddings import (
     TextEmbedding,
@@ -80,6 +84,7 @@ from cayu.providers.base import (
     _preflight_provider_portable_messages,
     privacy_safe_provider_option_projection,
 )
+from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
 if TYPE_CHECKING:
     import httpx
@@ -96,6 +101,7 @@ _RESERVED_OPENAI_OPTIONS = {
     "previous_response_id",
     "store",
     "tools",
+    "include",
     "stream",
 }
 _OPENAI_TOKEN_COUNT_FIELDS = frozenset(
@@ -111,6 +117,15 @@ _OPENAI_TOKEN_COUNT_FIELDS = frozenset(
         "conversation",
         "tool_choice",
         "parallel_tool_calls",
+    }
+)
+_OPENAI_HOSTED_WEB_SEARCH_MODELS = frozenset(
+    {
+        "chat-latest",
+        "gpt-5.6",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
     }
 )
 _PROTECTED_HEADER_NAMES = {
@@ -321,6 +336,20 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             tool_definition_validator=_openai_tool,
         )
 
+    def preflight_hosted_tools(
+        self,
+        *,
+        model: str,
+        hosted_tools: tuple[OpenAIWebSearch, ...],
+        options: dict[str, Any],
+    ) -> None:
+        _preflight_openai_hosted_tools(
+            model=model,
+            hosted_tools=hosted_tools,
+            options=options,
+            endpoint_supported=self.hosted_web_search_supported,
+        )
+
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
         return ModelContextPressureProfile(
@@ -351,6 +380,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         reasoning_state: str = "inline",
+        hosted_web_search_supported: bool | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.api_key = resolve_api_key(
@@ -363,6 +393,16 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             ),
         )
         self.base_url = _validate_base_url(base_url)
+        if (
+            hosted_web_search_supported is not None
+            and type(hosted_web_search_supported) is not bool
+        ):
+            raise TypeError("hosted_web_search_supported must be a boolean or None.")
+        self.hosted_web_search_supported = (
+            self.base_url == _validate_base_url(DEFAULT_OPENAI_BASE_URL)
+            if hosted_web_search_supported is None
+            else hosted_web_search_supported
+        )
         if type(timeout_s) not in {int, float}:
             raise TypeError("timeout_s must be a number.")
         timeout_s = require_finite(float(timeout_s), "timeout_s")
@@ -666,6 +706,7 @@ def build_openai_payload(
         payload["previous_response_id"] = previous_response_id
 
     tools = [_openai_tool(tool) for tool in request.tools]
+    tools.extend(_openai_hosted_tool(tool) for tool in request.hosted_tools)
     if tools:
         payload["tools"] = tools
     if structured_output_format is not None:
@@ -677,6 +718,11 @@ def build_openai_payload(
     # models. Apps can still override via options.openai.
     if reasoning_state == "inline":
         payload["include"] = ["reasoning.encrypted_content"]
+    if any(tool.include_sources for tool in request.hosted_tools):
+        payload["include"] = [
+            *payload.get("include", []),
+            "web_search_call.action.sources",
+        ]
     if stream:
         payload["stream"] = True
     payload.update(options)
@@ -847,18 +893,30 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
 
     events: list[ModelStreamEvent] = []
     provider_state_items: list[dict[str, Any]] = []
+    completion_output_items: list[Mapping[str, Any]] = []
+    hosted_call_indexes: dict[str, int] = {}
+    assistant_text_offset = 0
+    response_status = _optional_string(response, "status")
     for index, item in enumerate(output):
         if not isinstance(item, Mapping):
             raise OpenAIProtocolError(f"OpenAI output item {index} must be an object.")
         item = cast("Mapping[str, Any]", item)
         item_type = item.get("type")
         if item_type == "message":
-            events.extend(_message_output_events(item, index))
+            message_events, message_text_length = _message_output_events(
+                item,
+                index,
+                text_offset=assistant_text_offset,
+            )
+            events.extend(message_events)
+            assistant_text_offset += message_text_length
+            completion_output_items.append(item)
             provider_state_items.append(
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
         elif item_type == "function_call":
             events.append(_function_call_event(item, index))
+            completion_output_items.append(item)
             provider_state_items.append(
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
@@ -867,14 +925,42 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
             # capturing the full reasoning item (incl. encrypted_content) as provider
             # state so the multi-turn round-trip is unaffected.
             events.extend(_reasoning_thinking_events(item))
+            completion_output_items.append(item)
             provider_state_items.append(
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
             continue
+        elif item_type == "web_search_call":
+            normalized = _normalized_web_search_call(item, item_index=index)
+            _claim_web_search_call_identity(
+                hosted_call_indexes,
+                call_id=normalized["id"],
+                output_index=index,
+            )
+            if normalized["status"] in {"in_progress", "searching"}:
+                if response_status not in {"incomplete", "failed"}:
+                    raise OpenAIProtocolError(
+                        "OpenAI terminal response contains a nonterminal web search call."
+                    )
+                normalized = {
+                    "type": "web_search_call",
+                    "id": normalized["id"],
+                    "status": "outcome_unknown",
+                }
+            events.append(_web_search_call_event(normalized))
+            completion_output_items.append(normalized)
+            if normalized["status"] == "completed":
+                provider_state_items.append({"provider": "openai", "state": normalized})
         else:
             raise OpenAIProtocolError(f"Unsupported OpenAI output item type: {item_type!r}.")
 
-    events.append(_completed_event_from_response(response, provider_state_items))
+    events.append(
+        _completed_event_from_response(
+            response,
+            provider_state_items,
+            completion_output_items=completion_output_items,
+        )
+    )
     return events
 
 
@@ -918,26 +1004,100 @@ def _reasoning_thinking_events(item: Mapping[str, Any]) -> list[ModelStreamEvent
 async def openai_stream_events(
     events: AsyncIterator[Mapping[str, Any]], *, reasoning_state: str = "inline"
 ) -> AsyncIterator[ModelStreamEvent]:
+    """Normalize OpenAI streaming events with exact hosted-search settlement."""
+
+    pending_call_ids: set[str] = set()
+    seen_call_ids: set[str] = set()
+    parsed_events = _openai_stream_events(events, reasoning_state=reasoning_state)
+    try:
+        async with aclosing_provider_stream(parsed_events):
+            async for event in parsed_events:
+                if event.type is ModelStreamEventType.HOSTED_TOOL_CALL:
+                    call_id = event.payload.get("call_id")
+                    status = event.payload.get("status")
+                    if not isinstance(call_id, str) or not call_id:
+                        raise OpenAIProtocolError(
+                            "OpenAI hosted search event requires a call identity."
+                        )
+                    if status in {"in_progress", "searching"}:
+                        if status == "in_progress":
+                            if call_id in seen_call_ids:
+                                raise OpenAIProtocolError(
+                                    "OpenAI web search call identity was reused."
+                                )
+                            seen_call_ids.add(call_id)
+                            pending_call_ids.add(call_id)
+                        elif call_id not in pending_call_ids:
+                            raise OpenAIProtocolError(
+                                "OpenAI web search progress has no pending call."
+                            )
+                    elif status in {"completed", "incomplete", "failed", "outcome_unknown"}:
+                        pending_call_ids.discard(call_id)
+                yield event
+    except Exception:
+        for call_id in sorted(pending_call_ids):
+            yield _web_search_outcome_unknown_event(call_id)
+        raise
+
+
+async def _openai_stream_events(
+    events: AsyncIterator[Mapping[str, Any]], *, reasoning_state: str = "inline"
+) -> AsyncIterator[ModelStreamEvent]:
     pending_function_calls: dict[int, _PendingFunctionCall] = {}
     pending_reasoning_items: set[int] = set()
+    pending_web_search_calls: dict[int, tuple[str, str]] = {}
+    streamed_text: dict[tuple[int, int], str] = {}
+    streamed_text_offsets: dict[tuple[int, int], int] = {}
+    assembled_text_length = 0
     fallback_output_items: dict[int, dict[str, Any]] = {}
     completed = False
-    async for event in events:
+    async for event in _stream_events_with_cancellation_marker(events):
         if not isinstance(event, Mapping):
             raise OpenAIProtocolError("OpenAI stream event must be a JSON object.")
         event_type = event.get("type")
+        if event_type == "cayu.internal.transport_cancelled":
+            for call_id, _status in pending_web_search_calls.values():
+                yield _web_search_outcome_unknown_event(call_id)
+            pending_web_search_calls.clear()
+            continue
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
             if not isinstance(delta, str):
                 raise OpenAIProtocolError("OpenAI output_text delta must be a string.")
             if delta:
+                output_index = event.get("output_index")
+                content_index = event.get("content_index")
+                if type(output_index) is int and type(content_index) is int:
+                    key = (output_index, content_index)
+                    streamed_text_offsets.setdefault(key, assembled_text_length)
+                    streamed_text[key] = streamed_text.get(key, "") + delta
+                assembled_text_length += len(delta)
                 yield ModelStreamEvent.text_delta(delta)
+            continue
+        if event_type == "response.output_text.annotation.added":
+            annotation = event.get("annotation")
+            if not isinstance(annotation, Mapping):
+                raise OpenAIProtocolError("OpenAI annotation.added requires annotation object.")
+            output_index = _stream_output_index(event)
+            content_index = event.get("content_index")
+            if type(content_index) is not int or content_index < 0:
+                raise OpenAIProtocolError(
+                    "OpenAI annotation.added requires non-negative content_index."
+                )
+            if annotation.get("type") == "url_citation":
+                yield _url_citation_event(
+                    annotation,
+                    text=streamed_text.get((output_index, content_index), ""),
+                    path=f"stream.{output_index}.{content_index}",
+                    text_offset=streamed_text_offsets.get((output_index, content_index), 0),
+                )
             continue
         if event_type == "response.refusal.delta":
             delta = event.get("delta")
             if not isinstance(delta, str):
                 raise OpenAIProtocolError("OpenAI refusal delta must be a string.")
             if delta:
+                assembled_text_length += len(delta)
                 yield ModelStreamEvent.text_delta(delta)
             continue
         if event_type in {
@@ -956,12 +1116,67 @@ async def openai_stream_events(
             item = event.get("item")
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 pending_reasoning_items.add(_stream_output_index(event))
+            if isinstance(item, Mapping) and item.get("type") == "web_search_call":
+                output_index = _stream_output_index(event)
+                if output_index in pending_web_search_calls:
+                    raise OpenAIProtocolError(
+                        "OpenAI web_search_call output_item.added was repeated."
+                    )
+                normalized = _normalized_web_search_call(item, item_index=output_index)
+                if normalized["status"] != "in_progress":
+                    raise OpenAIProtocolError(
+                        "OpenAI web_search_call output_item.added must be in progress."
+                    )
+                pending_web_search_calls[output_index] = (
+                    normalized["id"],
+                    normalized["status"],
+                )
+                yield _web_search_call_event(normalized)
             _record_stream_output_item_added(event, pending_function_calls)
+            continue
+        if event_type in {
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+            "response.web_search_call.completed",
+        }:
+            output_index = _stream_output_index(event)
+            pending = pending_web_search_calls.get(output_index)
+            if pending is None:
+                raise OpenAIProtocolError(
+                    "OpenAI web search lifecycle arrived before output_item.added."
+                )
+            item_id = _mapping_optional_string(event, "item_id")
+            if item_id is not None and item_id != pending[0]:
+                raise OpenAIProtocolError("OpenAI web search lifecycle item_id mismatch.")
+            status = event_type.rsplit(".", 1)[-1]
+            if status == "searching" and pending[1] != status:
+                pending_web_search_calls[output_index] = (pending[0], status)
+                yield ModelStreamEvent.hosted_tool_call(
+                    {
+                        "tool_type": "web_search",
+                        "call_id": pending[0],
+                        "status": status,
+                    }
+                )
+            # output_item.done is the terminal evidence: it carries the bounded
+            # action and sources needed for transcript replay.
             continue
         if event_type == "response.output_item.done":
             item = event.get("item")
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 pending_reasoning_items.discard(_stream_output_index(event))
+            if isinstance(item, Mapping) and item.get("type") == "web_search_call":
+                output_index = _stream_output_index(event)
+                pending = pending_web_search_calls.pop(output_index, None)
+                if pending is None:
+                    raise OpenAIProtocolError(
+                        "OpenAI web_search_call output_item.done arrived before added."
+                    )
+                normalized = _normalized_web_search_call(item, item_index=output_index)
+                if normalized["id"] != pending[0]:
+                    raise OpenAIProtocolError("OpenAI web_search_call output identity mismatch.")
+                fallback_output_items[output_index] = normalized
+                yield _web_search_call_event(normalized)
             _record_stream_output_item_done(event, fallback_output_items)
             continue
         if event_type == "response.function_call_arguments.delta":
@@ -979,6 +1194,7 @@ async def openai_stream_events(
             unfinished_output_indexes = {
                 *pending_function_calls,
                 *pending_reasoning_items,
+                *pending_web_search_calls,
             }
             # A completed response promises complete output items. An incomplete
             # response may end mid-item, so retain the terminal classification but
@@ -991,18 +1207,31 @@ async def openai_stream_events(
                 raise OpenAIProtocolError(
                     "OpenAI streaming response completed with unfinished reasoning items."
                 )
-            yield _stream_completed_event(
+            if event_type == "response.completed" and pending_web_search_calls:
+                for call_id, _status in pending_web_search_calls.values():
+                    yield _web_search_outcome_unknown_event(call_id)
+                raise OpenAIProtocolError(
+                    "OpenAI streaming response completed with unfinished web search calls."
+                )
+            if event_type == "response.incomplete":
+                for call_id, _status in pending_web_search_calls.values():
+                    yield _web_search_outcome_unknown_event(call_id)
+                pending_web_search_calls.clear()
+            for terminal_event in _stream_terminal_events(
                 event,
                 fallback_output_items,
                 excluded_output_indexes=unfinished_output_indexes,
                 reasoning_state=reasoning_state,
-            )
+            ):
+                yield terminal_event
             if event_type == "response.completed":
                 return
             completed = True
             continue
         if event_type in {"response.failed", "error"}:
             failure = _openai_stream_error_exception(event)
+            for call_id, _status in pending_web_search_calls.values():
+                yield _web_search_outcome_unknown_event(call_id)
             # Keep raw provider envelopes out of direct parser tracebacks; the
             # outer provider wrapper is not the only supported caller.
             event = {}
@@ -1010,7 +1239,24 @@ async def openai_stream_events(
             raise failure from None
 
     if not completed:
+        for call_id, _status in pending_web_search_calls.values():
+            yield _web_search_outcome_unknown_event(call_id)
         raise OpenAIProtocolError("OpenAI streaming response ended before response.completed.")
+
+
+async def _stream_events_with_cancellation_marker(
+    events: AsyncIterator[Mapping[str, Any]],
+) -> AsyncIterator[Mapping[str, Any]]:
+    iterator = events.__aiter__()
+    while True:
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        except asyncio.CancelledError:
+            yield {"type": "cayu.internal.transport_cancelled"}
+            raise
+        yield event
 
 
 class _PendingFunctionCall:
@@ -1038,7 +1284,9 @@ class _PendingFunctionCall:
 def _message_output_events(
     item: Mapping[str, Any],
     item_index: int,
-) -> list[ModelStreamEvent]:
+    *,
+    text_offset: int,
+) -> tuple[list[ModelStreamEvent], int]:
     role = item.get("role")
     if role != "assistant":
         raise OpenAIProtocolError(
@@ -1050,6 +1298,7 @@ def _message_output_events(
             f"OpenAI message output item {item_index} content must be a list."
         )
     events: list[ModelStreamEvent] = []
+    message_text_length = 0
     for content_index, part in enumerate(content):
         if not isinstance(part, Mapping):
             raise OpenAIProtocolError(
@@ -1070,7 +1319,210 @@ def _message_output_events(
             raise OpenAIProtocolError(f"OpenAI {part_type} content requires string {text_key}.")
         if text:
             events.append(ModelStreamEvent.text_delta(text))
-    return events
+        annotations = part.get("annotations", [])
+        if not isinstance(annotations, list):
+            raise OpenAIProtocolError(f"OpenAI {part_type} content annotations must be a list.")
+        for annotation_index, annotation in enumerate(annotations):
+            if not isinstance(annotation, Mapping):
+                raise OpenAIProtocolError(
+                    "OpenAI output annotation "
+                    f"{item_index}.{content_index}.{annotation_index} must be an object."
+                )
+            annotation = cast("Mapping[str, Any]", annotation)
+            if annotation.get("type") != "url_citation":
+                continue
+            events.append(
+                _url_citation_event(
+                    annotation,
+                    text=text,
+                    path=f"{item_index}.{content_index}.{annotation_index}",
+                    text_offset=text_offset + message_text_length,
+                )
+            )
+        message_text_length += len(text)
+    return events, message_text_length
+
+
+def _web_search_call_event(item: Mapping[str, Any]) -> ModelStreamEvent:
+    action = item.get("action")
+    source_count = (
+        len(action.get("sources", []))
+        if isinstance(action, Mapping) and isinstance(action.get("sources", []), list)
+        else 0
+    )
+    return ModelStreamEvent.hosted_tool_call(
+        {
+            "tool_type": "web_search",
+            "call_id": item["id"],
+            "status": item["status"],
+            **({"action": action, "source_count": source_count} if action is not None else {}),
+        }
+    )
+
+
+def _web_search_outcome_unknown_event(call_id: str) -> ModelStreamEvent:
+    return ModelStreamEvent.hosted_tool_call(
+        {
+            "tool_type": "web_search",
+            "call_id": call_id,
+            "status": "outcome_unknown",
+        }
+    )
+
+
+def _claim_web_search_call_identity(
+    call_indexes: dict[str, int],
+    *,
+    call_id: str,
+    output_index: int,
+) -> None:
+    existing_index = call_indexes.get(call_id)
+    if existing_index is not None:
+        raise OpenAIProtocolError(
+            "OpenAI web search call identity is duplicated across output items."
+        )
+    call_indexes[call_id] = output_index
+
+
+def _normalized_web_search_call(
+    item: Mapping[str, Any],
+    *,
+    item_index: int,
+) -> dict[str, Any]:
+    call_id = item.get("id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        raise OpenAIProtocolError(f"OpenAI web_search_call item {item_index} requires nonblank id.")
+    status = item.get("status")
+    if status not in {"in_progress", "searching", "completed", "incomplete", "failed"}:
+        raise OpenAIProtocolError(
+            f"OpenAI web_search_call item {item_index} has unsupported status."
+        )
+    normalized: dict[str, Any] = {
+        "type": "web_search_call",
+        "id": call_id.strip(),
+        "status": status,
+    }
+    action = item.get("action")
+    if action is not None:
+        normalized["action"] = _normalized_web_search_action(
+            action,
+            path=f"output[{item_index}].action",
+        )
+    if status == "completed" and "action" not in normalized:
+        raise OpenAIProtocolError(
+            f"OpenAI web_search_call item {item_index} completed without action evidence."
+        )
+    return normalized
+
+
+def _normalized_web_search_action(action: object, *, path: str) -> dict[str, Any]:
+    if not isinstance(action, Mapping):
+        raise OpenAIProtocolError(f"OpenAI {path} must be an object.")
+    action = cast("Mapping[str, Any]", action)
+    action_type = action.get("type")
+    if action_type not in {"search", "open_page", "find_in_page"}:
+        raise OpenAIProtocolError(f"OpenAI {path}.type is unsupported.")
+    normalized: dict[str, Any] = {"type": action_type}
+    for key in ("query", "pattern"):
+        value = action.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value) > 4096:
+            raise OpenAIProtocolError(f"OpenAI {path}.{key} must be a bounded string.")
+        normalized[key] = value
+    raw_url = action.get("url")
+    if raw_url is not None:
+        normalized["url"] = _normalized_external_web_url(raw_url, path=f"{path}.url")
+    raw_queries = action.get("queries")
+    if raw_queries is not None:
+        if not isinstance(raw_queries, list) or not raw_queries or len(raw_queries) > 100:
+            raise OpenAIProtocolError(f"OpenAI {path}.queries must be a bounded list.")
+        queries: list[str] = []
+        for index, query in enumerate(raw_queries):
+            if not isinstance(query, str) or not query.strip() or len(query) > 4096:
+                raise OpenAIProtocolError(
+                    f"OpenAI {path}.queries[{index}] must be a bounded string."
+                )
+            queries.append(query)
+        normalized["queries"] = queries
+    raw_sources = action.get("sources")
+    if raw_sources is not None:
+        if not isinstance(raw_sources, list) or len(raw_sources) > 100:
+            raise OpenAIProtocolError(f"OpenAI {path}.sources must be a bounded list.")
+        sources: list[dict[str, str]] = []
+        for index, source in enumerate(raw_sources):
+            if not isinstance(source, Mapping):
+                raise OpenAIProtocolError(f"OpenAI {path}.sources[{index}] must be an object.")
+            source = cast("Mapping[str, Any]", source)
+            source_type = source.get("type", "url")
+            url = source.get("url")
+            title = source.get("title")
+            if source_type != "url":
+                raise OpenAIProtocolError(f"OpenAI {path}.sources[{index}].type is unsupported.")
+            url = _normalized_external_web_url(
+                url,
+                path=f"{path}.sources[{index}].url",
+            )
+            if title is not None and (
+                not isinstance(title, str) or not title.strip() or len(title) > 1024
+            ):
+                raise OpenAIProtocolError(
+                    f"OpenAI {path}.sources[{index}].title must be a bounded string."
+                )
+            sources.append(
+                {"type": "url", "url": url, **({"title": title} if title is not None else {})}
+            )
+        normalized["sources"] = sources
+    try:
+        WebSearchAction.model_validate(normalized)
+    except ValueError as exc:
+        raise OpenAIProtocolError(f"OpenAI {path} is invalid.") from exc
+    return normalized
+
+
+def _normalized_external_web_url(value: object, *, path: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 4096:
+        raise OpenAIProtocolError(f"OpenAI {path} must be a bounded URL.")
+    try:
+        return WebSearchSource(url=value).url
+    except ValueError as exc:
+        raise OpenAIProtocolError(f"OpenAI {path} must use http or https.") from exc
+
+
+def _url_citation_event(
+    annotation: Mapping[str, Any],
+    *,
+    text: str,
+    path: str,
+    text_offset: int = 0,
+) -> ModelStreamEvent:
+    url = annotation.get("url")
+    title = annotation.get("title")
+    start_index = annotation.get("start_index")
+    end_index = annotation.get("end_index")
+    url = _normalized_external_web_url(url, path=f"citation {path}.url")
+    if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 1024):
+        raise OpenAIProtocolError(f"OpenAI citation {path}.title must be a bounded string.")
+    if (start_index is None) != (end_index is None):
+        raise OpenAIProtocolError(f"OpenAI citation {path} has invalid text offsets.")
+    if start_index is not None and (
+        type(start_index) is not int
+        or type(end_index) is not int
+        or start_index < 0
+        or end_index <= start_index
+        or end_index > len(text)
+    ):
+        raise OpenAIProtocolError(f"OpenAI citation {path} has invalid text offsets.")
+    payload: dict[str, Any] = {
+        "citation_type": "url_citation",
+        "url": url,
+    }
+    if title is not None:
+        payload["title"] = title
+    if start_index is not None:
+        payload["start_index"] = text_offset + start_index
+        payload["end_index"] = text_offset + cast("int", end_index)
+    return ModelStreamEvent.citation(payload)
 
 
 def _function_call_event(
@@ -1137,6 +1589,29 @@ def _completed_event_from_response(
             "incomplete_details",
         ),
     }
+    usage_output = completion_output_items
+    if usage_output is None:
+        raw_output = response.get("output")
+        usage_output = raw_output if isinstance(raw_output, list) else []
+    web_search_calls = sum(
+        1
+        for item in usage_output
+        if isinstance(item, Mapping)
+        and item.get("type") == "web_search_call"
+        and item.get("status") in {"completed", "incomplete", "failed"}
+    )
+    web_search_outcome_unknown = sum(
+        1
+        for item in usage_output
+        if isinstance(item, Mapping)
+        and item.get("type") == "web_search_call"
+        and item.get("status") == "outcome_unknown"
+    )
+    if web_search_calls or web_search_outcome_unknown:
+        payload["hosted_tool_usage"] = {
+            "web_search_calls": web_search_calls,
+            "web_search_outcome_unknown": web_search_outcome_unknown,
+        }
     return ModelStreamEvent(
         type=ModelStreamEventType.COMPLETED,
         payload=payload,
@@ -1213,13 +1688,13 @@ def _output_items_have_function_call(output_items: list[Mapping[str, Any]]) -> b
     return any(item.get("type") == "function_call" for item in output_items)
 
 
-def _stream_completed_event(
+def _stream_terminal_events(
     event: Mapping[str, Any],
     fallback_output_items: Mapping[int, Mapping[str, Any]],
     *,
     excluded_output_indexes: set[int] | None = None,
     reasoning_state: str = "inline",
-) -> ModelStreamEvent:
+) -> list[ModelStreamEvent]:
     response = _stream_response_object(event)
     excluded_output_indexes = excluded_output_indexes or set()
     if response.get("output") is None:
@@ -1230,15 +1705,84 @@ def _stream_completed_event(
         }
         provider_state_items = _provider_state_items_from_output_items(completed_output_items)
         completion_output_items = list(_sorted_output_items(completed_output_items))
-        return _completed_event_from_response(
-            response,
-            provider_state_items,
-            completion_output_items=completion_output_items,
-            reasoning_state=reasoning_state,
-        )
+        return [
+            _completed_event_from_response(
+                response,
+                provider_state_items,
+                completion_output_items=completion_output_items,
+                reasoning_state=reasoning_state,
+            )
+        ]
     output = response.get("output")
-    if excluded_output_indexes and isinstance(output, list):
-        response = {
+    if not isinstance(output, list):
+        raise OpenAIProtocolError("OpenAI response output must be a list.")
+
+    terminal_hosted_calls: dict[int, dict[str, Any]] = {}
+    hosted_call_indexes: dict[str, int] = {}
+    completion_output_items: list[Mapping[str, Any]] = []
+    for output_index, item in enumerate(output):
+        if output_index in excluded_output_indexes:
+            continue
+        if not isinstance(item, Mapping):
+            raise OpenAIProtocolError(f"OpenAI output item {output_index} must be an object.")
+        item = cast("Mapping[str, Any]", item)
+        if item.get("type") != "web_search_call":
+            completion_output_items.append(item)
+            continue
+        normalized = _normalized_web_search_call(item, item_index=output_index)
+        _claim_web_search_call_identity(
+            hosted_call_indexes,
+            call_id=normalized["id"],
+            output_index=output_index,
+        )
+        if normalized["status"] in {"in_progress", "searching"}:
+            response_status = _optional_string(response, "status")
+            if response_status not in {"incomplete", "failed"}:
+                raise OpenAIProtocolError(
+                    "OpenAI terminal response contains a nonterminal web search call."
+                )
+            normalized = {
+                "type": "web_search_call",
+                "id": normalized["id"],
+                "status": "outcome_unknown",
+            }
+        terminal_hosted_calls[output_index] = normalized
+        completion_output_items.append(normalized)
+
+    lifecycle_hosted_calls: dict[int, Mapping[str, Any]] = {}
+    for output_index, item in fallback_output_items.items():
+        if item.get("type") != "web_search_call":
+            continue
+        lifecycle_hosted_calls[output_index] = item
+        existing_index = hosted_call_indexes.get(cast("str", item.get("id")))
+        if existing_index is not None and existing_index != output_index:
+            raise OpenAIProtocolError(
+                "OpenAI terminal web search identity conflicts with lifecycle evidence."
+            )
+
+    for output_index, lifecycle_item in lifecycle_hosted_calls.items():
+        terminal_item = terminal_hosted_calls.get(output_index)
+        if terminal_item is None:
+            raise OpenAIProtocolError(
+                "OpenAI terminal response omitted completed web search lifecycle evidence."
+            )
+        if terminal_item != lifecycle_item:
+            raise OpenAIProtocolError(
+                "OpenAI terminal web search evidence conflicts with lifecycle evidence."
+            )
+
+    terminal_events: list[ModelStreamEvent] = []
+    for output_index, terminal_item in terminal_hosted_calls.items():
+        fallback_item = fallback_output_items.get(output_index)
+        if fallback_item is not None and fallback_item.get("type") != "web_search_call":
+            raise OpenAIProtocolError(
+                "OpenAI terminal web search output conflicts with lifecycle item identity."
+            )
+        if output_index not in lifecycle_hosted_calls:
+            terminal_events.append(_web_search_call_event(terminal_item))
+
+    response_for_completion = (
+        {
             **response,
             "output": [
                 item
@@ -1246,7 +1790,19 @@ def _stream_completed_event(
                 if output_index not in excluded_output_indexes
             ],
         }
-    return _completed_event_from_response(response, reasoning_state=reasoning_state)
+        if excluded_output_indexes
+        else response
+    )
+    provider_state_items = _provider_state_items_from_response(response_for_completion)
+    terminal_events.append(
+        _completed_event_from_response(
+            response_for_completion,
+            provider_state_items,
+            completion_output_items=completion_output_items,
+            reasoning_state=reasoning_state,
+        )
+    )
+    return terminal_events
 
 
 def _provider_state_items_from_response(response: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1256,6 +1812,7 @@ def _provider_state_items_from_response(response: Mapping[str, Any]) -> list[dic
     if not isinstance(output, list):
         raise OpenAIProtocolError("OpenAI response output must be a list.")
     provider_state_items: list[dict[str, Any]] = []
+    hosted_call_indexes: dict[str, int] = {}
     for index, item in enumerate(output):
         if not isinstance(item, Mapping):
             raise OpenAIProtocolError(f"OpenAI output item {index} must be an object.")
@@ -1266,6 +1823,21 @@ def _provider_state_items_from_response(response: Mapping[str, Any]) -> list[dic
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
             continue
+        if item_type == "web_search_call":
+            normalized = _normalized_web_search_call(item, item_index=index)
+            _claim_web_search_call_identity(
+                hosted_call_indexes,
+                call_id=normalized["id"],
+                output_index=index,
+            )
+            if normalized["status"] == "completed":
+                provider_state_items.append(
+                    {
+                        "provider": "openai",
+                        "state": normalized,
+                    }
+                )
+            continue
         raise OpenAIProtocolError(f"Unsupported OpenAI output item type: {item_type!r}.")
     return provider_state_items
 
@@ -1275,6 +1847,8 @@ def _provider_state_items_from_output_items(
 ) -> list[dict[str, Any]]:
     provider_state_items: list[dict[str, Any]] = []
     for item in _sorted_output_items(output_items):
+        if item.get("type") == "web_search_call" and item.get("status") != "completed":
+            continue
         provider_state_items.append(
             {"provider": "openai", "state": copy_json_value(item, "output_item")}
         )
@@ -1818,6 +2392,8 @@ def _openai_input_items(
         )
         if provider_state_items:
             return provider_state_items
+        if not use_provider_state:
+            return _openai_neutral_assistant_items(message)
 
         items: list[dict[str, Any]] = []
         text_parts = [_output_text_part(part) for part in message.content if type(part) is TextPart]
@@ -1833,10 +2409,16 @@ def _openai_input_items(
         for part in message.content:
             if type(part) is ToolCallPart:
                 items.append(_function_call_input_item(part))
-            elif type(part) not in {TextPart, ProviderStatePart, ThinkingPart}:
+            elif type(part) not in {
+                TextPart,
+                ProviderStatePart,
+                ThinkingPart,
+                HostedToolCallPart,
+                CitationPart,
+            }:
                 raise OpenAIProtocolError(
                     "Assistant messages can only contain text, tool_call, provider_state, "
-                    "and thinking parts."
+                    "thinking, hosted_tool_call, and citation parts."
                 )
         # ThinkingPart is display-only here: OpenAI reasoning round-trips through the
         # encrypted reasoning ProviderStatePart, so the readable summary is not re-sent.
@@ -1863,6 +2445,115 @@ def _openai_input_items(
             )
         return items
     raise OpenAIProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
+
+
+def _openai_neutral_assistant_items(message: Message) -> list[dict[str, Any]]:
+    """Rebuild accepted assistant output without server-owned provider state."""
+
+    items: list[dict[str, Any]] = []
+    pending_text: list[str] = []
+    pending_citations: list[CitationPart] = []
+    assembled_text_length = 0
+    pending_text_offset = 0
+
+    def flush_text() -> None:
+        nonlocal pending_text_offset
+        if not pending_text:
+            if pending_citations:
+                raise OpenAIProtocolError(
+                    "OpenAI neutral replay cannot attach a citation without assistant text."
+                )
+            return
+        text = "".join(pending_text)
+        annotations = [
+            _openai_neutral_citation(
+                citation,
+                text_offset=pending_text_offset,
+                text_length=len(text),
+            )
+            for citation in pending_citations
+        ]
+        output_text: dict[str, Any] = {"type": "output_text", "text": text}
+        if annotations:
+            output_text["annotations"] = annotations
+        items.append(
+            {
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [output_text],
+            }
+        )
+        pending_text.clear()
+        pending_citations.clear()
+        pending_text_offset = assembled_text_length
+
+    for part in message.content:
+        if type(part) is TextPart:
+            if not pending_text:
+                pending_text_offset = assembled_text_length
+            pending_text.append(part.text)
+            assembled_text_length += len(part.text)
+            continue
+        if type(part) is CitationPart:
+            pending_citations.append(part)
+            continue
+        if type(part) is HostedToolCallPart:
+            if part.status == "completed":
+                flush_text()
+                if part.action is None:  # pragma: no cover - model validation owns this
+                    raise OpenAIProtocolError(
+                        "Completed hosted search replay requires action evidence."
+                    )
+                action = part.action.model_dump(mode="json", exclude_none=True)
+                if not action.get("queries"):
+                    action.pop("queries", None)
+                if not action.get("sources"):
+                    action.pop("sources", None)
+                items.append(
+                    {
+                        "type": "web_search_call",
+                        "id": part.call_id,
+                        "status": "completed",
+                        "action": action,
+                    }
+                )
+            continue
+        if type(part) is ToolCallPart:
+            flush_text()
+            items.append(_function_call_input_item(part))
+            continue
+        if type(part) in {ProviderStatePart, ThinkingPart}:
+            continue
+        raise OpenAIProtocolError(
+            "Assistant messages can only contain text, tool_call, provider_state, "
+            "thinking, hosted_tool_call, and citation parts."
+        )
+    flush_text()
+    return items
+
+
+def _openai_neutral_citation(
+    citation: CitationPart,
+    *,
+    text_offset: int,
+    text_length: int,
+) -> dict[str, Any]:
+    annotation: dict[str, Any] = {
+        "type": "url_citation",
+        "url": citation.url,
+    }
+    if citation.title is not None:
+        annotation["title"] = citation.title
+    if citation.start_index is not None and citation.end_index is not None:
+        segment_end = text_offset + text_length
+        if citation.start_index < text_offset or citation.end_index > segment_end:
+            raise OpenAIProtocolError(
+                "OpenAI neutral replay citation does not belong to its assistant text item."
+            )
+        annotation["start_index"] = citation.start_index - text_offset
+        annotation["end_index"] = citation.end_index - text_offset
+    return annotation
 
 
 def _server_chain(messages: list[Message]) -> tuple[str | None, list[Message]]:
@@ -1915,7 +2606,7 @@ def _openai_provider_state_items(
                 continue
             items.append(state)
             continue
-        if item_type not in {"message", "function_call"}:
+        if item_type not in {"message", "function_call", "web_search_call"}:
             raise OpenAIProtocolError(
                 f"Unsupported OpenAI provider state item type: {item_type!r}."
             )
@@ -1924,7 +2615,14 @@ def _openai_provider_state_items(
 
 
 def _user_input_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     if type(part) is TextPart:
@@ -1948,7 +2646,14 @@ def _resolved_user_attachment(
 
 
 def _output_text_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
 ) -> dict[str, str]:
     if type(part) is not TextPart:
         raise OpenAIProtocolError("Assistant text output requires a text part.")
@@ -1966,7 +2671,14 @@ def _function_call_input_item(part: ToolCallPart) -> dict[str, Any]:
 
 
 def _function_call_output_item(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
 ) -> dict[str, Any]:
     if type(part) is not ToolResultPart:
         raise OpenAIProtocolError("Tool messages can only contain tool_result parts.")
@@ -2035,6 +2747,65 @@ def _openai_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
         "parameters": copy_json_value(input_schema, "input_schema"),
         "strict": False,
     }
+
+
+def _openai_hosted_tool(tool: OpenAIWebSearch) -> dict[str, Any]:
+    if type(tool) is not OpenAIWebSearch:
+        raise TypeError("OpenAI hosted tools must be OpenAIWebSearch instances.")
+    projected: dict[str, Any] = {
+        "type": "web_search",
+        "search_context_size": tool.search_context_size,
+        "external_web_access": tool.external_web_access,
+    }
+    filters: dict[str, list[str]] = {}
+    if tool.allowed_domains:
+        filters["allowed_domains"] = list(tool.allowed_domains)
+    if tool.blocked_domains:
+        filters["blocked_domains"] = list(tool.blocked_domains)
+    if filters:
+        projected["filters"] = filters
+    if tool.return_token_budget != "default":
+        projected["return_token_budget"] = tool.return_token_budget
+    return projected
+
+
+def _preflight_openai_hosted_tools(
+    *,
+    model: str,
+    hosted_tools: tuple[OpenAIWebSearch, ...],
+    options: dict[str, Any],
+    endpoint_supported: bool = True,
+) -> None:
+    require_clean_nonblank(model, "model")
+    if type(hosted_tools) is not tuple or any(
+        type(tool) is not OpenAIWebSearch for tool in hosted_tools
+    ):
+        raise TypeError("hosted_tools must contain exact OpenAIWebSearch instances.")
+    if type(options) is not dict:
+        raise TypeError("Hosted-tool provider options must be a dictionary.")
+    if not hosted_tools:
+        return
+    if not endpoint_supported:
+        raise HostedToolCapabilityError(
+            "OpenAI hosted web search is not established for this custom endpoint; "
+            "set hosted_web_search_supported=True only after verifying its Responses contract."
+        )
+    if model not in _OPENAI_HOSTED_WEB_SEARCH_MODELS:
+        raise HostedToolCapabilityError(
+            f"OpenAI hosted web search support is not established for model {model!r}."
+        )
+    effective = _effective_openai_request_options(options)
+    reasoning = effective.get("reasoning")
+    if isinstance(reasoning, Mapping) and reasoning.get("effort") == "minimal":
+        raise HostedToolCapabilityError(
+            "OpenAI hosted web search does not support minimal reasoning effort."
+        )
+    if any(tool.return_token_budget == "unlimited" for tool in hosted_tools) and not re.match(
+        r"^gpt-5(?:[.-]|$)", model
+    ):
+        raise HostedToolCapabilityError(
+            "OpenAI return_token_budget='unlimited' requires a GPT-5+ reasoning model."
+        )
 
 
 def _validate_openai_tool_name(name: str) -> None:

@@ -30,6 +30,7 @@ from cayu.runtime.aggregates import (
     UsageRollupInconsistent,
     UsageRollupResultTooLarge,
     UsageRollupStoreResult,
+    UsageUnpricedReason,
     coalesce_usage_pricing_inputs,
     estimate_usage_rollup_cost,
     estimate_usage_session_cost_breakdown,
@@ -48,7 +49,7 @@ from cayu.runtime.sessions import (
     UsageRollupQuery,
 )
 from cayu.runtime.tasks import InMemoryTaskStore, TaskAggregateFilter, TaskCreate
-from cayu.runtime.usage import UsageMetrics
+from cayu.runtime.usage import HostedToolUsageMetrics, UsageMetrics, build_aggregate_usage_metrics
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
 
@@ -928,6 +929,7 @@ def test_pricing_input_accumulator_enforces_serialized_byte_limit() -> None:
 def test_pricing_input_accumulator_bounds_raw_payload_before_validation() -> None:
     accumulator = BoundedUsagePricingInputAccumulator(limit=10, max_bytes=64)
     accumulator.add_payload(
+        event_type=EventType.MODEL_COMPLETED,
         effective_on=datetime(2026, 7, 1).date(),
         occurrences=1,
         payload={
@@ -946,6 +948,154 @@ def test_pricing_input_accumulator_bounds_raw_payload_before_validation() -> Non
     assert group_count == 1
     assert accuracy.kind == "truncated"
     assert accuracy.limit == 64
+
+
+def test_pricing_input_preserves_completion_authority_over_colliding_payload_keys() -> None:
+    accumulator = BoundedUsagePricingInputAccumulator(limit=10)
+    accumulator.add_payload(
+        event_type=EventType.MODEL_COMPLETED,
+        effective_on=datetime(2026, 7, 1).date(),
+        occurrences=1,
+        payload={
+            "tool_type": "web_search",
+            "status": "completed",
+            "usage_metrics": {
+                "provider_name": "openai",
+                "model": "gpt-5.6",
+                "input_tokens": 7,
+                "total_tokens": 7,
+            },
+        },
+    )
+
+    inputs, group_count, accuracy = accumulator.result()
+
+    assert accuracy.kind == "exact"
+    assert group_count == 1
+    assert len(inputs) == 1
+    assert inputs[0].metrics is not None
+    assert inputs[0].metrics.input_tokens == 7
+    assert inputs[0].metrics.total_tokens == 7
+    assert inputs[0].metrics.hosted_tools.web_search_calls == 0
+
+
+def test_zero_token_completion_with_hosted_counters_remains_one_model_step() -> None:
+    start = datetime(2026, 8, 19, tzinfo=UTC)
+    hosted_usage = HostedToolUsageMetrics(web_search_calls=1)
+    pricing_input = UsagePricingInput(
+        effective_on=start.date(),
+        occurrences=1,
+        event_type="model.completed",
+        metrics=UsageMetrics(
+            provider_name="openai",
+            model="gpt-5.6-luna",
+            hosted_tools=hosted_usage,
+        ),
+    )
+    empty_breakdown = UsageAggregateBreakdown(
+        groups=(),
+        remainder=None,
+        accuracy=AggregateAccuracy(kind=AggregateAccuracyKind.EXACT),
+    )
+    result = UsageRollupStoreResult(
+        as_of=start + timedelta(seconds=1),
+        start_at=start,
+        end_at=start + timedelta(days=1),
+        totals=UsageAggregateTotals(
+            session_count=1,
+            model_steps=1,
+            model_steps_with_usage=1,
+            tool_calls=0,
+            usage=build_aggregate_usage_metrics(web_search_calls=1),
+        ),
+        provider_breakdown=empty_breakdown,
+        model_breakdown=empty_breakdown,
+        pricing_inputs=(pricing_input,),
+        pricing_inputs_included=True,
+        pricing_input_group_count=1,
+        matching_session_count=1,
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="openai",
+                model="gpt-5.6-luna",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+                web_search_per_thousand=Decimal("10"),
+            ),
+        )
+    )
+
+    cost = estimate_usage_rollup_cost(result, pricing)
+
+    assert cost.evaluated_model_steps == 1
+    assert cost.priced_model_steps == 1
+    assert cost.currencies[0].model_steps == 1
+    assert cost.currencies[0].hosted_resources == 1
+
+
+def test_missing_hosted_pricing_metrics_are_unpriced_resource_not_model_step() -> None:
+    start = datetime(2026, 8, 19, tzinfo=UTC)
+    completion_input = UsagePricingInput(
+        effective_on=start.date(),
+        occurrences=1,
+        event_type="model.completed",
+        metrics=UsageMetrics(provider_name="openai", model="gpt-5.6-luna"),
+    )
+    hosted_input = UsagePricingInput(
+        effective_on=start.date(),
+        occurrences=1,
+        event_type="model.hosted_tool_call",
+        metrics=None,
+    )
+    empty_breakdown = UsageAggregateBreakdown(
+        groups=(),
+        remainder=None,
+        accuracy=AggregateAccuracy(kind=AggregateAccuracyKind.EXACT),
+    )
+    result = UsageRollupStoreResult(
+        as_of=start + timedelta(seconds=1),
+        start_at=start,
+        end_at=start + timedelta(days=1),
+        totals=UsageAggregateTotals(
+            session_count=1,
+            model_steps=1,
+            model_steps_with_usage=1,
+            tool_calls=0,
+            usage=build_aggregate_usage_metrics(web_search_calls=1),
+        ),
+        provider_breakdown=empty_breakdown,
+        model_breakdown=empty_breakdown,
+        pricing_inputs=(completion_input, hosted_input),
+        pricing_inputs_included=True,
+        pricing_input_group_count=2,
+        matching_session_count=1,
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="openai",
+                model="gpt-5.6-luna",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+                web_search_per_thousand=Decimal("10"),
+            ),
+        )
+    )
+
+    cost = estimate_usage_rollup_cost(result, pricing)
+
+    assert cost.evaluated_model_steps == 1
+    assert cost.priced_model_steps == 1
+    assert cost.unpriced_model_steps == 0
+    assert cost.unpriced_reasons == (
+        UsageUnpricedReason(
+            reason="model.hosted_tool_call event has no valid normalized usage metrics",
+            model_steps=0,
+            hosted_resources=1,
+        ),
+    )
 
 
 def test_complete_sampled_usage_breakdown_is_representable() -> None:
@@ -1129,10 +1279,7 @@ def test_session_aggregate_filters_reject_oversized_label_predicates() -> None:
     ("model", "field_name", "mode"),
     [
         (model, field_name, mode)
-        for model, field_name in (
-            (UsageAggregateRemainder, "group_count"),
-            (UsageCurrencyCost, "model_steps"),
-        )
+        for model, field_name in ((UsageAggregateRemainder, "group_count"),)
         for mode in ("validation", "serialization")
     ],
 )
@@ -1145,6 +1292,18 @@ def test_positive_aggregate_counts_remain_positive_decimal_strings_in_json_schem
 
     assert field_schema["type"] == "string"
     assert field_schema["pattern"] == r"^[1-9]\d*$"
+
+
+@pytest.mark.parametrize("mode", ["validation", "serialization"])
+@pytest.mark.parametrize("field_name", ["model_steps", "hosted_resources"])
+def test_currency_cost_evidence_counts_are_nonnegative_decimal_strings_in_json_schema(
+    mode: Literal["validation", "serialization"],
+    field_name: str,
+) -> None:
+    field_schema = UsageCurrencyCost.model_json_schema(mode=mode)["properties"][field_name]
+
+    assert field_schema["type"] == "string"
+    assert field_schema["pattern"] == r"^(0|[1-9]\d*)$"
 
 
 @pytest.mark.parametrize("mode", ["validation", "serialization"])
@@ -2063,6 +2222,229 @@ def test_session_usage_breakdown_keeps_oversized_omitted_identity_in_remainder(
     asyncio.run(run())
 
 
+def test_sqlite_usage_rollup_matches_hosted_search_accounting_reference(tmp_path) -> None:
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        sqlite = SQLiteSessionStore(tmp_path / "hosted-search-usage.sqlite")
+        start = datetime(2026, 8, 19, tzinfo=UTC)
+
+        async def seed(store: SessionStore, session_id: str) -> None:
+            await store.create(_request(session_id), identity=_identity())
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        id=f"{session_id}-completed",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        timestamp=start,
+                        payload={
+                            "usage_metrics": {
+                                "provider_name": "openai",
+                                "model": "gpt-5.6-luna",
+                                "input_tokens": 12,
+                                "output_tokens": 3,
+                                "total_tokens": 15,
+                            },
+                            "hosted_tool_usage": {
+                                "web_search_calls": 2,
+                                "web_search_outcome_unknown": 0,
+                            },
+                        },
+                    ),
+                    *[
+                        Event(
+                            id=f"{session_id}-completed-search-{index}",
+                            type=EventType.MODEL_HOSTED_TOOL_CALL,
+                            session_id=session_id,
+                            timestamp=start + timedelta(milliseconds=index),
+                            payload={
+                                "tool_type": "web_search",
+                                "call_id": f"search-{index}",
+                                "status": "completed",
+                                "provider_name": "openai",
+                                "model": "gpt-5.6-luna",
+                            },
+                        )
+                        for index in range(1, 3)
+                    ],
+                    Event(
+                        id=f"{session_id}-unknown",
+                        type=EventType.MODEL_HOSTED_TOOL_CALL,
+                        session_id=session_id,
+                        timestamp=start + timedelta(seconds=1),
+                        payload={
+                            "tool_type": "web_search",
+                            "call_id": "search-unknown",
+                            "status": "outcome_unknown",
+                            "provider_name": "openai",
+                            "model": "gpt-5.6-luna",
+                            "model_step_id": "step-unknown",
+                            "model_attempt_id": "attempt-unknown",
+                        },
+                    ),
+                ],
+            )
+
+        try:
+            await seed(memory, "memory-hosted-search")
+            await seed(sqlite, "sqlite-hosted-search")
+            query = UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                session_group_limit=1,
+                include_pricing_inputs=True,
+            )
+            memory_result = await memory.aggregate_usage(query)
+            sqlite_result = await sqlite.aggregate_usage(query)
+            assert sqlite_result.totals == memory_result.totals
+            assert sqlite_result.totals.usage.hosted_tools.web_search_calls == 2
+            assert sqlite_result.totals.usage.hosted_tools.web_search_outcome_unknown == 1
+            assert sqlite_result.pricing_inputs == memory_result.pricing_inputs
+            assert (
+                sum(
+                    item.metrics.hosted_tools.web_search_calls * item.occurrences
+                    for item in sqlite_result.pricing_inputs
+                    if item.metrics is not None
+                )
+                == 2
+            )
+            assert sqlite_result.provider_breakdown.groups[0].provider_name == "openai"
+            assert (
+                sqlite_result.provider_breakdown.groups[
+                    0
+                ].totals.usage.hosted_tools.web_search_outcome_unknown
+                == 1
+            )
+            assert sqlite_result.session_breakdown is not None
+            assert (
+                sqlite_result.session_breakdown.groups[0].totals.usage.hosted_tools.web_search_calls
+                == 2
+            )
+            pricing = PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="openai",
+                        model="gpt-5.6-luna",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("1"),
+                        web_search_per_thousand=Decimal("10"),
+                    ),
+                )
+            )
+            cost = estimate_usage_rollup_cost(sqlite_result, pricing)
+            assert cost.evaluated_model_steps == 1
+            assert cost.priced_model_steps == 1
+            assert cost.unpriced_model_steps == 0
+            assert cost.currencies == (
+                UsageCurrencyCost(
+                    currency="USD",
+                    model_steps=1,
+                    hosted_resources=2,
+                    total_cost=Decimal("0.020015"),
+                ),
+            )
+            assert cost.unpriced_reasons == (
+                UsageUnpricedReason(
+                    reason="hosted web-search outcome and billing are unknown",
+                    model_steps=0,
+                    hosted_resources=1,
+                ),
+            )
+            session_cost = estimate_usage_session_cost_breakdown(sqlite_result, pricing)
+            assert session_cost.groups[0].cost.evaluated_model_steps == 1
+            assert session_cost.groups[0].cost.currencies[0].hosted_resources == 2
+        finally:
+            await sqlite.close()
+
+    asyncio.run(run())
+
+
+def test_session_pricing_remainder_keeps_hosted_resources_out_of_model_steps(tmp_path) -> None:
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        sqlite = SQLiteSessionStore(tmp_path / "hosted-search-remainder.sqlite")
+        start = datetime(2026, 8, 19, tzinfo=UTC)
+
+        async def seed(store: SessionStore, prefix: str) -> None:
+            for index in range(2):
+                session_id = f"{prefix}-hosted-remainder-{index}"
+                await store.create(_request(session_id), identity=_identity())
+                await store.append_events(
+                    session_id,
+                    [
+                        _model_event(
+                            event_id=f"{session_id}-completion",
+                            session_id=session_id,
+                            timestamp=start,
+                            provider_name="openai",
+                            model="gpt-5.6-luna",
+                            input_tokens=12,
+                            output_tokens=3,
+                        ),
+                        Event(
+                            id=f"{session_id}-search",
+                            type=EventType.MODEL_HOSTED_TOOL_CALL,
+                            session_id=session_id,
+                            timestamp=start + timedelta(milliseconds=1),
+                            payload={
+                                "tool_type": "web_search",
+                                "call_id": f"search-{index}",
+                                "status": "completed",
+                                "provider_name": "openai",
+                                "model": "gpt-5.6-luna",
+                            },
+                        ),
+                    ],
+                )
+
+        try:
+            await seed(memory, "shared")
+            await seed(sqlite, "shared")
+            query = UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                session_group_limit=1,
+                include_pricing_inputs=True,
+            )
+            memory_result = await memory.aggregate_usage(query)
+            sqlite_result = await sqlite.aggregate_usage(query)
+            assert sqlite_result.model_dump(exclude={"as_of"}) == memory_result.model_dump(
+                exclude={"as_of"}
+            )
+            assert sqlite_result.totals.model_steps == 2
+            assert sqlite_result.session_breakdown is not None
+            assert sqlite_result.session_breakdown.remainder is not None
+            assert sqlite_result.session_breakdown.remainder.totals.model_steps == 1
+            assert (
+                sqlite_result.session_breakdown.remainder.totals.usage.hosted_tools.web_search_calls
+                == 1
+            )
+
+            pricing = PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="openai",
+                        model="gpt-5.6-luna",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("1"),
+                        web_search_per_thousand=Decimal("10"),
+                    ),
+                )
+            )
+            cost = estimate_usage_rollup_cost(sqlite_result, pricing)
+            assert cost.evaluated_model_steps == 2
+            assert cost.currencies[0].hosted_resources == 2
+            session_cost = estimate_usage_session_cost_breakdown(sqlite_result, pricing)
+            assert session_cost.remainder is not None
+            assert session_cost.remainder.cost.evaluated_model_steps == 1
+            assert session_cost.remainder.cost.currencies[0].hosted_resources == 1
+        finally:
+            await sqlite.close()
+
+    asyncio.run(run())
+
+
 def test_sqlite_usage_rollup_handles_malformed_normalized_usage_like_memory(tmp_path) -> None:
     async def run() -> None:
         memory = InMemorySessionStore()
@@ -2449,6 +2831,99 @@ def test_postgres_session_usage_breakdown_matches_in_memory_reference(
                 postgres_result,
                 pricing,
             ) == estimate_usage_session_cost_breakdown(memory_result, pricing)
+        finally:
+            await postgres.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_usage_rollup_matches_hosted_search_accounting_reference(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        postgres = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        suffix = uuid4().hex
+        session_id = f"hosted-search-{suffix}"
+        start = datetime(2026, 8, 19, tzinfo=UTC)
+        label_value = f"hosted-search-usage-{suffix}"
+
+        async def seed(store: SessionStore, session_id: str) -> None:
+            await store.create(
+                _request(session_id, labels={"test-scope": label_value}),
+                identity=_identity(),
+            )
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        id=f"{session_id}-completed",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        timestamp=start,
+                        payload={
+                            "usage_metrics": {
+                                "provider_name": "openai",
+                                "model": "gpt-5.6-luna",
+                            }
+                        },
+                    ),
+                    *[
+                        Event(
+                            id=f"{session_id}-completed-search-{index}",
+                            type=EventType.MODEL_HOSTED_TOOL_CALL,
+                            session_id=session_id,
+                            timestamp=start + timedelta(milliseconds=index),
+                            payload={
+                                "tool_type": "web_search",
+                                "call_id": f"search-{index}",
+                                "status": "completed",
+                                "provider_name": "openai",
+                                "model": "gpt-5.6-luna",
+                            },
+                        )
+                        for index in range(1, 4)
+                    ],
+                    Event(
+                        id=f"{session_id}-unknown",
+                        type=EventType.MODEL_HOSTED_TOOL_CALL,
+                        session_id=session_id,
+                        timestamp=start + timedelta(seconds=1),
+                        payload={
+                            "tool_type": "web_search",
+                            "call_id": "search-unknown",
+                            "status": "outcome_unknown",
+                            "provider_name": "openai",
+                            "model": "gpt-5.6-luna",
+                        },
+                    ),
+                ],
+            )
+
+        try:
+            await seed(memory, session_id)
+            await seed(postgres, session_id)
+            query = UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                sessions=SessionAggregateFilter(labels={"test-scope": label_value}),
+                session_group_limit=1,
+            )
+            memory_result = await memory.aggregate_usage(query)
+            postgres_result = await postgres.aggregate_usage(query)
+            assert postgres_result.model_dump(exclude={"as_of"}) == memory_result.model_dump(
+                exclude={"as_of"}
+            )
+            assert postgres_result.totals.usage.hosted_tools.web_search_calls == 3
+            assert postgres_result.totals.usage.hosted_tools.web_search_outcome_unknown == 1
         finally:
             await postgres.close()
 
@@ -2950,12 +3425,38 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
             assert "<" in plan_predicates
             assert "event_type" in plan_predicates
         assert bounded_pricing_row is not None
-        assert bounded_pricing_row[1:4] == (None, None, True)
+        (
+            bounded_event_type,
+            bounded_effective_on,
+            bounded_usage_metrics,
+            bounded_billing_identity,
+            bounded_input_oversized,
+            _,
+            _,
+        ) = bounded_pricing_row
+        assert bounded_event_type == "model.completed"
+        assert bounded_effective_on == start.date()
+        assert (bounded_usage_metrics, bounded_billing_identity, bounded_input_oversized) == (
+            None,
+            None,
+            True,
+        )
         assert clean_evidence_row is not None
-        assert clean_evidence_row[1] is not None
-        assert clean_evidence_row[3] is False
-        assert "request_evidence" not in clean_evidence_row[1]["billing_identity"]
-        assert "completion_evidence" not in clean_evidence_row[1]["billing_identity"]
+        (
+            clean_event_type,
+            clean_effective_on,
+            clean_usage_metrics,
+            _,
+            clean_input_oversized,
+            _,
+            _,
+        ) = clean_evidence_row
+        assert clean_event_type == "model.completed"
+        assert clean_effective_on == start.date()
+        assert clean_usage_metrics is not None
+        assert clean_input_oversized is False
+        assert "request_evidence" not in clean_usage_metrics["billing_identity"]
+        assert "completion_evidence" not in clean_usage_metrics["billing_identity"]
 
         memory_tasks = InMemoryTaskStore()
         postgres_tasks = PostgresTaskStore(

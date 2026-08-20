@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import json
 from collections.abc import Mapping
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -14,12 +15,15 @@ import cayu.providers.openai as openai_module
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
+    BudgetLimit,
     CayuApp,
     Event,
     EventType,
     FileAttachmentKind,
     InMemorySessionStore,
     Message,
+    ModelPrice,
+    PriceBook,
     RecentTurnsContextPolicy,
     ResumeRequest,
     RetryPolicy,
@@ -35,7 +39,9 @@ from cayu.providers import (
     InputTokenCountMethod,
     ModelContextOverflowError,
     ModelFinishReason,
+    ModelProvider,
     ModelRequest,
+    ModelStreamEvent,
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
     OpenAIAPIError,
@@ -52,6 +58,7 @@ from cayu.providers import (
 from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.openai import openai_stream_events
+from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -153,6 +160,708 @@ class EchoTool(Tool):
             content=args["text"],
             structured={"agent": ctx.agent_name, "echoed": args["text"]},
         )
+
+
+@pytest.mark.anyio
+async def test_agent_hosted_web_search_projects_native_openai_tool() -> None:
+    from cayu.providers import OpenAIWebSearch
+
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "done"}],
+                            }
+                        ],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    },
+                }
+            ]
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(OpenAIProvider(api_key="test-key", transport=transport), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        tools=[EchoTool()],
+        hosted_tools=[
+            OpenAIWebSearch(
+                search_context_size="medium",
+                external_web_access=False,
+                allowed_domains=("openai.com",),
+                return_token_budget="default",
+                include_sources=True,
+            )
+        ],
+    )
+
+    events = await _collect_events(
+        app,
+        RunRequest(
+            agent_name="assistant",
+            messages=[Message.text("user", "Search the official docs.")],
+            max_steps=1,
+        ),
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert transport.calls[0]["payload"]["tools"] == [
+        {
+            "type": "function",
+            "name": "echo",
+            "description": "Echo text.",
+            "parameters": EchoTool.spec.input_schema,
+            "strict": False,
+        },
+        {
+            "type": "web_search",
+            "search_context_size": "medium",
+            "external_web_access": False,
+            "filters": {"allowed_domains": ["openai.com"]},
+        },
+    ]
+    assert transport.calls[0]["payload"]["include"] == [
+        "reasoning.encrypted_content",
+        "web_search_call.action.sources",
+    ]
+
+
+@pytest.mark.anyio
+async def test_agent_hosted_web_search_rejects_unsupported_provider_before_dispatch() -> None:
+    from cayu.providers import OpenAIWebSearch
+
+    class UnsupportedProvider(ModelProvider):
+        name = "unsupported"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest):
+            self.calls += 1
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "status": "completed",
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                }
+            )
+
+    provider = UnsupportedProvider()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch()],
+    )
+
+    with pytest.raises(ValueError, match="hosted.*not supported"):
+        await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "Search the web.")],
+                max_steps=1,
+            ),
+        )
+
+    assert provider.calls == 0
+
+
+def test_openai_hosted_web_search_custom_endpoint_requires_explicit_capability() -> None:
+    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+
+    provider = OpenAIProvider(
+        api_key="test-key",
+        base_url="https://compatible.example.test/v1",
+        transport=RecordingTransport(),
+    )
+
+    with pytest.raises(HostedToolCapabilityError, match="not established for this custom endpoint"):
+        provider.preflight_hosted_tools(
+            model="gpt-5.6",
+            hosted_tools=(OpenAIWebSearch(),),
+            options={},
+        )
+
+    verified_provider = OpenAIProvider(
+        api_key="test-key",
+        base_url="https://compatible.example.test/v1",
+        transport=RecordingTransport(),
+        hosted_web_search_supported=True,
+    )
+    verified_provider.preflight_hosted_tools(
+        model="gpt-5.6",
+        hosted_tools=(OpenAIWebSearch(),),
+        options={},
+    )
+
+
+def test_openai_hosted_web_search_unlimited_budget_requires_gpt5_reasoning() -> None:
+    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+
+    provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
+
+    with pytest.raises(HostedToolCapabilityError, match="requires a GPT-5"):
+        provider.preflight_hosted_tools(
+            model="chat-latest",
+            hosted_tools=(OpenAIWebSearch(return_token_budget="unlimited"),),
+            options={},
+        )
+
+
+@pytest.mark.parametrize("model", ["gpt-4.1", "gpt-5.6-unverified", "gpt-5.7"])
+def test_openai_hosted_web_search_rejects_model_without_verified_support(model: str) -> None:
+    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+
+    provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
+
+    with pytest.raises(HostedToolCapabilityError, match=f"not established for model {model!r}"):
+        provider.preflight_hosted_tools(
+            model=model,
+            hosted_tools=(OpenAIWebSearch(),),
+            options={},
+        )
+
+
+@pytest.mark.anyio
+async def test_agent_hosted_web_search_rejects_strict_budget_without_call_ceiling() -> None:
+    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+
+    transport = RecordingTransport()
+    app = CayuApp()
+    app.register_provider(OpenAIProvider(api_key="test-key", transport=transport), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch()],
+    )
+
+    with pytest.raises(HostedToolCapabilityError, match="no hard per-response"):
+        await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "Search the web.")],
+                max_steps=1,
+                budget_limits=(
+                    BudgetLimit(
+                        max_estimated_cost=Decimal("1"),
+                        pricing=PriceBook(
+                            prices=(
+                                ModelPrice.fixed(
+                                    provider_name="openai",
+                                    model="gpt-5.6",
+                                    input_per_million=Decimal("1"),
+                                    output_per_million=Decimal("1"),
+                                    web_search_per_thousand=Decimal("10"),
+                                ),
+                            )
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    assert transport.calls == []
+
+
+@pytest.mark.anyio
+async def test_hosted_web_search_configuration_changes_execution_profile_identity() -> None:
+    from cayu.providers import OpenAIWebSearch
+
+    async def run_with(search_context_size: str) -> str:
+        transport = RecordingTransport(
+            stream_events=[
+                [
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": f"resp_{search_context_size}",
+                            "model": "gpt-test",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "done"}],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        },
+                    }
+                ]
+            ]
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store)
+        app.register_provider(
+            OpenAIProvider(api_key="test-key", transport=transport),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="gpt-5.6"),
+            hosted_tools=[OpenAIWebSearch(search_context_size=search_context_size)],
+        )
+        events = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "Search.")],
+                max_steps=1,
+            ),
+        )
+        session = await store.load(events[0].session_id)
+        assert session is not None
+        return execution_profile_from_session_metadata(session.metadata).fingerprint
+
+    assert await run_with("low") != await run_with("high")
+
+
+@pytest.mark.anyio
+async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay() -> None:
+    from cayu import CitationPart, HostedToolCallPart, OpenAIWebSearch
+
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "in_progress",
+                    },
+                },
+                {
+                    "type": "response.web_search_call.searching",
+                    "output_index": 0,
+                    "item_id": "ws_1",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                        "action": {
+                            "type": "search",
+                            "query": "Cayu runtime",
+                            "sources": [
+                                {
+                                    "type": "url",
+                                    "url": "https://github.com/example/cayu",
+                                    "title": "Cayu",
+                                }
+                            ],
+                        },
+                    },
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": "Prefix ",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 1,
+                    "content_index": 1,
+                    "delta": "Cayu is a runtime.",
+                },
+                {
+                    "type": "response.output_text.annotation.added",
+                    "output_index": 1,
+                    "content_index": 1,
+                    "annotation": {
+                        "type": "url_citation",
+                        "url": "https://github.com/example/cayu",
+                        "title": "Cayu",
+                        "start_index": 0,
+                        "end_index": 4,
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 4,
+                            "total_tokens": 7,
+                        },
+                    },
+                },
+            ],
+            [
+                {"type": "response.output_text.delta", "delta": "Follow-up."},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Follow-up.",
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "usage": {
+                            "input_tokens": 5,
+                            "output_tokens": 2,
+                            "total_tokens": 7,
+                        },
+                    },
+                },
+            ],
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(OpenAIProvider(api_key="test-key", transport=transport), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch()],
+    )
+
+    run_events = await _collect_events(
+        app,
+        RunRequest(
+            session_id="sess_web_search",
+            agent_name="assistant",
+            messages=[Message.text("user", "Search for Cayu.")],
+            max_steps=1,
+        ),
+    )
+    resume_events = [
+        event
+        async for event in app.resume(
+            ResumeRequest(
+                session_id="sess_web_search",
+                messages=[Message.text("user", "Continue.")],
+                max_steps=1,
+            )
+        )
+    ]
+
+    hosted_events = [
+        event for event in run_events if event.type == EventType.MODEL_HOSTED_TOOL_CALL
+    ]
+    assert [event.payload["status"] for event in hosted_events] == [
+        "in_progress",
+        "searching",
+        "completed",
+    ]
+    assert all(event.payload["provider_name"] == "openai" for event in hosted_events)
+    assert all(event.payload["model"] == "gpt-5.6" for event in hosted_events)
+    assert len({event.payload["model_attempt_id"] for event in hosted_events}) == 1
+    assert len({event.payload["provider_operation_id"] for event in hosted_events}) == 1
+    citation_event = next(event for event in run_events if event.type == EventType.MODEL_CITATION)
+    assert (
+        citation_event.payload["provider_operation_id"]
+        == hosted_events[0].payload["provider_operation_id"]
+    )
+    assert citation_event.payload["provenance"] == {
+        "provider_name": "openai",
+        "hosted_tool": "web_search",
+        "untrusted_external_evidence": True,
+    }
+    completed = next(event for event in run_events if event.type == EventType.MODEL_COMPLETED)
+    assert "hosted_tools" not in completed.payload["usage_metrics"]
+    assert completed.payload["hosted_tool_usage"] == {
+        "web_search_calls": 1,
+        "web_search_outcome_unknown": 0,
+    }
+
+    transcript = await store.load_transcript("sess_web_search")
+    searched_message = next(
+        message
+        for message in transcript
+        if message.role == MessageRole.ASSISTANT
+        and any(type(part) is HostedToolCallPart for part in message.content)
+    )
+    hosted_part = next(
+        part for part in searched_message.content if type(part) is HostedToolCallPart
+    )
+    citation_part = next(part for part in searched_message.content if type(part) is CitationPart)
+    assert hosted_part.action.sources[0].url == "https://github.com/example/cayu"
+    stored_hosted_events = [
+        event
+        for event in await store.load_events("sess_web_search")
+        if event.type == EventType.MODEL_HOSTED_TOOL_CALL
+    ]
+    assert hosted_part.model_attempt_id == stored_hosted_events[-1].payload["model_attempt_id"]
+    assert citation_part.start_index == 7
+    assert citation_part.end_index == 11
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    usage = await app.get_session_usage("sess_web_search")
+    assert usage.usage.hosted_tools.web_search_calls == 1
+    assert usage.usage.hosted_tools.web_search_outcome_unknown == 0
+    assert any(
+        item.get("type") == "web_search_call" for item in transport.calls[1]["payload"]["input"]
+    )
+
+
+@pytest.mark.anyio
+async def test_runtime_accounts_terminal_only_web_search_evidence_once() -> None:
+    from cayu import OpenAIWebSearch
+
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_terminal_only",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "web_search_call",
+                                "id": "ws_terminal_only",
+                                "status": "completed",
+                                "action": {"type": "search", "query": "Cayu"},
+                            }
+                        ],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    },
+                }
+            ]
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(OpenAIProvider(api_key="test-key", transport=transport), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch()],
+    )
+
+    events = await _collect_events(
+        app,
+        RunRequest(
+            session_id="sess_terminal_only_search",
+            agent_name="assistant",
+            messages=[Message.text("user", "Search")],
+            max_steps=1,
+        ),
+    )
+
+    hosted = [event for event in events if event.type == EventType.MODEL_HOSTED_TOOL_CALL]
+    assert [event.payload["status"] for event in hosted] == ["completed"]
+    stored_hosted = [
+        event
+        for event in await store.load_events("sess_terminal_only_search")
+        if event.type == EventType.MODEL_HOSTED_TOOL_CALL
+    ]
+    assert [(event.payload["call_id"], event.payload["status"]) for event in stored_hosted] == [
+        ("ws_terminal_only", "completed")
+    ]
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["hosted_tool_usage"] == {
+        "web_search_calls": 1,
+        "web_search_outcome_unknown": 0,
+    }
+    usage = await app.get_session_usage("sess_terminal_only_search")
+    assert usage.usage.hosted_tools.web_search_calls == 1
+    assert usage.usage.hosted_tools.web_search_outcome_unknown == 0
+
+
+@pytest.mark.anyio
+async def test_runtime_accounts_for_ambiguous_search_before_provider_retry() -> None:
+    from cayu import OpenAIWebSearch
+
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_first",
+                        "status": "in_progress",
+                    },
+                },
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "server_error",
+                            "code": "internal_error",
+                            "message": "transient",
+                        }
+                    },
+                },
+            ],
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_retry",
+                        "status": "in_progress",
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_retry",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "Cayu"},
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_retry",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                    },
+                },
+            ],
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(OpenAIProvider(api_key="test-key", transport=transport), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch()],
+    )
+
+    events = await _collect_events(
+        app,
+        RunRequest(
+            session_id="sess_web_search_retry",
+            agent_name="assistant",
+            messages=[Message.text("user", "Search")],
+            max_steps=1,
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        ),
+    )
+
+    assert len(transport.calls) == 2
+    hosted = [event for event in events if event.type == EventType.MODEL_HOSTED_TOOL_CALL]
+    assert [event.payload["status"] for event in hosted] == [
+        "in_progress",
+        "outcome_unknown",
+        "in_progress",
+        "completed",
+    ]
+    stored_hosted = [
+        event
+        for event in await store.load_events("sess_web_search_retry")
+        if event.type == EventType.MODEL_HOSTED_TOOL_CALL
+    ]
+    assert [(event.payload["call_id"], event.payload["status"]) for event in stored_hosted] == [
+        ("ws_first", "in_progress"),
+        ("ws_first", "outcome_unknown"),
+        ("ws_retry", "in_progress"),
+        ("ws_retry", "completed"),
+    ]
+    assert EventType.MODEL_RETRY in [event.type for event in events]
+    usage = await app.get_session_usage("sess_web_search_retry")
+    assert usage.usage.hosted_tools.web_search_calls == 1
+    assert usage.usage.hosted_tools.web_search_outcome_unknown == 1
+
+
+@pytest.mark.anyio
+async def test_runtime_accounts_started_search_before_later_parser_failure() -> None:
+    from cayu import OpenAIWebSearch
+
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_parser_failure",
+                        "status": "in_progress",
+                    },
+                },
+                {
+                    "type": "response.web_search_call.searching",
+                    "output_index": 0,
+                    "item_id": "ws_wrong",
+                },
+            ]
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(OpenAIProvider(api_key="test-key", transport=transport), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch()],
+    )
+
+    events = await _collect_events(
+        app,
+        RunRequest(
+            session_id="sess_web_search_parser_failure",
+            agent_name="assistant",
+            messages=[Message.text("user", "Search")],
+            max_steps=1,
+            retry_policy=RetryPolicy(max_attempts=1),
+        ),
+    )
+
+    hosted = [event for event in events if event.type == EventType.MODEL_HOSTED_TOOL_CALL]
+    assert [event.payload["status"] for event in hosted] == [
+        "in_progress",
+        "outcome_unknown",
+    ]
+    stored_hosted = [
+        event
+        for event in await store.load_events("sess_web_search_parser_failure")
+        if event.type == EventType.MODEL_HOSTED_TOOL_CALL
+    ]
+    assert [(event.payload["call_id"], event.payload["status"]) for event in stored_hosted] == [
+        ("ws_parser_failure", "in_progress"),
+        ("ws_parser_failure", "outcome_unknown"),
+    ]
+    usage = await app.get_session_usage("sess_web_search_parser_failure")
+    assert usage.usage.hosted_tools.web_search_calls == 0
+    assert usage.usage.hosted_tools.web_search_outcome_unknown == 1
+    assert events[-1].type == EventType.SESSION_FAILED
 
 
 def test_build_openai_payload_translates_cayu_messages() -> None:
@@ -1762,6 +2471,425 @@ async def test_openai_stream_events_emits_incomplete_terminal_response() -> None
 
 
 @pytest.mark.anyio
+async def test_openai_stream_events_emits_web_search_lifecycle_and_citation() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        yield {
+            "type": "response.web_search_call.in_progress",
+            "output_index": 0,
+            "item_id": "ws_1",
+        }
+        yield {
+            "type": "response.web_search_call.searching",
+            "output_index": 0,
+            "item_id": "ws_1",
+        }
+        yield {
+            "type": "response.web_search_call.completed",
+            "output_index": 0,
+            "item_id": "ws_1",
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "Cayu",
+                    "sources": [
+                        {
+                            "type": "url",
+                            "url": "https://github.com/example/cayu",
+                            "title": "Cayu",
+                        }
+                    ],
+                },
+            },
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "output_index": 1,
+            "content_index": 0,
+            "delta": "Cayu is a runtime.",
+        }
+        yield {
+            "type": "response.output_text.annotation.added",
+            "output_index": 1,
+            "content_index": 0,
+            "annotation": {
+                "type": "url_citation",
+                "url": "https://github.com/example/cayu",
+                "title": "Cayu",
+                "start_index": 0,
+                "end_index": 4,
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.HOSTED_TOOL_CALL,
+        ModelStreamEventType.HOSTED_TOOL_CALL,
+        ModelStreamEventType.HOSTED_TOOL_CALL,
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.CITATION,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert [event.payload["status"] for event in events[:3]] == [
+        "in_progress",
+        "searching",
+        "completed",
+    ]
+    assert events[2].payload["action"]["sources"][0]["title"] == "Cayu"
+    assert events[4].payload["end_index"] == 4
+    assert events[-1].payload["provider_state"][0]["state"]["type"] == "web_search_call"
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_projects_citation_offsets_over_final_text() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Prefix ",
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 1,
+            "delta": "Cayu",
+        }
+        yield {
+            "type": "response.output_text.annotation.added",
+            "output_index": 0,
+            "content_index": 1,
+            "annotation": {
+                "type": "url_citation",
+                "url": "https://github.com/example/cayu",
+                "start_index": 0,
+                "end_index": 4,
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    citation = next(event for event in events if event.type is ModelStreamEventType.CITATION)
+    assert citation.payload["start_index"] == 7
+    assert citation.payload["end_index"] == 11
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_marks_started_search_unknown_on_transport_end() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+
+    stream = openai_stream_events(raw_events())
+    started = await anext(stream)
+    unknown = await anext(stream)
+
+    assert started.payload["status"] == "in_progress"
+    assert unknown.payload == {
+        "tool_type": "web_search",
+        "call_id": "ws_1",
+        "status": "outcome_unknown",
+    }
+    with pytest.raises(OpenAIProtocolError, match="ended before response.completed"):
+        await anext(stream)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_marks_started_search_unknown_before_protocol_error() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        yield {
+            "type": "response.web_search_call.searching",
+            "output_index": 0,
+            "item_id": "ws_wrong",
+        }
+
+    stream = openai_stream_events(raw_events())
+    started = await anext(stream)
+    unknown = await anext(stream)
+
+    assert started.payload["status"] == "in_progress"
+    assert unknown.payload == {
+        "tool_type": "web_search",
+        "call_id": "ws_1",
+        "status": "outcome_unknown",
+    }
+    with pytest.raises(OpenAIProtocolError, match="item_id mismatch"):
+        await anext(stream)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("second_output_index", "second_call_id", "expected_error"),
+    [
+        (0, "ws_2", "output_item.added was repeated"),
+        (1, "ws_1", "call identity was reused"),
+    ],
+)
+async def test_openai_stream_events_rejects_rebound_web_search_identity(
+    second_output_index: int,
+    second_call_id: str,
+    expected_error: str,
+) -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        yield {
+            "type": "response.output_item.added",
+            "output_index": second_output_index,
+            "item": {
+                "type": "web_search_call",
+                "id": second_call_id,
+                "status": "in_progress",
+            },
+        }
+
+    stream = openai_stream_events(raw_events())
+    assert (await anext(stream)).payload["status"] == "in_progress"
+    assert (await anext(stream)).payload == {
+        "tool_type": "web_search",
+        "call_id": "ws_1",
+        "status": "outcome_unknown",
+    }
+    with pytest.raises(OpenAIProtocolError, match=expected_error):
+        await anext(stream)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_duplicate_identity_in_terminal_output() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_same",
+                        "status": "completed",
+                        "action": {"type": "search", "query": query},
+                    }
+                    for query in ("Cayu", "Cayu docs")
+                ],
+            },
+        }
+
+    stream = openai_stream_events(raw_events())
+    with pytest.raises(OpenAIProtocolError, match="duplicated across output items"):
+        await anext(stream)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_reconciles_matching_terminal_search_evidence() -> None:
+    search_call = {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "Cayu"},
+    }
+
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": search_call,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [search_call],
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    hosted = [event for event in events if event.type is ModelStreamEventType.HOSTED_TOOL_CALL]
+    assert [event.payload["status"] for event in hosted] == ["in_progress", "completed"]
+    assert events[-1].type is ModelStreamEventType.COMPLETED
+    assert events[-1].payload["hosted_tool_usage"] == {
+        "web_search_calls": 1,
+        "web_search_outcome_unknown": 0,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "terminal_output",
+    [
+        pytest.param([], id="omitted"),
+        pytest.param(
+            [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_2",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "Cayu"},
+                }
+            ],
+            id="rebound-call-id",
+        ),
+        pytest.param(
+            [
+                {"type": "message", "role": "assistant", "content": []},
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "Cayu"},
+                },
+            ],
+            id="rebound-output-index",
+        ),
+    ],
+)
+async def test_openai_stream_events_rejects_terminal_output_that_omits_or_rebinds_search(
+    terminal_output: list[dict[str, object]],
+) -> None:
+    lifecycle_call = {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "Cayu"},
+    }
+
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": lifecycle_call,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": terminal_output,
+            },
+        }
+
+    stream = openai_stream_events(raw_events())
+    assert (await anext(stream)).payload["status"] == "in_progress"
+    assert (await anext(stream)).payload["status"] == "completed"
+    with pytest.raises(OpenAIProtocolError, match="omitted|conflicts"):
+        await anext(stream)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_marks_started_search_unknown_before_cancellation() -> None:
+    blocker = asyncio.Event()
+
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        await blocker.wait()
+
+    stream = openai_stream_events(raw_events())
+    started = await anext(stream)
+    pending = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    pending.cancel()
+
+    unknown = await pending
+    assert started.payload["status"] == "in_progress"
+    assert unknown.payload == {
+        "tool_type": "web_search",
+        "call_id": "ws_1",
+        "status": "outcome_unknown",
+    }
+    with pytest.raises(asyncio.CancelledError):
+        await anext(stream)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_marks_unfinished_search_unknown_on_incomplete() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        yield {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.HOSTED_TOOL_CALL,
+        ModelStreamEventType.HOSTED_TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[1].payload["status"] == "outcome_unknown"
+    assert events[-1].payload["provider_state"] == []
+
+
+@pytest.mark.anyio
 async def test_openai_incomplete_response_does_not_apply_end_turn_false() -> None:
     async def raw_events():
         yield {
@@ -2494,9 +3622,350 @@ async def test_runtime_does_not_recover_conflicting_openai_context_identity() ->
     assert events[-1].type == EventType.SESSION_FAILED
 
 
-def test_openai_response_events_rejects_unsupported_output_item() -> None:
-    with pytest.raises(OpenAIProtocolError, match="Unsupported OpenAI output item"):
-        openai_response_events({"output": [{"type": "web_search_call"}]})
+def test_openai_response_events_normalizes_web_search_sources_and_citations() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "Cayu runtime",
+                        "sources": [
+                            {
+                                "type": "url",
+                                "url": "https://github.com/example/cayu",
+                                "title": "Cayu",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Cayu is a runtime.",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://github.com/example/cayu",
+                                    "title": "Cayu",
+                                    "start_index": 0,
+                                    "end_index": 4,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+        }
+    )
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.HOSTED_TOOL_CALL,
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.CITATION,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].payload == {
+        "tool_type": "web_search",
+        "call_id": "ws_1",
+        "status": "completed",
+        "source_count": 1,
+        "action": {
+            "type": "search",
+            "query": "Cayu runtime",
+            "sources": [
+                {
+                    "type": "url",
+                    "url": "https://github.com/example/cayu",
+                    "title": "Cayu",
+                }
+            ],
+        },
+    }
+    assert events[2].payload == {
+        "citation_type": "url_citation",
+        "url": "https://github.com/example/cayu",
+        "title": "Cayu",
+        "start_index": 0,
+        "end_index": 4,
+    }
+    assert events[-1].payload["provider_state"][0] == {
+        "provider": "openai",
+        "state": {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "Cayu runtime",
+                "sources": [
+                    {
+                        "type": "url",
+                        "url": "https://github.com/example/cayu",
+                        "title": "Cayu",
+                    }
+                ],
+            },
+        },
+    }
+    assert events[-1].payload["hosted_tool_usage"] == {
+        "web_search_calls": 1,
+        "web_search_outcome_unknown": 0,
+    }
+
+
+def test_openai_response_events_preserves_multi_query_and_optional_citation_metadata() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "queries": ["Cayu runtime", "Cayu documentation"],
+                        "sources": [{"type": "url", "url": "https://github.com/example/cayu"}],
+                    },
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Cayu",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://github.com/example/cayu",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert events[0].payload["action"] == {
+        "type": "search",
+        "queries": ["Cayu runtime", "Cayu documentation"],
+        "sources": [{"type": "url", "url": "https://github.com/example/cayu"}],
+    }
+    assert events[2].payload == {
+        "citation_type": "url_citation",
+        "url": "https://github.com/example/cayu",
+    }
+
+
+def test_openai_response_events_projects_citation_offsets_over_final_text() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Prefix ", "annotations": []},
+                        {
+                            "type": "output_text",
+                            "text": "Cayu",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://github.com/example/cayu",
+                                    "start_index": 0,
+                                    "end_index": 4,
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    citation = next(event for event in events if event.type is ModelStreamEventType.CITATION)
+    assert citation.payload["start_index"] == 7
+    assert citation.payload["end_index"] == 11
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)",
+        "//example.com/no-scheme",
+        "https:///missing-host",
+        "https://@",
+        "https://:443",
+        "https://user@example.com/private",
+        "https://bad host.example/source",
+        "https://_service.example/source",
+    ],
+)
+def test_openai_response_events_rejects_unsafe_web_search_urls(url: str) -> None:
+    with pytest.raises(OpenAIProtocolError, match="must use http or https"):
+        openai_response_events(
+            {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                        "action": {
+                            "type": "search",
+                            "query": "Cayu",
+                            "sources": [{"type": "url", "url": url}],
+                        },
+                    }
+                ],
+            }
+        )
+
+
+def test_openai_response_events_counts_but_does_not_replay_incomplete_search() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "incomplete",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "incomplete",
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+        }
+    )
+
+    assert events[0].payload["status"] == "incomplete"
+    assert events[-1].payload["hosted_tool_usage"] == {
+        "web_search_calls": 1,
+        "web_search_outcome_unknown": 0,
+    }
+    assert events[-1].payload["provider_state"] == []
+
+
+@pytest.mark.parametrize("status", ["in_progress", "searching"])
+def test_openai_response_events_rejects_nonterminal_search_in_completed_response(
+    status: str,
+) -> None:
+    with pytest.raises(
+        OpenAIProtocolError,
+        match="terminal response contains a nonterminal web search call",
+    ):
+        openai_response_events(
+            {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": status,
+                    }
+                ],
+            }
+        )
+
+
+def test_openai_response_events_marks_nonterminal_search_unknown_in_incomplete_response() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "incomplete",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "in_progress",
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+        }
+    )
+
+    assert events[0].payload == {
+        "tool_type": "web_search",
+        "call_id": "ws_1",
+        "status": "outcome_unknown",
+    }
+    assert events[-1].payload["hosted_tool_usage"] == {
+        "web_search_calls": 0,
+        "web_search_outcome_unknown": 1,
+    }
+    assert events[-1].payload["provider_state"] == []
+
+
+def test_openai_response_events_rejects_duplicate_web_search_call_identity() -> None:
+    with pytest.raises(OpenAIProtocolError, match="duplicated across output items"):
+        openai_response_events(
+            {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_same",
+                        "status": "completed",
+                        "action": {"type": "search", "query": query},
+                    }
+                    for query in ("Cayu", "Cayu docs")
+                ],
+            }
+        )
+
+
+def test_openai_response_events_counts_multiple_search_calls_independently() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": f"ws_{index}",
+                    "status": "completed",
+                    "action": {"type": "search", "query": query},
+                }
+                for index, query in enumerate(("Cayu", "Cayu docs"), start=1)
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+        }
+    )
+
+    assert [event.payload["call_id"] for event in events[:-1]] == ["ws_1", "ws_2"]
+    assert events[-1].payload["hosted_tool_usage"] == {
+        "web_search_calls": 2,
+        "web_search_outcome_unknown": 0,
+    }
+    assert len(events[-1].payload["provider_state"]) == 2
 
 
 def test_openai_response_events_ignores_reasoning_items() -> None:
@@ -2523,7 +3992,7 @@ def test_openai_response_events_ignores_reasoning_items() -> None:
     assert events[0].delta == "done"
 
 
-@pytest.mark.parametrize("reserved_option", ["input", "store", "previous_response_id"])
+@pytest.mark.parametrize("reserved_option", ["include", "input", "store", "previous_response_id"])
 def test_openai_options_must_not_override_reserved_payload_fields(
     reserved_option: str,
 ) -> None:
@@ -3288,6 +4757,121 @@ async def test_server_mode_recovers_from_stale_previous_response_id() -> None:
     assert "previous_response_id" not in transport.payloads[1]
     assert transport.payloads[1]["store"] is True
     assert len(transport.payloads) == 2
+
+
+@pytest.mark.anyio
+async def test_server_mode_stale_chain_rebuilds_completed_hosted_search_in_order() -> None:
+    from cayu import (
+        CitationPart,
+        CitationProvenance,
+        HostedToolCallPart,
+        WebSearchAction,
+        WebSearchSource,
+    )
+
+    model_step_id = "mstep_00000000000000000000000000000000"
+    model_attempt_id = "matt_00000000000000000000000000000000"
+    prior_assistant = Message(
+        role=MessageRole.ASSISTANT,
+        content=[
+            HostedToolCallPart(
+                call_id="ws_unknown",
+                status="outcome_unknown",
+                provider_name="openai",
+                model="gpt-test",
+                model_step_id=model_step_id,
+                model_attempt_id=model_attempt_id,
+            ),
+            HostedToolCallPart(
+                call_id="ws_completed",
+                status="completed",
+                action=WebSearchAction(
+                    type="search",
+                    query="Cayu",
+                    sources=(
+                        WebSearchSource(
+                            url="https://github.com/example/cayu",
+                            title="Cayu",
+                        ),
+                    ),
+                ),
+                provider_name="openai",
+                model="gpt-test",
+                model_step_id=model_step_id,
+                model_attempt_id=model_attempt_id,
+            ),
+            TextPart(text="Cayu source"),
+            CitationPart(
+                url="https://github.com/example/cayu",
+                title="Cayu",
+                start_index=0,
+                end_index=4,
+                provenance=CitationProvenance(provider_name="openai"),
+                model_step_id=model_step_id,
+                model_attempt_id=model_attempt_id,
+            ),
+            ToolCallPart(
+                tool_call_id="call_1",
+                tool_name="read_file",
+                arguments={"path": "README.md"},
+            ),
+            ProviderStatePart(provider="openai", state={"type": "response_ref", "id": "resp_prev"}),
+        ],
+    )
+    transport = StaleChainRecoveryTransport()
+    provider = OpenAIProvider(api_key="k", reasoning_state="server", transport=transport)
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "first"),
+            prior_assistant,
+            Message.text("user", "second"),
+        ],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert any(event.type is ModelStreamEventType.COMPLETED for event in events)
+    replay_input = transport.payloads[1]["input"]
+    assert [item.get("type") for item in replay_input] == [
+        None,
+        "web_search_call",
+        "message",
+        "function_call",
+        None,
+    ]
+    assert replay_input[1] == {
+        "type": "web_search_call",
+        "id": "ws_completed",
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "query": "Cayu",
+            "sources": [
+                {
+                    "type": "url",
+                    "url": "https://github.com/example/cayu",
+                    "title": "Cayu",
+                }
+            ],
+        },
+    }
+    assert replay_input[2]["content"] == [
+        {
+            "type": "output_text",
+            "text": "Cayu source",
+            "annotations": [
+                {
+                    "type": "url_citation",
+                    "url": "https://github.com/example/cayu",
+                    "title": "Cayu",
+                    "start_index": 0,
+                    "end_index": 4,
+                }
+            ],
+        }
+    ]
+    assert replay_input[3]["call_id"] == "call_1"
 
 
 @pytest.mark.anyio

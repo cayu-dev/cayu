@@ -110,6 +110,8 @@ class EventType(StrEnum):
     MODEL_STARTED = "model.started"
     MODEL_TEXT_DELTA = "model.text.delta"
     MODEL_THINKING_DELTA = "model.thinking.delta"
+    MODEL_HOSTED_TOOL_CALL = "model.hosted_tool_call"
+    MODEL_CITATION = "model.citation"
     MODEL_COMPLETED = "model.completed"
     MODEL_ERROR = "model.error"
     MODEL_RETRY = "model.retry"

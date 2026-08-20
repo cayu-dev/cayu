@@ -74,13 +74,17 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.core.messages import (
+    CitationPart,
+    CitationProvenance,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
     ThinkingPart,
     ToolCallPart,
     ToolResultPart,
+    WebSearchAction,
     detach_message,
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
@@ -308,6 +312,7 @@ from cayu.runtime.tool_exposure import (
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
     durable_model_completed_payload,
+    hosted_tool_usage_metrics_from_payload,
     is_conversational_model_completion_payload,
     normalize_usage_metrics,
     normalize_usage_metrics_with_overflow_error,
@@ -3048,11 +3053,7 @@ class ModelStepExecutor:
                 status=operation.status.value,
             )
         )
-        assistant_parts: list[
-            transcript_helpers.AssistantTextPart
-            | transcript_helpers.AssistantThinkingPart
-            | ToolCallPart
-        ] = []
+        assistant_parts: list[transcript_helpers.AssistantContentPart] = []
         tool_calls: list[runtime_records.ToolCallRequest] = []
         completed_boundary = None
         completed_event: ModelStreamEvent | None = None
@@ -3157,13 +3158,19 @@ class ModelStepExecutor:
                 in {
                     ModelStreamEventType.THINKING,
                     ModelStreamEventType.TOOL_CALL,
+                    ModelStreamEventType.HOSTED_TOOL_CALL,
+                    ModelStreamEventType.CITATION,
                 }
                 and recovery_context is None
             ):
                 kind = (
                     "thinking transcript policy"
                     if (stream_event.type is ModelStreamEventType.THINKING)
-                    else "a tool continuation"
+                    else (
+                        "a tool continuation"
+                        if stream_event.type is ModelStreamEventType.TOOL_CALL
+                        else "hosted execution evidence"
+                    )
                 )
                 raise ProviderOperationEvidenceError(
                     f"Legacy provider-operation evidence cannot safely reconstruct {kind}."
@@ -3181,6 +3188,8 @@ class ModelStepExecutor:
                 if stream_event.type in {
                     ModelStreamEventType.TEXT_DELTA,
                     ModelStreamEventType.ERROR,
+                    ModelStreamEventType.HOSTED_TOOL_CALL,
+                    ModelStreamEventType.CITATION,
                 } or (
                     stream_event.type is ModelStreamEventType.THINKING and bool(stream_event.delta)
                 ):
@@ -3246,6 +3255,24 @@ class ModelStepExecutor:
                     raise AssertionError("Validated tool-call projection disappeared.")
                 tool_calls.append(tool_call)
                 assistant_parts.append(tool_call_part)
+            elif stream_event.type is ModelStreamEventType.HOSTED_TOOL_CALL:
+                hosted_part = _hosted_tool_call_part(
+                    stream_event,
+                    provider_name=registered_provider.name,
+                    model=session.model,
+                    model_attempt_identity=operation.model_attempt_identity,
+                )
+                if hosted_part is not None:
+                    assistant_parts.append(hosted_part)
+            elif stream_event.type is ModelStreamEventType.CITATION:
+                assistant_parts.append(
+                    _citation_part(
+                        stream_event,
+                        provider_name=registered_provider.name,
+                        model_attempt_identity=operation.model_attempt_identity,
+                        assistant_parts=assistant_parts,
+                    )
+                )
             elif stream_event.type is ModelStreamEventType.ERROR:
                 raise recovered_provider_error or RuntimeError(
                     "Recovered provider operation failed."
@@ -4007,6 +4034,7 @@ class ModelStepExecutor:
             model=session.model,
             messages=redacted_messages,
             tools=redacted_tools,
+            hosted_tools=registered_agent.hosted_tools,
             options=redacted_options,
         )
 
@@ -4050,6 +4078,11 @@ class ModelStepExecutor:
         model_step_identity = copy_model_step_identity(model_step_identity)
         resolved_tool_exposure = (
             None if tool_exposure is None else _require_frozen_tool_exposure(tool_exposure)
+        )
+        provider.preflight_hosted_tools(
+            model=model_request.model,
+            hosted_tools=model_request.hosted_tools,
+            options=model_request.options,
         )
         next_model_attempt_identity = (
             None
@@ -4626,11 +4659,7 @@ class ModelStepExecutor:
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ResolvedToolExposure | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
-        assistant_parts: list[
-            transcript_helpers.AssistantTextPart
-            | transcript_helpers.AssistantThinkingPart
-            | ToolCallPart
-        ] = []
+        assistant_parts: list[transcript_helpers.AssistantContentPart] = []
         thinking_options = model_request.options.get("thinking")
         include_thinking_in_transcript = (
             thinking_options.get("include_in_transcript", True)
@@ -5190,6 +5219,74 @@ class ModelStepExecutor:
                     assistant_parts.append(tool_call_part)
                     if progress_emitted_event is not None:
                         yield progress_emitted_event, None
+                    continue
+
+                if stream_event.type in {
+                    ModelStreamEventType.HOSTED_TOOL_CALL,
+                    ModelStreamEventType.CITATION,
+                }:
+                    progress_runtime_event = _model_stream_event_to_runtime_event(
+                        stream_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        provider_name=registered_provider.name,
+                        step=step,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                        usage_dialect=registered_provider.usage_dialect,
+                    )
+                    if provider_operation_state is not None:
+                        if completion_dispatch is None:  # pragma: no cover - checked at start
+                            raise AssertionError("Background operation lost its completion stage.")
+                        if provider_operation_interaction_id is None:  # pragma: no cover
+                            raise AssertionError("Background operation lost its interaction.")
+                        (
+                            progress,
+                            progress_emitted_event,
+                        ) = await self._commit_provider_operation_stream_event(
+                            stage=completion_dispatch.stage,
+                            state=provider_operation_state,
+                            stream_event=stream_event,
+                            runtime_event=progress_runtime_event,
+                            session=session,
+                            interaction_id=provider_operation_interaction_id,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            environment_name=environment_name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                        )
+                        provider_operation_state = progress.state
+                        if progress.replayed:
+                            continue
+                    if stream_event.type is ModelStreamEventType.HOSTED_TOOL_CALL:
+                        hosted_part = _hosted_tool_call_part(
+                            stream_event,
+                            provider_name=registered_provider.name,
+                            model=session.model,
+                            model_attempt_identity=model_attempt_identity,
+                        )
+                        if hosted_part is not None:
+                            assistant_parts.append(hosted_part)
+                    else:
+                        assistant_parts.append(
+                            _citation_part(
+                                stream_event,
+                                provider_name=registered_provider.name,
+                                model_attempt_identity=model_attempt_identity,
+                                assistant_parts=assistant_parts,
+                            )
+                        )
+                    emitted_event = (
+                        await self._event_writer.emit(progress_runtime_event)
+                        if progress_emitted_event is None
+                        else progress_emitted_event
+                    )
+                    yield emitted_event, None
                     continue
 
                 if stream_event.type == ModelStreamEventType.TEXT_DELTA:
@@ -9732,7 +9829,103 @@ def _validate_assistant_stream_event(
             text=stream_event.delta,
             provider_state=stream_event.payload.get("provider_state"),
         )
+    elif stream_event.type is ModelStreamEventType.HOSTED_TOOL_CALL:
+        payload = _validated_hosted_tool_call_payload(stream_event.payload)
+        stream_event = copy_model_stream_event(stream_event.model_copy(update={"payload": payload}))
+    elif stream_event.type is ModelStreamEventType.CITATION:
+        payload = _validated_citation_payload(stream_event.payload)
+        stream_event = copy_model_stream_event(stream_event.model_copy(update={"payload": payload}))
     return _AssistantStreamBoundaryValue(event=stream_event)
+
+
+def _validated_hosted_tool_call_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    copied = copy_durable_json_object(payload, "hosted_tool_call")
+    if copied.get("tool_type") != "web_search":
+        raise ValueError("Hosted tool stream events require tool_type='web_search'.")
+    call_id = copied.get("call_id")
+    if type(call_id) is not str:
+        raise ValueError("Hosted tool stream events require a string call_id.")
+    copied["call_id"] = require_durable_clean_nonblank(call_id, "call_id")
+    status = copied.get("status")
+    if status not in {
+        "in_progress",
+        "searching",
+        "completed",
+        "incomplete",
+        "failed",
+        "outcome_unknown",
+    }:
+        raise ValueError("Hosted tool stream events have an unsupported status.")
+    action = copied.get("action")
+    if action is not None:
+        copied["action"] = WebSearchAction.model_validate(action).model_dump(mode="json")
+    if status == "completed" and action is None:
+        raise ValueError("Completed web search calls require terminal action evidence.")
+    return copied
+
+
+def _validated_citation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    copied = copy_durable_json_object(payload, "citation")
+    probe = CitationPart.model_validate(
+        {
+            **copied,
+            "provenance": CitationProvenance(provider_name="provider-boundary"),
+            "model_step_id": "mstep_00000000000000000000000000000000",
+            "model_attempt_id": "matt_00000000000000000000000000000000",
+        }
+    )
+    return {
+        "citation_type": probe.citation_type,
+        "url": probe.url,
+        "title": probe.title,
+        "start_index": probe.start_index,
+        "end_index": probe.end_index,
+    }
+
+
+def _hosted_tool_call_part(
+    stream_event: ModelStreamEvent,
+    *,
+    provider_name: str,
+    model: str,
+    model_attempt_identity: ModelAttemptIdentity,
+) -> HostedToolCallPart | None:
+    payload = _validated_hosted_tool_call_payload(stream_event.payload)
+    status = payload["status"]
+    if status not in {"completed", "incomplete", "failed", "outcome_unknown"}:
+        return None
+    return HostedToolCallPart(
+        call_id=payload["call_id"],
+        status=status,
+        action=payload.get("action"),
+        provider_name=provider_name,
+        model=model,
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
+    )
+
+
+def _citation_part(
+    stream_event: ModelStreamEvent,
+    *,
+    provider_name: str,
+    model_attempt_identity: ModelAttemptIdentity,
+    assistant_parts: list[transcript_helpers.AssistantContentPart],
+) -> CitationPart:
+    payload = _validated_citation_payload(stream_event.payload)
+    assembled_text_length = sum(
+        len(part.text)
+        for part in assistant_parts
+        if type(part) is transcript_helpers.AssistantTextPart
+    )
+    if payload["end_index"] is not None and payload["end_index"] > assembled_text_length:
+        raise ValueError("Citation offsets exceed the associated assistant text.")
+    return CitationPart(
+        **payload,
+        provenance=CitationProvenance(provider_name=provider_name),
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
+    )
 
 
 def _provider_operation_generated_tool_call_id(
@@ -9747,6 +9940,19 @@ def _provider_operation_generated_tool_call_id(
     return provider_operation_progress_event_id(stage.stage_id, metadata.cursor)
 
 
+def _provider_operation_id(model_attempt_identity: ModelAttemptIdentity) -> str:
+    """Return the runtime-owned provider-call identity for one model attempt."""
+
+    material = canonical_durable_json_bytes(
+        {
+            "schema_version": 1,
+            "model_attempt_id": model_attempt_identity.model_attempt_id,
+        },
+        "provider_operation_id",
+    )
+    return f"provider-operation:v1:{sha256(material).hexdigest()}"
+
+
 def _copy_model_request_for_counting(request: ModelRequest) -> ModelRequest:
     return _detach_model_request(request)
 
@@ -9758,6 +9964,7 @@ def _detach_model_request(request: ModelRequest) -> ModelRequest:
         model=request.model,
         messages=request.messages,
         tools=request.tools,
+        hosted_tools=request.hosted_tools,
         options=request.options,
     )
 
@@ -9933,12 +10140,40 @@ def _model_stream_event_to_runtime_event(
     elif stream_event.type == ModelStreamEventType.THINKING:
         event_type = EventType.MODEL_THINKING_DELTA
         payload = {"delta": stream_event.delta}
+    elif stream_event.type == ModelStreamEventType.HOSTED_TOOL_CALL:
+        event_type = EventType.MODEL_HOSTED_TOOL_CALL
+        payload = {
+            **_validated_hosted_tool_call_payload(stream_event.payload),
+            "provider_name": provider_name,
+            "model": session.model,
+            "provider_operation_id": _provider_operation_id(model_attempt_identity),
+        }
+    elif stream_event.type == ModelStreamEventType.CITATION:
+        event_type = EventType.MODEL_CITATION
+        payload = {
+            **_validated_citation_payload(stream_event.payload),
+            "model": session.model,
+            "provider_operation_id": _provider_operation_id(model_attempt_identity),
+            "provenance": {
+                "provider_name": provider_name,
+                "hosted_tool": "web_search",
+                "untrusted_external_evidence": True,
+            },
+        }
     elif stream_event.type == ModelStreamEventType.COMPLETED:
         payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
         # When raw usage is present, its normalized projection and failure
         # marker are runtime-owned accounting evidence. Providers that expose
         # only the established normalized-usage payload retain compatibility.
         has_raw_usage = payload.get("usage") is not None
+        raw_hosted_tool_usage = payload.get("hosted_tool_usage")
+        if raw_hosted_tool_usage is not None:
+            hosted_tool_usage = hosted_tool_usage_metrics_from_payload(payload)
+            if hosted_tool_usage is None:
+                payload.pop("hosted_tool_usage", None)
+                payload["hosted_tool_usage_rejected"] = True
+            else:
+                payload["hosted_tool_usage"] = hosted_tool_usage.model_dump(mode="json")
         payload.pop("usage_metrics", None)
         payload.pop("usage_normalization_failed", None)
         payload.pop("usage_unavailable_reason", None)
@@ -10074,6 +10309,8 @@ def _model_stream_event_to_runtime_event(
         event.payload.get("tool_round_id") == tool_round_identity.tool_round_id
     ):
         event = event_with_runtime_payload_authority(event, "tool_round_id")
+    if event_type in {EventType.MODEL_HOSTED_TOOL_CALL, EventType.MODEL_CITATION}:
+        event = event_with_runtime_payload_authority(event, "provider_operation_id")
     return event_with_execution_profile_fingerprint_authority(
         event,
         execution_profile_fingerprint,

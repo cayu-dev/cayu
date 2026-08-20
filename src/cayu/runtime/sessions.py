@@ -115,6 +115,7 @@ from cayu.runtime.aggregates import (
     UsageSessionAggregateGroup,
     UsageSessionAggregateRemainder,
     add_aggregate_usage,
+    aggregate_hosted_tool_usage_metrics_from_event_payload,
     aggregate_usage_metrics_from_event_payload,
     build_aggregate_usage_metrics,
     normalize_aggregate_event_timestamp,
@@ -7780,7 +7781,11 @@ class SessionStore(ABC):
                         model_attempt_event,
                     )
                     budget_model_attempt_terminal_events.append(model_attempt_event)
-                if event.type in {EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED}:
+                if event.type in {
+                    EventType.MODEL_COMPLETED,
+                    EventType.MODEL_HOSTED_TOOL_CALL,
+                    EventType.TOOL_CALL_STARTED,
+                }:
                     usage_event, usage_metrics = project_aggregate_usage_inspection_event(event)
                     retained_event_bytes = _retain_session_inspection_event(
                         retained_event_bytes,
@@ -19246,6 +19251,9 @@ class _UsageAccumulator:
         self.model_steps_with_usage += 1
         self.usage = add_aggregate_usage(self.usage, metrics)
 
+    def add_usage_only(self, metrics: UsageMetrics) -> None:
+        self.usage = add_aggregate_usage(self.usage, metrics)
+
     def merge(self, other: _UsageAccumulator) -> None:
         self.session_count += other.session_count
         self.model_steps += other.model_steps
@@ -19277,11 +19285,20 @@ class _SessionInspectionUsageAccumulator:
         if event_type == EventType.TOOL_CALL_STARTED:
             self.tool_calls += 1
             return
+        if event_type == EventType.MODEL_HOSTED_TOOL_CALL:
+            if metrics is None:
+                return
+            self.totals.add_usage_only(metrics)
+            self._record_identity(metrics)
+            return
         if event_type != EventType.MODEL_COMPLETED:
             return
         self.totals.add(metrics)
         if metrics is None:
             return
+        self._record_identity(metrics)
+
+    def _record_identity(self, metrics: UsageMetrics) -> None:
         if (
             metrics.provider_name is not None
             and metrics.provider_name not in self._provider_names_seen
@@ -19327,6 +19344,12 @@ class _SessionUsageAccumulator:
         if event.type == EventType.TOOL_CALL_STARTED:
             self.tool_calls += 1
             self.has_activity = True
+            return
+        if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
+            metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
+            if metrics is not None:
+                self.has_activity = True
+                self.usage.add_usage_only(metrics)
             return
         if event.type != EventType.MODEL_COMPLETED:
             return
@@ -19410,14 +19433,21 @@ class _InMemoryUsageGroupCandidates:
     _generation: int = 0
     sampled: bool = False
 
-    def observe(self, key: _UsageGroupKey, metrics: UsageMetrics | None) -> None:
+    def observe(
+        self,
+        key: _UsageGroupKey,
+        metrics: UsageMetrics | None,
+        *,
+        model_step: bool = True,
+    ) -> None:
         token_weight = 0 if metrics is None else metrics.total_tokens
+        step_weight = int(model_step)
         current = self._estimates.get(key)
         if current is not None:
-            self._record(key, current[0] + token_weight, current[1] + 1)
+            self._record(key, current[0] + token_weight, current[1] + step_weight)
             return
         if len(self._estimates) < self.limit:
-            self._record(key, token_weight, 1)
+            self._record(key, token_weight, step_weight)
             return
 
         self.sampled = True
@@ -19426,7 +19456,7 @@ class _InMemoryUsageGroupCandidates:
         self._record(
             key,
             minimum_tokens + token_weight,
-            minimum_steps + 1,
+            minimum_steps + step_weight,
         )
 
     @property
@@ -19506,6 +19536,30 @@ def _usage_rollup_from_session_records(
                 session_has_activity = True
                 tool_calls += 1
                 continue
+            if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
+                metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
+                if metrics is None:
+                    continue
+                session_has_activity = True
+                totals.add_usage_only(metrics)
+                provider_candidates.observe(
+                    _usage_group_key(metrics, dimension="provider"),
+                    metrics,
+                    model_step=False,
+                )
+                model_candidates.observe(
+                    _usage_group_key(metrics, dimension="model"),
+                    metrics,
+                    model_step=False,
+                )
+                if query.include_pricing_inputs and not pricing.truncated:
+                    pricing.add_payload(
+                        event_type=EventType.MODEL_HOSTED_TOOL_CALL,
+                        effective_on=event_timestamp.date(),
+                        occurrences=1,
+                        payload=event.payload,
+                    )
+                continue
             if event.type != EventType.MODEL_COMPLETED:
                 continue
 
@@ -19524,6 +19578,7 @@ def _usage_rollup_from_session_records(
             if not query.include_pricing_inputs or pricing.truncated:
                 continue
             pricing.add_payload(
+                event_type=EventType.MODEL_COMPLETED,
                 effective_on=event_timestamp.date(),
                 occurrences=1,
                 payload=event.payload,
@@ -19555,6 +19610,11 @@ def _usage_rollup_from_session_records(
                 if not _aggregate_model_event_is_in_window(event, query):
                     continue
                 session_pricing.add_payload(
+                    event_type=(
+                        EventType.MODEL_HOSTED_TOOL_CALL
+                        if event.type == EventType.MODEL_HOSTED_TOOL_CALL
+                        else EventType.MODEL_COMPLETED
+                    ),
                     session_id=session_id,
                     effective_on=normalize_aggregate_event_timestamp(event.timestamp).date(),
                     occurrences=1,
@@ -19741,14 +19801,18 @@ def _accumulate_usage_group_batch(
         seen: set[_UsageGroupKey] = set()
         for record in records:
             event = record.event
-            if not _aggregate_model_event_is_in_window(event, query):
+            projected = _aggregate_usage_event_in_window(event, query)
+            if projected is None:
                 continue
-            metrics = aggregate_usage_metrics_from_event_payload(event.payload)
+            metrics, model_step = projected
             key = _usage_group_key(metrics, dimension=dimension)
             accumulator = accumulators.get(key)
             if accumulator is None:
                 continue
-            accumulator.add(metrics)
+            if model_step:
+                accumulator.add(metrics)
+            elif metrics is not None:
+                accumulator.add_usage_only(metrics)
             seen.add(key)
         for key in seen:
             accumulators[key].session_count += 1
@@ -19767,22 +19831,45 @@ def _accumulate_usage_remainder(
         session_has_remainder = False
         for record in records:
             event = record.event
-            if not _aggregate_model_event_is_in_window(event, query):
+            projected = _aggregate_usage_event_in_window(event, query)
+            if projected is None:
                 continue
-            metrics = aggregate_usage_metrics_from_event_payload(event.payload)
+            metrics, model_step = projected
             if _usage_group_key(metrics, dimension=dimension) in visible_keys:
                 continue
-            remainder.add(metrics)
+            if model_step:
+                remainder.add(metrics)
+            elif metrics is not None:
+                remainder.add_usage_only(metrics)
             session_has_remainder = True
         remainder.session_count += session_has_remainder
     return remainder
 
 
 def _aggregate_model_event_is_in_window(event: Event, query: UsageRollupQuery) -> bool:
-    if event.type != EventType.MODEL_COMPLETED:
+    if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
+        if aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload) is None:
+            return False
+    elif event.type != EventType.MODEL_COMPLETED:
         return False
     timestamp = normalize_aggregate_event_timestamp(event.timestamp)
     return query.start_at <= timestamp < query.end_at
+
+
+def _aggregate_usage_event_in_window(
+    event: Event,
+    query: UsageRollupQuery,
+) -> tuple[UsageMetrics | None, bool] | None:
+    timestamp = normalize_aggregate_event_timestamp(event.timestamp)
+    if timestamp < query.start_at or timestamp >= query.end_at:
+        return None
+    if event.type == EventType.MODEL_COMPLETED:
+        return aggregate_usage_metrics_from_event_payload(event.payload), True
+    if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
+        metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
+        if metrics is not None:
+            return metrics, False
+    return None
 
 
 def _usage_group_key(

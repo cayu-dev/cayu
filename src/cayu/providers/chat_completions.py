@@ -15,7 +15,9 @@ from cayu.artifacts import (
     resolved_file_attachments_from_options,
 )
 from cayu.core.messages import (
+    CitationPart,
     FilePart,
+    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -1135,10 +1137,14 @@ def _assistant_message(message: Message) -> dict[str, Any]:
             if extra_content is not None:
                 tool_call["extra_content"] = extra_content
             tool_calls.append(tool_call)
-        elif type(part) not in {ProviderStatePart, ThinkingPart}:
+        elif type(part) not in {
+            ProviderStatePart,
+            ThinkingPart,
+            HostedToolCallPart,
+            CitationPart,
+        }:
             raise ChatCompletionsProtocolError(
-                "Assistant messages can only contain text, tool_call, provider_state, "
-                "and thinking parts."
+                "Assistant messages can only contain portable assistant parts."
             )
     assistant: dict[str, Any] = {"role": "assistant"}
     # Chat Completions requires a content key; tool-call-only turns use null.
@@ -1174,7 +1180,14 @@ def _tool_call_extra_content_by_id(message: Message) -> dict[str, dict[str, Any]
 
 def _user_message(
     content: tuple[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+        TextPart
+        | ToolCallPart
+        | ToolResultPart
+        | ProviderStatePart
+        | ThinkingPart
+        | FilePart
+        | HostedToolCallPart
+        | CitationPart,
         ...,
     ],
     resolved_attachments: dict[str, dict[str, Any]],

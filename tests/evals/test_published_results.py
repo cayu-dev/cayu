@@ -57,7 +57,7 @@ from cayu.evals.result_contract import (
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
     EvalTrialOutputPreviewV1,
 )
-from cayu.runtime.costs import SessionCostSummary
+from cayu.runtime.costs import CostLineItem, SessionCostSummary
 from cayu.runtime.usage import (
     SessionUsageSummary,
     UsageMetrics,
@@ -1275,6 +1275,23 @@ def test_projection_rejects_cost_metadata_that_contradicts_its_exact_summary():
                 priced_model_steps=1,
                 unpriced_model_steps=0,
                 total_cost=Decimal("99"),
+                line_items=(
+                    CostLineItem(
+                        model_step=1,
+                        priced=True,
+                        currency="USD",
+                        input_tokens=0,
+                        output_tokens=0,
+                        cache_read_input_tokens=0,
+                        cache_write_input_tokens=0,
+                        uncached_input_tokens=0,
+                        input_cost=Decimal("99"),
+                        output_cost=Decimal("0"),
+                        cache_read_input_cost=Decimal("0"),
+                        cache_write_input_cost=Decimal("0"),
+                        total_cost=Decimal("99"),
+                    ),
+                ),
             )
         }
     )

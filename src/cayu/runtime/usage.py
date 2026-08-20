@@ -76,6 +76,33 @@ class CacheUsageMetrics(BaseModel):
     uncached_input_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
+class HostedToolUsageMetrics(BaseModel):
+    """Provider-neutral hosted-resource counters for one model attempt."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    web_search_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    web_search_outcome_unknown: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+
+
+def hosted_tool_usage_metrics_from_payload(
+    payload: dict[str, Any],
+) -> HostedToolUsageMetrics | None:
+    """Return the bounded completion-side hosted-resource pricing projection."""
+
+    raw = payload.get("hosted_tool_usage")
+    if raw is None:
+        return None
+    try:
+        return HostedToolUsageMetrics.model_validate(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class UsageMetrics(BaseModel):
     """Provider-neutral token counters for one model step."""
 
@@ -96,6 +123,12 @@ class UsageMetrics(BaseModel):
         le=MAX_DURABLE_JSON_INTEGER,
     )
     cache: CacheUsageMetrics = Field(default_factory=CacheUsageMetrics)
+    hosted_tools: HostedToolUsageMetrics = Field(
+        default_factory=HostedToolUsageMetrics,
+        exclude_if=lambda value: (
+            value.web_search_calls == 0 and value.web_search_outcome_unknown == 0
+        ),
+    )
 
     @field_validator("provider_name", "requested_model", "model")
     @classmethod
@@ -104,10 +137,15 @@ class UsageMetrics(BaseModel):
             return None
         return require_durable_clean_nonblank(value, info.field_name)
 
-    @field_validator("billing_identity", "cache", mode="before")
+    @field_validator("billing_identity", "cache", "hosted_tools", mode="before")
     @classmethod
     def copy_nested_contracts(cls, value: object) -> object:
-        return revalidate_model_input(value, BillingIdentity, CacheUsageMetrics)
+        return revalidate_model_input(
+            value,
+            BillingIdentity,
+            CacheUsageMetrics,
+            HostedToolUsageMetrics,
+        )
 
 
 def _serialize_aggregate_count(value: int) -> str:
@@ -174,6 +212,15 @@ class AggregateCacheUsageMetrics(BaseModel):
     uncached_input_tokens: AggregateCount = Field(ge=0)
 
 
+class AggregateHostedToolUsageMetrics(BaseModel):
+    """Lossless aggregate provider-hosted resource counters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    web_search_calls: AggregateCount = Field(default=0, ge=0)
+    web_search_outcome_unknown: AggregateCount = Field(default=0, ge=0)
+
+
 class AggregateUsageMetrics(BaseModel):
     """Lossless JSON projection of identity-free aggregate token counters."""
 
@@ -184,11 +231,21 @@ class AggregateUsageMetrics(BaseModel):
     total_tokens: AggregateCount = Field(ge=0)
     reasoning_output_tokens: AggregateCount = Field(ge=0)
     cache: AggregateCacheUsageMetrics
+    hosted_tools: AggregateHostedToolUsageMetrics = Field(
+        default_factory=AggregateHostedToolUsageMetrics,
+        exclude_if=lambda value: (
+            value.web_search_calls == 0 and value.web_search_outcome_unknown == 0
+        ),
+    )
 
-    @field_validator("cache", mode="before")
+    @field_validator("cache", "hosted_tools", mode="before")
     @classmethod
     def copy_cache(cls, value: object) -> object:
-        return revalidate_model_input(value, AggregateCacheUsageMetrics)
+        return revalidate_model_input(
+            value,
+            AggregateCacheUsageMetrics,
+            AggregateHostedToolUsageMetrics,
+        )
 
 
 def build_aggregate_usage_metrics(
@@ -204,6 +261,8 @@ def build_aggregate_usage_metrics(
     cache_write_unknown_ttl_tokens: int = 0,
     cached_input_tokens: int = 0,
     uncached_input_tokens: int = 0,
+    web_search_calls: int = 0,
+    web_search_outcome_unknown: int = 0,
 ) -> AggregateUsageMetrics:
     """Build identity-free aggregate counters without weakening step metrics."""
 
@@ -220,6 +279,10 @@ def build_aggregate_usage_metrics(
             write_unknown_ttl_tokens=cache_write_unknown_ttl_tokens,
             cached_input_tokens=cached_input_tokens,
             uncached_input_tokens=uncached_input_tokens,
+        ),
+        hosted_tools=AggregateHostedToolUsageMetrics(
+            web_search_calls=web_search_calls,
+            web_search_outcome_unknown=web_search_outcome_unknown,
         ),
     )
 
@@ -246,6 +309,11 @@ def add_aggregate_usage(
         uncached_input_tokens=(
             left.cache.uncached_input_tokens + right.cache.uncached_input_tokens
         ),
+        web_search_calls=(left.hosted_tools.web_search_calls + right.hosted_tools.web_search_calls),
+        web_search_outcome_unknown=(
+            left.hosted_tools.web_search_outcome_unknown
+            + right.hosted_tools.web_search_outcome_unknown
+        ),
     )
 
 
@@ -258,7 +326,7 @@ def aggregate_usage_metrics_payload(metrics: AggregateUsageMetrics) -> dict[str,
     def durable_count(value: int) -> int | str:
         return value if value <= MAX_DURABLE_JSON_INTEGER else str(value)
 
-    return {
+    payload = {
         "input_tokens": durable_count(metrics.input_tokens),
         "output_tokens": durable_count(metrics.output_tokens),
         "total_tokens": durable_count(metrics.total_tokens),
@@ -273,6 +341,14 @@ def aggregate_usage_metrics_payload(metrics: AggregateUsageMetrics) -> dict[str,
             "uncached_input_tokens": durable_count(metrics.cache.uncached_input_tokens),
         },
     }
+    if metrics.hosted_tools.web_search_calls or metrics.hosted_tools.web_search_outcome_unknown:
+        payload["hosted_tools"] = {
+            "web_search_calls": durable_count(metrics.hosted_tools.web_search_calls),
+            "web_search_outcome_unknown": durable_count(
+                metrics.hosted_tools.web_search_outcome_unknown
+            ),
+        }
+    return payload
 
 
 def aggregate_usage_metrics_from_json_payload(value: object) -> AggregateUsageMetrics:
@@ -294,6 +370,15 @@ def aggregate_usage_metrics_from_json_payload(value: object) -> AggregateUsageMe
             if key in projected_cache:
                 projected_cache[key] = _aggregate_count_from_json(projected_cache[key])
         copied["cache"] = projected_cache
+    raw_hosted_tools = copied.get("hosted_tools")
+    if type(raw_hosted_tools) is dict:
+        projected_hosted_tools = dict(raw_hosted_tools)
+        for key in ("web_search_calls", "web_search_outcome_unknown"):
+            if key in projected_hosted_tools:
+                projected_hosted_tools[key] = _aggregate_count_from_json(
+                    projected_hosted_tools[key]
+                )
+        copied["hosted_tools"] = projected_hosted_tools
     for key in (
         "input_tokens",
         "output_tokens",
@@ -336,6 +421,13 @@ def aggregate_usage_metrics_from_durable_payload(value: object) -> AggregateUsag
             if key in projected_cache:
                 projected_cache[key] = durable_count(projected_cache[key])
         copied["cache"] = projected_cache
+    raw_hosted_tools = copied.get("hosted_tools")
+    if type(raw_hosted_tools) is dict:
+        projected_hosted_tools = dict(raw_hosted_tools)
+        for key in ("web_search_calls", "web_search_outcome_unknown"):
+            if key in projected_hosted_tools:
+                projected_hosted_tools[key] = durable_count(projected_hosted_tools[key])
+        copied["hosted_tools"] = projected_hosted_tools
     for key in (
         "input_tokens",
         "output_tokens",
@@ -847,12 +939,16 @@ def strip_provider_billing_identity(payload: dict[str, Any]) -> None:
 # `session_usage_summary` below.
 USAGE_BEARING_EVENT_TYPES: tuple[EventType, ...] = (
     EventType.MODEL_COMPLETED,
+    EventType.MODEL_HOSTED_TOOL_CALL,
     EventType.TOOL_CALL_STARTED,
 )
 
 
 def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageSummary:
-    from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
+    from cayu.runtime.aggregates import (
+        aggregate_hosted_tool_usage_metrics_from_event_payload,
+        summary_usage_metrics_from_event_payload,
+    )
 
     provider_names: list[str] = []
     models: list[str] = []
@@ -860,9 +956,21 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
     model_steps = 0
     tool_calls = 0
 
+    def record_identity(metrics: UsageMetrics) -> None:
+        if metrics.provider_name is not None and metrics.provider_name not in provider_names:
+            provider_names.append(metrics.provider_name)
+        if metrics.model is not None and metrics.model not in models:
+            models.append(metrics.model)
+
     for event in events:
         if event.type == EventType.TOOL_CALL_STARTED:
             tool_calls += 1
+            continue
+        if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
+            metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
+            if metrics is not None:
+                usage = add_aggregate_usage(usage, metrics)
+                record_identity(metrics)
             continue
         if event.type != EventType.MODEL_COMPLETED:
             continue
@@ -874,10 +982,7 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
         if metrics is None:
             continue
         usage = add_aggregate_usage(usage, metrics)
-        if metrics.provider_name is not None and metrics.provider_name not in provider_names:
-            provider_names.append(metrics.provider_name)
-        if metrics.model is not None and metrics.model not in models:
-            models.append(metrics.model)
+        record_identity(metrics)
 
     return SessionUsageSummary(
         session_id=session_id,

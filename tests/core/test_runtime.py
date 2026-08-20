@@ -42810,6 +42810,7 @@ def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
     assert store.event_queries[0].event_type is None
     assert [str(event_type) for event_type in store.event_queries[0].event_types] == [
         "model.completed",
+        "model.hosted_tool_call",
         "tool.call.started",
     ]
 

@@ -39,6 +39,7 @@ from cayu import (
     InMemorySessionStore,
     Message,
     ModelPrice,
+    OpenAIWebSearch,
     PriceBook,
     RunRequest,
     StructuredOutputSpec,
@@ -122,6 +123,7 @@ class _ForkGroupProvider(ModelProvider):
     ) -> None:
         self.requests: list[ModelRequest] = []
         self.evaluator_tools: tuple[str, ...] | None = None
+        self.evaluator_hosted_tools: tuple[OpenAIWebSearch, ...] | None = None
         self.evaluator_evidence: dict[str, Any] | None = None
         self.evaluator_calls = 0
         self.fail_branch = fail_branch
@@ -149,6 +151,7 @@ class _ForkGroupProvider(ModelProvider):
         if "cayu.fork-group-evidence.v1" in user_text:
             self.evaluator_calls += 1
             self.evaluator_tools = tuple(tool["name"] for tool in request.tools)
+            self.evaluator_hosted_tools = request.hosted_tools
             if self.fail_evaluator:
                 yield ModelStreamEvent.error("evaluator failed")
                 return
@@ -347,6 +350,7 @@ def test_run_fork_group_selects_one_tool_free_evaluated_branch() -> None:
                 workflow_tool_names=("forbidden_evaluator_tool",),
             ),
             tools=[_ForbiddenEvaluatorTool()],
+            hosted_tools=[OpenAIWebSearch()],
         )
 
         source_events = [
@@ -402,6 +406,7 @@ def test_run_fork_group_selects_one_tool_free_evaluated_branch() -> None:
         ]
         assert provider.evaluator_tools is not None
         assert "forbidden_evaluator_tool" not in provider.evaluator_tools
+        assert provider.evaluator_hosted_tools == ()
         assert provider.evaluator_evidence is not None
         assert set(provider.evaluator_evidence) == {"schema", "group_id", "source", "branches"}
         assert "prepare source" not in json.dumps(provider.evaluator_evidence)

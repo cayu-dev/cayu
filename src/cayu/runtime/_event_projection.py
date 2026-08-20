@@ -333,7 +333,16 @@ _REQUEST_VARIANT_VALUES = frozenset(
 )
 _REQUEST_MESSAGE_ROLE_VALUES = frozenset({"user", "assistant", "system", "tool"})
 _REQUEST_MESSAGE_PART_TYPE_VALUES = frozenset(
-    {"text", "tool_call", "tool_result", "provider_state", "thinking", "file"}
+    {
+        "text",
+        "tool_call",
+        "tool_result",
+        "provider_state",
+        "thinking",
+        "file",
+        "hosted_tool_call",
+        "citation",
+    }
 )
 _REQUEST_ATTACHMENT_KIND_VALUES = frozenset({"image", "document"})
 _REQUEST_PROMPT_CONTRIBUTION_AVAILABILITY_VALUES = frozenset({"available", "unavailable"})
@@ -598,6 +607,25 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("budget_settlements", "*", "settlement_kind"): _BUDGET_SETTLEMENT_KIND_VALUES,
         ("budget_settlements", "*", "status"): _BUDGET_RESERVATION_STATUS_VALUES,
         ("budget_settlements", "*", "pricing", "match"): _PRICING_MATCH_VALUES,
+    },
+    EventType.MODEL_HOSTED_TOOL_CALL: {
+        ("tool_type",): frozenset({"web_search"}),
+        ("status",): frozenset(
+            {
+                "in_progress",
+                "searching",
+                "completed",
+                "incomplete",
+                "failed",
+                "outcome_unknown",
+            }
+        ),
+        ("action", "type"): frozenset({"search", "open_page", "find_in_page"}),
+    },
+    EventType.MODEL_CITATION: {
+        ("citation_type",): frozenset({"url_citation"}),
+        ("provenance", "hosted_tool"): frozenset({"web_search"}),
+        ("provenance", "untrusted_external_evidence"): frozenset({True}),
     },
     **{
         event_type: {
@@ -1593,6 +1621,35 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.MODEL_TEXT_DELTA] = model_delta
     policies[EventType.MODEL_THINKING_DELTA] = model_delta
+    policies[EventType.MODEL_HOSTED_TOOL_CALL] = _observed_policy(
+        "action attempt call_id max_attempts model model_attempt_id model_step_id "
+        "provider_name provider_operation_id source_count status step tool_type",
+        owned_nested_paths={
+            ("action", "type"),
+            ("action", "query"),
+            ("action", "queries"),
+            ("action", "queries", "*"),
+            ("action", "url"),
+            ("action", "pattern"),
+            ("action", "sources"),
+            ("action", "sources", "*", "type"),
+            ("action", "sources", "*", "url"),
+            ("action", "sources", "*", "title"),
+        },
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"call_id", "provider_operation_id"},
+        untrusted_container_keys={"action"},
+    )
+    policies[EventType.MODEL_CITATION] = _observed_policy(
+        "attempt citation_type end_index max_attempts model model_attempt_id model_step_id "
+        "provenance provider_operation_id start_index step title url",
+        owned_nested_paths={
+            ("provenance", "hosted_tool"),
+            ("provenance", "provider_name"),
+            ("provenance", "untrusted_external_evidence"),
+        },
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"provider_operation_id"},
+        untrusted_container_keys={"provenance"},
+    )
     policies[EventType.MODEL_COMPLETED] = _policy(
         "actor",
         "attempt",

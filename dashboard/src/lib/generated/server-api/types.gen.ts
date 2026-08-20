@@ -33,6 +33,10 @@ export type AgentManifest = {
      * Has System Prompt
      */
     has_system_prompt: boolean;
+    /**
+     * Hosted Tools
+     */
+    hosted_tools?: Array<HostedToolManifest>;
     implementation_provenance: RegistrationProvenance;
     /**
      * Loop Policies
@@ -194,12 +198,29 @@ export type AggregateCostSummary = {
 };
 
 /**
+ * AggregateHostedToolUsageMetrics
+ *
+ * Lossless aggregate provider-hosted resource counters.
+ */
+export type AggregateHostedToolUsageMetrics = {
+    /**
+     * Web Search Calls
+     */
+    web_search_calls?: string;
+    /**
+     * Web Search Outcome Unknown
+     */
+    web_search_outcome_unknown?: string;
+};
+
+/**
  * AggregateUsageMetrics
  *
  * Lossless JSON projection of identity-free aggregate token counters.
  */
 export type AggregateUsageMetrics = {
     cache: AggregateCacheUsageMetrics;
+    hosted_tools?: AggregateHostedToolUsageMetrics;
     /**
      * Input Tokens
      */
@@ -1840,7 +1861,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '8';
+    schema_version?: '9';
     stores: StoreManifest;
 };
 
@@ -2781,7 +2802,7 @@ export type CorpusUserMessageSpec = {
 /**
  * CostLineItem
  *
- * Estimated cost for one model.completed event.
+ * Estimated cost for one model attempt or standalone hosted resource evidence.
  */
 export type CostLineItem = {
     billing_identity?: BillingIdentity | null;
@@ -2894,6 +2915,18 @@ export type CostLineItem = {
      * Uncached Input Tokens
      */
     uncached_input_tokens: number;
+    /**
+     * Web Search Calls
+     */
+    web_search_calls?: number;
+    /**
+     * Web Search Cost
+     */
+    web_search_cost?: string;
+    /**
+     * Web Search Outcome Unknown
+     */
+    web_search_outcome_unknown?: number;
 };
 
 /**
@@ -3820,6 +3853,42 @@ export type HealthResponse = {
      * Ok
      */
     ok: boolean;
+};
+
+/**
+ * HostedToolManifest
+ *
+ * Typed provider-hosted authority declared by one agent registration.
+ */
+export type HostedToolManifest = {
+    /**
+     * Allowed Domains
+     */
+    allowed_domains: Array<string>;
+    /**
+     * Blocked Domains
+     */
+    blocked_domains: Array<string>;
+    /**
+     * External Web Access
+     */
+    external_web_access: boolean;
+    /**
+     * Include Sources
+     */
+    include_sources: boolean;
+    /**
+     * Return Token Budget
+     */
+    return_token_budget: 'default' | 'unlimited';
+    /**
+     * Search Context Size
+     */
+    search_context_size: 'low' | 'medium' | 'high';
+    /**
+     * Type
+     */
+    type: 'openai_web_search';
 };
 
 /**
@@ -5617,7 +5686,7 @@ export type SessionCostBody = {
 /**
  * SessionCostSummary
  *
- * Estimated session cost derived from durable model.completed events.
+ * Estimated session cost derived from durable completion and resource evidence.
  */
 export type SessionCostSummary = {
     /**
@@ -6449,6 +6518,10 @@ export type TieredPricing = {
      * Standard
      */
     standard: Array<PriceTier>;
+    /**
+     * Web Search Per Thousand
+     */
+    web_search_per_thousand?: number | string | null;
 };
 
 /**
@@ -7064,13 +7137,17 @@ export type UsageCostRollup = {
 /**
  * UsageCurrencyCost
  *
- * Exact estimated cost for one currency; currencies are never combined.
+ * Exact estimated model-step and hosted-resource cost for one currency.
  */
 export type UsageCurrencyCost = {
     /**
      * Currency
      */
     currency: string;
+    /**
+     * Hosted Resources
+     */
+    hosted_resources?: string;
     /**
      * Model Steps
      */
@@ -7325,9 +7402,13 @@ export type UsageSessionCostSummary = {
 /**
  * UsageUnpricedReason
  *
- * Model-step count that could not be priced for one explicit reason.
+ * Model-step and hosted-resource counts unpriced for one explicit reason.
  */
 export type UsageUnpricedReason = {
+    /**
+     * Hosted Resources
+     */
+    hosted_resources?: string;
     /**
      * Model Steps
      */
