@@ -19182,6 +19182,15 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
             "stage_id",
             "stream_protocol",
         )
+    if event_type == EventType.REQUEST_FOOTPRINT_RECORDED:
+        return ("execution_profile_fingerprint",)
+    if event_type == EventType.TOOL_EXPOSURE_RECORDED:
+        return (
+            "execution_profile_fingerprint",
+            "exposure_fingerprint",
+            "model_step_id",
+            "profile_id",
+        )
     return ()
 
 
@@ -19236,7 +19245,9 @@ def restore_persisted_event_authority(
     therefore only have crossed a persistence boundary with exact runtime
     authority. SQL serialization does not retain Pydantic private attributes;
     raw-record decoders use this helper to reconstruct that already-proven
-    provenance without exposing a marker in the public event payload.
+    provenance without exposing a marker in the public event payload. Trusted
+    Cayu JSONL restore uses the same fixed allowlist at its explicit backup
+    boundary; callers must not restore JSONL obtained from an untrusted source.
     """
 
     copied = copy_event(event)

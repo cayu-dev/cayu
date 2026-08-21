@@ -7,6 +7,7 @@ import pytest
 
 import cayu.runtime.execution_profiles as execution_profiles
 from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core.events import event_with_runtime_payload_authority
 from cayu.core.messages import ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
@@ -38,18 +39,22 @@ from cayu.runtime import (
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RecentTurnsContextPolicy,
+    RequestFootprintConfig,
     ResolutionActor,
     ResolutionActorSource,
     ResumeRequest,
     RetryPolicy,
     RunRequest,
+    Session,
     SessionIdentity,
+    SessionInvocationAdmission,
     SessionStatus,
     StaticToolExposurePolicy,
     StructuredOutputSpec,
     ToolApprovalDecision,
     ToolApprovalRequest,
     ToolCapabilityCeiling,
+    ToolExposure,
     ToolExposureDecision,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
@@ -152,6 +157,70 @@ class _CrashAfterStagedTerminalStore(InMemorySessionStore):
         return checkpoint
 
 
+class _InterleavedCompletedExposureStore(InMemorySessionStore):
+    """Complete one competing invocation immediately before resume admission."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.interleaved = False
+
+    async def admit_session_invocation(
+        self,
+        session_id: str,
+        *,
+        admission: SessionInvocationAdmission,
+    ) -> Session:
+        if not self.interleaved:
+            records = await self.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.TOOL_EXPOSURE_RECORDED,
+                    limit=1,
+                )
+            )
+            if records:
+                self.interleaved = True
+                running = await self.transition_status(
+                    session_id,
+                    from_statuses={SessionStatus.COMPLETED},
+                    to_status=SessionStatus.RUNNING,
+                )
+                await self.transform_checkpoint(
+                    session_id,
+                    lambda _session, checkpoint: (
+                        execution_profiles.checkpoint_with_active_invocation_execution_profile(
+                            checkpoint,
+                            session_id=session_id,
+                            interaction_id="competing-interaction",
+                            run_epoch=running.run_epoch,
+                            profile=execution_profiles.execution_profile_from_session_metadata(
+                                running.metadata
+                            ),
+                        )
+                    ),
+                )
+                payload = {
+                    **records[-1].event.payload,
+                    "profile_id": "competing-phase",
+                    "profile_changed": True,
+                }
+                competing = event_with_runtime_payload_authority(
+                    Event(
+                        type=EventType.TOOL_EXPOSURE_RECORDED,
+                        session_id=session_id,
+                        payload=payload,
+                    ),
+                    "execution_profile_fingerprint",
+                    "exposure_fingerprint",
+                    "model_step_id",
+                    "profile_id",
+                )
+                await self.append_event(session_id, competing)
+                _ = await self.update_status(session_id, SessionStatus.COMPLETED)
+                await self.release_run_fence(session_id)
+        return await super().admit_session_invocation(session_id, admission=admission)
+
+
 class _RecordingApprovalPolicy(ToolPolicy):
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -187,6 +256,18 @@ class _PhaseExposurePolicy(ToolExposurePolicy):
         if request.step == 1:
             return ToolExposureDecision(profile_id="phase-one", tool_names=("alpha",))
         return ToolExposureDecision(profile_id="phase-two", tool_names=("beta",))
+
+
+class _PreviousProfileRecordingPolicy(ToolExposurePolicy):
+    def __init__(self) -> None:
+        self.requests: list[ToolExposurePolicyRequest] = []
+
+    def select(self, request: ToolExposurePolicyRequest) -> ToolExposureDecision:
+        self.requests.append(request)
+        return ToolExposureDecision(
+            profile_id=("initial-phase" if request.previous_profile_id is None else "next-phase"),
+            tool_names=("alpha",),
+        )
 
 
 class _PreviousProfileExposurePolicy(ToolExposurePolicy):
@@ -324,6 +405,24 @@ def test_static_exposure_drives_counting_and_provider_request_in_registered_orde
     assert [_tool_names(request) for request in provider.requests] == [["alpha", "gamma"]]
     assert [_tool_names(request) for request in provider.count_requests] == [["alpha", "gamma"]]
     assert provider.requests[0].tools == provider.count_requests[0].tools
+    [exposure_event] = [event for event in events if event.type is EventType.TOOL_EXPOSURE_RECORDED]
+    exposure = ToolExposure.model_validate(exposure_event.payload)
+    assert exposure.profile_id == "selected"
+    assert exposure.registered_count == 3
+    assert exposure.ceiling_count == 3
+    assert exposure.exposed_count == 2
+    assert exposure.profile_changed is False
+    [footprint] = [event for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED]
+    assert footprint.payload["schema_version"] == 3
+    assert footprint.payload["tool_exposure"] == {
+        "profile_id": exposure.profile_id,
+        "exposure_fingerprint": exposure.exposure_fingerprint,
+        "registered_count": exposure.registered_count,
+        "ceiling_count": exposure.ceiling_count,
+        "exposed_count": exposure.exposed_count,
+        "profile_changed": exposure.profile_changed,
+    }
+    assert footprint.payload["fingerprints"]["tool_manifest"]["availability"] == "unavailable"
 
 
 def test_default_exposure_preserves_all_tools_and_unbounded_run_metadata() -> None:
@@ -346,6 +445,84 @@ def test_default_exposure_preserves_all_tools_and_unbounded_run_metadata() -> No
 
     assert events[-1].type is EventType.SESSION_COMPLETED
     assert [_tool_names(request) for request in provider.requests] == [["alpha", "beta"]]
+
+
+def test_exposure_evidence_is_independent_of_request_footprint_observation() -> None:
+    provider = _ScriptedProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app = CayuApp(
+        request_footprint=RequestFootprintConfig(enabled=False),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[_RecordingTool("alpha")],
+    )
+
+    events = _run(app, "exposure-without-footprint")
+
+    assert EventType.TOOL_EXPOSURE_RECORDED in {event.type for event in events}
+    assert EventType.REQUEST_FOOTPRINT_RECORDED not in {event.type for event in events}
+
+
+def test_resume_refreshes_previous_profile_after_competing_completed_invocation() -> None:
+    async def exercise() -> tuple[list[Event], _PreviousProfileRecordingPolicy]:
+        completed = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        store = _InterleavedCompletedExposureStore()
+        provider = _ScriptedProvider([completed, completed])
+        policy = _PreviousProfileRecordingPolicy()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha")],
+            tool_exposure_policy=policy,
+        )
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="interleaved-exposure-resume",
+                messages=[Message.text("user", "start")],
+            ),
+        )
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="interleaved-exposure-resume",
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+        return resumed, policy
+
+    resumed, policy = asyncio.run(exercise())
+
+    assert resumed[-1].type is EventType.SESSION_COMPLETED
+    assert [request.previous_profile_id for request in policy.requests] == [
+        None,
+        "competing-phase",
+    ]
+    [resumed_exposure] = [
+        ToolExposure.model_validate(event.payload)
+        for event in resumed
+        if event.type is EventType.TOOL_EXPOSURE_RECORDED
+    ]
+    assert (resumed_exposure.profile_id, resumed_exposure.profile_changed) == (
+        "next-phase",
+        True,
+    )
 
 
 def test_session_without_capability_ceiling_fails_closed_on_resume_and_fork() -> None:
@@ -986,6 +1163,24 @@ def test_unexposed_sibling_stays_blocked_across_approval_pause() -> None:
         None,
         "visible-only",
     ]
+    [initial_exposure] = [
+        ToolExposure.model_validate(event.payload)
+        for event in pause_events
+        if event.type is EventType.TOOL_EXPOSURE_RECORDED
+    ]
+    [resumed_exposure] = [
+        ToolExposure.model_validate(event.payload)
+        for event in resume_events
+        if event.type is EventType.TOOL_EXPOSURE_RECORDED
+    ]
+    assert (initial_exposure.profile_id, initial_exposure.profile_changed) == (
+        "visible-only",
+        False,
+    )
+    assert (resumed_exposure.profile_id, resumed_exposure.profile_changed) == (
+        "hidden-only",
+        True,
+    )
     [blocked] = [event for event in resume_events if event.type is EventType.TOOL_CALL_BLOCKED]
     assert blocked.tool_name == "hidden"
     assert blocked.payload["reason"] == "not_exposed_in_request"
@@ -1266,6 +1461,10 @@ def test_one_exposure_snapshot_is_reused_for_retry_and_overflow_recovery(
     policy = _PhaseExposurePolicy()
     app = CayuApp(
         retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="frozen-exposure",
+            fingerprint_key="frozen-exposure-test-key-material-0001",
+        ),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
@@ -1291,6 +1490,15 @@ def test_one_exposure_snapshot_is_reused_for_retry_and_overflow_recovery(
         ["alpha"],
     ]
     assert provider.requests[0].tools == provider.requests[1].tools
+    [exposure_event] = [event for event in events if event.type is EventType.TOOL_EXPOSURE_RECORDED]
+    footprints = [
+        event.payload for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert len(footprints) == 2
+    assert {item["tool_exposure"]["exposure_fingerprint"] for item in footprints} == {
+        exposure_event.payload["exposure_fingerprint"]
+    }
+    assert len({item["fingerprints"]["tool_manifest"]["value"] for item in footprints}) == 1
 
 
 def test_later_model_step_receives_previous_profile_and_may_select_another() -> None:
@@ -1327,6 +1535,15 @@ def test_later_model_step_receives_previous_profile_and_may_select_another() -> 
     assert [request.previous_profile_id for request in policy.requests] == [
         None,
         "phase-one",
+    ]
+    exposure_events = [
+        ToolExposure.model_validate(event.payload)
+        for event in events
+        if event.type is EventType.TOOL_EXPOSURE_RECORDED
+    ]
+    assert [(event.profile_id, event.profile_changed) for event in exposure_events] == [
+        ("phase-one", False),
+        ("phase-two", True),
     ]
     assert alpha.calls == [{}]
     assert beta.calls == []

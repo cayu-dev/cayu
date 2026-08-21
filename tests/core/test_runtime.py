@@ -1459,9 +1459,13 @@ def _without_interaction_lifecycle(events: list[Event]) -> list[Event]:
     return [event for event in events if event.type not in _INTERACTION_LIFECYCLE_EVENT_TYPES]
 
 
-def _without_request_footprints(events: list[Event]) -> list[Event]:
-    """Keep legacy event-sequence assertions separate from footprint coverage."""
-    return [event for event in events if event.type != EventType.REQUEST_FOOTPRINT_RECORDED]
+def _without_request_evidence(events: list[Event]) -> list[Event]:
+    """Keep pre-evidence event-sequence assertions focused on their contracts."""
+    request_evidence_types = {
+        EventType.REQUEST_FOOTPRINT_RECORDED,
+        EventType.TOOL_EXPOSURE_RECORDED,
+    }
+    return [event for event in events if event.type not in request_evidence_types]
 
 
 def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
@@ -1479,7 +1483,7 @@ def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
 
 async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
     events = [event async for event in app.run(request)]
-    return _without_request_footprints(_without_interaction_lifecycle(events))
+    return _without_request_evidence(_without_interaction_lifecycle(events))
 
 
 async def collect_request_footprint_events(
@@ -1585,7 +1589,7 @@ def _interaction_started_event(
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     events = [event async for event in app.resume(request)]
-    return _without_request_footprints(_without_interaction_lifecycle(events))
+    return _without_request_evidence(_without_interaction_lifecycle(events))
 
 
 def assert_model_step_limit_interruption(
@@ -1793,7 +1797,9 @@ def test_request_footprint_is_default_on_before_model_start_without_provider_cou
     assert provider.count_requests == []
 
     footprint = events[footprint_index].payload
-    assert footprint["schema_version"] == 2
+    assert footprint["schema_version"] == 3
+    assert footprint["tool_exposure"]["registered_count"] == 0
+    assert footprint["tool_exposure"]["exposed_count"] == 0
     assert footprint["execution_profile_fingerprint"] == next(
         event.payload["execution_profile_fingerprint"]
         for event in events
@@ -2159,6 +2165,47 @@ def test_request_footprint_redaction_collision_preserves_typed_unavailable_evide
         "conversation_prefix",
     }
     assert {item.ttl for item in footprint.cache_breakpoints} == {"standard"}
+
+
+def test_request_footprint_redaction_collision_preserves_public_tool_exposure() -> None:
+    def run(redactor: SecretRedactor) -> list[Event]:
+        provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        app = CayuApp(
+            secret_redactor=redactor,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        return asyncio.run(
+            collect_request_footprint_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_request_footprint_exposure_collision",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    baseline_events = run(SecretRedactor())
+    baseline_exposure = next(
+        event.payload for event in baseline_events if event.type is EventType.TOOL_EXPOSURE_RECORDED
+    )
+    fingerprint_secret = baseline_exposure["exposure_fingerprint"][10:18]
+
+    events = run(SecretRedactor(["cayu", fingerprint_secret]))
+    exposure = next(
+        event.payload for event in events if event.type is EventType.TOOL_EXPOSURE_RECORDED
+    )
+    footprint = RequestFootprint.model_validate(
+        next(
+            event.payload for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        )
+    )
+
+    assert footprint.tool_exposure is not None
+    assert footprint.tool_exposure.profile_id == exposure["profile_id"]
+    assert footprint.tool_exposure.exposure_fingerprint == exposure["exposure_fingerprint"]
 
 
 def test_request_footprint_records_effective_provider_cache_breakpoints() -> None:
@@ -2743,7 +2790,8 @@ def test_request_footprint_survives_sqlite_reconstruction(
 
     expected_identity, reconstructed = asyncio.run(run())
 
-    assert reconstructed.schema_version == 2
+    assert reconstructed.schema_version == 3
+    assert reconstructed.tool_exposure is not None
     assert reconstructed.fingerprints.provider_neutral_request.canonicalization_version == 1
     assert reconstructed.fingerprints.provider_neutral_request.value == expected_identity
     assert reconstructed.fingerprints.provider_neutral_request.availability == (
@@ -4501,7 +4549,7 @@ def test_knowledge_search_events_remain_in_live_stream_when_wrapped_policy_fails
             ),
         )
     )
-    durable_events = _without_request_footprints(
+    durable_events = _without_request_evidence(
         _without_interaction_lifecycle(
             [
                 record.event
@@ -6586,7 +6634,7 @@ class _AllowForkProfileAdoption(ExecutionProfilePolicy):
 
 async def collect_dispatch_events(app: CayuApp, request: DispatchRequest) -> list[Event]:
     events = [event async for event in app.dispatch_inline(request)]
-    return _without_request_footprints(_without_interaction_lifecycle(events))
+    return _without_request_evidence(_without_interaction_lifecycle(events))
 
 
 async def submit_dispatch(app: CayuApp, request: DispatchRequest) -> DispatchHandle:
@@ -6598,7 +6646,7 @@ async def collect_tool_approval_events(
     request: ToolApprovalRequest,
 ) -> list[Event]:
     events = [event async for event in app.resolve_tool_approval(request)]
-    return _without_request_footprints(_without_interaction_lifecycle(events))
+    return _without_request_evidence(_without_interaction_lifecycle(events))
 
 
 async def collect_user_input_events(
@@ -6606,7 +6654,7 @@ async def collect_user_input_events(
     response: UserInputResponse,
 ) -> list[Event]:
     events = [event async for event in app.resolve_user_input(response)]
-    return _without_request_footprints(_without_interaction_lifecycle(events))
+    return _without_request_evidence(_without_interaction_lifecycle(events))
 
 
 async def collect_tool_approval_recovery_events(
@@ -6614,7 +6662,7 @@ async def collect_tool_approval_recovery_events(
     request: ToolApprovalRecoveryRequest,
 ) -> list[Event]:
     events = [event async for event in app.recover_tool_approval(request)]
-    return _without_request_footprints(_without_interaction_lifecycle(events))
+    return _without_request_evidence(_without_interaction_lifecycle(events))
 
 
 async def collect_tool_round_recovery_events(
@@ -6622,7 +6670,7 @@ async def collect_tool_round_recovery_events(
     request: ToolRoundRecoveryRequest,
 ) -> list[Event]:
     events = [event async for event in app.recover_tool_round(request)]
-    return _without_request_footprints(_without_interaction_lifecycle(events))
+    return _without_request_evidence(_without_interaction_lifecycle(events))
 
 
 def _test_session() -> Session:
@@ -10805,11 +10853,7 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert _without_interaction_lifecycle(sink.events) == _without_interaction_lifecycle(projected)
     session = asyncio.run(store.load("sess_text"))
 
-    assert [
-        event
-        for event in _without_interaction_lifecycle(projected)
-        if event.type != EventType.REQUEST_FOOTPRINT_RECORDED
-    ] == events
+    assert _without_request_evidence(_without_interaction_lifecycle(projected)) == events
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert session.provider_name == "fake"
@@ -22816,7 +22860,7 @@ def test_cayu_app_dispatch_returns_inline_handle():
         session_id="sess_dispatch_handle",
         backend="inline",
         status=DispatchStatus.COMPLETED,
-        metadata={"events": 9},
+        metadata={"events": 10},
     )
     assert [message.content[0].text for message in provider.requests[1].messages] == [
         "first request",

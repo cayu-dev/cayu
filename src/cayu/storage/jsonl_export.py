@@ -48,6 +48,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     TranscriptQuery,
     TranscriptRecord,
+    restore_persisted_event_authority,
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskQuery, TaskStore
 
@@ -256,6 +257,11 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
     ``ValueError`` on a line whose ``type`` is not ``"session"`` and lets
     ``json.JSONDecodeError`` / pydantic ``ValidationError`` surface for
     malformed content.
+
+    Import is an explicit trusted-backup boundary. Runtime authority retained
+    by a built-in store is restored for Cayu's fixed allowlist of durable event
+    fields so appending the imported events to another store preserves resume
+    semantics. Do not restore JSONL from an untrusted source.
     """
     for obj in _iter_json_lines(lines):
         record_type = obj.get("type")
@@ -283,7 +289,13 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
         transcript = [record.message for record in transcript_records]
         yield ImportedSession(
             session=session,
-            events=[Event.model_validate(event) for event in obj["events"]],
+            events=[
+                restore_persisted_event_authority(
+                    Event.model_validate(event),
+                    input_contract_runtime_owned=True,
+                )
+                for event in obj["events"]
+            ],
             transcript=transcript,
             transcript_records=transcript_records,
             checkpoint=checkpoint,

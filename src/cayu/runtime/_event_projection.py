@@ -538,7 +538,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("duplicate_request_risk",): frozenset({True, False}),
     },
     EventType.REQUEST_FOOTPRINT_RECORDED: {
-        ("schema_version",): frozenset({1, 2}),
+        ("schema_version",): frozenset({1, 2, 3}),
         ("request_variant",): _REQUEST_VARIANT_VALUES,
         ("messages", "groups", "*", "role"): _REQUEST_MESSAGE_ROLE_VALUES,
         ("messages", "groups", "*", "part_type"): _REQUEST_MESSAGE_PART_TYPE_VALUES,
@@ -567,6 +567,10 @@ _DECLARED_FIXED_CONTROLS: Mapping[
             "kind",
         ): _REQUEST_CACHE_BREAKPOINT_KIND_VALUES,
         ("cache_breakpoints", "*", "ttl"): _REQUEST_CACHE_BREAKPOINT_TTL_VALUES,
+    },
+    EventType.TOOL_EXPOSURE_RECORDED: {
+        ("schema_version",): frozenset({1}),
+        ("profile_changed",): frozenset({True, False}),
     },
     **{
         event_type: {
@@ -1007,6 +1011,12 @@ _REQUEST_FOOTPRINT_NESTED_PATHS = frozenset(
         ("cache_breakpoints", "*", "kind"),
         ("cache_breakpoints", "*", "ttl"),
         ("cache_breakpoints", "*", "fingerprint"),
+        ("tool_exposure", "profile_id"),
+        ("tool_exposure", "exposure_fingerprint"),
+        ("tool_exposure", "registered_count"),
+        ("tool_exposure", "ceiling_count"),
+        ("tool_exposure", "exposed_count"),
+        ("tool_exposure", "profile_changed"),
     }
     | {
         (*prefix, field_name)
@@ -1601,10 +1611,18 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "attempt attempt_id attachments cache_breakpoints component_tokens context_pressure execution_profile_fingerprint "
         "fingerprints max_attempts messages model model_attempt_id model_step_id observation_id "
         "operation_id options provider_name prompt_contributions request_variant schema_version "
-        "step structured_output tools total",
+        "step structured_output tool_exposure tools total",
         owned_nested_paths=_REQUEST_FOOTPRINT_NESTED_PATHS,
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+    )
+    policies[EventType.TOOL_EXPOSURE_RECORDED] = _observed_policy(
+        "ceiling_count execution_profile_fingerprint exposed_count exposure_fingerprint model "
+        "model_step_id profile_changed profile_id provider_name registered_count schema_version step",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+        | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS,
+        aliased_authority_keys={"model_step_id"},
     )
     model_delta = _policy(
         "attempt",
@@ -3101,6 +3119,12 @@ def _prepare_runtime_event(
         redactor=redactor,
         reject_malformed=True,
     )
+    _restore_publication_safe_tool_exposure_footprint(
+        event,
+        redacted_payload=redacted_payload,
+        trust_persisted_projection=False,
+        reject_malformed=True,
+    )
     _restore_publication_safe_execution_profile_decision(
         event,
         redacted_payload=redacted_payload,
@@ -3373,6 +3397,12 @@ def _project_runtime_event(
         redactor=redactor,
         reject_malformed=False,
     )
+    _restore_publication_safe_tool_exposure_footprint(
+        event,
+        redacted_payload=redacted_payload,
+        trust_persisted_projection=trust_persisted_projection,
+        reject_malformed=False,
+    )
     _restore_publication_safe_execution_profile_decision(
         event,
         redacted_payload=redacted_payload,
@@ -3532,6 +3562,56 @@ def _restore_publication_safe_request_fingerprints(
                 redactor=redactor,
                 reject_malformed=reject_malformed,
             )
+
+
+def _restore_publication_safe_tool_exposure_footprint(
+    event: Event,
+    *,
+    redacted_payload: dict[str, Any],
+    trust_persisted_projection: bool,
+    reject_malformed: bool,
+) -> None:
+    """Retain a typed public exposure summary only with producer provenance."""
+
+    if event.type != EventType.REQUEST_FOOTPRINT_RECORDED:
+        return
+    raw_exposure = event.payload.get("tool_exposure")
+    schema_version = event.payload.get("schema_version")
+    if raw_exposure is None:
+        if schema_version == 3 and reject_malformed:
+            raise ValueError("Request footprint schema v3 has no tool exposure summary.")
+        redacted_payload.pop("tool_exposure", None)
+        return
+    if schema_version != 3:
+        if reject_malformed:
+            raise ValueError("Only request footprint schema v3 may carry tool exposure.")
+        redacted_payload.pop("tool_exposure", None)
+        return
+
+    from cayu.runtime.request_footprints import ToolExposureFootprint
+
+    try:
+        exposure = ToolExposureFootprint.model_validate(raw_exposure)
+    except (TypeError, ValueError) as exc:
+        if reject_malformed:
+            raise ValueError("Request footprint tool exposure is malformed.") from exc
+        redacted_payload.pop("tool_exposure", None)
+        return
+    if not _public_authority_is_trusted(
+        event,
+        field_name="execution_profile_fingerprint",
+        trust_persisted_projection=trust_persisted_projection,
+    ):
+        if reject_malformed:
+            raise ValueError("Request footprint tool exposure lacks runtime provenance.")
+        redacted_payload.pop("tool_exposure", None)
+        return
+
+    # profile_id is an explicitly public application label and exposure_fingerprint
+    # is runtime-owned public identity. Exact producer/store provenance lets both
+    # survive accidental workload-secret substring collisions, matching the
+    # standalone tool.exposure.recorded contract.
+    redacted_payload["tool_exposure"] = exposure.model_dump(mode="json")
 
 
 def _restore_publication_safe_execution_profile_decision(
@@ -3785,12 +3865,16 @@ def _reject_secret_authority_values(
                     "be used as durable event authority."
                 )
             continue
-        # Structurally trusted observer/profile producers attest their exact
-        # runtime-generated authority. That positive evidence must win over an
-        # accidental exact collision with a workload secret; caller-controlled
-        # values are not attested and continue through the ordinary admission
-        # checks below.
-        if field_name in {"observer", "execution_profile_fingerprint"} and (
+        # Structurally trusted observer/profile/exposure producers attest their
+        # exact runtime-generated authority. That positive evidence must win
+        # over an accidental exact collision with a workload secret;
+        # caller-controlled values are not attested and continue through the
+        # ordinary admission checks below.
+        if field_name in {
+            "observer",
+            "execution_profile_fingerprint",
+            "exposure_fingerprint",
+        } and (
             event_payload_authority_is_runtime_generated(
                 event,
                 field_name=field_name,

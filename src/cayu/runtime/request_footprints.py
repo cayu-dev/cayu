@@ -50,8 +50,13 @@ from cayu.runtime.context import (
     estimate_model_request_context_pressure,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.tool_exposure import (
+    TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
+    TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
+    ToolExposure,
+)
 
-REQUEST_FOOTPRINT_SCHEMA_VERSION = 2
+REQUEST_FOOTPRINT_SCHEMA_VERSION = 3
 PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION = 1
 REQUEST_FOOTPRINT_CANONICALIZATION_VERSION = 1
 _HMAC_CONTEXT = b"cayu.request-footprint"
@@ -118,11 +123,13 @@ class PromptContributionAvailability(StrEnum):
 
 
 class RequestFootprintConfig(BaseModel):
-    """Controls local privacy-safe request-footprint observation.
+    """Controls local, content-minimized request-footprint observation.
 
-    Footprints are local and content-free, so they are enabled by default. Keyed
-    request identities remain disabled until both a key ID and secret key are
-    supplied. This configuration never enables provider-backed token counting.
+    Footprints omit provider-request content but may contain bounded public
+    application labels, including a schema-v3 tool-exposure ``profile_id``.
+    They are enabled by default. Keyed request identities remain disabled until
+    both a key ID and secret key are supplied. This configuration never enables
+    provider-backed token counting.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -237,6 +244,41 @@ class RequestOptionsFootprint(BaseModel):
         if tuple(sorted(set(value))) != value:
             raise ValueError("known_categories must be unique and sorted.")
         return value
+
+
+class ToolExposureFootprint(BaseModel):
+    """Content-minimized exposure summary containing one public profile label."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    profile_id: str
+    exposure_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    registered_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    ceiling_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    exposed_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    profile_changed: StrictBool
+
+    @field_validator("profile_id")
+    @classmethod
+    def validate_profile_id(cls, value: str) -> str:
+        value = require_durable_clean_nonblank(value, "profile_id")
+        if len(value) > TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS:
+            raise ValueError(
+                f"profile_id cannot exceed {TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS} characters."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> ToolExposureFootprint:
+        if self.ceiling_count > self.registered_count:
+            raise ValueError("ceiling_count cannot exceed registered_count.")
+        if self.exposed_count > self.ceiling_count:
+            raise ValueError("exposed_count cannot exceed ceiling_count.")
+        return self
 
 
 class RequestComponentTokenEstimates(BaseModel):
@@ -400,12 +442,13 @@ class RequestPromptContributionAttribution(BaseModel):
 
 
 class RequestFootprint(BaseModel):
-    """Versioned, content-free evidence about one prepared provider request."""
+    """Versioned, content-minimized evidence about one prepared provider request."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     execution_profile_fingerprint: str | None = None
+    tool_exposure: ToolExposureFootprint | None = None
     observation_id: str
     provider_name: str
     model: str
@@ -432,8 +475,8 @@ class RequestFootprint(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value not in (1, REQUEST_FOOTPRINT_SCHEMA_VERSION):
-            raise ValueError("Request footprint schema_version must be integer 1 or 2.")
+        if type(value) is not int or value not in (1, 2, REQUEST_FOOTPRINT_SCHEMA_VERSION):
+            raise ValueError("Request footprint schema_version must be integer 1, 2, or 3.")
         return value
 
     @field_validator("execution_profile_fingerprint")
@@ -484,10 +527,18 @@ class RequestFootprint(BaseModel):
 
     @model_validator(mode="after")
     def validate_attempt(self) -> RequestFootprint:
-        if self.schema_version == 1 and self.execution_profile_fingerprint is not None:
-            raise ValueError("Request footprint schema v1 cannot carry an execution profile.")
+        if self.schema_version == 1 and (
+            self.execution_profile_fingerprint is not None or self.tool_exposure is not None
+        ):
+            raise ValueError(
+                "Request footprint schema v1 cannot carry an execution profile or tool exposure."
+            )
         if self.schema_version >= 2 and self.execution_profile_fingerprint is None:
-            raise ValueError("Request footprint schema v2 requires an execution profile.")
+            raise ValueError("Request footprint schema v2+ requires an execution profile.")
+        if self.schema_version == 2 and self.tool_exposure is not None:
+            raise ValueError("Request footprint schema v2 cannot carry tool exposure.")
+        if self.schema_version == 3 and self.tool_exposure is None:
+            raise ValueError("Request footprint schema v3 requires tool exposure.")
         if self.attempt > self.max_attempts:
             raise ValueError("attempt cannot exceed max_attempts.")
         if (self.operation_id is None) != (self.attempt_id is None):
@@ -536,6 +587,7 @@ def analyze_request_footprint(
     operation_id: str | None = None,
     operation_attempt_id: str | None = None,
     execution_profile_fingerprint: str | None = None,
+    tool_exposure: ToolExposure | None = None,
 ) -> RequestFootprint:
     """Analyze one detached request with the provider's effective cache policy."""
 
@@ -578,6 +630,7 @@ def analyze_request_footprint(
         operation_id=operation_id,
         operation_attempt_id=operation_attempt_id,
         execution_profile_fingerprint=execution_profile_fingerprint,
+        tool_exposure=tool_exposure,
     )
 
 
@@ -640,6 +693,7 @@ def build_request_footprint(
     operation_id: str | None = None,
     operation_attempt_id: str | None = None,
     execution_profile_fingerprint: str | None = None,
+    tool_exposure: ToolExposure | None = None,
 ) -> RequestFootprint:
     """Analyze one final provider-neutral request without retaining its content."""
 
@@ -693,6 +747,24 @@ def build_request_footprint(
         or any(character not in "0123456789abcdef" for character in execution_profile_fingerprint)
     ):
         raise ValueError("execution_profile_fingerprint must be a lowercase SHA-256 digest.")
+    if tool_exposure is not None:
+        if type(tool_exposure) is not ToolExposure:
+            raise TypeError("tool_exposure must be a ToolExposure or None.")
+        tool_exposure = ToolExposure.model_validate(tool_exposure.model_dump(mode="python"))
+        if execution_profile_fingerprint is None:
+            raise ValueError("tool_exposure requires an execution_profile_fingerprint.")
+        if tool_exposure.execution_profile_fingerprint != execution_profile_fingerprint:
+            raise ValueError(
+                "tool_exposure execution profile must match execution_profile_fingerprint."
+            )
+        if tool_exposure.provider_name != provider_name:
+            raise ValueError("tool_exposure provider_name must match provider_name.")
+        if tool_exposure.model != model_request.model:
+            raise ValueError("tool_exposure model must match ModelRequest.model.")
+        if tool_exposure.step != step:
+            raise ValueError("tool_exposure step must match step.")
+        if tool_exposure.model_step_id != model_step_id:
+            raise ValueError("tool_exposure model_step_id must match model_step_id.")
 
     resolved_attachments = resolved_file_attachments_from_options(model_request.options)
     attachment_occurrences = _attachment_occurrences(
@@ -778,6 +850,12 @@ def build_request_footprint(
     structured_output_tools = [
         tool for tool in model_request.tools if tool.get("name") == STRUCTURED_OUTPUT_TOOL_NAME
     ]
+    if tool_exposure is not None and (
+        len(model_request.tools) - len(structured_output_tools) != tool_exposure.exposed_count
+    ):
+        raise ValueError(
+            "tool_exposure exposed_count must match the prepared application tool definitions."
+        )
     structured_output_payload = (
         structured_output_option
         if structured_output_option is not None
@@ -891,9 +969,23 @@ def build_request_footprint(
     )
     return RequestFootprint(
         schema_version=(
-            REQUEST_FOOTPRINT_SCHEMA_VERSION if execution_profile_fingerprint is not None else 1
+            REQUEST_FOOTPRINT_SCHEMA_VERSION
+            if tool_exposure is not None
+            else (2 if execution_profile_fingerprint is not None else 1)
         ),
         execution_profile_fingerprint=execution_profile_fingerprint,
+        tool_exposure=(
+            None
+            if tool_exposure is None
+            else ToolExposureFootprint(
+                profile_id=tool_exposure.profile_id,
+                exposure_fingerprint=tool_exposure.exposure_fingerprint,
+                registered_count=tool_exposure.registered_count,
+                ceiling_count=tool_exposure.ceiling_count,
+                exposed_count=tool_exposure.exposed_count,
+                profile_changed=tool_exposure.profile_changed,
+            )
+        ),
         observation_id=observation_id,
         provider_name=provider_name,
         model=model_request.model,

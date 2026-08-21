@@ -158,6 +158,7 @@ def test_failing_sink_does_not_block_later_sink() -> None:
     assert [event.type for event in events] == [
         EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
+        EventType.TOOL_EXPOSURE_RECORDED,
         EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,

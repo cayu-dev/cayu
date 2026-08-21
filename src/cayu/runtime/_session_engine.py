@@ -67,6 +67,7 @@ from cayu.core.events import (
     EventType,
     copy_event,
     event_id_is_runtime_generated,
+    event_payload_authority_is_runtime_generated,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
@@ -537,6 +538,7 @@ from cayu.runtime.tasks import (
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
     ToolCapabilityCeiling,
+    ToolExposure,
     resolve_tool_capability_ceiling,
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
@@ -11473,6 +11475,31 @@ class SessionEngine:
                     self._session_control.end_interruption_request(loaded_session.id)
         return
 
+    async def _latest_tool_exposure_profile_id(self, session_id: str) -> str | None:
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.TOOL_EXPOSURE_RECORDED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not records:
+            return None
+
+        event = records[0].event
+        try:
+            exposure = ToolExposure.model_validate(event.payload)
+        except ValueError as exc:
+            raise RuntimeError("Latest durable tool-exposure evidence is malformed.") from exc
+        if not event_payload_authority_is_runtime_generated(
+            event,
+            field_name="profile_id",
+            value=exposure.profile_id,
+        ):
+            raise RuntimeError("Latest durable tool-exposure profile is not runtime-attested.")
+        return exposure.profile_id
+
     async def _resume_session(
         self,
         *,
@@ -11674,6 +11701,9 @@ class SessionEngine:
                 "Session status transition not allowed: "
                 f"{loaded_session.status} -> {SessionStatus.RUNNING}"
             )
+        previous_tool_exposure_profile_id = await self._latest_tool_exposure_profile_id(
+            loaded_session.id
+        )
         if loaded_projection_cursor or self._secret_redactor.has_values:
             preflight_snapshot = await self.session_store.load_transcript_snapshot(
                 loaded_session.id
@@ -12385,6 +12415,13 @@ class SessionEngine:
                 raise RuntimeError("New interaction admission produced no interaction identity.")
             _activate_session_interaction(session.id, interaction_id)
         try:
+            if session.run_epoch != loaded_session.run_epoch + 1:
+                # Another complete invocation won admission after our preflight
+                # snapshot. Refresh the adjacent profile while this invocation
+                # owns the run fence so phase continuity follows durable order.
+                previous_tool_exposure_profile_id = await self._latest_tool_exposure_profile_id(
+                    session.id
+                )
             admission_events = [
                 event
                 for event in (
@@ -12669,6 +12706,7 @@ class SessionEngine:
                 if reconciled_pending_round is None
                 else reconciled_pending_round.source_transcript_cursor
             ),
+            previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
         )
         authoritative_failure: BaseExceptionGroup | None = None
         try:

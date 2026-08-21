@@ -127,6 +127,7 @@ class EventType(StrEnum):
     PROVIDER_OPERATION_RESOLVED = "provider.operation.resolved"
     PROVIDER_OPERATION_RECONCILED = "provider.operation.reconciled"
     REQUEST_FOOTPRINT_RECORDED = "request.footprint.recorded"
+    TOOL_EXPOSURE_RECORDED = "tool.exposure.recorded"
 
     STRUCTURED_OUTPUT_VALIDATED = "structured_output.validated"
     STRUCTURED_OUTPUT_VALIDATING = "structured_output.validating"

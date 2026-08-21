@@ -20,11 +20,13 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     freeze_json_value,
     require_durable_clean_nonblank,
     require_durable_text,
+    require_execution_unit_id,
     thaw_json_value,
 )
 from cayu.core.execution_identity import (
@@ -414,7 +416,7 @@ class ToolExposurePolicyRequest(BaseModel):
     agent_name: str
     provider_name: str
     model: str
-    step: StrictInt = Field(ge=1)
+    step: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     transcript_cursor: StrictInt = Field(default=0, ge=0)
     registered_tools: tuple[RegisteredToolCapability, ...]
     capability_ceiling: tuple[str, ...]
@@ -621,6 +623,124 @@ class ResolvedToolExposure(BaseModel):
     @property
     def tool_names(self) -> tuple[str, ...]:
         return tuple(tool.name for tool in self.tools)
+
+
+class ToolExposure(BaseModel):
+    """Content-minimized public evidence for one prepared model-step tool projection.
+
+    The record intentionally contains no separate tool-name list, definitions,
+    policy metadata, arguments, or policy reasoning. ``profile_id`` is a public,
+    application-selected non-secret label. The fingerprint binds the record to the
+    exact ordered definitions retained privately by the runtime.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = TOOL_EXPOSURE_SCHEMA_VERSION
+    execution_profile_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    profile_id: str
+    exposure_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    registered_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    ceiling_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    exposed_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
+    profile_changed: StrictBool
+    step: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    provider_name: str
+    model: str
+    model_step_id: str
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != TOOL_EXPOSURE_SCHEMA_VERSION:
+            raise ValueError("Tool exposure schema_version must be the integer 1.")
+        return value
+
+    @field_validator("profile_id")
+    @classmethod
+    def validate_profile_id(cls, value: str) -> str:
+        return _validate_profile_id(value)
+
+    @field_validator("provider_name", "model")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("model_step_id")
+    @classmethod
+    def validate_model_step_id(cls, value: str) -> str:
+        try:
+            return require_execution_unit_id(value, "model_step_id")
+        except ValueError:
+            # Public events replace private execution-unit IDs with scoped linkage
+            # aliases. Keep the evidence record usable on both sides of that boundary.
+            from cayu.runtime._event_projection import (
+                PRIVATE_EVENT_AUTHORITY,
+                public_event_linkage_sequence,
+            )
+
+            if (
+                value == PRIVATE_EVENT_AUTHORITY
+                or public_event_linkage_sequence(
+                    value,
+                    field_name="model_step_id",
+                )
+                is not None
+            ):
+                return value
+            raise
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> ToolExposure:
+        if self.ceiling_count > self.registered_count:
+            raise ValueError("ceiling_count cannot exceed registered_count.")
+        if self.exposed_count > self.ceiling_count:
+            raise ValueError("exposed_count cannot exceed ceiling_count.")
+        return self
+
+
+def tool_exposure_record(
+    exposure: ResolvedToolExposure,
+    *,
+    profile_changed: bool,
+    step: int,
+    provider_name: str,
+    model: str,
+    model_step_id: str,
+    execution_profile_fingerprint: str,
+) -> ToolExposure:
+    """Project one frozen descriptor snapshot into content-minimized public evidence."""
+
+    if type(exposure) is not ResolvedToolExposure:
+        raise TypeError("exposure must be a ResolvedToolExposure.")
+    if type(profile_changed) is not bool:
+        raise TypeError("profile_changed must be a bool.")
+    return ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id=exposure.profile_id,
+        exposure_fingerprint=exposure.fingerprint,
+        registered_count=exposure.registered_count,
+        ceiling_count=exposure.ceiling_count,
+        exposed_count=len(exposure.tools),
+        profile_changed=profile_changed,
+        step=step,
+        provider_name=provider_name,
+        model=model,
+        model_step_id=model_step_id,
+    )
 
 
 class ResolvedToolExposureAuthority(BaseModel):

@@ -5021,8 +5021,8 @@ def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
     assert payload["metadata"] == {}
     assert payload["reason"] == expected_reason
     assert payload["tool_name"] == "exec_command"
-    assert payload["tool_call_id"] == "cayu_event_9:tool_call_id"
-    assert payload["tool_round_id"] == "cayu_event_9:tool_round_id"
+    assert payload["tool_call_id"] == "cayu_event_10:tool_call_id"
+    assert payload["tool_round_id"] == "cayu_event_10:tool_round_id"
     assert payload["idempotency_key"] == "[PRIVATE_EVENT_AUTHORITY]"
     assert payload["result"]["structured"]["error"] == expected_error
     assert payload["result"]["content"] != "rewritten as success"
@@ -5210,8 +5210,8 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
     assert blocked.payload["model_step_id"] == "[PRIVATE_EVENT_AUTHORITY]"
     assert blocked.payload["model_attempt_id"] == "[PRIVATE_EVENT_AUTHORITY]"
     assert blocked.payload["idempotency_key"] == "[PRIVATE_EVENT_AUTHORITY]"
-    assert blocked.payload["tool_call_id"] == "cayu_event_9:tool_call_id"
-    assert blocked.payload["tool_round_id"] == "cayu_event_9:tool_round_id"
+    assert blocked.payload["tool_call_id"] == "cayu_event_10:tool_call_id"
+    assert blocked.payload["tool_round_id"] == "cayu_event_10:tool_round_id"
     assert observed["structured"] == blocked.payload["result"]["structured"]
     assert runner.command is None
 

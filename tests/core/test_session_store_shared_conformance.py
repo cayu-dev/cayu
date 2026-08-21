@@ -52,7 +52,10 @@ from cayu.core import (
     WebSearchSource,
 )
 from cayu.core.billing import BillingIdentity
-from cayu.core.events import event_with_runtime_payload_authority
+from cayu.core.events import (
+    event_payload_authority_is_runtime_generated,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
@@ -82,6 +85,7 @@ from cayu.runtime import (
     CompactSessionRequest,
     ContextCompactor,
     EnqueueSessionMessageRequest,
+    EventOrder,
     EventQuery,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
@@ -123,6 +127,7 @@ from cayu.runtime import (
     PersistedEventSideEffectStatus,
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
+    RequestFootprint,
     RequestFootprintConfig,
     ResolutionActor,
     ResolutionActorSource,
@@ -154,6 +159,10 @@ from cayu.runtime import (
     ToolApprovalDecision,
     ToolApprovalRequest,
     ToolCapabilityCeiling,
+    ToolExposure,
+    ToolExposureDecision,
+    ToolExposurePolicy,
+    ToolExposurePolicyRequest,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -1058,6 +1067,35 @@ class _CeilingConformanceTool(Tool):
         return ToolResult(content=self.name)
 
 
+class _PreviousProfileConformancePolicy(ToolExposurePolicy):
+    def __init__(self) -> None:
+        self.requests: list[ToolExposurePolicyRequest] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:previous-exposure-policy",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def select(self, request: ToolExposurePolicyRequest) -> ToolExposureDecision:
+        self.requests.append(request)
+        if request.previous_profile_id is None:
+            return ToolExposureDecision(
+                profile_id="initial-phase",
+                tool_names=("inspect",),
+            )
+        if request.previous_profile_id != "initial-phase":
+            raise AssertionError(
+                f"unexpected previous exposure profile: {request.previous_profile_id}"
+            )
+        return ToolExposureDecision(
+            profile_id="resumed-phase",
+            tool_names=("inspect",),
+        )
+
+
 def _approval_recovery_environment_spec() -> EnvironmentSpec:
     return EnvironmentSpec(
         name="approval-environment",
@@ -1097,6 +1135,290 @@ def conformance_postgres_dsn(postgres_dsn) -> Iterator[str]:
         yield postgres_dsn
     finally:
         asyncio.run(_reset_postgres_data(postgres_dsn))
+
+
+def test_session_store_conformance_reconstructs_tool_exposure_evidence(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            provider = FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ]
+                ]
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            initial_policy = _PreviousProfileConformancePolicy()
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[_CeilingConformanceTool("inspect")],
+                tool_exposure_policy=initial_policy,
+            )
+            session_id = f"tool-exposure-evidence-{session_store_case[0]}"
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "inspect")],
+                    )
+                )
+            ]
+            [public_event] = [
+                event for event in events if event.type is EventType.TOOL_EXPOSURE_RECORDED
+            ]
+            public_evidence = ToolExposure.model_validate(public_event.payload)
+            [public_footprint_event] = [
+                event for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+            ]
+            public_footprint = RequestFootprint.model_validate(public_footprint_event.payload)
+            assert [request.previous_profile_id for request in initial_policy.requests] == [None]
+            [before_reopen] = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=(EventType.TOOL_EXPOSURE_RECORDED,),
+                )
+            )
+            [footprint_before_reopen] = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=(EventType.REQUEST_FOOTPRINT_RECORDED,),
+                )
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            [after_reopen] = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=(EventType.TOOL_EXPOSURE_RECORDED,),
+                )
+            )
+            [footprint_after_reopen] = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=(EventType.REQUEST_FOOTPRINT_RECORDED,),
+                )
+            )
+            reconstructed = ToolExposure.model_validate(after_reopen.event.payload)
+            reconstructed_footprint = RequestFootprint.model_validate(
+                footprint_after_reopen.event.payload
+            )
+
+            assert after_reopen.sequence == before_reopen.sequence
+            assert after_reopen.event.payload == before_reopen.event.payload
+            assert (
+                reconstructed.execution_profile_fingerprint,
+                reconstructed.profile_id,
+                reconstructed.exposure_fingerprint,
+                reconstructed.registered_count,
+                reconstructed.ceiling_count,
+                reconstructed.exposed_count,
+                reconstructed.profile_changed,
+                reconstructed.step,
+                reconstructed.provider_name,
+                reconstructed.model,
+            ) == (
+                public_evidence.execution_profile_fingerprint,
+                public_evidence.profile_id,
+                public_evidence.exposure_fingerprint,
+                1,
+                1,
+                1,
+                False,
+                1,
+                "fake",
+                "fake-model",
+            )
+            assert set(after_reopen.event.payload) == {
+                "schema_version",
+                "execution_profile_fingerprint",
+                "profile_id",
+                "exposure_fingerprint",
+                "registered_count",
+                "ceiling_count",
+                "exposed_count",
+                "profile_changed",
+                "step",
+                "provider_name",
+                "model",
+                "model_step_id",
+            }
+            assert footprint_after_reopen.sequence == footprint_before_reopen.sequence
+            assert footprint_after_reopen.event.payload == footprint_before_reopen.event.payload
+            assert reconstructed_footprint.tool_exposure == public_footprint.tool_exposure
+            footprint_profile = reconstructed_footprint.execution_profile_fingerprint
+            assert footprint_profile is not None
+            assert event_payload_authority_is_runtime_generated(
+                footprint_after_reopen.event,
+                field_name="execution_profile_fingerprint",
+                value=footprint_profile,
+            )
+
+            exported = io.StringIO()
+            assert await export_sessions(store, stream=exported) == 1
+            [imported] = list(import_sessions(io.StringIO(exported.getvalue())))
+            [imported_exposure] = [
+                event for event in imported.events if event.type is EventType.TOOL_EXPOSURE_RECORDED
+            ]
+            [imported_footprint] = [
+                event
+                for event in imported.events
+                if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+            ]
+            for field_name in (
+                "execution_profile_fingerprint",
+                "exposure_fingerprint",
+                "model_step_id",
+                "profile_id",
+            ):
+                value = imported_exposure.payload[field_name]
+                assert event_payload_authority_is_runtime_generated(
+                    imported_exposure,
+                    field_name=field_name,
+                    value=value,
+                )
+            assert event_payload_authority_is_runtime_generated(
+                imported_footprint,
+                field_name="execution_profile_fingerprint",
+                value=footprint_profile,
+            )
+
+            restored_store = InMemorySessionStore()
+            await restored_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await restored_store.append_events(
+                session_id,
+                [imported_exposure, imported_footprint],
+            )
+            restored_events = await restored_store.load_events(session_id)
+            assert [event.payload for event in restored_events] == [
+                imported_exposure.payload,
+                imported_footprint.payload,
+            ]
+            assert all(
+                event_payload_authority_is_runtime_generated(
+                    restored_events[0],
+                    field_name=field_name,
+                    value=restored_events[0].payload[field_name],
+                )
+                for field_name in (
+                    "execution_profile_fingerprint",
+                    "exposure_fingerprint",
+                    "model_step_id",
+                    "profile_id",
+                )
+            )
+            assert event_payload_authority_is_runtime_generated(
+                restored_events[1],
+                field_name="execution_profile_fingerprint",
+                value=footprint_profile,
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    type=EventType.REQUEST_FOOTPRINT_RECORDED,
+                    session_id=session_id,
+                    payload=public_footprint_event.payload,
+                ),
+            )
+            [untrusted_footprint] = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.REQUEST_FOOTPRINT_RECORDED,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            assert "execution_profile_fingerprint" not in untrusted_footprint.event.payload
+
+            resumed_provider = FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.text_delta("resumed"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ]
+                ]
+            )
+            resumed_policy = _PreviousProfileConformancePolicy()
+            resumed_app = CayuApp(session_store=store, enable_logging=False)
+            resumed_app.register_provider(resumed_provider, default=True)
+            resumed_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[_CeilingConformanceTool("inspect")],
+                tool_exposure_policy=resumed_policy,
+            )
+            resumed_events = [
+                event
+                async for event in resumed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            ]
+            [resumed_event] = [
+                event for event in resumed_events if event.type is EventType.TOOL_EXPOSURE_RECORDED
+            ]
+            resumed_evidence = ToolExposure.model_validate(resumed_event.payload)
+
+            assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+            assert [request.previous_profile_id for request in resumed_policy.requests] == [
+                "initial-phase"
+            ]
+            assert (resumed_evidence.profile_id, resumed_evidence.profile_changed) == (
+                "resumed-phase",
+                True,
+            )
+
+            await store.append_event(
+                session_id,
+                Event(
+                    type=EventType.TOOL_EXPOSURE_RECORDED,
+                    session_id=session_id,
+                    payload={
+                        **resumed_event.payload,
+                        "profile_id": "caller-authored-profile",
+                    },
+                ),
+            )
+            [untrusted_latest] = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.TOOL_EXPOSURE_RECORDED,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            assert "profile_id" not in untrusted_latest.event.payload
+            with pytest.raises(
+                RuntimeError,
+                match="Latest durable tool-exposure evidence is malformed",
+            ):
+                _ = [
+                    event
+                    async for event in resumed_app.resume(
+                        ResumeRequest(
+                            session_id=session_id,
+                            messages=[Message.text("user", "reject forged evidence")],
+                        )
+                    )
+                ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_reconstructs_completed_fork_group(

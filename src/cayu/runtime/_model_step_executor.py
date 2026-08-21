@@ -305,11 +305,13 @@ from cayu.runtime.tool_exposure import (
     AllRegisteredToolsExposurePolicy,
     ResolvedToolExposure,
     ResolvedToolExposureAuthority,
+    ToolExposure,
     ToolExposurePolicyRequest,
     copy_resolved_tool_exposure_authority,
     resolve_tool_exposure,
     resolved_tool_exposure_authority,
     tool_capability_ceiling_from_session_metadata,
+    tool_exposure_record,
 )
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
@@ -1754,6 +1756,35 @@ def _event_with_model_identity_authority(
         if event.payload.get(field_name) == value
     ]
     return event_with_runtime_payload_authority(event, *fields) if fields else event
+
+
+def _tool_exposure_event(
+    *,
+    exposure: ToolExposure,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    model_step_identity: ModelStepIdentity,
+    execution_profile: ExecutionProfileIdentity | None,
+) -> Event:
+    """Build one runtime-attested, content-minimized exposure evidence event."""
+
+    if type(exposure) is not ToolExposure:
+        raise TypeError("exposure must be a ToolExposure.")
+    event = Event(
+        type=EventType.TOOL_EXPOSURE_RECORDED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload=exposure.model_dump(mode="json"),
+    )
+    event = _event_with_model_identity_authority(event, model_step_identity)
+    event = event_with_runtime_payload_authority(
+        event,
+        "profile_id",
+        "exposure_fingerprint",
+    )
+    return event_with_execution_profile_authority(event, execution_profile)
 
 
 @dataclass
@@ -4164,6 +4195,7 @@ class ModelStepExecutor:
         model_completion_publisher: ModelCompletionPublisher | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         tool_exposure: ResolvedToolExposure | None = None,
+        tool_exposure_evidence: ToolExposure | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         request_variant = RequestVariant(request_variant)
@@ -4172,6 +4204,29 @@ class ModelStepExecutor:
         resolved_tool_exposure = (
             None if tool_exposure is None else _require_frozen_tool_exposure(tool_exposure)
         )
+        if tool_exposure_evidence is not None:
+            if type(tool_exposure_evidence) is not ToolExposure:
+                raise TypeError("tool_exposure_evidence must be a ToolExposure or None.")
+            tool_exposure_evidence = ToolExposure.model_validate(
+                tool_exposure_evidence.model_dump(mode="python")
+            )
+            if resolved_tool_exposure is None:
+                raise ValueError("Tool exposure evidence requires a frozen tool exposure.")
+            if execution_profile is None:
+                raise ValueError("Tool exposure evidence requires an execution profile.")
+            expected_tool_exposure_evidence = tool_exposure_record(
+                resolved_tool_exposure,
+                profile_changed=tool_exposure_evidence.profile_changed,
+                step=step,
+                provider_name=registered_provider.name,
+                model=model_request.model,
+                model_step_id=model_step_identity.model_step_id,
+                execution_profile_fingerprint=execution_profile.fingerprint,
+            )
+            if tool_exposure_evidence != expected_tool_exposure_evidence:
+                raise ValueError(
+                    "Tool exposure evidence does not match the frozen model request authority."
+                )
         provider.preflight_hosted_tools(
             model=model_request.model,
             hosted_tools=model_request.hosted_tools,
@@ -4253,6 +4308,7 @@ class ModelStepExecutor:
                 prompt_contribution_manifest=prompt_contribution_manifest,
                 structured_output=structured_output,
                 execution_profile=execution_profile,
+                tool_exposure=tool_exposure_evidence,
             )
             if request_footprint_event is not None:
                 yield request_footprint_event, None
@@ -4497,6 +4553,7 @@ class ModelStepExecutor:
         prompt_contribution_manifest: PromptContributionManifest | None,
         structured_output: StructuredOutputSpec | None,
         execution_profile: ExecutionProfileIdentity | None,
+        tool_exposure: ToolExposure | None,
     ) -> tuple[RequestFootprint | None, Event | None]:
         if not self._request_footprint.enabled:
             return None, None
@@ -4524,18 +4581,18 @@ class ModelStepExecutor:
             execution_profile_fingerprint=(
                 None if execution_profile is None else execution_profile.fingerprint
             ),
+            tool_exposure=tool_exposure,
+        )
+        footprint_event = Event(
+            type=EventType.REQUEST_FOOTPRINT_RECORDED,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=footprint.model_dump(mode="json", exclude_none=True),
         )
         event = await self._event_writer.emit(
             event_with_execution_profile_authority(
-                _context_observation_event(
-                    Event(
-                        type=EventType.REQUEST_FOOTPRINT_RECORDED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=footprint.model_dump(mode="json", exclude_none=True),
-                    )
-                ),
+                _context_observation_event(footprint_event),
                 execution_profile,
             )
         )
@@ -6433,9 +6490,14 @@ class ModelStepRun:
             raise ValueError("source_transcript_cursor must be >= 0.")
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
+        previous_tool_exposure_profile_id = self._previous_tool_exposure_profile_id
         tool_exposure = self._resolve_tool_exposure(
             step=step,
             transcript_cursor=source_transcript_cursor,
+        )
+        exposure_profile_changed = (
+            previous_tool_exposure_profile_id is not None
+            and previous_tool_exposure_profile_id != tool_exposure.profile_id
         )
         self._previous_tool_exposure_profile_id = tool_exposure.profile_id
         context_messages: list[Message]
@@ -6664,6 +6726,30 @@ class ModelStepRun:
             step=step,
             tool_exposure=tool_exposure,
         )
+        if self._execution_profile is None:
+            raise RuntimeError("Tool exposure evidence requires an execution profile.")
+        tool_exposure_evidence = tool_exposure_record(
+            tool_exposure,
+            profile_changed=exposure_profile_changed,
+            step=step,
+            provider_name=self._registered_provider.name,
+            model=self._session.model,
+            model_step_id=model_step_identity.model_step_id,
+            execution_profile_fingerprint=self._execution_profile.fingerprint,
+        )
+        yield (
+            await self._executor._event_writer.emit(
+                _tool_exposure_event(
+                    exposure=tool_exposure_evidence,
+                    session=self._session,
+                    registered_agent=self._registered_agent,
+                    environment_name=self._environment_name,
+                    model_step_identity=model_step_identity,
+                    execution_profile=self._execution_profile,
+                )
+            ),
+            None,
+        )
         request_events = self._execute_request(
             model_request=model_request,
             step=step,
@@ -6672,6 +6758,7 @@ class ModelStepRun:
             model_step_identity=model_step_identity,
             request_variant=request_variant,
             tool_exposure=tool_exposure,
+            tool_exposure_evidence=tool_exposure_evidence,
         )
         try:
             async for event, outcome in request_events:
@@ -6689,19 +6776,34 @@ class ModelStepRun:
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant = RequestVariant.INITIAL,
         tool_exposure: ResolvedToolExposure | None = None,
+        tool_exposure_evidence: ToolExposure | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        model_step_identity = copy_model_step_identity(model_step_identity)
         tool_exposure = (
             _all_registered_tool_exposure(self._registered_agent)
             if tool_exposure is None
             else _require_frozen_tool_exposure(tool_exposure)
         )
+        if tool_exposure_evidence is None:
+            if self._execution_profile is None:
+                raise RuntimeError("Tool exposure evidence requires an execution profile.")
+            tool_exposure_evidence = tool_exposure_record(
+                tool_exposure,
+                profile_changed=False,
+                step=step,
+                provider_name=self._registered_provider.name,
+                model=self._session.model,
+                model_step_id=model_step_identity.model_step_id,
+                execution_profile_fingerprint=self._execution_profile.fingerprint,
+            )
+        elif type(tool_exposure_evidence) is not ToolExposure:
+            raise TypeError("tool_exposure_evidence must be a ToolExposure or None.")
         if source_transcript_cursor is None:
             source_transcript_cursor = len(messages)
         elif type(source_transcript_cursor) is not int:
             raise TypeError("source_transcript_cursor must be an int.")
         elif source_transcript_cursor < 0:
             raise ValueError("source_transcript_cursor must be >= 0.")
-        model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
         initial_model_attempt_identity = model_step_identity.new_attempt()
         controller = self._executor._run_limit_controller
@@ -7087,6 +7189,7 @@ class ModelStepRun:
             ),
             model_completion_publisher=self._model_completion_publisher,
             tool_exposure=tool_exposure,
+            tool_exposure_evidence=tool_exposure_evidence,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -7272,6 +7375,7 @@ class ModelStepRun:
         | None,
         model_completion_publisher: ModelCompletionPublisher | None,
         tool_exposure: ResolvedToolExposure,
+        tool_exposure_evidence: ToolExposure,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
@@ -7333,6 +7437,7 @@ class ModelStepRun:
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=self._execution_profile,
                 tool_exposure=tool_exposure,
+                tool_exposure_evidence=tool_exposure_evidence,
             )
 
         attempt_events = run_attempt(

@@ -234,6 +234,95 @@ def test_execution_profile_attribution_requires_runtime_or_persisted_authority()
     )
 
 
+def test_request_footprint_tool_exposure_requires_and_retains_runtime_provenance() -> None:
+    fingerprint = "a" * 64
+    exposure_fingerprint = "b" * 64
+    forged = Event(
+        type=EventType.REQUEST_FOOTPRINT_RECORDED,
+        session_id="request-footprint-exposure",
+        payload={
+            "schema_version": 3,
+            "execution_profile_fingerprint": fingerprint,
+            "tool_exposure": {
+                "profile_id": "public-phase",
+                "exposure_fingerprint": exposure_fingerprint,
+                "registered_count": 2,
+                "ceiling_count": 1,
+                "exposed_count": 1,
+                "profile_changed": False,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="tool exposure lacks runtime provenance"):
+        prepare_new_runtime_event(forged, redactor=SecretRedactor())
+
+    attested = event_with_runtime_payload_authority(
+        forged,
+        "execution_profile_fingerprint",
+    )
+    redactor = SecretRedactor(["public", "b" * 8])
+    prepared = prepare_new_runtime_event(attested, redactor=redactor)
+    public = project_runtime_event(prepared, sequence=3, redactor=redactor)
+
+    assert prepared.payload["tool_exposure"] == forged.payload["tool_exposure"]
+    assert public.payload["tool_exposure"] == forged.payload["tool_exposure"]
+
+    reloaded = Event.model_validate(prepared.model_dump(mode="python"))
+    assert (
+        "tool_exposure"
+        not in project_runtime_event(
+            reloaded,
+            sequence=4,
+            redactor=redactor,
+        ).payload
+    )
+    assert (
+        project_persisted_runtime_event(
+            reloaded,
+            sequence=4,
+            redactor=redactor,
+        ).payload["tool_exposure"]
+        == forged.payload["tool_exposure"]
+    )
+
+
+def test_runtime_exposure_digest_survives_an_exact_workload_secret_collision() -> None:
+    exposure_fingerprint = "b" * 64
+    event = Event(
+        type=EventType.TOOL_EXPOSURE_RECORDED,
+        session_id="tool-exposure-secret-collision",
+        payload={
+            "schema_version": 1,
+            "execution_profile_fingerprint": "a" * 64,
+            "profile_id": "public-phase",
+            "exposure_fingerprint": exposure_fingerprint,
+            "registered_count": 2,
+            "ceiling_count": 1,
+            "exposed_count": 1,
+            "profile_changed": False,
+            "step": 1,
+            "provider_name": "provider",
+            "model": "model",
+            "model_step_id": "mstep_00000000000000000000000000000001",
+        },
+    )
+    attested = event_with_runtime_payload_authority(
+        event,
+        "execution_profile_fingerprint",
+        "exposure_fingerprint",
+        "model_step_id",
+        "profile_id",
+    )
+    redactor = SecretRedactor(exposure_fingerprint)
+
+    prepared = prepare_new_runtime_event(attested, redactor=redactor)
+    public = project_runtime_event(prepared, sequence=1, redactor=redactor)
+
+    assert prepared.payload["exposure_fingerprint"] == exposure_fingerprint
+    assert public.payload["exposure_fingerprint"] == exposure_fingerprint
+
+
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
     assert (
         frozenset(PendingToolCallApproval.model_fields) | {"arguments_state"}

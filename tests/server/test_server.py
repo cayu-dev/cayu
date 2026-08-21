@@ -6119,7 +6119,7 @@ def test_server_exposes_session_summary() -> None:
     assert body["session"]["model"] == "fake-model"
     assert body["session"]["environment_name"] is None
     assert "interruption_cascade" not in body
-    assert body["events"]["total_events"] == 9
+    assert body["events"]["total_events"] == 10
     assert body["events"]["counts_by_type"] == {
         "interaction.completed": 1,
         "interaction.started": 1,
@@ -6129,6 +6129,7 @@ def test_server_exposes_session_summary() -> None:
         "request.footprint.recorded": 1,
         "session.completed": 1,
         "session.started": 1,
+        "tool.exposure.recorded": 1,
         "turn.completed": 1,
     }
     assert body["events"]["latest_event"]["type"] == "session.completed"

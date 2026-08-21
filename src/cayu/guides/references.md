@@ -199,8 +199,10 @@ test the stop boundary. Estimated cost is evidence with provenance, not a bill.
 
 `cayu inspect` and `cayu check` are structural and credential-free. The console
 and dashboard inspect durable state; logging and OpenTelemetry sinks observe
-events. Read `request.footprint.recorded` for content-free final-request shape
-and typed proof availability; do not treat local estimates or fingerprints as
+events. Read `tool.exposure.recorded` for content-minimized model-step capability
+projection and `request.footprint.recorded` for final-request shape and typed
+proof availability. Both may include the application-selected public non-secret
+tool-exposure profile label; do not treat local estimates or fingerprints as
 billing, exact provider-wire evidence, or proof about hidden provider prompts.
 Do not confuse successful export with live provider, network, sandbox, or
 deployment verification.

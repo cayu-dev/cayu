@@ -17431,7 +17431,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             cast(
                 "LiteralString",
                 f"""
-                SELECT cayu_events.sequence, cayu_events.event
+                SELECT cayu_events.sequence,
+                       cayu_events.event,
+                       cayu_events.input_contract_runtime_owned
                 FROM cayu_events
                 JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
                 {plan.where_sql}
@@ -17442,7 +17444,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             params,
         )
         rows = await cur.fetchall()
-        return [EventRecord(sequence=row[0], event=Event(**_json_obj(row[1]))) for row in rows]
+        return [
+            EventRecord(
+                sequence=row[0],
+                event=restore_persisted_event_authority(
+                    Event(**_json_obj(row[1])),
+                    input_contract_runtime_owned=row[2],
+                ),
+            )
+            for row in rows
+        ]
 
     async def _query_events_by_session_id_batches(self, query: EventQuery) -> list[EventRecord]:
         records: list[EventRecord] = []

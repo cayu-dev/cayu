@@ -6008,7 +6008,7 @@ def test_model_attempt_footprint_usage_cost_and_evidence_share_governing_profile
         footprint = next(
             event for event in governed if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
         )
-        assert footprint.payload["schema_version"] == 2
+        assert footprint.payload["schema_version"] == 3
 
         pricing = _profile_price_book()
         cost = estimate_session_cost(session_id=session.id, events=events, pricing=pricing)

@@ -21,6 +21,7 @@ from cayu import (
     StaticToolExposurePolicy,
     ToolCapabilityCeiling,
     ToolEffect,
+    ToolExposure,
     ToolExposureDecision,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
@@ -369,9 +370,28 @@ def test_policy_metadata_is_json_safe_and_bounded() -> None:
         ToolExposureDecision(profile_id="review", metadata={"value": object()})
 
 
-def test_policy_decision_does_not_claim_the_exposure_evidence_name() -> None:
+def test_policy_decision_and_exposure_evidence_have_distinct_public_names() -> None:
     assert cayu.ToolExposureDecision is ToolExposureDecision
-    assert not hasattr(cayu, "ToolExposure")
+    assert cayu.ToolExposure is ToolExposure
+    evidence = ToolExposure(
+        execution_profile_fingerprint="b" * 64,
+        profile_id="review",
+        exposure_fingerprint="a" * 64,
+        registered_count=3,
+        ceiling_count=2,
+        exposed_count=1,
+        profile_changed=True,
+        step=2,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    )
+    assert evidence.exposed_count == 1
+
+    invalid = evidence.model_dump(mode="python")
+    invalid["exposed_count"] = 3
+    with pytest.raises(ValidationError, match="exposed_count cannot exceed ceiling_count"):
+        ToolExposure.model_validate(invalid)
 
 
 def test_all_registered_policy_exposes_only_the_effective_ceiling() -> None:

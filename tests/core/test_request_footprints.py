@@ -26,6 +26,7 @@ from cayu import (
     RequestFootprintConfig,
     RequestVariant,
     StructuredOutputSpec,
+    ToolExposure,
     build_prompt_contribution_manifest,
     build_request_footprint,
 )
@@ -145,13 +146,13 @@ def _build(
     )
 
 
-@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 3])
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 4])
 def test_request_footprint_versions_require_supported_exact_integers(
     invalid_version: object,
 ) -> None:
     footprint_payload = _build(_request()).model_dump(mode="python")
     footprint_payload["schema_version"] = invalid_version
-    with pytest.raises(ValidationError, match="schema_version must be integer 1 or 2"):
+    with pytest.raises(ValidationError, match="schema_version must be integer 1, 2, or 3"):
         RequestFootprint.model_validate(footprint_payload)
 
     fingerprint_payload = _build(
@@ -198,13 +199,116 @@ def test_request_footprint_v2_requires_and_retains_its_governing_profile() -> No
     assert footprint.execution_profile_fingerprint == fingerprint
     missing_profile = footprint.model_dump(mode="python")
     missing_profile["execution_profile_fingerprint"] = None
-    with pytest.raises(ValidationError, match="schema v2 requires an execution profile"):
+    with pytest.raises(ValidationError, match=r"schema v2\+ requires an execution profile"):
         RequestFootprint.model_validate(missing_profile)
 
     legacy_with_profile = footprint.model_dump(mode="python")
     legacy_with_profile["schema_version"] = 1
     with pytest.raises(ValidationError, match="schema v1 cannot carry an execution profile"):
         RequestFootprint.model_validate(legacy_with_profile)
+
+
+def test_request_footprint_v3_binds_the_prepared_tool_exposure() -> None:
+    execution_profile_fingerprint = "a" * 64
+    exposure = ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id="review",
+        exposure_fingerprint="b" * 64,
+        registered_count=2,
+        ceiling_count=1,
+        exposed_count=1,
+        profile_changed=False,
+        step=1,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    )
+    footprint = build_request_footprint(
+        _request(),
+        provider_name="provider-a",
+        step=1,
+        attempt=1,
+        max_attempts=1,
+        request_variant=RequestVariant.INITIAL,
+        observation_id="exposure-linked-footprint",
+        model_step_id=exposure.model_step_id,
+        model_attempt_id="matt_00000000000000000000000000000001",
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        tool_exposure=exposure,
+    )
+
+    assert footprint.schema_version == 3
+    assert footprint.tool_exposure is not None
+    assert footprint.tool_exposure.profile_id == "review"
+    assert footprint.tool_exposure.exposure_fingerprint == exposure.exposure_fingerprint
+    assert footprint.fingerprints.tool_manifest.availability == "unavailable"
+
+    mismatched = exposure.model_copy(update={"exposed_count": 0})
+    with pytest.raises(ValueError, match="exposed_count must match"):
+        build_request_footprint(
+            _request(),
+            provider_name="provider-a",
+            step=1,
+            attempt=1,
+            max_attempts=1,
+            request_variant=RequestVariant.INITIAL,
+            observation_id="mismatched-exposure",
+            model_step_id=exposure.model_step_id,
+            model_attempt_id="matt_00000000000000000000000000000002",
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            tool_exposure=mismatched,
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"execution_profile_fingerprint": "c" * 64},
+            "execution profile must match",
+        ),
+        ({"provider_name": "provider-b"}, "provider_name must match"),
+        ({"model": "model-b"}, "model must match"),
+        ({"step": 2}, "step must match"),
+        (
+            {"model_step_id": "mstep_00000000000000000000000000000002"},
+            "model_step_id must match",
+        ),
+    ],
+)
+def test_request_footprint_v3_rejects_mismatched_exposure_authority(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    execution_profile_fingerprint = "a" * 64
+    exposure = ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id="review",
+        exposure_fingerprint="b" * 64,
+        registered_count=1,
+        ceiling_count=1,
+        exposed_count=1,
+        profile_changed=False,
+        step=1,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    ).model_copy(update=changes)
+
+    with pytest.raises(ValueError, match=message):
+        build_request_footprint(
+            _request(),
+            provider_name="provider-a",
+            step=1,
+            attempt=1,
+            max_attempts=1,
+            request_variant=RequestVariant.INITIAL,
+            observation_id="mismatched-exposure-authority",
+            model_step_id="mstep_00000000000000000000000000000001",
+            model_attempt_id="matt_00000000000000000000000000000001",
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            tool_exposure=exposure,
+        )
 
 
 def test_request_footprint_versions_are_required() -> None:
