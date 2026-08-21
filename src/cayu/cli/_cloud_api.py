@@ -5,7 +5,8 @@ from __future__ import annotations
 import ipaddress
 import json
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -45,6 +46,11 @@ class CloudApiClient:
     api_url: str
     api_key: str
     timeout_seconds: float = 30.0
+    api_key_provider: Callable[[], str] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.api_url)
@@ -99,7 +105,7 @@ class CloudApiClient:
     ) -> dict[str, Any]:
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self._current_api_key()}",
         }
         body = None
         if payload is not None:
@@ -146,6 +152,19 @@ class CloudApiClient:
                 "Cayu Cloud API returned an unsupported response.",
             )
         return result
+
+    def _current_api_key(self) -> str:
+        api_key = self.api_key_provider() if self.api_key_provider is not None else self.api_key
+        if (
+            not api_key
+            or api_key != api_key.strip()
+            or any(character.isspace() for character in api_key)
+        ):
+            raise CloudApiError(
+                "api_key_unavailable",
+                "Could not refresh the Cayu Cloud login.",
+            )
+        return api_key
 
     def upload_bytes(
         self,

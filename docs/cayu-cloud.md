@@ -9,6 +9,7 @@ commands from an Agent repository.
 cayu cloud login
 cayu cloud whoami
 cayu cloud deploy .
+cayu cloud deployment status DEPLOYMENT_ID --application my-agent
 cayu cloud deployment timeline DEPLOYMENT_ID --application my-agent
 cayu cloud deployment logs DEPLOYMENT_ID --application my-agent
 cayu cloud service status --application my-agent
@@ -19,6 +20,22 @@ release can be retried or an active release can be cancelled. `deployment logs`
 returns the Cloud-owned structured publication activity for that exact immutable
 release. Both commands use authenticated, tenant-scoped customer API responses and
 emit the same machine-readable JSON envelope as the rest of the Cloud CLI.
+
+If a local deployment wait reaches its deadline while Cayu Cloud is still working, the
+command exits `2` with category `deployment_still_running`; it does not report the
+Release as failed or cancel it. The JSON error includes the current safe status and,
+when Cloud returned canonical IDs, ready-to-run noninteractive `deployment status`,
+`deployment timeline`, and `deployment wait` commands. Explicit `--context` and
+`--api-key-file` selections are preserved in those commands. The validated application
+and deployment identifiers remain available independently if the other identifier is
+invalid. Cayu Cloud owns final promotion and Agent service publication, so these commands
+only need to observe the durable Deployment Operation rather than reproduce those steps.
+
+If release publication finishes but the Agent service is still starting when the same
+local deadline expires, `deploy` exits `2` with category `service_still_starting` and a
+ready-to-run `service status` command. A timed-out service teardown similarly reports
+`service_deletion_still_running`; neither result marks the retained Cloud operation as
+failed.
 
 `service status` reports `degraded` when a required Agent process repeatedly fails to
 start. Its `result.issues` array preserves Cloud's safe structured diagnostics, including

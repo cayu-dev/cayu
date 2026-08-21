@@ -9,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import sys
 import time
 import webbrowser
@@ -18,6 +19,7 @@ from typing import Any, Never, TypedDict
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_auth import (
+    CloudAuthCredentials,
     CloudAuthError,
     CloudAuthStore,
     WorkOSDeviceAuthClient,
@@ -33,9 +35,21 @@ from cayu.cli._cloud_project import (
 )
 
 _DEPLOYMENT_FAILURES = {"cancelled", "destroyed", "failed"}
+_DEPLOYMENT_IN_PROGRESS = {
+    "accepted",
+    "image_built",
+    "image_scanned",
+    "policy_compiled",
+    "sandbox_template_ready",
+    "source_resolved",
+}
 _DEPLOYMENT_READY = {"smoke_tested", "promoted"}
+_DEPLOYMENT_STATUSES = _DEPLOYMENT_FAILURES | _DEPLOYMENT_IN_PROGRESS | _DEPLOYMENT_READY
 _SERVICE_FAILURES = {"degraded", "failed", "stopped"}
+_SERVICE_IN_PROGRESS = {"deleting", "deploying", "sleeping", "starting", "stopping"}
 _SERVICE_READY = {"running"}
+_SERVICE_STATUSES = _SERVICE_FAILURES | _SERVICE_IN_PROGRESS | _SERVICE_READY
+_CLOUD_DEPLOYMENT_ID = re.compile(r"dep_[a-z0-9]{1,64}")
 _PRODUCTION_API_URL = "https://cloud.cayu.dev"
 _SOURCE_BUILD_FAILURE_MESSAGE = "The Agent image could not be built."
 _SOURCE_BUILD_FAILURE_HINT = "Fix the Agent source and deploy again."
@@ -93,6 +107,93 @@ class _CloudDeploymentFailureError(CloudApiError):
     ) -> None:
         super().__init__(category, message)
         self.failure = failure.copy()
+
+
+class _CloudDeploymentStillRunningError(CloudApiError):
+    """A local wait ended while Cayu Cloud retained the deployment operation."""
+
+    def __init__(
+        self,
+        *,
+        application_id: str,
+        deployment_id: str,
+        recovery_arguments: Sequence[str] = (),
+        status: str,
+    ) -> None:
+        super().__init__(
+            "deployment_still_running",
+            "Cayu Cloud is still processing this deployment.",
+        )
+        self.application_id = _cloud_application_id(application_id)
+        self.deployment_id = _cloud_deployment_id(deployment_id)
+        self.recovery_arguments = tuple(recovery_arguments)
+        self.status = status if status in _DEPLOYMENT_IN_PROGRESS else "processing"
+
+    def public_details(self) -> dict[str, object]:
+        details: dict[str, object] = {"status": self.status}
+        if self.application_id is not None:
+            details["application"] = self.application_id
+        if self.deployment_id is not None:
+            details["deployment_id"] = self.deployment_id
+        if self.application_id is not None and self.deployment_id is not None:
+            command = ["cayu", "cloud", *self.recovery_arguments, "deployment"]
+            suffix = [self.deployment_id, "--application", self.application_id]
+            details["commands"] = {
+                action: shlex.join([*command, action, *suffix])
+                for action in ("status", "timeline", "wait")
+            }
+        return details
+
+
+class _CloudServiceStillRunningError(CloudApiError):
+    """A local wait ended while Cayu Cloud retained a service operation."""
+
+    def __init__(
+        self,
+        *,
+        application_id: str,
+        deleting: bool,
+        recovery_arguments: Sequence[str] = (),
+        status: str,
+    ) -> None:
+        super().__init__(
+            "service_deletion_still_running" if deleting else "service_still_starting",
+            (
+                "Cayu Cloud is still deleting this Agent service."
+                if deleting
+                else "Cayu Cloud is still starting this Agent service."
+            ),
+        )
+        self.application_id = _cloud_application_id(application_id)
+        self.recovery_arguments = tuple(recovery_arguments)
+        self.status = status if status in _SERVICE_IN_PROGRESS else "processing"
+
+    def public_details(self) -> dict[str, object]:
+        details: dict[str, object] = {"status": self.status}
+        if self.application_id is not None:
+            details["application"] = self.application_id
+            details["commands"] = {
+                "status": shlex.join(
+                    [
+                        "cayu",
+                        "cloud",
+                        *self.recovery_arguments,
+                        "service",
+                        "status",
+                        "--application",
+                        self.application_id,
+                    ]
+                )
+            }
+        return details
+
+
+def _cloud_deployment_id(value: str) -> str | None:
+    return value if _CLOUD_DEPLOYMENT_ID.fullmatch(value) is not None else None
+
+
+def _cloud_application_id(value: str) -> str | None:
+    return value if is_application_slug(value) else None
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -158,6 +259,8 @@ def _cloud_failure(exc: Exception) -> int:
     error: dict[str, object] = {"category": category, "message": message}
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
+    if isinstance(exc, (_CloudDeploymentStillRunningError, _CloudServiceStillRunningError)):
+        error.update(exc.public_details())
     if isinstance(exc, _CloudServiceHealthError):
         error["issues"] = exc.issues
     print(
@@ -661,6 +764,7 @@ def _deploy(
             deployment_id=str(deployment["id"]),
             include_failure_diagnostics=True,
             poll_seconds=arguments.poll_seconds,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
             wait_seconds=arguments.wait_seconds,
             sleep=sleep,
             monotonic=monotonic,
@@ -694,6 +798,7 @@ def _deploy(
                 application_id=str(application["id"]),
                 initial=service,
                 poll_seconds=arguments.poll_seconds,
+                recovery_arguments=_cloud_recovery_arguments(arguments),
                 wait_seconds=arguments.wait_seconds,
                 sleep=sleep,
                 monotonic=monotonic,
@@ -893,6 +998,7 @@ def _deployment(
     base = f"/v1/applications/{application_id}/deployments/{arguments.deployment_id}"
     if arguments.deployment_command == "status":
         result = client.request("GET", base)
+        _deployment_status(result)
     elif arguments.deployment_command in {"logs", "timeline"}:
         result = client.request("GET", f"{base}/{arguments.deployment_command}")
     elif arguments.deployment_command == "wait":
@@ -901,6 +1007,7 @@ def _deployment(
             application_id=application_id,
             deployment_id=arguments.deployment_id,
             poll_seconds=arguments.poll_seconds,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
             wait_seconds=arguments.wait_seconds,
             sleep=sleep,
             monotonic=monotonic,
@@ -971,6 +1078,7 @@ def _service(
     path = f"/v1/applications/{application_id}/service"
     if action == "status":
         result = client.request("GET", path)
+        _service_status(result)
     elif action == "restart":
         result = client.request("POST", f"{path}/restart")
     elif action in {"sleep", "wake"}:
@@ -979,17 +1087,21 @@ def _service(
         result = client.request("GET", f"{path}/logs")
     else:
         result = client.request("DELETE", path)
-        if result.get("status") == "deleting":
+        result_status = None if not result else _service_status(result)
+        if result_status == "deleting":
             _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
             deadline = monotonic() + arguments.wait_seconds
-            while result.get("status") == "deleting":
+            while result_status == "deleting":
                 if monotonic() >= deadline:
-                    raise CloudApiError(
-                        "wait_timeout",
-                        "Timed out waiting for application service deletion.",
+                    raise _CloudServiceStillRunningError(
+                        application_id=application_id,
+                        deleting=True,
+                        recovery_arguments=_cloud_recovery_arguments(arguments),
+                        status=result_status,
                     )
                 sleep(arguments.poll_seconds)
                 result = client.request("GET", path)
+                result_status = _service_status(result)
     return {"operation": f"service.{action}", "result": result}
 
 
@@ -1022,6 +1134,7 @@ def _wait_for_deployment(
     deployment_id: str,
     include_failure_diagnostics: bool = False,
     poll_seconds: float,
+    recovery_arguments: Sequence[str] = (),
     wait_seconds: float,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
@@ -1031,7 +1144,7 @@ def _wait_for_deployment(
     path = f"/v1/applications/{application_id}/deployments/{deployment_id}"
     while True:
         deployment = client.request("GET", path)
-        status = deployment.get("status")
+        status = _deployment_status(deployment)
         if status in _DEPLOYMENT_READY:
             return deployment
         if status in _DEPLOYMENT_FAILURES:
@@ -1048,7 +1161,12 @@ def _wait_for_deployment(
                 f"Deployment reached terminal status: {status}",
             )
         if monotonic() >= deadline:
-            raise CloudApiError("wait_timeout", "Timed out waiting for deployment.")
+            raise _CloudDeploymentStillRunningError(
+                application_id=application_id,
+                deployment_id=deployment_id,
+                recovery_arguments=recovery_arguments,
+                status=status,
+            )
         sleep(poll_seconds)
 
 
@@ -1103,12 +1221,23 @@ def _deployment_failure_string(value: object, *, max_bytes: int) -> str | None:
     return value
 
 
+def _deployment_status(deployment: dict[str, Any]) -> str:
+    status = deployment.get("status")
+    if not isinstance(status, str) or status not in _DEPLOYMENT_STATUSES:
+        raise CloudApiError(
+            "api_response_invalid",
+            "Cayu Cloud returned an invalid deployment status.",
+        )
+    return status
+
+
 def _wait_for_service(
     client: CloudApiClient,
     *,
     application_id: str,
     initial: dict[str, Any],
     poll_seconds: float,
+    recovery_arguments: Sequence[str] = (),
     wait_seconds: float,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
@@ -1118,7 +1247,7 @@ def _wait_for_service(
     path = f"/v1/applications/{application_id}/service"
     service = initial
     while True:
-        status = service.get("status")
+        status = _service_status(service)
         if status in _SERVICE_READY:
             return service
         if status in _SERVICE_FAILURES:
@@ -1129,9 +1258,24 @@ def _wait_for_service(
                 issues=issues,
             )
         if monotonic() >= deadline:
-            raise CloudApiError("wait_timeout", "Timed out waiting for Agent service readiness.")
+            raise _CloudServiceStillRunningError(
+                application_id=application_id,
+                deleting=False,
+                recovery_arguments=recovery_arguments,
+                status=status,
+            )
         sleep(poll_seconds)
         service = client.request("GET", path)
+
+
+def _service_status(service: dict[str, Any]) -> str:
+    status = service.get("status")
+    if not isinstance(status, str) or status not in _SERVICE_STATUSES:
+        raise CloudApiError(
+            "api_response_invalid",
+            "Cayu Cloud returned an invalid Agent service status.",
+        )
+    return status
 
 
 def _service_issues(service: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1268,6 +1412,18 @@ def _configured_cloud_api_url(
     return context_url()
 
 
+def _cloud_login_authority_fingerprint(credentials: CloudAuthCredentials) -> str:
+    authority = {
+        "api_url": credentials.api_url,
+        "organization_id": credentials.organization_id,
+        "user_id": credentials.user_id,
+        "workos_api_hostname": credentials.workos_api_hostname,
+        "workos_client_id": credentials.workos_client_id,
+    }
+    payload = json.dumps(authority, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(b"cayu.cloud-login-authority.v1\0" + payload).hexdigest()
+
+
 def _cloud_client(
     arguments: argparse.Namespace,
     *,
@@ -1330,6 +1486,28 @@ def _cloud_client(
                 "The saved login belongs to another Cayu Cloud; run "
                 "`cayu cloud login` to sign in to production.",
             )
+        authority_fingerprint = _cloud_login_authority_fingerprint(credentials)
+
+        def require_same_login_authority(current: CloudAuthCredentials) -> None:
+            if _cloud_login_authority_fingerprint(current) != authority_fingerprint:
+                raise CloudAuthError(
+                    "login_authority_changed",
+                    "The Cayu Cloud login authority changed; run `cayu cloud login` again.",
+                )
+
+        def current_access_token() -> str:
+            current = fresh_cloud_credentials(
+                auth_store,
+                timeout_seconds=arguments.timeout_seconds,
+            )
+            if current is None:
+                raise CloudAuthError(
+                    "cloud_auth_unavailable",
+                    "Could not read the local Cayu Cloud login.",
+                )
+            require_same_login_authority(current)
+            return current.access_token
+
         credentials = fresh_cloud_credentials(
             auth_store,
             timeout_seconds=arguments.timeout_seconds,
@@ -1339,10 +1517,12 @@ def _cloud_client(
                 "cloud_auth_unavailable",
                 "Could not read the local Cayu Cloud login.",
             )
+        require_same_login_authority(credentials)
         return CloudApiClient(
             api_url=api_url,
             api_key=credentials.access_token,
             timeout_seconds=arguments.timeout_seconds,
+            api_key_provider=current_access_token,
         )
 
     raise CloudAuthError(
@@ -1358,6 +1538,17 @@ def _evidence_directory(arguments: argparse.Namespace) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return Path.home() / ".local" / "state" / "cayu-cloud" / "evidence"
+
+
+def _cloud_recovery_arguments(arguments: argparse.Namespace) -> tuple[str, ...]:
+    result: list[str] = []
+    for flag, value in (
+        ("--context", getattr(arguments, "context", None)),
+        ("--api-key-file", getattr(arguments, "api_key_file", None)),
+    ):
+        if value is not None:
+            result.extend((flag, str(value)))
+    return tuple(result)
 
 
 def _correlation_id(operation: str) -> str:

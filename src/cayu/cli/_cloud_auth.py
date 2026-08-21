@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import math
 import os
+import sys
 import time
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,10 +21,24 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from cayu.cli._cloud_private_state import write_private_json
+from cayu._filesystem_lock import cooperative_path_lock
+from cayu.cli._cloud_private_state import (
+    PreparedPrivateJsonWrite,
+    prepare_private_json,
+    remove_private_json_staging,
+    write_private_json,
+)
 
 _DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 _REFRESH_SKEW_SECONDS = 60.0
+_REFRESH_RETRY_DELAYS_SECONDS = (0.25, 0.5)
+_REFRESH_RETRY_WINDOW_SECONDS = 25.0
+# Bound the complete refresh attempt so one lost acknowledgement still leaves
+# time for a replay inside WorkOS's 30-second rotated-token grace period.
+_REFRESH_HTTP_ATTEMPT_TIMEOUT_SECONDS = 5.0
+_AUTH_LOCK_DIRECTORY = "cayu-cloud-auth-locks-v1"
+_AUTH_TEXT_MAX_BYTES = 32_768
+_AUTH_REFRESH_STAGING_PREFIX = ".cayu-cloud-auth-refresh-"
 
 
 class CloudAuthError(RuntimeError):
@@ -56,7 +76,7 @@ class CloudAuthCredentials:
                 or not value
                 or value != value.strip()
                 or any(character.isspace() for character in value)
-                or len(value.encode()) > 32_768
+                or len(value.encode()) > _AUTH_TEXT_MAX_BYTES
             ):
                 raise ValueError(f"Cayu Cloud {field_name} is invalid.")
         _workos_base_url(self.workos_api_hostname)
@@ -121,31 +141,172 @@ class CloudAuthStore:
     def save(self, credentials: CloudAuthCredentials) -> None:
         if type(credentials) is not CloudAuthCredentials:
             raise TypeError("credentials must be CloudAuthCredentials.")
-        _write_private_json(
-            self.path,
-            {
-                "access_token": credentials.access_token,
-                "api_url": credentials.api_url,
-                "expires_at": credentials.expires_at,
-                "organization_id": credentials.organization_id,
-                "refresh_token": credentials.refresh_token,
-                "schema_version": 1,
-                "user_id": credentials.user_id,
-                "workos_api_hostname": credentials.workos_api_hostname,
-                "workos_client_id": credentials.workos_client_id,
-            },
-        )
+        with self._exclusive_lock():
+            self._save_unlocked(credentials)
+
+    @contextmanager
+    def prepare_refresh(
+        self,
+        expected: CloudAuthCredentials,
+    ) -> Iterator[_CloudAuthRefreshPublication]:
+        """Reserve publication capacity for one exact rotating-token refresh."""
+
+        if type(expected) is not CloudAuthCredentials:
+            raise TypeError("expected must be CloudAuthCredentials.")
+        try:
+            with ExitStack() as resources:
+                with self._exclusive_lock():
+                    current = self.load()
+                    prepared = None
+                    if current is not None and _same_cloud_auth_credentials(current, expected):
+                        prepared = resources.enter_context(
+                            prepare_private_json(
+                                self.path,
+                                _refresh_reservation_payload(current),
+                                staging_prefix=_auth_refresh_staging_prefix(self.path),
+                            )
+                        )
+                yield _CloudAuthRefreshPublication(
+                    store=self,
+                    expected=expected,
+                    current=current,
+                    prepared=prepared,
+                )
+        except CloudAuthError:
+            raise
+        except (OSError, ValueError, ExceptionGroup) as exc:
+            raise CloudAuthError(
+                "cloud_auth_unavailable",
+                "Could not prepare or clean up the local Cayu Cloud login refresh.",
+            ) from exc
+
+    def _save_unlocked(self, credentials: CloudAuthCredentials) -> None:
+        _write_private_json(self.path, _credentials_payload(credentials))
 
     def delete(self) -> bool:
-        existed = self.path.exists()
+        with self._exclusive_lock():
+            failures: list[Exception] = []
+            existed = True
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                existed = False
+            except OSError as exc:
+                failures.append(exc)
+            removed_staging = 0
+            try:
+                removed_staging = remove_private_json_staging(
+                    self.path,
+                    staging_prefix=_auth_refresh_staging_prefix(self.path),
+                )
+            except (OSError, ExceptionGroup) as exc:
+                failures.append(exc)
+            if failures:
+                cause: Exception
+                if len(failures) == 1:
+                    cause = failures[0]
+                else:
+                    cause = ExceptionGroup(
+                        "Cloud authentication cleanup failed.",
+                        failures,
+                    )
+                raise CloudAuthError(
+                    "cloud_auth_unavailable",
+                    "Could not remove the local Cayu Cloud login.",
+                ) from cause
+            return existed or removed_staging > 0
+
+    @contextmanager
+    def _exclusive_lock(self) -> Iterator[None]:
         try:
-            self.path.unlink(missing_ok=True)
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with cooperative_path_lock(
+                self.path.parent,
+                self.path.name,
+                lock_directory_name=_AUTH_LOCK_DIRECTORY,
+            ):
+                yield
         except OSError as exc:
             raise CloudAuthError(
                 "cloud_auth_unavailable",
-                "Could not remove the local Cayu Cloud login.",
+                "Could not update the local Cayu Cloud login.",
             ) from exc
-        return existed
+
+
+@dataclass(slots=True)
+class _CloudAuthRefreshPublication:
+    store: CloudAuthStore
+    expected: CloudAuthCredentials
+    current: CloudAuthCredentials | None
+    prepared: PreparedPrivateJsonWrite | None
+
+    def publish(
+        self,
+        replacement: CloudAuthCredentials,
+    ) -> CloudAuthCredentials | None:
+        if type(replacement) is not CloudAuthCredentials:
+            raise TypeError("replacement must be CloudAuthCredentials.")
+        if self.prepared is None:
+            return self.current
+        replacement_payload = _credentials_payload(replacement)
+        with self.store._exclusive_lock():
+            current = self.store.load()
+            if current is None or not _same_cloud_auth_credentials(current, self.expected):
+                return current
+            try:
+                self.prepared.publish(replacement_payload)
+            except (OSError, ValueError) as publication_error:
+                try:
+                    published = self.store.load()
+                except CloudAuthError:
+                    published = None
+                if published is not None and _same_cloud_auth_credentials(
+                    published,
+                    replacement,
+                ):
+                    try:
+                        self.prepared.adopt_observed_publication()
+                    except (OSError, ValueError) as synchronization_error:
+                        raise CloudAuthError(
+                            "cloud_auth_unavailable",
+                            "Could not save the refreshed Cayu Cloud login.",
+                        ) from synchronization_error
+                    return published
+                try:
+                    self.prepared.retry_publication(replacement_payload)
+                except (OSError, ValueError) as retry_error:
+                    try:
+                        published = self.store.load()
+                    except CloudAuthError:
+                        published = None
+                    if published is not None and _same_cloud_auth_credentials(
+                        published,
+                        replacement,
+                    ):
+                        try:
+                            self.prepared.adopt_observed_publication()
+                        except (OSError, ValueError) as synchronization_error:
+                            raise CloudAuthError(
+                                "cloud_auth_unavailable",
+                                "Could not save the refreshed Cayu Cloud login.",
+                            ) from synchronization_error
+                        return published
+                    raise CloudAuthError(
+                        "cloud_auth_unavailable",
+                        "Could not save the refreshed Cayu Cloud login.",
+                    ) from ExceptionGroup(
+                        "Private JSON publication attempts failed.",
+                        [
+                            publication_error,
+                            _detach_historical_exception_context(
+                                retry_error,
+                                historical=publication_error,
+                            ),
+                        ],
+                    )
+                else:
+                    return replacement
+            return replacement
 
 
 class WorkOSDeviceAuthClient:
@@ -241,19 +402,59 @@ class WorkOSDeviceAuthClient:
         raise CloudAuthError("login_expired", "Cayu Cloud login expired.")
 
     def refresh(self, credentials: CloudAuthCredentials) -> CloudAuthCredentials:
-        response = self._request(
-            "POST",
-            f"{_workos_base_url(credentials.workos_api_hostname)}/user_management/authenticate",
-            form={
-                "client_id": credentials.workos_client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": credentials.refresh_token,
-            },
-        )
-        if not 200 <= response.status_code < 300:
+        response: httpx.Response | None = None
+        retry_started_monotonic = time.monotonic()
+        retry_started_wall = time.time()
+        for attempt, retry_delay in enumerate((*_REFRESH_RETRY_DELAYS_SECONDS, None)):
+            if attempt > 0 and not _refresh_retry_window_open(
+                started_monotonic=retry_started_monotonic,
+                started_wall=retry_started_wall,
+            ):
+                return _transient_refresh_fallback(credentials)
+            try:
+                attempt_timeout_seconds = min(
+                    self.timeout_seconds,
+                    _REFRESH_HTTP_ATTEMPT_TIMEOUT_SECONDS,
+                )
+                response = self._request(
+                    "POST",
+                    f"{_workos_base_url(credentials.workos_api_hostname)}/user_management/authenticate",
+                    form={
+                        "client_id": credentials.workos_client_id,
+                        "grant_type": "refresh_token",
+                        "refresh_token": credentials.refresh_token,
+                    },
+                    timeout_seconds=attempt_timeout_seconds,
+                    total_timeout_seconds=attempt_timeout_seconds,
+                )
+            except CloudAuthError as exc:
+                if exc.category != "login_unavailable":
+                    raise
+            else:
+                if 200 <= response.status_code < 300:
+                    break
+                if not _transient_refresh_status(response.status_code):
+                    if response.status_code == 400 and _workos_error(response) == "invalid_grant":
+                        raise CloudAuthError(
+                            "login_refresh_failed",
+                            "The Cayu Cloud login expired; run `cayu cloud login` again.",
+                        )
+                    raise CloudAuthError(
+                        "login_refresh_failed",
+                        "Cayu Cloud authentication service rejected the login refresh.",
+                    )
+            if retry_delay is None or not _refresh_retry_window_open(
+                started_monotonic=retry_started_monotonic,
+                started_wall=retry_started_wall,
+                additional_seconds=retry_delay,
+            ):
+                return _transient_refresh_fallback(credentials)
+            time.sleep(retry_delay)
+
+        if response is None:  # pragma: no cover - the loop always attempts one request
             raise CloudAuthError(
-                "login_refresh_failed",
-                "The Cayu Cloud login expired; run `cayu cloud login` again.",
+                "login_refresh_unavailable",
+                "The Cayu Cloud login could not refresh temporarily; retry this command.",
             )
         refreshed = _credentials_from_response(
             _json_object(response),
@@ -292,18 +493,48 @@ class WorkOSDeviceAuthClient:
         url: str,
         *,
         form: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        total_timeout_seconds: float | None = None,
     ) -> httpx.Response:
         try:
+            if total_timeout_seconds is not None:
+                return asyncio.run(
+                    self._request_with_total_timeout(
+                        method,
+                        url,
+                        form=form,
+                        phase_timeout_seconds=(
+                            self.timeout_seconds if timeout_seconds is None else timeout_seconds
+                        ),
+                        total_timeout_seconds=total_timeout_seconds,
+                    )
+                )
             with httpx.Client(
                 follow_redirects=False,
-                timeout=self.timeout_seconds,
+                timeout=(self.timeout_seconds if timeout_seconds is None else timeout_seconds),
             ) as client:
                 return client.request(method, url, data=form)
-        except httpx.RequestError:
+        except (httpx.RequestError, TimeoutError):
             raise CloudAuthError(
                 "login_unavailable",
                 "Cayu Cloud authentication service is unavailable.",
             ) from None
+
+    async def _request_with_total_timeout(
+        self,
+        method: str,
+        url: str,
+        *,
+        form: dict[str, str] | None,
+        phase_timeout_seconds: float,
+        total_timeout_seconds: float,
+    ) -> httpx.Response:
+        async with asyncio.timeout(total_timeout_seconds):
+            async with httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=phase_timeout_seconds,
+            ) as client:
+                return await client.request(method, url, data=form)
 
 
 def fresh_cloud_credentials(
@@ -316,12 +547,130 @@ def fresh_cloud_credentials(
         return None
     if credentials.expires_at > time.time() + _REFRESH_SKEW_SECONDS:
         return credentials
-    refreshed = WorkOSDeviceAuthClient(
-        api_url=credentials.api_url,
-        timeout_seconds=timeout_seconds,
-    ).refresh(credentials)
-    store.save(refreshed)
-    return refreshed
+    with store.prepare_refresh(credentials) as publication:
+        current = publication.current
+        if current is None or not _same_cloud_auth_credentials(current, credentials):
+            return current
+        try:
+            refreshed = WorkOSDeviceAuthClient(
+                api_url=current.api_url,
+                timeout_seconds=timeout_seconds,
+            ).refresh(current)
+        except CloudAuthError as refresh_error:
+            try:
+                reconciled = store.load()
+            except CloudAuthError as reconciliation_error:
+                raise refresh_error from reconciliation_error
+            if reconciled is None or not _same_cloud_auth_credentials(
+                reconciled,
+                current,
+            ):
+                return reconciled
+            raise
+        if refreshed is current:
+            return store.load()
+        return publication.publish(refreshed)
+
+
+def _transient_refresh_status(status_code: int) -> bool:
+    return status_code in {408, 429} or 500 <= status_code < 600
+
+
+def _refresh_retry_window_open(
+    *,
+    started_monotonic: float,
+    started_wall: float,
+    additional_seconds: float = 0.0,
+) -> bool:
+    monotonic_elapsed = time.monotonic() - started_monotonic
+    wall_elapsed = time.time() - started_wall
+    return (
+        0.0 <= monotonic_elapsed + additional_seconds < _REFRESH_RETRY_WINDOW_SECONDS
+        and 0.0 <= wall_elapsed + additional_seconds < _REFRESH_RETRY_WINDOW_SECONDS
+    )
+
+
+def _transient_refresh_fallback(
+    credentials: CloudAuthCredentials,
+) -> CloudAuthCredentials:
+    if credentials.expires_at > time.time():
+        return credentials
+    raise CloudAuthError(
+        "login_refresh_unavailable",
+        "The Cayu Cloud login could not refresh temporarily; retry this command.",
+    )
+
+
+def _workos_error(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    return error if isinstance(error, str) else None
+
+
+def _same_cloud_auth_credentials(
+    left: CloudAuthCredentials,
+    right: CloudAuthCredentials,
+) -> bool:
+    tokens_match = hmac.compare_digest(
+        left.access_token.encode("utf-8"),
+        right.access_token.encode("utf-8"),
+    ) & hmac.compare_digest(
+        left.refresh_token.encode("utf-8"),
+        right.refresh_token.encode("utf-8"),
+    )
+    return tokens_match and (
+        left.api_url == right.api_url
+        and left.workos_api_hostname == right.workos_api_hostname
+        and left.workos_client_id == right.workos_client_id
+        and left.expires_at == right.expires_at
+        and left.organization_id == right.organization_id
+        and left.user_id == right.user_id
+    )
+
+
+def _detach_historical_exception_context(
+    error: Exception,
+    *,
+    historical: Exception,
+) -> Exception:
+    if error.__context__ is historical:
+        error.__context__ = None
+    return error
+
+
+def _credentials_payload(credentials: CloudAuthCredentials) -> dict[str, Any]:
+    return {
+        "access_token": credentials.access_token,
+        "api_url": credentials.api_url,
+        "expires_at": credentials.expires_at,
+        "organization_id": credentials.organization_id,
+        "refresh_token": credentials.refresh_token,
+        "schema_version": 1,
+        "user_id": credentials.user_id,
+        "workos_api_hostname": credentials.workos_api_hostname,
+        "workos_client_id": credentials.workos_client_id,
+    }
+
+
+def _auth_refresh_staging_prefix(path: Path) -> str:
+    destination_digest = hashlib.sha256(os.fsencode(path.name)).hexdigest()
+    return f"{_AUTH_REFRESH_STAGING_PREFIX}{destination_digest}-"
+
+
+def _refresh_reservation_payload(
+    credentials: CloudAuthCredentials,
+) -> dict[str, Any]:
+    payload = _credentials_payload(credentials)
+    maximum_escaped_value = "\0" * _AUTH_TEXT_MAX_BYTES
+    payload["access_token"] = maximum_escaped_value
+    payload["refresh_token"] = maximum_escaped_value
+    payload["expires_at"] = sys.float_info.max
+    return payload
 
 
 def _credentials_from_response(

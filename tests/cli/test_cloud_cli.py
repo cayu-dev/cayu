@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -590,6 +591,70 @@ def test_service_destroy_waits_until_the_application_is_stopped() -> None:
     ]
 
 
+def test_service_destroy_is_idempotent_when_no_service_exists() -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            if path == "/v1/applications":
+                return {"items": [{"id": "outbound-agent", "name": "Outbound Agent"}]}
+            if method == "DELETE" and path.endswith("/service"):
+                return {}
+            raise AssertionError(f"unexpected Cloud request: {method} {path}")
+
+    result = cloud_cli._service(
+        SimpleNamespace(
+            application="outbound-agent",
+            poll_seconds=1.0,
+            service_command="destroy",
+            wait_seconds=1.0,
+        ),
+        client=Client(),
+    )
+
+    assert result == {"operation": "service.destroy", "result": {}}
+
+
+def test_service_destroy_timeout_reports_the_retained_cloud_operation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            if path == "/v1/applications":
+                return {"items": [{"id": "outbound-agent", "name": "Outbound Agent"}]}
+            if method == "DELETE" and path.endswith("/service"):
+                return {"application_id": "outbound-agent", "status": "deleting"}
+            raise AssertionError(f"unexpected Cloud request: {method} {path}")
+
+    clock = iter((0.0, 10.0))
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._service(
+            SimpleNamespace(
+                application="outbound-agent",
+                poll_seconds=1.0,
+                service_command="destroy",
+                wait_seconds=1.0,
+            ),
+            client=Client(),
+            sleep=lambda _: None,
+            monotonic=lambda: next(clock),
+        )
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "application": "outbound-agent",
+            "category": "service_deletion_still_running",
+            "commands": {
+                "status": "cayu cloud service status --application outbound-agent",
+            },
+            "message": "Cayu Cloud is still deleting this Agent service.",
+            "status": "deleting",
+        },
+        "ok": False,
+    }
+
+
 def test_service_status_preserves_structured_health_issues(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -824,7 +889,7 @@ def test_cloud_deploy_is_implemented_by_the_core_package(
             body = json.loads(self.rfile.read(length)) if length else None
             requests.append(("POST", self.path, body))
             idempotency_keys.append(self.headers["Idempotency-Key"])
-            payload = json.dumps({"id": "dep_one", "status": "queued"}).encode()
+            payload = json.dumps({"id": "dep_one", "status": "accepted"}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -1123,7 +1188,7 @@ def test_cloud_deploy_uploads_a_local_bundle_before_creating_the_release(
                     }
                 )
             else:
-                self._reply({"id": "dep_local", "status": "queued"})
+                self._reply({"id": "dep_local", "status": "accepted"})
 
         def do_PUT(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1540,7 +1605,7 @@ def test_cloud_deploy_wait_preserves_every_degraded_process_issue(
                     ]
                 }
             if method == "POST" and path.endswith("/deployments"):
-                return {"id": "dep_health", "status": "queued"}
+                return {"id": "dep_health", "status": "accepted"}
             if method == "POST" and path.endswith("/promote"):
                 return {
                     "current_deployment_id": "dep_health",
@@ -1704,6 +1769,254 @@ def test_cloud_deploy_wait_falls_back_when_timeline_failure_is_unavailable() -> 
     assert str(raised.value) == "Deployment reached terminal status: failed"
 
 
+def test_cloud_deploy_wait_reports_a_nonterminal_deployment_after_local_timeout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, path, kwargs
+            return {"id": "dep_running", "status": "image_built"}
+
+    times = iter((0.0, 10.0))
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_deployment(
+            Client(),
+            application_id="outbound-agent",
+            deployment_id="dep_running",
+            include_failure_diagnostics=True,
+            poll_seconds=0.01,
+            wait_seconds=1.0,
+            sleep=lambda _: None,
+            monotonic=lambda: next(times),
+        )
+
+    assert raised.value.category == "deployment_still_running"
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "application": "outbound-agent",
+            "category": "deployment_still_running",
+            "commands": {
+                "status": ("cayu cloud deployment status dep_running --application outbound-agent"),
+                "timeline": (
+                    "cayu cloud deployment timeline dep_running --application outbound-agent"
+                ),
+                "wait": ("cayu cloud deployment wait dep_running --application outbound-agent"),
+            },
+            "deployment_id": "dep_running",
+            "message": "Cayu Cloud is still processing this deployment.",
+            "status": "image_built",
+        },
+        "ok": False,
+    }
+
+
+def test_cloud_deploy_timeout_exposes_recovery_for_a_real_application_slug(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            if path == "/v1/applications":
+                return {
+                    "items": [
+                        {
+                            "current_deployment_id": None,
+                            "id": "outbound-agent",
+                            "name": "Outbound Agent",
+                            "revision": 1,
+                        }
+                    ]
+                }
+            if method == "POST" and path.endswith("/deployments"):
+                return {"id": "dep_running", "status": "accepted"}
+            if method == "GET" and path.endswith("/dep_running"):
+                return {"id": "dep_running", "status": "image_scanned"}
+            raise AssertionError(f"unexpected Cloud request: {method} {path}")
+
+    manifest = cloud_project.CloudProjectManifest.loads(
+        """
+schema_version = 1
+application = "outbound-agent"
+name = "Outbound Agent"
+version = "1.0.0"
+entrypoint = "python -m outbound"
+capabilities = ["model.generate"]
+cpu_millis = 512
+memory_mb = 1024
+timeout_seconds = 600
+environment = "python"
+compatibility = "cayu>=0.1"
+policy_version = "v1"
+"""
+    )
+    project = cloud_project.ResolvedCloudProject(
+        root=None,
+        manifest_path=tmp_path / "cayu-cloud.toml",
+        manifest=manifest,
+        repository="https://github.com/example/outbound-agent",
+        revision="a" * 40,
+    )
+    times = iter((0.0, 10.0))
+
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._deploy(
+            SimpleNamespace(
+                application=None,
+                no_promote=False,
+                no_wait=False,
+                poll_seconds=0.01,
+                wait_seconds=1.0,
+            ),
+            client=Client(),
+            recorder=EvidenceRecorder(tmp_path / "evidence"),
+            project=project,
+            sleep=lambda _: None,
+            monotonic=lambda: next(times),
+        )
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["application"] == "outbound-agent"
+    assert error["deployment_id"] == "dep_running"
+    assert set(error["commands"]) == {"status", "timeline", "wait"}
+
+
+def test_cloud_deploy_recovery_commands_preserve_explicit_connection_options() -> None:
+    context = Path("private contexts/staging.json")
+    api_key_file = Path("private keys/staging.key")
+    error = cloud_cli._CloudDeploymentStillRunningError(
+        application_id="outbound-agent",
+        deployment_id="dep_running",
+        recovery_arguments=(
+            "--context",
+            str(context),
+            "--api-key-file",
+            str(api_key_file),
+        ),
+        status="image_built",
+    )
+
+    commands = error.public_details()["commands"]
+    assert isinstance(commands, dict)
+    for action, command in commands.items():
+        parsed = cloud_cli._build_parser().parse_args(shlex.split(str(command))[2:])
+        assert parsed.context == context
+        assert parsed.api_key_file == api_key_file
+        assert parsed.deployment_command == action
+        assert parsed.deployment_id == "dep_running"
+        assert parsed.application == "outbound-agent"
+
+
+@pytest.mark.parametrize("status", [None, 7, [], {}, "queued", "future_phase"])
+def test_cloud_deploy_wait_rejects_an_invalid_status(status: object) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, path, kwargs
+            return {"id": "dep_running", "status": status}
+
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_deployment(
+            Client(),
+            application_id="outbound-agent",
+            deployment_id="dep_running",
+            poll_seconds=0.01,
+            wait_seconds=1.0,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    assert raised.value.category == "api_response_invalid"
+    assert str(raised.value) == "Cayu Cloud returned an invalid deployment status."
+
+
+@pytest.mark.parametrize("status", [[], "future_phase"])
+@pytest.mark.parametrize(
+    ("command", "message"),
+    [
+        (
+            [
+                "deployment",
+                "status",
+                "dep_running",
+                "--application",
+                "outbound-agent",
+            ],
+            "Cayu Cloud returned an invalid deployment status.",
+        ),
+        (
+            ["service", "status", "--application", "outbound-agent"],
+            "Cayu Cloud returned an invalid Agent service status.",
+        ),
+    ],
+)
+def test_cloud_status_commands_reject_invalid_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+    message: str,
+    status: object,
+) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, kwargs
+            if path == "/v1/applications":
+                return {"items": [{"id": "outbound-agent", "name": "Outbound Agent"}]}
+            return {"status": status}
+
+    monkeypatch.setattr(
+        cloud_cli,
+        "_cloud_client",
+        lambda *_args, **_kwargs: Client(),
+    )
+
+    assert main(["cloud", *command]) == 2
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "category": "api_response_invalid",
+            "message": message,
+        },
+        "ok": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("application_id", "deployment_id", "unsafe_value"),
+    [
+        ("credential=customer-secret-material", "dep_running", "customer-secret-material"),
+        ("app_" + "a" * 65, "dep_running", "app_" + "a" * 65),
+        (
+            "outbound-agent",
+            "sk-proj-customer-secret-material",
+            "sk-proj-customer-secret-material",
+        ),
+        ("outbound-agent", "dep_" + "a" * 65, "dep_" + "a" * 65),
+    ],
+)
+def test_cloud_deploy_wait_omits_unsafe_recovery_identifiers(
+    application_id: str,
+    deployment_id: str,
+    unsafe_value: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = cloud_cli._CloudDeploymentStillRunningError(
+        application_id=application_id,
+        deployment_id=deployment_id,
+        status="image_built",
+    )
+
+    assert cloud_cli._cloud_failure(error) == 2
+    rendered = capsys.readouterr().out
+    error_payload = json.loads(rendered)["error"]
+    assert error_payload["category"] == "deployment_still_running"
+    assert error_payload["message"] == "Cayu Cloud is still processing this deployment."
+    assert error_payload["status"] == "image_built"
+    assert "commands" not in error_payload
+    assert unsafe_value not in rendered
+
+
 @pytest.mark.parametrize(
     "unsafe_detail",
     [
@@ -1823,6 +2136,63 @@ def test_cloud_deploy_wait_requires_the_agent_service_to_be_running() -> None:
     assert client.requests == [
         ("GET", "/v1/applications/outbound-agent/service"),
     ]
+
+
+def test_cloud_deploy_wait_reports_a_service_that_is_still_starting(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, path, kwargs
+            raise AssertionError("service wait should time out before another request")
+
+    times = iter((0.0, 10.0))
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            Client(),
+            application_id="outbound-agent",
+            initial={"issues": [], "status": "starting"},
+            poll_seconds=0.01,
+            wait_seconds=1.0,
+            sleep=lambda _: None,
+            monotonic=lambda: next(times),
+        )
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "application": "outbound-agent",
+            "category": "service_still_starting",
+            "commands": {
+                "status": "cayu cloud service status --application outbound-agent",
+            },
+            "message": "Cayu Cloud is still starting this Agent service.",
+            "status": "starting",
+        },
+        "ok": False,
+    }
+
+
+@pytest.mark.parametrize("status", [None, 7, [], {}, "future_status"])
+def test_cloud_deploy_wait_rejects_an_invalid_service_status(status: object) -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            del method, path, kwargs
+            raise AssertionError("invalid initial status should fail before another request")
+
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            Client(),
+            application_id="outbound-agent",
+            initial={"issues": [], "status": status},
+            poll_seconds=0.01,
+            wait_seconds=1.0,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    assert raised.value.category == "api_response_invalid"
+    assert str(raised.value) == "Cayu Cloud returned an invalid Agent service status."
 
 
 def test_cloud_inspection_commands_are_implemented_by_the_core_package(
