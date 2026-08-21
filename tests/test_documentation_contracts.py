@@ -250,8 +250,10 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "confirm revision 36 with no pending migrations" in v0_2_1
     assert "revision 39" not in v0_2_1
 
-    assert "advances from revision 36 to revision 45" in v0_3_0
-    assert "confirm revision 45 with no pending migrations" in v0_3_0
+    assert "advances from revision 36 to revision 47" in v0_3_0
+    assert "confirm revision 47 with no pending migrations" in v0_3_0
+    assert "Revision 47 adds the origin-aware immutable Evals result index" in v0_3_0
+    assert "revision-46 workers must be stopped before migration" in v0_3_0
     assert "Breaking schema revision 39" in v0_3_0
     assert "Breaking schema revision 40" in v0_3_0
     assert "confirm revision 40 before starting current workers" in v0_3_0

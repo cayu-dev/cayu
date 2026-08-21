@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -17,7 +17,12 @@ from pydantic import (
 
 from cayu.evals.corpus import _sha256_revision
 from cayu.evals.execution import CorpusExecutionResult
-from cayu.evals.published import PublishedStatus, _assertion_contract
+from cayu.evals.published import PublishedStatus
+from cayu.evals.results import (
+    CapturedEvaluationResultV1,
+    EvalResultProjectionV1,
+    eval_result_projection,
+)
 
 
 class CorpusComparisonReason(StrEnum):
@@ -275,51 +280,55 @@ class _ExecutionProjection:
 
 
 def _validated_projection(
-    result: CorpusExecutionResult,
+    result: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
     field_name: str,
 ) -> _ExecutionProjection:
     """Validate one potentially forged graph, then retain only bounded comparison data."""
 
-    if type(result) is not CorpusExecutionResult:
-        raise TypeError(f"{field_name} must be an exact CorpusExecutionResult.")
-    validated = CorpusExecutionResult.model_validate(
-        result.model_dump(mode="python", round_trip=True, warnings="none")
-    )
-    run = validated.run
-    case_contract = tuple((case.case_id, case.case_revision) for case in run.cases)
+    if type(result) is EvalResultProjectionV1:
+        projection = EvalResultProjectionV1.model_validate(
+            result.model_dump(mode="python", round_trip=True, warnings="none")
+        )
+    elif type(result) in {CorpusExecutionResult, CapturedEvaluationResultV1}:
+        projection = eval_result_projection(
+            cast("CorpusExecutionResult | CapturedEvaluationResultV1", result)
+        )
+    else:
+        raise TypeError(
+            f"{field_name} must be an exact CorpusExecutionResult, "
+            "CapturedEvaluationResultV1, or EvalResultProjectionV1."
+        )
+    case_contract = tuple((case.case_id, case.case_revision) for case in projection.cases)
     assertion_contract = tuple(
         (
             case.case_id,
-            tuple(_assertion_contract(assertion) for assertion in case.trials[0].assertions),
+            tuple(
+                (assertion.assertion_id, assertion.comparison_revision)
+                for assertion in case.assertions
+            ),
         )
-        for case in run.cases
-    )
-    uses_pricing = any(
-        assertion.detail.kind == "max_estimated_cost"
-        for case in run.cases
-        for trial in case.trials
-        for assertion in trial.assertions
+        for case in projection.cases
     )
     summary = CorpusComparisonResultSummary(
-        result_revision=validated.revision,
-        application_release_id=validated.target.application_release_id,
-        app_manifest_fingerprint=validated.target.app_manifest_fingerprint,
-        status=run.status,
-        score=run.score,
+        result_revision=projection.result_revision,
+        application_release_id=projection.target.application_release_id,
+        app_manifest_fingerprint=projection.target.app_manifest_fingerprint,
+        status=projection.status,
+        score=projection.score,
     )
     cases = tuple(
         _CaseOutcome(case_id=case.case_id, status=case.status, score=case.score)
-        for case in run.cases
+        for case in projection.cases
     )
     return _ExecutionProjection(
-        result_revision=validated.revision,
-        target_key=run.target_key,
-        corpus_revision=run.corpus_revision,
-        suite_id=run.suite_id,
-        suite_revision=run.suite_revision,
-        evidence_policy_revision=run.evidence_policy_revision,
-        pricing_profile_fingerprint=run.pricing_profile_fingerprint,
-        uses_pricing=uses_pricing,
+        result_revision=projection.result_revision,
+        target_key=projection.target.target_key,
+        corpus_revision=projection.corpus_revision,
+        suite_id=projection.suite_id,
+        suite_revision=projection.suite_revision,
+        evidence_policy_revision=projection.evidence_policy_revision,
+        pricing_profile_fingerprint=projection.pricing_profile_fingerprint,
+        uses_pricing=projection.uses_pricing,
         case_contract=case_contract,
         assertion_contract=assertion_contract,
         summary=summary,
@@ -364,6 +373,18 @@ def corpus_execution_compatibility(
     current: CorpusExecutionResult,
 ) -> CorpusComparisonCompatibility:
     """Check evaluation-contract compatibility without comparing target releases."""
+
+    return _compatibility_from_projections(
+        _validated_projection(baseline, "baseline"),
+        _validated_projection(current, "current"),
+    )
+
+
+def eval_result_compatibility(
+    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+) -> CorpusComparisonCompatibility:
+    """Check compatibility across captured and fresh immutable result origins."""
 
     return _compatibility_from_projections(
         _validated_projection(baseline, "baseline"),
@@ -442,14 +463,12 @@ def _regressions_from_summaries(
     return tuple(regressions)
 
 
-def compare_corpus_execution_results(
-    baseline: CorpusExecutionResult,
-    current: CorpusExecutionResult,
+def _compare_projected_results(
+    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
     *,
-    score_tolerance: float = 0.0,
+    score_tolerance: float,
 ) -> CorpusExecutionComparison:
-    """Compare published results only when their complete eval contracts match."""
-
     if type(score_tolerance) not in (int, float) or isinstance(score_tolerance, bool):
         raise TypeError("score_tolerance must be a number.")
     if score_tolerance != score_tolerance or score_tolerance < 0 or score_tolerance > 1:
@@ -494,4 +513,38 @@ def compare_corpus_execution_results(
         current=current_summary,
         cases=cases,
         regressions=regressions,
+    )
+
+
+def compare_corpus_execution_results(
+    baseline: CorpusExecutionResult,
+    current: CorpusExecutionResult,
+    *,
+    score_tolerance: float = 0.0,
+) -> CorpusExecutionComparison:
+    """Compare published fresh results only when their complete contracts match."""
+
+    if type(baseline) is not CorpusExecutionResult:
+        raise TypeError("baseline must be an exact CorpusExecutionResult.")
+    if type(current) is not CorpusExecutionResult:
+        raise TypeError("current must be an exact CorpusExecutionResult.")
+    return _compare_projected_results(
+        baseline,
+        current,
+        score_tolerance=score_tolerance,
+    )
+
+
+def compare_eval_results(
+    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    *,
+    score_tolerance: float = 0.0,
+) -> CorpusExecutionComparison:
+    """Compare captured and fresh results through their shared public projection."""
+
+    return _compare_projected_results(
+        baseline,
+        current,
+        score_tolerance=score_tolerance,
     )

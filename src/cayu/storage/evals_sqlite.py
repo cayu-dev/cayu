@@ -12,14 +12,26 @@ from uuid import uuid4
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_BYTES,
     EvalCorpusDocument,
+    EvalCorpusInspectionV1,
     _portable_id,
     _sha256_revision,
     eval_corpus_from_json,
 )
 from cayu.evals.execution import CORPUS_EXECUTION_RESULT_MAX_BYTES, CorpusExecutionResult
 from cayu.evals.execution_reporting import corpus_execution_result_from_json
+from cayu.evals.results import (
+    CapturedEvaluationResultV1,
+    EvalResultOrigin,
+    EvalResultTargetIdentityV1,
+    captured_evaluation_result_from_json,
+)
 from cayu.evals.store import (
     TERMINAL_EVAL_RUN_STATUSES,
+    EvalBaselineConflict,
+    EvalBaselineKey,
+    EvalBaselineMutationRecord,
+    EvalBaselineRecord,
+    EvalBaselineUpdate,
     EvalCaseCatalogEntry,
     EvalCaseCatalogPage,
     EvalCaseCatalogQuery,
@@ -27,6 +39,8 @@ from cayu.evals.store import (
     EvalCorpusCatalogEntry,
     EvalCorpusCatalogPage,
     EvalCorpusConflict,
+    EvalResultConflict,
+    EvalResultRecord,
     EvalRunAdmissionConflict,
     EvalRunClaim,
     EvalRunClaimLost,
@@ -54,15 +68,19 @@ from cayu.evals.store import (
     _copy_query,
     _exact_model,
     _lease_seconds,
+    _prepare_baseline_update_for_store,
+    _prepare_captured_result_for_store,
     _prepare_corpus_catalog_for_store,
     _prepare_result_for_store,
     _prepare_run_request_for_store,
     _read_limit,
     _store_identifier,
+    _validate_baseline_result,
     decode_case_cursor,
     decode_corpus_cursor,
     decode_run_cursor,
     decode_suite_cursor,
+    eval_result_record,
     result_summary,
     validate_result_for_run,
 )
@@ -70,7 +88,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 33
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 47
 
 _RUN_COLUMNS = """
     run_id,
@@ -94,6 +112,22 @@ _RUN_COLUMNS = """
     result_score,
     result_duration_ms,
     failure_code
+"""
+
+_RESULT_RECORD_COLUMNS = """
+    revision,
+    origin,
+    target_key,
+    corpus_revision,
+    suite_id,
+    suite_revision,
+    application_release_id,
+    app_manifest_schema_version,
+    app_manifest_fingerprint,
+    result_status,
+    result_score,
+    document_bytes,
+    created_at
 """
 
 
@@ -157,10 +191,62 @@ def _run_record_from_row(row: sqlite3.Row) -> EvalRunRecord:
     )
 
 
+def _result_record_from_row(row: sqlite3.Row) -> EvalResultRecord:
+    return EvalResultRecord(
+        revision=row["revision"],
+        origin=EvalResultOrigin(row["origin"]),
+        target=EvalResultTargetIdentityV1(
+            target_key=row["target_key"],
+            application_release_id=row["application_release_id"],
+            app_manifest_schema_version=row["app_manifest_schema_version"],
+            app_manifest_fingerprint=row["app_manifest_fingerprint"],
+        ),
+        corpus_revision=row["corpus_revision"],
+        suite_id=row["suite_id"],
+        suite_revision=row["suite_revision"],
+        status=row["result_status"],
+        score=row["result_score"],
+        document_bytes=row["document_bytes"],
+        created_at=sqlite_support.parse_datetime(row["created_at"]),
+    )
+
+
+def _baseline_key_from_row(row: sqlite3.Row) -> EvalBaselineKey:
+    return EvalBaselineKey(
+        target_key=row["target_key"],
+        corpus_revision=row["corpus_revision"],
+        suite_id=row["suite_id"],
+    )
+
+
+def _baseline_record_from_row(row: sqlite3.Row) -> EvalBaselineRecord:
+    return EvalBaselineRecord(
+        key=_baseline_key_from_row(row),
+        result_revision=row["result_revision"],
+        generation=row["generation"],
+        updated_by=row["updated_by"],
+        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+    )
+
+
+def _baseline_mutation_from_row(row: sqlite3.Row) -> EvalBaselineMutationRecord:
+    return EvalBaselineMutationRecord(
+        operation_id=row["operation_id"],
+        key=_baseline_key_from_row(row),
+        expected_generation=row["expected_generation"],
+        previous_result_revision=row["previous_result_revision"],
+        selected_result_revision=row["selected_result_revision"],
+        resulting_generation=row["resulting_generation"],
+        actor_id=row["actor_id"],
+        created_at=sqlite_support.parse_datetime(row["created_at"]),
+    )
+
+
 class SQLiteEvalStore(EvalStore):
     """Restart-durable embedded eval persistence for a single SQLite database."""
 
     durable: ClassVar[bool] = True
+    captured_results: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -228,88 +314,17 @@ class SQLiteEvalStore(EvalStore):
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 now = datetime.now(UTC)
-                existing = connection.execute(
-                    "SELECT document_json FROM cayu_eval_corpora WHERE revision = ?",
-                    (corpus.revision,),
-                ).fetchone()
-                if existing is not None:
-                    if existing["document_json"] != document_text:
-                        raise EvalCorpusConflict(
-                            f"Eval corpus revision {corpus.revision} has conflicting content."
-                        )
-                    entry = self._load_corpus_entry(connection, corpus.revision)
-                    connection.commit()
-                    assert entry is not None
-                    return entry
-                connection.execute(
-                    """
-                    INSERT INTO cayu_eval_corpora (
-                        revision, target_key, evidence_policy_revision,
-                        pricing_profile_fingerprint, suite_count, case_count,
-                        assertion_count, expanded_assertion_result_count,
-                        document_json, document_bytes, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        corpus.revision,
-                        inspection.target_key,
-                        inspection.evidence_policy_revision,
-                        inspection.pricing_profile_fingerprint,
-                        inspection.suite_count,
-                        inspection.case_count,
-                        inspection.assertion_count,
-                        inspection.expanded_assertion_result_count,
-                        document_text,
-                        len(document),
-                        _format_datetime(now),
-                    ),
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO cayu_eval_suites (
-                        corpus_revision, suite_id, suite_revision, name, description,
-                        case_count, assertion_count, trials, timeout_seconds
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            item.corpus_revision,
-                            item.id,
-                            item.revision,
-                            item.name,
-                            item.description,
-                            item.case_count,
-                            item.assertion_count,
-                            item.trials,
-                            item.timeout_seconds,
-                        )
-                        for item in suites
-                    ],
-                )
-                connection.executemany(
-                    """
-                    INSERT INTO cayu_eval_cases (
-                        corpus_revision, case_id, case_revision, suite_id, name,
-                        description, message_count, assertion_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            item.corpus_revision,
-                            item.id,
-                            item.revision,
-                            item.suite_id,
-                            item.name,
-                            item.description,
-                            item.message_count,
-                            item.assertion_count,
-                        )
-                        for item in cases
-                    ],
+                entry = self._save_prepared_corpus_in_transaction(
+                    connection,
+                    corpus=corpus,
+                    document_text=document_text,
+                    document_bytes=len(document),
+                    inspection=inspection,
+                    suites=suites,
+                    cases=cases,
+                    created_at=now,
                 )
                 connection.commit()
-                entry = self._load_corpus_entry(connection, corpus.revision)
-                assert entry is not None
                 return entry
             except BaseException:
                 connection.rollback()
@@ -917,6 +932,14 @@ class SQLiteEvalStore(EvalStore):
                         _format_datetime(now),
                     ),
                 )
+                self._save_result_in_transaction(
+                    connection,
+                    result=validated,
+                    document_text=document_text,
+                    document_bytes=len(document),
+                    created_at=now,
+                    fresh_run_id=claim.run_id,
+                )
                 connection.execute(
                     """
                     UPDATE cayu_eval_runs
@@ -1045,6 +1068,256 @@ class SQLiteEvalStore(EvalStore):
             return None
         return await asyncio.to_thread(corpus_execution_result_from_json, document)
 
+    async def save_captured_result(
+        self,
+        corpus: EvalCorpusDocument,
+        result: CapturedEvaluationResultV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalResultRecord:
+        corpus, corpus_document, inspection, suites, cases = await asyncio.to_thread(
+            _prepare_corpus_catalog_for_store,
+            corpus,
+            redact_json=redact_json,
+        )
+        result, result_document = await asyncio.to_thread(
+            _prepare_captured_result_for_store,
+            result,
+            corpus,
+            redact_json=redact_json,
+        )
+        corpus_text = corpus_document.decode("utf-8")
+        result_text = result_document.decode("utf-8")
+
+        def operation(connection: sqlite3.Connection) -> EvalResultRecord:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC)
+                self._save_prepared_corpus_in_transaction(
+                    connection,
+                    corpus=corpus,
+                    document_text=corpus_text,
+                    document_bytes=len(corpus_document),
+                    inspection=inspection,
+                    suites=suites,
+                    cases=cases,
+                    created_at=now,
+                )
+                record = self._save_result_in_transaction(
+                    connection,
+                    result=result,
+                    document_text=result_text,
+                    document_bytes=len(result_document),
+                    created_at=now,
+                    fresh_run_id=None,
+                )
+                connection.commit()
+                return record
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run(operation)
+
+    async def load_result_by_revision(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = CORPUS_EXECUTION_RESULT_MAX_BYTES,
+    ) -> CorpusExecutionResult | CapturedEvaluationResultV1 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=CORPUS_EXECUTION_RESULT_MAX_BYTES)
+
+        def operation(connection: sqlite3.Connection) -> tuple[EvalResultOrigin, str] | None:
+            row = connection.execute(
+                """
+                SELECT origin, document_bytes, fresh_run_id
+                FROM cayu_eval_result_records
+                WHERE revision = ?
+                """,
+                (revision,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["document_bytes"] > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            origin = EvalResultOrigin(row["origin"])
+            if origin is EvalResultOrigin.CAPTURED_SESSION:
+                document_row = connection.execute(
+                    "SELECT captured_result_json FROM cayu_eval_result_records WHERE revision = ?",
+                    (revision,),
+                ).fetchone()
+                document = None if document_row is None else document_row[0]
+            else:
+                document_row = connection.execute(
+                    "SELECT result_json FROM cayu_eval_results WHERE run_id = ?",
+                    (row["fresh_run_id"],),
+                ).fetchone()
+                document = None if document_row is None else document_row[0]
+            if document is None:
+                raise RuntimeError("Immutable eval result document is unavailable.")
+            return origin, document
+
+        loaded = await self._run(operation)
+        if loaded is None:
+            return None
+        origin, document = loaded
+        if origin is EvalResultOrigin.CAPTURED_SESSION:
+            return await asyncio.to_thread(captured_evaluation_result_from_json, document)
+        return await asyncio.to_thread(corpus_execution_result_from_json, document)
+
+    async def load_result_record(self, revision: str) -> EvalResultRecord | None:
+        revision = _sha256_revision(revision, "revision")
+
+        def operation(connection: sqlite3.Connection) -> EvalResultRecord | None:
+            row = connection.execute(
+                f"SELECT {_RESULT_RECORD_COLUMNS} FROM cayu_eval_result_records WHERE revision = ?",
+                (revision,),
+            ).fetchone()
+            return None if row is None else _result_record_from_row(row)
+
+        return await self._run(operation)
+
+    async def set_baseline(
+        self,
+        update: EvalBaselineUpdate,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalBaselineMutationRecord:
+        update = _prepare_baseline_update_for_store(update, redact_json=redact_json)
+
+        def operation(connection: sqlite3.Connection) -> EvalBaselineMutationRecord:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                replay_row = connection.execute(
+                    "SELECT * FROM cayu_eval_baseline_mutations WHERE operation_id = ?",
+                    (update.operation_id,),
+                ).fetchone()
+                if replay_row is not None:
+                    replay = _baseline_mutation_from_row(replay_row)
+                    if not self._baseline_mutation_matches(replay, update):
+                        raise EvalBaselineConflict(
+                            "Baseline operation id is already bound to another mutation."
+                        )
+                    connection.commit()
+                    return replay
+                result_row = connection.execute(
+                    f"SELECT {_RESULT_RECORD_COLUMNS} FROM cayu_eval_result_records "
+                    "WHERE revision = ?",
+                    (update.result_revision,),
+                ).fetchone()
+                if result_row is None:
+                    raise KeyError(f"Eval result not found: {update.result_revision}")
+                _validate_baseline_result(update, _result_record_from_row(result_row))
+                current_row = connection.execute(
+                    """
+                    SELECT target_key, corpus_revision, suite_id, result_revision,
+                           generation, updated_by, updated_at
+                    FROM cayu_eval_baselines
+                    WHERE target_key = ? AND corpus_revision = ? AND suite_id = ?
+                    """,
+                    (
+                        update.key.target_key,
+                        update.key.corpus_revision,
+                        update.key.suite_id,
+                    ),
+                ).fetchone()
+                current = None if current_row is None else _baseline_record_from_row(current_row)
+                generation = 0 if current is None else current.generation
+                if generation != update.expected_generation:
+                    raise EvalBaselineConflict("Eval baseline generation changed.")
+                if generation >= 9223372036854775807:
+                    raise EvalBaselineConflict("Eval baseline generation is exhausted.")
+                now = datetime.now(UTC)
+                next_generation = generation + 1
+                connection.execute(
+                    """
+                    INSERT INTO cayu_eval_baselines (
+                        target_key, corpus_revision, suite_id, result_revision,
+                        generation, updated_by, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(target_key, corpus_revision, suite_id) DO UPDATE SET
+                        result_revision = excluded.result_revision,
+                        generation = excluded.generation,
+                        updated_by = excluded.updated_by,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        update.key.target_key,
+                        update.key.corpus_revision,
+                        update.key.suite_id,
+                        update.result_revision,
+                        next_generation,
+                        update.actor_id,
+                        _format_datetime(now),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cayu_eval_baseline_mutations (
+                        operation_id, target_key, corpus_revision, suite_id,
+                        expected_generation, previous_result_revision,
+                        selected_result_revision, resulting_generation, actor_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        update.operation_id,
+                        update.key.target_key,
+                        update.key.corpus_revision,
+                        update.key.suite_id,
+                        update.expected_generation,
+                        None if current is None else current.result_revision,
+                        update.result_revision,
+                        next_generation,
+                        update.actor_id,
+                        _format_datetime(now),
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM cayu_eval_baseline_mutations WHERE operation_id = ?",
+                    (update.operation_id,),
+                ).fetchone()
+                assert row is not None
+                connection.commit()
+                return _baseline_mutation_from_row(row)
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run(operation)
+
+    async def load_baseline(self, key: EvalBaselineKey) -> EvalBaselineRecord | None:
+        key = _exact_model(key, EvalBaselineKey, "key")
+
+        def operation(connection: sqlite3.Connection) -> EvalBaselineRecord | None:
+            row = connection.execute(
+                """
+                SELECT target_key, corpus_revision, suite_id, result_revision,
+                       generation, updated_by, updated_at
+                FROM cayu_eval_baselines
+                WHERE target_key = ? AND corpus_revision = ? AND suite_id = ?
+                """,
+                (key.target_key, key.corpus_revision, key.suite_id),
+            ).fetchone()
+            return None if row is None else _baseline_record_from_row(row)
+
+        return await self._run(operation)
+
+    async def load_baseline_mutation(
+        self,
+        operation_id: str,
+    ) -> EvalBaselineMutationRecord | None:
+        operation_id = _sha256_revision(operation_id, "operation_id")
+
+        def operation(connection: sqlite3.Connection) -> EvalBaselineMutationRecord | None:
+            row = connection.execute(
+                "SELECT * FROM cayu_eval_baseline_mutations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            return None if row is None else _baseline_mutation_from_row(row)
+
+        return await self._run(operation)
+
     async def _terminalize_without_result(
         self,
         claim: EvalRunClaim,
@@ -1144,6 +1417,188 @@ class SQLiteEvalStore(EvalStore):
             return _request_from_row(self._require_run_row(connection, run_id))
 
         return await self._run(operation)
+
+    @classmethod
+    def _save_result_in_transaction(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        result: CorpusExecutionResult | CapturedEvaluationResultV1,
+        document_text: str,
+        document_bytes: int,
+        created_at: datetime,
+        fresh_run_id: str | None,
+    ) -> EvalResultRecord:
+        record = eval_result_record(
+            result,
+            document_bytes=document_bytes,
+            created_at=created_at,
+        )
+        existing_row = connection.execute(
+            f"SELECT {_RESULT_RECORD_COLUMNS}, fresh_run_id, captured_result_json "
+            "FROM cayu_eval_result_records WHERE revision = ?",
+            (record.revision,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _result_record_from_row(existing_row)
+            if existing != record.model_copy(update={"created_at": existing.created_at}):
+                raise EvalResultConflict(
+                    f"Eval result revision {record.revision} has conflicting metadata."
+                )
+            if existing.origin is EvalResultOrigin.CAPTURED_SESSION:
+                existing_document = existing_row["captured_result_json"]
+            else:
+                fresh = connection.execute(
+                    "SELECT result_json FROM cayu_eval_results WHERE run_id = ?",
+                    (existing_row["fresh_run_id"],),
+                ).fetchone()
+                existing_document = None if fresh is None else fresh["result_json"]
+            if existing_document != document_text:
+                raise EvalResultConflict(
+                    f"Eval result revision {record.revision} has conflicting content."
+                )
+            return existing
+        captured_document = (
+            document_text if record.origin is EvalResultOrigin.CAPTURED_SESSION else None
+        )
+        if (record.origin is EvalResultOrigin.FRESH_EXECUTION) != (fresh_run_id is not None):
+            raise ValueError("Fresh eval result records require their durable run mapping.")
+        connection.execute(
+            """
+            INSERT INTO cayu_eval_result_records (
+                revision, origin, target_key, corpus_revision, suite_id, suite_revision,
+                application_release_id, app_manifest_schema_version,
+                app_manifest_fingerprint, result_status, result_score, fresh_run_id,
+                captured_result_json, document_bytes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.revision,
+                record.origin.value,
+                record.target.target_key,
+                record.corpus_revision,
+                record.suite_id,
+                record.suite_revision,
+                record.target.application_release_id,
+                record.target.app_manifest_schema_version,
+                record.target.app_manifest_fingerprint,
+                record.status,
+                record.score,
+                fresh_run_id,
+                captured_document,
+                document_bytes,
+                _format_datetime(created_at),
+            ),
+        )
+        return record
+
+    @staticmethod
+    def _baseline_mutation_matches(
+        mutation: EvalBaselineMutationRecord,
+        update: EvalBaselineUpdate,
+    ) -> bool:
+        return (
+            mutation.operation_id == update.operation_id
+            and mutation.key == update.key
+            and mutation.expected_generation == update.expected_generation
+            and mutation.selected_result_revision == update.result_revision
+            and mutation.actor_id == update.actor_id
+        )
+
+    @classmethod
+    def _save_prepared_corpus_in_transaction(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        corpus: EvalCorpusDocument,
+        document_text: str,
+        document_bytes: int,
+        inspection: EvalCorpusInspectionV1,
+        suites: tuple[EvalSuiteCatalogEntry, ...],
+        cases: tuple[EvalCaseCatalogEntry, ...],
+        created_at: datetime,
+    ) -> EvalCorpusCatalogEntry:
+        existing = connection.execute(
+            "SELECT document_json FROM cayu_eval_corpora WHERE revision = ?",
+            (corpus.revision,),
+        ).fetchone()
+        if existing is not None:
+            if existing["document_json"] != document_text:
+                raise EvalCorpusConflict(
+                    f"Eval corpus revision {corpus.revision} has conflicting content."
+                )
+            entry = cls._load_corpus_entry(connection, corpus.revision)
+            assert entry is not None
+            return entry
+        connection.execute(
+            """
+            INSERT INTO cayu_eval_corpora (
+                revision, target_key, evidence_policy_revision,
+                pricing_profile_fingerprint, suite_count, case_count,
+                assertion_count, expanded_assertion_result_count,
+                document_json, document_bytes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                corpus.revision,
+                inspection.target_key,
+                inspection.evidence_policy_revision,
+                inspection.pricing_profile_fingerprint,
+                inspection.suite_count,
+                inspection.case_count,
+                inspection.assertion_count,
+                inspection.expanded_assertion_result_count,
+                document_text,
+                document_bytes,
+                _format_datetime(created_at),
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO cayu_eval_suites (
+                corpus_revision, suite_id, suite_revision, name, description,
+                case_count, assertion_count, trials, timeout_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item.corpus_revision,
+                    item.id,
+                    item.revision,
+                    item.name,
+                    item.description,
+                    item.case_count,
+                    item.assertion_count,
+                    item.trials,
+                    item.timeout_seconds,
+                )
+                for item in suites
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO cayu_eval_cases (
+                corpus_revision, case_id, case_revision, suite_id, name,
+                description, message_count, assertion_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item.corpus_revision,
+                    item.id,
+                    item.revision,
+                    item.suite_id,
+                    item.name,
+                    item.description,
+                    item.message_count,
+                    item.assertion_count,
+                )
+                for item in cases
+            ],
+        )
+        entry = cls._load_corpus_entry(connection, corpus.revision)
+        assert entry is not None
+        return entry
 
     @staticmethod
     def _corpus_exists(connection: sqlite3.Connection, revision: str) -> bool:

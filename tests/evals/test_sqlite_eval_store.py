@@ -7,14 +7,24 @@ from contextlib import suppress
 
 import pytest
 from tests.evals.eval_store_conformance import (
+    assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
+    captured_result_for_corpus,
 )
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
 
 import cayu.storage.evals_sqlite as evals_sqlite_module
-from cayu.evals.execution import run_corpus_suite
-from cayu.evals.store import EvalRunClaim, EvalRunRecord, EvalRunRequest, EvalRunStatus
+from cayu.evals.corpus import EvalCorpusDocument
+from cayu.evals.execution import CorpusExecutionResult, run_corpus_suite
+from cayu.evals.store import (
+    EvalBaselineKey,
+    EvalBaselineUpdate,
+    EvalRunClaim,
+    EvalRunRecord,
+    EvalRunRequest,
+    EvalRunStatus,
+)
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor
@@ -74,13 +84,18 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
         store = SQLiteEvalStore(tmp_path / "evals.db")
         try:
             await assert_eval_store_conformance(store, corpus=corpus, result=result)
+            await assert_captured_eval_store_conformance(
+                store,
+                corpus=corpus,
+                result=result,
+            )
         finally:
             await store.close()
 
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_thirty_three_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_forty_seven_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -91,7 +106,7 @@ def test_sqlite_eval_store_creates_revision_thirty_three_schema(tmp_path) -> Non
     connection = sqlite3.connect(path)
     try:
         revision = connection.execute(
-            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 33"
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 47"
         ).fetchone()
         tables = {
             row[0]
@@ -103,20 +118,28 @@ def test_sqlite_eval_store_creates_revision_thirty_three_schema(tmp_path) -> Non
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'index' "
-                "AND name LIKE 'idx_cayu_eval_runs_target_%'"
+                "AND (name LIKE 'idx_cayu_eval_runs_target_%' "
+                "OR name LIKE 'idx_cayu_eval_result_records_%' "
+                "OR name = 'idx_cayu_eval_baseline_mutations_scope')"
             ).fetchall()
         }
     finally:
         connection.close()
-    assert revision == ("additive", 31)
+    assert revision == ("breaking", 47)
     assert tables == {
+        "cayu_eval_baseline_mutations",
+        "cayu_eval_baselines",
         "cayu_eval_cases",
         "cayu_eval_corpora",
+        "cayu_eval_result_records",
         "cayu_eval_results",
         "cayu_eval_runs",
         "cayu_eval_suites",
     }
     assert indexes == {
+        "idx_cayu_eval_baseline_mutations_scope",
+        "idx_cayu_eval_result_records_contract",
+        "idx_cayu_eval_result_records_target_catalog",
         "idx_cayu_eval_runs_target_catalog",
         "idx_cayu_eval_runs_target_status_claim",
     }
@@ -140,16 +163,122 @@ def test_sqlite_eval_store_is_restart_durable_and_idempotent(tmp_path) -> None:
         assert claimed is not None
         completed = await _publish_result(first, claimed.claim, result)
         assert completed.status is EvalRunStatus.COMPLETED
+        captured = captured_result_for_corpus(corpus, result)
+        await first.save_captured_result(
+            corpus,
+            captured,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+        baseline_key = EvalBaselineKey(
+            target_key=corpus.target_key,
+            corpus_revision=corpus.revision,
+            suite_id=corpus.suites[0].id,
+        )
+        baseline_mutation = await first.set_baseline(
+            EvalBaselineUpdate(
+                key=baseline_key,
+                result_revision=captured.revision,
+                expected_generation=0,
+                operation_id="sha256:" + "9" * 64,
+                actor_id="restart-operator",
+            ),
+            redact_json=_NO_SECRETS.redact_json,
+        )
         await first.close()
 
         reopened = SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
         assert await reopened.load_corpus(corpus.revision) == corpus
         assert await reopened.load_run(completed.id) == completed
         assert await reopened.load_result(completed.id) == result
+        assert await reopened.load_result_by_revision(result.revision) == result
+        assert await reopened.load_result_by_revision(captured.revision) == captured
+        baseline = await reopened.load_baseline(baseline_key)
+        assert baseline is not None
+        assert baseline.result_revision == captured.revision
+        assert (
+            await reopened.load_baseline_mutation(baseline_mutation.operation_id)
+            == baseline_mutation
+        )
         assert await _admit_run(reopened, _request(corpus, run_id="retry-id")) == completed
         await reopened.close()
 
     asyncio.run(exercise())
+
+
+def test_sqlite_revision_forty_seven_indexes_existing_fresh_results(tmp_path) -> None:
+    path = tmp_path / "evals.db"
+
+    async def prepare_revision_forty_six() -> tuple[EvalCorpusDocument, CorpusExecutionResult]:
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+        store = SQLiteEvalStore(path)
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus, run_id="pre-revision-47"))
+            lease = await store.claim_run()
+            assert lease is not None
+            await _publish_result(store, lease.claim, result)
+        finally:
+            await store.close()
+        return corpus, result
+
+    corpus, result = asyncio.run(prepare_revision_forty_six())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TABLE cayu_eval_baseline_mutations;
+            DROP TABLE cayu_eval_baselines;
+            DROP TABLE cayu_eval_result_records;
+            DELETE FROM cayu_schema_migrations WHERE revision = 47;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate_and_read() -> None:
+        store = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+        try:
+            record = await store.load_result_record(result.revision)
+            assert record is not None
+            assert record.target.target_key == corpus.target_key
+            assert await store.load_result_by_revision(result.revision) == result
+        finally:
+            await store.close()
+
+    asyncio.run(migrate_and_read())
+
+
+def test_sqlite_revision_forty_seven_rejects_a_nonunique_baseline_audit_index(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals.db"
+
+    async def initialize() -> None:
+        store = SQLiteEvalStore(path)
+        await store.close()
+
+    asyncio.run(initialize())
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_eval_baseline_mutations_scope")
+        connection.execute(
+            "CREATE INDEX idx_cayu_eval_baseline_mutations_scope "
+            "ON cayu_eval_baseline_mutations("
+            "target_key, corpus_revision, suite_id, resulting_generation)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="revision-47 Evals query contract"):
+        SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
 
 @pytest.mark.parametrize(

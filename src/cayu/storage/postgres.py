@@ -1868,6 +1868,117 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         ON CONFLICT (singleton) DO NOTHING
         """,
     ),
+    47: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_result_records (
+            revision TEXT COLLATE "C" PRIMARY KEY,
+            origin TEXT NOT NULL CHECK (origin IN ('captured_session', 'fresh_execution')),
+            target_key TEXT NOT NULL,
+            corpus_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE "C" NOT NULL,
+            suite_revision TEXT NOT NULL,
+            application_release_id TEXT NOT NULL,
+            app_manifest_schema_version TEXT NOT NULL,
+            app_manifest_fingerprint TEXT NOT NULL
+                CHECK (app_manifest_fingerprint ~ '^[0-9a-f]{64}$'),
+            result_status TEXT NOT NULL CHECK (
+                result_status IN ('passed', 'failed', 'unavailable', 'error')
+            ),
+            result_score DOUBLE PRECISION CHECK (
+                result_score IS NULL OR (result_score >= 0.0 AND result_score <= 1.0)
+            ),
+            fresh_run_id TEXT UNIQUE REFERENCES cayu_eval_results(run_id) ON DELETE RESTRICT,
+            captured_result TEXT,
+            document_bytes BIGINT NOT NULL
+                CHECK (document_bytes >= 1 AND document_bytes <= 41943040),
+            created_at TIMESTAMPTZ NOT NULL,
+            CHECK (
+                (result_status IN ('passed', 'failed') AND result_score IS NOT NULL)
+                OR (result_status IN ('unavailable', 'error') AND result_score IS NULL)
+            ),
+            CHECK (
+                (origin = 'fresh_execution' AND fresh_run_id IS NOT NULL
+                    AND captured_result IS NULL)
+                OR (origin = 'captured_session' AND fresh_run_id IS NULL
+                    AND captured_result IS NOT NULL
+                    AND document_bytes = octet_length(captured_result))
+            ),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_result_records_target_catalog "
+        "ON cayu_eval_result_records(target_key, created_at DESC, revision ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_result_records_contract "
+        "ON cayu_eval_result_records("
+        "target_key, corpus_revision, suite_id, created_at DESC, revision ASC)",
+        """
+        INSERT INTO cayu_eval_result_records (
+            revision, origin, target_key, corpus_revision, suite_id, suite_revision,
+            application_release_id, app_manifest_schema_version,
+            app_manifest_fingerprint, result_status, result_score, fresh_run_id,
+            captured_result, document_bytes, created_at
+        )
+        SELECT
+            result.revision, 'fresh_execution', run.target_key, run.corpus_revision,
+            run.suite_id, run.suite_revision,
+            result.result::jsonb #>> '{target,application_release_id}',
+            result.result::jsonb #>> '{target,app_manifest,schema_version}',
+            result.result::jsonb #>> '{target,app_manifest,fingerprint}',
+            run.result_status, run.result_score, result.run_id, NULL,
+            result.result_bytes, result.created_at
+        FROM cayu_eval_results AS result
+        JOIN cayu_eval_runs AS run ON run.run_id = result.run_id
+        ON CONFLICT (revision) DO NOTHING
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_baselines (
+            target_key TEXT NOT NULL,
+            corpus_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE "C" NOT NULL,
+            result_revision TEXT NOT NULL
+                REFERENCES cayu_eval_result_records(revision) ON DELETE RESTRICT,
+            generation BIGINT NOT NULL
+                CHECK (generation >= 1 AND generation <= 9223372036854775807),
+            updated_by TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (target_key, corpus_revision, suite_id),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_baseline_mutations (
+            operation_id TEXT PRIMARY KEY,
+            target_key TEXT NOT NULL,
+            corpus_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE "C" NOT NULL,
+            expected_generation BIGINT NOT NULL
+                CHECK (expected_generation >= 0
+                    AND expected_generation < 9223372036854775807),
+            previous_result_revision TEXT,
+            selected_result_revision TEXT NOT NULL
+                REFERENCES cayu_eval_result_records(revision) ON DELETE RESTRICT,
+            resulting_generation BIGINT NOT NULL
+                CHECK (resulting_generation >= 1
+                    AND resulting_generation <= 9223372036854775807),
+            actor_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            CHECK (resulting_generation = expected_generation + 1),
+            CHECK (
+                (expected_generation = 0 AND previous_result_revision IS NULL)
+                OR (expected_generation > 0 AND previous_result_revision IS NOT NULL)
+            ),
+            FOREIGN KEY (previous_result_revision)
+                REFERENCES cayu_eval_result_records(revision) ON DELETE RESTRICT,
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_eval_baseline_mutations_scope "
+        "ON cayu_eval_baseline_mutations("
+        "target_key, corpus_revision, suite_id, resulting_generation)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3198,6 +3309,8 @@ class _PostgresStoreBase:
                             await self._validate_task_retry_series_schema(cur)
                         if self._min_required_revision >= 46:
                             await self._validate_transcript_search_document_column(cur)
+                        if self._min_required_revision >= 47:
+                            await self._validate_eval_result_baseline_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3360,6 +3473,8 @@ class _PostgresStoreBase:
             await self._validate_task_retry_series_schema(cur)
         if self._min_required_revision >= 46:
             await self._validate_transcript_search_document_column(cur)
+        if self._min_required_revision >= 47:
+            await self._validate_eval_result_baseline_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3440,6 +3555,8 @@ class _PostgresStoreBase:
             await self._validate_task_retry_series_schema(cur)
         if revision.revision == 46:
             await self._validate_transcript_search_document_column(cur)
+        if revision.revision == 47:
+            await self._validate_eval_result_baseline_schema(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -4490,6 +4607,126 @@ class _PostgresStoreBase:
                 "durability contract. Run `cayu storage migrate` or restore the "
                 "database from a known-good backup."
             )
+
+    async def _validate_eval_result_baseline_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_eval_result_records": (
+                ("revision", "text", "NO"),
+                ("origin", "text", "NO"),
+                ("target_key", "text", "NO"),
+                ("corpus_revision", "text", "NO"),
+                ("suite_id", "text", "NO"),
+                ("suite_revision", "text", "NO"),
+                ("application_release_id", "text", "NO"),
+                ("app_manifest_schema_version", "text", "NO"),
+                ("app_manifest_fingerprint", "text", "NO"),
+                ("result_status", "text", "NO"),
+                ("result_score", "double precision", "YES"),
+                ("fresh_run_id", "text", "YES"),
+                ("captured_result", "text", "YES"),
+                ("document_bytes", "bigint", "NO"),
+                ("created_at", "timestamp with time zone", "NO"),
+            ),
+            "cayu_eval_baselines": (
+                ("target_key", "text", "NO"),
+                ("corpus_revision", "text", "NO"),
+                ("suite_id", "text", "NO"),
+                ("result_revision", "text", "NO"),
+                ("generation", "bigint", "NO"),
+                ("updated_by", "text", "NO"),
+                ("updated_at", "timestamp with time zone", "NO"),
+            ),
+            "cayu_eval_baseline_mutations": (
+                ("operation_id", "text", "NO"),
+                ("target_key", "text", "NO"),
+                ("corpus_revision", "text", "NO"),
+                ("suite_id", "text", "NO"),
+                ("expected_generation", "bigint", "NO"),
+                ("previous_result_revision", "text", "YES"),
+                ("selected_result_revision", "text", "NO"),
+                ("resulting_generation", "bigint", "NO"),
+                ("actor_id", "text", "NO"),
+                ("created_at", "timestamp with time zone", "NO"),
+            ),
+        }
+        for table_name, expected in expected_columns.items():
+            await cur.execute(
+                """
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table_name,),
+            )
+            if tuple(await cur.fetchall()) != expected:
+                self._raise_eval_result_baseline_schema_error(table_name)
+
+        expected_keys = {
+            "cayu_eval_result_records": {
+                "PRIMARY KEY (revision)",
+                "UNIQUE (fresh_run_id)",
+            },
+            "cayu_eval_baselines": {
+                "PRIMARY KEY (target_key, corpus_revision, suite_id)",
+            },
+            "cayu_eval_baseline_mutations": {"PRIMARY KEY (operation_id)"},
+        }
+        for table_name, expected in expected_keys.items():
+            await cur.execute(
+                """
+                SELECT pg_get_constraintdef(constraint_record.oid)
+                FROM pg_catalog.pg_constraint AS constraint_record
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = constraint_record.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = table_record.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_record.relname = %s
+                  AND constraint_record.contype IN ('p', 'u')
+                """,
+                (table_name,),
+            )
+            if {str(row[0]) for row in await cur.fetchall()} != expected:
+                self._raise_eval_result_baseline_schema_error(table_name)
+
+        expected_indexes = {
+            "idx_cayu_eval_result_records_target_catalog": (
+                False,
+                "target_key, created_at DESC, revision",
+            ),
+            "idx_cayu_eval_result_records_contract": (
+                False,
+                "target_key, corpus_revision, suite_id, created_at DESC, revision",
+            ),
+            "idx_cayu_eval_baseline_mutations_scope": (
+                True,
+                "target_key, corpus_revision, suite_id, resulting_generation",
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema() AND indexname = ANY(%s)
+            """,
+            (list(expected_indexes),),
+        )
+        actual_indexes = {str(row[0]): str(row[1]) for row in await cur.fetchall()}
+        if set(actual_indexes) != set(expected_indexes) or any(
+            f"({columns})" not in actual_indexes[index_name]
+            or ("CREATE UNIQUE INDEX" in actual_indexes[index_name]) is not unique
+            for index_name, (unique, columns) in expected_indexes.items()
+        ):
+            self._raise_eval_result_baseline_schema_error("eval result indexes")
+
+    @staticmethod
+    def _raise_eval_result_baseline_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            f"Postgres schema object {name!r} conflicts with Cayu's revision-47 "
+            "Evals result and baseline contract. Run `cayu storage migrate` or "
+            "restore the database from a known-good backup."
+        )
 
     @staticmethod
     def _raise_knowledge_revision_schema_error(name: str) -> NoReturn:

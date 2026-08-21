@@ -2063,6 +2063,115 @@ _MIGRATION_STEPS: dict[int, str] = {
                 embedding_model, dimensions, sequence
             );
     """,
+    47: """
+        CREATE TABLE IF NOT EXISTS cayu_eval_result_records (
+            revision TEXT PRIMARY KEY,
+            origin TEXT NOT NULL CHECK (origin IN ('captured_session', 'fresh_execution')),
+            target_key TEXT NOT NULL,
+            corpus_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE BINARY NOT NULL,
+            suite_revision TEXT NOT NULL,
+            application_release_id TEXT NOT NULL,
+            app_manifest_schema_version TEXT NOT NULL,
+            app_manifest_fingerprint TEXT NOT NULL CHECK (
+                length(app_manifest_fingerprint) = 64
+                AND app_manifest_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            result_status TEXT NOT NULL CHECK (
+                result_status IN ('passed', 'failed', 'unavailable', 'error')
+            ),
+            result_score REAL CHECK (
+                result_score IS NULL OR (result_score >= 0.0 AND result_score <= 1.0)
+            ),
+            fresh_run_id TEXT UNIQUE REFERENCES cayu_eval_results(run_id) ON DELETE RESTRICT,
+            captured_result_json TEXT,
+            document_bytes INTEGER NOT NULL
+                CHECK (document_bytes >= 1 AND document_bytes <= 41943040),
+            created_at TEXT NOT NULL,
+            CHECK (
+                (result_status IN ('passed', 'failed') AND result_score IS NOT NULL)
+                OR (result_status IN ('unavailable', 'error') AND result_score IS NULL)
+            ),
+            CHECK (
+                (origin = 'fresh_execution' AND fresh_run_id IS NOT NULL
+                    AND captured_result_json IS NULL)
+                OR (origin = 'captured_session' AND fresh_run_id IS NULL
+                    AND captured_result_json IS NOT NULL
+                    AND document_bytes = length(CAST(captured_result_json AS BLOB)))
+            ),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_result_records_target_catalog
+            ON cayu_eval_result_records(target_key, created_at DESC, revision ASC);
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_result_records_contract
+            ON cayu_eval_result_records(
+                target_key, corpus_revision, suite_id, created_at DESC, revision ASC
+            );
+
+        INSERT OR IGNORE INTO cayu_eval_result_records (
+            revision, origin, target_key, corpus_revision, suite_id, suite_revision,
+            application_release_id, app_manifest_schema_version,
+            app_manifest_fingerprint, result_status, result_score, fresh_run_id,
+            captured_result_json, document_bytes, created_at
+        )
+        SELECT
+            result.revision, 'fresh_execution', run.target_key, run.corpus_revision,
+            run.suite_id, run.suite_revision,
+            json_extract(result.result_json, '$.target.application_release_id'),
+            json_extract(result.result_json, '$.target.app_manifest.schema_version'),
+            json_extract(result.result_json, '$.target.app_manifest.fingerprint'),
+            run.result_status, run.result_score, result.run_id, NULL,
+            result.result_bytes, result.created_at
+        FROM cayu_eval_results AS result
+        JOIN cayu_eval_runs AS run ON run.run_id = result.run_id;
+
+        CREATE TABLE IF NOT EXISTS cayu_eval_baselines (
+            target_key TEXT NOT NULL,
+            corpus_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE BINARY NOT NULL,
+            result_revision TEXT NOT NULL
+                REFERENCES cayu_eval_result_records(revision) ON DELETE RESTRICT,
+            generation INTEGER NOT NULL
+                CHECK (generation >= 1 AND generation <= 9223372036854775807),
+            updated_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (target_key, corpus_revision, suite_id),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS cayu_eval_baseline_mutations (
+            operation_id TEXT PRIMARY KEY,
+            target_key TEXT NOT NULL,
+            corpus_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE BINARY NOT NULL,
+            expected_generation INTEGER NOT NULL
+                CHECK (expected_generation >= 0
+                    AND expected_generation < 9223372036854775807),
+            previous_result_revision TEXT,
+            selected_result_revision TEXT NOT NULL
+                REFERENCES cayu_eval_result_records(revision) ON DELETE RESTRICT,
+            resulting_generation INTEGER NOT NULL
+                CHECK (resulting_generation >= 1
+                    AND resulting_generation <= 9223372036854775807),
+            actor_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK (resulting_generation = expected_generation + 1),
+            CHECK (
+                (expected_generation = 0 AND previous_result_revision IS NULL)
+                OR (expected_generation > 0 AND previous_result_revision IS NOT NULL)
+            ),
+            FOREIGN KEY (previous_result_revision)
+                REFERENCES cayu_eval_result_records(revision) ON DELETE RESTRICT,
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_eval_baseline_mutations_scope
+            ON cayu_eval_baseline_mutations(
+                target_key, corpus_revision, suite_id, resulting_generation
+            );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3186,6 +3295,8 @@ def reconcile_schema(
         _validate_task_retry_series_schema(connection)
     if app_min_supported >= 46:
         _validate_revision_46_transcript_search_schema(connection)
+    if app_min_supported >= 47:
+        _validate_eval_result_baseline_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -4209,6 +4320,104 @@ def _validate_revision_46_transcript_search_schema(
         )
 
 
+def _validate_eval_result_baseline_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "cayu_eval_result_records": (
+            ("revision", "TEXT", 0, 1),
+            ("origin", "TEXT", 1, 0),
+            ("target_key", "TEXT", 1, 0),
+            ("corpus_revision", "TEXT", 1, 0),
+            ("suite_id", "TEXT", 1, 0),
+            ("suite_revision", "TEXT", 1, 0),
+            ("application_release_id", "TEXT", 1, 0),
+            ("app_manifest_schema_version", "TEXT", 1, 0),
+            ("app_manifest_fingerprint", "TEXT", 1, 0),
+            ("result_status", "TEXT", 1, 0),
+            ("result_score", "REAL", 0, 0),
+            ("fresh_run_id", "TEXT", 0, 0),
+            ("captured_result_json", "TEXT", 0, 0),
+            ("document_bytes", "INTEGER", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+        "cayu_eval_baselines": (
+            ("target_key", "TEXT", 1, 1),
+            ("corpus_revision", "TEXT", 1, 2),
+            ("suite_id", "TEXT", 1, 3),
+            ("result_revision", "TEXT", 1, 0),
+            ("generation", "INTEGER", 1, 0),
+            ("updated_by", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ),
+        "cayu_eval_baseline_mutations": (
+            ("operation_id", "TEXT", 0, 1),
+            ("target_key", "TEXT", 1, 0),
+            ("corpus_revision", "TEXT", 1, 0),
+            ("suite_id", "TEXT", 1, 0),
+            ("expected_generation", "INTEGER", 1, 0),
+            ("previous_result_revision", "TEXT", 0, 0),
+            ("selected_result_revision", "TEXT", 1, 0),
+            ("resulting_generation", "INTEGER", 1, 0),
+            ("actor_id", "TEXT", 1, 0),
+            ("created_at", "TEXT", 1, 0),
+        ),
+    }
+    for table, expected in expected_columns.items():
+        actual = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            raise RuntimeError(
+                f"SQLite schema object {table!r} conflicts with Cayu's revision-47 "
+                "Evals result and baseline contract. Run `cayu storage migrate` or "
+                "restore the database from a known-good backup."
+            )
+    expected_indexes = {
+        "idx_cayu_eval_result_records_target_catalog": (
+            "cayu_eval_result_records",
+            False,
+            ("target_key", "created_at", "revision"),
+        ),
+        "idx_cayu_eval_result_records_contract": (
+            "cayu_eval_result_records",
+            False,
+            ("target_key", "corpus_revision", "suite_id", "created_at", "revision"),
+        ),
+        "idx_cayu_eval_baseline_mutations_scope": (
+            "cayu_eval_baseline_mutations",
+            True,
+            ("target_key", "corpus_revision", "suite_id", "resulting_generation"),
+        ),
+    }
+    for index_name, (table_name, expected_unique, expected_columns) in expected_indexes.items():
+        actual_columns = tuple(
+            str(row[2]) for row in connection.execute(f"PRAGMA index_info({index_name})")
+        )
+        index_row = connection.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        unique = next(
+            (
+                bool(row[2])
+                for row in connection.execute(f"PRAGMA index_list({table_name})")
+                if str(row[1]) == index_name
+            ),
+            None,
+        )
+        if (
+            index_row is None
+            or str(index_row[0]) != table_name
+            or unique is not expected_unique
+            or actual_columns != expected_columns
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu's revision-47 "
+                "Evals query contract. Run `cayu storage migrate` or restore the "
+                "database from a known-good backup."
+            )
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     reconcile_schema(connection, schema.SchemaMode.CREATE)
 
@@ -4486,6 +4695,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_task_retry_series_schema(connection)
         if rev.revision == 46:
             _validate_revision_46_transcript_search_schema(connection)
+        if rev.revision == 47:
+            _validate_eval_result_baseline_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

@@ -170,14 +170,21 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 45. Follow the
-revision-specific migration boundaries below: revisions 39 through 45 contain
+The storage schema advances from revision 36 to revision 47. Follow the
+revision-specific migration boundaries below: revisions 39 through 47 contain
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 45 with no pending migrations before
+PostgreSQL store, and confirm revision 47 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
+
+Revision 47 adds the origin-aware immutable Evals result index,
+actor-attributed baseline pointers, and idempotent baseline mutation audit. It
+indexes existing fresh results without copying or fabricating execution
+documents. Every fresh-result writer must maintain that index atomically, so
+revision-46 workers must be stopped before migration and cannot share the
+migrated database.
 
 ### Project serving assembles the durable Evals foundation
 
@@ -194,9 +201,8 @@ Generated maintained-service factories carry an opaque
 remain source-compatible and receive an actionable `cayu check` warning plus a
 conservative, idempotent `cayu generate service-context` migration. Explicit
 `EvalsConfig` remains authoritative and is never field-merged with automatic
-state. Execution-target assembly is a later slice, so automatically assembled
-projects currently report `eval_target_not_configured` and do not mount Evals
-mutation routes or workers.
+state. Generated project serving now publishes a bounded, stable target for
+every registered agent while retaining executable authority only in process.
 
 ### Control Plane Evals now publishes operation-level readiness
 

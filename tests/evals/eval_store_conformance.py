@@ -19,7 +19,17 @@ from cayu.evals.execution import (
     CorpusExecutionResult,
     EvaluationTargetIdentity,
 )
+from cayu.evals.promotion import CapturedRunScoreV1
+from cayu.evals.results import (
+    CapturedEvaluationResultV1,
+    EvalResultOrigin,
+    EvalResultTargetIdentityV1,
+)
 from cayu.evals.store import (
+    EvalBaselineConflict,
+    EvalBaselineKey,
+    EvalBaselineMutationRecord,
+    EvalBaselineUpdate,
     EvalCaseCatalogQuery,
     EvalCatalogQuery,
     EvalRunClaimLost,
@@ -80,6 +90,46 @@ def _result_with_run_update(result: CorpusExecutionResult, **updates) -> CorpusE
         update={"revision": _content_revision(revision_document, "published eval run")}
     )
     return CorpusExecutionResult.create(target=result.target, run=changed)
+
+
+def captured_result_for_corpus(
+    corpus: EvalCorpusDocument,
+    fresh_result: CorpusExecutionResult,
+) -> CapturedEvaluationResultV1:
+    """Build the exact captured counterpart used by store conformance tests."""
+
+    case = corpus.cases[0]
+    source = case.source
+    assert source is not None
+    assertions = fresh_result.run.cases[0].trials[0].assertions
+    score_document = {
+        "schema_version": 1,
+        "candidate_revision": "sha256:" + "c" * 64,
+        "case_id": case.id,
+        "case_revision": case.revision,
+        "evidence_revision": source.evidence_revision,
+        "evidence_policy_revision": corpus.evidence_policy.revision,
+        "pricing_profile_fingerprint": (
+            None if corpus.pricing_profile is None else corpus.pricing_profile.fingerprint
+        ),
+        "status": fresh_result.run.cases[0].status,
+        "score": fresh_result.run.cases[0].score,
+        "assertions": [item.model_dump(mode="json") for item in assertions],
+    }
+    score = CapturedRunScoreV1(
+        revision=_content_revision(score_document, "captured run score"),
+        **score_document,
+    )
+    return CapturedEvaluationResultV1.create(
+        corpus=corpus,
+        target=EvalResultTargetIdentityV1(
+            target_key=corpus.target_key,
+            application_release_id=source.application_release_id,
+            app_manifest_schema_version=source.app_manifest_schema_version,
+            app_manifest_fingerprint=source.app_manifest_fingerprint,
+        ),
+        score=score,
+    )
 
 
 def _result_with_secret_manifest_key(
@@ -498,3 +548,140 @@ async def assert_eval_store_conformance(
                 cursor=target_page.next_cursor,
             )
         )
+
+
+async def assert_captured_eval_store_conformance(
+    store: EvalStore,
+    *,
+    corpus: EvalCorpusDocument,
+    result: CorpusExecutionResult,
+) -> tuple[CapturedEvaluationResultV1, EvalBaselineKey, EvalBaselineMutationRecord]:
+    """Pin captured persistence and audited baseline semantics for every backend."""
+
+    assert store.captured_results is True
+    captured = captured_result_for_corpus(corpus, result)
+    saved = await store.save_captured_result(
+        corpus,
+        captured,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    assert saved.origin is EvalResultOrigin.CAPTURED_SESSION
+    assert saved.revision == captured.revision
+    assert (
+        await store.save_captured_result(
+            corpus,
+            captured,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+        == saved
+    )
+    assert await store.load_corpus(corpus.revision) == corpus
+    assert await store.load_result_by_revision(captured.revision) == captured
+    assert await store.load_result_record(captured.revision) == saved
+    with pytest.raises(EvalStoreResultTooLarge):
+        await store.load_result_by_revision(
+            captured.revision,
+            max_bytes=saved.document_bytes - 1,
+        )
+
+    fresh_record = await store.load_result_record(result.revision)
+    assert fresh_record is not None
+    assert fresh_record.origin is EvalResultOrigin.FRESH_EXECUTION
+    assert await store.load_result_by_revision(result.revision) == result
+
+    key = EvalBaselineKey(
+        target_key=corpus.target_key,
+        corpus_revision=corpus.revision,
+        suite_id=corpus.suites[0].id,
+    )
+    first_update = EvalBaselineUpdate(
+        key=key,
+        result_revision=captured.revision,
+        expected_generation=0,
+        operation_id="sha256:" + "4" * 64,
+        actor_id="operator-initial",
+    )
+    first = await store.set_baseline(
+        first_update,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    assert first.resulting_generation == 1
+    assert (
+        await store.set_baseline(
+            first_update,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+        == first
+    )
+    assert await store.load_baseline_mutation(first.operation_id) == first
+
+    contenders = (
+        EvalBaselineUpdate(
+            key=key,
+            result_revision=result.revision,
+            expected_generation=1,
+            operation_id="sha256:" + "5" * 64,
+            actor_id="operator-a",
+        ),
+        EvalBaselineUpdate(
+            key=key,
+            result_revision=captured.revision,
+            expected_generation=1,
+            operation_id="sha256:" + "6" * 64,
+            actor_id="operator-b",
+        ),
+    )
+    outcomes = await asyncio.gather(
+        *(store.set_baseline(update, redact_json=_NO_SECRETS.redact_json) for update in contenders),
+        return_exceptions=True,
+    )
+    committed = [item for item in outcomes if isinstance(item, EvalBaselineMutationRecord)]
+    conflicts = [item for item in outcomes if isinstance(item, EvalBaselineConflict)]
+    assert len(committed) == 1
+    assert len(conflicts) == 1
+    final_mutation = committed[0]
+    assert final_mutation.resulting_generation == 2
+    final_baseline = await store.load_baseline(key)
+    assert final_baseline is not None
+    assert final_baseline.generation == 2
+    assert final_baseline.result_revision == final_mutation.selected_result_revision
+    assert final_baseline.updated_by == final_mutation.actor_id
+
+    winning_update = next(
+        item for item in contenders if item.operation_id == final_mutation.operation_id
+    )
+    assert (
+        await store.set_baseline(
+            winning_update,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+        == final_mutation
+    )
+    with pytest.raises(EvalBaselineConflict, match="another mutation"):
+        await store.set_baseline(
+            winning_update.model_copy(update={"actor_id": "different-operator"}),
+            redact_json=_NO_SECRETS.redact_json,
+        )
+    with pytest.raises(EvalBaselineConflict, match="requested scope"):
+        await store.set_baseline(
+            EvalBaselineUpdate(
+                key=key.model_copy(update={"target_key": "different-target"}),
+                result_revision=captured.revision,
+                expected_generation=0,
+                operation_id="sha256:" + "7" * 64,
+                actor_id="operator-scope-check",
+            ),
+            redact_json=_NO_SECRETS.redact_json,
+        )
+    with pytest.raises(KeyError, match="Eval result not found"):
+        await store.set_baseline(
+            EvalBaselineUpdate(
+                key=key,
+                result_revision="sha256:" + "f" * 64,
+                expected_generation=2,
+                operation_id="sha256:" + "8" * 64,
+                actor_id="operator-missing-result",
+            ),
+            redact_json=_NO_SECRETS.redact_json,
+        )
+    return captured, key, final_mutation

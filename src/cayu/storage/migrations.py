@@ -269,6 +269,11 @@ REVISIONS: tuple[Revision, ...] = (
     # capability. Populated transcript tables must be recreated: the transition
     # deliberately has no historical projection backfill or compatibility path.
     Revision(revision=46, kind=RevisionKind.BREAKING, compatible_from=46),
+    # Add an origin-aware immutable eval-result index plus actor-attributed,
+    # idempotent baseline CAS records. Every fresh-result writer must maintain
+    # the index atomically; pre-47 EvalStore workers would publish unindexed
+    # results, so mixed-version writers are unsafe.
+    Revision(revision=47, kind=RevisionKind.BREAKING, compatible_from=47),
 )
 
 #: The revision an empty database is initialized to.

@@ -109,6 +109,22 @@ def test_revision_thirty_three_adds_target_scoped_eval_indexes() -> None:
         )
 
 
+def test_revision_forty_seven_adds_origin_aware_eval_results_and_baselines() -> None:
+    state = m.SchemaState(revision=47, compatible_from=47)
+
+    # A revision-46 EvalStore can publish a fresh result without maintaining the
+    # new origin-aware index, so it cannot share the migrated database.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 47"):
+        m.validate(state, app_latest=46, app_min_supported=46)
+    m.validate(state, app_latest=47, app_min_supported=47)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 47"):
+        m.validate(
+            m.SchemaState(revision=46, compatible_from=46),
+            app_latest=47,
+            app_min_supported=47,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

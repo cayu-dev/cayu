@@ -50,6 +50,15 @@ from cayu.evals.execution import (
     CorpusExecutionResult,
 )
 from cayu.evals.published import _validate_published_eval_run_for_corpus
+from cayu.evals.results import (
+    CAPTURED_EVALUATION_RESULT_MAX_BYTES,
+    CapturedEvaluationResultV1,
+    EvalResultOrigin,
+    EvalResultTargetIdentityV1,
+    captured_evaluation_result_from_json,
+    eval_result_projection,
+    validate_captured_result_for_corpus,
+)
 
 EVAL_STORE_DEFAULT_PAGE_SIZE = 50
 EVAL_STORE_MAX_PAGE_SIZE = 200
@@ -145,6 +154,14 @@ class EvalRunClaimLost(RuntimeError):
     """A worker no longer owns the live fenced claim required for a mutation."""
 
 
+class EvalResultConflict(ValueError):
+    """One immutable result revision resolves to contradictory stored content."""
+
+
+class EvalBaselineConflict(ValueError):
+    """A baseline mutation lost its compare-and-swap or idempotency contract."""
+
+
 def _require_publication_safe(
     document: dict[str, Any],
     *,
@@ -224,6 +241,30 @@ def _prepare_result_for_store(
     ).encode("utf-8")
     if len(wire_document) > CORPUS_EXECUTION_RESULT_MAX_BYTES:
         raise EvalStoreResultTooLarge(CORPUS_EXECUTION_RESULT_MAX_BYTES)
+    return validated, wire_document
+
+
+def _prepare_captured_result_for_store(
+    result: CapturedEvaluationResultV1,
+    corpus: EvalCorpusDocument,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> tuple[CapturedEvaluationResultV1, bytes]:
+    validated = validate_captured_result_for_corpus(result, corpus)
+    document = validated.model_dump(mode="json")
+    _require_publication_safe(
+        document,
+        redact_json=redact_json,
+        resource_name="Captured eval result",
+    )
+    wire_document = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(wire_document) > CAPTURED_EVALUATION_RESULT_MAX_BYTES:
+        raise EvalStoreResultTooLarge(CAPTURED_EVALUATION_RESULT_MAX_BYTES)
     return validated, wire_document
 
 
@@ -821,6 +862,158 @@ class EvalRunPage(_EvalStoreModel):
         return self
 
 
+class EvalResultRecord(_EvalStoreModel):
+    """Bounded catalog metadata for one immutable captured or fresh result."""
+
+    revision: StrictStr
+    origin: EvalResultOrigin
+    target: EvalResultTargetIdentityV1
+    corpus_revision: StrictStr
+    suite_id: StrictStr
+    suite_revision: StrictStr
+    status: Literal["passed", "failed", "unavailable", "error"]
+    score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    document_bytes: StrictInt = Field(ge=1, le=CORPUS_EXECUTION_RESULT_MAX_BYTES)
+    created_at: datetime
+
+    @field_validator("revision", "corpus_revision", "suite_revision")
+    @classmethod
+    def validate_revisions(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("suite_id")
+    @classmethod
+    def validate_suite_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime, info) -> datetime:
+        return _aware_utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_result_summary(self) -> EvalResultRecord:
+        if (self.status in {"passed", "failed"}) != (self.score is not None):
+            raise ValueError("Eval result record status contradicts its score.")
+        if (
+            self.origin is EvalResultOrigin.CAPTURED_SESSION
+            and self.document_bytes > CAPTURED_EVALUATION_RESULT_MAX_BYTES
+        ):
+            raise ValueError("Captured eval result record exceeds its document limit.")
+        return self
+
+
+class EvalBaselineKey(_EvalStoreModel):
+    """Stable scope of one explicit baseline pointer."""
+
+    target_key: StrictStr
+    corpus_revision: StrictStr
+    suite_id: StrictStr
+
+    @field_validator("target_key", "suite_id")
+    @classmethod
+    def validate_portable_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("corpus_revision")
+    @classmethod
+    def validate_corpus_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+
+class EvalBaselineUpdate(_EvalStoreModel):
+    """Actor-attributed idempotent compare-and-swap baseline request."""
+
+    key: EvalBaselineKey
+    result_revision: StrictStr
+    expected_generation: StrictInt = Field(ge=0, le=_EVAL_STORE_MAX_BIGINT)
+    operation_id: StrictStr
+    actor_id: StrictStr
+
+    @field_validator("result_revision", "operation_id")
+    @classmethod
+    def validate_revision_fields(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("actor_id")
+    @classmethod
+    def validate_actor_id(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+
+class EvalBaselineRecord(_EvalStoreModel):
+    """Current mutable pointer to an immutable eval result."""
+
+    key: EvalBaselineKey
+    result_revision: StrictStr
+    generation: StrictInt = Field(ge=1, le=_EVAL_STORE_MAX_BIGINT)
+    updated_by: StrictStr
+    updated_at: datetime
+
+    @field_validator("result_revision")
+    @classmethod
+    def validate_result_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("updated_by")
+    @classmethod
+    def validate_updated_by(cls, value: str, info) -> str:
+        return EvalBaselineUpdate.validate_actor_id(value, info)
+
+    @field_validator("updated_at")
+    @classmethod
+    def validate_updated_at(cls, value: datetime, info) -> datetime:
+        return _aware_utc(value, info.field_name)
+
+
+class EvalBaselineMutationRecord(_EvalStoreModel):
+    """Immutable audit fact for one committed baseline transition."""
+
+    operation_id: StrictStr
+    key: EvalBaselineKey
+    expected_generation: StrictInt = Field(ge=0, le=_EVAL_STORE_MAX_BIGINT)
+    previous_result_revision: StrictStr | None = None
+    selected_result_revision: StrictStr
+    resulting_generation: StrictInt = Field(ge=1, le=_EVAL_STORE_MAX_BIGINT)
+    actor_id: StrictStr
+    created_at: datetime
+
+    @field_validator(
+        "operation_id",
+        "previous_result_revision",
+        "selected_result_revision",
+    )
+    @classmethod
+    def validate_revision_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("actor_id")
+    @classmethod
+    def validate_actor_id(cls, value: str, info) -> str:
+        return EvalBaselineUpdate.validate_actor_id(value, info)
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime, info) -> datetime:
+        return _aware_utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_generations(self) -> EvalBaselineMutationRecord:
+        if self.resulting_generation != self.expected_generation + 1:
+            raise ValueError("Baseline mutation generation does not follow its CAS expectation.")
+        if (self.expected_generation == 0) != (self.previous_result_revision is None):
+            raise ValueError("Baseline mutation prior state contradicts its expected generation.")
+        return self
+
+
 def _validate_page_boundary(items: tuple, next_cursor: str | None, has_more: bool) -> None:
     if has_more and (not items or next_cursor is None):
         raise ValueError("A continued eval-store page requires items and next_cursor.")
@@ -1118,6 +1311,59 @@ def result_summary(result: CorpusExecutionResult) -> EvalRunResultSummary:
     )
 
 
+def eval_result_record(
+    result: CorpusExecutionResult | CapturedEvaluationResultV1,
+    *,
+    document_bytes: int,
+    created_at: datetime,
+) -> EvalResultRecord:
+    if type(result) not in {CorpusExecutionResult, CapturedEvaluationResultV1}:
+        raise TypeError(
+            "result must be an exact CorpusExecutionResult or CapturedEvaluationResultV1."
+        )
+    projection = eval_result_projection(result)
+    return EvalResultRecord(
+        revision=projection.result_revision,
+        origin=projection.origin,
+        target=projection.target,
+        corpus_revision=projection.corpus_revision,
+        suite_id=projection.suite_id,
+        suite_revision=projection.suite_revision,
+        status=projection.status,
+        score=projection.score,
+        document_bytes=document_bytes,
+        created_at=created_at,
+    )
+
+
+def _prepare_baseline_update_for_store(
+    update: EvalBaselineUpdate,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> EvalBaselineUpdate:
+    validated = _exact_model(update, EvalBaselineUpdate, "update")
+    _require_publication_safe(
+        validated.model_dump(mode="json"),
+        redact_json=redact_json,
+        resource_name="Eval baseline mutation",
+    )
+    return validated
+
+
+def _validate_baseline_result(
+    update: EvalBaselineUpdate,
+    result: EvalResultRecord,
+) -> None:
+    if result.revision != update.result_revision:
+        raise EvalBaselineConflict("Baseline result revision does not match stored content.")
+    if (
+        result.target.target_key != update.key.target_key
+        or result.corpus_revision != update.key.corpus_revision
+        or result.suite_id != update.key.suite_id
+    ):
+        raise EvalBaselineConflict("Baseline result does not belong to the requested scope.")
+
+
 def run_spec(request: EvalRunRequest) -> EvalRunSpec:
     values = request.model_dump(mode="python")
     values.pop("idempotency_key")
@@ -1128,6 +1374,7 @@ class EvalStore(ABC):
     """Bounded persistence for public eval corpora, run state, and safe results."""
 
     durable: ClassVar[bool] = False
+    captured_results: ClassVar[bool] = False
 
     @abstractmethod
     async def close(self) -> None:
@@ -1263,6 +1510,65 @@ class EvalStore(ABC):
     ) -> CorpusExecutionResult | None:
         """Load one immutable safe result under an exact byte ceiling."""
 
+    async def save_captured_result(
+        self,
+        corpus: EvalCorpusDocument,
+        result: CapturedEvaluationResultV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalResultRecord:
+        """Atomically save one immutable corpus and its captured result.
+
+        Existing custom V1 stores remain constructible. They opt into the new
+        contract by overriding this method and ``captured_results``.
+        """
+
+        del corpus, result, redact_json
+        raise NotImplementedError("Captured eval result persistence is not supported.")
+
+    async def load_result_by_revision(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = CORPUS_EXECUTION_RESULT_MAX_BYTES,
+    ) -> CorpusExecutionResult | CapturedEvaluationResultV1 | None:
+        """Load one immutable result independent of its captured/fresh origin."""
+
+        del revision, max_bytes
+        raise NotImplementedError("Origin-aware eval result reads are not supported.")
+
+    async def load_result_record(self, revision: str) -> EvalResultRecord | None:
+        """Load bounded metadata for one immutable result revision."""
+
+        del revision
+        raise NotImplementedError("Origin-aware eval result reads are not supported.")
+
+    async def set_baseline(
+        self,
+        update: EvalBaselineUpdate,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalBaselineMutationRecord:
+        """Commit or replay one actor-attributed baseline CAS mutation."""
+
+        del update, redact_json
+        raise NotImplementedError("Eval baseline persistence is not supported.")
+
+    async def load_baseline(self, key: EvalBaselineKey) -> EvalBaselineRecord | None:
+        """Load the current baseline pointer for one exact evaluation scope."""
+
+        del key
+        raise NotImplementedError("Eval baseline persistence is not supported.")
+
+    async def load_baseline_mutation(
+        self,
+        operation_id: str,
+    ) -> EvalBaselineMutationRecord | None:
+        """Load one immutable baseline audit fact by its idempotency digest."""
+
+        del operation_id
+        raise NotImplementedError("Eval baseline persistence is not supported.")
+
 
 @dataclass
 class _MemoryRunState:
@@ -1280,10 +1586,17 @@ class _MemoryRunState:
     failure_code: EvalRunFailureCode | None = None
 
 
+@dataclass
+class _MemoryEvalResultState:
+    record: EvalResultRecord
+    document: bytes
+
+
 class InMemoryEvalStore(EvalStore):
     """Explicitly ephemeral EvalStore for tests and process-local SDK use."""
 
     durable: ClassVar[bool] = False
+    captured_results: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1300,12 +1613,42 @@ class InMemoryEvalStore(EvalStore):
         self._cases: dict[str, tuple[EvalCaseCatalogEntry, ...]] = {}
         self._runs: dict[str, _MemoryRunState] = {}
         self._run_ids_by_idempotency_key: dict[str, str] = {}
+        self._results: dict[str, _MemoryEvalResultState] = {}
+        self._baselines: dict[tuple[str, str, str], EvalBaselineRecord] = {}
+        self._baseline_mutations: dict[str, EvalBaselineMutationRecord] = {}
 
     def _now(self) -> datetime:
         return _aware_utc(self._clock(), "clock result")
 
     async def close(self) -> None:
         return None
+
+    def _save_prepared_corpus(
+        self,
+        corpus: EvalCorpusDocument,
+        document: bytes,
+        suites: tuple[EvalSuiteCatalogEntry, ...],
+        cases: tuple[EvalCaseCatalogEntry, ...],
+        *,
+        created_at: datetime,
+    ) -> EvalCorpusCatalogEntry:
+        existing = self._corpus_documents.get(corpus.revision)
+        if existing is not None:
+            if existing != document:
+                raise EvalCorpusConflict(
+                    f"Eval corpus revision {corpus.revision} has conflicting content."
+                )
+            return self._corpora[corpus.revision].model_copy(deep=True)
+        entry = corpus_catalog_entry(
+            corpus,
+            created_at=created_at,
+            document_bytes=len(document),
+        )
+        self._corpus_documents[corpus.revision] = document
+        self._corpora[corpus.revision] = entry
+        self._suites[corpus.revision] = suites
+        self._cases[corpus.revision] = cases
+        return entry.model_copy(deep=True)
 
     async def save_corpus(
         self,
@@ -1320,23 +1663,13 @@ class InMemoryEvalStore(EvalStore):
         suites = tuple(sorted(suite_catalog_entries(validated), key=lambda item: item.id))
         cases = tuple(sorted(case_catalog_entries(validated), key=lambda item: item.id))
         async with self._lock:
-            existing = self._corpus_documents.get(validated.revision)
-            if existing is not None:
-                if existing != document:
-                    raise EvalCorpusConflict(
-                        f"Eval corpus revision {validated.revision} has conflicting content."
-                    )
-                return self._corpora[validated.revision].model_copy(deep=True)
-            entry = corpus_catalog_entry(
+            return self._save_prepared_corpus(
                 validated,
+                document,
+                suites,
+                cases,
                 created_at=self._now(),
-                document_bytes=len(document),
             )
-            self._corpus_documents[validated.revision] = document
-            self._corpora[validated.revision] = entry
-            self._suites[validated.revision] = suites
-            self._cases[validated.revision] = cases
-            return entry.model_copy(deep=True)
 
     async def load_corpus(
         self,
@@ -1642,7 +1975,7 @@ class InMemoryEvalStore(EvalStore):
         redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
-        validated_result, _ = _prepare_result_for_store(
+        validated_result, result_document = _prepare_result_for_store(
             result,
             redact_json=redact_json,
         )
@@ -1667,6 +2000,11 @@ class InMemoryEvalStore(EvalStore):
             if state.status is not EvalRunStatus.RUNNING:
                 raise EvalRunStateConflict("Only a running eval may publish a result.")
             now = self._now()
+            self._save_result_document(
+                validated_result,
+                result_document,
+                created_at=now,
+            )
             state.status = EvalRunStatus.COMPLETED
             state.result = validated_result
             state.updated_at = now
@@ -1743,6 +2081,186 @@ class InMemoryEvalStore(EvalStore):
             if len(_wire_model_bytes(state.result)) > max_bytes:
                 raise EvalStoreResultTooLarge(max_bytes)
             return CorpusExecutionResult.model_validate(_model_python_input(state.result))
+
+    async def save_captured_result(
+        self,
+        corpus: EvalCorpusDocument,
+        result: CapturedEvaluationResultV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalResultRecord:
+        validated_corpus, corpus_document = _prepare_corpus_for_store(
+            corpus,
+            redact_json=redact_json,
+        )
+        suites = tuple(sorted(suite_catalog_entries(validated_corpus), key=lambda item: item.id))
+        cases = tuple(sorted(case_catalog_entries(validated_corpus), key=lambda item: item.id))
+        validated_result, result_document = _prepare_captured_result_for_store(
+            result,
+            validated_corpus,
+            redact_json=redact_json,
+        )
+        prepared_record = eval_result_record(
+            validated_result,
+            document_bytes=len(result_document),
+            created_at=self._now(),
+        )
+        async with self._lock:
+            now = self._now()
+            existing_corpus = self._corpus_documents.get(validated_corpus.revision)
+            if existing_corpus is not None and existing_corpus != corpus_document:
+                raise EvalCorpusConflict(
+                    f"Eval corpus revision {validated_corpus.revision} has conflicting content."
+                )
+            existing_result = self._results.get(prepared_record.revision)
+            if existing_result is not None and (
+                existing_result.document != result_document
+                or existing_result.record.origin is not prepared_record.origin
+            ):
+                raise EvalResultConflict(
+                    f"Eval result revision {prepared_record.revision} has conflicting content."
+                )
+            self._save_prepared_corpus(
+                validated_corpus,
+                corpus_document,
+                suites,
+                cases,
+                created_at=now,
+            )
+            return self._save_result_document(
+                validated_result,
+                result_document,
+                created_at=now,
+            )
+
+    async def load_result_by_revision(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = CORPUS_EXECUTION_RESULT_MAX_BYTES,
+    ) -> CorpusExecutionResult | CapturedEvaluationResultV1 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=CORPUS_EXECUTION_RESULT_MAX_BYTES)
+        async with self._lock:
+            state = self._results.get(revision)
+            if state is None:
+                return None
+            if len(state.document) > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            source = state.document.decode("utf-8")
+            if state.record.origin is EvalResultOrigin.CAPTURED_SESSION:
+                return captured_evaluation_result_from_json(source)
+            return CorpusExecutionResult.model_validate_json(source)
+
+    async def load_result_record(self, revision: str) -> EvalResultRecord | None:
+        revision = _sha256_revision(revision, "revision")
+        async with self._lock:
+            state = self._results.get(revision)
+            return None if state is None else state.record.model_copy(deep=True)
+
+    async def set_baseline(
+        self,
+        update: EvalBaselineUpdate,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalBaselineMutationRecord:
+        update = _prepare_baseline_update_for_store(update, redact_json=redact_json)
+        async with self._lock:
+            replay = self._baseline_mutations.get(update.operation_id)
+            if replay is not None:
+                if not self._baseline_mutation_matches(replay, update):
+                    raise EvalBaselineConflict(
+                        "Baseline operation id is already bound to another mutation."
+                    )
+                return replay.model_copy(deep=True)
+            result_state = self._results.get(update.result_revision)
+            if result_state is None:
+                raise KeyError(f"Eval result not found: {update.result_revision}")
+            _validate_baseline_result(update, result_state.record)
+            scope = self._baseline_scope(update.key)
+            current = self._baselines.get(scope)
+            current_generation = 0 if current is None else current.generation
+            if current_generation != update.expected_generation:
+                raise EvalBaselineConflict("Eval baseline generation changed.")
+            if current_generation >= _EVAL_STORE_MAX_BIGINT:
+                raise EvalBaselineConflict("Eval baseline generation is exhausted.")
+            now = self._now()
+            mutation = EvalBaselineMutationRecord(
+                operation_id=update.operation_id,
+                key=update.key,
+                expected_generation=update.expected_generation,
+                previous_result_revision=(None if current is None else current.result_revision),
+                selected_result_revision=update.result_revision,
+                resulting_generation=current_generation + 1,
+                actor_id=update.actor_id,
+                created_at=now,
+            )
+            self._baselines[scope] = EvalBaselineRecord(
+                key=update.key,
+                result_revision=update.result_revision,
+                generation=mutation.resulting_generation,
+                updated_by=update.actor_id,
+                updated_at=now,
+            )
+            self._baseline_mutations[update.operation_id] = mutation
+            return mutation.model_copy(deep=True)
+
+    async def load_baseline(self, key: EvalBaselineKey) -> EvalBaselineRecord | None:
+        key = _exact_model(key, EvalBaselineKey, "key")
+        async with self._lock:
+            record = self._baselines.get(self._baseline_scope(key))
+            return None if record is None else record.model_copy(deep=True)
+
+    async def load_baseline_mutation(
+        self,
+        operation_id: str,
+    ) -> EvalBaselineMutationRecord | None:
+        operation_id = _sha256_revision(operation_id, "operation_id")
+        async with self._lock:
+            mutation = self._baseline_mutations.get(operation_id)
+            return None if mutation is None else mutation.model_copy(deep=True)
+
+    def _save_result_document(
+        self,
+        result: CorpusExecutionResult | CapturedEvaluationResultV1,
+        document: bytes,
+        *,
+        created_at: datetime,
+    ) -> EvalResultRecord:
+        record = eval_result_record(
+            result,
+            document_bytes=len(document),
+            created_at=created_at,
+        )
+        existing = self._results.get(record.revision)
+        if existing is not None:
+            if existing.document != document or existing.record.origin is not record.origin:
+                raise EvalResultConflict(
+                    f"Eval result revision {record.revision} has conflicting content."
+                )
+            return existing.record.model_copy(deep=True)
+        self._results[record.revision] = _MemoryEvalResultState(
+            record=record,
+            document=bytes(document),
+        )
+        return record.model_copy(deep=True)
+
+    @staticmethod
+    def _baseline_scope(key: EvalBaselineKey) -> tuple[str, str, str]:
+        return key.target_key, key.corpus_revision, key.suite_id
+
+    @staticmethod
+    def _baseline_mutation_matches(
+        mutation: EvalBaselineMutationRecord,
+        update: EvalBaselineUpdate,
+    ) -> bool:
+        return (
+            mutation.operation_id == update.operation_id
+            and mutation.key == update.key
+            and mutation.expected_generation == update.expected_generation
+            and mutation.selected_result_revision == update.result_revision
+            and mutation.actor_id == update.actor_id
+        )
 
     def _require_run(self, run_id: str) -> _MemoryRunState:
         state = self._runs.get(run_id)

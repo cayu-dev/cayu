@@ -772,7 +772,7 @@ must survive beyond the promotion request. `SQLiteEvalStore` is restart-durable
 for one embedded database; `PostgresEvalStore` supports shared multi-worker
 claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
-schema revision 33. Corpus saves, run admission, and result publication require
+schema revision 47. Corpus saves, run admission, and result publication require
 the active application's complete JSON redaction boundary. A configured workload
 secret or redaction failure rejects before any write; the store never retains
 the redaction function or secret registry.
@@ -849,6 +849,82 @@ exception text. Claim APIs do not accept or persist worker labels; private,
 random claim tokens and fenced epochs provide ownership. `EvalStore` owns
 persistence and coordination only—the caller still supplies the trusted target
 and performs execution.
+
+Captured-session scores and fresh executions use different immutable source
+documents but one comparison contract. `CapturedEvaluationResultV1` binds a
+`CapturedRunScoreV1` to the exact stored corpus, suite, case, assertion,
+evidence-policy, pricing, application-release, and AppManifest identities that
+produced it. It deliberately contains no session identifier, executable app,
+store handle, credential, or historical runtime authority.
+Each captured result uses a single-case suite containing exactly the scored
+session; a partial score cannot be published as the result of a larger suite.
+
+`save_captured_result(...)` validates and redaction-scans the complete corpus
+and result before atomically saving both. A process loss cannot leave a visible
+captured result without its immutable corpus. `load_result_by_revision(...)`
+and `load_result_record(...)` address captured and fresh results through the
+same content revision; the metadata record exposes the origin explicitly.
+Fresh publication writes its origin-aware record in the same transaction as
+the existing terminal run result.
+
+```python
+from cayu import (
+    CapturedEvaluationResultV1,
+    EvalBaselineKey,
+    EvalBaselineUpdate,
+    EvalResultTargetIdentityV1,
+)
+
+captured = CapturedEvaluationResultV1.create(
+    corpus=corpus,
+    target=EvalResultTargetIdentityV1(
+        target_key=corpus.target_key,
+        application_release_id=source.application_release_id,
+        app_manifest_schema_version=source.app_manifest_schema_version,
+        app_manifest_fingerprint=source.app_manifest_fingerprint,
+    ),
+    score=captured_score,
+)
+record = await store.save_captured_result(
+    corpus,
+    captured,
+    redact_json=app.redact_json,
+)
+```
+
+Baselines are explicit mutable pointers to immutable results. The key is the
+exact target, corpus revision, and suite; a result from another scope cannot be
+selected. Every update carries an authenticated actor identifier, an expected
+generation, and an idempotent operation digest. The store performs an atomic
+compare-and-swap and appends an immutable mutation record. Retrying the same
+operation returns the original audit fact, while reusing its digest for another
+mutation or losing the generation race fails closed.
+
+```python
+key = EvalBaselineKey(
+    target_key=corpus.target_key,
+    corpus_revision=corpus.revision,
+    suite_id=corpus.suites[0].id,
+)
+mutation = await store.set_baseline(
+    EvalBaselineUpdate(
+        key=key,
+        result_revision=record.revision,
+        expected_generation=0,
+        operation_id="sha256:" + operation_digest,
+        actor_id=authenticated_subject,
+    ),
+    redact_json=app.redact_json,
+)
+```
+
+`eval_result_projection(...)`, `eval_result_compatibility(...)`, and
+`compare_eval_results(...)` provide the common captured/fresh comparison path.
+Application releases may differ, but target, corpus, suite, case, assertion,
+evidence-policy, and applicable-pricing contracts must match. Cayu never picks
+a baseline automatically. Existing custom `EvalStore` implementations remain
+source-compatible and advertise this optional contract only when
+`captured_results` is true.
 
 ### Server-attached durable execution
 
@@ -983,8 +1059,8 @@ shell and does not query absent Evals endpoints. Deployment-gated operations
 remain visible with their factual missing dependency, planned framework work is
 labeled separately from a genuine runtime incompatibility, and ready operations
 remain independently visible. Project serving automatically assembles durable
-storage and project/release identity when their declarations are available. It
-does not yet assemble an execution target. Existing explicit Evals and
+storage, project/release identity, and the bounded generated target registry
+when their declarations are available. Existing explicit Evals and
 evaluation-promotion configuration remains supported and authoritative.
 
 When `surfaces.evals.read` and `evals_readiness.catalog_read` are enabled, the

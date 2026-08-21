@@ -2639,7 +2639,7 @@ def test_sqlite_revision_forty_six_rejects_populated_transcript_database_without
             DROP TABLE cayu_transcript_search_configuration;
             ALTER TABLE cayu_transcript_messages
                 DROP COLUMN transcript_search_document;
-            DELETE FROM cayu_schema_migrations WHERE revision = 46;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 46;
             PRAGMA user_version = 45;
             """
         )
@@ -2696,7 +2696,7 @@ def test_sqlite_revision_forty_six_migrates_empty_transcript_database(tmp_path) 
             DROP TABLE cayu_transcript_search_configuration;
             ALTER TABLE cayu_transcript_messages
                 DROP COLUMN transcript_search_document;
-            DELETE FROM cayu_schema_migrations WHERE revision = 46;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 46;
             PRAGMA user_version = 45;
             """
         )
@@ -2728,8 +2728,8 @@ def test_sqlite_revision_forty_six_migrates_empty_transcript_database(tmp_path) 
     finally:
         connection.close()
 
-    assert revision == (46,)
-    assert version == (46,)
+    assert revision == (47,)
+    assert version == (47,)
     assert transcript_column == ("TEXT", 1)
     assert fts is not None
     assert tokenizer_configuration == (1, TRANSCRIPT_SEARCH_TOKENIZER_VERSION)
@@ -2896,6 +2896,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (44, 44),
         (45, 45),
         (46, 46),
+        (47, 47),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -2905,7 +2906,7 @@ def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(
     monkeypatch,
 ) -> None:
     # This test intentionally boots historical revision-40/41 binaries. The
-    # current SessionStore requires revision 46 for its transcript-search index.
+    # The current SessionStore requires revision 46 for its transcript-search index.
     monkeypatch.setattr(sqlite_storage, "_SQLITE_SESSION_MIN_REQUIRED_REVISION", 40)
     db_path = tmp_path / "pre-knowledge-access-snapshot.sqlite"
     revisions = schema_migrations.REVISIONS

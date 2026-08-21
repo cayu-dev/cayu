@@ -172,7 +172,7 @@ def test_revision_forty_six_rejects_populated_transcript_database_without_mutati
                 await cur.execute(
                     "ALTER TABLE cayu_transcript_messages DROP COLUMN transcript_search_document"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 46")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 46")
             await conn.commit()
 
         migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
@@ -227,7 +227,7 @@ def test_revision_forty_six_migrates_empty_transcript_database(
                 await cur.execute(
                     "ALTER TABLE cayu_transcript_messages DROP COLUMN transcript_search_document"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 46")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 46")
             await conn.commit()
 
         migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
@@ -251,7 +251,7 @@ def test_revision_forty_six_migrates_empty_transcript_database(
             await cur.execute("SELECT to_regclass('idx_cayu_transcript_messages_narrative_fts')")
             assert await cur.fetchone() == ("idx_cayu_transcript_messages_narrative_fts",)
             await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
-            assert await cur.fetchone() == (46,)
+            assert await cur.fetchone() == (47,)
             await cur.execute(
                 "SELECT singleton, tokenizer_version FROM cayu_transcript_search_configuration"
             )
@@ -508,6 +508,9 @@ _TABLES = (
     "cayu_session_operations",
     "cayu_tasks",
     "cayu_sessions",
+    "cayu_eval_baseline_mutations",
+    "cayu_eval_baselines",
+    "cayu_eval_result_records",
     "cayu_eval_results",
     "cayu_eval_runs",
     "cayu_eval_cases",
@@ -1235,6 +1238,10 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             )
             assert await cur.fetchone() == ("breaking", 46)
             await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 47"
+            )
+            assert await cur.fetchone() == ("breaking", 47)
+            await cur.execute(
                 "SELECT data_type, is_nullable, is_generated "
                 "FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
@@ -1244,6 +1251,21 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             assert await cur.fetchone() == ("text", "NO", "NEVER")
             await cur.execute("SELECT to_regclass('idx_cayu_transcript_messages_narrative_fts')")
             assert (await cur.fetchone())[0] == "idx_cayu_transcript_messages_narrative_fts"
+            await cur.execute(
+                "SELECT to_regclass(table_name) FROM unnest(%s::text[]) AS table_name",
+                (
+                    [
+                        "cayu_eval_result_records",
+                        "cayu_eval_baselines",
+                        "cayu_eval_baseline_mutations",
+                    ],
+                ),
+            )
+            assert [row[0] for row in await cur.fetchall()] == [
+                "cayu_eval_result_records",
+                "cayu_eval_baselines",
+                "cayu_eval_baseline_mutations",
+            ]
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

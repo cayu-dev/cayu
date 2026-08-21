@@ -6,13 +6,22 @@ from contextlib import suppress
 
 import pytest
 from tests.evals.eval_store_conformance import (
+    assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
+    captured_result_for_corpus,
 )
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
 
 from cayu.evals.execution import run_corpus_suite
-from cayu.evals.store import EvalRunClaim, EvalRunRecord, EvalRunRequest, EvalRunStatus
+from cayu.evals.store import (
+    EvalBaselineKey,
+    EvalBaselineUpdate,
+    EvalRunClaim,
+    EvalRunRecord,
+    EvalRunRequest,
+    EvalRunStatus,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -89,13 +98,18 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
         )
         try:
             await assert_eval_store_conformance(store, corpus=corpus, result=result)
+            await assert_captured_eval_store_conformance(
+                store,
+                corpus=corpus,
+                result=result,
+            )
         finally:
             await store.close()
 
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_thirty_three_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_forty_seven_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -114,14 +128,20 @@ def test_postgres_eval_store_creates_revision_thirty_three_schema(postgres_dsn) 
             conn.cursor() as cur,
         ):
             await cur.execute(
-                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 33"
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 47"
             )
-            assert await cur.fetchone() == ("additive", 31)
+            assert await cur.fetchone() == ("breaking", 47)
             await cur.execute(
                 "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
-                "AND indexname LIKE 'idx_cayu_eval_runs_target_%' ORDER BY indexname"
+                "AND (indexname LIKE 'idx_cayu_eval_runs_target_%' "
+                "OR indexname LIKE 'idx_cayu_eval_result_records_%' "
+                "OR indexname = 'idx_cayu_eval_baseline_mutations_scope') "
+                "ORDER BY indexname"
             )
             assert [row[0] for row in await cur.fetchall()] == [
+                "idx_cayu_eval_baseline_mutations_scope",
+                "idx_cayu_eval_result_records_contract",
+                "idx_cayu_eval_result_records_target_catalog",
                 "idx_cayu_eval_runs_target_catalog",
                 "idx_cayu_eval_runs_target_status_claim",
             ]
@@ -130,8 +150,11 @@ def test_postgres_eval_store_creates_revision_thirty_three_schema(postgres_dsn) 
                 "WHERE schemaname = current_schema() AND tablename LIKE 'cayu_eval_%'"
             )
             assert {row[0] for row in await cur.fetchall()} == {
+                "cayu_eval_baseline_mutations",
+                "cayu_eval_baselines",
                 "cayu_eval_cases",
                 "cayu_eval_corpora",
+                "cayu_eval_result_records",
                 "cayu_eval_results",
                 "cayu_eval_runs",
                 "cayu_eval_suites",
@@ -194,6 +217,27 @@ def test_postgres_eval_store_is_restart_durable_and_idempotent(postgres_dsn) -> 
             assert claimed is not None
             completed = await _publish_result(first, claimed.claim, result)
             assert completed.status is EvalRunStatus.COMPLETED
+            captured = captured_result_for_corpus(corpus, result)
+            await first.save_captured_result(
+                corpus,
+                captured,
+                redact_json=_NO_SECRETS.redact_json,
+            )
+            baseline_key = EvalBaselineKey(
+                target_key=corpus.target_key,
+                corpus_revision=corpus.revision,
+                suite_id=corpus.suites[0].id,
+            )
+            baseline_mutation = await first.set_baseline(
+                EvalBaselineUpdate(
+                    key=baseline_key,
+                    result_revision=captured.revision,
+                    expected_generation=0,
+                    operation_id="sha256:" + "9" * 64,
+                    actor_id="restart-operator",
+                ),
+                redact_json=_NO_SECRETS.redact_json,
+            )
         finally:
             await first.close()
 
@@ -207,9 +251,102 @@ def test_postgres_eval_store_is_restart_durable_and_idempotent(postgres_dsn) -> 
             assert await reopened.load_corpus(corpus.revision) == corpus
             assert await reopened.load_run(completed.id) == completed
             assert await reopened.load_result(completed.id) == result
+            assert await reopened.load_result_by_revision(result.revision) == result
+            assert await reopened.load_result_by_revision(captured.revision) == captured
+            baseline = await reopened.load_baseline(baseline_key)
+            assert baseline is not None
+            assert baseline.result_revision == captured.revision
+            assert (
+                await reopened.load_baseline_mutation(baseline_mutation.operation_id)
+                == baseline_mutation
+            )
             assert await _admit_run(reopened, _request(corpus, run_id="retry-id")) == completed
         finally:
             await reopened.close()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_forty_seven_indexes_existing_fresh_results(postgres_dsn) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+        first = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await _save_corpus(first, corpus)
+            await _admit_run(first, _request(corpus, run_id="pre-revision-47"))
+            lease = await first.claim_run()
+            assert lease is not None
+            await _publish_result(first, lease.claim, result)
+        finally:
+            await first.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("DROP TABLE cayu_eval_baseline_mutations")
+            await cur.execute("DROP TABLE cayu_eval_baselines")
+            await cur.execute("DROP TABLE cayu_eval_result_records")
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 47")
+            await conn.commit()
+
+        migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            record = await migrated.load_result_record(result.revision)
+            assert record is not None
+            assert record.target.target_key == corpus.target_key
+            assert await migrated.load_result_by_revision(result.revision) == result
+        finally:
+            await migrated.close()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_forty_seven_rejects_a_nonunique_baseline_audit_index(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await initialized.list_corpora()
+        finally:
+            await initialized.close()
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("DROP INDEX idx_cayu_eval_baseline_mutations_scope")
+            await cur.execute(
+                "CREATE INDEX idx_cayu_eval_baseline_mutations_scope "
+                "ON cayu_eval_baseline_mutations("
+                "target_key, corpus_revision, suite_id, resulting_generation)"
+            )
+            await conn.commit()
+
+        validator = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="revision-47 Evals result"):
+                await validator.list_corpora()
+        finally:
+            await validator.close()
 
     asyncio.run(exercise())
 
