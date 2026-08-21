@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -48,10 +49,18 @@ from cayu.runtime.sessions import MAX_SESSION_ID_BYTES
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeAccessScope,
+    KnowledgeHit,
+    KnowledgeIndexCoverage,
+    KnowledgeQuery,
+    KnowledgeSearchMode,
+    KnowledgeSearchResult,
+    KnowledgeStore,
     copy_knowledge_access_scope,
 )
 
 RECALL_ENGINE_VERSION = "cayu.recall.v1"
+KNOWLEDGE_LEXICAL_CHANNEL = "knowledge.lexical"
+KNOWLEDGE_SEMANTIC_CHANNEL = "knowledge.semantic"
 RECALL_MAX_RECENT_CONVERSATION_ITEMS = 20
 RECALL_MAX_RECENT_CONVERSATION_BYTES = 32_000
 RECALL_MAX_WORK_CONTEXT_BYTES = 32_000
@@ -1251,6 +1260,232 @@ class RecallEngine:
         return bounded_result
 
 
+class KnowledgeRecallSource(RecallSource):
+    """Revision-exact lexical and optional semantic lanes from one KnowledgeStore."""
+
+    name = "knowledge"
+    channel_names = (KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL)
+
+    def __init__(
+        self,
+        store: KnowledgeStore,
+        *,
+        required: bool = True,
+        candidate_limit: int = 20,
+        max_bytes: int = 64_000,
+        max_record_bytes: int = 8_000,
+        semantic_timeout_seconds: float = 1.0,
+    ) -> None:
+        if not isinstance(store, KnowledgeStore):
+            raise TypeError("store must be a KnowledgeStore.")
+        super().__init__(required=required, candidate_limit=candidate_limit)
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer.")
+        if type(max_record_bytes) is not int or not 1 <= max_record_bytes <= max_bytes:
+            raise ValueError("max_record_bytes must be positive and cannot exceed max_bytes.")
+        if isinstance(semantic_timeout_seconds, bool) or not isinstance(
+            semantic_timeout_seconds, int | float
+        ):
+            raise ValueError("semantic_timeout_seconds must be a number.")
+        semantic_timeout_seconds = require_finite(
+            float(semantic_timeout_seconds),
+            "semantic_timeout_seconds",
+        )
+        if not 0 < semantic_timeout_seconds <= 60:
+            raise ValueError("semantic_timeout_seconds must be greater than 0 and at most 60.")
+        self._store = store
+        self._max_bytes = max_bytes
+        self._max_record_bytes = max_record_bytes
+        self._semantic_timeout_seconds = semantic_timeout_seconds
+
+    async def retrieve(self, situation: RecallSituation) -> RecallSourceResult:
+        if situation.knowledge_access_scope is None:
+            raise ValueError("Knowledge recall requires an explicit KnowledgeAccessScope.")
+        text = situation.retrieval_text()
+        lexical_query = KnowledgeQuery(
+            text=text,
+            namespace=situation.knowledge_namespace,
+            mode=KnowledgeSearchMode.KEYWORD,
+            limit=self.candidate_limit,
+            max_bytes=self._max_bytes,
+        )
+        semantic: KnowledgeSearchResult | None = None
+        semantic_failure: str | None = None
+        semantic_supported = KnowledgeSearchMode.SEMANTIC in self._store.supported_search_modes()
+        semantic_task: asyncio.Task[tuple[KnowledgeSearchResult | None, str | None]] | None = None
+        if semantic_supported:
+            semantic_query = KnowledgeQuery.model_validate(
+                {
+                    **lexical_query.model_dump(mode="python"),
+                    "mode": KnowledgeSearchMode.SEMANTIC,
+                }
+            )
+
+            async def retrieve_semantic() -> tuple[KnowledgeSearchResult | None, str | None]:
+                try:
+                    async with asyncio.timeout(self._semantic_timeout_seconds):
+                        result = await self._store.search(
+                            semantic_query,
+                            access_scope=situation.knowledge_access_scope,
+                        )
+                except TimeoutError:
+                    return None, "semantic_timeout"
+                except Exception:
+                    return None, "semantic_failed"
+                return result, None
+
+            semantic_task = asyncio.create_task(
+                retrieve_semantic(),
+                name="cayu-knowledge-semantic-recall",
+            )
+        try:
+            lexical = await self._store.search(
+                lexical_query,
+                access_scope=situation.knowledge_access_scope,
+            )
+        except BaseException:
+            if semantic_task is not None:
+                semantic_task.cancel()
+                with suppress(BaseException):
+                    await semantic_task
+            raise
+        if semantic_task is not None:
+            semantic, semantic_failure = await semantic_task
+
+        records: dict[tuple[str, str, str], RecallRecord] = {}
+        lexical_channel = self._channel_from_result(
+            lexical,
+            channel=KNOWLEDGE_LEXICAL_CHANNEL,
+            index_version="cayu.knowledge.lexical.v1",
+            records=records,
+            coverage_complete=True,
+        )
+        partial_reasons: list[str] = []
+        if lexical.truncated:
+            partial_reasons.append("lexical_truncated")
+        if semantic is None:
+            semantic_channel = RankedRetrievalChannel(
+                channel=KNOWLEDGE_SEMANTIC_CHANNEL,
+                index_version=("unsupported" if not semantic_supported else "unavailable"),
+                candidate_limit=self.candidate_limit,
+                truncated=True,
+            )
+            partial_reasons.append(semantic_failure or "semantic_unsupported")
+        else:
+            semantic_index_complete = bool(semantic.index_coverage) and all(
+                coverage.complete for coverage in semantic.index_coverage
+            )
+            semantic_channel = self._channel_from_result(
+                semantic,
+                channel=KNOWLEDGE_SEMANTIC_CHANNEL,
+                index_version=_knowledge_coverage_version(semantic.index_coverage),
+                records=records,
+                coverage_complete=semantic_index_complete,
+            )
+            if not semantic_index_complete:
+                partial_reasons.append("semantic_index_partial")
+            if semantic.truncated:
+                partial_reasons.append("semantic_truncated")
+        return RecallSourceResult(
+            source=self.name,
+            channels=(lexical_channel, semantic_channel),
+            records=tuple(records[key] for key in sorted(records)),
+            coverage_complete=not partial_reasons,
+            partial_reason=(None if not partial_reasons else "+".join(partial_reasons)),
+        )
+
+    def _channel_from_result(
+        self,
+        result: KnowledgeSearchResult,
+        *,
+        channel: str,
+        index_version: str,
+        records: dict[tuple[str, str, str], RecallRecord],
+        coverage_complete: bool,
+    ) -> RankedRetrievalChannel:
+        ranked: list[RankedRetrievalHit] = []
+        for fallback_rank, hit in enumerate(result.hits, start=1):
+            record = _knowledge_recall_record(hit, max_text_bytes=self._max_record_bytes)
+            key = record.identity.sort_key()
+            existing = records.get(key)
+            if existing is not None and existing != record:
+                raise ValueError("Knowledge lanes disagree on exact candidate material.")
+            records[key] = record
+            ranked.append(
+                RankedRetrievalHit(
+                    identity=record.identity,
+                    rank=hit.rank or fallback_rank,
+                    representation=record.representation,
+                    content_hash=record.content_hash,
+                    explanations=(() if hit.reason is None else (hit.reason,)),
+                    raw_score=hit.score,
+                    features={"current_revision": 1.0},
+                )
+            )
+        return RankedRetrievalChannel(
+            channel=channel,
+            index_version=index_version,
+            candidate_limit=self.candidate_limit,
+            hits=tuple(ranked),
+            truncated=result.truncated or not coverage_complete,
+        )
+
+
+def _knowledge_recall_record(
+    hit: KnowledgeHit,
+    *,
+    max_text_bytes: int,
+) -> RecallRecord:
+    if hit.chunk is None:
+        identity = RetrievalCandidateIdentity(
+            record_type="knowledge_entry",
+            record_id=hit.entry.id,
+            revision=str(hit.entry.revision),
+        )
+        representation = "entry_text"
+        text = hit.entry.text
+        locator = {
+            "entry_id": hit.entry.id,
+            "entry_revision": hit.entry.revision,
+        }
+    else:
+        identity = RetrievalCandidateIdentity(
+            record_type="knowledge_chunk",
+            record_id=hit.chunk.id,
+            revision=str(hit.entry.revision),
+        )
+        representation = "chunk_text"
+        text = hit.chunk.text
+        locator = {
+            "entry_id": hit.entry.id,
+            "entry_revision": hit.entry.revision,
+            "chunk_id": hit.chunk.id,
+            "chunk_index": hit.chunk.chunk_index,
+        }
+    encoded = text.encode("utf-8")
+    preview = encoded[:max_text_bytes].decode("utf-8", errors="ignore")
+    if not preview:
+        raise ValueError("Knowledge recall record cannot fit its configured byte bound.")
+    return RecallRecord(
+        identity=identity,
+        representation=representation,
+        text=preview,
+        text_complete=len(preview.encode("utf-8")) == len(encoded),
+        content_hash=sha256(encoded).hexdigest(),
+        locator=locator,
+    )
+
+
+def _knowledge_coverage_version(coverage: Sequence[KnowledgeIndexCoverage]) -> str:
+    if not coverage:
+        return "unreported"
+    payload = [item.model_dump(mode="json") for item in coverage]
+    return (
+        "sha256:"
+        + sha256(canonical_durable_json_bytes(payload, "knowledge semantic coverage")).hexdigest()
+    )
+
+
 def _validate_custom_fusion_result(
     result: RetrievalFusionResult,
     *,
@@ -1333,7 +1568,10 @@ def _validate_custom_fusion_result(
 
 
 __all__ = [
+    "KNOWLEDGE_LEXICAL_CHANNEL",
+    "KNOWLEDGE_SEMANTIC_CHANNEL",
     "RECALL_ENGINE_VERSION",
+    "KnowledgeRecallSource",
     "RecallCandidate",
     "RecallEngine",
     "RecallEngineConfig",

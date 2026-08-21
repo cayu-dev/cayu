@@ -9,6 +9,9 @@ import pytest
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.recall import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    KnowledgeRecallSource,
     RecallEngine,
     RecallEngineConfig,
     RecallRecord,
@@ -29,7 +32,12 @@ from cayu.retrieval import (
     WeightedReciprocalRankFusion,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.storage.memory import KnowledgeAccessScope
+from cayu.storage.memory import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+    KnowledgeSearchMode,
+)
 
 _NOW = datetime(2026, 8, 21, 7, 0, tzinfo=UTC)
 
@@ -503,3 +511,71 @@ def test_recall_engine_rejects_cursor_advancement_without_a_returned_hit() -> No
 
     with pytest.raises(ValueError, match="cannot advance its cursor without a hit"):
         asyncio.run(engine.recall(_situation()))
+
+
+@pytest.mark.parametrize(
+    ("semantic_behavior", "expected_reason"),
+    (("fail", "semantic_failed"), ("timeout", "semantic_timeout")),
+)
+def test_knowledge_recall_preserves_lexical_results_when_semantic_lane_degrades(
+    semantic_behavior: str,
+    expected_reason: str,
+) -> None:
+    class DegradedSemanticStore(InMemoryKnowledgeStore):
+        def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
+            return (
+                KnowledgeSearchMode.AUTO,
+                KnowledgeSearchMode.KEYWORD,
+                KnowledgeSearchMode.SEMANTIC,
+            )
+
+        async def search(self, query, *, access_scope=None):
+            if query.mode is KnowledgeSearchMode.SEMANTIC:
+                if semantic_behavior == "timeout":
+                    await asyncio.Event().wait()
+                raise RuntimeError("private semantic failure")
+            return await super().search(query, access_scope=access_scope)
+
+    async def run() -> RecallResult:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = DegradedSemanticStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="release-date",
+                text="Atlas release date is Friday",
+                namespace="project:cayu",
+            )
+        )
+        return await RecallEngine(
+            (
+                KnowledgeRecallSource(
+                    knowledge,
+                    semantic_timeout_seconds=0.01,
+                ),
+            ),
+            fusion_config=_fusion_config(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+            ),
+        ).recall(
+            _situation(
+                knowledge_access_scope=scope,
+                knowledge_namespace="project:cayu",
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert [candidate.record.identity.record_id for candidate in result.candidates] == [
+        "release-date"
+    ]
+    assert result.sources[0].status is RecallSourceStatus.PARTIAL
+    assert result.sources[0].failure_code == expected_reason
+    semantic = next(
+        channel
+        for channel in result.fusion.channels
+        if channel.channel == KNOWLEDGE_SEMANTIC_CHANNEL
+    )
+    assert semantic.index_version == "unavailable"
+    assert semantic.hit_count == 0
+    assert result.truncated is True

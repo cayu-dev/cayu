@@ -460,7 +460,10 @@ from cayu.proxies import (
     ProxyAuthorizationResult,
 )
 from cayu.recall import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
     RECALL_ENGINE_VERSION,
+    KnowledgeRecallSource,
     RecallCandidate,
     RecallEngine,
     RecallEngineConfig,
@@ -1567,6 +1570,8 @@ __all__ = [
     "KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION",
     "KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION",
     "KNOWLEDGE_CHUNK_TEXT_PROJECTION",
+    "KNOWLEDGE_LEXICAL_CHANNEL",
+    "KNOWLEDGE_SEMANTIC_CHANNEL",
     "KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION",
     "MAX_BROWSER_FETCH_MAX_DOM_NODES",
     "MAX_BROWSER_FETCH_MAX_REQUESTS",
@@ -2070,6 +2075,7 @@ __all__ = [
     "KnowledgePublicationConflict",
     "KnowledgePublicationReceipt",
     "KnowledgeQuery",
+    "KnowledgeRecallSource",
     "KnowledgeReviewWorkflow",
     "KnowledgeRevisionConflict",
     "KnowledgeSearchMode",
