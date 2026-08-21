@@ -29,6 +29,8 @@ import type {
   EvalRunRecord,
   EvalRunStatus,
   EvalSuiteCatalogPage,
+  EvalTargetCatalogEntry,
+  EvalTargetCatalogResponse,
   EvaluationPromotionDraft,
   EvaluationPromotionExportRequest,
   EvaluationPromotionPreviewResponse,
@@ -180,6 +182,8 @@ export type EvalRunsPage = EvalRunPage
 export type EvalStatus = EvalRunStatus
 export type EvalResult = EvalResultResponse
 export type EvalComparison = EvalComparisonResponse
+export type EvalTarget = EvalTargetCatalogEntry
+export type EvalTargets = EvalTargetCatalogResponse
 export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
 export type EvalSuitesQuery = NonNullable<
   ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData["query"]
@@ -434,6 +438,10 @@ export async function fetchEvalCorpora(
   signal?: AbortSignal,
 ): Promise<EvalCorporaPage> {
   return requestJson<EvalCorporaPage>(`/evals/corpora${queryString(query)}`, { signal })
+}
+
+export async function fetchEvalTargets(signal?: AbortSignal): Promise<EvalTargets> {
+  return requestJson<EvalTargets>("/evals/targets", { signal })
 }
 
 export async function importEvalCorpus(

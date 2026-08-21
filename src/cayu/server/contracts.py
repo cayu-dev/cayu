@@ -42,7 +42,7 @@ from cayu.evals.promotion import (
     CapturedRunScoreV1,
     PromotionCandidateV1,
 )
-from cayu.evals.store import EvalRunRecord, EvalRunStatus
+from cayu.evals.store import EVAL_STORE_MAX_CLAIM_TARGETS, EvalRunRecord, EvalRunStatus
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -120,6 +120,8 @@ MAX_CONTROL_PLANE_REQUEST_BYTES = 1024 * 1024
 MAX_EVALUATION_PROMOTION_REQUEST_BYTES = PROMOTION_CANDIDATE_MAX_BYTES + (64 * 1024)
 MAX_EVALS_REQUEST_BYTES = EVAL_CORPUS_MAX_BYTES + (64 * 1024)
 MAX_EXECUTION_TOPOLOGY_EDGES = 1500
+MAX_EVAL_TARGETS = EVAL_STORE_MAX_CLAIM_TARGETS
+MAX_EVAL_TARGET_COMPONENT_CHARS = 256
 
 SessionTopologyIdentifier = Annotated[
     str,
@@ -916,6 +918,10 @@ EvalRevision = Annotated[
     str,
     StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
 ]
+EvalSha256Hex = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9a-f]{64}$", min_length=64, max_length=64),
+]
 EvalServerIdentifier = Annotated[
     str,
     StringConstraints(
@@ -924,6 +930,70 @@ EvalServerIdentifier = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
     ),
 ]
+
+
+class EvalTargetCatalogEntry(ApiBaseModel):
+    """Bounded public identity for one server-owned eval execution target."""
+
+    target_key: PromotionPortableId
+    project_id: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_EVAL_TARGET_COMPONENT_CHARS,
+    )
+    agent_name: StrictStr = Field(
+        min_length=1,
+        max_length=MAX_EVAL_TARGET_COMPONENT_CHARS,
+    )
+    profile_id: PromotionPortableId
+    label: StrictStr = Field(min_length=1, max_length=MAX_EVAL_TARGET_COMPONENT_CHARS * 2)
+    source: Literal["generated", "explicit"]
+    application_release_id: StrictStr = Field(
+        min_length=1,
+        max_length=MAX_EVAL_TARGET_COMPONENT_CHARS,
+    )
+    app_manifest_fingerprint: EvalSha256Hex
+
+    @field_validator(
+        "project_id",
+        "agent_name",
+        "label",
+        "application_release_id",
+    )
+    @classmethod
+    def validate_identity_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip():
+            raise ValueError(f"{info.field_name} must not have surrounding whitespace.")
+        return require_unicode_scalar_text(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> EvalTargetCatalogEntry:
+        if self.source == "generated" and self.project_id is None:
+            raise ValueError("Generated eval targets require project identity.")
+        if self.source == "explicit" and self.project_id is not None:
+            raise ValueError("Explicit eval targets do not claim generated project identity.")
+        return self
+
+
+class EvalTargetCatalogResponse(ApiBaseModel):
+    """Complete bounded registry projection for target selection."""
+
+    items: tuple[EvalTargetCatalogEntry, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVAL_TARGETS,
+    )
+    default_target_key: PromotionPortableId
+
+    @model_validator(mode="after")
+    def validate_registry_projection(self) -> EvalTargetCatalogResponse:
+        keys = tuple(item.target_key for item in self.items)
+        if len(keys) != len(set(keys)):
+            raise ValueError("Eval target catalog keys must be unique.")
+        if self.default_target_key not in keys:
+            raise ValueError("The default eval target must be present in the catalog.")
+        return self
 
 
 class EvalRunCreateRequest(ApiBaseModel):

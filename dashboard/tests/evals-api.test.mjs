@@ -3,8 +3,16 @@ import test from "node:test"
 
 globalThis.window = { __CAYU_DASHBOARD_CONFIG__: { apiBaseUrl: "/api" } }
 
-const { compareEvalRuns, createEvalRun, downloadEvalResultJson, fetchEvalCases, importEvalCorpus } =
-  await import("../src/lib/api.ts")
+const {
+  compareEvalRuns,
+  createEvalRun,
+  downloadEvalResultJson,
+  fetchEvalCases,
+  fetchEvalCorpora,
+  fetchEvalRuns,
+  fetchEvalTargets,
+  importEvalCorpus,
+} = await import("../src/lib/api.ts")
 const { preflightEvalCorpusFile } = await import("../src/lib/evals-dashboard.ts")
 
 test("eval API adapters encode identities, forward cancellation, and preserve launch idempotency", async () => {
@@ -96,6 +104,30 @@ test("eval downloads reject unsafe server filenames and use a sanitized fallback
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test("eval catalog adapters select only server-published target keys", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (input) => {
+    calls.push(String(input))
+    return new Response(JSON.stringify({ items: [], has_more: false, next_cursor: null }), {
+      headers: { "content-type": "application/json" },
+    })
+  }
+  try {
+    await fetchEvalTargets()
+    await fetchEvalCorpora({ target_key: "eval.target-one", limit: 25 })
+    await fetchEvalRuns({ target_key: "eval.target-two", status: "completed" })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.deepEqual(calls, [
+    "/api/evals/targets",
+    "/api/evals/corpora?target_key=eval.target-one&limit=25",
+    "/api/evals/runs?target_key=eval.target-two&status=completed",
+  ])
 })
 
 test("eval corpus imports preserve the selected file bytes for strict server validation", async () => {

@@ -58,6 +58,7 @@ EVAL_STORE_MAX_PAGE_BYTES = 8 << 20
 EVAL_STORE_MAX_CURSOR_BYTES = 1_024
 EVAL_STORE_MAX_IDENTIFIER_CHARS = 128
 EVAL_STORE_MAX_LEASE_SECONDS = 3_600
+EVAL_STORE_MAX_CLAIM_TARGETS = 128
 _EVAL_STORE_MAX_BIGINT = 2**63 - 1
 
 _STORE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
@@ -1191,6 +1192,29 @@ class EvalStore(ABC):
     ) -> EvalRunLease | None:
         """Claim the oldest eligible queued or expired run for an optional target."""
 
+    async def claim_run_for_targets(
+        self,
+        target_keys: tuple[str, ...],
+        *,
+        lease_seconds: int = 300,
+    ) -> EvalRunLease | None:
+        """Claim work only from a bounded approved target set.
+
+        Custom stores inherit a compatible sequential fallback. Durable built-in
+        stores override this with one indexed atomic claim across the whole set.
+        """
+
+        target_keys = _claim_target_keys(target_keys)
+        lease_seconds = _lease_seconds(lease_seconds)
+        for target_key in target_keys:
+            lease = await self.claim_run(
+                target_key=target_key,
+                lease_seconds=lease_seconds,
+            )
+            if lease is not None:
+                return lease
+        return None
+
     @abstractmethod
     async def heartbeat_run(
         self,
@@ -1524,6 +1548,54 @@ class InMemoryEvalStore(EvalStore):
                 ),
             )
 
+    async def claim_run_for_targets(
+        self,
+        target_keys: tuple[str, ...],
+        *,
+        lease_seconds: int = 300,
+    ) -> EvalRunLease | None:
+        target_keys = _claim_target_keys(target_keys)
+        lease_seconds = _lease_seconds(lease_seconds)
+        approved = frozenset(target_keys)
+        async with self._lock:
+            now = self._now()
+            eligible = [
+                state
+                for state in self._runs.values()
+                if state.request.target_key in approved
+                and state.epoch < _EVAL_STORE_MAX_BIGINT
+                and (
+                    state.status is EvalRunStatus.QUEUED
+                    or (
+                        state.status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}
+                        and state.lease_expires_at is not None
+                        and state.lease_expires_at <= now
+                    )
+                )
+            ]
+            if not eligible:
+                return None
+            state = min(eligible, key=lambda item: (item.created_at, item.request.run_id))
+            state.status = (
+                EvalRunStatus.CANCELLING
+                if state.cancel_requested_at is not None
+                else EvalRunStatus.RUNNING
+            )
+            state.started_at = state.started_at or now
+            state.updated_at = now
+            state.claim_id = _store_identifier(self._claim_id_factory(), "claim_id")
+            state.epoch += 1
+            state.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            record = self._record(state)
+            return EvalRunLease(
+                run=record,
+                claim=EvalRunClaim(
+                    run_id=record.id,
+                    claim_id=state.claim_id,
+                    epoch=state.epoch,
+                ),
+            )
+
     async def heartbeat_run(
         self,
         claim: EvalRunClaim,
@@ -1748,6 +1820,23 @@ def _lease_seconds(value: int) -> int:
     return value
 
 
+def _claim_target_keys(value: tuple[str, ...]) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError("target_keys must be a tuple.")
+    if not value:
+        raise ValueError("target_keys cannot be empty.")
+    if len(value) > EVAL_STORE_MAX_CLAIM_TARGETS:
+        raise ValueError(
+            f"target_keys cannot contain more than {EVAL_STORE_MAX_CLAIM_TARGETS} values."
+        )
+    validated = tuple(
+        _portable_id(target_key, f"target_keys[{index}]") for index, target_key in enumerate(value)
+    )
+    if len(validated) != len(set(validated)):
+        raise ValueError("target_keys must be unique.")
+    return validated
+
+
 def _bounded_page(items, *, limit: int, max_bytes: int, cursor):
     retained = []
     for index, item in enumerate(items[:limit]):
@@ -1827,7 +1916,9 @@ def _bounded_run_page(items: list[EvalRunRecord], query: EvalRunQuery) -> EvalRu
 __all__ = [
     "EVAL_STORE_DEFAULT_PAGE_BYTES",
     "EVAL_STORE_DEFAULT_PAGE_SIZE",
+    "EVAL_STORE_MAX_CLAIM_TARGETS",
     "EVAL_STORE_MAX_CURSOR_BYTES",
+    "EVAL_STORE_MAX_IDENTIFIER_CHARS",
     "EVAL_STORE_MAX_LEASE_SECONDS",
     "EVAL_STORE_MAX_PAGE_BYTES",
     "EVAL_STORE_MAX_PAGE_SIZE",

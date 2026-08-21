@@ -470,16 +470,21 @@ async def assert_eval_store_conformance(
     await store.admit_run(other_request, redact_json=_NO_SECRETS.redact_json)
     await store.admit_run(main_request, redact_json=_NO_SECRETS.redact_json)
 
+    other_claimed = await store.claim_run_for_targets((corpus.target_key, other_corpus.target_key))
+    assert other_claimed is not None
+    assert other_claimed.run.id == other_request.run_id
+    await store.release_run(other_claimed.claim)
+    await store.request_cancel(other_request.run_id)
     main_claimed = await store.claim_run(target_key=corpus.target_key)
     assert main_claimed is not None
     assert main_claimed.run.id == main_request.run_id
     await store.release_run(main_claimed.claim)
     await store.request_cancel(main_request.run_id)
-    other_claimed = await store.claim_run(target_key=other_corpus.target_key)
-    assert other_claimed is not None
-    assert other_claimed.run.id == other_request.run_id
-    await store.release_run(other_claimed.claim)
-    await store.request_cancel(other_request.run_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await store.claim_run_for_targets(())
+    with pytest.raises(ValueError, match="must be unique"):
+        await store.claim_run_for_targets((corpus.target_key, corpus.target_key))
 
     target_page = await store.list_runs(EvalRunQuery(target_key=corpus.target_key, limit=1))
     assert target_page.items

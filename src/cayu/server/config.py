@@ -46,6 +46,9 @@ DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS = 300
 DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS = 10.0
+DEFAULT_EVAL_LEASE_SECONDS = 300
+DEFAULT_EVAL_POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_EVAL_SHUTDOWN_GRACE_SECONDS = 30.0
 _GENERATED_DOCS_PATHS = frozenset(
     {
         "/docs",
@@ -348,9 +351,21 @@ class EvalsConfig(BaseModel):
 
     target: CorpusTarget = Field(exclude=True, repr=False)
     store: EvalStore = Field(exclude=True, repr=False)
-    lease_seconds: StrictInt = Field(default=300, ge=1, le=EVAL_STORE_MAX_LEASE_SECONDS)
-    poll_interval_seconds: StrictFloat = Field(default=1.0, gt=0, le=60)
-    shutdown_grace_seconds: StrictFloat = Field(default=30.0, gt=0, le=300)
+    lease_seconds: StrictInt = Field(
+        default=DEFAULT_EVAL_LEASE_SECONDS,
+        ge=1,
+        le=EVAL_STORE_MAX_LEASE_SECONDS,
+    )
+    poll_interval_seconds: StrictFloat = Field(
+        default=DEFAULT_EVAL_POLL_INTERVAL_SECONDS,
+        gt=0,
+        le=60,
+    )
+    shutdown_grace_seconds: StrictFloat = Field(
+        default=DEFAULT_EVAL_SHUTDOWN_GRACE_SECONDS,
+        gt=0,
+        le=300,
+    )
 
     @model_validator(mode="wrap")
     @classmethod

@@ -3429,6 +3429,62 @@ export type EvalSuiteSpec = {
 };
 
 /**
+ * EvalTargetCatalogEntry
+ *
+ * Bounded public identity for one server-owned eval execution target.
+ */
+export type EvalTargetCatalogEntry = {
+    /**
+     * Agent Name
+     */
+    agent_name: string;
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Profile Id
+     */
+    profile_id: string;
+    /**
+     * Project Id
+     */
+    project_id?: string | null;
+    /**
+     * Source
+     */
+    source: 'generated' | 'explicit';
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalTargetCatalogResponse
+ *
+ * Complete bounded registry projection for target selection.
+ */
+export type EvalTargetCatalogResponse = {
+    /**
+     * Default Target Key
+     */
+    default_target_key: string;
+    /**
+     * Items
+     */
+    items: Array<EvalTargetCatalogEntry>;
+};
+
+/**
  * EvalTrialDiagnosticCode
  *
  * Stable, non-secret reason for one fresh trial's terminal outcome.
@@ -8040,6 +8096,10 @@ export type ListEvalCorporaApiEvalsCorporaGetData = {
     path?: never;
     query?: {
         /**
+         * Target Key
+         */
+        target_key?: string | null;
+        /**
          * Cursor
          */
         cursor?: string | null;
@@ -8425,6 +8485,10 @@ export type ListEvalRunsApiEvalsRunsGetData = {
     path?: never;
     query?: {
         /**
+         * Target Key
+         */
+        target_key?: string | null;
+        /**
          * Status
          */
         status?: EvalRunStatus | null;
@@ -8758,6 +8822,45 @@ export type GetEvalResultApiEvalsRunsRunIdResultGetResponses = {
 };
 
 export type GetEvalResultApiEvalsRunsRunIdResultGetResponse = GetEvalResultApiEvalsRunsRunIdResultGetResponses[keyof GetEvalResultApiEvalsRunsRunIdResultGetResponses];
+
+export type ListEvalTargetsApiEvalsTargetsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/evals/targets';
+};
+
+export type ListEvalTargetsApiEvalsTargetsGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalTargetsApiEvalsTargetsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalTargetCatalogResponse;
+};
+
+export type ListEvalTargetsApiEvalsTargetsGetResponse = ListEvalTargetsApiEvalsTargetsGetResponses[keyof ListEvalTargetsApiEvalsTargetsGetResponses];
 
 export type HealthApiHealthGetData = {
     body?: never;

@@ -4,6 +4,7 @@ export type EvalsTab = "catalog" | "runs"
 
 export type EvalsSearch = {
   tab?: EvalsTab
+  target?: string
   corpus?: string
   suite?: string
   run?: string
@@ -48,6 +49,7 @@ function boundedCursorValue(value: unknown): string | undefined {
 export function validateEvalsSearch(search: Record<string, unknown>): EvalsSearch {
   const tab = search.tab === "runs" ? "runs" : search.tab === "catalog" ? "catalog" : undefined
   const status = typeof search.status === "string" ? search.status.trim() : undefined
+  const target = matchingSearchValue(search.target, EVAL_PORTABLE_ID_RE)
   const corpus = matchingSearchValue(search.corpus, EVAL_CORPUS_REVISION_RE)
   const suite = matchingSearchValue(search.suite, EVAL_PORTABLE_ID_RE)
   const run = matchingSearchValue(search.run, EVAL_RUN_ID_RE)
@@ -58,6 +60,7 @@ export function validateEvalsSearch(search: Record<string, unknown>): EvalsSearc
   const runsCursor = boundedCursorValue(search.runs_cursor)
   return {
     ...(tab ? { tab } : {}),
+    ...(target ? { target } : {}),
     ...(corpus ? { corpus } : {}),
     ...(suite ? { suite } : {}),
     ...(run ? { run } : {}),

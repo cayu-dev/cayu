@@ -24,11 +24,19 @@ public application-manifest fingerprint, and a matching SQLite or PostgreSQL
 `cayu serve --dev` may create `data/cayu.db` as the local default; production
 does not invent a database.
 
-This slice deliberately stops before target assembly. The Evals page can report
-that storage and identity are ready while catalog and fresh execution remain
-gated by `eval_target_not_configured`. The browser never manufactures a live
-application, credentials, tools, environments, request templates, or other
-execution authority.
+After the application is constructed, Cayu generates one bounded `default` eval
+target for every registered agent. Each target keeps the agent's normal provider,
+tools, environment defaults, approvals, and runtime policy. Its stable key is a
+domain-separated SHA-256 of the project, agent, and profile identities, so the
+key does not change when the application release changes. The current release
+and exact application-manifest fingerprint remain separate result identity.
+
+`GET /api/evals/targets` publishes the safe project/agent/profile mapping. Corpus
+and run catalog requests select only one of those keys; an omitted selector uses
+the server-published deterministic default. Imports and run admission resolve the
+key carried by the immutable corpus and reject unknown keys. The browser never
+manufactures a live application, credentials, tools, environments, request
+templates, or other execution authority.
 
 New maintained-service factories accept Cayu's opaque project context and pass
 it unchanged to `create_agent_service(...)`. Existing factories remain
@@ -42,9 +50,12 @@ cayu generate service-context
 
 The generator edits only the previous generated shape it can prove safe;
 customized or conflicting code requires manual review. Explicit `EvalsConfig`
-continues to win as a complete configuration and is never partially combined
-with framework-assembled state. Direct embedded servers continue to wire their
-trusted objects explicitly.
+continues to win as one complete singleton registry and is never partially
+combined with framework-assembled state. Direct embedded servers continue to
+wire their trusted objects explicitly. The registry identity already includes a
+profile dimension; this slice publishes only the normal-authority `default`
+profile. Additional application-owned profiles are reserved for cases that
+deliberately substitute fixtures, environments, or authority.
 
 ## Eject and customize the matching source
 

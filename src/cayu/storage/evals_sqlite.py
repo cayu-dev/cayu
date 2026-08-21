@@ -50,6 +50,7 @@ from cayu.evals.store import (
     _bounded_corpus_page,
     _bounded_run_page,
     _bounded_suite_page,
+    _claim_target_keys,
     _copy_query,
     _exact_model,
     _lease_seconds,
@@ -620,6 +621,85 @@ class SQLiteEvalStore(EvalStore):
                     """,
                     (
                         *target_params,
+                        str(EvalRunStatus.QUEUED),
+                        str(EvalRunStatus.RUNNING),
+                        str(EvalRunStatus.CANCELLING),
+                        _format_datetime(now),
+                    ),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                status = (
+                    EvalRunStatus.CANCELLING
+                    if row["cancel_requested_at"] is not None
+                    else EvalRunStatus.RUNNING
+                )
+                connection.execute(
+                    """
+                    UPDATE cayu_eval_runs
+                    SET status = ?, updated_at = ?,
+                        started_at = COALESCE(started_at, ?),
+                        claim_id = ?,
+                        ownership_epoch = ownership_epoch + 1,
+                        lease_expires_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        str(status),
+                        _format_datetime(now),
+                        _format_datetime(now),
+                        claim_id,
+                        _format_datetime(now + timedelta(seconds=lease_seconds)),
+                        row["run_id"],
+                    ),
+                )
+                claimed = self._load_run_row(connection, row["run_id"])
+                connection.commit()
+                assert claimed is not None
+                record = _run_record_from_row(claimed)
+                return EvalRunLease(
+                    run=record,
+                    claim=EvalRunClaim(
+                        run_id=record.id,
+                        claim_id=claimed["claim_id"],
+                        epoch=claimed["ownership_epoch"],
+                    ),
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run(operation)
+
+    async def claim_run_for_targets(
+        self,
+        target_keys: tuple[str, ...],
+        *,
+        lease_seconds: int = 300,
+    ) -> EvalRunLease | None:
+        target_keys = _claim_target_keys(target_keys)
+        lease_seconds = _lease_seconds(lease_seconds)
+
+        def operation(connection: sqlite3.Connection) -> EvalRunLease | None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC)
+                claim_id = str(uuid4())
+                placeholders = ", ".join("?" for _ in target_keys)
+                row = connection.execute(
+                    f"""
+                    SELECT {_RUN_COLUMNS}
+                    FROM cayu_eval_runs
+                    WHERE ownership_epoch < 9223372036854775807
+                      AND target_key IN ({placeholders})
+                      AND (status = ?
+                       OR (status IN (?, ?) AND lease_expires_at <= ?))
+                    ORDER BY created_at ASC, run_id ASC
+                    LIMIT 1
+                    """,
+                    (
+                        *target_keys,
                         str(EvalRunStatus.QUEUED),
                         str(EvalRunStatus.RUNNING),
                         str(EvalRunStatus.CANCELLING),

@@ -89,6 +89,7 @@ from cayu.evals.store import (
     EVAL_STORE_DEFAULT_PAGE_BYTES,
     EVAL_STORE_DEFAULT_PAGE_SIZE,
     EVAL_STORE_MAX_CURSOR_BYTES,
+    EVAL_STORE_MAX_IDENTIFIER_CHARS,
     EVAL_STORE_MAX_PAGE_BYTES,
     EVAL_STORE_MAX_PAGE_SIZE,
     EvalCaseCatalogPage,
@@ -287,6 +288,7 @@ from cayu.server.contracts import (
     EvalComparisonResponse,
     EvalResultResponse,
     EvalRunCreateRequest,
+    EvalTargetCatalogResponse,
     EvaluationPromotionDraft,
     EvaluationPromotionExportRequest,
     EvaluationPromotionPreviewRequest,
@@ -311,6 +313,10 @@ from cayu.server.contracts import (
     UsageBreakdownItem,
     UsageRollupRequest,
     UsageRollupResponse,
+)
+from cayu.server.evals_registry import (
+    generated_eval_target_registry,
+    resolved_evals_runtime,
 )
 from cayu.server.evals_worker import EvalRunCoordinator
 from cayu.server.sse import (
@@ -3447,9 +3453,10 @@ def create_router(
             policy. When absent, no promotion route or enabled capability exists.
         evaluation_promotion_pricing: Optional already-validated dashboard price
             book reused for captured cost evidence.
-        evals: Complete authenticated durable execution wiring for the one
-            explicitly attached corpus target. When absent, no durable Evals
-            route, worker, or enabled capability exists.
+        evals: Complete authenticated durable execution wiring for one explicit
+            V1 corpus target. It takes indivisible precedence over generated
+            project targets. When both it and project authority are absent, no
+            durable Evals route, worker, or enabled capability exists.
         continuation_loop_policy_provider: Optional internal-session policy
             resolver used by an embedding application for resume, approval,
             user-input, and tool-recovery continuations. The returned policies
@@ -3528,11 +3535,37 @@ def create_router(
         except Exception as exc:
             raise ValueError("evals target identity is unavailable.") from exc
 
+    automatic_evals_access = auth is not None or trusted_local_evals_access
+    generated_registry = None
+    if (
+        evals is None
+        and automatic_evals_access
+        and _project_context is not None
+        and _project_context.project_id is not None
+    ):
+        generated_registry = generated_eval_target_registry(
+            cayu_app,
+            project_id=_project_context.project_id,
+            application_release_id=_project_context.application_release_id,
+            app_manifest_fingerprint=_project_context.app_manifest_fingerprint,
+            app_manifest_project_root=_project_context.app_manifest_project_root,
+        )
+    eval_runtime = resolved_evals_runtime(
+        explicit=evals,
+        registry=generated_registry,
+        automatic_store=(
+            None
+            if not automatic_evals_access or _project_context is None
+            else _project_context.eval_store
+        ),
+    )
+    eval_registry = eval_runtime.registry if eval_runtime is not None else generated_registry
+
     api_prefix = normalize_api_path(api_path, field_name="api_path")
 
     @contextlib.asynccontextmanager
     async def evals_lifespan(_app):
-        coordinator = None if evals is None else EvalRunCoordinator(evals)
+        coordinator = None if eval_runtime is None else EvalRunCoordinator(eval_runtime)
         if coordinator is not None:
             coordinator.start()
         try:
@@ -3558,14 +3591,14 @@ def create_router(
         evaluation_promotion_configured=evaluation_promotion is not None,
         terminal_session_evidence_supported=session_store.supports_terminal_session_evidence,
         session_lineage_supported=session_store.supports_session_lineage,
-        evals_configured=evals is not None,
+        evals_configured=eval_runtime is not None,
         eval_store_configured=(
-            evals is not None
+            eval_runtime is not None
             or (_project_context is not None and _project_context.eval_store is not None)
         ),
-        eval_target_configured=evals is not None,
+        eval_target_configured=eval_registry is not None,
         eval_project_identity_configured=(
-            evals is not None
+            (eval_runtime is not None and evals is not None)
             or (_project_context is not None and _project_context.project_id is not None)
         ),
     )
@@ -4132,9 +4165,29 @@ def create_router(
                 },
             )
 
-    if evals is not None:
-        eval_store = evals.store
-        eval_target = evals.target
+    if eval_registry is not None:
+
+        @bounded_evals_router.get(
+            "/evals/targets",
+            response_model=EvalTargetCatalogResponse,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def list_eval_targets() -> EvalTargetCatalogResponse:
+            return eval_registry.catalog()
+
+    if eval_runtime is not None:
+        eval_store = eval_runtime.store
+        active_eval_registry = eval_runtime.registry
+
+        def _eval_target(target_key: str | None = None):
+            selected_key = (
+                active_eval_registry.default_target_key if target_key is None else target_key
+            )
+            target = active_eval_registry.get(selected_key)
+            if target is None:
+                raise HTTPException(status_code=404, detail="Eval target not found.")
+            return target
 
         def _eval_query_error() -> NoReturn:
             raise HTTPException(status_code=422, detail="Invalid Evals query.")
@@ -4151,7 +4204,7 @@ def create_router(
                 _eval_query_error()
             if corpus is None:
                 raise HTTPException(status_code=404, detail="Eval corpus not found.")
-            if corpus.target_key != eval_target.key:
+            if active_eval_registry.get(corpus.target_key) is None:
                 raise HTTPException(status_code=404, detail="Eval corpus not found.")
             return corpus
 
@@ -4162,7 +4215,7 @@ def create_router(
                 _eval_query_error()
             if run is None:
                 raise HTTPException(status_code=404, detail="Eval run not found.")
-            if run.spec.target_key != eval_target.key:
+            if active_eval_registry.get(run.spec.target_key) is None:
                 raise HTTPException(status_code=404, detail="Eval run not found.")
             return run
 
@@ -4201,6 +4254,12 @@ def create_router(
                 EvalCorpusDocument,
                 invalid_detail="Invalid Evals request.",
             )
+            eval_target = active_eval_registry.get(corpus.target_key)
+            if eval_target is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval corpus is incompatible with the attached target.",
+                )
             try:
                 await asyncio.to_thread(
                     evaluation_target_identity,
@@ -4249,6 +4308,10 @@ def create_router(
             dependencies=protected,
         )
         async def list_eval_corpora(
+            target_key: Annotated[
+                str | None,
+                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
+            ] = None,
             cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
             limit: Annotated[
                 int,
@@ -4259,6 +4322,7 @@ def create_router(
                 Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
             ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
         ):
+            eval_target = _eval_target(target_key)
             try:
                 return await eval_store.list_corpora(
                     EvalCatalogQuery(
@@ -4404,6 +4468,7 @@ def create_router(
                 invalid_detail="Invalid Evals request.",
             )
             corpus = await _load_eval_corpus(body.corpus_revision)
+            eval_target = _eval_target(corpus.target_key)
             try:
                 idempotency_key = require_clean_nonblank(
                     idempotency_key,
@@ -4467,6 +4532,10 @@ def create_router(
             dependencies=protected,
         )
         async def list_eval_runs(
+            target_key: Annotated[
+                str | None,
+                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
+            ] = None,
             status: EvalRunStatus | None = None,
             corpus_revision: str | None = None,
             cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
@@ -4479,6 +4548,7 @@ def create_router(
                 Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
             ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
         ):
+            eval_target = _eval_target(target_key)
             try:
                 return await eval_store.list_runs(
                     EvalRunQuery(

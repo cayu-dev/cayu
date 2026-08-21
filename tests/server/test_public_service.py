@@ -61,6 +61,10 @@ from cayu import (
     run_to_completion,
     session_invocation_from_task,
 )
+from cayu.project_control_plane import (
+    ProjectControlPlaneAccess,
+    _create_project_control_plane_context,
+)
 from cayu.runtime.sessions import run_request_with_task_invocation
 from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.server import (
@@ -91,6 +95,7 @@ from cayu.server.service import (
     _product_auth_dependency,
     _ProductResultReceiptPolicy,
 )
+from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 
 def _product_task_create(
@@ -390,6 +395,7 @@ def _build_service(
     product_api_path="/api",
     control_plane_path="/cayu",
     execution_profile_policy=None,
+    project_context=None,
 ):
     provider = provider or ScriptedModelProvider(
         [
@@ -437,6 +443,7 @@ def _build_service(
         product_store=product_store,
         product_api_path=product_api_path,
         control_plane_path=control_plane_path,
+        project_context=project_context,
     )
     return service, product_store, provider
 
@@ -2405,6 +2412,44 @@ def test_public_service_keeps_operator_control_plane_separate_and_authenticated(
     assert service.manifest.runtime_session_store == "development"
     assert service.manifest.runtime_task_store == "development"
     assert service.manifest.host_routing == "maintained"
+
+
+def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_path) -> None:
+    eval_store = SQLiteEvalStore(tmp_path / "service.db")
+    context = _create_project_control_plane_context(
+        project_root=tmp_path.resolve(),
+        project_id="maintained-service",
+        configured_release_id="release-current",
+        eval_store=eval_store,
+        store_backend="sqlite",
+        store_source="project",
+        access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+    )
+    service, _store, _provider = _build_service(project_context=context)
+
+    try:
+        with TestClient(service.asgi_app) as client:
+            response = client.get(
+                "/cayu/api/evals/targets",
+                auth=("operator", "operator-secret"),
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["default_target_key"] == body["items"][0]["target_key"]
+            assert body["items"] == [
+                {
+                    "target_key": body["default_target_key"],
+                    "project_id": "maintained-service",
+                    "agent_name": "assistant",
+                    "profile_id": "default",
+                    "label": "assistant · Default",
+                    "source": "generated",
+                    "application_release_id": "release-current",
+                    "app_manifest_fingerprint": body["items"][0]["app_manifest_fingerprint"],
+                }
+            ]
+    finally:
+        asyncio.run(context.close())
 
 
 def test_sqlite_memory_runtime_stores_are_not_reported_as_durable() -> None:

@@ -50,12 +50,14 @@ import {
   type EvalResult,
   type EvalRun,
   type EvalStatus,
+  type EvalTarget,
   fetchEvalCases,
   fetchEvalCorpora,
   fetchEvalResult,
   fetchEvalRun,
   fetchEvalRuns,
   fetchEvalSuites,
+  fetchEvalTargets,
   importEvalCorpus,
 } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
@@ -94,6 +96,17 @@ export function EvalsPage() {
   const queryClient = useQueryClient()
   const readiness = useServerContract().capabilities.evals_readiness
   const catalogReady = readiness.catalog_read.state === "ready"
+  const targets = useQuery({
+    queryKey: ["evals", "targets"],
+    queryFn: ({ signal }) => fetchEvalTargets(signal),
+    enabled: catalogReady,
+    staleTime: Number.POSITIVE_INFINITY,
+  })
+  const selectedTargetKey = targets.data?.items.some(
+    (target) => target.target_key === search.target,
+  )
+    ? search.target
+    : targets.data?.default_target_key
   const mutateCapability = useDashboardCapability({
     kind: "surface",
     surface: "evals",
@@ -159,12 +172,30 @@ export function EvalsPage() {
         ...evalsSearchWithout(current, "suite", "suites_cursor", "cases_cursor", "corpora_cursor"),
         tab: "catalog",
         corpus: imported.revision,
+        target: imported.target_key,
       }))
       return `Imported corpus ${shortEvalIdentity(imported.revision)}.`
     })
   }
 
   const activeTab = search.tab ?? "catalog"
+  const selectTarget = (targetKey: string) =>
+    updateSearch((current) => ({
+      ...evalsSearchWithout(
+        current,
+        "target",
+        "corpus",
+        "suite",
+        "run",
+        "baseline",
+        "status",
+        "corpora_cursor",
+        "suites_cursor",
+        "cases_cursor",
+        "runs_cursor",
+      ),
+      target: targetKey,
+    }))
   const showCatalog = () =>
     updateSearch((current) => ({
       ...evalsSearchWithout(current, "run", "baseline", "runs_cursor", "status"),
@@ -224,6 +255,12 @@ export function EvalsPage() {
         description="Manage portable regression corpora and durable fresh evaluation runs."
         actions={
           <>
+            <EvalTargetSelector
+              targets={targets.data?.items ?? []}
+              selectedTargetKey={selectedTargetKey}
+              loading={targets.isLoading}
+              selectTarget={selectTarget}
+            />
             <input
               ref={fileInputRef}
               type="file"
@@ -306,39 +343,86 @@ export function EvalsPage() {
         </div>
       )}
 
-      <div
-        id="evals-panel-catalog"
-        role="tabpanel"
-        aria-labelledby="evals-tab-catalog"
-        hidden={activeTab !== "catalog"}
-      >
-        {activeTab === "catalog" && (
-          <CatalogView
-            search={search}
-            updateSearch={updateSearch}
-            pendingAction={pendingAction}
-            runAction={runAction}
-            mutateEnabled={mutateCapability.enabled}
-          />
-        )}
-      </div>
-      <div
-        id="evals-panel-runs"
-        role="tabpanel"
-        aria-labelledby="evals-tab-runs"
-        hidden={activeTab !== "runs"}
-      >
-        {activeTab === "runs" && (
-          <RunsView
-            search={search}
-            updateSearch={updateSearch}
-            pendingAction={pendingAction}
-            runAction={runAction}
-            mutateEnabled={mutateCapability.enabled}
-          />
-        )}
-      </div>
+      {targets.isError && (
+        <QueryError
+          message="Could not load the server-owned eval targets."
+          retry={() => void targets.refetch()}
+        />
+      )}
+
+      {targets.isLoading ? (
+        <LoadingState label="Loading eval targets..." />
+      ) : selectedTargetKey ? (
+        <>
+          <div
+            id="evals-panel-catalog"
+            role="tabpanel"
+            aria-labelledby="evals-tab-catalog"
+            hidden={activeTab !== "catalog"}
+          >
+            {activeTab === "catalog" && (
+              <CatalogView
+                search={search}
+                targetKey={selectedTargetKey}
+                updateSearch={updateSearch}
+                pendingAction={pendingAction}
+                runAction={runAction}
+                mutateEnabled={mutateCapability.enabled}
+              />
+            )}
+          </div>
+          <div
+            id="evals-panel-runs"
+            role="tabpanel"
+            aria-labelledby="evals-tab-runs"
+            hidden={activeTab !== "runs"}
+          >
+            {activeTab === "runs" && (
+              <RunsView
+                search={search}
+                targetKey={selectedTargetKey}
+                updateSearch={updateSearch}
+                pendingAction={pendingAction}
+                runAction={runAction}
+                mutateEnabled={mutateCapability.enabled}
+              />
+            )}
+          </div>
+        </>
+      ) : null}
     </Page>
+  )
+}
+
+function EvalTargetSelector({
+  targets,
+  selectedTargetKey,
+  loading,
+  selectTarget,
+}: {
+  targets: EvalTarget[]
+  selectedTargetKey: string | undefined
+  loading: boolean
+  selectTarget: (targetKey: string) => Promise<void>
+}) {
+  return (
+    <label className="flex items-center gap-2 text-xs text-muted-foreground">
+      Target
+      <select
+        value={selectedTargetKey ?? ""}
+        disabled={loading || targets.length === 0}
+        className="h-9 max-w-72 rounded-md border border-input bg-background px-2 text-sm text-foreground"
+        aria-label="Eval target"
+        onChange={(event) => void selectTarget(event.target.value)}
+      >
+        {loading && <option value="">Loading...</option>}
+        {targets.map((target) => (
+          <option key={target.target_key} value={target.target_key}>
+            {target.agent_name} · {target.profile_id}
+          </option>
+        ))}
+      </select>
+    </label>
   )
 }
 
@@ -376,12 +460,14 @@ function EvalsReadinessOverview({ readiness }: { readiness: EvalsReadiness }) {
 
 function CatalogView({
   search,
+  targetKey,
   updateSearch,
   pendingAction,
   runAction,
   mutateEnabled,
 }: {
   search: EvalsSearch
+  targetKey: string
   updateSearch: UpdateEvalsSearch
   pendingAction: string | null
   runAction: (
@@ -394,9 +480,12 @@ function CatalogView({
   const [maxConcurrency, setMaxConcurrency] = useState("1")
   const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
   const corpora = useQuery({
-    queryKey: ["evals", "corpora", search.corpora_cursor],
+    queryKey: ["evals", "corpora", targetKey, search.corpora_cursor],
     queryFn: ({ signal }) =>
-      fetchEvalCorpora({ limit: PAGE_LIMIT, cursor: search.corpora_cursor }, signal),
+      fetchEvalCorpora(
+        { target_key: targetKey, limit: PAGE_LIMIT, cursor: search.corpora_cursor },
+        signal,
+      ),
   })
   const suites = useQuery({
     queryKey: ["evals", "suites", search.corpus, search.suites_cursor],
@@ -793,12 +882,14 @@ function CatalogView({
 
 function RunsView({
   search,
+  targetKey,
   updateSearch,
   pendingAction,
   runAction,
   mutateEnabled,
 }: {
   search: EvalsSearch
+  targetKey: string
   updateSearch: UpdateEvalsSearch
   pendingAction: string | null
   runAction: (
@@ -809,11 +900,12 @@ function RunsView({
 }) {
   const queryClient = useQueryClient()
   const runs = useQuery({
-    queryKey: ["evals", "runs", search.status, search.corpus, search.runs_cursor],
+    queryKey: ["evals", "runs", targetKey, search.status, search.corpus, search.runs_cursor],
     queryFn: ({ signal }) =>
       fetchEvalRuns(
         {
           limit: PAGE_LIMIT,
+          target_key: targetKey,
           cursor: search.runs_cursor,
           status: search.status,
           corpus_revision: search.corpus,

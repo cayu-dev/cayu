@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import (
@@ -499,21 +500,34 @@ def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
     )
 
 
-def evaluation_target_identity(target: CorpusTarget) -> EvaluationTargetIdentity:
+def evaluation_target_identity(
+    target: CorpusTarget,
+    *,
+    project_root: str | Path | None = None,
+) -> EvaluationTargetIdentity:
     """Describe a validated target without invoking application dependencies."""
 
     validated = _copy_corpus_target(target)
-    return _evaluation_target_identity_from_validated_target(validated)
+    return _evaluation_target_identity_from_validated_target(
+        validated,
+        project_root=project_root,
+    )
 
 
 def _evaluation_target_identity_from_validated_target(
     target: CorpusTarget,
+    *,
+    project_root: str | Path | None = None,
 ) -> EvaluationTargetIdentity:
     """Describe an internally validated target without another potentially large copy."""
 
     if type(target) is not CorpusTarget:
         raise TypeError("target must be an exact CorpusTarget.")
-    manifest = target.app.describe()
+    manifest = (
+        target.app.describe()
+        if project_root is None
+        else target.app.describe(project_root=project_root)
+    )
     if type(manifest) is not AppManifest:
         raise TypeError("CayuApp.describe() must return an AppManifest.")
     return EvaluationTargetIdentity(
@@ -803,6 +817,8 @@ async def _run_compiled_corpus_suite(
     compiled: CompiledCorpusSuite,
     *,
     max_concurrency: int,
+    manifest_project_root: Path | None = None,
+    expected_app_manifest_fingerprint: str | None = None,
 ) -> CorpusExecutionResult:
     """Execute one internally compiled suite without repeating corpus compilation."""
 
@@ -815,7 +831,17 @@ async def _run_compiled_corpus_suite(
         raise ValueError("Compiled corpus evidence policy does not match the trusted target.")
     _validate_corpus_concurrency(validated_target, max_concurrency)
 
-    target_before = _evaluation_target_identity_from_validated_target(validated_target)
+    target_before = _evaluation_target_identity_from_validated_target(
+        validated_target,
+        project_root=manifest_project_root,
+    )
+    if (
+        expected_app_manifest_fingerprint is not None
+        and target_before.app_manifest_fingerprint != expected_app_manifest_fingerprint
+    ):
+        raise RuntimeError(
+            "CorpusTarget application manifest does not match its registered identity."
+        )
     trial_count = len(compiled.suite.cases) * compiled.trials
     output_preview_bytes = min(
         EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
@@ -836,6 +862,7 @@ async def _run_compiled_corpus_suite(
         target_before,
         internal_run,
         trial_public_data_by_case,
+        manifest_project_root,
     )
 
 
@@ -845,10 +872,14 @@ def _finalize_compiled_corpus_result(
     target_before: EvaluationTargetIdentity,
     internal_run: EvalRun,
     trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]],
+    manifest_project_root: Path | None,
 ) -> CorpusExecutionResult:
     """Construct and validate the complete published result off the event loop."""
 
-    target_after = _evaluation_target_identity_from_validated_target(target)
+    target_after = _evaluation_target_identity_from_validated_target(
+        target,
+        project_root=manifest_project_root,
+    )
     if target_after != target_before:
         raise RuntimeError("CorpusTarget application manifest changed during eval execution.")
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)

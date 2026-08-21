@@ -13,6 +13,7 @@ test("eval search accepts only bounded known values", () => {
   assert.deepEqual(
     validateEvalsSearch({
       tab: "runs",
+      target: `eval.${"f".repeat(64)}`,
       corpus: ` ${CORPUS_REVISION} `,
       suite: "suite-1",
       run: "eval-1",
@@ -23,6 +24,7 @@ test("eval search accepts only bounded known values", () => {
     }),
     {
       tab: "runs",
+      target: `eval.${"f".repeat(64)}`,
       corpus: CORPUS_REVISION,
       suite: "suite-1",
       run: "eval-1",
@@ -40,6 +42,7 @@ test("eval search drops invalid status, arrays, blanks, and oversized values", (
       status: "succeeded",
       corpus: ["one", "two"],
       suite: "UPPERCASE",
+      target: "UPPERCASE",
       run: "x".repeat(129),
     }),
     {},

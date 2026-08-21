@@ -6819,6 +6819,111 @@
         "title": "EvalSuiteSpec",
         "type": "object"
       },
+      "EvalTargetCatalogEntry": {
+        "additionalProperties": false,
+        "description": "Bounded public identity for one server-owned eval execution target.",
+        "properties": {
+          "agent_name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Agent Name",
+            "type": "string"
+          },
+          "app_manifest_fingerprint": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "App Manifest Fingerprint",
+            "type": "string"
+          },
+          "application_release_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "profile_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "source": {
+            "enum": [
+              "generated",
+              "explicit"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "target_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_key",
+          "agent_name",
+          "profile_id",
+          "label",
+          "source",
+          "application_release_id",
+          "app_manifest_fingerprint"
+        ],
+        "title": "EvalTargetCatalogEntry",
+        "type": "object"
+      },
+      "EvalTargetCatalogResponse": {
+        "additionalProperties": false,
+        "description": "Complete bounded registry projection for target selection.",
+        "properties": {
+          "default_target_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Default Target Key",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalTargetCatalogEntry"
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "default_target_key"
+        ],
+        "title": "EvalTargetCatalogResponse",
+        "type": "object"
+      },
       "EvalTrialDiagnosticCode": {
         "description": "Stable, non-secret reason for one fresh trial's terminal outcome.",
         "enum": [
@@ -10919,7 +11024,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "16",
+            "default": "17",
             "title": "Contract Version",
             "type": "string"
           },
@@ -14595,7 +14700,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "16",
+            "default": "17",
             "title": "Contract Version",
             "type": "string"
           }
@@ -15460,6 +15565,23 @@
         "parameters": [
           {
             "in": "query",
+            "name": "target_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Key"
+            }
+          },
+          {
+            "in": "query",
             "name": "cursor",
             "required": false,
             "schema": {
@@ -15952,6 +16074,23 @@
         "parameters": [
           {
             "in": "query",
+            "name": "target_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Key"
+            }
+          },
+          {
+            "in": "query",
             "name": "status",
             "required": false,
             "schema": {
@@ -16342,6 +16481,39 @@
           }
         },
         "summary": "Get Eval Result"
+      }
+    },
+    "/api/evals/targets": {
+      "get": {
+        "operationId": "list_eval_targets_api_evals_targets_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalTargetCatalogResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Targets"
       }
     },
     "/api/health": {

@@ -48,6 +48,7 @@ from cayu import (
     TextPart,
     ThinkingPart,
     Tool,
+    ToolCapabilityCeiling,
     ToolContext,
     ToolEffect,
     ToolResult,
@@ -533,6 +534,9 @@ async def _seed_app() -> tuple[
         tools=[DashboardContractTool()],
         tool_policy=AlwaysRequireApprovalToolPolicy(tools=["dashboard_contract_tool"]),
     )
+    contract_tool_capability_ceiling = ToolCapabilityCeiling(
+        tool_names=(DashboardContractTool.spec.name,)
+    )
     contract_session_identity = _profiled_session_identity(
         app,
         provider_name=PROVIDER_NAME,
@@ -550,6 +554,7 @@ async def _seed_app() -> tuple[
             },
             messages=[Message.text("user", "Show the dashboard contract session.")],
             max_steps=20,
+            tool_capability_ceiling=contract_tool_capability_ceiling,
         ),
         identity=contract_session_identity,
     )
@@ -710,6 +715,7 @@ async def _seed_app() -> tuple[
                 labels=labels or {},
                 messages=[Message.text("user", prompt)],
                 max_steps=20,
+                tool_capability_ceiling=contract_tool_capability_ceiling,
             ),
             identity=contract_session_identity,
         )
@@ -743,6 +749,7 @@ async def _seed_app() -> tuple[
                 session_id=session_id,
                 messages=[Message.text("user", "Wait for a dashboard interruption.")],
                 max_steps=20,
+                tool_capability_ceiling=contract_tool_capability_ceiling,
             ),
             identity=contract_session_identity,
         )

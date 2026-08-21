@@ -10,6 +10,7 @@ from enum import StrEnum
 from cayu.evals.corpus import EvalCorpusDocument
 from cayu.evals.execution import (
     CompiledCorpusSuite,
+    CorpusTarget,
     _run_compiled_corpus_suite,
     compile_corpus_suite,
     evaluation_target_identity,
@@ -23,6 +24,11 @@ from cayu.evals.store import (
     EvalRunStatus,
 )
 from cayu.server.config import EvalsConfig
+from cayu.server.evals_registry import (
+    EvalTargetRegistration,
+    ResolvedEvalsRuntime,
+    resolved_evals_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +47,17 @@ class EvalRunCoordinator:
     state and never publishes after its fenced claim is lost.
     """
 
-    def __init__(self, config: EvalsConfig) -> None:
-        if type(config) is not EvalsConfig:
-            raise TypeError("config must be an exact EvalsConfig.")
+    def __init__(self, config: EvalsConfig | ResolvedEvalsRuntime) -> None:
+        if type(config) is EvalsConfig:
+            resolved = resolved_evals_runtime(
+                explicit=config,
+                registry=None,
+                automatic_store=None,
+            )
+            assert resolved is not None
+            config = resolved
+        elif type(config) is not ResolvedEvalsRuntime:
+            raise TypeError("config must be an exact EvalsConfig or ResolvedEvalsRuntime.")
         self._config = config
         self._stop_requested = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -86,10 +100,7 @@ class EvalRunCoordinator:
     async def _run_forever(self) -> None:
         while not self._stop_requested.is_set():
             try:
-                lease = await self._config.store.claim_run(
-                    target_key=self._config.target.key,
-                    lease_seconds=self._config.lease_seconds,
-                )
+                lease = await self._claim_run()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -109,6 +120,18 @@ class EvalRunCoordinator:
                 logger.error("Unexpected failure while coordinating durable eval work.")
                 await self._release_after_interruption(lease.claim)
 
+    async def _claim_run(self) -> EvalRunLease | None:
+        target_keys = self._config.registry.target_keys
+        if len(target_keys) == 1:
+            return await self._config.store.claim_run(
+                target_key=target_keys[0],
+                lease_seconds=self._config.lease_seconds,
+            )
+        return await self._config.store.claim_run_for_targets(
+            target_keys,
+            lease_seconds=self._config.lease_seconds,
+        )
+
     async def _wait_for_work(self) -> None:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(
@@ -120,11 +143,22 @@ class EvalRunCoordinator:
         if lease.run.status is EvalRunStatus.CANCELLING:
             await self._finish_cancel(lease.claim)
             return
-        await self._run_owned_lease(lease)
+        registration = self._config.registry.registration(lease.run.spec.target_key)
+        if registration is None:
+            await self._finalize_failure(
+                lease.claim,
+                EvalRunFailureCode.TARGET_UNAVAILABLE,
+            )
+            return
+        await self._run_owned_lease(lease, registration)
 
-    async def _run_owned_lease(self, lease: EvalRunLease) -> None:
+    async def _run_owned_lease(
+        self,
+        lease: EvalRunLease,
+        registration: EvalTargetRegistration,
+    ) -> None:
         preflight = asyncio.create_task(
-            self._preflight_lease(lease),
+            self._preflight_lease(lease, registration),
             name=f"cayu-eval-preflight-{lease.run.id}",
         )
         monitor = asyncio.create_task(
@@ -167,7 +201,7 @@ class EvalRunCoordinator:
                 await self._release_after_interruption(lease.claim)
                 return
 
-            await self._execute_compiled_lease(lease, preflight_result, monitor)
+            await self._execute_compiled_lease(lease, registration, preflight_result, monitor)
         finally:
             await self._cancel_task(preflight)
             await self._cancel_task(monitor)
@@ -175,6 +209,7 @@ class EvalRunCoordinator:
     async def _preflight_lease(
         self,
         lease: EvalRunLease,
+        registration: EvalTargetRegistration,
     ) -> CompiledCorpusSuite | EvalRunFailureCode:
         try:
             corpus = await self._config.store.load_corpus(lease.run.spec.corpus_revision)
@@ -189,21 +224,29 @@ class EvalRunCoordinator:
             self._compile_loaded_corpus,
             corpus,
             lease,
+            registration,
         )
 
     def _compile_loaded_corpus(
         self,
         corpus: EvalCorpusDocument,
         lease: EvalRunLease,
+        registration: EvalTargetRegistration,
     ) -> CompiledCorpusSuite | EvalRunFailureCode:
+        target = registration.target
         try:
-            evaluation_target_identity(self._config.target)
+            identity = evaluation_target_identity(
+                target,
+                project_root=registration.manifest_project_root,
+            )
         except Exception:
+            return EvalRunFailureCode.TARGET_UNAVAILABLE
+        if identity.app_manifest_fingerprint != registration.catalog_entry.app_manifest_fingerprint:
             return EvalRunFailureCode.TARGET_UNAVAILABLE
         try:
             compiled = compile_corpus_suite(
                 corpus,
-                self._config.target,
+                target,
                 lease.run.spec.suite_id,
             )
             if (
@@ -219,14 +262,20 @@ class EvalRunCoordinator:
     async def _execute_compiled_lease(
         self,
         lease: EvalRunLease,
+        registration: EvalTargetRegistration,
         compiled: CompiledCorpusSuite,
         monitor: asyncio.Task[_ClaimMonitorOutcome],
     ) -> None:
+        target = registration.target
         execution = asyncio.create_task(
             _run_compiled_corpus_suite(
-                self._config.target,
+                target,
                 compiled,
                 max_concurrency=lease.run.spec.max_concurrency,
+                manifest_project_root=registration.manifest_project_root,
+                expected_app_manifest_fingerprint=(
+                    registration.catalog_entry.app_manifest_fingerprint
+                ),
             ),
             name=f"cayu-eval-run-{lease.run.id}",
         )
@@ -249,7 +298,7 @@ class EvalRunCoordinator:
                 return
 
             publication = asyncio.create_task(
-                self._publish_execution_outcome(lease.claim, execution),
+                self._publish_execution_outcome(lease.claim, target, execution),
                 name=f"cayu-eval-publication-{lease.run.id}",
             )
             await self._await_owned_action(lease.claim, publication, monitor)
@@ -259,6 +308,7 @@ class EvalRunCoordinator:
     async def _publish_execution_outcome(
         self,
         claim: EvalRunClaim,
+        target: CorpusTarget,
         execution: asyncio.Task,
     ) -> None:
         if execution.cancelled():
@@ -279,7 +329,7 @@ class EvalRunCoordinator:
             await self._config.store.publish_result(
                 claim,
                 execution.result(),
-                redact_json=self._config.target.app.redact_json,
+                redact_json=target.app.redact_json,
             )
         except EvalRunClaimLost:
             return

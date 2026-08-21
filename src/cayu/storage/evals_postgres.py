@@ -47,6 +47,7 @@ from cayu.evals.store import (
     _bounded_corpus_page,
     _bounded_run_page,
     _bounded_suite_page,
+    _claim_target_keys,
     _copy_query,
     _exact_model,
     _lease_seconds,
@@ -603,6 +604,83 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             now,
                             now,
                             str(uuid4()),
+                            now + timedelta(seconds=lease_seconds),
+                            row[0],
+                        ),
+                    )
+                    claimed = await self._load_run_row(cur, row[0])
+                await conn.commit()
+                assert claimed is not None
+                record = _run_record_from_row(claimed)
+                return EvalRunLease(
+                    run=record,
+                    claim=EvalRunClaim(
+                        run_id=record.id,
+                        claim_id=claimed[13],
+                        epoch=claimed[14],
+                    ),
+                )
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def claim_run_for_targets(
+        self,
+        target_keys: tuple[str, ...],
+        *,
+        lease_seconds: int = 300,
+    ) -> EvalRunLease | None:
+        target_keys = _claim_target_keys(target_keys)
+        lease_seconds = _lease_seconds(lease_seconds)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    now = await _database_now(cur)
+                    placeholders = ", ".join("%s" for _ in target_keys)
+                    await cur.execute(
+                        f"""
+                        SELECT {_RUN_COLUMNS}
+                        FROM cayu_eval_runs
+                        WHERE ownership_epoch < 9223372036854775807
+                          AND target_key IN ({placeholders})
+                          AND (status = %s
+                           OR (status IN (%s, %s) AND lease_expires_at <= %s))
+                        ORDER BY created_at ASC, run_id ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                        """,
+                        (
+                            *target_keys,
+                            str(EvalRunStatus.QUEUED),
+                            str(EvalRunStatus.RUNNING),
+                            str(EvalRunStatus.CANCELLING),
+                            now,
+                        ),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        await conn.commit()
+                        return None
+                    status = (
+                        EvalRunStatus.CANCELLING if row[12] is not None else EvalRunStatus.RUNNING
+                    )
+                    claim_id = str(uuid4())
+                    await cur.execute(
+                        """
+                        UPDATE cayu_eval_runs
+                        SET status = %s, updated_at = %s,
+                            started_at = COALESCE(started_at, %s),
+                            claim_id = %s,
+                            ownership_epoch = ownership_epoch + 1,
+                            lease_expires_at = %s
+                        WHERE run_id = %s
+                        """,
+                        (
+                            str(status),
+                            now,
+                            now,
+                            claim_id,
                             now + timedelta(seconds=lease_seconds),
                             row[0],
                         ),

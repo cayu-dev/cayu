@@ -150,6 +150,7 @@ class ProjectControlPlaneContext:
             project_id=self._project_id,
             application_release_id=release_id,
             app_manifest_fingerprint=manifest.fingerprint,
+            app_manifest_project_root=self._project_root,
             eval_store=self._eval_store,
             store_backend=self._store_backend,
             store_source=self._store_source,
@@ -166,6 +167,7 @@ class ResolvedProjectControlPlaneContext:
     project_id: str | None
     application_release_id: str
     app_manifest_fingerprint: str
+    app_manifest_project_root: Path
     eval_store: EvalStore | None
     store_backend: Literal["sqlite", "postgres"] | None
     store_source: str | None
@@ -176,6 +178,11 @@ class ResolvedProjectControlPlaneContext:
     def __post_init__(self) -> None:
         if self._assembly_token is not _PROJECT_CONTEXT_ASSEMBLY_TOKEN:
             raise TypeError("Resolved project context must originate from Cayu project bootstrap.")
+        if (
+            not isinstance(self.app_manifest_project_root, Path)
+            or not self.app_manifest_project_root.is_absolute()
+        ):
+            raise TypeError("app_manifest_project_root must be an absolute Path.")
 
     @property
     def trusted_local_development(self) -> bool:

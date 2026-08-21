@@ -96,8 +96,8 @@ def test_serve_uses_the_maintained_service_factory_for_explicit_local_developmen
     with TestClient(launched["server"]) as client:
         readiness = client.get("/cayu/api/contract").json()["capabilities"]["evals_readiness"]
     assert readiness["catalog_read"] == {
-        "state": "gated",
-        "reason_code": "eval_target_not_configured",
+        "state": "ready",
+        "reason_code": None,
     }
     assert readiness["captured_result_persistence"] == {
         "state": "unsupported",

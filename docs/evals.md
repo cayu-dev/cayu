@@ -862,14 +862,31 @@ part of this configuration from project-owned declarations:
   `EvalStore` backend. Trusted loopback `cayu serve --dev` may instead create
   the project-local `data/cayu.db` default.
 
-This assembly does not deserialize or invent an executable eval target. Until
-the project target registry is available, automatic catalog and fresh-run
-operations remain visibly gated with `eval_target_not_configured`. An explicit
-`EvalsConfig` remains the complete low-level contract and takes precedence as
-one indivisible configuration; Cayu never merges its target with the
-automatically assembled store. Arbitrary embedded `create_server(...)` and
-`mount_cayu(...)` integrations continue to provide trusted runtime objects
-explicitly.
+After the application is built, project assembly generates one trusted
+normal-authority target for every registered agent. The empty request base names
+that agent and otherwise retains ordinary runtime defaults. A target key is
+derived from length-delimited UTF-8 project, agent, and profile identities under
+the `cayu-generated-eval-target-v1` domain and published as
+`eval.<sha256>`. Release identity is deliberately absent from this derivation;
+results separately retain the current release and exact application manifest.
+
+The registry is process-local and bounded to 128 targets. It publishes only safe
+identity through `GET /api/evals/targets`; the application object and executable
+request authority are never serialized. Corpus and run list queries are scoped
+to a published target key, with the registry's deterministic default used when
+the query omits one. Imports, reads, admission, cancellation, comparison, and
+worker claims resolve persisted target identity back through the registry, so
+work for an unknown or foreign target is neither exposed nor claimed.
+
+The generated profile id is currently `default`. It preserves normal agent
+provider, tool, environment, approval, and policy selection. The profile
+dimension is part of stable identity now so later server-published profiles can
+represent deliberate fixture, isolation, or authority changes without changing
+existing keys. An explicit `EvalsConfig` remains the complete low-level contract
+and takes precedence as one indivisible singleton registry; Cayu never merges its
+target with the automatically assembled store. Arbitrary embedded
+`create_server(...)` and `mount_cayu(...)` integrations continue to provide
+trusted runtime objects explicitly.
 
 Generated maintained-service factories carry an opaque
 `ProjectControlPlaneContext` into `create_agent_service(...)`. Existing
@@ -879,9 +896,9 @@ factories continue to start unchanged, but `cayu check` reports
 `cayu generate service-context`. Customized factories fail closed for manual
 review instead of being rewritten heuristically.
 
-An authenticated Cayu server can attach exactly one trusted `CorpusTarget` to a
-durable `SQLiteEvalStore` or `PostgresEvalStore`. `EvalsConfig` is complete,
-programmatic runtime wiring and is off by default:
+An embedded authenticated Cayu server can attach exactly one trusted
+`CorpusTarget` to a durable `SQLiteEvalStore` or `PostgresEvalStore`.
+`EvalsConfig` is complete programmatic V1 wiring and is off by default:
 
 ```python
 from cayu import SQLiteEvalStore
