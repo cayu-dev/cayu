@@ -61,6 +61,10 @@ class ProviderOperationStatus(StrEnum):
         return self not in {ProviderOperationStatus.QUEUED, ProviderOperationStatus.IN_PROGRESS}
 
 
+class ProviderOperationMalformedError(ValueError):
+    """A provider operation returned invalid protocol data during recovery."""
+
+
 class ProviderOperationRecoveryMetadata(BaseModel):
     """Small provider-neutral continuation state, never request or response data.
 
@@ -297,6 +301,7 @@ __all__ = [
     "ProviderOperationAdapter",
     "ProviderOperationCancellationSupport",
     "ProviderOperationConnection",
+    "ProviderOperationMalformedError",
     "ProviderOperationMode",
     "ProviderOperationRecoveryMetadata",
     "ProviderOperationSnapshot",

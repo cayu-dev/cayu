@@ -103,6 +103,7 @@ from cayu.providers import (
     ProviderOperationAdapter,
     ProviderOperationCancellationSupport,
     ProviderOperationConnection,
+    ProviderOperationMalformedError,
     ProviderOperationMode,
     ProviderOperationRecoveryMetadata,
     ProviderOperationSnapshot,
@@ -1443,6 +1444,19 @@ class _ProviderRecoveryRequiredPublicationFailureEvidence(RuntimeError):
         )
         self.recovery_reason = recovery_reason
         self.cleanup_diagnostic = copied
+
+
+class _ProviderOperationStreamStatusError(RuntimeError):
+    """A validated operation error boundary carrying the provider's typed status."""
+
+    def __init__(
+        self,
+        status: ProviderOperationStatus,
+        provider_error: ModelProviderError,
+    ) -> None:
+        super().__init__(str(provider_error))
+        self.status = status
+        self.provider_error = provider_error
 
 
 async def _emit_provider_recovery_required_event(
@@ -3274,6 +3288,15 @@ class ModelStepExecutor:
                     )
                 )
             elif stream_event.type is ModelStreamEventType.ERROR:
+                if stream_event.provider_operation_status is not None:
+                    if not isinstance(recovered_provider_error, ModelProviderError):
+                        raise RuntimeError(
+                            "Provider-operation status requires a typed provider error."
+                        )
+                    raise _ProviderOperationStreamStatusError(
+                        stream_event.provider_operation_status,
+                        recovered_provider_error,
+                    ) from recovered_provider_error
                 raise recovered_provider_error or RuntimeError(
                     "Recovered provider operation failed."
                 )
@@ -3331,6 +3354,18 @@ class ModelStepExecutor:
                 raise RuntimeError("Recovered provider operation returned an unsupported event.")
 
         for accepted_event in operation.accepted_stream_events:
+            if (
+                accepted_event.type is ModelStreamEventType.ERROR
+                and accepted_event.provider_operation_status
+                in {
+                    ProviderOperationStatus.QUEUED,
+                    ProviderOperationStatus.IN_PROGRESS,
+                }
+            ):
+                # The error evidence and cursor are already durable. A
+                # nonterminal provider status means recovery should continue
+                # after that boundary rather than replaying the model error.
+                continue
             await accept_recovered_event(accepted_event, persist_progress=False)
 
         await require_recovery_owner()
@@ -3347,9 +3382,14 @@ class ModelStepExecutor:
                 )
                 if not isinstance(recovery_failure, Exception):
                     raise recovery_failure
+                malformed = isinstance(recovery_failure, ProviderOperationMalformedError)
                 return await unavailable_recovery_result(
-                    ProviderOperationUnavailableReason.UNAVAILABLE,
-                    ProviderOperationStatus.UNAVAILABLE,
+                    (
+                        ProviderOperationUnavailableReason.MALFORMED
+                        if malformed
+                        else ProviderOperationUnavailableReason.UNAVAILABLE
+                    ),
+                    "malformed" if malformed else ProviderOperationStatus.UNAVAILABLE,
                 )
             try:
                 connection = copy_provider_operation_connection(raw_connection)
@@ -3398,6 +3438,7 @@ class ModelStepExecutor:
                 ]
                 | None
             ) = None
+            reconnect_pending_status: ProviderOperationStatus | None = None
             reconnect_cleanup_failure: Exception | None = None
             try:
                 async with aclosing_provider_stream(connection.events) as reconnect_events:
@@ -3412,6 +3453,26 @@ class ModelStepExecutor:
                             await require_recovery_owner()
                             try:
                                 await accept_recovered_event(raw_event, persist_progress=True)
+                            except _ProviderOperationStreamStatusError as status_failure:
+                                if completed_event is None:
+                                    if status_failure.status in {
+                                        ProviderOperationStatus.QUEUED,
+                                        ProviderOperationStatus.IN_PROGRESS,
+                                    }:
+                                        reconnect_pending_status = status_failure.status
+                                    else:
+                                        reason = provider_operation_unavailable_reason(
+                                            status_failure.status
+                                        )
+                                        if reason is None:
+                                            reason = ProviderOperationUnavailableReason.MALFORMED
+                                        reconnect_unavailable = (
+                                            reason,
+                                            status_failure.status,
+                                        )
+                                else:
+                                    retain_post_completion_failure(status_failure.provider_error)
+                                break
                             except Exception as event_failure:
                                 if completed_event is None:
                                     reason = recovered_event_failure_reason(event_failure)
@@ -3431,9 +3492,14 @@ class ModelStepExecutor:
                 if completed_event is None:
                     if isinstance(stream_failure, Exception):
                         if reconnect_unavailable is None:
+                            malformed = isinstance(stream_failure, ProviderOperationMalformedError)
                             reconnect_unavailable = (
-                                ProviderOperationUnavailableReason.UNAVAILABLE,
-                                ProviderOperationStatus.UNAVAILABLE,
+                                (
+                                    ProviderOperationUnavailableReason.MALFORMED
+                                    if malformed
+                                    else ProviderOperationUnavailableReason.UNAVAILABLE
+                                ),
+                                ("malformed" if malformed else ProviderOperationStatus.UNAVAILABLE),
                             )
                         else:
                             reconnect_cleanup_failure = stream_failure
@@ -3446,6 +3512,8 @@ class ModelStepExecutor:
                     *reconnect_unavailable,
                     cleanup_failure=reconnect_cleanup_failure,
                 )
+            if reconnect_pending_status is not None and completed_event is None:
+                return await pending_recovery_result(reconnect_pending_status)
         else:
             try:
                 raw_snapshot = await adapter.retrieve(
@@ -3462,9 +3530,14 @@ class ModelStepExecutor:
                 )
                 if not isinstance(recovery_failure, Exception):
                     raise recovery_failure
+                malformed = isinstance(recovery_failure, ProviderOperationMalformedError)
                 return await unavailable_recovery_result(
-                    ProviderOperationUnavailableReason.UNAVAILABLE,
-                    ProviderOperationStatus.UNAVAILABLE,
+                    (
+                        ProviderOperationUnavailableReason.MALFORMED
+                        if malformed
+                        else ProviderOperationUnavailableReason.UNAVAILABLE
+                    ),
+                    "malformed" if malformed else ProviderOperationStatus.UNAVAILABLE,
                 )
             try:
                 snapshot = copy_provider_operation_snapshot(raw_snapshot)
@@ -3487,6 +3560,22 @@ class ModelStepExecutor:
             for raw_event in snapshot.events:
                 try:
                     await accept_recovered_event(raw_event, persist_progress=False)
+                except _ProviderOperationStreamStatusError as status_failure:
+                    if completed_event is None:
+                        if status_failure.status in {
+                            ProviderOperationStatus.QUEUED,
+                            ProviderOperationStatus.IN_PROGRESS,
+                        }:
+                            return await pending_recovery_result(status_failure.status)
+                        reason = provider_operation_unavailable_reason(status_failure.status)
+                        if reason is None:
+                            reason = ProviderOperationUnavailableReason.MALFORMED
+                        return await unavailable_recovery_result(
+                            reason,
+                            status_failure.status,
+                        )
+                    retain_post_completion_failure(status_failure.provider_error)
+                    break
                 except Exception as snapshot_failure:
                     if completed_event is None:
                         reason = recovered_event_failure_reason(snapshot_failure)

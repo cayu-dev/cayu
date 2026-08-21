@@ -136,6 +136,21 @@ from cayu.runtime.sessions import (
 )
 
 
+def test_openai_background_mode_is_part_of_the_builtin_provider_profile() -> None:
+    synchronous = execution_profile_admission._cayu_provider_material(
+        OpenAIProvider(api_key="test-key")
+    )
+    background = execution_profile_admission._cayu_provider_material(
+        OpenAIProvider(api_key="test-key", background=True)
+    )
+
+    assert synchronous is not None
+    assert background is not None
+    assert synchronous["background"] is False
+    assert background["background"] is True
+    assert synchronous != background
+
+
 def test_dashboard_profile_fixture_delegates_to_the_runtime_resolver() -> None:
     path = Path(__file__).resolve().parents[2] / "examples/dashboard_behavior_live.py"
     source = path.read_text(encoding="utf-8")

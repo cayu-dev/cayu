@@ -89,6 +89,23 @@ guard.
 
 ## Unreleased
 
+### OpenAI Responses background work survives worker loss
+
+`OpenAIProvider(background=True)` now starts stored, streamed Responses API
+background operations and durably binds their response ID and accepted sequence
+cursor to Cayu's provider-operation recovery contract. Recovery retrieves
+offline completions or resumes after the last accepted OpenAI event without
+duplicating transcript output, terminal events, usage, or cost settlement.
+Cancellation targets the same response and preserves completion when it wins a
+race. The default OpenAI path and every unsupported provider remain synchronous.
+
+OpenAI does not document exact key-only recovery for a lost create
+acknowledgement, so Cayu reports generic `ambiguous_submission` evidence instead
+of retrying or heuristically searching for a response. Background storage,
+retention, ZDR, latency, account, model, region, and project-policy tradeoffs are
+documented in `cayu guide providers` and must be accepted explicitly by enabling
+the provider option.
+
 ## v0.3.0
 
 `v0.3.0` hardens Cayu's durable runtime contracts while extending the

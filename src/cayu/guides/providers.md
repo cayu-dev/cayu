@@ -23,6 +23,53 @@ Google AI Studio automatically uses Gemini usage accounting. For Gemini through
 another OpenAI-compatible Vertex or gateway endpoint, pass
 `usage_dialect=UsageDialect.GEMINI` explicitly.
 
+## Recoverable OpenAI background responses
+
+Long OpenAI Responses calls can opt into provider-owned background execution:
+
+```python
+from cayu import AgentSpec, CayuApp
+from cayu.providers import OpenAIProvider
+
+app = CayuApp()
+app.register_provider(OpenAIProvider(background=True), default=True)
+app.register_agent(AgentSpec(name="assistant", model="gpt-5.6"))
+```
+
+This is a provider-registration choice, not a per-request OpenAI option.
+Cayu sends `background: true`, `stream: true`, and `store: true`, records the
+OpenAI response ID before accepting later output, and can retrieve or resume
+that same response after worker loss. `ModelRequest.options["openai"]` cannot
+override these fields. The default `OpenAIProvider()` remains synchronous.
+
+Enable this only after reviewing the deployment tradeoffs:
+
+- OpenAI background responses have higher time to first token than synchronous
+  responses.
+- A non-ZDR project stores the response at OpenAI so it can be retrieved and
+  resumed. OpenAI documents a 30-day Responses application-state retention
+  period and says data for `store=true` responses is retained for at least 30
+  days. OpenAI forces `store=false` under Zero Data Retention, but background
+  mode still stores response data on disk for roughly ten minutes for polling.
+  Confirm that behavior satisfies the application's retention policy before
+  enabling it.
+- Cayu currently enables this mode only for the global `api.openai.com` base
+  URL and rejects region-specific OpenAI domains. OpenAI separately documents
+  that `background=true` is unavailable on its EU regional route. Validate the
+  account, model, project policy, processing location, and storage location for
+  the intended production deployment.
+- OpenAI does not document exact recovery of a lost create acknowledgement from
+  Cayu's idempotency key. If the response ID was never made durable, Cayu reports
+  `ambiguous_submission` and does not submit the request again automatically.
+
+This capability reconnects one provider operation. It is distinct from
+server-side conversation chaining (`previous_response_id`) and from Cayu's
+durable transcript. `OpenAISubscriptionProvider`, `ChatCompletionsProvider`,
+Anthropic, Bedrock, Vertex, and custom adapters do not gain this capability.
+See OpenAI's [data controls](https://developers.openai.com/api/docs/guides/your-data)
+and [background mode](https://developers.openai.com/api/docs/guides/background)
+guides for the current provider policy.
+
 ## Compatible Chat Completions
 
 OpenRouter, Fireworks, Baseten Model APIs, OpenCode Go, and other compatible

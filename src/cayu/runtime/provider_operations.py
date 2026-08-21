@@ -1149,7 +1149,13 @@ async def _load_accepted_provider_operation_progress(
         raise ProviderOperationEvidenceError(
             "Provider-operation latest progress conflicts with durable event history."
         )
-    if final_event.type in {ModelStreamEventType.ERROR, ModelStreamEventType.COMPLETED}:
+    if final_event.type is ModelStreamEventType.COMPLETED or (
+        final_event.type is ModelStreamEventType.ERROR
+        and (
+            final_event.provider_operation_status is None
+            or final_event.provider_operation_status.terminal
+        )
+    ):
         raise ProviderOperationEvidenceError(
             "Provider-operation terminal output already crossed Cayu's durable boundary."
         )
@@ -2561,6 +2567,52 @@ async def inspect_provider_operation(
             provider=provider,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
+            cancellation_status=cancellation_status,
+            accounting_status=accounting_status,
+            reservation_count=reservation_count,
+        )
+    terminal_progress_statuses: set[ProviderOperationStatus] = set()
+    for event in owning_events:
+        if event.type != EventType.MODEL_ERROR:
+            continue
+        if event.payload.get("provider_operation_progress") is None:
+            continue
+        envelope = _parse_progress_envelope(event)
+        if (
+            envelope.state_version != state.version
+            or envelope.operation_id != state.operation_id
+            or envelope.stream_protocol != state.stream_protocol
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation terminal progress changed operation identity."
+            )
+        terminal_status = envelope.stream_event.provider_operation_status
+        if terminal_status is not None and terminal_status.terminal:
+            terminal_progress_statuses.add(terminal_status)
+    if len(terminal_progress_statuses) > 1:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation terminal progress contains contradictory statuses."
+        )
+    if terminal_progress_statuses:
+        [terminal_progress_status] = terminal_progress_statuses
+        recovery_reason = provider_operation_unavailable_reason(terminal_progress_status)
+        if recovery_reason is None:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation terminal progress has no recovery reason."
+            )
+        return ProviderOperationInspection(
+            status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE,
+            provider=provider,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+            recovery_reason=recovery_reason,
+            duplicate_request_risk=provider_operation_duplicate_request_risk(recovery_reason),
+            allowed_resolutions=(
+                ProviderOperationResolutionAction.FALLBACK_RETRY,
+                ProviderOperationResolutionAction.FAIL,
+            ),
+            stage_id=resolution_stage_id,
+            run_epoch=resolution_run_epoch,
             cancellation_status=cancellation_status,
             accounting_status=accounting_status,
             reservation_count=reservation_count,

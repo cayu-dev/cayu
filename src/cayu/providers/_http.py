@@ -422,13 +422,55 @@ async def post_json(
     structured error (typed status/code fields) from the HTTP error response;
     the shared layer supplies its parsed ``Retry-After`` delay.
     """
+    return await request_json(
+        client=client,
+        method="POST",
+        url=url,
+        headers=headers,
+        payload=payload,
+        timeout_s=timeout_s,
+        request_label=request_label,
+        response_label=response_label,
+        api_error=api_error,
+        protocol_error=protocol_error,
+        error_response_text=error_response_text,
+        raise_context_overflow=raise_context_overflow,
+        api_error_from_response=api_error_from_response,
+    )
+
+
+async def request_json(
+    *,
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    payload: Mapping[str, Any] | None,
+    timeout_s: float,
+    request_label: str,
+    response_label: str,
+    api_error: Callable[..., Exception],
+    protocol_error: type[Exception],
+    error_response_text: Callable[[httpx.Response], str],
+    raise_context_overflow: Callable[[httpx.Response], None] | None = None,
+    api_error_from_response: _ApiErrorFromResponse | None = None,
+) -> Mapping[str, Any]:
+    """Send a bounded JSON request and return one decoded object response."""
+
+    method = require_clean_nonblank(method, "method").upper()
     try:
-        response = await client.post(
-            url,
-            headers=dict(headers),
-            json=dict(payload),
-            timeout=timeout_s,
-        )
+        request_kwargs: dict[str, Any] = {
+            "headers": dict(headers),
+            "timeout": timeout_s,
+        }
+        if payload is not None:
+            request_kwargs["json"] = dict(payload)
+        if method == "POST":
+            response = await client.post(url, **request_kwargs)
+        elif method == "GET":
+            response = await client.get(url, **request_kwargs)
+        else:
+            response = await client.request(method, url, **request_kwargs)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         if raise_context_overflow is not None:
@@ -477,8 +519,9 @@ async def stream_sse_json_events(
     raise_context_overflow: Callable[[httpx.Response], None] | None = None,
     raise_context_overflow_from_status: _RaiseContextOverflowFromStatus | None = None,
     api_error_from_response: _ApiErrorFromResponse | None = None,
+    method: str = "POST",
 ) -> AsyncIterator[Mapping[str, Any]]:
-    """POST a streaming JSON payload and yield decoded SSE data objects.
+    """Send a streaming JSON request and yield decoded SSE data objects.
 
     The caller-owned ``client`` is reused across requests; only the streaming
     response is opened and closed per call. ``api_error_from_response`` mirrors
@@ -487,6 +530,7 @@ async def stream_sse_json_events(
     ``raise_context_overflow_from_status`` is reserved for provider statuses
     that are authoritative when the response body cannot be read safely.
     """
+    method = require_clean_nonblank(method, "method").upper()
     error_body_idle_timeout_s = require_finite(
         float(stream_idle_timeout_s),
         "stream_idle_timeout_s",
@@ -501,13 +545,13 @@ async def stream_sse_json_events(
     )
     timeout = httpx.Timeout(timeout_s, read=None)
     try:
-        response_context = client.stream(
-            "POST",
-            url,
-            headers=_identity_sse_headers(headers),
-            json=dict(payload),
-            timeout=timeout,
-        )
+        request_kwargs: dict[str, Any] = {
+            "headers": _identity_sse_headers(headers),
+            "timeout": timeout,
+        }
+        if method != "GET":
+            request_kwargs["json"] = dict(payload)
+        response_context = client.stream(method, url, **request_kwargs)
         responses = _aiter_owned_stream_response(response_context)
         async with aclosing_provider_stream(responses):
             response = await anext(responses)
@@ -1094,6 +1138,7 @@ __all__ = [
     "new_async_client",
     "optional_error_string",
     "post_json",
+    "request_json",
     "response_json_object",
     "retry_after_seconds",
     "safe_error_json",

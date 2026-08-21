@@ -1560,10 +1560,11 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "openai-responses",
-            "version": 1,
+            "version": 2,
             "base_url": provider.base_url,
             "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
             "reasoning_state": provider.reasoning_state,
+            "background": provider.background,
             "timeout_s": provider.timeout_s,
             "stream_idle_timeout_s": provider.stream_idle_timeout_s,
         }

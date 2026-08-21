@@ -4540,6 +4540,24 @@ adapter exposes separate start, retrieve, reconnect, and cancel operations and
 normalizes provider lifecycle values into bounded `ProviderOperationStatus`
 values.
 
+Reconnectable `ModelStreamEvent` values may set
+`provider_operation_status` only on `completed` or `error` events. A completed
+event may carry only `COMPLETED`. An error may carry a terminal status when the
+provider explicitly reported that outcome, or `QUEUED`/`IN_PROGRESS` when the
+stream failed but the provider-owned operation has not reached a known terminal
+state. Cayu trusts that status only after the complete event passes runtime
+validation and its reconnect cursor is durably accepted; an invalid cursor,
+secret-bearing envelope, malformed payload, or failed progress commit cannot
+self-classify as cancelled, expired, or failed. A durably accepted nonterminal
+error advances the cursor, remains inspectable as error evidence, and schedules
+continuation after that boundary rather than authorizing fallback dispatch.
+
+Adapters raise `ProviderOperationMalformedError` when retrieve or reconnect
+data violates the provider protocol. The runtime maps that typed exception to
+the provider-neutral `malformed` recovery reason. Ordinary transport or service
+availability failures must not use it; those remain `unavailable` so operators
+can distinguish invalid evidence from an operation that could not be observed.
+
 Before external dispatch, Cayu durably commits
 `provider.operation.starting` with a stable, model-attempt-scoped idempotency
 key. The adapter receives that key when it starts the provider operation. An
@@ -4827,6 +4845,32 @@ which kind of evidence an input represents.
 Transport loss after start is an unknown outcome. A retry may repeat the search and cost. Because OpenAI does
 not expose a hard per-response search-call ceiling, strict cost budgets reject
 hosted search before provider dispatch. See [`web-fetch.md`](web-fetch.md).
+
+`OpenAIProvider(background=True)` is the explicit exception to that synchronous,
+non-stored default. It is available only on the official OpenAI API route and
+sends `background: true`, `stream: true`, and `store: true`. Cayu commits the
+`response.created` ID before consuming subsequent output, stores each accepted
+OpenAI `sequence_number` as bounded adapter-private recovery state, resumes with
+`starting_after`, retrieves terminal responses that completed while no worker
+was attached, and targets the same response ID for cancellation. OpenAI does
+not document a key-only lookup for a create acknowledgement that Cayu never
+received, so this adapter declares start idempotency unsupported and preserves
+the generic `ambiguous_submission` boundary without heuristic search or replay.
+
+Background mode may have higher time to first token. OpenAI documents a 30-day
+Responses application-state retention period and says `store=true` response
+data is retained for at least 30 days. Under Zero Data Retention OpenAI forces
+`store=false`, but background mode still stores response data on disk for
+roughly ten minutes to support asynchronous execution and polling. Cayu only
+admits background mode on the global `api.openai.com` route and rejects every
+region-specific base URL; OpenAI separately documents that `background=true`
+is unavailable on its EU regional route. Applications must validate model,
+account, project policy, processing location, storage location, and retention
+suitability before opting in. Operation reconnection is not server-side
+conversation chaining: `previous_response_id` and transcript `provider_state`
+remain separate conversation-state mechanisms. The subscription, Chat
+Completions, Anthropic, Bedrock, Vertex, and other providers retain their
+synchronous capability declaration.
 
 `OpenAISubscriptionProvider` reuses that neutral Responses translation against
 the ChatGPT Codex backend after `cayu auth openai login`. It refreshes the

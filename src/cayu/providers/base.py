@@ -43,6 +43,7 @@ from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationMode,
     ProviderOperationRecoveryMetadata,
+    ProviderOperationStatus,
 )
 
 _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS = frozenset(
@@ -588,6 +589,10 @@ class ModelStreamEvent(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    provider_operation_status: ProviderOperationStatus | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -620,9 +625,19 @@ class ModelStreamEvent(BaseModel):
         if self.type == ModelStreamEventType.COMPLETED:
             if self.completion is None:
                 self.completion = normalize_model_completion(self.payload)
+            if self.provider_operation_status not in {
+                None,
+                ProviderOperationStatus.COMPLETED,
+            }:
+                raise ValueError("Completed stream events require completed operation status.")
             return self
         if self.completion is not None:
             raise ValueError("Only completed model stream events can include completion metadata.")
+        if self.provider_operation_status is not None:
+            if self.type is not ModelStreamEventType.ERROR:
+                raise ValueError("Only error events can carry operation status.")
+            if self.provider_operation_status is ProviderOperationStatus.COMPLETED:
+                raise ValueError("Completed operation status requires a completed stream event.")
         return self
 
     @classmethod
@@ -737,6 +752,7 @@ class ModelStreamEvent(BaseModel):
         *,
         cause: Exception | None = None,
         recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
+        provider_operation_status: ProviderOperationStatus | None = None,
     ) -> ModelStreamEvent:
         """An error event; `cause` preserves typed classification in the payload.
 
@@ -762,6 +778,7 @@ class ModelStreamEvent(BaseModel):
             type=ModelStreamEventType.ERROR,
             payload=payload,
             recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
+            provider_operation_status=provider_operation_status,
         )
 
 
@@ -787,6 +804,7 @@ def copy_model_stream_event(event: ModelStreamEvent) -> ModelStreamEvent:
                 event.recovery_metadata.model_dump(mode="python")
             )
         ),
+        provider_operation_status=event.provider_operation_status,
     )
 
 
