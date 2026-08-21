@@ -245,6 +245,25 @@ survives ordinary tool-round recovery and approval or user-input interruption,
 while exposed calls continue through every existing authorization and execution
 control.
 
+Ordinary same-session resumes and queued dispatches now seed the next policy
+request from the latest runtime-attested durable exposure profile. This keeps
+phase selection and `profile_changed` evidence continuous across process
+reconstruction; malformed or caller-authored lookalike evidence fails closed.
+
+Tool exposure now emits the typed, content-minimized `tool.exposure.recorded`
+evidence reserved by the public contract: profile and resolved fingerprint,
+registered/ceiling/exposed counts, provider/model/step identity, and profile
+transition state, with no separate tool-name list, tool definitions, arguments,
+or policy reasoning. Application-selected profile ids are public and must be
+stable non-secret labels.
+Conversational request footprints advance to schema version 3 and bind the same
+exposure summary to their keyed tool-manifest and cache-prefix identities.
+`LLMJudge` now runs under a durable zero-tool capability ceiling even when its
+registered agent has tools; adversarial candidate content cannot expose or
+execute them. The paired tool-exposure economics fixture reports requests,
+retries, cache categories, provider usage, quality, and cost without claiming a
+universal winning strategy.
+
 ### Bounded fork groups are durable public runtime operations
 
 `CayuApp.run_fork_group(...)` now freezes one terminal source checkpoint and

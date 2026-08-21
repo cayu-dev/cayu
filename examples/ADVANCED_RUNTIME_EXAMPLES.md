@@ -1,7 +1,9 @@
 # Advanced Runtime Examples
 
 Start here when you are evaluating, extending, or asking an agent to work on
-Cayu's advanced examples. These applications serve two purposes:
+Cayu's advanced examples. The suite contains six provider-portable product
+stories and one deterministic measurement fixture. Together they serve two
+purposes:
 
 1. exercise Cayu against deterministic providers and real provider APIs; and
 2. demonstrate programmable runtime behavior built from durable sessions,
@@ -15,7 +17,7 @@ For the product narrative and dated measurements, see
 cost strategy and governance map, see
 [Cost optimization and governance](../docs/cost-optimization.md).
 
-## Example map
+## Product-story map
 
 | Example | Product idea | Stable runtime evidence | Entry point |
 | --- | --- | --- | --- |
@@ -26,6 +28,12 @@ cost strategy and governance map, see
 | `repo_maintainer_tournament` | Generate competing repairs, reject reward hacking, and promote only the verified winner. | Candidate isolation, deterministic tests and diff gates, test-weakening rejection, one winner, idempotent PR recovery, and optional real Git worktree/commit/push/PR verification. | [README](repo_maintainer_tournament/README.md) · [app](repo_maintainer_tournament/app.py) |
 | `tainted_incident_response` | Preserve trust boundaries even when untrusted context crosses a session fork and `CayuApp` reconstruction. | Durable inherited taint, a real runtime `tool.call.blocked` event, zero protected mutations, restricted outbound authority, and one sanitized handoff. | [README](tainted_incident_response/README.md) · [app](tainted_incident_response/app.py) |
 
+## Measurement fixture
+
+| Fixture | Measurement purpose | Stable runtime evidence | Entry point |
+| --- | --- | --- | --- |
+| `tool_exposure_economics` | Compare stable broad and changing narrow direct-tool profiles without assuming that smaller schemas always reduce whole-session cost. | Exposure profiles and transitions, keyed tool-manifest and cache-prefix identities, request/retry counts, provider-style cache categories, exact quality, and fixture-priced cost with no universal savings claim. | [README](tool_exposure_economics/README.md) · [deterministic](tool_exposure_economics/deterministic.py) |
+
 ## Where agents and developers should look
 
 Use these files in this order:
@@ -33,7 +41,7 @@ Use these files in this order:
 1. This index for the suite-level contract and commands.
 2. The example's `README.md` for its scenario and prerequisites.
 3. The example's `scenario.py` for the provider-neutral orchestration.
-4. `deterministic.py` and `live.py` for backend construction.
+4. `deterministic.py` and, when supported, `live.py` for backend construction.
 5. [`_advanced_support/results.py`](_advanced_support/results.py) for the
    durable evidence envelope.
 6. [`tests/advanced_examples/`](../tests/advanced_examples/) for deterministic
@@ -49,8 +57,9 @@ the scenario.
 
 ## Run the suite deterministically
 
-Deterministic runs use `ScriptedModelProvider`, call no external model API, and
-must satisfy the same structural assertions as live runs:
+The six provider-portable product stories use `ScriptedModelProvider`, call no
+external model API in deterministic mode, and satisfy the same structural
+assertions as their live runs:
 
 ```bash
 for example in \
@@ -65,15 +74,22 @@ do
 done
 ```
 
+The tool-exposure economics fixture is deliberately deterministic-only:
+
+```bash
+uv run python -m examples.tool_exposure_economics.deterministic
+```
+
 Run the deterministic specifications directly with:
 
 ```bash
 uv run pytest -q tests/advanced_examples
 ```
 
-## Run with a real provider
+## Run the provider-portable stories with a real provider
 
-Every example supports Gemini, OpenAI, and Anthropic through the same CLI:
+The six provider-portable stories support live backends through the same CLI;
+provider-specific examples document any narrower support in their README:
 
 ```bash
 # Gemini through its OpenAI-compatible endpoint
@@ -126,10 +142,13 @@ head SHA, base, changed files, and one-open-PR recovery contract.
 
 ## Evidence contract
 
-Every successful run writes ignored JSON under
+Each provider-portable product-story run writes ignored JSON under
 `.cayu-example-results/<scenario>/<run-id>.json`. Repository workspaces are
 written under ignored `.cayu-example-workspaces/` or
 `.cayu-example-repositories/` directories.
+
+The deterministic-only tool-exposure economics fixture prints its versioned
+paired report to stdout and does not claim the shared live-result envelope.
 
 The shared result contains:
 
@@ -148,7 +167,7 @@ and semantic envelope passed—not merely that the provider returned text.
 
 | Layer | Cost and prerequisites | Purpose |
 | --- | --- | --- |
-| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for all six scenarios. |
+| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for the six product stories and measurement fixture. |
 | Primary Gemini checks | `GEMINI_API_KEY`; five trials when the registered nightly checks are invoked | Multi-trial verification of the main live-provider path. |
 | OpenAI and Anthropic portability checks | Matching provider key; one trial per registered check | Detect provider-specific tool, structured-output, and usage regressions. |
 | Real repository promotion | Provider key, GitHub authority, Git credentials, and a disposable repository; manual opt-in | Verify clone, real worktrees, commit, push, PR creation, and idempotent recovery. |
@@ -165,7 +184,8 @@ for current invocation and status vocabulary.
 - Persist evidence for lineage, usage, recovery, authority, and side effects
   relevant to the claim.
 - Add deterministic coverage under `tests/advanced_examples/`.
-- Register credential-gated live checks in `scripts/nightly_verification.py`.
+- Register credential-gated checks in `scripts/nightly_verification.py` when the
+  example has a live mode.
 - Separate first-attempt token effects from total provider usage, including
   retries.
 - State what the example does not prove.

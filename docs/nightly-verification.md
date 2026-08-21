@@ -29,9 +29,10 @@ The report is the product. A pass count without a capability map is not enough.
 5. **Costs and prerequisites are separate.** "No LLM spend" does not mean "no
    external service." E2B needs `E2B_API_KEY` even when no model is called.
 
-The six executable advanced scenarios and their assertion contract are indexed
-in [`examples/ADVANCED_RUNTIME_EXAMPLES.md`](../examples/ADVANCED_RUNTIME_EXAMPLES.md).
-Their product story and dated live observations are documented in
+The six executable advanced product stories and deterministic tool-exposure
+measurement fixture are indexed in
+[`examples/ADVANCED_RUNTIME_EXAMPLES.md`](../examples/ADVANCED_RUNTIME_EXAMPLES.md).
+The product narratives and dated live observations are documented in
 [`docs/advanced-runtime-examples.md`](advanced-runtime-examples.md).
 
 ## Runner

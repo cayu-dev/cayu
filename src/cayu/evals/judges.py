@@ -12,6 +12,7 @@ from cayu.evals.models import EvalAssertionResult, EvalContext
 from cayu.evals.runner import final_output_text
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import RunRequest, Session, SessionStatus
+from cayu.runtime.tool_exposure import ToolCapabilityCeiling
 
 _JUDGE_INSTRUCTIONS = (
     'Respond with ONLY a JSON object of the form {"score": <number between 0 and 1>, '
@@ -38,10 +39,12 @@ class LLMJudge(EvalAssertion):
     judge's provider/model, the rubric (and version), the exact prompt, the raw output, and the
     parsed score/rationale.
 
-    The judge agent must be registered without tools. A tool-bearing registration is rejected
-    before the provider is invoked. Each evaluation opens a new session on the judge ``app``
-    and deletes it (best-effort) once the judgment is captured, so large suites don't accumulate
-    orphan judge sessions; stores that don't support ``delete_session`` simply retain them.
+    Every judge session is created with a durable zero-application-tool capability ceiling.
+    The registered judge agent may have tools for its ordinary workloads, but their definitions
+    are absent from the judge request and returned calls cannot reach authorization or execution.
+    Each evaluation opens a new session on the judge ``app`` and deletes it (best-effort) once the
+    judgment is captured, so large suites don't accumulate orphan judge sessions; stores that
+    don't support ``delete_session`` simply retain them.
 
     The graded material (task, final output, transcript) is delimited as untrusted data in
     the judge prompt, and the score is only accepted as a well-formed JSON object — a run
@@ -96,15 +99,9 @@ class LLMJudge(EvalAssertion):
         transcript_text: str | None,
     ) -> EvalAssertionResult:
         try:
-            registered_agent = self._app.get_agent(self._agent_name)
+            self._app.get_agent(self._agent_name)
         except Exception as exc:
             return self.error(f"Judge configuration is invalid: {type(exc).__name__}: {exc}")
-        if registered_agent.tools:
-            tool_names = ", ".join(sorted(registered_agent.tools))
-            return self.error(
-                f"Judge agent {self._agent_name!r} must be tool-free; registered tools: "
-                f"{tool_names}."
-            )
 
         prompt = _build_judge_prompt_from_material(
             self._rubric,
@@ -121,11 +118,12 @@ class LLMJudge(EvalAssertion):
                         agent_name=self._agent_name,
                         messages=[Message.text("user", prompt)],
                         max_steps=1,
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                     )
                 ):
                     session_id = session_id or event.session_id
-                    # Defense in depth only: the tool-free agent pre-gate above prevents
-                    # execution; this post-hoc check rejects even a hallucinated tool request.
+                    # Defense in depth: the zero-tool ceiling prevents execution; this
+                    # post-hoc check also rejects a provider that fabricated a hidden call.
                     if str(event.type).startswith("tool.call."):
                         tool_call_observed = True
                 if session_id is None:

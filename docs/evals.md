@@ -1113,6 +1113,14 @@ deterministically testable by injecting a scripted provider. Every judgment is *
 exact `prompt`, the raw `judge_output`, and the parsed `score`/`rationale`. Pass
 `include_transcript=True` to give the judge the full transcript, not just the final output.
 
+Each `LLMJudge` session applies a durable zero-application-tool capability
+ceiling. The registered judge agent may therefore have tools for other
+workloads, but judge requests contain none of their definitions, and even a
+provider-fabricated hidden call is blocked before authorization, approval, or
+execution. This controls tool visibility and authority; it does not remove
+candidate text from the judge prompt or replace the application's privacy
+review for provider-bound evaluation data.
+
 For authority-free corpora, use `ModelJudgeAssertionSpec` plus a trusted
 `ModelJudgeTarget` on `CorpusTarget`. SDK `run_corpus_suite(...)`, corpus-mode
 `cayu eval run`, and the server-attached durable worker all resolve and execute

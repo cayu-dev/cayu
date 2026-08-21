@@ -140,6 +140,24 @@ same public v2 runtime-evidence projection used by the research council; the
 report exposes only the allowlisted policy outcome, matched taint labels, and
 source event identity, never the hostile ticket or tool payload.
 
+## Advanced measurement fixture
+
+### Compare stable and changing tool-exposure profiles
+
+The [tool-exposure economics fixture](../examples/tool_exposure_economics/)
+runs one paired deterministic workload under two valid strategies. The stable
+side keeps the same broad two-tool profile for both model steps; the narrow side
+changes from an inspect-only profile to a publish-only profile. Both sides must
+produce the same exact task outcome.
+
+The report combines standalone exposure-transition evidence with keyed request
+footprints, provider-style cache categories, retry-inclusive usage, and one
+fixture price book. It demonstrates how to measure the whole session when
+smaller schemas and cache stability pull in different directions. It is an
+advanced deterministic measurement fixture, not a provider-portable product
+story or live benchmark, and does not claim that either strategy is universally
+cheaper.
+
 ## Observed live evidence
 
 The following observations were recorded during credentialed verification on
@@ -184,6 +202,8 @@ bound spend.
 
 - Runtime-owned session lineage and checkpoint state can be composed into
   branch, evaluator, and repair strategies.
+- Stable and changing tool-exposure profiles can be compared with request,
+  cache, usage, quality, and cost evidence instead of schema-size claims alone.
 - Stable behavioral assertions can survive provider and prose variation.
 - Authority-free speculative work can coexist with a protected human decision.
 - Side-effect recovery can reconcile a durable external receipt without replay.

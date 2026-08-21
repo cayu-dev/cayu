@@ -655,7 +655,7 @@ custom compactors must explicitly return `None` from
 opaque provider-backed extension must disable footprints (and cannot combine it
 with run or cost controls that require per-dispatch admission).
 
-`RequestFootprint` contains exact content-free character, UTF-8 byte,
+`RequestFootprint` contains exact content-minimized character, UTF-8 byte,
 canonical-JSON byte, and attachment source-byte measurements for the safely
 measurable provider-neutral shape: system and non-system message groups,
 model-visible tools, structured-output wiring, resolved attachment classes,
@@ -670,8 +670,10 @@ so component estimates are not additive. `context_pressure` remains the single
 canonical full-request estimate consumed by observation and completion evidence.
 Neither model is an official token count, billing fact, or provider invoice. Raw prompts,
 messages, tool descriptions and schemas, arguments and results, attachment
-identities and bytes, metadata, credentials, and provider error bodies are not
-part of the event.
+identities and bytes, arbitrary request metadata, credentials, and provider error
+bodies are not part of the event. Conversational schema-v3 footprints do include
+the bounded application-selected tool-exposure `profile_id`; it is public
+non-secret metadata under the tool-exposure contract.
 
 Optional equality evidence uses HMAC-SHA-256 only. Configure both a non-secret
 `fingerprint_key_id` and a secret `fingerprint_key` on
@@ -1459,16 +1461,22 @@ resolution rather than rehashed on every admission check.
 `AllRegisteredToolsExposurePolicy` preserves the compatibility behavior inside
 the effective ceiling. `StaticToolExposurePolicy` defines one stable named
 allow-list and supports an empty tool-free profile.
-`ToolExposureDecision` is deliberately distinct from the future
-`ToolExposure` evidence record, which will describe definitions actually made
-visible to a model request.
+`ToolExposureDecision` is deliberately distinct from `ToolExposure`, the
+content-minimized public evidence record for definitions frozen into one
+prepared logical model step. `tool.exposure.recorded` carries the selected profile, resolved
+exposure fingerprint, registered/ceiling/exposed counts, provider/model/step
+identity, and whether the profile changed from the previous model step. It
+contains no separate tool-name list, schemas, arguments, policy metadata, or
+free-form reasoning. The application-selected `profile_id` remains public
+evidence, so it must be an opaque or otherwise non-secret stable label.
 Custom policies implement synchronous `select(...)`; they must be local,
 deterministic, and side-effect-free and must not call a model or remote service.
 The resolved fingerprint covers the profile id and exact ordered definitions;
 diagnostic metadata is bounded but intentionally does not change tool identity
-or confer authority. Profile ids and metadata are application declarations and
-must contain stable non-secret labels, never credentials, prompts, schemas, or
-free-form policy reasoning.
+or confer authority. Profile ids and metadata are public application
+declarations and must contain stable non-secret labels; any descriptive names
+embedded in them are intentionally public. They must never contain credentials,
+prompts, schemas, or free-form policy reasoning.
 
 Narrowing tool exposure changes only the definitions sent for a model step. It
 does not remove sensitive text already present in the transcript, system
@@ -1507,10 +1515,30 @@ component. Later registration changes cannot silently grant more tools.
 The snapshot is frozen for the logical model step: generic retries and the one
 context-overflow recovery reuse its exact definitions and order. A later model
 step invokes the policy again and supplies `previous_profile_id`, allowing an
-application to select another explicit stable phase profile. Prefer a small
-number of stable profiles over arbitrary per-turn schema churn because changing
-the tool array can split or invalidate provider prompt-cache prefixes; a
-smaller single request is not proof of lower whole-task cost.
+application to select another explicit stable phase profile. The first model
+step of an ordinary same-session resume or queued dispatch derives that value
+from the latest runtime-attested durable exposure event; malformed or
+caller-authored lookalikes fail closed. Prefer a small number of stable profiles
+over arbitrary per-turn schema churn because changing the tool array can split
+or invalidate provider prompt-cache prefixes; a smaller single request is not
+proof of lower whole-task cost.
+
+When request-footprint observation is enabled, conversational requests use
+`RequestFootprint.schema_version == 3` and embed the same content-minimized
+exposure profile/fingerprint/count summary. The keyed
+`fingerprints.tool_manifest` and cache-breakpoint fingerprints bind that summary
+to the exact prepared request without persisting tool definitions.
+Context-compactor requests have no application exposure and remain on the prior
+footprint schema. The standalone
+`tool.exposure.recorded` event is emitted independently, so disabling request
+footprints does not disable capability evidence.
+
+Use the paired deterministic
+[`tool_exposure_economics`](../examples/tool_exposure_economics/) fixture to
+inspect stable-broad versus changing-narrow profiles. It reports request and
+retry counts, cache categories, provider usage, quality, and fixture-priced
+cost. It is an instrumentation example, not evidence that either strategy is
+universally cheaper.
 
 The compact snapshot authority is also stored in durable model-completion
 recovery context before provider dispatch. Offline output containing tool calls

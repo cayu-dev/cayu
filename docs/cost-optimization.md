@@ -17,11 +17,12 @@ contract that lets an application measure and control those outcomes.
 | --- | --- | --- | --- | --- | --- |
 | Refresh a warm prompt cache before compaction | Long, stable provider prefix with enough reuse to amortize cache-write and refresh cost | `PromptCacheCompactor`, `CheckpointCompactionContextPolicy`, normalized cache usage | Compare with bounded `ModelCompactor` from the same compactable source; report read, write, uncached, output, and retry-inclusive usage | Summary preserves concrete constraints and later turns still complete correctly | Cold or expired cache, provider/model/request-shape drift, cache-write premium, or too little future reuse |
 | Compact shared context, then fork | Several independent branches need the same expensive source context | durable checkpoints, `fork_session`, causal budget lineage, `ModelCompactor` | Paired compacted and full-context branches from one resolved source; report first attempts and whole-workflow totals | Evaluator finds material weaknesses and a repair addresses them | Compaction loses decisive evidence; evaluator or repair retries consume the input saving |
+| Stabilize direct-tool exposure profiles | Agents with a large registered catalog but phase-specific model needs | `ToolExposurePolicy`, named profiles, durable capability ceilings, request footprints | Compare stable-broad and changing-narrow runs; report requests, retries, keyed manifests/cache prefixes, provider cache counters, and whole-session cost | Identical task-specific quality gate on both sides | Narrow schemas reduce one request but profile churn loses cache reuse or adds retries |
 | Use a bounded or cheaper compaction model | Repeated sessions where full-prefix refresh is unavailable or uneconomical | `ModelCompactor(model=...)`, bounded input, compaction usage events | Compare the same compactable source at the same output cap; include escalation and repair attempts | Task-specific continuation/eval floor, not summary prose equality | Cheap model causes omissions, more retries, or an expensive repair |
 | Retrieve a small working set | Large corpora where only a small subset is relevant per step | knowledge injection, visibility/taint metadata, context policies | Compare identical tasks with and without retrieval; include embedding/search/model calls | Recall and answer-quality gates on known relevant evidence | Retrieval misses, stale indexes, hostile stored content, or retrieval overhead dominates |
 | Escalate only hard cases | High-volume workflows with a reliable cheap-model acceptance test | model override, loop/eval policies, durable attempt events, causal budgets | Compare cheap-first plus all escalation attempts with an always-expensive control | Deterministic or evaluator-backed acceptance threshold | Weak gate accepts bad output or escalates so often that savings disappear |
 
-The first two strategies have executable advanced cost examples today. The
+The first three strategies have executable advanced cost examples today. The
 other rows are supported building blocks or application patterns, not Cayu
 benchmark claims.
 
@@ -33,8 +34,9 @@ research branch calls, with all six final trials passing their runtime and quali
 gates. See [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)
 for the exact paired denominators, range, pricing provenance, and run IDs.
 
-Cayu currently has six advanced runtime examples. Two are deliberately
-cost-optimization examples:
+Cayu currently has six advanced runtime product stories plus one deterministic
+measurement fixture. Two product stories and the fixture deliberately cover
+cost optimization:
 
 - [Prompt-cache compaction](../examples/prompt_cache_compaction/) runs a
   cache-aware candidate and a bounded `ModelCompactor` control from the same
@@ -48,6 +50,12 @@ cost-optimization examples:
   adds a provenance-gated, retry-inclusive dollar comparison across the paired
   branch sessions. It does not provide an explicit same-checkpoint, pre-expiry
   compaction lifecycle.
+- [Tool-exposure economics](../examples/tool_exposure_economics/) compares a
+  stable broad profile with changing narrow phase profiles. Its deterministic
+  report includes request/retry counts, keyed tool-manifest and cache-prefix
+  identities, provider cache categories, an exact quality outcome, and
+  fixture-priced whole-session cost. It explicitly makes no provider benchmark
+  or universal savings claim.
 
 The other four advanced examples focus on bounded population evaluation,
 authority during approval, verified repository repair, and taint-preserving
@@ -188,7 +196,7 @@ explicit; neither should be silently treated as permission to spend.
 
 ## Start here
 
-- Run the six deterministic product stories with
+- Run the six deterministic product stories and the measurement fixture with
   `uv run pytest -q tests/advanced_examples`.
 - Run the prompt-cache pair with
   `uv run python -m examples.prompt_cache_compaction.app`.
