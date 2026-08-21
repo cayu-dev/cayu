@@ -30,12 +30,14 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime import sessions as sessions_module
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_round_executor import (
     ToolRoundRun,
     _copy_agent_spec,
+    _project_staged_terminal_event,
     _ToolRoundPublicationCoordinator,
 )
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
@@ -47,6 +49,7 @@ from cayu.runtime.tool_exposure import (
     unexposed_tool_result,
 )
 from cayu.tools._runner import sanitize_runner_failure_group
+from cayu.tools.web import WebFetchTool
 from cayu.vaults import SecretRedactor
 
 
@@ -327,6 +330,79 @@ def test_staged_terminal_exposure_authority_is_owned_by_the_frozen_snapshot() ->
     )
     with pytest.raises(RuntimeError, match="has no durable exposure owner"):
         unowned_coordinator.restore_staged_event_authority(terminal)
+
+
+def test_staged_web_access_authority_survives_only_owned_durable_reconstruction() -> None:
+    identity = _tool_round_identity()
+    result = ToolResult(
+        content="Access is blocked.",
+        structured={
+            "access": {
+                "schema_version": 1,
+                "outcome": "bot_challenge",
+                "source": "http_response",
+                "signal": "status_code",
+                "destination_fingerprint": "a" * 64,
+                "status_code": 401,
+                "retry_after_seconds": None,
+                "retry_after_unrepresentable": False,
+            }
+        },
+        is_error=True,
+    )
+    terminal = web_access_results.attest_runtime_web_access_result(
+        Event(
+            type=EventType.TOOL_CALL_FAILED,
+            session_id="session-staged-web-access-authority",
+            tool_name="web_fetch",
+            payload={
+                **identity.payload(),
+                "tool_call_id": "call_1",
+                "result": result.model_dump(mode="json"),
+            },
+        ),
+        result,
+        tool=WebFetchTool(),
+    )
+    marker = terminal.payload[web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD]
+    persisted = Event.model_validate(terminal.model_dump(mode="json"))
+    redactor = SecretRedactor("bot_challenge")
+
+    projected = _project_staged_terminal_event(
+        persisted,
+        redactor=redactor,
+        trust_persisted_web_access_authority=True,
+    )
+    projected_access = projected.payload["result"]["structured"]["access"]
+    assert projected_access["outcome"] == "bot_challenge"
+    assert projected.payload[web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD] == marker
+
+    untrusted = _project_staged_terminal_event(persisted, redactor=redactor)
+    assert web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD not in untrusted.payload
+    assert untrusted.payload["result"]["structured"]["access"]["outcome"] == ("[REDACTED_SECRET]")
+
+    coordinator = _ToolRoundPublicationCoordinator(
+        session_id="session-staged-web-access-authority",
+        tool_round_identity=identity,
+        session_store=InMemorySessionStore(),
+        redactor=redactor,
+        execution_profile=None,
+    )
+    restored = coordinator.restore_staged_event_authority(persisted)
+    assert event_payload_authority_is_runtime_generated(
+        restored,
+        field_name=web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+        value=marker,
+    )
+
+    tampered_payload = persisted.model_dump(mode="json")["payload"]
+    tampered_payload["result"]["structured"]["access"]["outcome"] = "consent_required"
+    with pytest.raises(ValueError, match="authority is malformed"):
+        _project_staged_terminal_event(
+            persisted.model_copy(update={"payload": tampered_payload}),
+            redactor=redactor,
+            trust_persisted_web_access_authority=True,
+        )
 
 
 def test_tool_round_agent_copy_rejects_agent_spec_subclasses() -> None:

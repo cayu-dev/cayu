@@ -10,6 +10,7 @@ that profile.
 | `WebBridge.trusted_local()` | `web_fetch` | trusted Cayu host process | none | DNS/URL admission, not process or network isolation; ordinary host network cost |
 | `WebBridge.hosted(adapter=...)` | adapter-supported `web_search` and/or `web_fetch` | trusted hosted-adapter path | declared `SecretRef` values resolved by the invocation credential proxy | provider request, usage, and cost semantics; no runner/browser authority |
 | `WebBridge.sandboxed_browser(...)` | `web_fetch`, `screenshot_page` | exact admitted runner | none in browser state | brokered egress, confirmed cancellation/cleanup, pinned worker handshake, runner and artifact cost |
+| `WebBridge.routed(routes=..., policy=...)` | `web_fetch` | only the explicitly selected route | each route retains its own authority | finite application-owned fallback graph plus durable denial circuit |
 
 Construction fails if the adapter exposes no supported capability, a hosted
 adapter does not declare reference-only credential authority, the sandboxed
@@ -59,6 +60,113 @@ needs its own stable execution-profile identity for the complete app profile to
 reconstruct after restart. Hosted tools repeat the compatibility
 check against the active invocation proxy before adapter dispatch, so selecting
 a different environment on `RunRequest` cannot bypass registration.
+
+## Classified access barriers and explicit routing
+
+Trusted HTTP/provider metadata and the browser's main-document response may
+classify only these stable outcomes: `authentication_required`,
+`consent_required`, `rate_limited`, `bot_challenge`, `destination_denied`,
+`content_unavailable`, and `transient_transport_failure`. The evidence contains
+only its schema, outcome, trusted source/signal, a SHA-256 destination-origin
+fingerprint, an optional status code, and a bounded `Retry-After` delay. Cayu
+does not classify from page text, denial-page HTML, challenge contents, full
+protected URLs, credentials, or browser-profile state. A successful page that
+claims to be a challenge in its body remains ordinary untrusted content.
+Sandboxed browser routes intercept a classified main-document response before
+its body can execute; a broker egress denial remains authoritative over browser
+response classification.
+
+Applications may explicitly assemble a finite ordered policy over already
+validated bridges:
+
+```python
+from cayu import (
+    AgentSpec,
+    ExecutionProfileBehaviorIdentity,
+    WebAccessOutcome,
+    WebAccessRouteAction,
+    WebAccessRoutePolicy,
+    WebAccessRouteRule,
+    WebBridge,
+    WebBridgeRoute,
+)
+
+hosted_provider_bridge = WebBridge.hosted(
+    adapter=hosted_adapter,
+    execution_profile_identity=ExecutionProfileBehaviorIdentity(
+        name="research-provider",
+        behavior_version="1",
+        implementation_version="2026-08-20",
+    ),
+)
+routed = WebBridge.routed(
+    routes=(
+        WebBridgeRoute("browser", sandboxed_browser_bridge),
+        WebBridgeRoute("hosted", hosted_provider_bridge),
+    ),
+    policy=WebAccessRoutePolicy(
+        entry_route_id="browser",
+        rules=(
+            WebAccessRouteRule(
+                "browser",
+                WebAccessOutcome.BOT_CHALLENGE,
+                WebAccessRouteAction.fallback_to("hosted"),
+            ),
+            WebAccessRouteRule(
+                "browser",
+                WebAccessOutcome.AUTHENTICATION_REQUIRED,
+                WebAccessRouteAction.operator_action(
+                    "Configure approved credentials or stop."
+                ),
+            ),
+        ),
+    ),
+)
+routed.register_agent(
+    app,
+    AgentSpec(name="researcher", model="your-model"),
+)
+```
+
+There is no implicit fallback and no route can expand another route's runner,
+destination, credential, or artifact authority. A fallback invokes the named
+bridge normally; if its own capability or policy check fails, routing stops.
+Routed registration validates every contained bridge against the same selected
+application environment before registering the aggregate, so all route
+credential, runner, environment, and artifact authorities must coexist. The
+aggregate execution requirements retain guarantees shared by every route;
+route-specific runtime checks remain authoritative.
+Routed hosted adapters require an application-versioned
+`execution_profile_identity`; its complete credential-reference authority and
+adapter identity are fingerprinted without publishing those references.
+`wait` returns a bounded `next_eligible_at` disposition rather than sleeping or
+starting a hidden retry, so the caller's cumulative run/task budget remains
+authoritative. An authoritative delay beyond Cayu's 24-hour bounded horizon
+fails closed to operator action rather than publishing an earlier retry time.
+`operator_action` and `stop` likewise return terminal evidence.
+
+Each terminal result retains the original classified denial, route history,
+selected route identity and profile fingerprint, effective source URL, and
+terminal disposition. Successful replacement evidence retains its validated
+page URL; a denied replacement retains only the destination-bound HTTPS origin,
+never a protected path or query. Repeated destination/outcome/route denials
+advance a bounded durable circuit record through the tool invocation's session
+store authority. An open circuit skips only that exact route and destination
+until its recorded time; process restart does not reset it. Store ambiguity or
+malformed circuit authority fails closed as `durable_authority_unavailable`.
+Routed fetch calls are serialized within the active session/run fence so a
+commit-acknowledgement readback cannot race a second circuit mutation.
+
+This mechanism is not an anti-bot bypass, CAPTCHA solver, credential discovery
+path, or instruction to evade a site's controls. In particular, an Anubis-style
+HTTP 401 without an authentication challenge is content-free
+`bot_challenge` evidence; Cayu follows only the application policy (for example,
+one named hosted fallback or stop) and never loops on the challenged browser
+route. Benchmark reports must pin the policy fingerprint and preserve original
+plus replacement-route evidence instead of describing fallback output as if it
+came from the blocked source. Use pinned or controlled evidence instead of the
+live web whenever access controls, availability, or a configured replacement
+route could change the benchmark source or make repeated runs incomparable.
 
 ## Trusted local fetch
 
@@ -138,7 +246,7 @@ Prefer `WebBridge.sandboxed_browser(environment=..., browser_image=...)` for
 application setup. It validates those runner claims and artifact storage before
 agent registration, binds their identities plus the exact environment/factory
 egress authority into the constructed tools, and
-requires the pinned `cayu-browser-fetch:5-playwright-1.62.0` image declaration.
+requires the pinned `cayu-browser-fetch:6-playwright-1.62.0` image declaration.
 The versioned worker handshake still verifies protocol, worker, and Playwright
 versions on every dispatch. Browser inspection needs no mutable workspace; the
 profile records `workspace_requirement="none"` instead of silently depending

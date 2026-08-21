@@ -13,8 +13,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -61,6 +62,11 @@ from cayu.tools.browser import (
     _WorkloadAwareRunnerHandle,
 )
 from cayu.tools.web import MAX_WEB_FETCH_URL_LENGTH, _canonicalize_url
+from cayu.tools.web_access import (
+    WebAccessEvidence,
+    WebAccessEvidenceSource,
+    web_destination_fingerprint,
+)
 
 BROWSER_SESSION_PROTOCOL_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.protocol_version
 BROWSER_SESSION_WORKER_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.worker_version
@@ -209,8 +215,8 @@ class BrowserBackendIdentity(BaseModel):
     backend_version: str = Field(min_length=1, max_length=64)
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
-    worker_protocol: Literal["cayu.browser-session.v1"]
-    worker_version: Literal["5"]
+    worker_protocol: Literal["cayu.browser-session.v2"]
+    worker_version: Literal["6"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod
@@ -252,6 +258,7 @@ class BrowserBackendObservation(BaseModel):
     refs: tuple[BrowserElementRef, ...] = Field(max_length=MAX_BROWSER_SESSION_MAX_REFS)
     load_state: Literal["loaded", "loading", "failed"]
     access_state: Literal["available", "blocked", "unknown"]
+    access: WebAccessEvidence | None = None
     idle_timeout_seconds: int = Field(ge=1, le=MAX_BROWSER_SESSION_IDLE_TIMEOUT_SECONDS)
     truncation_reasons: tuple[
         Literal["snapshot", "refs", "title", "url", "requests", "responses"], ...
@@ -279,6 +286,25 @@ class BrowserBackendObservation(BaseModel):
     @classmethod
     def validate_snapshot(cls, value: str) -> str:
         return require_durable_text(value, "snapshot")
+
+    @model_validator(mode="after")
+    def validate_access_state(self) -> BrowserBackendObservation:
+        if (self.access_state == "blocked") != (self.access is not None):
+            raise ValueError("Blocked browser observations require typed access evidence.")
+        if self.access is not None:
+            parsed = urlsplit(self.url)
+            if (
+                self.access.source is not WebAccessEvidenceSource.BROWSER_RESPONSE
+                or self.access.destination_fingerprint != web_destination_fingerprint(self.url)
+                or self.title is not None
+                or self.snapshot
+                or self.refs
+                or parsed.path != "/"
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("Blocked browser observations cannot publish denial-page content.")
+        return self
 
 
 @dataclass(frozen=True)

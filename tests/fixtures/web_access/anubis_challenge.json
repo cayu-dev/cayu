@@ -1,0 +1,8 @@
+{
+  "fixture": "anubis-challenge-v1",
+  "status_code": 401,
+  "headers": {
+    "cache-control": "no-store",
+    "content-type": "text/html; charset=utf-8"
+  }
+}

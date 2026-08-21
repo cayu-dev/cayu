@@ -23,6 +23,10 @@ from cayu import (
     ModelStreamEvent,
     RunRequest,
     ScriptedModelProvider,
+    WebAccessEvidence,
+    WebAccessEvidenceSource,
+    WebAccessOutcome,
+    WebAccessSignal,
     run_to_completion,
 )
 from cayu.core import ToolContext
@@ -49,6 +53,7 @@ from cayu.tools.browser_session import (
     BrowserSessionBackend,
     BrowserSessionTool,
 )
+from cayu.tools.web_access import web_destination_fingerprint
 from cayu.vaults import SecretRedactor
 
 _IDENTITY = BrowserBackendIdentity(
@@ -56,9 +61,48 @@ _IDENTITY = BrowserBackendIdentity(
     backend_version="1.62.0",
     browser="chromium",
     browser_version="test-chromium",
-    worker_protocol="cayu.browser-session.v1",
-    worker_version="5",
+    worker_protocol="cayu.browser-session.v2",
+    worker_version="6",
 )
+
+
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    [
+        (WebAccessEvidenceSource.HOSTED_PROVIDER, "https://blocked.example/"),
+        (WebAccessEvidenceSource.BROWSER_RESPONSE, "https://other.example/"),
+    ],
+)
+def test_blocked_backend_observation_binds_browser_source_and_origin(
+    source: WebAccessEvidenceSource,
+    destination: str,
+) -> None:
+    with pytest.raises(ValueError, match="denial-page content"):
+        BrowserBackendObservation(
+            session_id="bs_blocked",
+            page_id="bp_blocked",
+            revision="br_blocked",
+            url="https://blocked.example/",
+            title=None,
+            snapshot="",
+            refs=(),
+            load_state="failed",
+            access_state="blocked",
+            access=WebAccessEvidence(
+                outcome=WebAccessOutcome.BOT_CHALLENGE,
+                source=source,
+                signal=(
+                    WebAccessSignal.STATUS_CODE
+                    if source is WebAccessEvidenceSource.BROWSER_RESPONSE
+                    else WebAccessSignal.PROVIDER_STATUS
+                ),
+                destination_fingerprint=web_destination_fingerprint(destination),
+                status_code=401,
+            ),
+            idle_timeout_seconds=900,
+            truncation_reasons=(),
+            backend_identity=_IDENTITY,
+        )
 
 
 @dataclass
@@ -360,8 +404,8 @@ class _WireRunner:
         return ExecResult(
             stdout=json.dumps(
                 {
-                    "protocol_version": "cayu.browser-session.v1",
-                    "worker_version": "5",
+                    "protocol_version": "cayu.browser-session.v2",
+                    "worker_version": "6",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -382,8 +426,8 @@ class _WireRunner:
                             "backend_version": "1.62.0",
                             "browser": "chromium",
                             "browser_version": "test-chromium",
-                            "worker_protocol": "cayu.browser-session.v1",
-                            "worker_version": "5",
+                            "worker_protocol": "cayu.browser-session.v2",
+                            "worker_version": "6",
                         },
                     },
                     "artifacts": [],
@@ -600,6 +644,17 @@ class _BoundedSnapshotCdp:
             return {}
         if method == "Page.getFrameTree":
             return {"frameTree": {"frame": {"id": "frame-main"}}}
+        if method == "Fetch.enable":
+            assert params == {
+                "patterns": [
+                    {
+                        "urlPattern": "*",
+                        "resourceType": "Document",
+                        "requestStage": "Response",
+                    }
+                ]
+            }
+            return {}
         if method == "Page.createIsolatedWorld":
             return {"executionContextId": 1}
         if method == "Runtime.evaluate":
@@ -646,8 +701,8 @@ def _interactive_request(
 
 def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
-        "protocol_version": "cayu.browser-session.v1",
-        "worker_version": "5",
+        "protocol_version": "cayu.browser-session.v2",
+        "worker_version": "6",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -1656,8 +1711,8 @@ def test_browser_session_refuses_artifacts_when_secret_authority_appears_during_
 
 def test_interactive_guest_request_parser_rejects_escape_hatches() -> None:
     raw = {
-        "protocol_version": "cayu.browser-session.v1",
-        "worker_version": "5",
+        "protocol_version": "cayu.browser-session.v2",
+        "worker_version": "6",
         "expected_playwright_version": "1.62.0",
         "operation": "navigate",
         "session_id": "bs_test",
@@ -1884,8 +1939,8 @@ def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> Non
         async def _execute_locked(self, request):
             self.calls += 1
             return {
-                "protocol_version": "cayu.browser-session.v1",
-                "worker_version": "5",
+                "protocol_version": "cayu.browser-session.v2",
+                "worker_version": "6",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"call": self.calls, "operation": request.operation},
@@ -2110,8 +2165,8 @@ def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
     class _LedgerDaemon(_browser_guest._InteractiveDaemon):
         async def _execute_locked(self, request):
             return {
-                "protocol_version": "cayu.browser-session.v1",
-                "worker_version": "5",
+                "protocol_version": "cayu.browser-session.v2",
+                "worker_version": "6",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"operation": request.operation},
@@ -2143,8 +2198,8 @@ def test_interactive_guest_close_reports_cleanup_failure() -> None:
         daemon.context = _FailedContext()
         request = _browser_guest._interactive_request_from_json(
             {
-                "protocol_version": "cayu.browser-session.v1",
-                "worker_version": "5",
+                "protocol_version": "cayu.browser-session.v2",
+                "worker_version": "6",
                 "expected_playwright_version": "1.62.0",
                 "operation": "close",
                 "session_id": "bs_test",
@@ -2207,8 +2262,8 @@ def test_interactive_guest_failed_initial_navigation_retires_allocation() -> Non
         daemon.context = _Context(page)
         request = _browser_guest._interactive_request_from_json(
             {
-                "protocol_version": "cayu.browser-session.v1",
-                "worker_version": "5",
+                "protocol_version": "cayu.browser-session.v2",
+                "worker_version": "6",
                 "expected_playwright_version": "1.62.0",
                 "operation": "navigate",
                 "session_id": "bs_test",
@@ -2313,9 +2368,21 @@ def test_interactive_guest_closes_background_page_at_response_byte_limit() -> No
         def __init__(self) -> None:
             self.handlers: dict[str, Any] = {}
 
-        async def send(self, method: str) -> dict[str, Any]:
-            assert method == "Network.enable"
-            return {}
+        async def send(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if method == "Network.enable":
+                assert params is None
+                return {}
+            if method == "Page.getFrameTree":
+                assert params is None
+                return {"frameTree": {"frame": {"id": "frame-main"}}}
+            if method == "Fetch.enable":
+                assert params is not None
+                return {}
+            raise AssertionError(f"unexpected CDP method: {method}")
 
         def on(self, event: str, callback: Any) -> None:
             self.handlers[event] = callback
@@ -2645,12 +2712,24 @@ def test_interactive_guest_blocks_popup_creation_before_page_scripts(
 
 def test_interactive_guest_rejects_sticky_denial_before_next_action() -> None:
     class _Cdp:
-        async def send(self, method: str) -> dict[str, Any]:
-            assert method == "Network.enable"
-            return {}
+        async def send(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if method == "Network.enable":
+                assert params is None
+                return {}
+            if method == "Page.getFrameTree":
+                assert params is None
+                return {"frameTree": {"frame": {"id": "frame-main"}}}
+            if method == "Fetch.enable":
+                assert params is not None
+                return {}
+            raise AssertionError(f"unexpected CDP method: {method}")
 
         def on(self, event: str, callback: Any) -> None:
-            assert event == "Network.dataReceived"
+            assert event in {"Fetch.requestPaused", "Network.dataReceived"}
             assert callable(callback)
 
     class _Page:
@@ -2962,6 +3041,59 @@ def test_interactive_guest_bounds_url_before_advancing_revision() -> None:
     asyncio.run(scenario())
 
 
+def test_interactive_guest_blocked_observation_discards_denial_page_content() -> None:
+    protected_url = "https://blocked.example/protected?token=not-evidence"
+
+    class _Page:
+        url = "chrome-error://chromewebdata/"
+
+        def locator(self, selector: str) -> None:
+            raise AssertionError(f"blocked observation inspected {selector}")
+
+        async def title(self) -> str:
+            raise AssertionError("blocked observation inspected the page title")
+
+    async def scenario() -> None:
+        state = _browser_guest._InteractivePage(
+            page=_Page(),
+            session_id="bs_blocked",
+            page_id="bp_blocked",
+            public_url="https://blocked.example/",
+            cdp=_BoundedSnapshotCdp(),
+            access_evidence=_browser_guest._guest_http_access(
+                protected_url,
+                401,
+                {},
+                source="browser_response",
+            ),
+        )
+
+        observation = await _browser_guest._interactive_observation(
+            state,
+            _interactive_limits(),
+            browser_version="test-chromium",
+        )
+
+        assert observation["access_state"] == "blocked"
+        assert observation["access"]["outcome"] == "bot_challenge"
+        assert observation["url"] == "https://blocked.example/"
+        assert observation["title"] is None
+        assert observation["snapshot"] == ""
+        assert observation["refs"] == []
+        assert "protected" not in json.dumps(observation)
+        BrowserBackendObservation.model_validate(observation)
+        for update in (
+            {"url": protected_url},
+            {"title": "Access denied"},
+            {"snapshot": "challenge page"},
+            {"refs": [{"ref": "ref_bad", "role": "button", "name": "Solve"}]},
+        ):
+            with pytest.raises(ValueError, match="denial-page content"):
+                BrowserBackendObservation.model_validate({**observation, **update})
+
+    asyncio.run(scenario())
+
+
 def test_interactive_guest_projects_data_url_to_last_admitted_https_url() -> None:
     class _Locator:
         async def aria_snapshot(self, **kwargs: Any) -> str:
@@ -3257,7 +3389,7 @@ def test_interactive_guest_classifies_timeout_and_crash_separately() -> None:
 def test_browser_session_uses_the_ordinary_runtime_tool_lifecycle() -> None:
     backend = _FakeBrowserBackend()
     tool = _tool(backend)
-    app = CayuApp(enable_logging=False)
+    app = CayuApp(secret_redactor=SecretRedactor("available"), enable_logging=False)
     app.register_provider(
         ScriptedModelProvider(
             [
@@ -3303,6 +3435,10 @@ def test_browser_session_uses_the_ordinary_runtime_tool_lifecycle() -> None:
         "observation": "published",
         "terminal": "settled",
     }
+    assert completed[0].payload["result"]["structured"]["access_state"] == "available"
+    transcript = asyncio.run(app.session_store.load_transcript("browser-runtime"))
+    tool_result = next(message for message in transcript if message.role == "tool").content[0]
+    assert tool_result.structured["access_state"] == "available"
 
 
 def test_browser_session_navigate_observe_and_click_preserve_state(tmp_path: Path) -> None:

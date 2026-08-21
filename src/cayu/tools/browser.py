@@ -9,8 +9,9 @@ import json
 import math
 import struct
 import zlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Literal, Protocol, cast, runtime_checkable
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -55,6 +56,18 @@ from cayu.tools.web import (
     _canonicalize_url,
     _error_result,
     _web_fetch_success_result,
+)
+from cayu.tools.web_access import (
+    WebAccessEvidence,
+    WebAccessEvidenceSource,
+    WebAccessOutcome,
+    WebAccessSignal,
+    _register_builtin_adapter_access_source,
+    access_error_result,
+    access_evidence_from_result,
+    attach_access_evidence,
+    transport_access_evidence,
+    web_destination_fingerprint,
 )
 
 BROWSER_FETCH_PROTOCOL_VERSION = PINNED_BROWSER_FETCH_WORKLOAD.protocol_version
@@ -107,6 +120,7 @@ _BROWSER_FETCH_ERROR_CODES = frozenset(
     {
         "browser_crash",
         "browser_unavailable",
+        "access_blocked",
         "capability_refused",
         "cleanup_failed",
         "destination_denied",
@@ -126,6 +140,7 @@ _BROWSER_FETCH_ERROR_CODES = frozenset(
 _BROWSER_FETCH_ERROR_MESSAGES = {
     "browser_crash": "The sandboxed browser stopped unexpectedly.",
     "browser_unavailable": "The selected runner does not provide the browser worker.",
+    "access_blocked": "The destination returned a classified access barrier.",
     "capability_refused": "The selected runner did not prove the required browser isolation.",
     "cleanup_failed": "The sandboxed browser could not be cleaned up safely.",
     "destination_denied": "The destination was denied by the browser egress policy.",
@@ -173,8 +188,8 @@ class _BrowserRedirect(BaseModel):
 class _BrowserSuccess(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    protocol_version: Literal["cayu.browser-fetch.v3"]
-    worker_version: Literal["3"]
+    protocol_version: Literal["cayu.browser-fetch.v4"]
+    worker_version: Literal["4"]
     playwright_version: Literal["1.62.0"]
     kind: Literal["success"]
     requested_url: str = Field(min_length=1, max_length=8192)
@@ -197,12 +212,14 @@ class _BrowserSuccess(BaseModel):
 class _BrowserFailure(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    protocol_version: Literal["cayu.browser-fetch.v3"]
-    worker_version: Literal["3"]
+    protocol_version: Literal["cayu.browser-fetch.v4"]
+    worker_version: Literal["4"]
     playwright_version: str = Field(min_length=1, max_length=32)
     kind: Literal["error"]
     error: str = Field(min_length=1, max_length=64)
     status_code: StrictInt | None = Field(default=None, ge=100, le=599)
+    access: WebAccessEvidence | None = None
+    effective_source_url: str | None = Field(default=None, max_length=MAX_WEB_FETCH_URL_LENGTH)
 
     @model_validator(mode="after")
     def validate_error(self) -> _BrowserFailure:
@@ -210,14 +227,36 @@ class _BrowserFailure(BaseModel):
             raise ValueError("Unknown browser worker error code.")
         if (self.error == "http_status") != (self.status_code is not None):
             raise ValueError("Only http_status errors carry status_code.")
+        if (self.error == "access_blocked") != (self.access is not None):
+            raise ValueError("Only access_blocked errors carry access evidence.")
+        if self.access is not None and self.effective_source_url is None:
+            raise ValueError("Access evidence requires its bounded effective origin.")
+        if self.effective_source_url is not None:
+            try:
+                effective = _canonicalize_url(self.effective_source_url)
+                split = urlsplit(effective)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Browser access origin must be a canonical HTTPS URL.") from exc
+            if (
+                effective != self.effective_source_url
+                or split.path != "/"
+                or split.query
+                or split.fragment
+            ):
+                raise ValueError("Browser access origin cannot contain protected URL material.")
+        if self.access is not None and self.effective_source_url is not None:
+            if self.access.source is not WebAccessEvidenceSource.BROWSER_RESPONSE:
+                raise ValueError("Browser access evidence requires browser-response authority.")
+            if self.access.destination_fingerprint != web_destination_fingerprint(effective):
+                raise ValueError("Browser access evidence conflicts with its effective origin.")
         return self
 
 
 class _BrowserScreenshotSuccess(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    protocol_version: Literal["cayu.browser-fetch.v3"]
-    worker_version: Literal["3"]
+    protocol_version: Literal["cayu.browser-fetch.v4"]
+    worker_version: Literal["4"]
     playwright_version: Literal["1.62.0"]
     kind: Literal["screenshot"]
     requested_url: str = Field(min_length=1, max_length=8192)
@@ -339,12 +378,21 @@ class BrowserWebFetchAdapter:
             oversized_error="oversized_response",
         )
         if isinstance(execution, ToolResult):
-            return execution
-        return _browser_worker_result(
-            execution.stdout,
-            request=request,
-            max_requests=self.max_requests,
+            return _attach_browser_access_evidence(execution, request.requested_url)
+        return _attach_browser_access_evidence(
+            _browser_worker_result(
+                execution.stdout,
+                request=request,
+                max_requests=self.max_requests,
+            ),
+            request.requested_url,
         )
+
+
+_register_builtin_adapter_access_source(
+    BrowserWebFetchAdapter,
+    WebAccessEvidenceSource.BROWSER_RESPONSE,
+)
 
 
 class ScreenshotPageTool(Tool):
@@ -565,7 +613,7 @@ class ScreenshotPageTool(Tool):
             oversized_error="oversized_screenshot",
         )
         if isinstance(execution, ToolResult):
-            return execution
+            return _attach_browser_access_evidence(execution, requested_url)
         parsed = _browser_screenshot_result(
             execution.stdout,
             requested_url=requested_url,
@@ -581,7 +629,7 @@ class ScreenshotPageTool(Tool):
             max_page_pixels=self.max_page_pixels,
         )
         if isinstance(parsed, ToolResult):
-            return parsed
+            return _attach_browser_access_evidence(parsed, requested_url)
         success, screenshot = parsed
         artifact = await _store_screenshot_artifact(
             artifact_store,
@@ -809,16 +857,7 @@ def _browser_screenshot_result(
     try:
         if raw.get("kind") == "error":
             failure = _BrowserFailure.model_validate(raw)
-            if failure.error == "http_status":
-                return ToolResult(
-                    content=f"The HTTPS request returned status {failure.status_code}.",
-                    structured={"error": "http_status", "status_code": failure.status_code},
-                    is_error=True,
-                )
-            return _error_result(
-                failure.error,
-                _BROWSER_FETCH_ERROR_MESSAGES[failure.error],
-            )
+            return _browser_failure_result(failure)
         success = _BrowserScreenshotSuccess.model_validate(raw)
         canonical_requested_url = _canonicalize_url(success.requested_url)
         canonical_final_url = _canonicalize_url(success.final_url)
@@ -1409,16 +1448,7 @@ def _browser_worker_result(
     try:
         if raw.get("kind") == "error":
             failure = _BrowserFailure.model_validate(raw)
-            if failure.error == "http_status":
-                return ToolResult(
-                    content=f"The HTTPS request returned status {failure.status_code}.",
-                    structured={"error": "http_status", "status_code": failure.status_code},
-                    is_error=True,
-                )
-            return _error_result(
-                failure.error,
-                _BROWSER_FETCH_ERROR_MESSAGES[failure.error],
-            )
+            return _browser_failure_result(failure)
         success = _BrowserSuccess.model_validate(raw)
     except (KeyError, ValidationError, RecursionError):
         return _error_result(
@@ -1469,6 +1499,68 @@ def _browser_worker_result(
         redirects=redirects,
         truncation_reasons=success.truncation_reasons,
     )
+
+
+def _attach_browser_access_evidence(result: ToolResult, requested_url: str) -> ToolResult:
+    structured = result.structured
+    error = structured.get("error") if isinstance(structured, Mapping) else None
+    if error in {"browser_crash", "dns_failure", "fetch_failed", "timeout"}:
+        evidence_url = requested_url
+        if isinstance(structured, Mapping):
+            candidate = structured.get("effective_source_url")
+            if type(candidate) is str:
+                evidence_url = candidate
+        return attach_access_evidence(
+            result,
+            transport_access_evidence(
+                evidence_url,
+                outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+                source=WebAccessEvidenceSource.TRANSPORT,
+                signal=WebAccessSignal.TRANSPORT_ERROR,
+            ),
+        )
+    evidence = access_evidence_from_result(
+        result,
+        requested_url=requested_url,
+        source=WebAccessEvidenceSource.BROWSER_RESPONSE,
+        allowed_sources=frozenset(
+            {
+                WebAccessEvidenceSource.BROWSER_RESPONSE,
+                WebAccessEvidenceSource.EGRESS_POLICY,
+            }
+        ),
+    )
+    return result if evidence is None else attach_access_evidence(result, evidence)
+
+
+def _browser_failure_result(failure: _BrowserFailure) -> ToolResult:
+    if failure.access is not None:
+        return _browser_access_error_result(failure)
+    if failure.error == "http_status":
+        result = ToolResult(
+            content=f"The HTTPS request returned status {failure.status_code}.",
+            structured={"error": "http_status", "status_code": failure.status_code},
+            is_error=True,
+        )
+    else:
+        result = _error_result(
+            failure.error,
+            _BROWSER_FETCH_ERROR_MESSAGES[failure.error],
+        )
+    if failure.effective_source_url is None:
+        return result
+    structured = dict(result.structured or {})
+    structured["effective_source_url"] = failure.effective_source_url
+    return result.model_copy(update={"structured": structured})
+
+
+def _browser_access_error_result(failure: _BrowserFailure) -> ToolResult:
+    if failure.access is None or failure.effective_source_url is None:
+        raise ValueError("Browser access failure requires validated evidence and origin.")
+    result = access_error_result(failure.access)
+    structured = dict(result.structured or {})
+    structured["effective_source_url"] = failure.effective_source_url
+    return result.model_copy(update={"structured": structured})
 
 
 __all__ = [

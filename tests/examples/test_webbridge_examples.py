@@ -43,6 +43,9 @@ from cayu import (
     TaskStatus,
     ToolContext,
     ToolResult,
+    WebAccessEvidenceSource,
+    WebAccessOutcome,
+    WebAccessSignal,
     WebBridge,
     WebBridgeCredentialAuthority,
     session_invocation_from_task,
@@ -53,6 +56,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_is_released,
 )
 from cayu.tools import WebFetchAdapterRequest, WebSearchAdapterRequest
+from cayu.tools.web_access import access_error_result, transport_access_evidence
 from cayu.vaults import ResolvedSecret
 
 
@@ -173,10 +177,15 @@ class _ResearchAdapter:
         del ctx
         self.fetches += 1
         if request.requested_url == "https://two.example/":
-            return ToolResult(
-                content="denied",
-                structured={"error": "destination_denied"},
-                is_error=True,
+            return access_error_result(
+                transport_access_evidence(
+                    request.requested_url,
+                    outcome=WebAccessOutcome.DESTINATION_DENIED,
+                    source=WebAccessEvidenceSource.HOSTED_PROVIDER,
+                    signal=WebAccessSignal.PROVIDER_STATUS,
+                ),
+                error="destination_denied",
+                message="denied",
             )
         return ToolResult(
             content="<untrusted_web_content>page</untrusted_web_content>",

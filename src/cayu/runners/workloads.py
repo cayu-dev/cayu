@@ -3,7 +3,7 @@
 from cayu.runners.base import RunnerWorkloadAuthority
 
 BROWSER_FETCH_WORKLOAD_NAME = "cayu.browser-fetch"
-PINNED_BROWSER_FETCH_IMAGE = "cayu-browser-fetch:5-playwright-1.62.0"
+PINNED_BROWSER_FETCH_IMAGE = "cayu-browser-fetch:6-playwright-1.62.0"
 PINNED_BROWSER_FETCH_WORKLOAD = RunnerWorkloadAuthority(
     name=BROWSER_FETCH_WORKLOAD_NAME,
     image=PINNED_BROWSER_FETCH_IMAGE,
@@ -12,8 +12,8 @@ PINNED_BROWSER_FETCH_WORKLOAD = RunnerWorkloadAuthority(
         "-I",
         "/opt/cayu-browser/worker.py",
     ),
-    protocol_version="cayu.browser-fetch.v3",
-    worker_version="3",
+    protocol_version="cayu.browser-fetch.v4",
+    worker_version="4",
     component_versions=(("playwright", "1.62.0"),),
 )
 
@@ -27,8 +27,8 @@ PINNED_BROWSER_SESSION_WORKLOAD = RunnerWorkloadAuthority(
         "-I",
         "/opt/cayu-browser/worker.py",
     ),
-    protocol_version="cayu.browser-session.v1",
-    worker_version="5",
+    protocol_version="cayu.browser-session.v2",
+    worker_version="6",
     component_versions=(
         ("playwright", "1.62.0"),
         ("browser", "chromium"),

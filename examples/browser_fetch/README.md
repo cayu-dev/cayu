@@ -3,8 +3,8 @@
 This image is the versioned guest half of `BrowserWebFetchAdapter`,
 `ScreenshotPageTool`, and the opt-in `BrowserSessionTool`. It contains
 Playwright 1.62.0, its matching Chromium build, NSS tooling for the per-session
-Cayu CA, the closed `cayu.browser-fetch.v3` one-shot protocol, and the closed
-`cayu.browser-session.v1` stateful protocol. The image runs as the
+Cayu CA, the closed `cayu.browser-fetch.v4` one-shot protocol, and the closed
+`cayu.browser-session.v2` stateful protocol. The image runs as the
 non-root `pwuser`; the root-owned, read-only worker refuses root execution and
 launches Chromium with its browser sandbox enabled. Other commands running as
 the guest user cannot replace the versioned worker between invocations.
@@ -20,7 +20,7 @@ Build from the repository root:
 ```bash
 docker build \
   --file examples/browser_fetch/Dockerfile \
-  --tag cayu-browser-fetch:5-playwright-1.62.0 \
+  --tag cayu-browser-fetch:6-playwright-1.62.0 \
   .
 ```
 
@@ -68,7 +68,7 @@ Pass `policies={"product-docs": browser_policy}`,
 `approved_destinations=approved_destinations`, `credentials=[]`, an adapter
 constructed with
 `DockerEgressAdapter(seccomp_profile="/absolute/path/to/examples/browser_fetch/seccomp_profile.json")`,
-and `image="cayu-browser-fetch:5-playwright-1.62.0"` to
+and `image="cayu-browser-fetch:6-playwright-1.62.0"` to
 `VirtualEgressEnvironmentFactory`. Plain Docker proves the enforced networking
 path for trusted development and CI; it is not Cayu's untrusted-code isolation
 boundary. Applications that require a stronger boundary use the same adapter

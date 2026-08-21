@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -48,7 +49,6 @@ MAX_PARALLEL_USAGE_NAME_BYTES = 128
 MAX_PARALLEL_EXCERPTS_PER_RESULT = 16
 MAX_PARALLEL_FETCH_AGE_SECONDS = 365 * 24 * 60 * 60
 _MAX_PARALLEL_RETRY_AFTER_SECONDS = 24 * 60 * 60
-
 _PARALLEL_SEARCH_MODES = frozenset({"turbo", "fast", "basic", "advanced"})
 
 
@@ -776,12 +776,16 @@ def _parallel_http_error_result(response: _ParallelHttpResponse) -> ToolResult:
     retry_after_header = response.headers.get("retry-after")
     retry_after = None
     if not _parallel_text_contains_secret(retry_after_header, redactor=response.redactor):
-        retry_after = _parallel_retry_after_seconds(retry_after_header)
+        retry_after, retry_after_unrepresentable = _parallel_retry_after_seconds(retry_after_header)
+    else:
+        retry_after_unrepresentable = False
     if retry_after is not None and not _parallel_scalar_contains_secret(
         retry_after,
         redactor=response.redactor,
     ):
         parallel_metadata["retry_after_seconds"] = retry_after
+    if retry_after_unrepresentable:
+        parallel_metadata["retry_after_unrepresentable"] = True
     structured: dict[str, Any] = {"error": code}
     if not _parallel_scalar_contains_secret(response.status_code, redactor=response.redactor):
         structured["status_code"] = response.status_code
@@ -964,30 +968,35 @@ def _parallel_reject_json_constant(value: str) -> Any:
     raise _ParallelMalformedResponseError
 
 
-def _parallel_retry_after_seconds(value: str | None) -> float | None:
+def _parallel_retry_after_seconds(value: str | None) -> tuple[float | None, bool]:
     if value is None:
-        return None
+        return None, False
     value = value.strip()
     if not value:
-        return None
+        return None, False
     try:
         seconds = float(value)
     except ValueError:
         try:
             target = parsedate_to_datetime(value)
         except (TypeError, ValueError):
-            return None
+            return None, False
         if target is None:
-            return None
+            return None, False
         if target.tzinfo is None:
-            return None
-        return min(
-            _MAX_PARALLEL_RETRY_AFTER_SECONDS,
-            max(0.0, (target - datetime.now(UTC)).total_seconds()),
-        )
-    if not math.isfinite(seconds) or seconds < 0:
-        return None
-    return min(seconds, _MAX_PARALLEL_RETRY_AFTER_SECONDS)
+            return None, False
+        seconds = max(0.0, (target - datetime.now(UTC)).total_seconds())
+    if not math.isfinite(seconds):
+        try:
+            exact_seconds = Decimal(value)
+        except InvalidOperation:
+            return None, False
+        return None, exact_seconds.is_finite() and exact_seconds >= 0
+    if seconds < 0:
+        return None, False
+    if seconds > _MAX_PARALLEL_RETRY_AFTER_SECONDS:
+        return None, True
+    return seconds, False
 
 
 def _parallel_origin(value: Any) -> str:

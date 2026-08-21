@@ -1211,6 +1211,44 @@ def test_application_artifact_cannot_claim_runtime_projection_ownership() -> Non
     assert redacted.content[0].artifacts[0]["store_id"] == REDACTED_SECRET
 
 
+def test_application_result_cannot_claim_web_access_control_ownership() -> None:
+    from cayu.core import MessageRole, ToolResultPart
+    from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
+
+    secret = "application-web-control-secret"
+    lookalike = Message(
+        role=MessageRole.TOOL,
+        content=(
+            ToolResultPart(
+                tool_call_id="call_application_web_control",
+                tool_name="application_tool",
+                content="application result",
+                structured={
+                    "access": {
+                        "schema_version": 1,
+                        "outcome": "bot_challenge",
+                        "source": "hosted_provider",
+                        "signal": "provider_status",
+                        "destination_fingerprint": secret,
+                        "status_code": secret,
+                    }
+                },
+            ),
+        ),
+    )
+
+    redacted = redact_runtime_message_for_boundary(
+        lookalike,
+        redactor=SecretRedactor(secret),
+        field_name="message",
+    )
+
+    structured = redacted.content[0].structured
+    assert structured["access"]["outcome"] == "bot_challenge"
+    assert structured["access"]["destination_fingerprint"] == REDACTED_SECRET
+    assert structured["access"]["status_code"] == REDACTED_SECRET
+
+
 def test_valid_projection_re_redacts_content_under_rotated_message_registry() -> None:
     from cayu.core import MessageRole, ToolResultPart
     from cayu.runtime._message_redaction import redact_runtime_message_for_boundary

@@ -5400,7 +5400,7 @@ usage, warnings, and retry hints remain bounded and secret-checked under
 default-provider dependency.
 
 `WebBridge` is the application-owned assembly boundary for these seams. Its
-three explicit profiles construct only the ordinary tools supported by trusted
+four explicit profiles construct only the ordinary tools supported by trusted
 local HTTP, one named hosted adapter, or one admitted sandboxed-browser
 environment. Profile selection never enters model arguments and never creates
 a parallel tool lifecycle. Hosted construction requires the adapter to declare
@@ -5427,8 +5427,72 @@ screenshot publication revalidates the artifact-store identity. Missing or
 failed browser/provider capability never falls back to trusted host HTTP or a
 different provider.
 
+Web access barriers are a versioned, content-free transport contract. Trusted
+HTTP/provider metadata and the browser's main-document response may classify
+only `authentication_required`, `consent_required`, `rate_limited`,
+`bot_challenge`, `destination_denied`, `content_unavailable`, or
+`transient_transport_failure`. Evidence contains the outcome, trusted
+source/signal, a destination-origin SHA-256 fingerprint, optional status, and a
+bounded retry delay. Page text, challenge contents, protected paths/queries,
+credentials, browser state, and arbitrary provider diagnostics are never
+classification evidence. A blocked interactive observation publishes an
+origin-only URL and no title, snapshot, or refs. The sandboxed guest intercepts
+a classified main-document response before body execution; broker egress denial
+remains authoritative over browser response classification.
+
+`WebBridge.routed` exposes one ordinary `web_fetch` tool backed by a finite,
+acyclic application-owned route graph over already validated WebBridge
+profiles. Missing rules stop. Fallback, wait, operator action, and stop are
+explicit terminal/routing actions; wait publishes `next_eligible_at` without
+sleeping or retrying. Each route retains its own runner, destination,
+credential, artifact, and profile authority, and a rejected replacement route
+cannot widen them. Routed agent registration applies each contained profile's
+non-mutating compatibility validation to the same selected environment before
+registering the aggregate; incompatible credential proxies, runner/environment
+authorities, or artifact stores fail setup. The aggregate publishes only exact
+execution guarantees shared by every route. Hosted routes require an
+application-versioned adapter identity; complete credential-reference authority
+and adapter identity plus Cayu-owned fetch limits feed the non-published route
+fingerprint and the aggregate execution profile. Each downstream route dispatch
+receives a stable child idempotency identity derived from the outer tool-call
+identity, route-policy fingerprint, and route id; the outer identity remains the
+durable Cayu invocation identity. Results retain
+original denial evidence, route identities, selected-route profile fingerprint,
+effective URL, and terminal disposition.
+Successful replacement evidence retains its validated page URL; a denied route
+retains only the destination-bound HTTPS origin, never a protected path or query.
+
+The routing tool stores a bounded circuit under the authenticated durable tool
+invocation authority. Entries are keyed by route plus destination/outcome
+fingerprint, count repeated denials, retain original bounded transport
+evidence, and record an absolute next-eligible time. A companion authority
+digest binds the complete entry, including denial count, status, retry evidence,
+and timing, so a valid-looking change to any decision-bearing field fails
+closed. Compare-and-set publication and exact readback reconcile
+acknowledgement ambiguity. An open circuit skips only its exact
+route/destination; restart grants no fresh attempt. Store
+failure, malformed authority, or exhausted non-evictable capacity fails closed
+as `durable_authority_unavailable`. Readback reconstructs the typed evidence and
+exact denial fingerprint against the current route set before use. Durable
+sealing preserves authenticated protocol controls. When a denial selects a
+fallback, Cayu first persists a content-free circuit update with the effective
+origin omitted, then resolves any replacement-route credentials, and seals the
+pending origin at the terminal routing boundary. Process loss in that interval
+therefore preserves the circuit decision without closing the invocation secret
+scope or persisting an unsealed origin. An effective origin changed by final
+secret redaction is likewise omitted rather than persisted as contradictory
+evidence.
+`Retry-After` may extend, never shorten, the application circuit/wait time;
+timing beyond the bounded 24-hour horizon cannot become a shortened wait and is
+handled only by an explicit fallback or operator action. Routed calls are
+non-parallel within the active
+session/run fence so acknowledgement readback cannot race another circuit
+mutation. Routing never solves or bypasses site controls,
+and benchmark evidence must preserve the blocked source separately from any
+configured replacement.
+
 The opt-in interactive sandboxed profile exposes one ordinary
-`browser_session` tool backed by `cayu.browser-session.v1` worker version 5 in
+`browser_session` tool backed by `cayu.browser-session.v2` worker version 6 in
 the same pinned Playwright/Chromium worker image. Cayu owns browser session and
 page identities.
 Each bounded AI-mode ARIA observation produces a new opaque revision and opaque

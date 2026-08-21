@@ -11,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,15 @@ _BROWSER_IMAGE = os.environ.get(
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SECCOMP_PROFILE = _REPOSITORY_ROOT / "examples" / "browser_fetch" / "seccomp_profile.json"
+
+
+def _assert_destination_access_error(result: Any, error: str) -> None:
+    assert result.is_error is True
+    assert result.structured["error"] == error
+    access = result.structured["access"]
+    assert isinstance(access, Mapping)
+    assert access["outcome"] == "destination_denied"
+    assert access["source"] == "egress_policy"
 
 
 def _docker_available() -> bool:
@@ -160,6 +170,17 @@ document.querySelector('#save').addEventListener('click', () => {
 </script>
 </main></body></html>"""
             self._send(200, "text/html; charset=utf-8", body)
+            return
+        if self.path == "/challenge":
+            body = b"""<!doctype html><html><head><title>Challenge</title></head>
+<body><script>
+fetch('/challenge-script');
+window.location.replace('/challenge-success');
+</script><main>challenge body must not execute</main></body></html>"""
+            self._send(401, "text/html; charset=utf-8", body)
+            return
+        if self.path in {"/challenge-script", "/challenge-success"}:
+            self._send(200, "text/plain; charset=utf-8", b"challenge code executed")
             return
         if self.path == "/navigation":
             body = b"""<!doctype html>
@@ -589,6 +610,23 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "operation_id": "interactive-close-1",
             },
         )
+        interactive_challenge = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/challenge",
+                "operation_id": "interactive-challenge-1",
+            },
+        )
+        assert interactive_challenge.is_error is False
+        interactive_challenge_close = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "close",
+                "session_id": interactive_challenge.structured["session_id"],
+                "operation_id": "interactive-challenge-close-1",
+            },
+        )
         interactive_denied = await browser_session_tool.run(
             interactive_context,
             {
@@ -629,6 +667,10 @@ async def _drive_browser_fetch() -> dict[str, Any]:
         success = await tool.run(
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
             {"url": "https://docs.browser.test/start"},
+        )
+        challenge = await tool.run(
+            ToolContext(session_id="browser-fetch-e2e", runner=handle),
+            {"url": "https://docs.browser.test/challenge"},
         )
         structured = await tool.run(
             ToolContext(session_id="browser-fetch-e2e", runner=handle),
@@ -895,6 +937,7 @@ asyncio.run(main())
         )
         return {
             "success": success,
+            "challenge": challenge,
             "screenshot": screenshot,
             "screenshot_bytes": screenshot_read.content,
             "screenshot_denied": screenshot_denied,
@@ -932,6 +975,8 @@ asyncio.run(main())
                 interactive_shot["artifacts"][0]["artifact_id"]
             ),
             "interactive_close": interactive_close,
+            "interactive_challenge": interactive_challenge,
+            "interactive_challenge_close": interactive_challenge_close,
             "interactive_denied": interactive_denied,
             "interactive_replacement": interactive_replacement,
             "interactive_replacement_close": interactive_replacement_close,
@@ -1066,6 +1111,29 @@ def test_interactive_browser_releases_capacity_after_idle_and_initial_failure(
     assert browser_fetch_results["interactive_replacement_close"].structured["closed"] is True
 
 
+def test_browser_classifies_challenge_before_its_body_can_execute(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    challenge = browser_fetch_results["challenge"]
+    assert challenge.is_error is True
+    assert challenge.structured["access"]["outcome"] == "bot_challenge"
+    assert challenge.structured["access"]["source"] == "browser_response"
+
+    interactive = browser_fetch_results["interactive_challenge"]
+    assert interactive.is_error is False
+    assert interactive.structured["access_state"] == "blocked"
+    assert interactive.structured["snapshot"] == ""
+    assert interactive.structured["url"] == "https://docs.browser.test/"
+    assert interactive.structured["access"]["outcome"] == "bot_challenge"
+    assert interactive.structured["access"]["source"] == "browser_response"
+    assert browser_fetch_results["interactive_challenge_close"].structured["closed"] is True
+
+    requests = browser_fetch_results["requests"]
+    assert ("docs.browser.test", "/challenge") in requests
+    assert ("docs.browser.test", "/challenge-script") not in requests
+    assert ("docs.browser.test", "/challenge-success") not in requests
+
+
 def test_screenshot_page_returns_an_artifact_backed_model_image_without_bypassing_egress(
     browser_fetch_results: dict[str, Any],
 ) -> None:
@@ -1093,7 +1161,7 @@ def test_screenshot_page_returns_an_artifact_backed_model_image_without_bypassin
     # Exercise the screenshot operation itself against a page that requests a
     # prohibited subresource; the worker must fail before publishing an image.
     denied = browser_fetch_results["screenshot_denied"]
-    assert denied.structured == {"error": "destination_denied"}
+    _assert_destination_access_error(denied, "destination_denied")
     assert denied.artifacts == []
     assert ("static.browser.test", "/private/subresource.js") not in browser_fetch_results[
         "requests"
@@ -1195,11 +1263,9 @@ def test_browser_fetch_denies_unapproved_redirect_and_direct_network(
     browser_fetch_results: dict[str, Any],
 ) -> None:
     denied = browser_fetch_results["denied"]
-    assert denied.is_error is True
-    assert denied.structured == {"error": "redirect_denied"}
+    _assert_destination_access_error(denied, "redirect_denied")
     locally_denied = browser_fetch_results["locally_denied_redirect"]
-    assert locally_denied.is_error is True
-    assert locally_denied.structured == {"error": "redirect_denied"}
+    _assert_destination_access_error(locally_denied, "redirect_denied")
     assert ("docs.browser.test", "/plain") not in browser_fetch_results["requests"]
     network_probe = browser_fetch_results["network_probe"]
     assert network_probe.exit_code == 0
@@ -1212,7 +1278,10 @@ def test_browser_fetch_rejects_untracked_secondary_pages(
 ) -> None:
     popup = browser_fetch_results["popup"]
     assert popup.is_error is True
-    assert popup.structured == {"error": "fetch_failed"}
+    assert popup.structured["error"] == "fetch_failed"
+    assert popup.structured["access"]["outcome"] == "transient_transport_failure"
+    assert popup.structured["access"]["source"] == "transport"
+    assert popup.structured["access"]["signal"] == "transport_error"
 
 
 def test_browser_fetch_freezes_and_isolates_page_controlled_extraction(
@@ -1284,8 +1353,7 @@ def test_browser_fetch_does_not_misclassify_denied_subresource_after_redirect(
     browser_fetch_results: dict[str, Any],
 ) -> None:
     denied = browser_fetch_results["denied_subresource"]
-    assert denied.is_error is True
-    assert denied.structured == {"error": "destination_denied"}
+    _assert_destination_access_error(denied, "destination_denied")
     assert ("static.browser.test", "/private/subresource.js") not in browser_fetch_results[
         "requests"
     ]

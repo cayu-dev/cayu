@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+from collections.abc import Mapping
 from typing import cast
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ from cayu import (
     ToolPolicyDecision,
     ToolResult,
     ToolSpec,
+    WebAccessOutcome,
     WebFetchAdapterRequest,
     WebFetchTool,
 )
@@ -89,6 +91,24 @@ class _FakeAdapter:
     ) -> ToolResult:
         self.calls.append((ctx, request))
         return self.result
+
+
+def _assert_access_error(
+    result: ToolResult,
+    *,
+    error: str,
+    outcome: WebAccessOutcome,
+    status_code: int | None = None,
+) -> None:
+    assert result.is_error is True
+    assert result.structured is not None
+    assert result.structured["error"] == error
+    if status_code is not None:
+        assert result.structured["status_code"] == status_code
+    access = result.structured["access"]
+    assert isinstance(access, Mapping)
+    assert access["outcome"] == outcome.value
+    assert access["status_code"] == status_code
 
 
 def test_web_fetch_explicit_adapter_receives_canonical_bounded_request() -> None:
@@ -328,8 +348,11 @@ def test_web_fetch_denies_non_public_or_mixed_dns_answers(
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "destination_denied"}
+    _assert_access_error(
+        result,
+        error="destination_denied",
+        outcome=WebAccessOutcome.DESTINATION_DENIED,
+    )
     assert transport.requests == []
 
 
@@ -359,8 +382,11 @@ def test_web_fetch_denies_special_use_answers_under_legacy_global_classification
             )
         )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "destination_denied"}
+    _assert_access_error(
+        result,
+        error="destination_denied",
+        outcome=WebAccessOutcome.DESTINATION_DENIED,
+    )
     assert transport.requests == []
 
 
@@ -421,8 +447,11 @@ def test_web_fetch_reports_dns_failure_without_resolver_details(resolver: object
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "dns_failure"}
+    _assert_access_error(
+        result,
+        error="dns_failure",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+    )
     assert "test resolver detail" not in result.content
     assert "private resolver diagnostic" not in result.content
     assert transport.requests == []
@@ -502,8 +531,11 @@ def test_web_fetch_reresolves_same_host_redirect_and_denies_rebinding() -> None:
 
     assert resolver.calls == [("example.com", 443), ("example.com", 443)]
     assert len(transport.requests) == 1
-    assert result.is_error is True
-    assert result.structured == {"error": "redirect_denied"}
+    _assert_access_error(
+        result,
+        error="redirect_denied",
+        outcome=WebAccessOutcome.DESTINATION_DENIED,
+    )
 
 
 def test_web_fetch_denies_redirect_pivot_to_a_private_destination() -> None:
@@ -535,7 +567,11 @@ def test_web_fetch_denies_redirect_pivot_to_a_private_destination() -> None:
         ("internal.example.com", 443),
     ]
     assert len(transport.requests) == 1
-    assert result.structured == {"error": "redirect_denied"}
+    _assert_access_error(
+        result,
+        error="redirect_denied",
+        outcome=WebAccessOutcome.DESTINATION_DENIED,
+    )
 
 
 @pytest.mark.parametrize(
@@ -561,8 +597,11 @@ def test_web_fetch_denies_invalid_redirect_targets(location: str) -> None:
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "redirect_denied"}
+    _assert_access_error(
+        result,
+        error="redirect_denied",
+        outcome=WebAccessOutcome.DESTINATION_DENIED,
+    )
     assert len(transport.requests) == 1
 
 
@@ -582,8 +621,11 @@ def test_web_fetch_denies_redirects_beyond_the_configured_limit() -> None:
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "redirect_denied"}
+    _assert_access_error(
+        result,
+        error="redirect_denied",
+        outcome=WebAccessOutcome.DESTINATION_DENIED,
+    )
     assert len(transport.requests) == 2
 
 
@@ -835,8 +877,12 @@ def test_web_fetch_reports_http_status_without_returning_the_error_body() -> Non
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "http_status", "status_code": 503}
+    _assert_access_error(
+        result,
+        error="http_status",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+        status_code=503,
+    )
     assert "private upstream diagnostic" not in result.content
 
 
@@ -1028,8 +1074,11 @@ def test_web_fetch_applies_one_total_timeout_without_leaking_an_exception() -> N
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "timeout"}
+    _assert_access_error(
+        result,
+        error="timeout",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+    )
 
 
 def test_web_fetch_total_timeout_covers_incremental_html_extraction() -> None:
@@ -1056,8 +1105,11 @@ def test_web_fetch_total_timeout_covers_incremental_html_extraction() -> None:
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "timeout"}
+    _assert_access_error(
+        result,
+        error="timeout",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+    )
 
 
 def test_web_fetch_bounds_transport_failure_without_exception_text() -> None:
@@ -1070,8 +1122,11 @@ def test_web_fetch_bounds_transport_failure_without_exception_text() -> None:
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "fetch_failed"}
+    _assert_access_error(
+        result,
+        error="fetch_failed",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+    )
     assert "private transport diagnostic" not in result.content
 
 
@@ -1232,8 +1287,12 @@ def test_httpx_web_fetch_transport_does_not_read_error_body() -> None:
         )
     )
 
-    assert result.is_error is True
-    assert result.structured == {"error": "http_status", "status_code": 503}
+    _assert_access_error(
+        result,
+        error="http_status",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+        status_code=503,
+    )
 
 
 @pytest.mark.parametrize("content_type", [None, "application/octet-stream"])

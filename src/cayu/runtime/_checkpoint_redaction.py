@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from cayu._validation import copy_json_value
+from cayu.runtime._web_access_results import persisted_web_access_control_paths
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -483,10 +484,17 @@ def durable_value_contains_secret(
     *,
     redactor: SecretRedactor,
     path: tuple[str, ...] = (),
+    _trusted_web_control_paths: frozenset[tuple[str, ...]] = frozenset(),
 ) -> bool:
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
     if type(value) is str:
+        if path in _trusted_web_control_paths:
+            # Exact closed controls are runtime protocol, not copied workload
+            # text. The complete persisted attestation was validated before
+            # this path was admitted; neighboring data fields remain subject
+            # to the workload-secret boundary.
+            return False
         if (
             _is_active_invocation_profile_identity_path(path)
             or _is_workspace_observation_identity_path(path)
@@ -523,9 +531,22 @@ def durable_value_contains_secret(
         return False
     if type(value) is list:
         return any(
-            durable_value_contains_secret(item, redactor=redactor, path=path) for item in value
+            durable_value_contains_secret(
+                item,
+                redactor=redactor,
+                path=path,
+                _trusted_web_control_paths=_trusted_web_control_paths,
+            )
+            for item in value
         )
     if type(value) is dict:
+        trusted_web_control_paths = _trusted_web_control_paths
+        if _is_staged_terminal_event(path):
+            relative_paths = persisted_web_access_control_paths(value)
+            if relative_paths:
+                trusted_web_control_paths = frozenset(
+                    (*path, *relative_path) for relative_path in relative_paths
+                )
         if path and path[-1] == "json_schema" and _path_has_typed_schema(path[:-1]):
             return json_schema_contains_secret(
                 value,
@@ -563,6 +584,7 @@ def durable_value_contains_secret(
                 item,
                 redactor=redactor,
                 path=(*path, key),
+                _trusted_web_control_paths=trusted_web_control_paths,
             ):
                 return True
         return False
@@ -680,6 +702,14 @@ def _is_staged_terminal_event_payload(path: tuple[str, ...]) -> bool:
             "event",
             "payload",
         )
+    )
+
+
+def _is_staged_terminal_event(path: tuple[str, ...]) -> bool:
+    return (
+        len(path) == 3
+        and path[0] in {"pending_tool_round", "pending_user_input"}
+        and path[1:] == ("staged_terminals", "event")
     )
 
 

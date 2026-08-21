@@ -6,6 +6,7 @@ import hashlib
 import json
 import struct
 import zlib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from cayu import (
     ScreenshotPageTool,
     ToolContext,
     ToolEffect,
+    WebAccessOutcome,
 )
 from cayu.artifacts import ArtifactStore
 from cayu.environments.admission import ExecutionAdmissionCandidate
@@ -444,7 +446,24 @@ def test_screenshot_tool_preserves_distinct_bounded_worker_errors(
 
     result, _store = _run(tmp_path, _FakeRunner(ExecResult(stdout=stdout)))
 
-    assert result.structured == {"error": code}
+    assert result.structured["error"] == code
+    if code in {
+        "browser_crash",
+        "destination_denied",
+        "dns_failure",
+        "fetch_failed",
+        "redirect_denied",
+        "timeout",
+    }:
+        access = result.structured["access"]
+        assert isinstance(access, Mapping)
+        assert access["outcome"] == (
+            WebAccessOutcome.DESTINATION_DENIED.value
+            if code in {"destination_denied", "redirect_denied"}
+            else WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE.value
+        )
+    else:
+        assert "access" not in result.structured
     assert result.is_error is True
 
 
@@ -462,7 +481,9 @@ def test_screenshot_tool_preserves_bounded_http_status_failure(tmp_path: Path) -
 
     result, _store = _run(tmp_path, _FakeRunner(ExecResult(stdout=stdout)))
 
-    assert result.structured == {"error": "http_status", "status_code": 429}
+    assert result.structured["error"] == "http_status"
+    assert result.structured["status_code"] == 429
+    assert result.structured["access"]["outcome"] == WebAccessOutcome.RATE_LIMITED.value
     assert result.is_error is True
 
 

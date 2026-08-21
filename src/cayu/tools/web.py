@@ -22,6 +22,17 @@ from cayu.egress._resolution import (
     resolve_destination,
     validated_resolved_address,
 )
+from cayu.tools.web_access import (
+    WebAccessEvidenceSource,
+    WebAccessOutcome,
+    WebAccessSignal,
+    _builtin_adapter_access_source,
+    access_error_result,
+    access_evidence_from_result,
+    attach_access_evidence,
+    classify_http_access,
+    transport_access_evidence,
+)
 from cayu.vaults import SecretRedactor
 
 MAX_WEB_FETCH_URL_LENGTH = 8192
@@ -332,12 +343,7 @@ class WebFetchTool(Tool):
     def _execution_profile_material(self) -> dict[str, Any] | None:
         """Return bounded fetch behavior when every collaborator is Cayu-owned."""
 
-        common = {
-            "max_response_bytes": self.max_response_bytes,
-            "max_content_bytes": self.max_content_bytes,
-            "timeout_seconds": self.timeout_seconds,
-            "max_redirects": self.max_redirects,
-        }
+        common = self._execution_profile_wrapper_material()
         if self.adapter is not None:
             # Browser imports this module, so keep the reverse edge local to the
             # admission-only path after both modules have initialized.
@@ -361,6 +367,16 @@ class WebFetchTool(Tool):
             **common,
             "resolver": "cayu.tools.web:SystemWebFetchResolver",
             "transport": "cayu.tools.web:HttpxWebFetchTransport",
+        }
+
+    def _execution_profile_wrapper_material(self) -> dict[str, Any]:
+        """Return the Cayu-owned limits around any configured fetch adapter."""
+
+        return {
+            "max_response_bytes": self.max_response_bytes,
+            "max_content_bytes": self.max_content_bytes,
+            "timeout_seconds": self.timeout_seconds,
+            "max_redirects": self.max_redirects,
         }
 
     def __init__(
@@ -423,6 +439,7 @@ class WebFetchTool(Tool):
             return _error_result("invalid_url", "A valid public HTTPS URL is required.")
 
         if self.adapter is not None:
+            access_source = _builtin_adapter_access_source(self.adapter)
             try:
                 async with asyncio.timeout(self.timeout_seconds):
                     result = await self.adapter.fetch(
@@ -436,17 +453,49 @@ class WebFetchTool(Tool):
                         ),
                     )
             except TimeoutError:
-                return _error_result("timeout", "The web fetch timed out.")
+                return access_error_result(
+                    transport_access_evidence(
+                        requested_url,
+                        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+                        source=WebAccessEvidenceSource.TRANSPORT,
+                        signal=WebAccessSignal.TRANSPORT_ERROR,
+                    ),
+                    error="timeout",
+                    message="The web fetch timed out.",
+                )
             if type(result) is not ToolResult:
                 raise TypeError("WebFetchAdapter.fetch() must return ToolResult.")
+            evidence = access_evidence_from_result(
+                result,
+                requested_url=requested_url,
+                source=access_source,
+                allowed_sources=(
+                    frozenset(
+                        {
+                            access_source,
+                            WebAccessEvidenceSource.EGRESS_POLICY,
+                            WebAccessEvidenceSource.TRANSPORT,
+                        }
+                    )
+                    if access_source is WebAccessEvidenceSource.BROWSER_RESPONSE
+                    else frozenset({access_source})
+                ),
+            )
+            if evidence is not None:
+                return attach_access_evidence(result, evidence)
+            if _result_claims_web_access(result):
+                return _error_result(
+                    "malformed_access_evidence",
+                    "The web adapter returned invalid access evidence.",
+                )
             return result
 
         del ctx
 
         extracted: tuple[str | None, str, tuple[str, ...]] | None = None
+        current_url = requested_url
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                current_url = requested_url
                 redirects: list[dict[str, Any]] = []
                 while True:
                     try:
@@ -490,23 +539,96 @@ class WebFetchTool(Tool):
                     except (AssertionError, LookupError, TypeError, UnicodeError):
                         raise _WebFetchUnsupportedContentError from None
         except TimeoutError:
-            return _error_result("timeout", "The web fetch timed out.")
+            return access_error_result(
+                transport_access_evidence(
+                    current_url,
+                    outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+                    source=WebAccessEvidenceSource.TRANSPORT,
+                    signal=WebAccessSignal.TRANSPORT_ERROR,
+                ),
+                error="timeout",
+                message="The web fetch timed out.",
+                effective_source_url=current_url,
+            )
         except socket.gaierror:
-            return _error_result("dns_failure", "The destination could not be resolved.")
+            return access_error_result(
+                transport_access_evidence(
+                    current_url,
+                    outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+                    source=WebAccessEvidenceSource.TRANSPORT,
+                    signal=WebAccessSignal.TRANSPORT_ERROR,
+                ),
+                error="dns_failure",
+                message="The destination could not be resolved.",
+                effective_source_url=current_url,
+            )
         except _WebFetchDestinationDeniedError:
-            return _error_result("destination_denied", "The destination is not public.")
+            return access_error_result(
+                transport_access_evidence(
+                    current_url,
+                    outcome=WebAccessOutcome.DESTINATION_DENIED,
+                    source=WebAccessEvidenceSource.EGRESS_POLICY,
+                    signal=WebAccessSignal.EGRESS_DENIAL,
+                ),
+                error="destination_denied",
+                message="The destination is not public.",
+                effective_source_url=current_url,
+            )
         except _WebFetchRedirectDeniedError:
-            return _error_result("redirect_denied", "The redirect target was denied.")
+            return access_error_result(
+                transport_access_evidence(
+                    current_url,
+                    outcome=WebAccessOutcome.DESTINATION_DENIED,
+                    source=WebAccessEvidenceSource.EGRESS_POLICY,
+                    signal=WebAccessSignal.EGRESS_DENIAL,
+                ),
+                error="redirect_denied",
+                message="The redirect target was denied.",
+                effective_source_url=current_url,
+            )
         except _WebFetchOversizedError:
             return _error_result("oversized_response", "The response exceeded the byte limit.")
         except _WebFetchUnsupportedContentError:
             return _error_result("unsupported_content", "The response encoding is unsupported.")
         except httpx.TimeoutException:
-            return _error_result("timeout", "The web fetch timed out.")
+            return access_error_result(
+                transport_access_evidence(
+                    current_url,
+                    outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+                    source=WebAccessEvidenceSource.TRANSPORT,
+                    signal=WebAccessSignal.TRANSPORT_ERROR,
+                ),
+                error="timeout",
+                message="The web fetch timed out.",
+                effective_source_url=current_url,
+            )
         except (httpx.RequestError, OSError):
-            return _error_result("fetch_failed", "The HTTPS request failed.")
+            return access_error_result(
+                transport_access_evidence(
+                    current_url,
+                    outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+                    source=WebAccessEvidenceSource.TRANSPORT,
+                    signal=WebAccessSignal.TRANSPORT_ERROR,
+                ),
+                error="fetch_failed",
+                message="The HTTPS request failed.",
+                effective_source_url=current_url,
+            )
 
         if response.status_code < 200 or response.status_code >= 300:
+            access = classify_http_access(
+                request.url,
+                status_code=response.status_code,
+                headers=response.headers,
+                source=WebAccessEvidenceSource.HTTP_RESPONSE,
+            )
+            if access is not None:
+                return access_error_result(
+                    access,
+                    error="http_status",
+                    message=f"The HTTPS request returned status {response.status_code}.",
+                    effective_source_url=request.url,
+                )
             return ToolResult(
                 content=f"The HTTPS request returned status {response.status_code}.",
                 structured={"error": "http_status", "status_code": response.status_code},
@@ -552,6 +674,22 @@ class WebFetchTool(Tool):
             timeout_seconds=self.timeout_seconds,
         )
         return await self.transport.fetch(request), request
+
+
+def _result_claims_web_access(result: ToolResult) -> bool:
+    structured = result.structured
+    if not isinstance(structured, Mapping):
+        return False
+    if "access" in structured:
+        return True
+    return structured.get("error") in {
+        "destination_denied",
+        "policy_denied",
+        "provider_authentication_failed",
+        "provider_unavailable",
+        "rate_limited",
+        "redirect_denied",
+    }
 
 
 def _web_search_tool_spec(*, default_results: int, max_results: int) -> ToolSpec:

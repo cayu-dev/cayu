@@ -50,6 +50,7 @@ from cayu.vaults import SecretRef, copy_secret_ref
 
 if TYPE_CHECKING:
     from cayu.runtime.app import CayuApp
+    from cayu.tools.web_access import WebAccessRoutePolicy, WebBridgeRoute
 
 DEFAULT_WEBBRIDGE_BROWSER_IMAGE = PINNED_BROWSER_FETCH_WORKLOAD.image
 DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE = PINNED_BROWSER_SESSION_WORKLOAD.image
@@ -108,6 +109,7 @@ class WebBridgeProfileKind(StrEnum):
     TRUSTED_LOCAL = "trusted_local"
     HOSTED_PROVIDER = "hosted_provider"
     SANDBOXED_BROWSER = "sandboxed_browser"
+    ROUTED = "routed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +464,21 @@ class WebBridge:
             raise TypeError("app must be a CayuApp.")
         if type(spec) is not AgentSpec:
             raise TypeError("spec must be an AgentSpec.")
+        self._validate_registration(app, environment_name=environment_name)
+        return app.register_agent(
+            spec,
+            tools=self.tools,
+            execution_requirements=self.execution_requirements,
+        )
+
+    def _validate_registration(
+        self,
+        app: CayuApp,
+        *,
+        environment_name: str | None,
+    ) -> None:
+        """Validate this profile without registering any agent or mutating the app."""
+
         if self.kind is WebBridgeProfileKind.HOSTED_PROVIDER:
             try:
                 registered_environment = app.get_environment(environment_name)
@@ -491,11 +508,19 @@ class WebBridge:
                 )
         elif self.kind is WebBridgeProfileKind.SANDBOXED_BROWSER:
             self._validate_sandbox_registration(app, environment_name=environment_name)
-        return app.register_agent(
-            spec,
-            tools=self.tools,
-            execution_requirements=self.execution_requirements,
-        )
+        elif self.kind is WebBridgeProfileKind.ROUTED:
+            from cayu.tools.web_access import WebAccessRoutingTool
+
+            if len(self.tools) != 1 or type(self.tools[0]) is not WebAccessRoutingTool:
+                raise ValueError("Routed WebBridge has invalid route authority.")
+            routing_tool = self.tools[0]
+            for route in routing_tool.routes:
+                route.bridge._validate_registration(
+                    app,
+                    environment_name=environment_name,
+                )
+            if self.execution_requirements != _routed_execution_requirements(routing_tool.routes):
+                raise ValueError("Routed WebBridge execution requirements changed.")
 
     def _validate_sandbox_registration(
         self,
@@ -521,6 +546,54 @@ class WebBridge:
             raise ValueError(
                 "The selected environment does not match the sandboxed WebBridge artifact store."
             )
+
+    @classmethod
+    def routed(
+        cls,
+        *,
+        routes: tuple[WebBridgeRoute, ...],
+        policy: WebAccessRoutePolicy,
+    ) -> WebBridge:
+        """Build one explicit, finite, durable ``web_fetch`` route policy.
+
+        Each route must be an already validated :class:`WebBridgeRoute`. The
+        aggregate does not merge or widen any route's runner, destination, or
+        credential authority; the active route executes with the same
+        invocation context and application grants it would receive directly.
+        """
+
+        from cayu.tools.web_access import (
+            WebAccessRoutePolicy,
+            WebAccessRoutingTool,
+            WebBridgeRoute,
+        )
+
+        if type(routes) is not tuple or any(type(route) is not WebBridgeRoute for route in routes):
+            raise TypeError("routes must be a tuple of WebBridgeRoute values.")
+        if type(policy) is not WebAccessRoutePolicy:
+            raise TypeError("policy must be a WebAccessRoutePolicy.")
+        tool = WebAccessRoutingTool(routes=routes, policy=policy)
+        return cls(
+            kind=WebBridgeProfileKind.ROUTED,
+            tools=(tool,),
+            execution_requirements=_routed_execution_requirements(routes),
+            execution_location="application_routed",
+            credential_path="per_route_explicit",
+            workspace_requirement="none",
+            _construction_token=_WEBBRIDGE_CONSTRUCTION_TOKEN,
+        )
+
+
+def _routed_execution_requirements(
+    routes: tuple[WebBridgeRoute, ...],
+) -> ExecutionRequirements:
+    """Publish only execution guarantees shared exactly by every route."""
+
+    requirements = tuple(route.bridge.execution_requirements for route in routes)
+    first = requirements[0]
+    if all(candidate == first for candidate in requirements[1:]):
+        return first.model_copy(deep=True)
+    return ExecutionRequirements.trusted()
 
 
 def _copy_webbridge_credential_authority(

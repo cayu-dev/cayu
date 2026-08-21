@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import importlib.metadata
+import ipaddress
 import json
 import math
 import os
@@ -26,15 +28,17 @@ import tempfile
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal, Never
 from urllib.parse import urljoin, urlsplit
 
-PROTOCOL_VERSION = "cayu.browser-fetch.v3"
-WORKER_VERSION = "3"
+PROTOCOL_VERSION = "cayu.browser-fetch.v4"
+WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
-INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v1"
-INTERACTIVE_WORKER_VERSION = "5"
+INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v2"
+INTERACTIVE_WORKER_VERSION = "6"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -164,6 +168,7 @@ _INTERACTIVE_ELEMENT_PATTERN = re.compile(
     r'^\s*-\s+([A-Za-z][A-Za-z0-9_-]{0,127})(?:\s+"((?:\\.|[^"\\])*)")?'
 )
 _INTERACTIVE_SAFE_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$")
+_MAX_ACCESS_RETRY_AFTER_SECONDS = 24 * 60 * 60
 
 
 class _GuestFailure(RuntimeError):
@@ -173,11 +178,156 @@ class _GuestFailure(RuntimeError):
         *,
         status_code: int | None = None,
         allocation_disposition: Literal["live", "retired", "uncertain"] = "uncertain",
+        access: dict[str, Any] | None = None,
+        effective_origin: str | None = None,
     ) -> None:
         self.code = code
         self.status_code = status_code
         self.allocation_disposition = allocation_disposition
+        self.access = access
+        self.effective_origin = effective_origin
         super().__init__(code)
+
+
+def _guest_http_access(
+    url: str,
+    status_code: int,
+    headers: Any,
+    *,
+    source: Literal["browser_response"],
+) -> dict[str, Any] | None:
+    """Classify bounded response metadata without reading page-controlled text."""
+
+    if type(headers) is not dict:
+        headers = {}
+    normalized: dict[str, str] = {}
+    allowed = {
+        "cf-mitigated",
+        "retry-after",
+        "www-authenticate",
+        "x-cayu-access-block",
+        "x-cayu-access-requirement",
+    }
+    for key, value in headers.items():
+        if type(key) is str and type(value) is str and key.lower() in allowed:
+            normalized[key.lower()] = value.encode("utf-8", errors="replace")[:256].decode(
+                "utf-8", errors="ignore"
+            )
+    outcome: str | None = None
+    signal = "status_code"
+    retry_after: int | None = None
+    retry_after_unrepresentable = False
+    if normalized.get("x-cayu-access-requirement", "").lower() == "consent":
+        outcome = "consent_required"
+        signal = "consent_header"
+    elif (
+        normalized.get("cf-mitigated", "").lower() == "challenge"
+        or normalized.get("x-cayu-access-block", "").lower() == "bot_challenge"
+    ):
+        outcome = "bot_challenge"
+        signal = "challenge_header"
+    elif status_code == 401:
+        if normalized.get("www-authenticate"):
+            outcome = "authentication_required"
+            signal = "www_authenticate"
+        else:
+            outcome = "bot_challenge"
+    elif status_code == 407:
+        outcome = "authentication_required"
+        signal = "www_authenticate"
+    elif status_code == 429:
+        outcome = "rate_limited"
+        retry_after, retry_after_unrepresentable = _guest_retry_after_seconds(
+            normalized.get("retry-after")
+        )
+        signal = (
+            "retry_after"
+            if retry_after is not None or retry_after_unrepresentable
+            else "status_code"
+        )
+    elif status_code in {403, 451}:
+        outcome = "destination_denied"
+    elif status_code in {404, 410}:
+        outcome = "content_unavailable"
+    elif status_code in {408, 425} or status_code >= 500:
+        outcome = "transient_transport_failure"
+    if outcome is None:
+        return None
+    effective_origin = _guest_https_origin(url)
+    destination = hashlib.sha256(
+        b"cayu.web-access-destination.v1\0" + effective_origin.encode("utf-8")
+    ).hexdigest()
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "outcome": outcome,
+        "source": source,
+        "signal": signal,
+        "destination_fingerprint": destination,
+        "status_code": status_code,
+        "retry_after_seconds": retry_after,
+        "retry_after_unrepresentable": retry_after_unrepresentable,
+    }
+    return evidence
+
+
+def _guest_https_origin(url: str) -> str:
+    split = urlsplit(url)
+    try:
+        port = split.port
+    except ValueError as exc:
+        raise _GuestFailure("browser_crash") from exc
+    if (
+        split.scheme.lower() != "https"
+        or split.hostname is None
+        or split.username is not None
+        or split.password is not None
+        or port not in {None, 443}
+    ):
+        raise _GuestFailure("browser_crash")
+    try:
+        hostname = split.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    except UnicodeError as exc:
+        raise _GuestFailure("browser_crash") from exc
+    else:
+        raise _GuestFailure("browser_crash")
+    if not hostname:
+        raise _GuestFailure("browser_crash")
+    return f"https://{hostname}/"
+
+
+def _guest_retry_after_seconds(value: str | None) -> tuple[int | None, bool]:
+    if value is None:
+        return None, False
+    stripped = value.strip()
+    if not stripped:
+        return None, False
+    if stripped.isascii() and stripped.isdigit():
+        if len(stripped) > 128:
+            return None, True
+        canonical_digits = stripped.lstrip("0") or "0"
+        if len(canonical_digits) > 5:
+            return None, True
+        seconds = int(canonical_digits)
+        if seconds > _MAX_ACCESS_RETRY_AFTER_SECONDS:
+            return None, True
+        return seconds, False
+    if len(stripped) > 128:
+        return None, False
+    try:
+        target = parsedate_to_datetime(stripped)
+    except (TypeError, ValueError, OverflowError):
+        return None, False
+    if target.tzinfo is None:
+        return None, False
+    delta = math.ceil((target.astimezone(UTC) - datetime.now(UTC)).total_seconds())
+    if delta > _MAX_ACCESS_RETRY_AFTER_SECONDS:
+        return None, True
+    if delta >= 0:
+        return delta, False
+    return None, False
 
 
 @dataclass(frozen=True)
@@ -224,6 +374,8 @@ class _PageState:
     response_inspection_failed: bool = False
     browser_crashed: bool = False
     cleanup_failed: bool = False
+    access_evidence: dict[str, Any] | None = None
+    effective_origin: str | None = None
     redirects: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -339,6 +491,7 @@ class _InteractivePage:
         "oversized_response"
     )
     denied_code: str | None = None
+    access_evidence: dict[str, Any] | None = None
     limit_abort_task: asyncio.Task[bool] | None = None
 
 
@@ -1938,6 +2091,20 @@ async def _fetch_with_browser(
 
         async def route_request(route: Any, browser_request: Any) -> None:
             state.request_count += 1
+            is_navigation_request = browser_request.is_navigation_request()
+            try:
+                request_frame = browser_request.frame if is_navigation_request else None
+            except Exception:
+                state.response_inspection_failed = True
+                with contextlib.suppress(Exception):
+                    await route.abort("blockedbyclient")
+                abort_page()
+                return
+            is_main_navigation = is_navigation_request and request_frame == page.main_frame
+            if state.access_evidence is not None:
+                await route.abort("blockedbyclient")
+                abort_page()
+                return
             if state.request_count > state.max_requests:
                 state.limit_exceeded = True
                 await route.abort("blockedbyclient")
@@ -1945,9 +2112,7 @@ async def _fetch_with_browser(
                 return
             if not _browser_request_is_admissible(browser_request.url):
                 is_redirected_main_navigation = (
-                    browser_request.is_navigation_request()
-                    and browser_request.frame == page.main_frame
-                    and browser_request.redirected_from is not None
+                    is_main_navigation and browser_request.redirected_from is not None
                 )
                 _record_page_denial(
                     state,
@@ -1956,18 +2121,35 @@ async def _fetch_with_browser(
                 await route.abort("blockedbyclient")
                 abort_page()
                 return
+            if is_main_navigation and urlsplit(browser_request.url).scheme.lower() == "https":
+                with contextlib.suppress(_GuestFailure):
+                    state.effective_origin = _guest_https_origin(browser_request.url)
             await route.continue_()
 
         await context.route("**/*", route_request)
 
         cdp = await context.new_cdp_session(page)
         await cdp.send("Network.enable")
-        main_frame_id: str | None = None
+        frame_tree = await cdp.send("Page.getFrameTree")
+        main_frame_id = frame_tree["frameTree"]["frame"]["id"]
+        if type(main_frame_id) is not str:
+            raise _GuestFailure("browser_crash")
         main_document_request_ids: set[str] = set()
         redirected_main_request_ids: set[str] = set()
+        await cdp.send(
+            "Fetch.enable",
+            {
+                "patterns": [
+                    {
+                        "urlPattern": "*",
+                        "resourceType": "Document",
+                        "requestStage": "Response",
+                    }
+                ]
+            },
+        )
 
         def request_will_be_sent(params: dict[str, Any]) -> None:
-            nonlocal main_frame_id
             try:
                 if params.get("type") != "Document":
                     return
@@ -1975,8 +2157,6 @@ async def _fetch_with_browser(
                 frame_id = params.get("frameId")
                 if type(request_id) is not str or type(frame_id) is not str:
                     raise TypeError("Missing browser navigation identity.")
-                if main_frame_id is None:
-                    main_frame_id = frame_id
                 redirect_response = params.get("redirectResponse")
                 if redirect_response is not None and type(redirect_response) is not dict:
                     raise TypeError("Malformed browser redirect evidence.")
@@ -1989,6 +2169,84 @@ async def _fetch_with_browser(
                 abort_page()
 
         cdp.on("Network.requestWillBeSent", request_will_be_sent)
+
+        async def response_paused(params: dict[str, Any]) -> None:
+            request_id = params.get("requestId")
+            try:
+                if type(request_id) is not str:
+                    raise TypeError("Missing paused browser response identity.")
+                frame_id = params.get("frameId")
+                status_code = params.get("responseStatusCode")
+                raw_headers = params.get("responseHeaders")
+                if (
+                    params.get("resourceType") == "Document"
+                    and frame_id == main_frame_id
+                    and type(status_code) is int
+                    and type(raw_headers) is list
+                ):
+                    headers = {
+                        item["name"]: item["value"]
+                        for item in raw_headers
+                        if type(item) is dict
+                        and type(item.get("name")) is str
+                        and type(item.get("value")) is str
+                    }
+                    broker_code = next(
+                        (
+                            value
+                            for key, value in headers.items()
+                            if key.lower() == _BROKER_ERROR_HEADER and value
+                        ),
+                        None,
+                    )
+                    if broker_code is not None:
+                        network_id = params.get("networkId")
+                        _record_page_denial(
+                            state,
+                            (
+                                "redirect_denied"
+                                if broker_code == "destination_denied"
+                                and network_id in redirected_main_request_ids
+                                else broker_code
+                            ),
+                        )
+                        abort_page()
+                        await cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+                        return
+                    response_url = params.get("request", {}).get("url")
+                    if type(response_url) is not str:
+                        raise TypeError("Missing paused browser response URL.")
+                    access = _guest_http_access(
+                        response_url,
+                        status_code,
+                        headers,
+                        source="browser_response",
+                    )
+                    if access is not None:
+                        if state.access_evidence is None:
+                            state.access_evidence = access
+                            state.effective_origin = _guest_https_origin(response_url)
+                        abort_page()
+                        await cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+                        return
+                await cdp.send("Fetch.continueResponse", {"requestId": request_id})
+            except Exception:
+                state.response_inspection_failed = True
+                abort_page()
+                if type(request_id) is str:
+                    with contextlib.suppress(Exception):
+                        await cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+
+        cdp.on("Fetch.requestPaused", response_paused)
 
         def response_extra_info(params: dict[str, Any]) -> None:
             try:
@@ -2039,6 +2297,22 @@ async def _fetch_with_browser(
         def response_observed(response: Any) -> None:
             try:
                 headers = response.headers
+                if (
+                    response.request.is_navigation_request()
+                    and response.request.frame == page.main_frame
+                ):
+                    access = _guest_http_access(
+                        response.url,
+                        response.status,
+                        headers,
+                        source="browser_response",
+                    )
+                    if access is not None:
+                        if state.access_evidence is None:
+                            state.access_evidence = access
+                            state.effective_origin = _guest_https_origin(response.url)
+                        abort_page()
+                        return
                 broker_code = headers.get(_BROKER_ERROR_HEADER)
                 if broker_code:
                     is_redirected_main_navigation = (
@@ -2094,7 +2368,10 @@ async def _fetch_with_browser(
             navigation_task = None
             await _cancel_task(violation_task)
             violation_task = None
-            raise _page_state_failure(state, redirects=redirects) or _GuestFailure("fetch_failed")
+            raise _page_state_failure(state, redirects=redirects) or _GuestFailure(
+                "fetch_failed",
+                effective_origin=state.effective_origin,
+            )
         await _cancel_task(violation_task)
         violation_task = None
         final_response = await navigation_task
@@ -2104,10 +2381,22 @@ async def _fetch_with_browser(
         if state_failure is not None:
             raise state_failure
         if final_response is None:
-            raise _GuestFailure("fetch_failed")
+            raise _GuestFailure("fetch_failed", effective_origin=state.effective_origin)
+        final_headers = await final_response.all_headers()
+        access = _guest_http_access(
+            final_response.url,
+            final_response.status,
+            final_headers,
+            source="browser_response",
+        )
+        if access is not None:
+            raise _GuestFailure(
+                "access_blocked",
+                access=access,
+                effective_origin=_guest_https_origin(final_response.url),
+            )
         if final_response.status < 200 or final_response.status >= 300:
             raise _GuestFailure("http_status", status_code=final_response.status)
-        final_headers = await final_response.all_headers()
         content_type = final_headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type not in _HTML_CONTENT_TYPES | _TEXT_CONTENT_TYPES:
             raise _GuestFailure("unsupported_content")
@@ -2161,18 +2450,25 @@ async def _fetch_with_browser(
         primary = exc
         raise
     except (PlaywrightTimeoutError, TimeoutError) as exc:
-        primary = _page_state_failure(state, redirects=redirects) or _GuestFailure("timeout")
+        primary = _page_state_failure(state, redirects=redirects) or _GuestFailure(
+            "timeout",
+            effective_origin=state.effective_origin,
+        )
         raise primary from exc
     except _GuestFailure as exc:
         primary = exc
         raise
     except PlaywrightError as exc:
         primary = _page_state_failure(state, redirects=redirects) or _GuestFailure(
-            "browser_crash" if launched else "browser_unavailable"
+            "browser_crash" if launched else "browser_unavailable",
+            effective_origin=state.effective_origin,
         )
         raise primary from exc
     except Exception as exc:
-        primary = _GuestFailure("browser_crash")
+        primary = _page_state_failure(state, redirects=redirects) or _GuestFailure(
+            "browser_crash",
+            effective_origin=state.effective_origin,
+        )
         raise primary from exc
     finally:
         cleanup_task = asyncio.create_task(
@@ -2272,12 +2568,21 @@ def _page_state_failure(
             "redirect_denied",
             "timeout",
         }:
-            return _GuestFailure(state.denied_code)
-        return _GuestFailure("fetch_failed")
+            return _GuestFailure(
+                state.denied_code,
+                effective_origin=state.effective_origin,
+            )
+        return _GuestFailure("fetch_failed", effective_origin=state.effective_origin)
+    if state.access_evidence is not None and state.effective_origin is not None:
+        return _GuestFailure(
+            "access_blocked",
+            access=state.access_evidence,
+            effective_origin=state.effective_origin,
+        )
     if state.response_inspection_failed:
-        return _GuestFailure("fetch_failed")
+        return _GuestFailure("fetch_failed", effective_origin=state.effective_origin)
     if len(redirects) > state.max_redirects:
-        return _GuestFailure("redirect_denied")
+        return _GuestFailure("redirect_denied", effective_origin=state.effective_origin)
     return None
 
 
@@ -3082,6 +3387,9 @@ class _InteractiveDaemon:
 
         async def route_request(route: Any, browser_request: Any) -> None:
             state.request_count += 1
+            if state.access_evidence is not None:
+                await route.abort("blockedbyclient")
+                return
             if state.request_count > limits.max_requests:
                 state.limit_exceeded = True
                 self._schedule_response_limit_abort(state)
@@ -3090,7 +3398,7 @@ class _InteractiveDaemon:
             try:
                 request_page = browser_request.frame.page
             except Exception:
-                state.limit_exceeded = True
+                state.denied_code = "fetch_failed"
                 await route.abort("blockedbyclient")
                 return
             if request_page != page:
@@ -3122,6 +3430,92 @@ class _InteractiveDaemon:
 
         state.cdp = await self.context.new_cdp_session(page)
         await state.cdp.send("Network.enable")
+        frame_tree = await state.cdp.send("Page.getFrameTree")
+        main_frame_id = frame_tree["frameTree"]["frame"]["id"]
+        if type(main_frame_id) is not str:
+            raise _GuestFailure("browser_crash")
+        await state.cdp.send(
+            "Fetch.enable",
+            {
+                "patterns": [
+                    {
+                        "urlPattern": "*",
+                        "resourceType": "Document",
+                        "requestStage": "Response",
+                    }
+                ]
+            },
+        )
+
+        async def response_paused(params: dict[str, Any]) -> None:
+            request_id = params.get("requestId")
+            try:
+                if type(request_id) is not str:
+                    raise TypeError("Missing paused browser response identity.")
+                frame_id = params.get("frameId")
+                status_code = params.get("responseStatusCode")
+                raw_headers = params.get("responseHeaders")
+                if (
+                    params.get("resourceType") == "Document"
+                    and frame_id == main_frame_id
+                    and type(status_code) is int
+                    and type(raw_headers) is list
+                ):
+                    headers = {
+                        item["name"]: item["value"]
+                        for item in raw_headers
+                        if type(item) is dict
+                        and type(item.get("name")) is str
+                        and type(item.get("value")) is str
+                    }
+                    broker_code = next(
+                        (
+                            value
+                            for key, value in headers.items()
+                            if key.lower() == _BROKER_ERROR_HEADER and value
+                        ),
+                        None,
+                    )
+                    if broker_code is not None:
+                        state.denied_code = (
+                            "redirect_denied"
+                            if broker_code == "destination_denied" and state.redirect_count > 0
+                            else broker_code
+                        )
+                        await state.cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+                        return
+                    response_url = params.get("request", {}).get("url")
+                    if type(response_url) is not str:
+                        raise TypeError("Missing paused browser response URL.")
+                    access = _guest_http_access(
+                        response_url,
+                        status_code,
+                        headers,
+                        source="browser_response",
+                    )
+                    if access is not None:
+                        if state.access_evidence is None:
+                            state.access_evidence = access
+                            state.public_url = _guest_https_origin(response_url)
+                        await state.cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+                        return
+                await state.cdp.send("Fetch.continueResponse", {"requestId": request_id})
+            except Exception:
+                state.denied_code = "fetch_failed"
+                if type(request_id) is str:
+                    with contextlib.suppress(Exception):
+                        await state.cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+
+        state.cdp.on("Fetch.requestPaused", response_paused)
 
         def data_received(params: dict[str, Any]) -> None:
             length = params.get("encodedDataLength")
@@ -3136,6 +3530,19 @@ class _InteractiveDaemon:
         def response_observed(response: Any) -> None:
             try:
                 headers = response.headers
+                if (
+                    response.request.is_navigation_request()
+                    and response.request.frame == page.main_frame
+                ):
+                    access = _guest_http_access(
+                        response.url,
+                        response.status,
+                        headers,
+                        source="browser_response",
+                    )
+                    if access is not None and state.access_evidence is None:
+                        state.access_evidence = access
+                        state.public_url = _guest_https_origin(response.url)
                 broker_code = next(
                     (
                         value
@@ -3179,9 +3586,15 @@ class _InteractiveDaemon:
         if failure is not None:
             raise failure
         if request.operation == "navigate":
-            await page.goto(
-                request.url, wait_until="load", timeout=max(1_000, request.limits.max_wait_ms)
-            )
+            try:
+                await page.goto(
+                    request.url,
+                    wait_until="load",
+                    timeout=max(1_000, request.limits.max_wait_ms),
+                )
+            except Exception:
+                if state.access_evidence is None:
+                    raise
         elif request.operation != "observe":
             if state.revision is None or request.expected_revision != state.revision:
                 raise _GuestFailure("incompatible_browser")
@@ -3627,6 +4040,7 @@ async def _interactive_observation(
     browser_version: str,
 ) -> dict[str, Any]:
     page = state.page
+    blocked = state.access_evidence is not None
     if state.cdp is None:
         raise _GuestFailure("browser_crash")
     primary_failure: BaseException | None = None
@@ -3642,21 +4056,35 @@ async def _interactive_observation(
         )
         if type(freeze_result) is not dict:
             raise _GuestFailure("browser_crash")
-        await _admit_interactive_snapshot_materialization(state, limits)
-        raw_snapshot = await page.locator("body").aria_snapshot(
-            mode="ai",
-            depth=_ACCESSIBILITY_SNAPSHOT_DEPTH,
-            timeout=max(1_000, limits.max_wait_ms),
-        )
-        if type(raw_snapshot) is not str:
-            raise _GuestFailure("browser_crash")
-        snapshot, refs, ref_metadata, truncation = _interactive_snapshot(raw_snapshot, limits)
-        url = page.url
+        if blocked:
+            snapshot = ""
+            refs: dict[str, str] = {}
+            ref_metadata: dict[str, tuple[str, str]] = {}
+            truncation: list[str] = []
+        else:
+            await _admit_interactive_snapshot_materialization(state, limits)
+            raw_snapshot = await page.locator("body").aria_snapshot(
+                mode="ai",
+                depth=_ACCESSIBILITY_SNAPSHOT_DEPTH,
+                timeout=max(1_000, limits.max_wait_ms),
+            )
+            if type(raw_snapshot) is not str:
+                raise _GuestFailure("browser_crash")
+            snapshot, refs, ref_metadata, truncation = _interactive_snapshot(
+                raw_snapshot,
+                limits,
+            )
+        url = state.public_url if blocked else page.url
         if type(url) is not str:
             raise _GuestFailure("browser_crash")
         split = urlsplit(url)
         scheme = split.scheme.lower()
         if scheme == "https":
+            if blocked:
+                if split.hostname is None:
+                    raise _GuestFailure("browser_crash")
+                url = f"https://{split.hostname.lower()}/"
+                truncation.append("url")
             if len(url.encode("utf-8", errors="replace")) > _MAX_URL_LENGTH:
                 try:
                     port = split.port
@@ -3674,11 +4102,12 @@ async def _interactive_observation(
             truncation.append("url")
         else:
             raise _GuestFailure("browser_crash")
-        title = await page.title()
-        title_bytes = title.encode("utf-8", errors="replace")
-        if len(title_bytes) > _MAX_TITLE_BYTES:
-            title = title_bytes[:_MAX_TITLE_BYTES].decode("utf-8", errors="ignore")
-            truncation.append("title")
+        title = None if blocked else await page.title()
+        if title is not None:
+            title_bytes = title.encode("utf-8", errors="replace")
+            if len(title_bytes) > _MAX_TITLE_BYTES:
+                title = title_bytes[:_MAX_TITLE_BYTES].decode("utf-8", errors="ignore")
+                truncation.append("title")
     except _GuestFailure as exc:
         primary_failure = exc
         if exc.code in {"oversized_response", "oversized_snapshot"}:
@@ -3736,7 +4165,8 @@ async def _interactive_observation(
             for opaque in refs
         ],
         "load_state": "loaded",
-        "access_state": "available",
+        "access_state": "blocked" if blocked else "available",
+        "access": state.access_evidence,
         "idle_timeout_seconds": limits.idle_timeout_seconds,
         "truncation_reasons": list(dict.fromkeys(truncation)),
         "backend_identity": {
@@ -3899,6 +4329,7 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
         "kind": "error",
         "allocation_disposition": error.allocation_disposition,
         "error": stable,
+        **({"access": error.access} if error.access is not None else {}),
     }
 
 
@@ -4033,6 +4464,10 @@ def _error_payload(error: _GuestFailure) -> dict[str, Any]:
     }
     if error.status_code is not None:
         payload["status_code"] = error.status_code
+    if error.access is not None:
+        payload["access"] = error.access
+    if error.effective_origin is not None:
+        payload["effective_source_url"] = error.effective_origin
     return payload
 
 

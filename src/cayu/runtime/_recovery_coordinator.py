@@ -79,6 +79,7 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime import pending_actions
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
@@ -10414,6 +10415,9 @@ class RecoveryCoordinator:
                     session_id=session.id,
                     tool_round_identity=tool_round_identity,
                     tool_exposure=pending_round.tool_exposure,
+                )
+                terminal_event = web_access_results.restore_persisted_web_access_result_authority(
+                    terminal_event
                 )
             expected_public_outcome = runtime_records.ToolCallOutcome(
                 call=runtime_records.ToolCallRequest(

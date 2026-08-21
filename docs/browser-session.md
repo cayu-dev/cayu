@@ -21,8 +21,8 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:5-playwright-1.62.0` image, the
-`cayu.browser-session.v1` protocol and worker version 5, brokered deny-by-default egress,
+`cayu-browser-fetch:6-playwright-1.62.0` image, the
+`cayu.browser-session.v2` protocol and worker version 6, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -181,4 +181,9 @@ allocation itself is lost.
 
 Access-block classification and explicit fallback routing belong to a separate
 browser-access contract; this recovery boundary does not infer or select a
-fallback.
+fallback. A blocked main-document response publishes only typed transport
+evidence with an origin-only URL and an empty title/snapshot/ref set. Denial-page
+text never executes or becomes fallback evidence: the guest intercepts the
+classified response before body execution, while broker egress denial remains
+authoritative. See
+[WebBridge access routing](web-fetch.md#classified-access-barriers-and-explicit-routing).

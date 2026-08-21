@@ -23,9 +23,11 @@ from cayu import (
     SecretRedactor,
     SecretRef,
     VirtualEgressEnvironmentFactory,
+    WebAccessRoutePolicy,
     WebBridge,
     WebBridgeCredentialAuthority,
     WebBridgeProfileKind,
+    WebBridgeRoute,
     WebSearchRestrictions,
 )
 from cayu.core import AgentSpec, ToolContext, ToolResult
@@ -396,6 +398,32 @@ def test_hosted_profile_registration_fails_closed_on_proxy_compatibility_error()
     assert "private proxy diagnostic" not in str(caught.value)
 
 
+def test_routed_profile_registration_validates_hosted_proxy_authority() -> None:
+    hosted = WebBridge.hosted(
+        adapter=_HostedAdapter(),
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="routed-hosted-test",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
+    routed = WebBridge.routed(
+        routes=(WebBridgeRoute("hosted", hosted),),
+        policy=WebAccessRoutePolicy(entry_route_id="hosted"),
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="hosted")),
+        default=True,
+    )
+
+    with pytest.raises(ValueError, match="credential proxy"):
+        routed.register_agent(
+            app,
+            AgentSpec(name="routed-agent", model="test-model"),
+        )
+
+
 def test_hosted_profile_revalidates_active_proxy_before_adapter_dispatch() -> None:
     adapter = _HostedAdapter()
     bridge = WebBridge.hosted(adapter=adapter)
@@ -560,6 +588,55 @@ def test_sandboxed_profile_validates_and_binds_setup_authorities(tmp_path: Path)
     assert bridge.execution_requirements.cleanup == "confirmed"
 
 
+@pytest.mark.parametrize("mismatch", ["environment", "artifact"])
+def test_routed_profile_registration_validates_sandbox_authority(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    configured_store = LocalArtifactStore(tmp_path / "configured-artifacts")
+    sandboxed = WebBridge.sandboxed_browser(
+        environment=Environment(
+            EnvironmentSpec(name="browser"),
+            runner=_BrowserRunner(),
+            artifact_store=configured_store,
+        ),
+        browser_image=PINNED_BROWSER_FETCH_WORKLOAD.image,
+    )
+    routed = WebBridge.routed(
+        routes=(WebBridgeRoute("browser", sandboxed),),
+        policy=WebAccessRoutePolicy(entry_route_id="browser"),
+    )
+    assert routed.execution_requirements == sandboxed.execution_requirements
+    app = CayuApp(enable_logging=False)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="browser"),
+            runner=_BrowserRunner(
+                environment_authority=(
+                    ExecutionEnvironmentAuthority(
+                        identity="different-browser-environment",
+                        profile_identity="different-browser-profile",
+                    )
+                    if mismatch == "environment"
+                    else _BROWSER_ENVIRONMENT_AUTHORITY
+                )
+            ),
+            artifact_store=(
+                LocalArtifactStore(tmp_path / "different-artifacts")
+                if mismatch == "artifact"
+                else configured_store
+            ),
+        ),
+        default=True,
+    )
+
+    with pytest.raises(ValueError, match=mismatch):
+        routed.register_agent(
+            app,
+            AgentSpec(name="routed-agent", model="test-model"),
+        )
+
+
 def test_sandboxed_static_profile_binds_one_exact_runner_instance(tmp_path: Path) -> None:
     configured_runner = _ImplicitAuthorityBrowserRunner()
     bridge = WebBridge.sandboxed_browser(
@@ -601,8 +678,8 @@ def test_sandboxed_interactive_profile_exposes_one_closed_browser_session_tool(
     )
 
     assert [tool.spec.name for tool in bridge.tools] == ["browser_session"]
-    assert bridge.browser_protocol == "cayu.browser-session.v1"
-    assert bridge.browser_worker_version == "5"
+    assert bridge.browser_protocol == "cayu.browser-session.v2"
+    assert bridge.browser_worker_version == "6"
     assert bridge.playwright_version == BROWSER_FETCH_PLAYWRIGHT_VERSION
     tool = bridge.tools[0]
     assert tool.max_dom_nodes == 500

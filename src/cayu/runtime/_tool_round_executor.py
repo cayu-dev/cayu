@@ -88,6 +88,7 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._assistant_tool_round_publication import (
     validate_tool_exposure_terminal_event,
 )
@@ -547,6 +548,7 @@ class _ToolRoundPublicationCoordinator:
             tool_round_identity=self._tool_round_identity,
             tool_exposure=self._tool_exposure,
         )
+        restored = web_access_results.restore_persisted_web_access_result_authority(restored)
         observed_fingerprint = restored.payload.get(EXECUTION_PROFILE_FINGERPRINT_FIELD)
         if (
             observed_fingerprint is not None
@@ -738,6 +740,7 @@ class _ToolRoundPublicationCoordinator:
                         "event": _project_staged_terminal_event(
                             item.event,
                             redactor=redactor,
+                            trust_persisted_web_access_authority=True,
                         )
                     },
                     deep=True,
@@ -3468,6 +3471,7 @@ class ToolRoundExecutor:
                     event=result_event,
                     result=result,
                     redactor=output_redactor,
+                    runtime_tool=registered_tool.tool,
                 )
                 if not output_redactor.has_same_registry(redactor):
                     result_event, result = _prepare_tool_result_event(
@@ -3685,6 +3689,7 @@ class ToolRoundExecutor:
                 publish_before_hooks=execution_outcome.publish_before_hooks,
                 deferred_terminal_stager=effective_terminal_stager,
                 publication_snapshot=publication_snapshot,
+                executed_runtime_tool=registered_tool.tool,
             ),
             cancellation=post_tool_cancellation,
             restore_cancellation_requests=post_tool_cancellation_requests_consumed,
@@ -4368,6 +4373,7 @@ class ToolRoundExecutor:
         hooks_already_completed: bool = False,
         publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        executed_runtime_tool: object | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         if publish_before_hooks and allow_modification:
             raise ValueError("Pre-hook tool-result publication cannot allow hook modification.")
@@ -4438,6 +4444,7 @@ class ToolRoundExecutor:
             event=event,
             result=result,
             redactor=resolved_output_redactor,
+            runtime_tool=executed_runtime_tool,
         )
         if not resolved_output_redactor.has_same_registry(resolved_redactor):
             event, result = _prepare_tool_result_event(
@@ -4659,6 +4666,11 @@ class ToolRoundExecutor:
             event=projected_event,
             result=projection.result,
         )
+        projected_event, projected_result = web_access_results.restore_attested_tool_result(
+            projected_event,
+            original=projected_result,
+            redacted=projected_result,
+        )
         projected_event = event_with_runtime_nested_payload_authority(
             projected_event,
             _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
@@ -4701,6 +4713,7 @@ class ToolRoundExecutor:
                 output_redactor=output_redactor,
                 allow_modification=allow_modification,
                 quarantine_output=quarantine_output,
+                attested_result=result,
             ):
                 yield hook_event, modified
                 if modified is not None:
@@ -4723,6 +4736,7 @@ class ToolRoundExecutor:
         execution_profile: ExecutionProfileIdentity | None = None,
         allow_modification: bool = False,
         quarantine_output: bool = False,
+        attested_result: ToolResult | None = None,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
         current_result = result
         for registered_hook in hooks:
@@ -4826,6 +4840,12 @@ class ToolRoundExecutor:
                 )
                 continue
             if modified is not None:
+                if attested_result is not None:
+                    modified = web_access_results.preserve_attested_controls_across_hook(
+                        tool_event,
+                        original=attested_result,
+                        replacement=modified,
+                    )
                 current_result = modified
             yield (
                 await self._event_writer.emit(
@@ -8631,6 +8651,7 @@ def _prepare_tool_result_event(
     event: Event,
     result: ToolResult,
     redactor: SecretRedactor,
+    runtime_tool: object | None = None,
 ) -> tuple[Event, ToolResult]:
     argument_state = event.payload.get(tool_argument_publication.ARGUMENTS_STATE_FIELD)
     if argument_state is not None and (
@@ -8669,6 +8690,11 @@ def _prepare_tool_result_event(
         structured=result.structured,
         artifacts=tool_results.strip_runtime_tool_result_projection_authority(result.artifacts),
         is_error=result.is_error,
+    )
+    event = web_access_results.attest_runtime_web_access_result(
+        event,
+        result,
+        tool=runtime_tool,
     )
     event, result = _validate_and_synchronize_tool_result_event(
         event=event,
@@ -8859,9 +8885,12 @@ def _project_staged_terminal_event(
     event: Event,
     *,
     redactor: SecretRedactor,
+    trust_persisted_web_access_authority: bool = False,
 ) -> Event:
     """Progressively sanitize one private terminal without changing its identity."""
 
+    if trust_persisted_web_access_authority:
+        event = web_access_results.restore_persisted_web_access_result_authority(event)
     raw_result = event.payload.get("result")
     if type(raw_result) is not dict:
         raise ValueError("Staged terminal event requires a tool result object.")

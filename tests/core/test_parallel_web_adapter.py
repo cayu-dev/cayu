@@ -33,6 +33,7 @@ from cayu import (
     WebSearchRestrictions,
     WebSearchTool,
 )
+from cayu.tools.web_access import web_destination_fingerprint
 
 _API_KEY = "parallel-test-secret-value"
 _API_KEY_REF = SecretRef(name="parallel_api_key")
@@ -394,14 +395,17 @@ def test_parallel_extract_failure_is_stable_and_does_not_leak_raw_content() -> N
     assert result.is_error is True
     assert result.structured == {
         "error": "fetch_failed",
-        "status_code": 404,
-        "provider_metadata": {
-            "parallel": {
-                "request_id": "extract_123",
-                "session_id": "session_123",
-                "extract_error_type": "fetch_error",
-            }
+        "access": {
+            "schema_version": 1,
+            "outcome": "content_unavailable",
+            "source": "hosted_provider",
+            "signal": "status_code",
+            "destination_fingerprint": web_destination_fingerprint("https://example.com/missing"),
+            "status_code": 404,
+            "retry_after_seconds": None,
+            "retry_after_unrepresentable": False,
         },
+        "status_code": 404,
     }
     assert secret_detail not in result.content
     assert secret_detail not in json.dumps(result.model_dump()["structured"])
@@ -687,6 +691,52 @@ def test_parallel_rate_limit_preserves_bounded_retry_metadata_without_retrying()
                 "retry_after_seconds": 15.0,
             }
         },
+    }
+
+
+def test_parallel_rate_limit_does_not_shorten_unrepresentable_retry_timing() -> None:
+    result = asyncio.run(
+        WebSearchTool(
+            adapter=ParallelAIWebAdapter(
+                api_key_ref=_API_KEY_REF,
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        429,
+                        headers={"retry-after": "86401"},
+                        stream=_UnreadableStream(),
+                    )
+                ),
+            )
+        ).run(_context(_CredentialProxy()), {"query": "rate limited"})
+    )
+
+    assert result.structured == {
+        "error": "rate_limited",
+        "status_code": 429,
+        "provider_metadata": {"parallel": {"retry_after_unrepresentable": True}},
+    }
+
+
+def test_parallel_rate_limit_does_not_ignore_overflowing_retry_timing() -> None:
+    result = asyncio.run(
+        WebSearchTool(
+            adapter=ParallelAIWebAdapter(
+                api_key_ref=_API_KEY_REF,
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        429,
+                        headers={"retry-after": "9" * 400},
+                        stream=_UnreadableStream(),
+                    )
+                ),
+            )
+        ).run(_context(_CredentialProxy()), {"query": "rate limited"})
+    )
+
+    assert result.structured == {
+        "error": "rate_limited",
+        "status_code": 429,
+        "provider_metadata": {"parallel": {"retry_after_unrepresentable": True}},
     }
 
 

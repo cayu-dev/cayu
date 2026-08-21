@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -45,7 +46,6 @@ MAX_EXA_WARNINGS = 16
 MAX_EXA_PUBLICATION_TIME_BYTES = 64
 _MAX_EXA_SNIPPETS_PER_RESULT = 8
 _MAX_EXA_RETRY_AFTER_SECONDS = 24 * 60 * 60
-
 _EXA_SEARCH_TYPES = frozenset({"instant", "fast", "auto", "deep-lite", "deep", "deep-reasoning"})
 _EXA_AUTH_HEADERS = frozenset({"x-api-key", "authorization"})
 
@@ -736,9 +736,13 @@ def _exa_http_error_result(response: _ExaHttpResponse) -> ToolResult:
     )
     if request_id is not None:
         exa_metadata["request_id"] = request_id
-    retry_after = _retry_after_seconds(response.headers.get("retry-after"))
+    retry_after, retry_after_unrepresentable = _retry_after_seconds(
+        response.headers.get("retry-after")
+    )
     if retry_after is not None:
         exa_metadata["retry_after_seconds"] = retry_after
+    if retry_after_unrepresentable:
+        exa_metadata["retry_after_unrepresentable"] = True
     structured: dict[str, Any] = {
         "error": code,
         "status_code": response.status_code,
@@ -952,30 +956,35 @@ def _reject_json_constant(value: str) -> Any:
     raise _ExaMalformedResponseError
 
 
-def _retry_after_seconds(value: str | None) -> float | None:
+def _retry_after_seconds(value: str | None) -> tuple[float | None, bool]:
     if value is None:
-        return None
+        return None, False
     value = value.strip()
     if not value:
-        return None
+        return None, False
     try:
         seconds = float(value)
     except ValueError:
         try:
             target = parsedate_to_datetime(value)
         except (TypeError, ValueError):
-            return None
+            return None, False
         if target is None:
-            return None
+            return None, False
         if target.tzinfo is None:
             target = target.replace(tzinfo=UTC)
-        return min(
-            _MAX_EXA_RETRY_AFTER_SECONDS,
-            max(0.0, (target - datetime.now(UTC)).total_seconds()),
-        )
-    if not math.isfinite(seconds) or seconds < 0:
-        return None
-    return min(seconds, _MAX_EXA_RETRY_AFTER_SECONDS)
+        seconds = max(0.0, (target - datetime.now(UTC)).total_seconds())
+    if not math.isfinite(seconds):
+        try:
+            exact_seconds = Decimal(value)
+        except InvalidOperation:
+            return None, False
+        return None, exact_seconds.is_finite() and exact_seconds >= 0
+    if seconds < 0:
+        return None, False
+    if seconds > _MAX_EXA_RETRY_AFTER_SECONDS:
+        return None, True
+    return seconds, False
 
 
 def _exa_origin(value: Any) -> str:

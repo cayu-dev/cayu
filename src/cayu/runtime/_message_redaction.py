@@ -5,6 +5,7 @@ from typing import Any, cast
 from cayu.artifacts.attachments import FILE_ATTACHMENT_TYPE
 from cayu.core.messages import Message
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime.tool_result_projection import (
     _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
     TOOL_RESULT_ARTIFACT_TYPE,
@@ -276,6 +277,10 @@ def _redact_message_for_boundary(
             redacted_structured = redacted_part.get("structured")
             if terminal_controls and type(redacted_structured) is dict:
                 redacted_structured.update(terminal_controls)
+            web_access_results.restore_finite_message_controls(
+                structured,
+                redacted_structured,
+            )
         redacted_content.append(redacted_part)
     return Message.model_validate(
         {
@@ -495,6 +500,15 @@ def _require_secret_free_tool_result_structure(
     field_name: str,
 ) -> None:
     """Exempt only positively identified runtime-owned tool-result schemas."""
+
+    if web_access_results.finite_message_controls(structured):
+        redactor.require_no_secret_keys(
+            structured,
+            field_name=field_name,
+            preserve_keys=web_access_results.WEB_ACCESS_MESSAGE_STRUCTURE_KEYS,
+            match_short_substrings=True,
+        )
+        return
 
     terminal_controls = _recognized_runtime_terminal_controls(structured)
     if terminal_controls:

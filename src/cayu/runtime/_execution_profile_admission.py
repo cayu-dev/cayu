@@ -784,6 +784,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
     from cayu.tools.search import SearchTextTool
     from cayu.tools.user_input import UserInputTool
     from cayu.tools.web import WebFetchTool
+    from cayu.tools.web_access import WebAccessRoutingTool
 
     tool_types = (
         ExecCommandTool,
@@ -803,6 +804,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
         ScreenshotPageTool,
         UserInputTool,
         WebFetchTool,
+        WebAccessRoutingTool,
     )
     return {tool_type: tool_type._execution_profile_material for tool_type in tool_types}
 

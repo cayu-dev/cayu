@@ -32,6 +32,11 @@ from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._tool_identity import tool_idempotency_key
+from cayu.runtime._web_access_results import (
+    WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+    WEB_ACCESS_RESULT_EVENT_SCHEMA_PATHS,
+    restore_attested_event_result,
+)
 from cayu.runtime.model_steps import StepClassificationType
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -1225,7 +1230,11 @@ _TOOL_RESULT_PROJECTION_RECORD_FIELDS = frozenset(
 _TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS = frozenset(
     ("tool_result_projection", field_name) for field_name in _TOOL_RESULT_PROJECTION_RECORD_FIELDS
 )
-_TOOL_EVENT_NESTED_PATHS = _TOOL_RESULT_NESTED_PATHS | _TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS
+_TOOL_EVENT_NESTED_PATHS = (
+    _TOOL_RESULT_NESTED_PATHS
+    | _TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS
+    | WEB_ACCESS_RESULT_EVENT_SCHEMA_PATHS
+)
 _TOOL_DENIAL_RESULT_NESTED_PATHS = _TOOL_RESULT_NESTED_PATHS | {
     ("result", "structured", "decision"),
     ("result", "structured", "error"),
@@ -2022,6 +2031,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "registration_state",
         "terminal_outcome",
         "tool_effect",
+        WEB_ACCESS_RESULT_AUTHORITY_FIELD,
     }
     tool_actor_paths = _resolution_actor_nested_paths("resolved_by")
     policies[EventType.TOOL_CALL_STARTED] = _policy(
@@ -2057,7 +2067,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "resolved_by",
             "tool_result_projection",
             owned_nested_paths=_TOOL_EVENT_NESTED_PATHS | tool_actor_paths,
-            authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
+            authority_keys={
+                *_TOOL_LINKAGE_AUTHORITY_KEYS,
+                WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+            },
+            internal_authority_keys={WEB_ACCESS_RESULT_AUTHORITY_FIELD},
             public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
             aliased_authority_keys={
                 "approval_id",
@@ -3167,6 +3181,12 @@ def _prepare_runtime_event(
         references=projection_references,
         redactor=redactor,
     )
+    restore_attested_event_result(
+        event,
+        redacted_payload=redacted_payload,
+        trust_persisted=False,
+        reject_malformed=True,
+    )
     redacted_payload.update(_top_level_controls(controls))
     _restore_nested_controls(
         event,
@@ -3437,6 +3457,12 @@ def _project_runtime_event(
         redacted_payload=redacted_payload,
         references=projection_references,
         redactor=redactor,
+    )
+    restore_attested_event_result(
+        event,
+        redacted_payload=redacted_payload,
+        trust_persisted=trust_persisted_projection,
+        reject_malformed=False,
     )
     for key in policy.authority_keys:
         if key not in redacted_payload or redacted_payload[key] is None:

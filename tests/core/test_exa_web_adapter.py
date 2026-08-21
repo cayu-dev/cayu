@@ -518,7 +518,10 @@ def test_exa_fetch_maps_per_url_failure_without_exposing_provider_detail() -> No
         )
     )
 
-    assert result.structured == {"error": "fetch_failed", "status_code": 404}
+    assert result.structured is not None
+    assert result.structured["error"] == "fetch_failed"
+    assert result.structured["status_code"] == 404
+    assert result.structured["access"]["outcome"] == "content_unavailable"
     assert result.is_error is True
     assert "private-provider-detail" not in result.content
 
@@ -689,6 +692,52 @@ def test_exa_rate_limit_preserves_bounded_retry_metadata_without_retrying() -> N
         },
     }
     assert calls == 1
+
+
+def test_exa_rate_limit_does_not_shorten_unrepresentable_retry_timing() -> None:
+    result = asyncio.run(
+        WebSearchTool(
+            adapter=ExaWebAdapter(
+                api_key_ref=_API_KEY_REF,
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        429,
+                        headers={"retry-after": "86401"},
+                        stream=_UnreadableStream(),
+                    )
+                ),
+            )
+        ).run(_context(_CredentialProxy()), {"query": "rate limit"})
+    )
+
+    assert result.structured == {
+        "error": "rate_limited",
+        "status_code": 429,
+        "provider_metadata": {"exa": {"retry_after_unrepresentable": True}},
+    }
+
+
+def test_exa_rate_limit_does_not_ignore_overflowing_retry_timing() -> None:
+    result = asyncio.run(
+        WebSearchTool(
+            adapter=ExaWebAdapter(
+                api_key_ref=_API_KEY_REF,
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        429,
+                        headers={"retry-after": "9" * 400},
+                        stream=_UnreadableStream(),
+                    )
+                ),
+            )
+        ).run(_context(_CredentialProxy()), {"query": "rate limit"})
+    )
+
+    assert result.structured == {
+        "error": "rate_limited",
+        "status_code": 429,
+        "provider_metadata": {"exa": {"retry_after_unrepresentable": True}},
+    }
 
 
 def test_exa_transport_failure_is_sanitized_and_not_retried() -> None:

@@ -19,6 +19,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.core.tools import ToolEffect, ToolResult
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._diagnostics import (
     MAX_DIAGNOSTIC_UTF8_BYTES,
     ExceptionDiagnostic,
@@ -173,7 +174,11 @@ def redact_tool_result_event(
         raise TypeError("redactor must be a SecretRedactor.")
     terminal_controls = runtime_terminal_controls(event.payload)
     if not redactor.has_values:
-        return event, redact_tool_result(result, redactor)
+        return web_access_results.restore_attested_tool_result(
+            event,
+            original=result,
+            redacted=redact_tool_result(result, redactor),
+        )
     result_to_redact = _tool_result_without_terminal_controls(
         result,
         terminal_controls=terminal_controls,
@@ -212,7 +217,11 @@ def redact_tool_result_event(
         )
         payload.update(terminal_controls)
     payload["result"] = redacted_result.model_dump()
-    return event.model_copy(update={"payload": payload}), redacted_result
+    return web_access_results.restore_attested_tool_result(
+        event.model_copy(update={"payload": payload}),
+        original=result,
+        redacted=redacted_result,
+    )
 
 
 def _runtime_execution_profile_attribution(event: Event) -> dict[str, str]:

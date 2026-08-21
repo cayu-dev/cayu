@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import types
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -26,12 +27,14 @@ from cayu import (
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ToolContext,
+    WebAccessOutcome,
     WebFetchTool,
 )
 from cayu.environments.admission import ExecutionAdmissionCandidate
 from cayu.runners import ExecResult, RunnerExecutionError, RunnerUnavailableError
 from cayu.tools import MAX_BROWSER_FETCH_MAX_DOM_NODES, MAX_BROWSER_FETCH_MAX_REQUESTS
 from cayu.tools import _browser_guest as guest
+from cayu.tools.web_access import web_destination_fingerprint
 
 
 def _candidate(
@@ -95,6 +98,22 @@ def _success_payload(**overrides: Any) -> str:
     }
     payload.update(overrides)
     return json.dumps(payload)
+
+
+def _assert_access_error(
+    result: Any,
+    *,
+    error: str,
+    outcome: WebAccessOutcome,
+    status_code: int | None = None,
+) -> None:
+    assert result.structured["error"] == error
+    if status_code is not None:
+        assert result.structured["status_code"] == status_code
+    access = result.structured["access"]
+    assert isinstance(access, Mapping)
+    assert access["outcome"] == outcome.value
+    assert access["status_code"] == status_code
 
 
 class _FakeRunner:
@@ -280,7 +299,14 @@ def test_browser_adapter_classifies_bounded_runner_outcomes(
 ) -> None:
     result = _run(_FakeRunner(execution))
 
-    assert result.structured == {"error": error}
+    if error in {"browser_crash", "timeout"}:
+        _assert_access_error(
+            result,
+            error=error,
+            outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+        )
+    else:
+        assert result.structured == {"error": error}
 
 
 @pytest.mark.parametrize(
@@ -306,7 +332,14 @@ def test_browser_adapter_sanitizes_known_runner_failures(
 ) -> None:
     result = _run(_FakeRunner(error=runner_error))
 
-    assert result.structured == {"error": error}
+    if error in {"browser_crash", "timeout"}:
+        _assert_access_error(
+            result,
+            error=error,
+            outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+        )
+    else:
+        assert result.structured == {"error": error}
     assert "private" not in result.content
 
 
@@ -315,7 +348,11 @@ def test_browser_adapter_sanitizes_unexpected_runner_failure() -> None:
 
     result = _run(_FakeRunner(error=RuntimeError(sensitive)))
 
-    assert result.structured == {"error": "browser_crash"}
+    _assert_access_error(
+        result,
+        error="browser_crash",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+    )
     assert sensitive not in result.content
 
 
@@ -332,7 +369,7 @@ def test_browser_adapter_sanitizes_unexpected_runner_failure() -> None:
             ),
             "incompatible_browser",
         ),
-        (_success_payload(worker_version="4"), "incompatible_browser"),
+        (_success_payload(worker_version="5"), "incompatible_browser"),
         (_success_payload(playwright_version="1.63.0"), "incompatible_browser"),
         (_success_payload(requested_url="https://other.example/"), "malformed_browser_result"),
         (_success_payload(response_bytes=2049), "malformed_browser_result"),
@@ -399,7 +436,256 @@ def test_browser_adapter_projects_versioned_worker_failures(
 
     result = _run(_FakeRunner(ExecResult(stdout=json.dumps(payload))))
 
-    assert result.structured == expected
+    if code in {"destination_denied", "redirect_denied"}:
+        _assert_access_error(
+            result,
+            error=code,
+            outcome=WebAccessOutcome.DESTINATION_DENIED,
+        )
+    elif code == "http_status":
+        _assert_access_error(
+            result,
+            error=code,
+            outcome=WebAccessOutcome.RATE_LIMITED,
+            status_code=429,
+        )
+    else:
+        assert result.structured == expected
+
+
+def test_browser_adapter_projects_content_free_typed_access_evidence() -> None:
+    protected_url = "https://blocked.example/protected?credential=secret-canary"
+    payload = {
+        "protocol_version": BROWSER_FETCH_PROTOCOL_VERSION,
+        "worker_version": BROWSER_FETCH_WORKER_VERSION,
+        "playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
+        "kind": "error",
+        "error": "access_blocked",
+        "access": {
+            "schema_version": 1,
+            "outcome": "bot_challenge",
+            "source": "browser_response",
+            "signal": "status_code",
+            "destination_fingerprint": web_destination_fingerprint(protected_url),
+            "status_code": 401,
+            "retry_after_seconds": None,
+        },
+        "effective_source_url": "https://blocked.example/",
+    }
+
+    result = _run(
+        _FakeRunner(ExecResult(stdout=json.dumps(payload))),
+        url=protected_url,
+    )
+
+    _assert_access_error(
+        result,
+        error="access_blocked",
+        outcome=WebAccessOutcome.BOT_CHALLENGE,
+        status_code=401,
+    )
+    assert "protected" not in result.model_dump_json()
+    assert "secret-canary" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("error", ["dns_failure", "fetch_failed"])
+def test_browser_adapter_types_transport_failures(error: str) -> None:
+    payload = {
+        "protocol_version": BROWSER_FETCH_PROTOCOL_VERSION,
+        "worker_version": BROWSER_FETCH_WORKER_VERSION,
+        "playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
+        "kind": "error",
+        "error": error,
+    }
+
+    result = _run(_FakeRunner(ExecResult(stdout=json.dumps(payload))))
+
+    _assert_access_error(
+        result,
+        error=error,
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+    )
+
+
+def test_browser_adapter_attributes_redirect_transport_failure_to_effective_origin() -> None:
+    effective_origin = "https://challenge.example/"
+    payload = {
+        "protocol_version": BROWSER_FETCH_PROTOCOL_VERSION,
+        "worker_version": BROWSER_FETCH_WORKER_VERSION,
+        "playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
+        "kind": "error",
+        "error": "fetch_failed",
+        "effective_source_url": effective_origin,
+    }
+
+    result = _run(
+        _FakeRunner(ExecResult(stdout=json.dumps(payload))),
+        url="https://entry.example/",
+    )
+
+    _assert_access_error(
+        result,
+        error="fetch_failed",
+        outcome=WebAccessOutcome.TRANSIENT_TRANSPORT_FAILURE,
+    )
+    assert result.structured["effective_source_url"] == effective_origin
+    assert result.structured["access"]["destination_fingerprint"] == (
+        web_destination_fingerprint(effective_origin)
+    )
+
+
+def test_browser_adapter_attributes_redirect_egress_denial_to_effective_origin() -> None:
+    effective_origin = "https://denied.example/"
+    payload = {
+        "protocol_version": BROWSER_FETCH_PROTOCOL_VERSION,
+        "worker_version": BROWSER_FETCH_WORKER_VERSION,
+        "playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
+        "kind": "error",
+        "error": "redirect_denied",
+        "effective_source_url": effective_origin,
+    }
+
+    result = _run(
+        _FakeRunner(ExecResult(stdout=json.dumps(payload))),
+        url="https://entry.example/",
+    )
+
+    _assert_access_error(
+        result,
+        error="redirect_denied",
+        outcome=WebAccessOutcome.DESTINATION_DENIED,
+    )
+    assert result.structured["effective_source_url"] == effective_origin
+    assert result.structured["access"]["destination_fingerprint"] == (
+        web_destination_fingerprint(effective_origin)
+    )
+
+
+def test_browser_guest_retains_effective_origin_for_redirect_timeout() -> None:
+    state = guest._PageState(max_response_bytes=1_000, max_redirects=5, max_requests=10)
+    state.effective_origin = "https://challenge.example/"
+    state.denied_code = "timeout"
+
+    failure = guest._page_state_failure(state, redirects=[])
+
+    assert failure is not None
+    assert failure.code == "timeout"
+    assert failure.effective_origin == "https://challenge.example/"
+    assert guest._error_payload(failure)["effective_source_url"] == ("https://challenge.example/")
+
+
+def test_browser_guest_canonicalizes_trailing_dot_access_origin_once() -> None:
+    redirected_url = "https://challenge.example./protected"
+    access = guest._guest_http_access(
+        redirected_url,
+        401,
+        {},
+        source="browser_response",
+    )
+    assert access is not None
+    payload = guest._error_payload(
+        guest._GuestFailure(
+            "access_blocked",
+            access=access,
+            effective_origin=guest._guest_https_origin(redirected_url),
+        )
+    )
+
+    result = _run(
+        _FakeRunner(ExecResult(stdout=json.dumps(payload))),
+        url="https://entry.example/",
+    )
+
+    assert result.structured["effective_source_url"] == "https://challenge.example/"
+    assert result.structured["access"]["destination_fingerprint"] == (
+        web_destination_fingerprint("https://challenge.example./")
+    )
+
+
+def test_browser_adapter_rejects_non_browser_access_authority() -> None:
+    payload = {
+        "protocol_version": BROWSER_FETCH_PROTOCOL_VERSION,
+        "worker_version": BROWSER_FETCH_WORKER_VERSION,
+        "playwright_version": BROWSER_FETCH_PLAYWRIGHT_VERSION,
+        "kind": "error",
+        "error": "access_blocked",
+        "access": {
+            "schema_version": 1,
+            "outcome": "bot_challenge",
+            "source": "hosted_provider",
+            "signal": "provider_status",
+            "destination_fingerprint": web_destination_fingerprint("https://blocked.example/"),
+            "status_code": 401,
+            "retry_after_seconds": None,
+            "retry_after_unrepresentable": False,
+        },
+        "effective_source_url": "https://blocked.example/",
+    }
+
+    result = _run(_FakeRunner(ExecResult(stdout=json.dumps(payload))))
+
+    assert result.structured == {"error": "malformed_browser_result"}
+
+
+def test_browser_guest_classifies_only_trusted_response_metadata() -> None:
+    protected_url = "https://blocked.example/protected?token=not-evidence"
+
+    assert (
+        guest._guest_http_access(
+            protected_url,
+            200,
+            {"content-type": "text/html"},
+            source="browser_response",
+        )
+        is None
+    )
+    access = guest._guest_http_access(
+        protected_url,
+        401,
+        {"content-type": "text/html"},
+        source="browser_response",
+    )
+
+    assert access is not None
+    assert access["outcome"] == "bot_challenge"
+    assert access["destination_fingerprint"] == web_destination_fingerprint(protected_url)
+    assert "protected" not in json.dumps(access)
+
+    oversized_retry = guest._guest_http_access(
+        "https://limited.example/",
+        429,
+        {"retry-after": "9" * 129},
+        source="browser_response",
+    )
+    assert oversized_retry is not None
+    assert oversized_retry["retry_after_seconds"] is None
+    assert oversized_retry["retry_after_unrepresentable"] is True
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds", "unrepresentable"),
+    [
+        ("000001", 1, False),
+        ("086400", 86_400, False),
+        ("086401", None, True),
+        ("0" * 129, None, True),
+    ],
+)
+def test_browser_guest_retry_after_accepts_leading_zeroes_without_weakening_bounds(
+    value: str,
+    seconds: int | None,
+    unrepresentable: bool,
+) -> None:
+    access = guest._guest_http_access(
+        "https://limited.example/",
+        429,
+        {"retry-after": value},
+        source="browser_response",
+    )
+
+    assert access is not None
+    assert access["retry_after_seconds"] == seconds
+    assert access["retry_after_unrepresentable"] is unrepresentable
 
 
 def test_browser_adapter_configuration_is_bounded() -> None:
