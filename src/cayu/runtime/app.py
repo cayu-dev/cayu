@@ -414,6 +414,8 @@ if TYPE_CHECKING:
     from cayu.runtime.fork_groups import (
         ForkGroupGate,
         ForkGroupGateSelection,
+        ForkGroupReplacementPlanner,
+        ForkGroupReplacementPlannerSelection,
         ForkGroupRequest,
         ForkGroupResult,
     )
@@ -1825,6 +1827,18 @@ class CayuApp:
         """Register one application-owned deterministic fork-group gate."""
 
         return self._fork_group_coordinator.register_gate(gate_id, gate)
+
+    def register_fork_group_replacement_planner(
+        self,
+        planner_id: str,
+        planner: ForkGroupReplacementPlanner,
+    ) -> ForkGroupReplacementPlannerSelection:
+        """Register one application-owned idempotent replacement planner."""
+
+        return self._fork_group_coordinator.register_replacement_planner(
+            planner_id,
+            planner,
+        )
 
     def _fork_group_evaluator_agent_state(
         self,

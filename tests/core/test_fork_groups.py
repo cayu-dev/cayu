@@ -4,6 +4,7 @@ import asyncio
 import json
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -17,19 +18,27 @@ from cayu import (
     CayuApp,
     Event,
     EventType,
+    ExecutionProfileAdoptionIntent,
     ExecutionProfileMismatchError,
     ForkGroupArtifactReference,
     ForkGroupBranchSpec,
+    ForkGroupBranchStatus,
     ForkGroupCheckpointSelector,
     ForkGroupConflict,
     ForkGroupDisposition,
     ForkGroupEvaluatorSpec,
     ForkGroupFailureCode,
+    ForkGroupFailureMode,
+    ForkGroupFailurePolicy,
     ForkGroupGate,
     ForkGroupGateDecision,
     ForkGroupGateRequest,
     ForkGroupGateResult,
     ForkGroupGateSelection,
+    ForkGroupReplacementPlanner,
+    ForkGroupReplacementPlannerRequest,
+    ForkGroupReplacementPlannerSelection,
+    ForkGroupReplacementSpec,
     ForkGroupRequest,
     ForkGroupState,
     ForkSessionRequest,
@@ -41,7 +50,10 @@ from cayu import (
     ModelPrice,
     OpenAIWebSearch,
     PriceBook,
+    ResolutionActor,
+    ResolutionActorSource,
     RunRequest,
+    SQLiteSessionStore,
     StructuredOutputSpec,
     Tool,
     ToolContext,
@@ -88,6 +100,24 @@ class _ConfiguredGate(ForkGroupGate):
         )
 
 
+class _AttemptGate(ForkGroupGate):
+    def __init__(self, *rejected: tuple[str, int]) -> None:
+        self.rejected = frozenset(rejected)
+        self.requests: list[ForkGroupGateRequest] = []
+
+    @property
+    def identity(self) -> str:
+        return "tests.attempt-gate.v1"
+
+    async def evaluate(self, request: ForkGroupGateRequest) -> ForkGroupGateDecision:
+        self.requests.append(request)
+        passed = (request.branch.branch_id, request.branch.attempt_index) not in self.rejected
+        return ForkGroupGateDecision(
+            passed=passed,
+            summary="attempt eligible" if passed else "attempt rejected",
+        )
+
+
 class _SecretFailingGate(ForkGroupGate):
     def __init__(self, secret: str) -> None:
         self.secret = secret
@@ -99,6 +129,99 @@ class _SecretFailingGate(ForkGroupGate):
     async def evaluate(self, request: ForkGroupGateRequest) -> ForkGroupGateDecision:
         del request
         raise RuntimeError(f"gate rejected {self.secret}")
+
+
+class _ConfiguredReplacementPlanner(ForkGroupReplacementPlanner):
+    def __init__(
+        self,
+        *,
+        message_suffix: str = "",
+        artifact_references: tuple[ForkGroupArtifactReference, ...] = (),
+    ) -> None:
+        self.requests: list[ForkGroupReplacementPlannerRequest] = []
+        self.message_suffix = message_suffix
+        self.artifact_references = artifact_references
+
+    @property
+    def identity(self) -> str:
+        return "tests.configured-replacement-planner.v1"
+
+    async def plan(
+        self,
+        request: ForkGroupReplacementPlannerRequest,
+    ) -> ForkGroupReplacementSpec:
+        self.requests.append(request)
+        return ForkGroupReplacementSpec(
+            messages=(
+                Message.text(
+                    "user",
+                    (
+                        f"replacement {request.branch_id} attempt {request.attempt_index}"
+                        f"{self.message_suffix}"
+                    ),
+                ),
+            ),
+            structured_output=_candidate_output(f"replacement-{request.branch_id}"),
+            artifact_references=self.artifact_references,
+        )
+
+
+class _SecretFailingReplacementPlanner(ForkGroupReplacementPlanner):
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    @property
+    def identity(self) -> str:
+        return "tests.secret-failing-replacement-planner.v1"
+
+    async def plan(
+        self,
+        request: ForkGroupReplacementPlannerRequest,
+    ) -> ForkGroupReplacementSpec:
+        del request
+        raise RuntimeError(f"replacement planning rejected {self.secret}")
+
+
+class _MissingAgentReplacementPlanner(ForkGroupReplacementPlanner):
+    @property
+    def identity(self) -> str:
+        return "tests.missing-agent-replacement-planner.v1"
+
+    async def plan(
+        self,
+        request: ForkGroupReplacementPlannerRequest,
+    ) -> ForkGroupReplacementSpec:
+        del request
+        return ForkGroupReplacementSpec(
+            agent_name="missing-replacement-agent",
+            profile_adoption=ExecutionProfileAdoptionIntent(
+                idempotency_key="missing-replacement-agent-profile",
+                reason="Exercise rejected replacement profile preparation.",
+                requested_by=ResolutionActor(
+                    subject="tests",
+                    source=ResolutionActorSource.REQUEST,
+                ),
+            ),
+            messages=(Message.text("user", "replacement with missing agent"),),
+            structured_output=_candidate_output("missing-agent-replacement"),
+        )
+
+
+class _MixedProfileReplacementPlanner(_MissingAgentReplacementPlanner):
+    @property
+    def identity(self) -> str:
+        return "tests.mixed-profile-replacement-planner.v1"
+
+    async def plan(
+        self,
+        request: ForkGroupReplacementPlannerRequest,
+    ) -> ForkGroupReplacementSpec:
+        if request.branch_id == "beta":
+            return await super().plan(request)
+        return ForkGroupReplacementSpec(
+            messages=(Message.text("user", f"replacement {request.branch_id}"),),
+            structured_output=_candidate_output(f"replacement-{request.branch_id}"),
+        )
 
 
 class _ForkGroupProvider(ModelProvider):
@@ -118,7 +241,11 @@ class _ForkGroupProvider(ModelProvider):
         fail_branch: str | None = None,
         fail_evaluator: bool = False,
         invalid_judgment: str | None = None,
+        replacement_failures: int = 0,
         branch_callback: Callable[[], Awaitable[None]] | None = None,
+        replacement_callback: Callable[[], Awaitable[None]] | None = None,
+        evaluator_callback: Callable[[], Awaitable[None]] | None = None,
+        branch_failure_message: str | None = None,
         branch_delay: float = 0,
     ) -> None:
         self.requests: list[ModelRequest] = []
@@ -129,9 +256,15 @@ class _ForkGroupProvider(ModelProvider):
         self.fail_branch = fail_branch
         self.fail_evaluator = fail_evaluator
         self.invalid_judgment = invalid_judgment
+        self.replacement_failures = replacement_failures
+        self.replacement_calls = 0
         self.branch_callback = branch_callback
+        self.replacement_callback = replacement_callback
+        self.evaluator_callback = evaluator_callback
+        self.branch_failure_message = branch_failure_message
         self.branch_delay = branch_delay
         self.callback_called = False
+        self.replacement_callback_called = False
         self.active_branches = 0
         self.max_active_branches = 0
 
@@ -148,8 +281,10 @@ class _ForkGroupProvider(ModelProvider):
             (tool["name"] for tool in request.tools if tool["name"].startswith("__cayu")),
             None,
         )
-        if "cayu.fork-group-evidence.v1" in user_text:
+        if "cayu.fork-group-evidence.v1" in user_text or "cayu.fork-group-evidence.v2" in user_text:
             self.evaluator_calls += 1
+            if self.evaluator_callback is not None:
+                await self.evaluator_callback()
             self.evaluator_tools = tuple(tool["name"] for tool in request.tools)
             self.evaluator_hosted_tools = request.hosted_tools
             if self.fail_evaluator:
@@ -157,47 +292,96 @@ class _ForkGroupProvider(ModelProvider):
                 return
             evidence = json.loads(user_text)
             self.evaluator_evidence = evidence
-            branch_ids = [branch["branch_id"] for branch in evidence["branches"]]
-            if self.invalid_judgment == "duplicate":
+            branch_identities = [
+                (branch["branch_id"], branch.get("attempt_id")) for branch in evidence["branches"]
+            ]
+
+            def disposition(
+                branch_id: str,
+                attempt_id: str | None,
+                value: str,
+                reason: str,
+            ) -> dict[str, str]:
+                del attempt_id
+                item = {
+                    "branch_id": branch_id,
+                    "disposition": value,
+                    "reason": reason,
+                }
+                return item
+
+            if self.invalid_judgment == "select-excluded":
+                excluded = evidence["excluded_attempts"][0]
                 output = {
                     "dispositions": [
-                        {
-                            "branch_id": branch_ids[0],
-                            "disposition": "selected",
-                            "reason": "duplicate judgment",
-                        },
-                        {
-                            "branch_id": branch_ids[0],
-                            "disposition": "rejected",
-                            "reason": "duplicate judgment",
-                        },
+                        disposition(
+                            excluded["branch_id"],
+                            excluded["attempt_id"],
+                            "selected",
+                            "invalid excluded selection",
+                        ),
+                        disposition(
+                            branch_identities[0][0],
+                            branch_identities[0][1],
+                            "rejected",
+                            "invalid excluded selection",
+                        ),
+                    ]
+                }
+            elif self.invalid_judgment == "duplicate":
+                output = {
+                    "dispositions": [
+                        disposition(
+                            branch_identities[0][0],
+                            branch_identities[0][1],
+                            "selected",
+                            "duplicate judgment",
+                        ),
+                        disposition(
+                            branch_identities[0][0],
+                            branch_identities[0][1],
+                            "rejected",
+                            "duplicate judgment",
+                        ),
                     ]
                 }
             elif self.invalid_judgment == "multiple-selected":
                 output = {
                     "dispositions": [
-                        {
-                            "branch_id": branch_id,
-                            "disposition": "selected",
-                            "reason": "invalid judgment",
-                        }
-                        for branch_id in branch_ids
+                        disposition(
+                            branch_id,
+                            attempt_id,
+                            "selected",
+                            "invalid judgment",
+                        )
+                        for branch_id, attempt_id in branch_identities
                     ]
                 }
             else:
                 output = {
                     "dispositions": [
-                        {
-                            "branch_id": branch_id,
-                            "disposition": "selected" if index == 0 else "rejected",
-                            "reason": "deterministic test judgment",
-                        }
-                        for index, branch_id in enumerate(branch_ids)
+                        disposition(
+                            branch_id,
+                            attempt_id,
+                            "selected" if index == 0 else "rejected",
+                            "deterministic test judgment",
+                        )
+                        for index, (branch_id, attempt_id) in enumerate(branch_identities)
                     ]
                 }
+        elif "replacement beta" in user_text:
+            self.replacement_calls += 1
+            if self.replacement_calls <= self.replacement_failures:
+                yield ModelStreamEvent.error("replacement beta failed")
+                return
+            await self._enter_branch(replacement=True)
+            try:
+                output = {"candidate": "beta", "score": 3}
+            finally:
+                self.active_branches -= 1
         elif "candidate alpha" in user_text:
             if self.fail_branch == "alpha":
-                yield ModelStreamEvent.error("alpha failed")
+                yield ModelStreamEvent.error(self.branch_failure_message or "alpha failed")
                 return
             await self._enter_branch()
             try:
@@ -206,7 +390,7 @@ class _ForkGroupProvider(ModelProvider):
                 self.active_branches -= 1
         elif "candidate beta" in user_text:
             if self.fail_branch == "beta":
-                yield ModelStreamEvent.error("beta failed")
+                yield ModelStreamEvent.error(self.branch_failure_message or "beta failed")
                 return
             await self._enter_branch()
             try:
@@ -243,10 +427,17 @@ class _ForkGroupProvider(ModelProvider):
             }
         )
 
-    async def _enter_branch(self) -> None:
+    async def _enter_branch(self, *, replacement: bool = False) -> None:
         self.active_branches += 1
         self.max_active_branches = max(self.max_active_branches, self.active_branches)
-        if self.branch_callback is not None and not self.callback_called:
+        if (
+            replacement
+            and self.replacement_callback is not None
+            and not self.replacement_callback_called
+        ):
+            self.replacement_callback_called = True
+            await self.replacement_callback()
+        elif self.branch_callback is not None and not self.callback_called:
             self.callback_called = True
             await self.branch_callback()
         if self.branch_delay:
@@ -328,12 +519,129 @@ def _request(
     )
 
 
-def _app(provider: _ForkGroupProvider) -> CayuApp:
-    app = CayuApp(enable_logging=False)
+def _app(provider: _ForkGroupProvider, *, session_store: Any | None = None) -> CayuApp:
+    app = CayuApp(session_store=session_store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="source", model="fake-model"))
     app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
     return app
+
+
+async def assert_viable_fork_group_store_conformance(session_store: Any) -> None:
+    """Exercise replacement, exhaustion, concurrency, and replay on one store."""
+
+    def configure(
+        provider: _ForkGroupProvider,
+    ) -> tuple[CayuApp, _ConfiguredReplacementPlanner]:
+        app = _app(provider, session_store=session_store)
+        app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner = _ConfiguredReplacementPlanner()
+        app.register_fork_group_replacement_planner("tests", planner)
+        return app, planner
+
+    def viable_request(group_id: str, *, max_replacements: int) -> ForkGroupRequest:
+        return _request(
+            group_id=group_id,
+            gates=(
+                ForkGroupGateSelection(
+                    gate_id="tests",
+                    gate_identity="tests.configured-gate.v1",
+                ),
+            ),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=max_replacements,
+                    replacement_parallelism=1,
+                    replacement_planner=ForkGroupReplacementPlannerSelection(
+                        planner_id="tests",
+                        planner_identity="tests.configured-replacement-planner.v1",
+                    ),
+                )
+            }
+        )
+
+    successful_provider = _ForkGroupProvider(
+        fail_branch="beta",
+        replacement_failures=1,
+    )
+    successful_app, successful_planner = configure(successful_provider)
+    await _source(successful_app)
+    successful_request = viable_request(
+        "group-store-conformance-success",
+        max_replacements=2,
+    )
+    successful = await successful_app.run_fork_group(successful_request)
+    request_count = len(successful_provider.requests)
+    replay = await successful_app.run_fork_group(successful_request)
+
+    assert successful.state is ForkGroupState.COMPLETED
+    assert len(successful.branches) == 4
+    assert [item.attempt_index for item in successful.branches if item.branch_id == "beta"] == [
+        0,
+        1,
+        2,
+    ]
+    assert len(successful_planner.requests) == 2
+    assert replay.state is ForkGroupState.COMPLETED and replay.replayed is True
+    assert replay.branches == successful.branches
+    assert len(successful_provider.requests) == request_count
+
+    exhausted_provider = _ForkGroupProvider(
+        fail_branch="beta",
+        replacement_failures=2,
+    )
+    exhausted_app, exhausted_planner = configure(exhausted_provider)
+    exhausted = await exhausted_app.run_fork_group(
+        viable_request("group-store-conformance-exhausted", max_replacements=2)
+    )
+
+    assert exhausted.state is ForkGroupState.FAILED
+    assert exhausted.failure is not None
+    assert exhausted.failure.code is ForkGroupFailureCode.REPLACEMENTS_EXHAUSTED
+    assert len(exhausted.branches) == 4
+    assert len(exhausted_planner.requests) == 2
+    assert exhausted.dispositions == ()
+
+    concurrent_provider = _ForkGroupProvider(fail_branch="beta", branch_delay=0.1)
+    first_app, first_planner = configure(concurrent_provider)
+    second_app, second_planner = configure(concurrent_provider)
+    concurrent_request = viable_request(
+        "group-store-conformance-concurrent",
+        max_replacements=1,
+    )
+    await asyncio.gather(
+        first_app.run_fork_group(concurrent_request),
+        second_app.run_fork_group(concurrent_request),
+    )
+    converged = await first_app.run_fork_group(concurrent_request)
+
+    assert converged.state is ForkGroupState.COMPLETED
+    assert concurrent_provider.replacement_calls == 1
+    assert concurrent_provider.evaluator_calls == 1
+    assert len(first_planner.requests) + len(second_planner.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(lambda _path: InMemorySessionStore(), id="in-memory"),
+        pytest.param(lambda path: SQLiteSessionStore(path), id="sqlite"),
+    ],
+)
+def test_viable_fork_group_store_conformance(tmp_path, store_factory) -> None:
+    async def run() -> None:
+        store = store_factory(tmp_path / "fork-groups.sqlite")
+        try:
+            await assert_viable_fork_group_store_conformance(store)
+        finally:
+            close = getattr(store, "close", None)
+            if close is not None:
+                await close()
+
+    asyncio.run(run())
 
 
 def test_run_fork_group_selects_one_tool_free_evaluated_branch() -> None:
@@ -578,16 +886,19 @@ def test_run_fork_group_replays_terminal_result_and_rejects_conflicts() -> None:
             "fork_group.completed",
         ]
         terminal_payload = records[-1].event.payload
-        assert terminal_payload["schema_version"] == 1
+        assert terminal_payload["schema_version"] == 2
         assert terminal_payload["selected_branch_id"] == "alpha"
+        assert terminal_payload["selected_attempt_id"] == first.branches[0].attempt_id
         assert terminal_payload["dispositions"] == [
             {
                 "branch_id": "alpha",
+                "attempt_id": first.branches[0].attempt_id,
                 "disposition": "selected",
                 "reason": "deterministic test judgment",
             },
             {
                 "branch_id": "beta",
+                "attempt_id": first.branches[1].attempt_id,
                 "disposition": "rejected",
                 "reason": "deterministic test judgment",
             },
@@ -595,13 +906,25 @@ def test_run_fork_group_replays_terminal_result_and_rejects_conflicts() -> None:
         assert terminal_payload["branches"] == [
             {
                 "branch_id": "alpha",
+                "attempt_id": first.branches[0].attempt_id,
+                "attempt_request_sha256": first.branches[0].attempt_request_sha256,
+                "attempt_index": 0,
+                "replaced_attempt_id": None,
+                "superseded_by_attempt_id": None,
                 "session_id": "group-replay-alpha",
                 "status": "completed",
+                "eligible": True,
             },
             {
                 "branch_id": "beta",
+                "attempt_id": first.branches[1].attempt_id,
+                "attempt_request_sha256": first.branches[1].attempt_request_sha256,
+                "attempt_index": 0,
+                "replaced_attempt_id": None,
+                "superseded_by_attempt_id": None,
                 "session_id": "group-replay-beta",
                 "status": "completed",
+                "eligible": True,
             },
         ]
 
@@ -767,6 +1090,936 @@ def test_run_fork_group_preserves_successful_sibling_and_skips_evaluator_on_fail
         assert beta is not None and beta.status is SessionStatus.FAILED
         assert provider.evaluator_calls == 0
         assert await app.session_store.load("group-branch-failure-evaluator") is None
+
+    asyncio.run(run())
+
+
+def test_run_fork_group_replaces_failure_and_evaluates_viable_siblings() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        app = _app(provider)
+        await _source(app)
+        gate = _ConfiguredGate()
+        gate_selection = app.register_fork_group_gate("tests", gate)
+        planner = _ConfiguredReplacementPlanner()
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            planner,
+        )
+        request = _request(
+            group_id="group-viable-replacement",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.COMPLETED
+        assert result.failure is None
+        assert len(result.branches) == 3
+        alpha, failed_beta, replacement_beta = result.branches
+        assert alpha.branch_id == "alpha"
+        assert alpha.attempt_index == 0
+        assert alpha.eligible is True
+        assert failed_beta.branch_id == "beta"
+        assert failed_beta.attempt_index == 0
+        assert failed_beta.status == "failed"
+        assert failed_beta.eligible is False
+        assert failed_beta.superseded_by_attempt_id == replacement_beta.attempt_id
+        assert replacement_beta.branch_id == "beta"
+        assert replacement_beta.attempt_index == 1
+        assert replacement_beta.replaced_attempt_id == failed_beta.attempt_id
+        assert replacement_beta.eligible is True
+        assert replacement_beta.session_id != failed_beta.session_id
+        assert [request.branch_id for request in planner.requests] == ["beta"]
+        assert planner.requests[0].attempt_index == 1
+        assert planner.requests[0].replaced_attempt.attempt_id == failed_beta.attempt_id
+        assert planner.requests[0].idempotency_key == replacement_beta.attempt_id
+        assert provider.evaluator_evidence is not None
+        assert provider.evaluator_evidence["schema"] == "cayu.fork-group-evidence.v2"
+        assert [branch["attempt_id"] for branch in provider.evaluator_evidence["branches"]] == [
+            alpha.attempt_id,
+            replacement_beta.attempt_id,
+        ]
+        assert provider.evaluator_evidence["excluded_attempts"] == [
+            {
+                "attempt_id": failed_beta.attempt_id,
+                "attempt_index": 0,
+                "branch_id": "beta",
+                "replaced_attempt_id": None,
+                "session_id": failed_beta.session_id,
+                "status": "failed",
+                "superseded_by_attempt_id": replacement_beta.attempt_id,
+                "gate_results": [],
+                "error": failed_beta.error,
+            }
+        ]
+        assert {item.attempt_id for item in result.dispositions} == {
+            alpha.attempt_id,
+            replacement_beta.attempt_id,
+        }
+
+    asyncio.run(run())
+
+
+def test_viable_replacement_does_not_infer_budget_exhaustion_from_error_text() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(
+            fail_branch="beta",
+            branch_failure_message="provider budget formatter failed",
+        )
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-non-budget-wording",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.COMPLETED
+        assert result.failure is None
+        assert result.branches[1].failure_code is ForkGroupFailureCode.BRANCH_FAILED
+        assert result.branches[2].eligible is True
+        assert provider.replacement_calls == 1
+        assert provider.evaluator_calls == 1
+
+    asyncio.run(run())
+
+
+def test_evaluate_viable_policy_requires_bounded_replacement_and_gates() -> None:
+    planner = ForkGroupReplacementPlannerSelection(
+        planner_id="tests",
+        planner_identity="tests.configured-replacement-planner.v1",
+    )
+    policy = ForkGroupFailurePolicy(
+        mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+        minimum_viable_branches=2,
+        max_replacement_attempts=1,
+        replacement_parallelism=1,
+        replacement_planner=planner,
+    )
+
+    assert ForkGroupFailurePolicy().mode is ForkGroupFailureMode.FAIL_GROUP
+    with pytest.raises(ValidationError, match="deterministic gates"):
+        ForkGroupRequest.model_validate(
+            _request().model_dump(mode="python") | {"failure_policy": policy}
+        )
+    with pytest.raises(ValidationError, match="cannot exceed candidate slots"):
+        ForkGroupRequest.model_validate(
+            _request(
+                gates=(ForkGroupGateSelection(gate_id="gate", gate_identity="v1"),)
+            ).model_dump(mode="python")
+            | {"failure_policy": policy.model_copy(update={"minimum_viable_branches": 3})}
+        )
+    with pytest.raises(ValidationError, match="cannot exceed max_parallelism"):
+        ForkGroupRequest.model_validate(
+            _request(
+                max_parallelism=1,
+                gates=(ForkGroupGateSelection(gate_id="gate", gate_identity="v1"),),
+            ).model_dump(mode="python")
+            | {"failure_policy": policy.model_copy(update={"replacement_parallelism": 2})}
+        )
+    with pytest.raises(ValidationError, match="fail-group policy"):
+        ForkGroupFailurePolicy(max_replacement_attempts=1)
+
+
+def test_attempt_identity_is_scoped_to_source_authority() -> None:
+    request = _request(group_id="group-shared-name")
+    other_source = request.model_copy(update={"source_session_id": "other-source"})
+    other_checkpoint = request.model_copy(
+        update={
+            "source_checkpoint": ForkGroupCheckpointSelector(expected_run_epoch=99),
+        }
+    )
+
+    attempt_id = fork_group_runtime._attempt_id(request, "beta", 1)
+
+    assert attempt_id != fork_group_runtime._attempt_id(other_source, "beta", 1)
+    assert attempt_id != fork_group_runtime._attempt_id(other_checkpoint, "beta", 1)
+
+
+def test_run_fork_group_records_multiple_replacements_and_limit_exhaustion() -> None:
+    async def run() -> None:
+        for group_id, failures, expected_state in (
+            ("group-multiple-replacements", 1, ForkGroupState.COMPLETED),
+            ("group-replacements-exhausted", 2, ForkGroupState.FAILED),
+        ):
+            provider = _ForkGroupProvider(
+                fail_branch="beta",
+                replacement_failures=failures,
+            )
+            app = _app(provider)
+            await _source(app)
+            gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+            planner = _ConfiguredReplacementPlanner()
+            planner_selection = app.register_fork_group_replacement_planner(
+                "tests",
+                planner,
+            )
+            request = _request(group_id=group_id, gates=(gate_selection,)).model_copy(
+                update={
+                    "failure_policy": ForkGroupFailurePolicy(
+                        mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                        minimum_viable_branches=2,
+                        max_replacement_attempts=2,
+                        replacement_parallelism=1,
+                        replacement_planner=planner_selection,
+                    )
+                }
+            )
+
+            result = await app.run_fork_group(request)
+
+            assert result.state is expected_state
+            assert len(result.branches) == 4
+            beta_attempts = [attempt for attempt in result.branches if attempt.branch_id == "beta"]
+            assert [attempt.attempt_index for attempt in beta_attempts] == [0, 1, 2]
+            assert [attempt.replaced_attempt_id for attempt in beta_attempts] == [
+                None,
+                beta_attempts[0].attempt_id,
+                beta_attempts[1].attempt_id,
+            ]
+            assert [attempt.superseded_by_attempt_id for attempt in beta_attempts] == [
+                beta_attempts[1].attempt_id,
+                beta_attempts[2].attempt_id,
+                None,
+            ]
+            assert provider.replacement_calls == 2
+            assert [item.attempt_index for item in planner.requests] == [1, 2]
+            if expected_state is ForkGroupState.COMPLETED:
+                assert beta_attempts[-1].eligible is True
+                assert result.failure is None
+                assert provider.evaluator_calls == 1
+            else:
+                assert all(not attempt.eligible for attempt in beta_attempts)
+                assert result.failure is not None
+                assert result.failure.code is ForkGroupFailureCode.REPLACEMENTS_EXHAUSTED
+                assert result.dispositions == ()
+                assert provider.evaluator_calls == 0
+
+    asyncio.run(run())
+
+
+def test_run_fork_group_replaces_deterministically_ineligible_attempt() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        app = _app(provider)
+        await _source(app)
+        gate = _AttemptGate(("beta", 0))
+        gate_selection = app.register_fork_group_gate("attempt-gate", gate)
+        planner = _ConfiguredReplacementPlanner()
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            planner,
+        )
+        request = _request(
+            group_id="group-replace-gate-rejection",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.COMPLETED
+        _, rejected, replacement = result.branches
+        assert rejected.status.value == "completed"
+        assert rejected.eligible is False
+        assert rejected.gate_results[0].passed is False
+        assert rejected.superseded_by_attempt_id == replacement.attempt_id
+        assert replacement.eligible is True
+        assert replacement.gate_results[0].passed is True
+        assert [(item.branch.branch_id, item.branch.attempt_index) for item in gate.requests] == [
+            ("alpha", 0),
+            ("beta", 0),
+            ("beta", 1),
+        ]
+        assert provider.evaluator_evidence is not None
+        assert (
+            provider.evaluator_evidence["excluded_attempts"][0]["gate_results"][0]["passed"]
+            is False
+        )
+
+    asyncio.run(run())
+
+
+def test_evaluator_cannot_select_an_excluded_attempt() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(
+            fail_branch="beta",
+            invalid_judgment="select-excluded",
+        )
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-reject-excluded-selection",
+            gates=(gate_selection,),
+            extra_alpha=True,
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.EVALUATOR_FAILED
+        assert result.dispositions == ()
+        assert len(result.branches) == 3
+        assert any(attempt.status.value == "failed" for attempt in result.branches)
+        assert all(attempt.attempt_index == 0 for attempt in result.branches)
+
+    asyncio.run(run())
+
+
+def test_evaluator_schema_exposes_only_eligible_attempts() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-eligible-evaluator-schema",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=1,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.COMPLETED
+        evaluator_request = next(
+            model_request
+            for model_request in provider.requests
+            if any(
+                type(part) is TextPart and "cayu.fork-group-evidence.v2" in part.text
+                for message in model_request.messages
+                for part in message.content
+            )
+        )
+        structured_tool = next(
+            tool for tool in evaluator_request.tools if tool["name"].startswith("__cayu")
+        )
+        dispositions = structured_tool["input_schema"]["properties"]["output"]["properties"][
+            "dispositions"
+        ]
+        assert dispositions["minItems"] == 1
+        assert dispositions["maxItems"] == 1
+        assert dispositions["items"]["properties"]["branch_id"]["enum"] == ["alpha"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("planner_state", ["missing", "changed"])
+def test_viable_replacement_fails_closed_on_planner_authority(
+    planner_state: str,
+) -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = ForkGroupReplacementPlannerSelection(
+            planner_id="tests",
+            planner_identity="tests.configured-replacement-planner.v1",
+        )
+        if planner_state == "changed":
+            app.register_fork_group_replacement_planner(
+                "tests",
+                _ConfiguredReplacementPlanner(),
+            )
+            planner_selection = planner_selection.model_copy(
+                update={"planner_identity": "tests.configured-replacement-planner.v2"}
+            )
+        request = _request(
+            group_id=f"group-planner-authority-{planner_state}",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.REPLACEMENT_FAILED
+        assert len(result.branches) == 2
+        assert result.dispositions == ()
+        assert provider.evaluator_calls == 0
+
+    asyncio.run(run())
+
+
+def test_failed_replacement_fork_is_published_as_a_durable_attempt() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner = _ConfiguredReplacementPlanner()
+        planner_selection = app.register_fork_group_replacement_planner("tests", planner)
+        request = _request(
+            group_id="group-replacement-fork-failure",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+        original_fork_session = app.fork_session
+
+        async def fail_replacement_fork(
+            fork_request: ForkSessionRequest,
+        ) -> AsyncIterator[Event]:
+            if (fork_request.session_id or "").startswith("fork-replacement:"):
+                raise RuntimeError("replacement child creation failed")
+            async for event in original_fork_session(fork_request):
+                yield event
+
+        app.fork_session = fail_replacement_fork  # ty: ignore[invalid-assignment]
+        app._fork_group_coordinator._fork_session_callback = fail_replacement_fork
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.REPLACEMENT_FAILED
+        assert len(result.branches) == 3
+        failed_beta, failed_replacement = result.branches[1:]
+        assert failed_beta.superseded_by_attempt_id == failed_replacement.attempt_id
+        assert failed_replacement.replaced_attempt_id == failed_beta.attempt_id
+        assert failed_replacement.status.value == "failed"
+        assert failed_replacement.failure_code is ForkGroupFailureCode.BRANCH_FAILED
+        assert failed_replacement.eligible is False
+        assert (
+            failed_replacement.execution_profile_fingerprint
+            == result.source.execution_profile_fingerprint
+        )
+        assert len(planner.requests) == 1
+        replacement_session_id = fork_group_runtime._replacement_session_id(
+            planner.requests[0].attempt_id
+        )
+        assert failed_replacement.session_id == replacement_session_id
+        assert await app.session_store.load(replacement_session_id) is None
+
+    asyncio.run(run())
+
+
+def test_failed_replacement_attempt_survives_owner_loss_before_execute_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _ForkGroupProvider(fail_branch="beta")
+        app = _app(provider, session_store=store)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-replacement-owner-loss",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+        original_fork_session = app.fork_session
+
+        async def fail_replacement_fork(
+            fork_request: ForkSessionRequest,
+        ) -> AsyncIterator[Event]:
+            if (fork_request.session_id or "").startswith("fork-replacement:"):
+                raise RuntimeError("replacement child creation failed")
+            async for event in original_fork_session(fork_request):
+                yield event
+
+        app.fork_session = fail_replacement_fork  # ty: ignore[invalid-assignment]
+        app._fork_group_coordinator._fork_session_callback = fail_replacement_fork
+        original_run_viable_attempts = fork_group_runtime._run_viable_attempts
+
+        async def lose_owner_after_viable_attempts(*args: Any, **kwargs: Any) -> Any:
+            outcome = await original_run_viable_attempts(*args, **kwargs)
+            assert outcome[2] is not None
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(
+            fork_group_runtime,
+            "_run_viable_attempts",
+            lose_owner_after_viable_attempts,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await app.run_fork_group(request)
+
+        durable = await store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+        assert durable is not None
+        assert durable["result"]["state"] == ForkGroupState.FAILED.value
+        assert len(durable["result"]["branches"]) == 3
+        assert (
+            durable["result"]["branches"][-1]["execution_profile_fingerprint"]
+            == (durable["result"]["source"]["execution_profile_fingerprint"])
+        )
+
+    asyncio.run(run())
+
+
+def test_rejected_replacement_profile_fails_before_attempt_admission() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "missing-agent",
+            _MissingAgentReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-replacement-profile-rejected",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.REPLACEMENT_FAILED
+        assert result.failure.branch_id == "beta"
+        assert len(result.branches) == 2
+        assert all(branch.attempt_index == 0 for branch in result.branches)
+        durable = await app.session_store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+        assert durable is not None
+        assert len(durable["result"]["branches"]) == 2
+
+    asyncio.run(run())
+
+
+def test_rejected_replacement_profile_preserves_concurrent_authoritative_sibling() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        app = _app(provider)
+        await _source(app)
+        gate = _AttemptGate(("beta", 0), ("alpha-second", 0))
+        gate_selection = app.register_fork_group_gate("attempt-gate", gate)
+        planner_selection = app.register_fork_group_replacement_planner(
+            "mixed-profile",
+            _MixedProfileReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-mixed-replacement-profile",
+            gates=(gate_selection,),
+            extra_alpha=True,
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=3,
+                    max_replacement_attempts=2,
+                    replacement_parallelism=2,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.REPLACEMENT_FAILED
+        assert result.failure.branch_id == "beta"
+        assert len(result.branches) == 4
+        beta = next(branch for branch in result.branches if branch.branch_id == "beta")
+        alpha_second_attempts = [
+            branch for branch in result.branches if branch.branch_id == "alpha-second"
+        ]
+        assert beta.superseded_by_attempt_id is None
+        assert [branch.attempt_index for branch in alpha_second_attempts] == [0, 1]
+        assert (
+            alpha_second_attempts[0].superseded_by_attempt_id == alpha_second_attempts[1].attempt_id
+        )
+        assert alpha_second_attempts[1].execution_profile_fingerprint is not None
+        replacement_child = await app.session_store.load(alpha_second_attempts[1].session_id)
+        assert replacement_child is not None
+        durable = await app.session_store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+        assert durable is not None
+        assert len(durable["result"]["branches"]) == 4
+
+    asyncio.run(run())
+
+
+def test_replacement_planner_exception_is_redacted_before_durable_failure() -> None:
+    async def run() -> None:
+        secret = "fork-group-replacement-secret-canary"
+        provider = _ForkGroupProvider(fail_branch="beta")
+        app = CayuApp(
+            enable_logging=False,
+            secret_redactor=SecretRedactor(secret),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="source", model="fake-model"))
+        app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "secret-planner",
+            _SecretFailingReplacementPlanner(secret),
+        )
+        request = _request(
+            group_id="group-secret-replacement-failure",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+
+        result = await app.run_fork_group(request)
+        durable = await app.session_store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.REPLACEMENT_FAILED
+        assert secret not in result.failure.message
+        assert secret not in json.dumps(durable)
+
+    asyncio.run(run())
+
+
+def test_viable_replacement_concurrent_recovery_and_terminal_replay_converge() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _ForkGroupProvider(fail_branch="beta", branch_delay=0.1)
+
+        def configured_app() -> tuple[CayuApp, _ConfiguredReplacementPlanner]:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="source", model="fake-model"))
+            app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+            app.register_fork_group_gate("tests", _ConfiguredGate())
+            planner = _ConfiguredReplacementPlanner()
+            app.register_fork_group_replacement_planner("tests", planner)
+            return app, planner
+
+        first_app, first_planner = configured_app()
+        second_app, second_planner = configured_app()
+        await _source(first_app)
+        request = _request(
+            group_id="group-concurrent-viable-recovery",
+            gates=(
+                ForkGroupGateSelection(
+                    gate_id="tests",
+                    gate_identity="tests.configured-gate.v1",
+                ),
+            ),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=ForkGroupReplacementPlannerSelection(
+                        planner_id="tests",
+                        planner_identity="tests.configured-replacement-planner.v1",
+                    ),
+                )
+            }
+        )
+
+        first, second = await asyncio.gather(
+            first_app.run_fork_group(request),
+            second_app.run_fork_group(request),
+        )
+        completed = await second_app.run_fork_group(request)
+
+        assert {first.state, second.state} <= {
+            ForkGroupState.CREATED,
+            ForkGroupState.BRANCHES_RUNNING,
+            ForkGroupState.AWAITING_EVALUATION,
+            ForkGroupState.COMPLETED,
+        }
+        assert completed.state is ForkGroupState.COMPLETED
+        assert provider.replacement_calls == 1
+        assert provider.evaluator_calls == 1
+        assert len(first_planner.requests) + len(second_planner.requests) == 1
+        replacement = next(attempt for attempt in completed.branches if attempt.attempt_index == 1)
+        child = await store.load(replacement.session_id)
+        assert child is not None and child.status is SessionStatus.COMPLETED
+
+        replay_provider = _ForkGroupProvider(fail_branch="alpha", fail_evaluator=True)
+        replay_app = CayuApp(session_store=store, enable_logging=False)
+        replay_app.register_provider(replay_provider, default=True)
+        replay_app.register_agent(AgentSpec(name="source", model="fake-model"))
+        replay_app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+        replay = await replay_app.run_fork_group(request)
+
+        assert replay.state is ForkGroupState.COMPLETED
+        assert replay.replayed is True
+        assert replay.branches == completed.branches
+        assert replay.dispositions == completed.dispositions
+        assert replay_provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_viable_replacement_recovers_after_owner_loss_mid_replacement() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        replacement_started = asyncio.Event()
+        hold_replacement = asyncio.Event()
+
+        async def block_replacement() -> None:
+            replacement_started.set()
+            await hold_replacement.wait()
+
+        def configured_app(provider: _ForkGroupProvider) -> CayuApp:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="source", model="fake-model"))
+            app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+            app.register_fork_group_gate("tests", _ConfiguredGate())
+            app.register_fork_group_replacement_planner(
+                "tests",
+                _ConfiguredReplacementPlanner(),
+            )
+            return app
+
+        first_provider = _ForkGroupProvider(
+            fail_branch="beta",
+            replacement_callback=block_replacement,
+        )
+        first_app = configured_app(first_provider)
+        await _source(first_app)
+        request = _request(
+            group_id="group-owner-loss-mid-replacement",
+            gates=(
+                ForkGroupGateSelection(
+                    gate_id="tests",
+                    gate_identity="tests.configured-gate.v1",
+                ),
+            ),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=2,
+                    replacement_parallelism=1,
+                    replacement_planner=ForkGroupReplacementPlannerSelection(
+                        planner_id="tests",
+                        planner_identity="tests.configured-replacement-planner.v1",
+                    ),
+                )
+            }
+        )
+
+        abandoned = asyncio.create_task(first_app.run_fork_group(request))
+        await asyncio.wait_for(replacement_started.wait(), timeout=5)
+        abandoned.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abandoned
+
+        fresh_provider = _ForkGroupProvider(fail_branch="beta")
+        fresh_app = configured_app(fresh_provider)
+        recovered = await fresh_app.run_fork_group(request)
+
+        assert recovered.state is ForkGroupState.COMPLETED
+        beta_attempts = [attempt for attempt in recovered.branches if attempt.branch_id == "beta"]
+        assert [attempt.attempt_index for attempt in beta_attempts] == [0, 1, 2]
+        assert beta_attempts[0].superseded_by_attempt_id == beta_attempts[1].attempt_id
+        assert beta_attempts[1].superseded_by_attempt_id == beta_attempts[2].attempt_id
+        assert beta_attempts[2].eligible is True
+        assert all(
+            attempt.execution_profile_fingerprint is not None for attempt in beta_attempts[1:]
+        )
+        assert fresh_provider.replacement_calls == 1
+        assert fresh_provider.evaluator_calls == 1
+        for attempt in beta_attempts[1:]:
+            child = await store.load(attempt.session_id)
+            assert child is not None
+
+    asyncio.run(run())
+
+
+def test_viable_replacement_replay_rejects_changed_planner_output() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        replacement_gated = asyncio.Event()
+        hold_gate = asyncio.Event()
+
+        class _BlockingReplacementGate(_ConfiguredGate):
+            async def evaluate(self, request: ForkGroupGateRequest) -> ForkGroupGateDecision:
+                decision = await super().evaluate(request)
+                if request.branch.attempt_index == 1:
+                    replacement_gated.set()
+                    await hold_gate.wait()
+                return decision
+
+        def configured_app(
+            provider: _ForkGroupProvider,
+            planner: _ConfiguredReplacementPlanner,
+            gate: ForkGroupGate,
+        ) -> CayuApp:
+            app = _app(provider, session_store=store)
+            app.register_fork_group_gate("tests", gate)
+            app.register_fork_group_replacement_planner("tests", planner)
+            return app
+
+        first_app = configured_app(
+            _ForkGroupProvider(fail_branch="beta"),
+            _ConfiguredReplacementPlanner(),
+            _BlockingReplacementGate(),
+        )
+        await _source(first_app)
+        request = _request(
+            group_id="group-changed-replacement-replay",
+            gates=(
+                ForkGroupGateSelection(
+                    gate_id="tests",
+                    gate_identity="tests.configured-gate.v1",
+                ),
+            ),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=ForkGroupReplacementPlannerSelection(
+                        planner_id="tests",
+                        planner_identity="tests.configured-replacement-planner.v1",
+                    ),
+                )
+            }
+        )
+
+        abandoned = asyncio.create_task(first_app.run_fork_group(request))
+        await asyncio.wait_for(replacement_gated.wait(), timeout=5)
+        abandoned.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abandoned
+
+        changed_app = configured_app(
+            _ForkGroupProvider(fail_branch="beta"),
+            _ConfiguredReplacementPlanner(
+                message_suffix=" changed",
+                artifact_references=(
+                    ForkGroupArtifactReference(artifact_id="changed-planner-artifact"),
+                ),
+            ),
+            _ConfiguredGate(),
+        )
+        with pytest.raises(ForkGroupConflict, match="conflicts with the fork-group request"):
+            await changed_app.run_fork_group(request)
 
     asyncio.run(run())
 
@@ -1150,7 +2403,7 @@ def test_run_fork_group_rejects_existing_child_from_older_same_epoch_snapshot() 
             execution_profile_fingerprint=profile.fingerprint,
             causal_budget_id=source.causal_budget_id,
         )
-        fork_status, fork_error = await fork_group_runtime._fork_exact_source(
+        fork_status, fork_error, fork_failure_code, _ = await fork_group_runtime._fork_exact_source(
             coordinator,
             fork_group_runtime._branch_fork_request(
                 prepared,
@@ -1160,6 +2413,7 @@ def test_run_fork_group_rejects_existing_child_from_older_same_epoch_snapshot() 
         )
         assert fork_status is SessionStatus.COMPLETED
         assert fork_error is None
+        assert fork_failure_code is None
         mutated = {} if checkpoint is None else checkpoint
         mutated["same_epoch_semantic_mutation"] = {"candidate": "newer"}
         await app.session_store.checkpoint(request.source_session_id, mutated)
@@ -1280,6 +2534,227 @@ def test_run_fork_group_reconciles_lost_terminal_publication_acknowledgement() -
             )
         )
         assert len(records) == 1
+
+    asyncio.run(run())
+
+
+def test_run_fork_group_retries_precommit_terminal_publication() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        app = _app(provider)
+        await _source(app)
+        request = _request(group_id="group-terminal-precommit-failure")
+        original_publish = app.session_store.publish_session_operation
+        publication_failed = False
+
+        async def fail_before_terminal_publication(session_id: str, **kwargs):
+            nonlocal publication_failed
+            events = kwargs.get("events", [])
+            if (
+                not publication_failed
+                and events
+                and events[0].type is EventType.FORK_GROUP_COMPLETED
+            ):
+                publication_failed = True
+                raise ConnectionError("simulated pre-commit terminal publication failure")
+            return await original_publish(session_id, **kwargs)
+
+        app.session_store.publish_session_operation = (  # ty: ignore[invalid-assignment]
+            fail_before_terminal_publication
+        )
+        completed = await app.run_fork_group(request)
+
+        assert publication_failed is True
+        assert completed.state is ForkGroupState.COMPLETED
+        assert completed.failure is None
+        assert len(completed.dispositions) == 2
+        request_count = len(provider.requests)
+
+        replay = await app.run_fork_group(request)
+
+        assert replay.replayed is True
+        assert replay.dispositions == completed.dispositions
+        assert len(provider.requests) == request_count
+
+    asyncio.run(run())
+
+
+def test_viable_group_retains_completed_attempts_when_awaiting_publication_fails() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-awaiting-publication-failure",
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=1,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                )
+            }
+        )
+        original_publish = app.session_store.publish_session_operation
+        publication_failed = False
+
+        async def fail_before_awaiting_publication(session_id: str, **kwargs):
+            nonlocal publication_failed
+            events = kwargs.get("events", [])
+            if (
+                not publication_failed
+                and events
+                and events[0].type is EventType.FORK_GROUP_AWAITING_EVALUATION
+            ):
+                publication_failed = True
+                raise ConnectionError("simulated pre-commit awaiting publication failure")
+            return await original_publish(session_id, **kwargs)
+
+        app.session_store.publish_session_operation = (  # ty: ignore[invalid-assignment]
+            fail_before_awaiting_publication
+        )
+        failed = await app.run_fork_group(request)
+
+        assert publication_failed is True
+        assert failed.state is ForkGroupState.FAILED
+        assert failed.failure is not None
+        assert failed.failure.code is ForkGroupFailureCode.INTERNAL_ERROR
+        assert "ConnectionError" in failed.failure.message
+        assert [branch.branch_id for branch in failed.branches] == ["alpha", "beta"]
+        assert all(branch.status is ForkGroupBranchStatus.COMPLETED for branch in failed.branches)
+        request_count = len(provider.requests)
+
+        replay = await app.run_fork_group(request)
+
+        assert replay.replayed is True
+        assert replay.state is ForkGroupState.FAILED
+        assert replay.branches == failed.branches
+        assert len(provider.requests) == request_count
+
+    asyncio.run(run())
+
+
+def test_stale_publication_failure_does_not_terminalize_successor_claim() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        current_time = [datetime(2026, 1, 1, tzinfo=UTC)]
+        successor_evaluator_started = asyncio.Event()
+        release_successor = asyncio.Event()
+
+        async def block_successor_evaluator() -> None:
+            successor_evaluator_started.set()
+            await release_successor.wait()
+
+        def shared_app(provider: _ForkGroupProvider) -> CayuApp:
+            app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                clock=lambda: current_time[0],
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="source", model="fake-model"))
+            app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+            return app
+
+        first_app = shared_app(_ForkGroupProvider())
+        second_app = shared_app(_ForkGroupProvider(evaluator_callback=block_successor_evaluator))
+        await _source(first_app)
+        request = _request(group_id="group-stale-publication-failure")
+        original_publish = store.publish_session_operation
+        publication_failed = False
+        successor_task: asyncio.Task[Any] | None = None
+
+        async def fail_after_successor_claims(session_id: str, **kwargs):
+            nonlocal publication_failed, successor_task
+            events = kwargs.get("events", [])
+            if (
+                not publication_failed
+                and events
+                and events[0].type is EventType.FORK_GROUP_AWAITING_EVALUATION
+            ):
+                publication_failed = True
+                current_time[0] += timedelta(hours=1)
+                successor_task = asyncio.create_task(second_app.run_fork_group(request))
+                await asyncio.wait_for(successor_evaluator_started.wait(), timeout=5)
+                raise ConnectionError("simulated stale-owner publication failure")
+            return await original_publish(session_id, **kwargs)
+
+        store.publish_session_operation = (  # ty: ignore[invalid-assignment]
+            fail_after_successor_claims
+        )
+        stale_result = await first_app.run_fork_group(request)
+        durable_during_successor = await store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+
+        assert stale_result.state is ForkGroupState.AWAITING_EVALUATION
+        assert durable_during_successor is not None
+        assert durable_during_successor["result"]["state"] == "awaiting-evaluation"
+        assert durable_during_successor["execution_claim"] is not None
+
+        release_successor.set()
+        assert successor_task is not None
+        successor_result = await successor_task
+        replay = await first_app.run_fork_group(request)
+
+        assert successor_result.state is ForkGroupState.COMPLETED
+        assert replay.state is ForkGroupState.COMPLETED
+        assert replay.replayed is True
+
+    asyncio.run(run())
+
+
+def test_gate_failure_survives_failed_terminal_publication() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        app = _app(provider)
+        await _source(app)
+        gate_selection = app.register_fork_group_gate(
+            "tests",
+            _ConfiguredGate(failed_branch_id="beta"),
+        )
+        request = _request(
+            group_id="group-gate-failure-publication-failure",
+            gates=(gate_selection,),
+        )
+        original_publish = app.session_store.publish_session_operation
+        publication_failed = False
+
+        async def fail_before_terminal_publication(session_id: str, **kwargs):
+            nonlocal publication_failed
+            events = kwargs.get("events", [])
+            if not publication_failed and events and events[0].type is EventType.FORK_GROUP_FAILED:
+                publication_failed = True
+                raise ConnectionError("simulated pre-commit failed publication")
+            return await original_publish(session_id, **kwargs)
+
+        app.session_store.publish_session_operation = (  # ty: ignore[invalid-assignment]
+            fail_before_terminal_publication
+        )
+        failed = await app.run_fork_group(request)
+
+        assert publication_failed is True
+        assert failed.state is ForkGroupState.FAILED
+        assert failed.failure is not None
+        assert failed.failure.code is ForkGroupFailureCode.GATE_FAILED
+        assert failed.failure.branch_id == "beta"
+        assert [branch.branch_id for branch in failed.branches] == ["alpha", "beta"]
+        assert failed.branches[1].gate_results[0].passed is False
+
+        replay = await app.run_fork_group(request)
+
+        assert replay.replayed is True
+        assert replay.failure == failed.failure
+        assert replay.branches == failed.branches
 
     asyncio.run(run())
 
@@ -1497,15 +2972,20 @@ def test_run_fork_group_keeps_group_nonterminal_while_evaluator_provider_is_pend
                 for branch in prepared.branches
             ]
         )
+        awaiting_record = fork_group_runtime._result_with(
+            record,
+            state=ForkGroupState.AWAITING_EVALUATION,
+            branches=branch_results,
+            evaluator_session_id=prepared.evaluator.session_id,
+        )
+        awaiting_record = await fork_group_runtime._bind_tool_free_evaluator_authority(
+            coordinator,
+            awaiting_record,
+        )
         awaiting = await fork_group_runtime._publish_record(
             coordinator,
             request.source_session_id,
-            fork_group_runtime._result_with(
-                record,
-                state=ForkGroupState.AWAITING_EVALUATION,
-                branches=branch_results,
-                evaluator_session_id=prepared.evaluator.session_id,
-            ),
+            awaiting_record,
             EventType.FORK_GROUP_AWAITING_EVALUATION,
             expected_record=record,
         )
@@ -1516,7 +2996,13 @@ def test_run_fork_group_keeps_group_nonterminal_while_evaluator_provider_is_pend
                 fork_group_runtime._evaluator_run_request(
                     awaiting,
                     synthetic_agent_name=synthetic_name,
-                    branch_ids=tuple(branch.branch_id for branch in awaiting.result.branches),
+                    branch_identities=tuple(
+                        fork_group_runtime._ForkGroupAttemptIdentity(
+                            branch_id=branch.branch_id,
+                            attempt_id=branch.attempt_id,
+                        )
+                        for branch in awaiting.result.branches
+                    ),
                 )
             )
         ]
@@ -1619,15 +3105,20 @@ def test_run_fork_group_rejects_changed_evaluator_profile_after_restart() -> Non
                 for branch in prepared.branches
             ]
         )
+        awaiting_record = fork_group_runtime._result_with(
+            record,
+            state=ForkGroupState.AWAITING_EVALUATION,
+            branches=branch_results,
+            evaluator_session_id=prepared.evaluator.session_id,
+        )
+        awaiting_record = await fork_group_runtime._bind_tool_free_evaluator_authority(
+            coordinator,
+            awaiting_record,
+        )
         awaiting = await fork_group_runtime._publish_record(
             coordinator,
             request.source_session_id,
-            fork_group_runtime._result_with(
-                record,
-                state=ForkGroupState.AWAITING_EVALUATION,
-                branches=branch_results,
-                evaluator_session_id=prepared.evaluator.session_id,
-            ),
+            awaiting_record,
             EventType.FORK_GROUP_AWAITING_EVALUATION,
             expected_record=record,
         )
@@ -1686,6 +3177,11 @@ def test_run_fork_group_reports_shared_causal_budget_exhaustion() -> None:
         app.register_agent(AgentSpec(name="source", model="fake-model"))
         app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
         await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
         limit = BudgetLimit(
             scope="causal",
             key="fork-group-budget",
@@ -1705,7 +3201,11 @@ def test_run_fork_group_reports_shared_causal_budget_exhaustion() -> None:
                 max_output_tokens=1,
             ),
         )
-        request = _request(group_id="group-budget", max_parallelism=1)
+        request = _request(
+            group_id="group-budget",
+            max_parallelism=1,
+            gates=(gate_selection,),
+        )
         request = request.model_copy(
             update={
                 "branches": tuple(
@@ -1722,7 +3222,14 @@ def test_run_fork_group_reports_shared_causal_budget_exhaustion() -> None:
                         deep=True,
                     )
                     for branch in request.branches
-                )
+                ),
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                ),
             },
             deep=True,
         )
@@ -1735,6 +3242,8 @@ def test_run_fork_group_reports_shared_causal_budget_exhaustion() -> None:
         assert result.failure.branch_id == "beta"
         assert result.branches[0].status == "completed"
         assert result.branches[1].status == "interrupted"
+        assert result.branches[1].failure_code is ForkGroupFailureCode.BUDGET_EXHAUSTED
+        assert provider.replacement_calls == 0
         assert provider.evaluator_calls == 0
 
     asyncio.run(run())

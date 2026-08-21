@@ -13180,6 +13180,10 @@ class SessionEngine:
                 )
             initial_invocation_profile = candidate_execution_profile
 
+        execution_profile_fingerprint_capture = request._execution_profile_fingerprint_capture
+        if execution_profile_fingerprint_capture is not None:
+            execution_profile_fingerprint_capture(selected_execution_profile.fingerprint)
+
         if (
             prompt_workflow.prompt_replacement is not None
             and registered_provider.name != source_session.provider_name

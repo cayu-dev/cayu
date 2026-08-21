@@ -31,6 +31,14 @@ async def run(root: Path) -> ScenarioResult:
             ),
             structured_batch(
                 {
+                    "proposal": "safer bounded extensible replacement",
+                    "quality": 8,
+                    "risk": "low",
+                },
+                call_id="extensible-replacement",
+            ),
+            structured_batch(
+                {
                     "dispositions": [
                         {
                             "branch_id": "focused",

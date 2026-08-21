@@ -1825,6 +1825,7 @@ class ForkSessionRequest(BaseModel):
     _fork_group_initial_invocation: _ForkGroupInitialInvocationExpectation | None = PrivateAttr(
         default=None
     )
+    _execution_profile_fingerprint_capture: Callable[[str], None] | None = PrivateAttr(default=None)
 
     @field_validator("session_id")
     @classmethod
@@ -14177,6 +14178,22 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
             request_sha256=initial_invocation.request_sha256,
         )
     )
+    copied._execution_profile_fingerprint_capture = request._execution_profile_fingerprint_capture
+    return copied
+
+
+def _bind_fork_execution_profile_fingerprint_capture(
+    request: ForkSessionRequest,
+    capture: Callable[[str], None],
+) -> ForkSessionRequest:
+    """Observe the runtime-selected child baseline before fork publication."""
+
+    if type(request) is not ForkSessionRequest:
+        raise TypeError("Session fork requires a ForkSessionRequest.")
+    if not callable(capture):
+        raise TypeError("Fork execution-profile capture must be callable.")
+    copied = copy_fork_session_request(request)
+    copied._execution_profile_fingerprint_capture = capture
     return copied
 
 

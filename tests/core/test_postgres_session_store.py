@@ -28,6 +28,7 @@ from tests.core.pending_action_conformance import assert_pending_action_store_co
 from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
 )
+from tests.core.test_fork_groups import assert_viable_fork_group_store_conformance
 from tests.core.test_provider_operation_offline_recovery import (
     assert_budgeted_offline_provider_operation_recovery,
     assert_offline_provider_operation_recovery,
@@ -178,6 +179,10 @@ def _run(dsn: str, coro_factory) -> object:
             await store.close()
 
     return asyncio.run(runner())
+
+
+def test_postgres_viable_fork_group_store_conformance(postgres_dsn: str) -> None:
+    _run(postgres_dsn, assert_viable_fork_group_store_conformance)
 
 
 def test_postgres_session_store_preserves_projected_tool_results(

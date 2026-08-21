@@ -18,9 +18,14 @@ from cayu import (
     ForkGroupCheckpointSelector,
     ForkGroupDisposition,
     ForkGroupEvaluatorSpec,
+    ForkGroupFailureMode,
+    ForkGroupFailurePolicy,
     ForkGroupGate,
     ForkGroupGateDecision,
     ForkGroupGateRequest,
+    ForkGroupReplacementPlanner,
+    ForkGroupReplacementPlannerRequest,
+    ForkGroupReplacementSpec,
     ForkGroupRequest,
     ForkGroupState,
     Message,
@@ -50,16 +55,16 @@ class CandidateContractGate(ForkGroupGate):
     """Application-owned deterministic contract checked before model evaluation."""
 
     def __init__(self) -> None:
-        self.branch_ids: list[str] = []
+        self.attempts: list[tuple[str, int]] = []
 
     @property
     def identity(self) -> str:
         return "examples.bounded-fork-group.candidate-contract.v1"
 
     async def evaluate(self, request: ForkGroupGateRequest) -> ForkGroupGateDecision:
-        self.branch_ids.append(request.branch.branch_id)
+        self.attempts.append((request.branch.branch_id, request.branch.attempt_index))
         output = request.branch.structured_output
-        passed = (
+        contract_passed = (
             request.branch.has_structured_output
             and type(output) is dict
             and type(output.get("proposal")) is str
@@ -67,9 +72,47 @@ class CandidateContractGate(ForkGroupGate):
             and 1 <= output["quality"] <= 10
             and output.get("risk") in {"low", "medium", "high"}
         )
+        # The application, not the evaluator, rejects one seed attempt so the
+        # example deterministically exercises bounded replacement in every mode.
+        passed = contract_passed and not (
+            request.branch.branch_id == "extensible" and request.branch.attempt_index == 0
+        )
         return ForkGroupGateDecision(
             passed=passed,
-            summary="candidate contract passed" if passed else "candidate contract failed",
+            summary=(
+                "candidate contract passed"
+                if passed
+                else "seed attempt rejected by application policy"
+            ),
+        )
+
+
+class BoundedReplacementPlanner(ForkGroupReplacementPlanner):
+    """Application-owned mutation content; Cayu owns attempt/session identity."""
+
+    def __init__(self, output_spec: StructuredOutputSpec) -> None:
+        self.output_spec = output_spec
+        self.requests: list[ForkGroupReplacementPlannerRequest] = []
+
+    @property
+    def identity(self) -> str:
+        return "examples.bounded-fork-group.replacement-planner.v1"
+
+    async def plan(
+        self,
+        request: ForkGroupReplacementPlannerRequest,
+    ) -> ForkGroupReplacementSpec:
+        self.requests.append(request)
+        return ForkGroupReplacementSpec(
+            messages=(
+                Message.text(
+                    "user",
+                    "Replace the rejected extensible seed with a safer bounded proposal. "
+                    f"This is attempt {request.attempt_index}.",
+                ),
+            ),
+            structured_output=self.output_spec,
+            limits=advanced_run_limits(),
         )
 
 
@@ -108,16 +151,13 @@ async def run_scenario(
             name="evaluator",
             model=model,
             system_prompt=(
-                "Judge only the supplied fork-group evidence. Select exactly one branch and "
-                "give every branch one disposition."
+                "Judge only the supplied fork-group evidence. Select exactly one eligible "
+                "candidate slot and give every eligible slot one disposition."
             ),
             workflow_tool_names=("evaluator_forbidden_tool",),
         ),
         tools=[EvaluatorForbiddenTool()],
     )
-    gate = CandidateContractGate()
-    gate_selection = app.register_fork_group_gate("candidate-contract-v1", gate)
-
     source_id = "bounded-group-source"
     causal_budget_id = "bounded-group-budget"
     await collect_events(
@@ -141,6 +181,13 @@ async def run_scenario(
         json_schema=CANDIDATE_SCHEMA,
         max_retries=2,
         repair_prompt="Return one concise proposal that satisfies the candidate schema.",
+    )
+    gate = CandidateContractGate()
+    gate_selection = app.register_fork_group_gate("candidate-contract-v1", gate)
+    planner = BoundedReplacementPlanner(output_spec)
+    planner_selection = app.register_fork_group_replacement_planner(
+        "replacement-planner-v1",
+        planner,
     )
     request = ForkGroupRequest(
         group_id="bounded-group",
@@ -175,6 +222,13 @@ async def run_scenario(
             ),
         ),
         gates=(gate_selection,),
+        failure_policy=ForkGroupFailurePolicy(
+            mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+            minimum_viable_branches=2,
+            max_replacement_attempts=1,
+            replacement_parallelism=1,
+            replacement_planner=planner_selection,
+        ),
         evaluator=ForkGroupEvaluatorSpec(
             session_id="bounded-group-evaluator",
             agent_name="evaluator",
@@ -204,17 +258,35 @@ async def run_scenario(
         for item in group.dispositions
         if item.disposition is ForkGroupDisposition.SELECTED
     ]
+    focused = next(
+        branch
+        for branch in group.branches
+        if branch.branch_id == "focused" and branch.attempt_index == 0
+    )
+    rejected_seed = next(
+        branch
+        for branch in group.branches
+        if branch.branch_id == "extensible" and branch.attempt_index == 0
+    )
+    replacement = next(
+        branch
+        for branch in group.branches
+        if branch.branch_id == "extensible" and branch.attempt_index == 1
+    )
     sessions = await session_evidence(
         app,
         {
             source_id: "source",
-            "bounded-group-focused": "focused",
-            "bounded-group-extensible": "extensible",
+            focused.session_id: "focused",
+            rejected_seed.session_id: "extensible-seed",
+            replacement.session_id: "extensible-replacement",
             "bounded-group-evaluator": "evaluator",
         },
     )
     candidate_sessions = [
-        session for session in sessions if session.role in {"focused", "extensible"}
+        session
+        for session in sessions
+        if session.role in {"focused", "extensible-seed", "extensible-replacement"}
     ]
     source_session = await app.session_store.load(source_id)
     candidate_records = [
@@ -235,19 +307,36 @@ async def run_scenario(
     manifest_agents = {agent.name: agent for agent in app.describe().agents}
     evaluator_manifest = manifest_agents[evaluator_session.agent_name]
     total_tokens = sum(session.usage["total_tokens"] for session in sessions)
+    eligible = [branch for branch in group.branches if branch.eligible]
     assertions = {
-        "all_deterministic_gates_passed": (
-            gate.branch_ids == ["focused", "extensible"]
-            and all(
-                branch.gate_results and all(result.passed for result in branch.gate_results)
-                for branch in group.branches
-            )
+        "application_gates_control_eligibility": (
+            gate.attempts == [("focused", 0), ("extensible", 0), ("extensible", 1)]
+            and focused.eligible
+            and focused.gate_results[0].passed
+            and not rejected_seed.eligible
+            and not rejected_seed.gate_results[0].passed
+            and replacement.eligible
+            and replacement.gate_results[0].passed
         ),
         "bounded_group_completed": group.state is ForkGroupState.COMPLETED,
-        "dispositions_cover_all_and_select_one": (
+        "dispositions_cover_eligible_and_select_one": (
             len(selected) == 1
-            and {item.branch_id for item in group.dispositions}
-            == {branch.branch_id for branch in group.branches}
+            and {(item.branch_id, item.attempt_id) for item in group.dispositions}
+            == {(branch.branch_id, branch.attempt_id) for branch in eligible}
+        ),
+        "replacement_lineage_preserves_the_seed": (
+            len(group.branches) == 3
+            and rejected_seed.status.value == "completed"
+            and rejected_seed.superseded_by_attempt_id == replacement.attempt_id
+            and replacement.replaced_attempt_id == rejected_seed.attempt_id
+            and replacement.session_id != rejected_seed.session_id
+            and len(planner.requests) == 1
+            and planner.requests[0].attempt_id == replacement.attempt_id
+        ),
+        "surviving_sibling_was_not_rerun": (
+            focused.attempt_index == 0
+            and focused.replaced_attempt_id is None
+            and focused.superseded_by_attempt_id is None
         ),
         "economic_evidence_is_complete": (
             total_tokens > 0
@@ -308,7 +397,15 @@ async def run_scenario(
             "total_tokens": total_tokens,
         },
         outputs={
-            "candidates": {branch.branch_id: branch.structured_output for branch in group.branches},
+            "candidates": {
+                branch.attempt_id: {
+                    "branch_id": branch.branch_id,
+                    "attempt_index": branch.attempt_index,
+                    "eligible": branch.eligible,
+                    "structured_output": branch.structured_output,
+                }
+                for branch in group.branches
+            },
             "dispositions": [item.model_dump(mode="json") for item in group.dispositions],
         },
     )
