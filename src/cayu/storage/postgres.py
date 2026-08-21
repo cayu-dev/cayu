@@ -291,6 +291,7 @@ from cayu.runtime.sessions import (
     _reject_reserved_runtime_publication_key,
     _replay_model_completion_stage_abandonment,
     _replay_promoted_model_completion_stage,
+    _run_session_commit_guard_owned,
     _runtime_publication_json_equal,
     _runtime_publication_receipt_record,
     _runtime_publication_referenced_event_ids,
@@ -11520,6 +11521,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
+    supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -16634,6 +16636,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         updated_at = datetime.now(UTC)
         await self._ensure_ready()
         async with self._connection() as conn:
+            commit_guard_signal: BaseException | None = None
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
@@ -16832,10 +16835,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             copied_events,
                         )
                     if operation_commit_guard is not None:
-                        operation_commit_guard()
+                        commit_guard_signal = await _run_session_commit_guard_owned(
+                            operation_commit_guard
+                        )
                 await conn.commit()
+                if commit_guard_signal is not None:
+                    raise commit_guard_signal
             except UniqueViolation as exc:
                 await conn.rollback()
+                if commit_guard_signal is not None:
+                    raise commit_guard_signal from exc
                 existing = await self._first_existing_event_id(
                     session_id,
                     [event.id for event in copied_events],
@@ -16845,8 +16854,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         f"Event already exists for session {session_id}: {existing}"
                     ) from exc
                 raise
-            except Exception:
+            except Exception as error:
                 await conn.rollback()
+                if commit_guard_signal is not None:
+                    raise commit_guard_signal from error
                 raise
             return loaded.model_copy(
                 update={"updated_at": updated_at, "last_activity_at": updated_at}

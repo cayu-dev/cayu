@@ -146,6 +146,20 @@ class _RuntimeCheckpointSessionStore:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
 
+    @property
+    def supports_owned_off_thread_session_commit_guards(self) -> bool:
+        """Preserve the wrapped store's guarded-mutation capability exactly."""
+
+        return self._supports_owned_off_thread_session_commit_guard_protocol()
+
+    def _supports_owned_off_thread_session_commit_guard_protocol(self) -> bool:
+        checker = getattr(
+            self._store,
+            "_supports_owned_off_thread_session_commit_guard_protocol",
+            None,
+        )
+        return callable(checker) and checker() is True
+
     async def create(
         self,
         request: Any,

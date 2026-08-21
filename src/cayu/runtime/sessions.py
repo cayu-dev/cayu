@@ -82,6 +82,7 @@ from cayu.core.messages import (
 )
 from cayu.core.runtime_authority import (
     CheckpointValueAuthority,
+    SessionRunFenced,
     checkpoint_value_authority,
 )
 from cayu.core.thinking import ThinkingConfig
@@ -223,16 +224,79 @@ from cayu.runtime.usage import UsageMetrics
 from cayu.vaults.redaction import SecretRedactor
 
 
+class _SessionCommitGuardCancelled(RuntimeError):
+    """An owned commit guard stopped without caller-owned cancellation."""
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedOffThreadSessionCommitGuard:
+    callback: Callable[[], None]
+
+    def __call__(self) -> None:
+        try:
+            self.callback()
+        except asyncio.CancelledError as error:
+            raise _SessionCommitGuardCancelled(
+                "Session commit guard was unexpectedly cancelled."
+            ) from error
+
+
+async def _run_session_commit_guard_owned(
+    commit_guard: Callable[[], None],
+) -> BaseException | None:
+    """Run an explicitly off-thread commit guard without abandoning its mutation."""
+
+    if type(commit_guard) is not _OwnedOffThreadSessionCommitGuard:
+        commit_guard()
+        return None
+
+    worker = asyncio.create_task(asyncio.to_thread(commit_guard))
+    caller_signal: BaseException | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as cancellation:
+            if caller_signal is None:
+                caller_signal = cancellation
+            elif isinstance(caller_signal, asyncio.CancelledError):
+                caller_signal.add_note(
+                    "Additional cancellation arrived while the session commit guard settled."
+                )
+            else:
+                caller_signal = BaseExceptionGroup(
+                    "Session commit guard received multiple control signals.",
+                    [caller_signal, cancellation],
+                )
+        except BaseException as signal:
+            if worker.done():
+                break
+            caller_signal = (
+                signal
+                if caller_signal is None
+                else BaseExceptionGroup(
+                    "Session commit guard received multiple control signals.",
+                    [caller_signal, signal],
+                )
+            )
+    try:
+        worker.result()
+    except BaseException as guard_error:
+        if not isinstance(guard_error, (Exception, asyncio.CancelledError)):
+            if caller_signal is not None:
+                raise guard_error from caller_signal
+            raise
+        if caller_signal is not None:
+            raise caller_signal from guard_error
+        raise
+    return caller_signal
+
+
 class SessionStatusConflict(ValueError):
     """A session status transition was rejected because the session was not in an
     allowed source status (e.g. resuming a session another worker is already
     running). Subclasses ``ValueError`` so existing ``except ValueError`` handlers
     keep working; callers that need to react specifically (e.g. requeue) catch this.
     """
-
-
-class SessionRunFenced(RuntimeError):
-    """A durable write was rejected because its run no longer owns the session epoch."""
 
 
 class SessionForkSourceNotFound(KeyError):
@@ -6938,6 +7002,7 @@ class SessionStore(ABC):
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_model_completion_stage_release: ClassVar[bool] = False
     supports_transcript_search: ClassVar[bool] = False
+    supports_owned_off_thread_session_commit_guards: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @property
@@ -7599,6 +7664,24 @@ class SessionStore(ABC):
         expected_transcript_cursor: int | None = None,
     ) -> Session:
         """Atomically publish a checkpoint, events, and terminal operation records."""
+
+    def _supports_owned_off_thread_session_commit_guard_protocol(self) -> bool:
+        """Return whether this exact guarded-publication override owns its capability."""
+
+        capability_owner_index = next(
+            index
+            for index, owner in enumerate(type(self).__mro__)
+            if "supports_owned_off_thread_session_commit_guards" in owner.__dict__
+        )
+        publication_owner_index = next(
+            index
+            for index, owner in enumerate(type(self).__mro__)
+            if "publish_session_operation_guarded" in owner.__dict__
+        )
+        return (
+            self.supports_owned_off_thread_session_commit_guards is True
+            and capability_owner_index <= publication_owner_index
+        )
 
     def _supports_atomic_model_completion_stage_release_protocol(self) -> bool:
         """Return whether this exact publication override owns stage release semantics."""
@@ -8609,6 +8692,7 @@ class InMemorySessionStore(SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
+    supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
@@ -11508,8 +11592,11 @@ class InMemorySessionStore(SessionStore):
                     terminal_record=operation_records.get(terminal_key),
                     release=release,
                 )
-            if commit_guard is not None:
-                commit_guard()
+            commit_guard_signal = (
+                None
+                if commit_guard is None
+                else await _run_session_commit_guard_owned(commit_guard)
+            )
             updated = self._append_events_unlocked(session, copied_events)
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             operation_records = self._session_operation_records.setdefault(session_id, {})
@@ -11517,6 +11604,8 @@ class InMemorySessionStore(SessionStore):
             if release is not None:
                 del operation_records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY]
             self._sessions[session_id] = updated
+            if commit_guard_signal is not None:
+                raise commit_guard_signal
             return updated.model_copy(deep=True)
 
     async def _load_model_completion_stage_records(

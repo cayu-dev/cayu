@@ -795,6 +795,7 @@ from cayu.runtime.work_contracts import (
     work_contract_fingerprint,
     work_contract_from_draft,
 )
+from cayu.runtime.workspace_branches import SessionWorkspaceBranchStore
 
 __all__ = [
     "ALL_REGISTERED_TOOLS_PROFILE_ID",
@@ -1305,6 +1306,7 @@ __all__ = [
     "SessionTopologyQuery",
     "SessionTopologyStoreResult",
     "SessionUsageSummary",
+    "SessionWorkspaceBranchStore",
     "StaticToolExposurePolicy",
     "StaticToolPolicy",
     "StopDecision",

@@ -12,6 +12,10 @@ from cayu._validation import canonical_durable_json_bytes
 _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 
 
+class SessionRunFenced(RuntimeError):
+    """A durable write was rejected because its run no longer owns the session epoch."""
+
+
 @dataclass(frozen=True)
 class CheckpointValueAuthority:
     """Content authority for one exact durable checkpoint value."""

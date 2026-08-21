@@ -1086,6 +1086,7 @@ class SQLiteSessionStore(SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
+    supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -6143,7 +6144,7 @@ class SQLiteSessionStore(SessionStore):
                         f"Event already exists for session {session_id}: {existing_event_id}"
                     ) from exc
                 raise
-            except Exception:
+            except BaseException:
                 connection.rollback()
                 raise
             return loaded.model_copy(

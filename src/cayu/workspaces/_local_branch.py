@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import ctypes
 import errno
 import hashlib
 import os
@@ -13,14 +14,30 @@ import threading
 import time
 import unicodedata
 import uuid
-from collections.abc import Callable, Hashable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Hashable, Sequence
+from contextlib import nullcontext, suppress
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, TypeVar, cast
 
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+from cayu._exception_groups import exception_group_children
+from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
+from cayu.core.runtime_authority import SessionRunFenced
 from cayu.workspaces._local_guard import (
     _LocalGuardStagingCleanupError,
+    _LocalGuardStagingConflictError,
     create_regular,
     delete_empty_directory,
     delete_regular,
@@ -28,6 +45,7 @@ from cayu.workspaces._local_guard import (
     open_regular_for_read,
     replace_regular_if_revision,
     restore_regular,
+    settle_regular_staging,
 )
 from cayu.workspaces._mutations import (
     fence_local_workspace_source,
@@ -49,23 +67,32 @@ from cayu.workspaces.base import (
 )
 from cayu.workspaces.branches import (
     WorkspaceBranch,
+    WorkspaceBranchAuthority,
+    WorkspaceBranchBindingAuthority,
+    WorkspaceBranchBindingAuthorityClaim,
     WorkspaceBranchChange,
     WorkspaceBranchChangeSet,
     WorkspaceBranchClosedError,
     WorkspaceBranchConflict,
     WorkspaceBranchContentIdentity,
     WorkspaceBranchCreationResult,
+    WorkspaceBranchDurableState,
     WorkspaceBranchEvidence,
     WorkspaceBranchFencedError,
     WorkspaceBranchLifecycleStatus,
     WorkspaceBranchLimits,
+    WorkspaceBranchOperationConflict,
     WorkspaceBranchOutcomeStatus,
     WorkspaceBranchPublicationError,
     WorkspaceBranchPublicationRequest,
     WorkspaceBranchPublicationResult,
+    WorkspaceBranchRecoveryRequest,
+    WorkspaceBranchRecoveryResult,
     WorkspaceBranchRequest,
     WorkspaceBranchResourceExhaustedError,
+    WorkspaceBranchRollbackRequest,
     WorkspaceBranchRollbackResult,
+    WorkspaceBranchStore,
     _bounded_workspace_branch_evidence,
     _copy_workspace_branch_request_envelope,
     _json_text_size,
@@ -77,6 +104,8 @@ from cayu.workspaces.branches import (
 )
 from cayu.workspaces.revisions import (
     WorkspaceIdentity,
+    WorkspacePathRevision,
+    WorkspaceRevisionObservationStatus,
     _deterministic_workspace_manifest_bytes,
     _deterministic_workspace_manifest_revision,
 )
@@ -90,7 +119,10 @@ _CleanupKeyT = TypeVar("_CleanupKeyT", bound=Hashable)
 _CleanupPayloadT = TypeVar("_CleanupPayloadT")
 _PathKind = Literal["missing", "file", "directory", "symlink", "special"]
 _SOURCE_MANAGER_LOCK = threading.Lock()
-_ACTIVE_BRANCHES: dict[tuple[object, ...], int] = {}
+_ACTIVE_BRANCHES: dict[
+    tuple[object, ...],
+    dict[Hashable, _BranchCapacityOwner],
+] = {}
 _LINUX_IOCTL_READ = 2
 _LINUX_FS_IOC_GETFLAGS_TYPE = ord("f")
 _LINUX_FS_IOC_GETFLAGS_NUMBER = 1
@@ -168,7 +200,7 @@ class _RetainedCleanupRegistry(Generic[_CleanupKeyT, _CleanupPayloadT]):
         *,
         source_key: tuple[object, ...],
         payload: _CleanupPayloadT,
-    ) -> None:
+    ) -> bool:
         with self._lock:
             retained = self._records.get(key)
             if retained is None:
@@ -176,9 +208,39 @@ class _RetainedCleanupRegistry(Generic[_CleanupKeyT, _CleanupPayloadT]):
                     source_key=source_key,
                     payload=payload,
                 )
-                return
+                return True
             if retained.source_key != source_key or retained.payload != payload:
                 raise RuntimeError("Retained cleanup identity changed while owned.")
+            return False
+
+    def retain_or_existing(
+        self,
+        key: _CleanupKeyT,
+        *,
+        source_key: tuple[object, ...],
+        payload: _CleanupPayloadT,
+        replace_unclaimed: Callable[[_CleanupPayloadT], bool] | None = None,
+    ) -> tuple[bool, _CleanupPayloadT]:
+        """Retain one exact owner or return the equivalent existing owner."""
+
+        with self._lock:
+            retained = self._records.get(key)
+            if retained is None:
+                self._records[key] = _RetainedCleanup(
+                    source_key=source_key,
+                    payload=payload,
+                )
+                return True, payload
+            if retained.source_key != source_key:
+                raise RuntimeError("Retained cleanup identity changed while owned.")
+            if (
+                not retained.claimed
+                and replace_unclaimed is not None
+                and replace_unclaimed(retained.payload)
+            ):
+                retained.payload = payload
+                return True, payload
+            return False, retained.payload
 
     def claim(
         self,
@@ -211,6 +273,17 @@ class _RetainedCleanupRegistry(Generic[_CleanupKeyT, _CleanupPayloadT]):
     def forget(self, key: _CleanupKeyT) -> None:
         with self._lock:
             self._records.pop(key, None)
+
+    def pending_keys(
+        self,
+        source_key: tuple[object, ...],
+    ) -> tuple[_CleanupKeyT, ...]:
+        with self._lock:
+            return tuple(
+                key
+                for key, retained in self._records.items()
+                if retained.source_key == source_key and not retained.claimed
+            )
 
     def claim_pending(
         self,
@@ -251,7 +324,7 @@ class _RetainedCleanupRegistry(Generic[_CleanupKeyT, _CleanupPayloadT]):
 
 
 _SOURCE_STAGING_CLEANUPS: _RetainedCleanupRegistry[
-    _LocalGuardStagingCleanupError,
+    tuple[tuple[object, ...], str],
     _LocalGuardStagingCleanupError,
 ] = _RetainedCleanupRegistry()
 _RESOURCE_ERRNOS = frozenset(
@@ -265,6 +338,23 @@ _RESOURCE_ERRNOS = frozenset(
     if error is not None
 )
 _PRIVATE_FILE_MODE = 0o600
+_PRIVATE_ROOT_OWNER_FILE = ".cayu-owner"
+_PRIVATE_CLEANUP_CLAIM_PREFIX = "cayu.local-workspace-branch-cleanup.v1"
+_PRIVATE_CLEANUP_CLAIM_MAX_BYTES = 1024
+_PRIVATE_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_PRIVATE_OWNER_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 4
 
 
 def write_regular(root: Path, relative_path: str, content: bytes) -> None:
@@ -276,6 +366,47 @@ def write_regular(root: Path, relative_path: str, content: bytes) -> None:
         content,
         mode=_PRIVATE_FILE_MODE,
     )
+
+
+def _project_overlay_write(
+    relative: str,
+    after: _FileIdentity,
+    *,
+    baseline: dict[str, _FileIdentity],
+    overlay: dict[str, _FileIdentity],
+    tombstones: set[str],
+) -> tuple[dict[str, _FileIdentity], set[str]]:
+    proposed_overlay = dict(overlay)
+    proposed_tombstones = set(tombstones)
+    baseline_identity = baseline.get(relative)
+    if (
+        baseline_identity is not None
+        and baseline_identity.sha256 == after.sha256
+        and baseline_identity.bytes == after.bytes
+    ):
+        proposed_overlay.pop(relative, None)
+        proposed_tombstones.discard(relative)
+    else:
+        proposed_overlay[relative] = after
+        proposed_tombstones.discard(relative)
+    return proposed_overlay, proposed_tombstones
+
+
+def _project_overlay_delete(
+    relative: str,
+    *,
+    baseline: dict[str, _FileIdentity],
+    overlay: dict[str, _FileIdentity],
+    tombstones: set[str],
+) -> tuple[dict[str, _FileIdentity], set[str]]:
+    proposed_overlay = dict(overlay)
+    proposed_tombstones = set(tombstones)
+    proposed_overlay.pop(relative, None)
+    if relative in baseline:
+        proposed_tombstones.add(relative)
+    else:
+        proposed_tombstones.discard(relative)
+    return proposed_overlay, proposed_tombstones
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,12 +438,46 @@ class _CreationConflict(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class _CapturedBaseline:
     private_root: Path
+    private_root_owner: str | None
     baseline_root: Path
     overlay_root: Path
     files: dict[str, _FileIdentity]
     directories: frozenset[str]
     root_identity: tuple[int, int]
     path_semantics: _DirectoryLookupSemantics
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineCaptureAuthority:
+    source: WorkspaceIdentity
+    revision: str
+    limits: WorkspaceBranchLimits
+    expected_paths: tuple[WorkspacePathRevision, ...] | None
+
+
+def _capture_authority_from_request(
+    request: WorkspaceBranchRequest,
+) -> _BaselineCaptureAuthority:
+    revision = request.baseline.revision
+    if revision is None:  # pragma: no cover - request invariant
+        raise AssertionError("Workspace branch baseline revision disappeared.")
+    return _BaselineCaptureAuthority(
+        source=request.baseline.identity,
+        revision=revision,
+        limits=request.limits,
+        expected_paths=request.baseline.paths,
+    )
+
+
+def _capture_authority_from_record(
+    record: _DurableBranchRecord,
+) -> _BaselineCaptureAuthority:
+    return _BaselineCaptureAuthority(
+        source=record.source,
+        revision=record.baseline_revision,
+        limits=record.limits,
+        expected_paths=None,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +502,665 @@ def _required_source_mode(applied: _AppliedPublicationChange) -> int:
 class _RollbackReceipt:
     paths: tuple[str, ...]
     detail_code: str
+
+
+class _DurableFileIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bytes: StrictInt = Field(ge=0)
+    mode: StrictInt = Field(ge=0)
+
+    @classmethod
+    def from_private(cls, identity: _FileIdentity) -> _DurableFileIdentity:
+        return cls(sha256=identity.sha256, bytes=identity.bytes, mode=identity.mode)
+
+    def private(self) -> _FileIdentity:
+        return _FileIdentity(sha256=self.sha256, bytes=self.bytes, mode=self.mode)
+
+
+class _DurablePublication(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    idempotency_key: str = Field(max_length=512)
+    staging_owner: str = Field(pattern=r"^[0-9a-f]{32}$")
+    change_set: WorkspaceBranchChangeSet
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "idempotency_key")
+
+
+class _DurablePublicationAttempt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    idempotency_key: str = Field(max_length=512)
+    change_set_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "idempotency_key")
+
+
+def _durable_publication_staging_owner(
+    *,
+    private_root_owner: str,
+    idempotency_key: str,
+    change_set_digest: str,
+) -> str:
+    return hashlib.sha256(
+        f"{private_root_owner}\0{idempotency_key}\0{change_set_digest}".encode()
+    ).hexdigest()[:32]
+
+
+class _DurableRollback(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    idempotency_key: str = Field(max_length=512)
+    reason: Literal["explicit", "expired"]
+    paths: tuple[str, ...]
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "idempotency_key")
+
+
+class _DurableFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    phase: Literal["creation", "publication"]
+    outcome: Literal["conflicted", "unsupported", "resource_exhausted", "failed"]
+    detail_code: str = Field(max_length=512)
+    conflicts: tuple[WorkspaceBranchConflict, ...] = ()
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "detail_code")
+
+    @model_validator(mode="after")
+    def validate_conflicts(self) -> _DurableFailure:
+        if self.phase == "publication" and self.outcome != "failed":
+            raise ValueError("Durable publication failures require a failed outcome.")
+        if (self.outcome == "conflicted") != bool(self.conflicts):
+            raise ValueError("Durable creation conflicts require a conflicted outcome.")
+        return self
+
+
+def _parse_durable_branch_timestamp(value: str, field_name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"Durable {field_name} must be a canonical UTC timestamp.") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"Durable {field_name} must be a canonical UTC timestamp.")
+    if parsed.isoformat() != value:
+        raise ValueError(f"Durable {field_name} must be a canonical UTC timestamp.")
+    return parsed
+
+
+class _DurableBranchRecord(BaseModel):
+    """Complete reconstructible authority for one local branch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    branch_id: str = Field(max_length=256)
+    creation_idempotency_key: str = Field(max_length=512)
+    state: WorkspaceBranchDurableState
+    source: WorkspaceIdentity
+    source_root: str
+    baseline_revision: str
+    authority: WorkspaceBranchAuthority
+    limits: WorkspaceBranchLimits
+    private_root: str
+    private_root_owner: str = Field(pattern=r"^[0-9a-f]{32}$")
+    capture_attempt_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    root_device: StrictInt
+    root_inode: StrictInt
+    created_at: str
+    expires_at: str
+    overlay: dict[str, _DurableFileIdentity] = Field(default_factory=dict)
+    tombstones: tuple[str, ...] = ()
+    publication_attempts: tuple[_DurablePublicationAttempt, ...] = ()
+    publication: _DurablePublication | None = None
+    rollback: _DurableRollback | None = None
+    failure: _DurableFailure | None = None
+    revision: StrictInt = Field(ge=0)
+
+    @field_validator(
+        "branch_id",
+        "creation_idempotency_key",
+        "source_root",
+        "baseline_revision",
+        "private_root",
+        "created_at",
+        "expires_at",
+    )
+    @classmethod
+    def validate_text(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_lifecycle_invariants(self) -> _DurableBranchRecord:
+        created_at = _parse_durable_branch_timestamp(self.created_at, "created_at")
+        expires_at = _parse_durable_branch_timestamp(self.expires_at, "expires_at")
+        if expires_at - created_at != timedelta(milliseconds=self.limits.lifetime_ms):
+            raise ValueError("Durable branch lifetime authority is invalid.")
+        if (self.state is WorkspaceBranchDurableState.FAILED) != (self.failure is not None):
+            raise ValueError("Durable failed state requires exact failure evidence.")
+        rollback_states = {
+            WorkspaceBranchDurableState.ROLLBACK_INTENT,
+            WorkspaceBranchDurableState.ROLLED_BACK,
+            WorkspaceBranchDurableState.EXPIRED,
+        }
+        if (self.rollback is not None) != (self.state in rollback_states):
+            raise ValueError("Durable rollback evidence does not match its lifecycle state.")
+        if self.state in {
+            WorkspaceBranchDurableState.ROLLED_BACK,
+            WorkspaceBranchDurableState.EXPIRED,
+        }:
+            expected_reason = (
+                "expired" if self.state is WorkspaceBranchDurableState.EXPIRED else "explicit"
+            )
+            if self.rollback is None:  # pragma: no cover - rollback-state invariant above
+                raise AssertionError("Durable rollback evidence disappeared.")
+            if self.rollback.reason != expected_reason:
+                raise ValueError("Durable rollback terminal reason does not match its state.")
+        publication_required_states = {
+            WorkspaceBranchDurableState.PUBLICATION_INTENT,
+            WorkspaceBranchDurableState.PUBLICATION_PROGRESS,
+            WorkspaceBranchDurableState.COMMITTED,
+            WorkspaceBranchDurableState.CONFLICTED,
+        }
+        if self.state in publication_required_states and self.publication is None:
+            raise ValueError("Durable publication state requires publication evidence.")
+        if (
+            self.state
+            in {
+                WorkspaceBranchDurableState.CREATING,
+                WorkspaceBranchDurableState.OPEN,
+            }
+            and self.publication is not None
+        ):
+            raise ValueError(
+                "Durable publication evidence is incompatible with its lifecycle state."
+            )
+        if self.failure is not None:
+            if self.failure.phase == "creation" and self.publication is not None:
+                raise ValueError("Durable creation failure cannot carry publication evidence.")
+            if self.failure.phase == "publication" and self.publication is None:
+                raise ValueError("Durable publication failure requires publication evidence.")
+        attempt_keys = tuple(attempt.idempotency_key for attempt in self.publication_attempts)
+        if len(set(attempt_keys)) != len(attempt_keys):
+            raise ValueError("Durable publication attempt identities must be unique.")
+        if len(self.publication_attempts) > self.limits.max_publication_attempts:
+            raise ValueError("Durable publication attempt evidence exceeds its limit.")
+        if self.publication is not None and not any(
+            attempt.idempotency_key == self.publication.idempotency_key
+            and attempt.change_set_digest == self.publication.change_set.digest
+            for attempt in self.publication_attempts
+        ):
+            raise ValueError("Durable publication is missing its attempt identity.")
+        if self.publication is not None and self.publication.staging_owner != (
+            _durable_publication_staging_owner(
+                private_root_owner=self.private_root_owner,
+                idempotency_key=self.publication.idempotency_key,
+                change_set_digest=self.publication.change_set.digest,
+            )
+        ):
+            raise ValueError("Durable publication staging authority is invalid.")
+        retained_paths = tuple(self.overlay) + self.tombstones
+        if len(set(retained_paths)) != len(retained_paths):
+            raise ValueError("Durable private paths must be unique.")
+        if self.tombstones != tuple(sorted(self.tombstones)):
+            raise ValueError("Durable tombstones must be path ordered.")
+        if len(retained_paths) > self.limits.max_paths:
+            raise ValueError("Durable private path evidence exceeds its limit.")
+        if len(self.overlay) > self.limits.max_files:
+            raise ValueError("Durable overlay file evidence exceeds its limit.")
+        if (
+            sum(identity.bytes for identity in self.overlay.values())
+            > self.limits.max_overlay_bytes
+        ):
+            raise ValueError("Durable overlay byte evidence exceeds its limit.")
+        for path, identity in self.overlay.items():
+            self._validate_retained_path(path)
+            if identity.bytes > self.limits.max_file_bytes:
+                raise ValueError("Durable overlay file evidence exceeds its byte limit.")
+        for path in self.tombstones:
+            self._validate_retained_path(path)
+        if self.publication is not None:
+            change_set = self.publication.change_set
+            if (
+                change_set.branch_id != self.branch_id
+                or change_set.source != self.source
+                or change_set.baseline_revision != self.baseline_revision
+            ):
+                raise ValueError("Durable publication authority does not match its branch.")
+            if len(change_set.changes) > self.limits.max_changed_paths:
+                raise ValueError("Durable publication change evidence exceeds its limit.")
+            retained_path_set = set(retained_paths)
+            if {change.path for change in change_set.changes} != retained_path_set:
+                raise ValueError("Durable publication paths do not match retained branch state.")
+            for change in change_set.changes:
+                self._validate_retained_path(change.path)
+                retained_identity = self.overlay.get(change.path)
+                if change.operation == "deleted":
+                    if change.path not in self.tombstones or retained_identity is not None:
+                        raise ValueError("Durable deletion evidence does not match its tombstone.")
+                    continue
+                if (
+                    retained_identity is None
+                    or change.path in self.tombstones
+                    or change.after is None
+                    or change.after.sha256 != retained_identity.sha256
+                    or change.after.bytes != retained_identity.bytes
+                ):
+                    raise ValueError(
+                        "Durable publication content does not match retained branch state."
+                    )
+        if self.rollback is not None:
+            if self.rollback.paths != tuple(sorted(set(self.rollback.paths))):
+                raise ValueError("Durable rollback paths must be unique and path ordered.")
+            if self.rollback.paths != tuple(sorted(retained_paths)):
+                raise ValueError("Durable rollback paths do not match retained branch state.")
+            if len(self.rollback.paths) > self.limits.max_changed_paths:
+                raise ValueError("Durable rollback path evidence exceeds its limit.")
+            for path in self.rollback.paths:
+                self._validate_retained_path(path)
+        return self
+
+    def _validate_retained_path(self, path: str) -> None:
+        if _validate_workspace_relative_path(path) != path:
+            raise ValueError("Durable workspace branch paths must be canonical.")
+        if len(path.encode("utf-8")) > self.limits.max_path_bytes:
+            raise ValueError("Durable workspace branch path evidence exceeds its byte limit.")
+
+
+def _durable_branch_creation_identity(record: _DurableBranchRecord) -> tuple[object, ...]:
+    """Return every immutable field owned by one durable creation attempt."""
+
+    authority = record.authority
+    return (
+        record.schema_version,
+        record.branch_id,
+        record.creation_idempotency_key,
+        record.source.workspace_id,
+        record.source.observer,
+        record.source_root,
+        record.baseline_revision,
+        record.private_root,
+        record.private_root_owner,
+        record.capture_attempt_id,
+        record.root_device,
+        record.root_inode,
+        record.created_at,
+        record.expires_at,
+        authority.session_id,
+        authority.expected_run_epoch,
+        authority.environment_name,
+        authority.binding_generation,
+        authority.binding_identity,
+        authority.creating_authority,
+        authority.resource_policy,
+        tuple((name, getattr(record.limits, name)) for name in WorkspaceBranchLimits.model_fields),
+    )
+
+
+def _durable_branch_capacity_identity(record: _DurableBranchRecord) -> tuple[object, ...]:
+    """Return the immutable authority tuple for one logical durable branch."""
+
+    return ("durable", *_durable_branch_creation_identity(record))
+
+
+def _durable_terminal_lifecycle(
+    record: _DurableBranchRecord,
+) -> WorkspaceBranchLifecycleStatus:
+    if record.state is WorkspaceBranchDurableState.COMMITTED:
+        return WorkspaceBranchLifecycleStatus.COMMITTED
+    if record.state in {
+        WorkspaceBranchDurableState.ROLLED_BACK,
+        WorkspaceBranchDurableState.EXPIRED,
+    }:
+        return WorkspaceBranchLifecycleStatus.ROLLED_BACK
+    if record.state in {
+        WorkspaceBranchDurableState.FAILED,
+        WorkspaceBranchDurableState.AMBIGUOUS,
+    }:
+        return WorkspaceBranchLifecycleStatus.FENCED
+    raise AssertionError("Durable branch record is not terminal.")
+
+
+def _mark_matching_branch_owner_terminal(
+    source_key: tuple[object, ...],
+    record: _DurableBranchRecord,
+) -> _BranchCapacityOwner | None:
+    with _SOURCE_MANAGER_LOCK:
+        owner = _ACTIVE_BRANCHES.get(source_key, {}).get(_durable_branch_capacity_identity(record))
+        if owner is not None:
+            owner.mark_terminal(_durable_terminal_lifecycle(record))
+    return owner
+
+
+def _changes_for_retained_branch_state(
+    baseline: dict[str, _FileIdentity],
+    overlay: dict[str, _FileIdentity],
+    tombstones: set[str],
+) -> tuple[WorkspaceBranchChange, ...]:
+    changes: list[WorkspaceBranchChange] = []
+    for path in sorted(overlay.keys() | tombstones):
+        before = baseline.get(path)
+        after = overlay.get(path)
+        if path in tombstones:
+            if before is None:
+                continue
+            operation = "deleted"
+        elif before is None:
+            operation = "created"
+        else:
+            operation = "modified"
+        changes.append(
+            WorkspaceBranchChange(
+                path=path,
+                operation=operation,
+                before=None if before is None else before.public(),
+                after=None if after is None else after.public(),
+            )
+        )
+    return tuple(changes)
+
+
+def _validate_retained_publication_evidence(
+    record: _DurableBranchRecord,
+    baseline: dict[str, _FileIdentity],
+    overlay: dict[str, _FileIdentity],
+) -> None:
+    publication = record.publication
+    if publication is None:
+        return
+    expected_changes = _changes_for_retained_branch_state(
+        baseline,
+        overlay,
+        set(record.tombstones),
+    )
+    if publication.change_set.changes != expected_changes:
+        raise WorkspaceBranchFencedError(
+            "Durable publication evidence conflicts with retained branch state."
+        )
+
+
+@dataclass(slots=True)
+class _DurableBranchContext:
+    store: WorkspaceBranchStore
+    record: _DurableBranchRecord
+    storage_key: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class _DurablePublicationConflict(RuntimeError):
+    def __init__(self, conflicts: tuple[WorkspaceBranchConflict, ...]) -> None:
+        self.conflicts = conflicts
+        super().__init__("durable workspace publication conflicted")
+
+
+class _DurablePublicationAmbiguous(RuntimeError):
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        self.paths = paths
+        super().__init__("durable workspace publication is ambiguous")
+
+
+class _DurablePublicationFailed(RuntimeError):
+    def __init__(self, detail_code: str) -> None:
+        self.detail_code = require_durable_clean_nonblank(detail_code, "detail_code")
+        super().__init__(detail_code)
+
+
+def _durable_branch_storage_key(branch_id: str) -> str:
+    return "workspace-branch:" + hashlib.sha256(branch_id.encode("utf-8")).hexdigest()
+
+
+def _durable_private_root(
+    source_root: Path,
+    branch_id: str,
+    authority: WorkspaceBranchAuthority,
+) -> Path:
+    identity = hashlib.sha256(
+        canonical_durable_json_bytes(
+            {
+                "source_root": str(source_root),
+                "branch_id": branch_id,
+                "authority": authority.model_dump(mode="json"),
+            },
+            "workspace_branch.private_root",
+        )
+    ).hexdigest()[:32]
+    return source_root.parent / f".cayu-workspace-branch-{identity}"
+
+
+def _durable_record_wrapper(record: _DurableBranchRecord) -> dict[str, object]:
+    payload = record.model_dump(mode="json", warnings=False)
+    digest = hashlib.sha256(
+        canonical_durable_json_bytes(payload, "workspace_branch.record")
+    ).hexdigest()
+    return {
+        "record_type": "cayu.local-workspace-branch",
+        "payload": payload,
+        "record_digest": digest,
+    }
+
+
+def _durable_record_from_wrapper(raw: object) -> _DurableBranchRecord:
+    if type(raw) is not dict or set(raw) != {"record_type", "payload", "record_digest"}:
+        raise WorkspaceBranchFencedError("Durable workspace branch record is corrupt.")
+    record = cast("dict[str, object]", raw)
+    if record.get("record_type") != "cayu.local-workspace-branch":
+        raise WorkspaceBranchFencedError("Durable workspace branch record type is invalid.")
+    payload = record.get("payload")
+    digest = record.get("record_digest")
+    if type(payload) is not dict or type(digest) is not str:
+        raise WorkspaceBranchFencedError("Durable workspace branch record is corrupt.")
+    expected = hashlib.sha256(
+        canonical_durable_json_bytes(payload, "workspace_branch.record")
+    ).hexdigest()
+    if digest != expected:
+        raise WorkspaceBranchFencedError("Durable workspace branch record digest is invalid.")
+    try:
+        return _DurableBranchRecord.model_validate(payload)
+    except ValidationError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable workspace branch record schema is invalid."
+        ) from error
+
+
+def _validated_durable_branch_record(record: _DurableBranchRecord) -> _DurableBranchRecord:
+    """Revalidate an internally copied record before it reaches durable storage."""
+
+    return _DurableBranchRecord.model_validate(record.model_dump(mode="python", warnings=False))
+
+
+async def _load_durable_branch_record(
+    store: WorkspaceBranchStore,
+    *,
+    session_id: str,
+    storage_key: str,
+) -> _DurableBranchRecord | None:
+    raw = await store.load_workspace_branch_record(session_id, storage_key)
+    return None if raw is None else _durable_record_from_wrapper(raw)
+
+
+async def _publish_durable_branch_record(
+    store: WorkspaceBranchStore,
+    *,
+    session_id: str,
+    storage_key: str,
+    expected: _DurableBranchRecord | None,
+    updated: _DurableBranchRecord,
+    expected_run_epoch: int,
+    commit_guard: Callable[[], None] | None = None,
+) -> _DurableBranchRecord:
+    updated = _validated_durable_branch_record(updated)
+    wrapper = _durable_record_wrapper(updated)
+
+    def transform(current_raw: dict[str, Any] | None) -> dict[str, Any]:
+        if current_raw is None:
+            if expected is not None:
+                raise WorkspaceBranchOperationConflict(
+                    "Durable workspace branch record disappeared during transition."
+                )
+        else:
+            current = _durable_record_from_wrapper(current_raw)
+            if current == updated:
+                return current_raw
+            if expected is None or current != expected:
+                raise WorkspaceBranchOperationConflict(
+                    "Durable workspace branch changed under another operation."
+                )
+        return wrapper
+
+    await store.publish_workspace_branch_record(
+        session_id,
+        storage_key,
+        record_transform=transform,
+        commit_guard=commit_guard,
+        expected_run_epoch=expected_run_epoch,
+    )
+    return updated
+
+
+def _raise_primary_with_reconciliation_failure(
+    signal: BaseException,
+    reconciliation_error: BaseException,
+) -> NoReturn:
+    """Keep the original operation signal authoritative during reconciliation."""
+
+    if not isinstance(reconciliation_error, Exception):
+        raise reconciliation_error from signal
+    if reconciliation_error.__cause__ is None and reconciliation_error.__context__ is signal:
+        reconciliation_error.__context__ = None
+    existing_evidence = (
+        signal.__cause__
+        if signal.__cause__ is not None
+        else (
+            signal.__context__
+            if signal.__context__ is not None and not signal.__suppress_context__
+            else None
+        )
+    )
+    secondary_evidence: BaseException = reconciliation_error
+    if (
+        existing_evidence is not None
+        and existing_evidence is not reconciliation_error
+        and existing_evidence is not signal
+    ):
+        secondary_evidence = BaseExceptionGroup(
+            "Durable branch publication and reconciliation failures.",
+            [existing_evidence, reconciliation_error],
+        )
+    raise signal from secondary_evidence
+
+
+def _publication_staging_cleanup_error(
+    signal: BaseException,
+) -> _LocalGuardStagingCleanupError | None:
+    """Find cleanup evidence delivered by this guarded publication attempt."""
+
+    pending = [signal]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(candidate, _LocalGuardStagingCleanupError):
+            return candidate
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(reversed(children))
+        if candidate.__cause__ is not None:
+            pending.append(candidate.__cause__)
+        elif candidate.__context__ is not None and not candidate.__suppress_context__:
+            pending.append(candidate.__context__)
+    return None
+
+
+async def _publish_or_reconcile_exact_record(
+    store: WorkspaceBranchStore,
+    *,
+    session_id: str,
+    storage_key: str,
+    expected: _DurableBranchRecord | None,
+    updated: _DurableBranchRecord,
+    expected_run_epoch: int,
+    commit_guard: Callable[[], None] | None = None,
+    on_exact_control_signal: Callable[[_DurableBranchRecord], Awaitable[None]] | None = None,
+    retain_uncertain_owner: Callable[[], None] | None = None,
+) -> _DurableBranchRecord:
+    """Publish one transition or prove its exact commit after acknowledgement loss."""
+
+    updated = _validated_durable_branch_record(updated)
+    guard_completed = commit_guard is None
+
+    def guarded_commit() -> None:
+        nonlocal guard_completed
+        if commit_guard is None:  # pragma: no cover - wrapper construction invariant
+            raise AssertionError("Durable branch commit guard disappeared.")
+        commit_guard()
+        guard_completed = True
+
+    try:
+        await _publish_durable_branch_record(
+            store,
+            session_id=session_id,
+            storage_key=storage_key,
+            expected=expected,
+            updated=updated,
+            expected_run_epoch=expected_run_epoch,
+            commit_guard=None if commit_guard is None else guarded_commit,
+        )
+    except BaseException as signal:
+
+        def retain_owner() -> BaseException | None:
+            if retain_uncertain_owner is None:
+                return None
+            try:
+                retain_uncertain_owner()
+            except BaseException as ownership_error:
+                return ownership_error
+            return None
+
+        try:
+            loaded = await _load_durable_branch_record(
+                store,
+                session_id=session_id,
+                storage_key=storage_key,
+            )
+        except BaseException as reconciliation_error:
+            ownership_error = retain_owner()
+            if ownership_error is not None:
+                reconciliation_error = BaseExceptionGroup(
+                    "Durable branch reconciliation and ownership-transfer failures.",
+                    [reconciliation_error, ownership_error],
+                )
+            _raise_primary_with_reconciliation_failure(signal, reconciliation_error)
+        if loaded is None or loaded != updated or not guard_completed:
+            ownership_error = retain_owner()
+            if ownership_error is not None:
+                _raise_primary_with_reconciliation_failure(signal, ownership_error)
+            raise
+        if not isinstance(signal, Exception):
+            if on_exact_control_signal is not None:
+                try:
+                    await on_exact_control_signal(loaded)
+                except BaseException as settlement_error:
+                    _raise_primary_with_reconciliation_failure(signal, settlement_error)
+            raise
+        return loaded
+    return updated
 
 
 class _PublicationConflictAccumulator:
@@ -374,40 +1198,1967 @@ class _PublicationConflictAccumulator:
         return tuple(self._conflicts[path][0] for path in sorted(self._conflicts))
 
 
-class _BranchCapacityLease:
-    """Release one admitted source slot only after its private tree is gone."""
+class _BranchCapacityOwner:
+    """One process-local capacity slot shared by an exact durable branch."""
 
-    def __init__(self, source_key: tuple[object, ...]) -> None:
-        self._source_key = source_key
+    def __init__(self, source_key: tuple[object, ...], identity: Hashable) -> None:
+        self.source_key = source_key
+        self.identity = identity
+        self.attachments = 0
+        self.released = False
+        self.cleanup_settlement_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._terminal_lifecycle: WorkspaceBranchLifecycleStatus | None = None
+        self._active_generation = 0
+        self._generation_uncertain = False
+
+    def attachment_generation(self) -> int:
+        with self._lifecycle_lock:
+            return self._active_generation
+
+    def mark_terminal(self, lifecycle: WorkspaceBranchLifecycleStatus) -> None:
+        if lifecycle not in {
+            WorkspaceBranchLifecycleStatus.COMMITTED,
+            WorkspaceBranchLifecycleStatus.ROLLED_BACK,
+            WorkspaceBranchLifecycleStatus.FENCED,
+        }:
+            raise AssertionError("Shared branch lifecycle must be terminal or fenced.")
+        with self._lifecycle_lock:
+            if self._terminal_lifecycle is None:
+                self._terminal_lifecycle = lifecycle
+            elif self._terminal_lifecycle is not lifecycle:
+                self._terminal_lifecycle = WorkspaceBranchLifecycleStatus.FENCED
+            self._generation_uncertain = False
+
+    def mark_uncertain(self) -> None:
+        with self._lifecycle_lock:
+            if self._terminal_lifecycle is None:
+                self._generation_uncertain = True
+
+    def lifecycle_for_generation(
+        self,
+        generation: int,
+    ) -> WorkspaceBranchLifecycleStatus | None:
+        with self._lifecycle_lock:
+            if self._terminal_lifecycle is not None:
+                return self._terminal_lifecycle
+            if self._generation_uncertain or generation != self._active_generation:
+                return WorkspaceBranchLifecycleStatus.FENCED
+            return None
+
+    def recover_generation(self, generation: int) -> int:
+        """Activate one reconstructed generation without reviving stale attachments."""
+
+        with self._lifecycle_lock:
+            terminal = self._terminal_lifecycle
+            if terminal is WorkspaceBranchLifecycleStatus.FENCED:
+                raise WorkspaceBranchFencedError("Workspace branch is fenced.")
+            if terminal is not None:
+                raise WorkspaceBranchClosedError(
+                    f"Workspace branch is not active: {terminal.value}."
+                )
+            if self._generation_uncertain:
+                if generation != self._active_generation:
+                    raise WorkspaceBranchFencedError(
+                        "Workspace branch recovery attachment is stale."
+                    )
+                self._active_generation += 1
+                self._generation_uncertain = False
+            return self._active_generation
+
+
+class _BranchCapacityLease:
+    """Attach one handle or construction attempt to one logical branch slot."""
+
+    def __init__(self, owner: _BranchCapacityOwner, generation: int) -> None:
+        self._owner = owner
+        self._generation = generation
+        self._source_key = owner.source_key
+        self._cleanup_settlement_lock = owner.cleanup_settlement_lock
         self._lock = threading.Lock()
-        self._cleanup_settlement_lock = threading.Lock()
+        self._active = False
         self._retained_for_cleanup = False
-        self._released = False
+        self._settled = False
+
+    def activate(self) -> None:
+        with self._lock:
+            if self._settled:
+                raise RuntimeError("Workspace branch capacity attachment was already settled.")
+            self._active = True
+
+    def mark_terminal(self, lifecycle: WorkspaceBranchLifecycleStatus) -> None:
+        self._owner.mark_terminal(lifecycle)
+
+    def mark_uncertain(self) -> None:
+        self._owner.mark_uncertain()
+
+    def terminal_lifecycle(self) -> WorkspaceBranchLifecycleStatus | None:
+        return self._owner.lifecycle_for_generation(self._generation)
+
+    def adopt_recovered_generation(self) -> None:
+        with self._lock:
+            if self._settled or self._retained_for_cleanup or self._active:
+                raise RuntimeError(
+                    "Workspace branch recovery generation cannot replace an active attachment."
+                )
+            self._generation = self._owner.recover_generation(self._generation)
 
     def retain_for_cleanup(self) -> None:
         with self._lock:
-            if not self._released:
+            if not self._settled:
                 self._retained_for_cleanup = True
 
     def release_owner(self) -> None:
         with self._lock:
-            if self._released or self._retained_for_cleanup:
+            if self._settled or self._retained_for_cleanup:
                 return
-            self._released = True
-        _release_branch(self._source_key)
+            self._settled = True
+            terminal = self._active
+        _release_branch_attachment(self._owner, terminal=terminal)
 
     def release_after_cleanup(self) -> None:
         with self._lock:
+            if self._settled:
+                return
+            self._settled = True
+            terminal = self._active
+        _release_branch_attachment(self._owner, terminal=terminal)
+
+    def released(self) -> bool:
+        with self._lock:
+            return self._settled
+
+
+class _BindingAuthorityClaimLease:
+    """Transfer one exact binding claim to retained terminal settlement."""
+
+    def __init__(
+        self,
+        claim: WorkspaceBranchBindingAuthorityClaim,
+        expected: WorkspaceBranchBindingAuthority,
+        source_key: tuple[object, ...],
+    ) -> None:
+        if not isinstance(claim, WorkspaceBranchBindingAuthorityClaim):
+            raise TypeError(
+                "Workspace branch binding authority claims must support transferable release."
+            )
+        self._claim = claim
+        self._expected = expected
+        self._source_key = source_key
+        self._lock = threading.Lock()
+        self._retained_for_settlement = False
+        self._released = False
+
+    def validate(self, authority: WorkspaceBranchAuthority) -> None:
+        expected = self._expected
+        with self._lock:
+            if self._released:
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch binding authority claim is no longer active."
+                )
+        if (
+            expected.environment_name != authority.environment_name
+            or expected.binding_generation != authority.binding_generation
+            or expected.binding_identity != authority.binding_identity
+        ):
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch binding authority claim does not match the operation."
+            )
+
+    def retain_for_settlement(self) -> None:
+        with self._lock:
+            if self._released:
+                raise RuntimeError("Binding authority claim was already released.")
+            self._retained_for_settlement = True
+
+    def release_owner(self) -> None:
+        with self._lock:
+            if self._released or self._retained_for_settlement:
+                return
+            self._claim.release()
+            self._released = True
+
+    def release_after_settlement(self) -> None:
+        with self._lock:
             if self._released:
                 return
+            self._claim.release()
             self._released = True
-        _release_branch(self._source_key)
+
+    @property
+    def source_key(self) -> tuple[object, ...]:
+        return self._source_key
+
+
+@dataclass(slots=True)
+class _RetainedDurableTerminalSettlement:
+    """Process-local owner for one exact terminal transition and cleanup."""
+
+    branch: LocalWorkspaceBranch
+    terminal_record: _DurableBranchRecord
+    publication_expected: _DurableBranchRecord | None = field(compare=False)
+    binding_claim_lease: _BindingAuthorityClaimLease = field(compare=False)
+
+
+@dataclass(slots=True)
+class _RetainedDurableRecoveryCleanup:
+    """Own one fresh-process terminal cleanup and its exact binding claim."""
+
+    source: LocalWorkspace = field(compare=False)
+    record: _DurableBranchRecord
+    binding_claim_lease: _BindingAuthorityClaimLease = field(compare=False)
 
 
 _PRIVATE_TREE_CLEANUPS: _RetainedCleanupRegistry[
     tuple[Path, int],
-    tuple[Path, _BranchCapacityLease],
+    tuple[Path, _BranchCapacityLease, str | None],
 ] = _RetainedCleanupRegistry()
+
+_DURABLE_TERMINAL_SETTLEMENTS: _RetainedCleanupRegistry[
+    tuple[Path, int],
+    _RetainedDurableTerminalSettlement,
+] = _RetainedCleanupRegistry()
+_DURABLE_RECOVERY_CLEANUPS: _RetainedCleanupRegistry[
+    tuple[Path, str],
+    _RetainedDurableRecoveryCleanup,
+] = _RetainedCleanupRegistry()
+_BINDING_CLAIM_RELEASES: _RetainedCleanupRegistry[
+    tuple[tuple[object, ...], int],
+    _BindingAuthorityClaimLease,
+] = _RetainedCleanupRegistry()
+
+
+def _scan_private_tree(
+    root: Path,
+    limits: WorkspaceBranchLimits,
+    *,
+    max_total_bytes: int,
+    total_limit_detail_code: str,
+) -> tuple[dict[str, _FileIdentity], frozenset[str]]:
+    try:
+        root_fd = os.open(root, _PRIVATE_DIRECTORY_OPEN_FLAGS)
+    except OSError as error:
+        raise WorkspaceBranchFencedError("Durable workspace branch tree is unavailable.") from error
+    try:
+        root_identity = os.fstat(root_fd)
+    except OSError as error:
+        os.close(root_fd)
+        raise WorkspaceBranchFencedError("Durable workspace branch tree is unavailable.") from error
+    files: dict[str, _FileIdentity] = {}
+    directories: set[str] = set()
+    total_bytes = 0
+    scanned_paths = 0
+    pending_directories: list[tuple[str, tuple[int, int]]] = [
+        ("", (root_identity.st_dev, root_identity.st_ino))
+    ]
+    try:
+        while pending_directories:
+            prefix, expected_directory_identity = pending_directories.pop()
+            try:
+                directory_fd = (
+                    os.dup(root_fd) if not prefix else _open_captured_directory(root_fd, prefix)
+                )
+            except OSError as error:
+                raise WorkspaceBranchFencedError(
+                    "Durable workspace branch directory changed during reconstruction."
+                ) from error
+            try:
+                opened_directory = os.fstat(directory_fd)
+                if (
+                    opened_directory.st_dev,
+                    opened_directory.st_ino,
+                ) != expected_directory_identity:
+                    raise WorkspaceBranchFencedError(
+                        "Durable workspace branch directory changed during reconstruction."
+                    )
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        relative = f"{prefix}/{entry.name}" if prefix else entry.name
+                        _validate_private_scanned_path(relative, limits)
+                        scanned_paths += 1
+                        if scanned_paths > limits.max_paths:
+                            raise WorkspaceBranchResourceExhaustedError("path_count_limit_exceeded")
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                        except OSError as error:
+                            raise WorkspaceBranchFencedError(
+                                "Durable workspace branch path changed during reconstruction."
+                            ) from error
+                        if stat.S_ISDIR(info.st_mode):
+                            child_identity = _open_private_scanned_directory(
+                                directory_fd,
+                                entry.name,
+                                info,
+                            )
+                            directories.add(relative)
+                            pending_directories.append((relative, child_identity))
+                            continue
+                        if not stat.S_ISREG(info.st_mode):
+                            raise WorkspaceBranchFencedError(
+                                "Durable workspace branch contains an unsafe private file."
+                            )
+                        if len(files) >= limits.max_files:
+                            raise WorkspaceBranchResourceExhaustedError("file_count_limit_exceeded")
+                        remaining_total_bytes = max_total_bytes - total_bytes
+                        if info.st_size > limits.max_file_bytes:
+                            raise WorkspaceBranchResourceExhaustedError("file_byte_limit_exceeded")
+                        if info.st_size > remaining_total_bytes:
+                            raise WorkspaceBranchResourceExhaustedError(total_limit_detail_code)
+                        identity = _scan_private_regular(
+                            directory_fd,
+                            entry.name,
+                            expected=info,
+                            max_bytes=min(limits.max_file_bytes, remaining_total_bytes),
+                            limit_detail_code=(
+                                "file_byte_limit_exceeded"
+                                if limits.max_file_bytes <= remaining_total_bytes
+                                else total_limit_detail_code
+                            ),
+                        )
+                        total_bytes += identity.bytes
+                        files[relative] = identity
+            finally:
+                os.close(directory_fd)
+        try:
+            current_root = os.stat(root, follow_symlinks=False)
+        except OSError as error:
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch tree changed during reconstruction."
+            ) from error
+        if not os.path.samestat(root_identity, current_root):
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch tree changed during reconstruction."
+            )
+        return files, frozenset(directories)
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable workspace branch tree changed during reconstruction."
+        ) from error
+    finally:
+        os.close(root_fd)
+
+
+def _validate_private_scanned_path(path: str, limits: WorkspaceBranchLimits) -> None:
+    try:
+        _validate_captured_path(path, limits)
+    except (TypeError, ValueError, _UnsupportedBranch) as error:
+        raise WorkspaceBranchFencedError(
+            "Durable workspace branch contains an unsafe private path."
+        ) from error
+
+
+def _open_private_scanned_directory(
+    directory_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> tuple[int, int]:
+    child_fd = -1
+    try:
+        child_fd = os.open(name, _PRIVATE_DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+        opened = os.fstat(child_fd)
+        if not stat.S_ISDIR(opened.st_mode) or not os.path.samestat(expected, opened):
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch directory changed during reconstruction."
+            )
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not os.path.samestat(opened, current):
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch directory changed during reconstruction."
+            )
+        return opened.st_dev, opened.st_ino
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable workspace branch directory changed during reconstruction."
+        ) from error
+    finally:
+        if child_fd >= 0:
+            os.close(child_fd)
+
+
+def _scan_private_regular(
+    directory_fd: int,
+    name: str,
+    *,
+    expected: os.stat_result,
+    max_bytes: int,
+    limit_detail_code: str,
+) -> _FileIdentity:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=directory_fd,
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(expected, opened):
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch file changed during reconstruction."
+            )
+        if opened.st_size > max_bytes:
+            raise WorkspaceBranchResourceExhaustedError(limit_detail_code)
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1 << 16, max_bytes + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise WorkspaceBranchResourceExhaustedError(limit_detail_code)
+            digest.update(chunk)
+        finished = os.fstat(descriptor)
+        if not os.path.samestat(opened, finished) or finished.st_size != total:
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch file changed during reconstruction."
+            )
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not os.path.samestat(opened, current):
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch file changed during reconstruction."
+            )
+        return _FileIdentity(
+            sha256=digest.hexdigest(),
+            bytes=total,
+            mode=stat.S_IMODE(opened.st_mode),
+        )
+    except WorkspaceBranchResourceExhaustedError:
+        raise
+    except WorkspaceBranchFencedError:
+        raise
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable workspace branch file changed during reconstruction."
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _validated_durable_private_root(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+) -> Path:
+    _validate_durable_source_workspace_identity(source, record)
+    private_root = Path(record.private_root)
+    expected_private_root = _durable_private_root(
+        source.root,
+        record.branch_id,
+        record.authority,
+    )
+    if private_root != expected_private_root or private_root.parent != source.root.parent:
+        raise WorkspaceBranchFencedError("Durable private branch location is invalid.")
+    return private_root
+
+
+def _durable_private_root_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private branch ownership is unavailable."
+        ) from error
+    return True
+
+
+def _remove_durable_private_tree(source: LocalWorkspace, record: _DurableBranchRecord) -> None:
+    _require_durable_terminal_expiry_eligible(record)
+    _validate_durable_source_root_identity(source, record)
+    private_root = _validated_durable_private_root(source, record)
+    if record.publication is not None and _durable_private_root_exists(private_root):
+        try:
+            _captured_from_private_root(source, record, private_root)
+        except WorkspaceBranchFencedError:
+            # An exact concurrent terminal recovery may have authenticated and
+            # quarantined this tree after our existence check. Preserve every
+            # other mismatch as corruption rather than deleting its evidence.
+            if _durable_private_root_exists(private_root):
+                raise
+    _discard_owned_capture_staging(
+        _capture_staging_root(private_root, record.capture_attempt_id),
+        record.private_root_owner,
+    )
+    _remove_private_tree(
+        private_root,
+        private_root_owner=record.private_root_owner,
+    )
+
+
+def _settle_durable_private_tree_removal(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+    capacity_lease: _BranchCapacityLease,
+) -> None:
+    """Serialize authenticated terminal removal with every cleanup owner."""
+
+    with capacity_lease._cleanup_settlement_lock:
+        _remove_durable_private_tree(source, record)
+
+
+def _private_root_owner_bytes(owner: str) -> bytes:
+    return f"cayu.local-workspace-branch-owner.v1\n{owner}\n".encode()
+
+
+def _write_private_root_owner(path: Path, owner: str) -> None:
+    root_fd = os.open(path, _PRIVATE_DIRECTORY_OPEN_FLAGS)
+    try:
+        _write_private_root_owner_to_fd(root_fd, owner)
+    finally:
+        os.close(root_fd)
+
+
+def _write_private_root_owner_to_fd(root_fd: int, owner: str) -> None:
+    marker_fd = -1
+    published = False
+    try:
+        marker_fd = os.open(
+            _PRIVATE_ROOT_OWNER_FILE,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            _PRIVATE_FILE_MODE,
+            dir_fd=root_fd,
+        )
+        with os.fdopen(marker_fd, "wb") as marker:
+            marker_fd = -1
+            marker.write(_private_root_owner_bytes(owner))
+            marker.flush()
+            os.fsync(marker.fileno())
+        os.fsync(root_fd)
+        published = True
+    finally:
+        if marker_fd >= 0:
+            os.close(marker_fd)
+        if not published:
+            with suppress(OSError):
+                os.unlink(_PRIVATE_ROOT_OWNER_FILE, dir_fd=root_fd)
+
+
+def _require_private_root_owner(directory_fd: int, owner: str) -> None:
+    expected = _private_root_owner_bytes(owner)
+    marker_fd = -1
+    try:
+        marker_fd = os.open(
+            _PRIVATE_ROOT_OWNER_FILE,
+            _PRIVATE_OWNER_OPEN_FLAGS,
+            dir_fd=directory_fd,
+        )
+        marker_info = os.fstat(marker_fd)
+        if not stat.S_ISREG(marker_info.st_mode) or marker_info.st_size != len(expected):
+            raise WorkspaceBranchFencedError(
+                "Durable private branch ownership evidence is invalid."
+            )
+        content = bytearray()
+        while len(content) <= len(expected):
+            chunk = os.read(marker_fd, len(expected) + 1 - len(content))
+            if not chunk:
+                break
+            content.extend(chunk)
+        current = os.stat(
+            _PRIVATE_ROOT_OWNER_FILE,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if not os.path.samestat(marker_info, current) or bytes(content) != expected:
+            raise WorkspaceBranchFencedError(
+                "Durable private branch ownership evidence is invalid."
+            )
+    except FileNotFoundError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private branch ownership evidence is missing."
+        ) from error
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private branch ownership evidence is unavailable."
+        ) from error
+    finally:
+        if marker_fd >= 0:
+            os.close(marker_fd)
+
+
+def _validate_private_root_owner(path: Path, owner: str) -> None:
+    try:
+        directory_fd = os.open(path, _PRIVATE_DIRECTORY_OPEN_FLAGS)
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private branch ownership is unavailable."
+        ) from error
+    try:
+        _require_private_root_owner(directory_fd, owner)
+    finally:
+        os.close(directory_fd)
+
+
+def _call_private_root_rename(function_name: str, arguments: tuple[object, ...]) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = getattr(libc, function_name)
+    except AttributeError as error:
+        raise _UnsupportedBranch("atomic_private_root_publication_unavailable") from error
+    function.restype = ctypes.c_int
+    if function(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def _rename_private_root_no_replace(
+    source: Path,
+    target: Path,
+    *,
+    parent_fd: int,
+) -> None:
+    if sys.platform == "darwin":
+        _call_private_root_rename(
+            "renameatx_np",
+            (
+                parent_fd,
+                os.fsencode(source.name),
+                parent_fd,
+                os.fsencode(target.name),
+                _RENAME_EXCL,
+            ),
+        )
+        return
+    if sys.platform.startswith("linux"):
+        _call_private_root_rename(
+            "renameat2",
+            (
+                parent_fd,
+                os.fsencode(source.name),
+                parent_fd,
+                os.fsencode(target.name),
+                _RENAME_NOREPLACE,
+            ),
+        )
+        return
+    raise _UnsupportedBranch("atomic_private_root_publication_unavailable")
+
+
+def _capture_staging_root(private_root: Path, capture_attempt_id: str) -> Path:
+    return private_root.with_name(f"{private_root.name}.capture-{capture_attempt_id}")
+
+
+def _remove_incomplete_capture_staging(path: Path, owner: str) -> None:
+    """Remove only the exact pre-owner shape of one durable capture attempt."""
+
+    parent_fd = os.open(path.parent, _PRIVATE_DIRECTORY_OPEN_FLAGS)
+    directory_fd = -1
+    marker_fd = -1
+    try:
+        try:
+            directory_fd = os.open(
+                path.name,
+                _PRIVATE_DIRECTORY_OPEN_FLAGS,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return
+        owned_identity = os.fstat(directory_fd)
+        with os.scandir(directory_fd) as entries:
+            names = [entry.name for entry in entries]
+        if names not in ([], [_PRIVATE_ROOT_OWNER_FILE]):
+            raise WorkspaceBranchFencedError(
+                "Incomplete durable capture staging contains unowned material."
+            )
+        if names:
+            expected = _private_root_owner_bytes(owner)
+            try:
+                marker_fd = os.open(
+                    _PRIVATE_ROOT_OWNER_FILE,
+                    _PRIVATE_OWNER_OPEN_FLAGS,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                _remove_empty_owned_directory(
+                    parent_fd,
+                    path,
+                    directory_fd,
+                    owned_identity,
+                    detail="Incomplete durable capture ownership changed during cleanup.",
+                )
+                return
+            except OSError as error:
+                raise WorkspaceBranchFencedError(
+                    "Incomplete durable capture ownership is unavailable."
+                ) from error
+            marker_info = os.fstat(marker_fd)
+            content = bytearray()
+            while len(content) <= len(expected):
+                chunk = os.read(marker_fd, len(expected) + 1 - len(content))
+                if not chunk:
+                    break
+                content.extend(chunk)
+            if (
+                not stat.S_ISREG(marker_info.st_mode)
+                or len(content) >= len(expected)
+                or not expected.startswith(bytes(content))
+            ):
+                raise WorkspaceBranchFencedError("Incomplete durable capture ownership is invalid.")
+            try:
+                current_marker = os.stat(
+                    _PRIVATE_ROOT_OWNER_FILE,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                _remove_empty_owned_directory(
+                    parent_fd,
+                    path,
+                    directory_fd,
+                    owned_identity,
+                    detail="Incomplete durable capture ownership changed during cleanup.",
+                )
+                return
+            if not os.path.samestat(marker_info, current_marker):
+                raise WorkspaceBranchFencedError(
+                    "Incomplete durable capture ownership changed during cleanup."
+                )
+            try:
+                os.unlink(_PRIVATE_ROOT_OWNER_FILE, dir_fd=directory_fd)
+            except FileNotFoundError:
+                _remove_empty_owned_directory(
+                    parent_fd,
+                    path,
+                    directory_fd,
+                    owned_identity,
+                    detail="Incomplete durable capture ownership changed during cleanup.",
+                )
+                return
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not os.path.samestat(owned_identity, current):
+            raise WorkspaceBranchFencedError(
+                "Incomplete durable capture ownership changed during cleanup."
+            )
+        try:
+            os.rmdir(path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return
+    finally:
+        if marker_fd >= 0:
+            os.close(marker_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
+def _discard_owned_capture_staging(path: Path, owner: str) -> None:
+    try:
+        _remove_private_tree(path, private_root_owner=owner)
+    except _CleanupQuarantineReplacement:
+        raise
+    except WorkspaceBranchFencedError as ownership_error:
+        try:
+            _remove_incomplete_capture_staging(path, owner)
+        except WorkspaceBranchFencedError as incomplete_error:
+            raise ownership_error from incomplete_error
+
+
+def _validate_durable_source_workspace_identity(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+) -> None:
+    if str(source.root) != record.source_root or source.id != record.source.workspace_id:
+        raise WorkspaceBranchOperationConflict(
+            "Durable workspace branch belongs to a different source workspace."
+        )
+
+
+def _validate_durable_source_root_identity(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+) -> None:
+    _validate_durable_source_workspace_identity(source, record)
+    source_info = source.root.stat()
+    if (source_info.st_dev, source_info.st_ino) != (
+        record.root_device,
+        record.root_inode,
+    ):
+        raise WorkspaceBranchFencedError("Local workspace root identity changed.")
+
+
+def _captured_from_private_root(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+    private_root: Path,
+) -> _CapturedBaseline:
+    _validate_durable_source_root_identity(source, record)
+    _validate_private_root_owner(private_root, record.private_root_owner)
+    baseline_root = private_root / "baseline"
+    overlay_root = private_root / "overlay"
+    baseline, directories = _scan_private_tree(
+        baseline_root,
+        record.limits,
+        max_total_bytes=record.limits.max_baseline_bytes,
+        total_limit_detail_code="baseline_byte_limit_exceeded",
+    )
+    if _revision_for_files(baseline) != record.baseline_revision:
+        raise WorkspaceBranchFencedError("Durable branch baseline evidence is corrupt.")
+    overlay, _overlay_directories = _scan_private_tree(
+        overlay_root,
+        record.limits,
+        max_total_bytes=record.limits.max_overlay_bytes,
+        total_limit_detail_code="overlay_byte_limit_exceeded",
+    )
+    expected_overlay = {path: identity.private() for path, identity in record.overlay.items()}
+    if overlay.keys() != expected_overlay.keys() or any(
+        overlay[path].sha256 != expected.sha256 or overlay[path].bytes != expected.bytes
+        for path, expected in expected_overlay.items()
+    ):
+        raise WorkspaceBranchFencedError("Durable branch overlay evidence is ambiguous.")
+    _validate_retained_publication_evidence(record, baseline, overlay)
+    source_semantics = _directory_lookup_semantics(source.root)
+    if source_semantics is _DirectoryLookupSemantics.UNKNOWN or any(
+        _directory_lookup_semantics(path) is not source_semantics
+        for path in (baseline_root, overlay_root)
+    ):
+        raise WorkspaceBranchFencedError("Durable branch path semantics changed.")
+    return _CapturedBaseline(
+        private_root=private_root,
+        private_root_owner=record.private_root_owner,
+        baseline_root=baseline_root,
+        overlay_root=overlay_root,
+        files=baseline,
+        directories=directories,
+        root_identity=(record.root_device, record.root_inode),
+        path_semantics=source_semantics,
+    )
+
+
+def _captured_from_durable_record(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+) -> _CapturedBaseline:
+    return _captured_from_private_root(
+        source,
+        record,
+        _validated_durable_private_root(source, record),
+    )
+
+
+def _binding_authority_claim_lease(
+    source: LocalWorkspace,
+    authority: WorkspaceBranchAuthority,
+) -> _BindingAuthorityClaimLease:
+    source_key = source.resource_key
+    if type(source_key) is not tuple or not source_key:
+        raise WorkspaceBranchFencedError("Workspace source identity is unavailable.")
+    _retry_pending_binding_claim_releases(source_key)
+    provider = source._branch_authority_resolver
+    if provider is None:
+        raise RuntimeError(
+            "Durable workspace branches require LocalWorkspace branch_authority_resolver."
+        )
+    expected = WorkspaceBranchBindingAuthority(
+        environment_name=authority.environment_name,
+        binding_generation=authority.binding_generation,
+        binding_identity=authority.binding_identity,
+    )
+    return _BindingAuthorityClaimLease(provider.claim(expected), expected, source_key)
+
+
+def _binding_claim_release_key(
+    claim: _BindingAuthorityClaimLease,
+) -> tuple[tuple[object, ...], int]:
+    return claim.source_key, id(claim)
+
+
+def _retain_failed_binding_claim_release(claim: _BindingAuthorityClaimLease) -> None:
+    _BINDING_CLAIM_RELEASES.retain(
+        _binding_claim_release_key(claim),
+        source_key=claim.source_key,
+        payload=claim,
+    )
+
+
+def _retry_pending_binding_claim_releases(source_key: tuple[object, ...]) -> None:
+    for key, claim in _BINDING_CLAIM_RELEASES.claim_pending(source_key):
+        try:
+            claim.release_after_settlement()
+        except BaseException:
+            _BINDING_CLAIM_RELEASES.release_claim(key)
+            raise
+        _BINDING_CLAIM_RELEASES.forget(key)
+
+
+def _release_binding_authority_claim_lease(
+    claim: _BindingAuthorityClaimLease,
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    try:
+        claim.release_owner()
+    except BaseException as release_error:
+        _retain_failed_binding_claim_release(claim)
+        if primary is not None:
+            _raise_primary_with_reconciliation_failure(primary, release_error)
+        raise
+
+
+async def _record_durable_creation_failure(
+    store: WorkspaceBranchStore,
+    current: _DurableBranchRecord,
+    storage_key: str,
+    failure: _DurableFailure,
+    *,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> _DurableBranchRecord:
+    binding_claim_lease.validate(current.authority)
+    failed = current.model_copy(
+        update={
+            "state": WorkspaceBranchDurableState.FAILED,
+            "failure": failure,
+            "revision": current.revision + 1,
+        }
+    )
+    return await _publish_or_reconcile_exact_record(
+        store,
+        session_id=current.authority.session_id,
+        storage_key=storage_key,
+        expected=current,
+        updated=failed,
+        expected_run_epoch=current.authority.expected_run_epoch,
+    )
+
+
+async def _complete_durable_creating_record(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+    storage_key: str,
+    capture_authority: _BaselineCaptureAuthority,
+    capacity_lease: _BranchCapacityLease,
+    *,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> tuple[_DurableBranchRecord, _CapturedBaseline | None]:
+    """Complete the exact CREATING capture, including fresh-process replay."""
+
+    if record.state is not WorkspaceBranchDurableState.CREATING:
+        raise AssertionError("Durable creation completion requires a CREATING record.")
+    store = source._branch_store
+    if store is None:  # pragma: no cover - durable caller invariant
+        raise AssertionError("Durable branch store disappeared during creation completion.")
+    _validate_durable_source_root_identity(source, record)
+    private_root = _validated_durable_private_root(source, record)
+    captured: _CapturedBaseline | None = None
+    capture_failure: BaseException | None = None
+
+    def capture_before_open() -> None:
+        nonlocal capture_failure, captured
+        private_root_existed = _durable_private_root_exists(private_root)
+        try:
+            binding_claim_lease.validate(record.authority)
+            if private_root_existed:
+                captured = _captured_from_durable_record(source, record)
+            else:
+                captured = _capture_baseline_at_private_root(
+                    source.root,
+                    capture_authority,
+                    record.branch_id,
+                    capacity_lease,
+                    private_root,
+                    record.private_root_owner,
+                    record.capture_attempt_id,
+                    (record.root_device, record.root_inode),
+                    lambda: binding_claim_lease.validate(record.authority),
+                )
+            try:
+                binding_claim_lease.validate(record.authority)
+            except BaseException as binding_failure:
+                if not private_root_existed and captured is not None:
+                    try:
+                        _discard_captured_baseline(captured, capacity_lease)
+                    except BaseException as cleanup_failure:
+                        raise binding_failure from cleanup_failure
+                    captured = None
+                raise
+        except BaseException as error:
+            capture_failure = error
+            raise
+
+    opened = record.model_copy(
+        update={"state": WorkspaceBranchDurableState.OPEN, "revision": record.revision + 1}
+    )
+    try:
+        settled = await _publish_or_reconcile_exact_record(
+            store,
+            session_id=record.authority.session_id,
+            storage_key=storage_key,
+            expected=record,
+            updated=opened,
+            expected_run_epoch=record.authority.expected_run_epoch,
+            commit_guard=capture_before_open,
+        )
+    except WorkspaceBranchOperationConflict as conflict:
+        try:
+            successor = await _load_durable_branch_record(
+                store,
+                session_id=record.authority.session_id,
+                storage_key=storage_key,
+            )
+        except BaseException as reconciliation_error:
+            _raise_primary_with_reconciliation_failure(conflict, reconciliation_error)
+        if successor is None or _durable_branch_creation_identity(
+            successor
+        ) != _durable_branch_creation_identity(record):
+            raise
+        binding_claim_lease.validate(successor.authority)
+        if successor.state in {
+            WorkspaceBranchDurableState.OPEN,
+            WorkspaceBranchDurableState.CONFLICTED,
+        }:
+            reconstructed = await _await_owned_thread(
+                _captured_from_durable_record,
+                source,
+                successor,
+            )
+            return successor, reconstructed
+        if (
+            successor.state is WorkspaceBranchDurableState.FAILED
+            and successor.failure is not None
+            and successor.failure.phase == "creation"
+        ):
+            return successor, None
+        raise
+    except _CreationConflict as conflict:
+        if conflict is not capture_failure:
+            raise
+        try:
+            evidence = _bounded_workspace_branch_evidence(
+                source=record.source,
+                baseline_revision=record.baseline_revision,
+                branch_id=record.branch_id,
+                outcome=WorkspaceBranchOutcomeStatus.CONFLICTED,
+                max_bytes=record.limits.max_evidence_bytes,
+                paths=tuple(item.path for item in conflict.conflicts),
+                detail_code="workspace_branch_baseline_conflicted",
+            )
+            _validate_conflict_evidence_limit(
+                conflict.conflicts,
+                record.limits.max_evidence_bytes,
+                evidence=evidence,
+            )
+        except WorkspaceBranchResourceExhaustedError as exhausted:
+            failure = _DurableFailure(
+                phase="creation",
+                outcome="resource_exhausted",
+                detail_code=exhausted.detail_code,
+            )
+        else:
+            failure = _DurableFailure(
+                phase="creation",
+                outcome="conflicted",
+                detail_code="workspace_branch_baseline_conflicted",
+                conflicts=conflict.conflicts,
+            )
+        failed = await _record_durable_creation_failure(
+            store,
+            record,
+            storage_key,
+            failure,
+            binding_claim_lease=binding_claim_lease,
+        )
+        return failed, None
+    except _UnsupportedBranch as unsupported:
+        if unsupported is not capture_failure:
+            raise
+        failed = await _record_durable_creation_failure(
+            store,
+            record,
+            storage_key,
+            _DurableFailure(
+                phase="creation",
+                outcome="unsupported",
+                detail_code=unsupported.detail_code,
+            ),
+            binding_claim_lease=binding_claim_lease,
+        )
+        return failed, None
+    except WorkspaceBranchResourceExhaustedError as exhausted:
+        if exhausted is not capture_failure:
+            raise
+        failed = await _record_durable_creation_failure(
+            store,
+            record,
+            storage_key,
+            _DurableFailure(
+                phase="creation",
+                outcome="resource_exhausted",
+                detail_code=exhausted.detail_code,
+            ),
+            binding_claim_lease=binding_claim_lease,
+        )
+        return failed, None
+    except OSError as error:
+        if error is not capture_failure:
+            raise
+        detail_code = (
+            "branch_storage_exhausted"
+            if error.errno in _RESOURCE_ERRNOS
+            else "durable_workspace_branch_creation_failed"
+        )
+        outcome = "resource_exhausted" if error.errno in _RESOURCE_ERRNOS else "failed"
+        failed = await _record_durable_creation_failure(
+            store,
+            record,
+            storage_key,
+            _DurableFailure(
+                phase="creation",
+                outcome=outcome,
+                detail_code=detail_code,
+            ),
+            binding_claim_lease=binding_claim_lease,
+        )
+        return failed, None
+    if captured is None:
+        captured = await _await_owned_thread(_captured_from_durable_record, source, settled)
+    return settled, captured
+
+
+def _validate_durable_creation_authority(
+    source: LocalWorkspace,
+    request: WorkspaceBranchRequest,
+    record: _DurableBranchRecord,
+) -> None:
+    authority = request.authority
+    if authority is None or request.branch_id is None or request.idempotency_key is None:
+        raise AssertionError("Durable branch creation authority disappeared.")
+    if (
+        record.branch_id != request.branch_id
+        or record.creation_idempotency_key != request.idempotency_key
+        or record.source != request.baseline.identity
+        or record.source_root != str(source.root)
+        or record.baseline_revision != request.baseline.revision
+        or record.authority != authority
+        or record.limits != request.limits
+    ):
+        raise WorkspaceBranchOperationConflict(
+            "Durable workspace branch identity was reused with different authority."
+        )
+
+
+def _durable_creation_result(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+    captured: _CapturedBaseline,
+    source_key: tuple[object, ...],
+    capacity_lease: _BranchCapacityLease,
+) -> WorkspaceBranchCreationResult:
+    branch_store = source._branch_store
+    if branch_store is None:  # pragma: no cover - durable caller invariant
+        raise AssertionError("Durable branch store disappeared during reconstruction.")
+    branch = LocalWorkspaceBranch(
+        source=source,
+        branch_id=record.branch_id,
+        request=WorkspaceBranchRequest(
+            baseline=_workspace_revision_from_record(record, captured),
+            limits=record.limits,
+            branch_id=record.branch_id,
+            idempotency_key=record.creation_idempotency_key,
+            authority=record.authority,
+        ),
+        captured=captured,
+        source_key=source_key,
+        capacity_lease=capacity_lease,
+        durable=_DurableBranchContext(
+            store=branch_store,
+            record=record,
+            storage_key=_durable_branch_storage_key(record.branch_id),
+        ),
+    )
+    capacity_lease.activate()
+    return WorkspaceBranchCreationResult(
+        status=WorkspaceBranchOutcomeStatus.CREATED,
+        branch=branch,
+        evidence=_bounded_workspace_branch_evidence(
+            source=record.source,
+            baseline_revision=record.baseline_revision,
+            branch_id=record.branch_id,
+            outcome=WorkspaceBranchOutcomeStatus.CREATED,
+            max_bytes=record.limits.max_evidence_bytes,
+            detail_code="durable_workspace_branch_created",
+        ),
+    )
+
+
+def _durable_failed_creation_result(
+    record: _DurableBranchRecord,
+) -> WorkspaceBranchCreationResult:
+    failure = record.failure
+    if (
+        record.state is not WorkspaceBranchDurableState.FAILED
+        or failure is None
+        or failure.phase != "creation"
+    ):
+        raise WorkspaceBranchFencedError("Durable creation failure evidence is missing.")
+    outcome = WorkspaceBranchOutcomeStatus(failure.outcome)
+    return WorkspaceBranchCreationResult(
+        status=outcome,
+        branch=None,
+        evidence=_durable_state_evidence(
+            record,
+            outcome=outcome,
+            paths=tuple(conflict.path for conflict in failure.conflicts),
+            detail_code=failure.detail_code,
+        ),
+        conflicts=failure.conflicts,
+    )
+
+
+def _workspace_revision_from_record(
+    record: _DurableBranchRecord,
+    captured: _CapturedBaseline,
+):
+    from cayu.workspaces.revisions import WorkspacePathRevision, WorkspaceRevisionObservation
+
+    paths = tuple(
+        WorkspacePathRevision(
+            path=path,
+            kind="file",
+            present=True,
+            content_sha256=identity.sha256,
+        )
+        for path, identity in sorted(captured.files.items())
+    )
+    return WorkspaceRevisionObservation(
+        identity=record.source,
+        status=WorkspaceRevisionObservationStatus.SUPPORTED,
+        revision=record.baseline_revision,
+        paths=paths,
+        total_paths=len(paths),
+    )
+
+
+async def _create_durable_local_workspace_branch(
+    source: LocalWorkspace,
+    request: WorkspaceBranchRequest,
+    source_key: tuple[object, ...],
+    *,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> WorkspaceBranchCreationResult:
+    store = source._branch_store
+    if store is None:
+        raise RuntimeError("Durable workspace branches require LocalWorkspace branch_store.")
+    branch_id = request.branch_id
+    create_key = request.idempotency_key
+    authority = request.authority
+    if branch_id is None or create_key is None or authority is None:
+        raise AssertionError("Durable branch authority is incomplete.")
+    binding_claim_lease.validate(authority)
+    storage_key = _durable_branch_storage_key(branch_id)
+    current = await _load_durable_branch_record(
+        store,
+        session_id=authority.session_id,
+        storage_key=storage_key,
+    )
+    if current is None:
+        root_info = source.root.stat()
+        now = datetime.now(UTC)
+        baseline_revision = request.baseline.revision
+        if baseline_revision is None:  # pragma: no cover - request invariant
+            raise AssertionError("Durable workspace branch baseline revision disappeared.")
+        candidate = _DurableBranchRecord(
+            branch_id=branch_id,
+            creation_idempotency_key=create_key,
+            state=WorkspaceBranchDurableState.CREATING,
+            source=request.baseline.identity,
+            source_root=str(source.root),
+            baseline_revision=baseline_revision,
+            authority=authority,
+            limits=request.limits,
+            private_root=str(_durable_private_root(source.root, branch_id, authority)),
+            private_root_owner=uuid.uuid4().hex,
+            capture_attempt_id=uuid.uuid4().hex,
+            root_device=root_info.st_dev,
+            root_inode=root_info.st_ino,
+            created_at=now.isoformat(),
+            expires_at=(now + timedelta(milliseconds=request.limits.lifetime_ms)).isoformat(),
+            revision=0,
+        )
+        try:
+            current = await _publish_or_reconcile_exact_record(
+                store,
+                session_id=authority.session_id,
+                storage_key=storage_key,
+                expected=None,
+                updated=candidate,
+                expected_run_epoch=authority.expected_run_epoch,
+            )
+        except WorkspaceBranchOperationConflict as conflict:
+            try:
+                winner = await _load_durable_branch_record(
+                    store,
+                    session_id=authority.session_id,
+                    storage_key=storage_key,
+                )
+            except BaseException as reconciliation_error:
+                _raise_primary_with_reconciliation_failure(conflict, reconciliation_error)
+            if winner is None:
+                raise
+            _validate_durable_creation_authority(source, request, winner)
+            current = winner
+    if current is None:  # pragma: no cover - store publication invariant
+        raise AssertionError("Durable workspace branch creation produced no record.")
+    _validate_durable_creation_authority(source, request, current)
+    binding_claim_lease.validate(current.authority)
+    if current.state is WorkspaceBranchDurableState.FAILED:
+        if current.failure is not None and current.failure.phase == "creation":
+            return _durable_failed_creation_result(current)
+        raise WorkspaceBranchClosedError("Durable workspace branch publication already failed.")
+    if current.state not in {
+        WorkspaceBranchDurableState.CREATING,
+        WorkspaceBranchDurableState.OPEN,
+        WorkspaceBranchDurableState.CONFLICTED,
+    }:
+        raise WorkspaceBranchClosedError(
+            f"Durable workspace branch is already {current.state.value}."
+        )
+    await _await_owned_thread(_retry_pending_branch_cleanups, source_key)
+    capacity_lease = _admit_branch(
+        source_key,
+        request.limits.max_active_branches,
+        identity=_durable_branch_capacity_identity(current),
+    )
+    if capacity_lease is None:
+        return _creation_result_without_branch(
+            request,
+            WorkspaceBranchOutcomeStatus.RESOURCE_EXHAUSTED,
+            branch_id=branch_id,
+            detail_code="active_branch_limit_exceeded",
+        )
+    try:
+        if current.state is WorkspaceBranchDurableState.CREATING:
+            current, captured = await _complete_durable_creating_record(
+                source,
+                current,
+                storage_key,
+                _capture_authority_from_request(request),
+                capacity_lease,
+                binding_claim_lease=binding_claim_lease,
+            )
+            if current.state is WorkspaceBranchDurableState.FAILED:
+                capacity_lease.release_owner()
+                return _durable_failed_creation_result(current)
+            if captured is None:  # pragma: no cover - completion invariant
+                raise AssertionError("Durable branch creation lost its captured baseline.")
+        else:
+            captured = await _await_owned_thread(_captured_from_durable_record, source, current)
+        capacity_lease.adopt_recovered_generation()
+        return _durable_creation_result(
+            source,
+            current,
+            captured,
+            source_key,
+            capacity_lease,
+        )
+    except BaseException:
+        capacity_lease.release_owner()
+        raise
+
+
+def _validate_recovery_authority(
+    source: LocalWorkspace,
+    request: WorkspaceBranchRecoveryRequest,
+    record: _DurableBranchRecord,
+) -> None:
+    if (
+        request.branch_id != record.branch_id
+        or request.session_id != record.authority.session_id
+        or request.expected_run_epoch != record.authority.expected_run_epoch
+        or request.binding_generation != record.authority.binding_generation
+        or request.binding_identity != record.authority.binding_identity
+        or source.id != record.source.workspace_id
+        or str(source.root) != record.source_root
+    ):
+        raise WorkspaceBranchOperationConflict(
+            "Workspace branch recovery authority does not match durable evidence."
+        )
+
+
+def _durable_state_evidence(
+    record: _DurableBranchRecord,
+    *,
+    outcome: WorkspaceBranchOutcomeStatus,
+    paths: Sequence[str] = (),
+    change_set_digest: str | None = None,
+    detail_code: str,
+) -> WorkspaceBranchEvidence:
+    return _bounded_workspace_branch_evidence(
+        source=record.source,
+        baseline_revision=record.baseline_revision,
+        branch_id=record.branch_id,
+        outcome=outcome,
+        change_set_digest=change_set_digest,
+        paths=paths,
+        detail_code=detail_code,
+        max_bytes=record.limits.max_evidence_bytes,
+    )
+
+
+def _durable_record_is_expired(record: _DurableBranchRecord) -> bool:
+    try:
+        expires_at = _parse_durable_branch_timestamp(record.expires_at, "expires_at")
+    except ValueError as error:  # pragma: no cover - validated record invariant
+        raise WorkspaceBranchFencedError("Durable branch expiry evidence is invalid.") from error
+    return datetime.now(UTC) >= expires_at
+
+
+def _require_durable_terminal_expiry_eligible(record: _DurableBranchRecord) -> None:
+    if record.state is WorkspaceBranchDurableState.EXPIRED:
+        _require_durable_expiry_eligible(record)
+
+
+def _require_durable_expiry_eligible(record: _DurableBranchRecord) -> None:
+    if not _durable_record_is_expired(record):
+        raise WorkspaceBranchFencedError(
+            "Durable branch expiry terminal evidence precedes its deadline."
+        )
+
+
+def _durable_publication_staging_name(
+    publication: _DurablePublication,
+    path: str,
+) -> str:
+    name = path.rsplit("/", 1)[-1]
+    digest = hashlib.sha256(f"{publication.staging_owner}\0{path}".encode()).hexdigest()
+    return f".{name}.cayu-{digest[:48]}"
+
+
+async def _record_durable_branch_ambiguity(
+    store: WorkspaceBranchStore,
+    record: _DurableBranchRecord,
+    storage_key: str,
+    *,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> _DurableBranchRecord:
+    binding_claim_lease.validate(record.authority)
+    if record.state is WorkspaceBranchDurableState.AMBIGUOUS:
+        return record
+    ambiguous = record.model_copy(
+        update={
+            "state": WorkspaceBranchDurableState.AMBIGUOUS,
+            "revision": record.revision + 1,
+        }
+    )
+    try:
+        return await _publish_or_reconcile_exact_record(
+            store,
+            session_id=record.authority.session_id,
+            storage_key=storage_key,
+            expected=record,
+            updated=ambiguous,
+            expected_run_epoch=record.authority.expected_run_epoch,
+        )
+    except WorkspaceBranchOperationConflict:
+        settled = await _load_durable_branch_record(
+            store,
+            session_id=record.authority.session_id,
+            storage_key=storage_key,
+        )
+        if settled is not None and settled.state is WorkspaceBranchDurableState.AMBIGUOUS:
+            return settled
+        raise
+
+
+def _durable_publication_result(
+    record: _DurableBranchRecord,
+) -> WorkspaceBranchPublicationResult:
+    publication = record.publication
+    if publication is None:
+        raise WorkspaceBranchFencedError("Durable committed publication evidence is missing.")
+    paths = tuple(change.path for change in publication.change_set.changes)
+    return WorkspaceBranchPublicationResult(
+        status=WorkspaceBranchOutcomeStatus.COMMITTED,
+        evidence=_durable_state_evidence(
+            record,
+            outcome=WorkspaceBranchOutcomeStatus.COMMITTED,
+            paths=paths,
+            change_set_digest=publication.change_set.digest,
+            detail_code="durable_workspace_branch_committed",
+        ),
+    )
+
+
+def _durable_failed_publication_result(
+    record: _DurableBranchRecord,
+) -> WorkspaceBranchPublicationResult:
+    failure = record.failure
+    publication = record.publication
+    if (
+        record.state is not WorkspaceBranchDurableState.FAILED
+        or failure is None
+        or failure.phase != "publication"
+        or publication is None
+    ):
+        raise WorkspaceBranchFencedError("Durable publication failure evidence is missing.")
+    paths = tuple(change.path for change in publication.change_set.changes)
+    return WorkspaceBranchPublicationResult(
+        status=WorkspaceBranchOutcomeStatus.FAILED,
+        evidence=_durable_state_evidence(
+            record,
+            outcome=WorkspaceBranchOutcomeStatus.FAILED,
+            paths=paths,
+            change_set_digest=publication.change_set.digest,
+            detail_code=failure.detail_code,
+        ),
+    )
+
+
+def _durable_rollback_result(record: _DurableBranchRecord) -> WorkspaceBranchRollbackResult:
+    _require_durable_terminal_expiry_eligible(record)
+    rollback = record.rollback
+    if rollback is None:
+        raise WorkspaceBranchFencedError("Durable rollback evidence is missing.")
+    status = (
+        WorkspaceBranchOutcomeStatus.EXPIRED
+        if record.state is WorkspaceBranchDurableState.EXPIRED
+        else WorkspaceBranchOutcomeStatus.ROLLED_BACK
+    )
+    return WorkspaceBranchRollbackResult(
+        status=status,
+        evidence=_durable_state_evidence(
+            record,
+            outcome=status,
+            paths=rollback.paths,
+            detail_code=(
+                "durable_workspace_branch_expired"
+                if status is WorkspaceBranchOutcomeStatus.EXPIRED
+                else "durable_workspace_branch_rolled_back"
+            ),
+        ),
+    )
+
+
+def _durable_recovery_cleanup_key(
+    record: _DurableBranchRecord,
+) -> tuple[Path, str]:
+    return Path(record.private_root), record.private_root_owner
+
+
+def _release_durable_recovery_cleanup(record: _DurableBranchRecord) -> None:
+    key = _durable_recovery_cleanup_key(record)
+    retained = _DURABLE_RECOVERY_CLEANUPS.payload(key)
+    if retained is not None:
+        retained.binding_claim_lease.release_after_settlement()
+        _DURABLE_RECOVERY_CLEANUPS.forget(key)
+
+
+def _retain_durable_recovery_cleanup(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> None:
+    source_key = source.resource_key
+    if type(source_key) is not tuple or not source_key:
+        raise WorkspaceBranchFencedError("Workspace source identity is unavailable.")
+    key = _durable_recovery_cleanup_key(record)
+    existing = _DURABLE_RECOVERY_CLEANUPS.payload(key)
+    if existing is not None:
+        if existing.source.resource_key != source_key or existing.record != record:
+            raise RuntimeError("Retained recovery cleanup identity changed while owned.")
+        return
+    retained = _DURABLE_RECOVERY_CLEANUPS.retain(
+        key,
+        source_key=source_key,
+        payload=_RetainedDurableRecoveryCleanup(
+            source=source,
+            record=record,
+            binding_claim_lease=binding_claim_lease,
+        ),
+    )
+    if retained:
+        binding_claim_lease.retain_for_settlement()
+
+
+async def _settle_durable_recovery_private_tree(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+    *,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> None:
+    source_key = source.resource_key
+    if type(source_key) is not tuple or not source_key:
+        raise WorkspaceBranchFencedError("Workspace source identity is unavailable.")
+    capacity_owner = _mark_matching_branch_owner_terminal(source_key, record)
+    binding_claim_lease.validate(record.authority)
+    try:
+        await _await_owned_thread(_remove_durable_private_tree, source, record)
+    except BaseException as cleanup_error:
+        try:
+            _retain_durable_recovery_cleanup(source, record, binding_claim_lease)
+        except BaseException as retention_error:
+            raise cleanup_error from retention_error
+        raise
+    if capacity_owner is not None:
+        _release_branch_attachment(capacity_owner, terminal=True)
+    _release_durable_recovery_cleanup(record)
+
+
+async def _durable_terminal_recovery_result(
+    source: LocalWorkspace,
+    record: _DurableBranchRecord,
+    *,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> WorkspaceBranchRecoveryResult:
+    if record.state is WorkspaceBranchDurableState.COMMITTED:
+        publication = _durable_publication_result(record)
+        result = WorkspaceBranchRecoveryResult(
+            state=record.state,
+            evidence=publication.evidence,
+            publication=publication,
+        )
+    elif record.state in {
+        WorkspaceBranchDurableState.ROLLED_BACK,
+        WorkspaceBranchDurableState.EXPIRED,
+    }:
+        rollback = _durable_rollback_result(record)
+        result = WorkspaceBranchRecoveryResult(
+            state=record.state,
+            evidence=rollback.evidence,
+            rollback=rollback,
+        )
+    else:
+        raise WorkspaceBranchFencedError("Durable branch is not terminal.")
+    await _settle_durable_recovery_private_tree(
+        source,
+        record,
+        binding_claim_lease=binding_claim_lease,
+    )
+    return result
+
+
+async def recover_local_workspace_branch(
+    source: LocalWorkspace,
+    request: WorkspaceBranchRecoveryRequest,
+) -> WorkspaceBranchRecoveryResult:
+    from cayu.workspaces.local import LocalWorkspace
+
+    if type(source) is not LocalWorkspace:
+        raise TypeError("Durable local branch recovery requires an exact LocalWorkspace.")
+    if type(request) is not WorkspaceBranchRecoveryRequest:
+        raise TypeError("Workspace branch recovery request is invalid.")
+    store = source._branch_store
+    if store is None:
+        raise RuntimeError("Durable workspace branch recovery requires branch_store.")
+    source_key = source.resource_key
+    if type(source_key) is not tuple or not source_key:
+        raise WorkspaceBranchFencedError("Workspace source identity is unavailable.")
+    await _retry_pending_durable_terminal_settlements(source_key)
+    record = await _load_durable_branch_record(
+        store,
+        session_id=request.session_id,
+        storage_key=_durable_branch_storage_key(request.branch_id),
+    )
+    if record is None:
+        raise KeyError(f"Durable workspace branch not found: {request.branch_id}")
+    _validate_recovery_authority(source, request, record)
+    binding_claim_lease = _binding_authority_claim_lease(source, record.authority)
+    try:
+        result = await _recover_local_workspace_branch_claimed(
+            source,
+            request,
+            binding_claim_lease=binding_claim_lease,
+        )
+    except BaseException as primary:
+        _release_binding_authority_claim_lease(binding_claim_lease, primary=primary)
+        raise
+    _release_binding_authority_claim_lease(binding_claim_lease)
+    return result
+
+
+async def _recover_local_workspace_branch_claimed(
+    source: LocalWorkspace,
+    request: WorkspaceBranchRecoveryRequest,
+    *,
+    binding_claim_lease: _BindingAuthorityClaimLease,
+) -> WorkspaceBranchRecoveryResult:
+    from cayu.workspaces.local import LocalWorkspace
+
+    if type(source) is not LocalWorkspace:
+        raise TypeError("Durable local branch recovery requires an exact LocalWorkspace.")
+    if type(request) is not WorkspaceBranchRecoveryRequest:
+        raise TypeError("Workspace branch recovery request is invalid.")
+    store = source._branch_store
+    if store is None:
+        raise RuntimeError("Durable workspace branch recovery requires branch_store.")
+    source_key = source.resource_key
+    if type(source_key) is not tuple or not source_key:
+        raise WorkspaceBranchFencedError("Workspace source identity is unavailable.")
+    storage_key = _durable_branch_storage_key(request.branch_id)
+    record = await _load_durable_branch_record(
+        store,
+        session_id=request.session_id,
+        storage_key=storage_key,
+    )
+    if record is None:
+        raise KeyError(f"Durable workspace branch not found: {request.branch_id}")
+    _validate_recovery_authority(source, request, record)
+    binding_claim_lease.validate(record.authority)
+    _validated_durable_private_root(source, record)
+
+    capacity_lease: _BranchCapacityLease | None = None
+    creating_captured: _CapturedBaseline | None = None
+    if record.state is WorkspaceBranchDurableState.CREATING:
+        await _await_owned_thread(_retry_pending_branch_cleanups, source_key)
+        capacity_lease = _admit_branch(
+            source_key,
+            record.limits.max_active_branches,
+            identity=_durable_branch_capacity_identity(record),
+        )
+        if capacity_lease is None:
+            raise WorkspaceBranchResourceExhaustedError("active_branch_limit_exceeded")
+        try:
+            record, creating_captured = await _complete_durable_creating_record(
+                source,
+                record,
+                storage_key,
+                _capture_authority_from_record(record),
+                capacity_lease,
+                binding_claim_lease=binding_claim_lease,
+            )
+        except BaseException:
+            capacity_lease.release_owner()
+            raise
+        if record.state is WorkspaceBranchDurableState.FAILED:
+            capacity_lease.release_owner()
+            capacity_lease = None
+
+    if record.state is WorkspaceBranchDurableState.ROLLBACK_INTENT:
+        rollback = record.rollback
+        if rollback is None:
+            raise WorkspaceBranchFencedError("Durable rollback intent is incomplete.")
+        if rollback.reason == "expired":
+            _require_durable_expiry_eligible(record)
+        terminal_state = (
+            WorkspaceBranchDurableState.EXPIRED
+            if rollback.reason == "expired"
+            else WorkspaceBranchDurableState.ROLLED_BACK
+        )
+        terminal = record.model_copy(
+            update={"state": terminal_state, "revision": record.revision + 1}
+        )
+        record = await _publish_or_reconcile_exact_record(
+            store,
+            session_id=record.authority.session_id,
+            storage_key=storage_key,
+            expected=record,
+            updated=terminal,
+            expected_run_epoch=record.authority.expected_run_epoch,
+        )
+
+    if record.state in {
+        WorkspaceBranchDurableState.OPEN,
+        WorkspaceBranchDurableState.CONFLICTED,
+        WorkspaceBranchDurableState.PUBLICATION_INTENT,
+        WorkspaceBranchDurableState.PUBLICATION_PROGRESS,
+    }:
+        if capacity_lease is None:
+            capacity_lease = _admit_branch(
+                source_key,
+                record.limits.max_active_branches,
+                identity=_durable_branch_capacity_identity(record),
+            )
+            if capacity_lease is None:
+                raise WorkspaceBranchResourceExhaustedError("active_branch_limit_exceeded")
+        try:
+            try:
+                captured = creating_captured
+                if captured is None:
+                    captured = await _await_owned_thread(
+                        _captured_from_durable_record,
+                        source,
+                        record,
+                    )
+            except WorkspaceBranchFencedError:
+                capacity_lease.release_owner()
+                settled = await _load_durable_branch_record(
+                    store,
+                    session_id=record.authority.session_id,
+                    storage_key=storage_key,
+                )
+                if settled is not None and settled.state in {
+                    WorkspaceBranchDurableState.COMMITTED,
+                    WorkspaceBranchDurableState.ROLLED_BACK,
+                    WorkspaceBranchDurableState.EXPIRED,
+                }:
+                    return await _durable_terminal_recovery_result(
+                        source,
+                        settled,
+                        binding_claim_lease=binding_claim_lease,
+                    )
+                ambiguous = await _record_durable_branch_ambiguity(
+                    store,
+                    record,
+                    storage_key,
+                    binding_claim_lease=binding_claim_lease,
+                )
+                _mark_matching_branch_owner_terminal(source_key, ambiguous)
+                return WorkspaceBranchRecoveryResult(
+                    state=WorkspaceBranchDurableState.AMBIGUOUS,
+                    evidence=_durable_state_evidence(
+                        ambiguous,
+                        outcome=WorkspaceBranchOutcomeStatus.AMBIGUOUS,
+                        change_set_digest=(
+                            None
+                            if ambiguous.publication is None
+                            else ambiguous.publication.change_set.digest
+                        ),
+                        detail_code="durable_workspace_branch_private_state_ambiguous",
+                    ),
+                )
+            try:
+                capacity_lease.adopt_recovered_generation()
+            except (WorkspaceBranchClosedError, WorkspaceBranchFencedError):
+                capacity_lease.release_owner()
+                settled = await _load_durable_branch_record(
+                    store,
+                    session_id=record.authority.session_id,
+                    storage_key=storage_key,
+                )
+                if settled is not None and settled != record:
+                    return await _recover_local_workspace_branch_claimed(
+                        source,
+                        request,
+                        binding_claim_lease=binding_claim_lease,
+                    )
+                raise
+            creation = _durable_creation_result(
+                source,
+                record,
+                captured,
+                source_key,
+                capacity_lease,
+            )
+        except BaseException:
+            capacity_lease.release_owner()
+            raise
+        branch = creation.branch
+        if not isinstance(branch, LocalWorkspaceBranch):
+            raise AssertionError("Durable branch reconstruction returned no branch.")
+        if record.state in {
+            WorkspaceBranchDurableState.OPEN,
+            WorkspaceBranchDurableState.CONFLICTED,
+        } and _durable_record_is_expired(record):
+            rollback = await branch._rollback_durable_claimed(
+                WorkspaceBranchRollbackRequest(
+                    branch_id=record.branch_id,
+                    idempotency_key=(
+                        "expire:" + hashlib.sha256(record.expires_at.encode()).hexdigest()
+                    ),
+                    expected_run_epoch=record.authority.expected_run_epoch,
+                    binding_generation=record.authority.binding_generation,
+                    reason="expired",
+                ),
+                binding_claim_lease=binding_claim_lease,
+            )
+            return WorkspaceBranchRecoveryResult(
+                state=WorkspaceBranchDurableState.EXPIRED,
+                evidence=rollback.evidence,
+                rollback=rollback,
+            )
+        if record.state in {
+            WorkspaceBranchDurableState.PUBLICATION_INTENT,
+            WorkspaceBranchDurableState.PUBLICATION_PROGRESS,
+        }:
+            publication = record.publication
+            if publication is None:
+                raise WorkspaceBranchFencedError("Durable publication intent is missing.")
+            result = await branch._publish_durable_claimed(
+                WorkspaceBranchPublicationRequest(
+                    branch_id=record.branch_id,
+                    baseline_revision=record.baseline_revision,
+                    change_set_digest=publication.change_set.digest,
+                    idempotency_key=publication.idempotency_key,
+                    expected_run_epoch=record.authority.expected_run_epoch,
+                    binding_generation=record.authority.binding_generation,
+                ),
+                binding_claim_lease=binding_claim_lease,
+            )
+            settled = await _load_durable_branch_record(
+                store,
+                session_id=record.authority.session_id,
+                storage_key=storage_key,
+            )
+            if settled is None:
+                raise WorkspaceBranchFencedError(
+                    "Durable workspace branch disappeared during recovery."
+                )
+            if settled.state is WorkspaceBranchDurableState.COMMITTED:
+                return WorkspaceBranchRecoveryResult(
+                    state=settled.state,
+                    evidence=result.evidence,
+                    publication=result,
+                )
+            if settled.state is WorkspaceBranchDurableState.CONFLICTED:
+                return WorkspaceBranchRecoveryResult(
+                    state=settled.state,
+                    evidence=result.evidence,
+                    branch=branch,
+                )
+            return WorkspaceBranchRecoveryResult(
+                state=settled.state,
+                evidence=result.evidence,
+            )
+        return WorkspaceBranchRecoveryResult(
+            state=record.state,
+            evidence=_durable_state_evidence(
+                record,
+                outcome=WorkspaceBranchOutcomeStatus.CREATED,
+                detail_code="durable_workspace_branch_recovered",
+            ),
+            branch=branch,
+        )
+
+    if record.state in {
+        WorkspaceBranchDurableState.COMMITTED,
+        WorkspaceBranchDurableState.ROLLED_BACK,
+        WorkspaceBranchDurableState.EXPIRED,
+    }:
+        return await _durable_terminal_recovery_result(
+            source,
+            record,
+            binding_claim_lease=binding_claim_lease,
+        )
+    if record.state is WorkspaceBranchDurableState.AMBIGUOUS:
+        _mark_matching_branch_owner_terminal(source_key, record)
+        outcome = WorkspaceBranchOutcomeStatus.AMBIGUOUS
+        detail_code = "durable_workspace_branch_ambiguous"
+        settle_failed_private_tree = False
+    elif record.state is WorkspaceBranchDurableState.FAILED and record.failure is not None:
+        outcome = WorkspaceBranchOutcomeStatus(record.failure.outcome)
+        detail_code = record.failure.detail_code
+        settle_failed_private_tree = True
+    else:
+        outcome = WorkspaceBranchOutcomeStatus.FAILED
+        detail_code = f"durable_workspace_branch_{record.state.value}"
+        settle_failed_private_tree = False
+    result = WorkspaceBranchRecoveryResult(
+        state=record.state,
+        evidence=_durable_state_evidence(
+            record,
+            outcome=outcome,
+            change_set_digest=(
+                record.publication.change_set.digest
+                if record.failure is not None
+                and record.failure.phase == "publication"
+                and record.publication is not None
+                else None
+            ),
+            detail_code=detail_code,
+        ),
+    )
+    if settle_failed_private_tree:
+        await _settle_durable_recovery_private_tree(
+            source,
+            record,
+            binding_claim_lease=binding_claim_lease,
+        )
+    return result
 
 
 async def create_local_workspace_branch(
@@ -486,27 +3237,47 @@ async def create_local_workspace_branch(
             WorkspaceBranchOutcomeStatus.UNSUPPORTED,
             detail_code="source_identity_unavailable",
         )
+    await _retry_pending_durable_terminal_settlements(source_key)
+    if copied.authority is not None:
+        if source._branch_store is None:
+            raise RuntimeError("Durable workspace branch creation requires branch_store.")
+        binding_claim_lease = _binding_authority_claim_lease(source, copied.authority)
+        try:
+            result = await _create_durable_local_workspace_branch(
+                source,
+                copied,
+                source_key,
+                binding_claim_lease=binding_claim_lease,
+            )
+        except BaseException as primary:
+            _release_binding_authority_claim_lease(binding_claim_lease, primary=primary)
+            raise
+        _release_binding_authority_claim_lease(binding_claim_lease)
+        return result
     await _await_owned_thread(_retry_pending_branch_cleanups, source_key)
     if local_workspace_source_is_fenced(source.root):
         raise WorkspaceBranchFencedError(
             "Local workspace is fenced after an incomplete branch publication rollback."
         )
-    if not _admit_branch(source_key, copied.limits.max_active_branches):
+    branch_id = f"wsb_{uuid.uuid4().hex}"
+    capacity_lease = _admit_branch(
+        source_key,
+        copied.limits.max_active_branches,
+        identity=("ephemeral", branch_id),
+    )
+    if capacity_lease is None:
         return _creation_result_without_branch(
             copied,
             WorkspaceBranchOutcomeStatus.RESOURCE_EXHAUSTED,
             detail_code="active_branch_limit_exceeded",
         )
-    capacity_lease = _BranchCapacityLease(source_key)
-
-    branch_id = f"wsb_{uuid.uuid4().hex}"
     captured: _CapturedBaseline | None = None
     ownership_transferred = False
     try:
         captured_result = await _await_owned_thread(
             _capture_baseline,
             source.root,
-            copied,
+            _capture_authority_from_request(copied),
             branch_id,
             capacity_lease,
             abandon_result=lambda result: _discard_captured_baseline(
@@ -532,6 +3303,7 @@ async def create_local_workspace_branch(
             source_key=source_key,
             capacity_lease=capacity_lease,
         )
+        capacity_lease.activate()
         ownership_transferred = True
         return WorkspaceBranchCreationResult(
             status=WorkspaceBranchOutcomeStatus.CREATED,
@@ -723,48 +3495,96 @@ def _bounded_branch_evidence(
     )
 
 
-def _admit_branch(source_key: tuple[object, ...], limit: int) -> bool:
+def _admit_branch(
+    source_key: tuple[object, ...],
+    limit: int,
+    *,
+    identity: Hashable,
+) -> _BranchCapacityLease | None:
     with _SOURCE_MANAGER_LOCK:
-        active = _ACTIVE_BRANCHES.get(source_key, 0)
-        if active >= limit:
-            return False
-        _ACTIVE_BRANCHES[source_key] = active + 1
-        return True
+        active = _ACTIVE_BRANCHES.setdefault(source_key, {})
+        owner = active.get(identity)
+        if owner is None or owner.released:
+            if len(active) >= limit:
+                return None
+            owner = _BranchCapacityOwner(source_key, identity)
+            active[identity] = owner
+        owner.attachments += 1
+        generation = owner.attachment_generation()
+    return _BranchCapacityLease(owner, generation)
 
 
-def _release_branch(source_key: tuple[object, ...]) -> None:
+def _release_branch_attachment(
+    owner: _BranchCapacityOwner,
+    *,
+    terminal: bool,
+) -> None:
     with _SOURCE_MANAGER_LOCK:
-        active = _ACTIVE_BRANCHES.get(source_key, 0)
-        if active <= 1:
-            _ACTIVE_BRANCHES.pop(source_key, None)
-        else:
-            _ACTIVE_BRANCHES[source_key] = active - 1
+        if owner.released:
+            return
+        active = _ACTIVE_BRANCHES.get(owner.source_key)
+        if active is None or active.get(owner.identity) is not owner:
+            owner.released = True
+            return
+        owner.attachments = max(0, owner.attachments - 1)
+        if terminal or owner.attachments == 0:
+            owner.released = True
+            active.pop(owner.identity, None)
+            if not active:
+                _ACTIVE_BRANCHES.pop(owner.source_key, None)
 
 
 def _capture_baseline(
     root: Path,
-    request: WorkspaceBranchRequest,
+    authority: _BaselineCaptureAuthority,
     branch_id: str,
     capacity_lease: _BranchCapacityLease,
+    *,
+    private_root_path: Path | None = None,
+    private_root_owner: str | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
+    source_lock_held: bool = False,
 ) -> _CapturedBaseline:
     private_root: Path | None = None
+    private_root_owner_written = False
     captured: _CapturedBaseline | None = None
     primary_error: BaseException | None = None
     try:
-        with workspace_source_lock(root, exclusive=True):
+        source_lock = (
+            nullcontext() if source_lock_held else workspace_source_lock(root, exclusive=True)
+        )
+        with source_lock:
             before = root.stat()
+            if (
+                expected_root_identity is not None
+                and (
+                    before.st_dev,
+                    before.st_ino,
+                )
+                != expected_root_identity
+            ):
+                raise WorkspaceBranchFencedError("Local workspace root identity changed.")
             if not stat.S_ISDIR(before.st_mode):
                 raise _UnsupportedBranch("source_root_is_not_directory")
             private_parent = root.parent
             if private_parent == root:
                 raise _UnsupportedBranch("source_root_has_no_private_sibling")
-            private_root = Path(
-                tempfile.mkdtemp(
-                    prefix=f".cayu-{branch_id}-",
-                    dir=private_parent,
+            if private_root_path is None:
+                private_root = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".cayu-{branch_id}-",
+                        dir=private_parent,
+                    )
                 )
-            )
+            else:
+                if private_root_path.parent != private_parent:
+                    raise _UnsupportedBranch("private_storage_parent_mismatch")
+                private_root_path.mkdir(mode=0o700)
+                private_root = private_root_path
             os.chmod(private_root, 0o700)
+            if private_root_owner is not None:
+                _write_private_root_owner(private_root, private_root_owner)
+                private_root_owner_written = True
             private_info = private_root.stat()
             if private_info.st_dev != before.st_dev:
                 raise _UnsupportedBranch("private_storage_filesystem_mismatch")
@@ -786,7 +3606,7 @@ def _capture_baseline(
             files, directories = _copy_regular_tree(
                 root,
                 baseline_root,
-                request.limits,
+                authority.limits,
                 source_semantics=source_semantics,
             )
             after = root.stat()
@@ -800,8 +3620,8 @@ def _capture_baseline(
                     )
                 )
             actual_revision = _revision_for_files(files)
-            conflicts = _baseline_conflicts(request, files, branch_id=branch_id)
-            if actual_revision != request.baseline.revision or conflicts:
+            conflicts = _baseline_conflicts(authority, files, branch_id=branch_id)
+            if actual_revision != authority.revision or conflicts:
                 if not conflicts:
                     conflicts = (
                         WorkspaceBranchConflict(
@@ -812,6 +3632,7 @@ def _capture_baseline(
                 raise _CreationConflict(conflicts)
             captured = _CapturedBaseline(
                 private_root=private_root,
+                private_root_owner=private_root_owner,
                 baseline_root=baseline_root,
                 overlay_root=overlay_root,
                 files=files,
@@ -824,13 +3645,77 @@ def _capture_baseline(
     if primary_error is not None:
         if private_root is not None:
             try:
-                _discard_private_tree(private_root, capacity_lease)
+                if private_root_owner is not None and not private_root_owner_written:
+                    private_root.rmdir()
+                    capacity_lease.release_after_cleanup()
+                else:
+                    _discard_private_tree(
+                        private_root,
+                        capacity_lease,
+                        private_root_owner=private_root_owner,
+                    )
             except BaseException as cleanup_error:
                 raise primary_error from cleanup_error
         raise primary_error
     if captured is None:  # pragma: no cover - successful capture invariant
         raise AssertionError("Workspace branch capture produced no baseline.")
     return captured
+
+
+def _capture_baseline_at_private_root(
+    root: Path,
+    authority: _BaselineCaptureAuthority,
+    branch_id: str,
+    capacity_lease: _BranchCapacityLease,
+    private_root: Path,
+    private_root_owner: str,
+    capture_attempt_id: str,
+    expected_root_identity: tuple[int, int],
+    publish_guard: Callable[[], None],
+) -> _CapturedBaseline:
+    staging_root = _capture_staging_root(private_root, capture_attempt_id)
+    _discard_owned_capture_staging(staging_root, private_root_owner)
+    captured: _CapturedBaseline | None = None
+    try:
+        captured = _capture_baseline(
+            root,
+            authority,
+            branch_id,
+            capacity_lease,
+            private_root_path=staging_root,
+            private_root_owner=private_root_owner,
+            expected_root_identity=expected_root_identity,
+        )
+        publish_guard()
+        parent_fd = os.open(private_root.parent, _PRIVATE_DIRECTORY_OPEN_FLAGS)
+        try:
+            try:
+                _rename_private_root_no_replace(
+                    staging_root,
+                    private_root,
+                    parent_fd=parent_fd,
+                )
+            except FileExistsError as error:
+                raise WorkspaceBranchFencedError(
+                    "Durable private branch location became occupied."
+                ) from error
+            captured = replace(
+                captured,
+                private_root=private_root,
+                baseline_root=private_root / "baseline",
+                overlay_root=private_root / "overlay",
+            )
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        return captured
+    except BaseException as primary_error:
+        if captured is not None:
+            try:
+                _discard_captured_baseline(captured, capacity_lease)
+            except BaseException as cleanup_error:
+                raise primary_error from cleanup_error
+        raise
 
 
 def _copy_regular_tree(
@@ -1026,12 +3911,14 @@ def _revision_for_files(files: dict[str, _FileIdentity]) -> str:
 
 
 def _baseline_conflicts(
-    request: WorkspaceBranchRequest,
+    authority: _BaselineCaptureAuthority,
     actual: dict[str, _FileIdentity],
     *,
     branch_id: str,
 ) -> tuple[WorkspaceBranchConflict, ...]:
-    expected = {entry.path: entry for entry in request.baseline.paths}
+    if authority.expected_paths is None:
+        return ()
+    expected = {entry.path: entry for entry in authority.expected_paths}
     conflicts: list[WorkspaceBranchConflict] = []
     serialized_conflicts_bytes = 2
     for path in sorted(expected.keys() | actual.keys()):
@@ -1049,9 +3936,9 @@ def _baseline_conflicts(
         if conflicts:
             item_bytes += 1
         projected_evidence_bytes = _workspace_branch_evidence_json_size(
-            source=request.baseline.identity,
+            source=authority.source,
             outcome=WorkspaceBranchOutcomeStatus.CONFLICTED,
-            baseline_revision=request.baseline.revision,
+            baseline_revision=authority.revision,
             branch_id=branch_id,
             change_set_digest=None,
             affected_path_count=len(conflicts) + 1,
@@ -1059,7 +3946,7 @@ def _baseline_conflicts(
         )
         if (
             projected_evidence_bytes + serialized_conflicts_bytes + item_bytes
-            > request.limits.max_evidence_bytes
+            > authority.limits.max_evidence_bytes
         ):
             raise WorkspaceBranchResourceExhaustedError("conflict_evidence_limit_exceeded")
         conflict = WorkspaceBranchConflict(
@@ -1130,6 +4017,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
         captured: _CapturedBaseline,
         source_key: tuple[object, ...],
         capacity_lease: _BranchCapacityLease,
+        durable: _DurableBranchContext | None = None,
     ) -> None:
         self._source = source
         self._branch_id = branch_id
@@ -1141,6 +4029,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             raise AssertionError("Branch baseline revision disappeared.")
         self._baseline_revision: str = baseline_revision
         self._private_root = captured.private_root
+        self._private_root_owner = captured.private_root_owner
         self._baseline_root = captured.baseline_root
         self._overlay_root = captured.overlay_root
         self._baseline = dict(captured.files)
@@ -1149,16 +4038,33 @@ class LocalWorkspaceBranch(WorkspaceBranch):
         self._path_semantics = captured.path_semantics
         self._source_key = source_key
         self._capacity_lease = capacity_lease
-        self._overlay: dict[str, _FileIdentity] = {}
-        self._tombstones: set[str] = set()
+        self._durable = durable
+        self._overlay: dict[str, _FileIdentity] = (
+            {}
+            if durable is None
+            else {path: value.private() for path, value in durable.record.overlay.items()}
+        )
+        self._tombstones: set[str] = set() if durable is None else set(durable.record.tombstones)
         self._state_lock = threading.RLock()
         self._lifecycle = WorkspaceBranchLifecycleStatus.ACTIVE
         self._publication_receipt: _PublicationReceipt | None = None
         self._rollback_receipt: _RollbackReceipt | None = None
-        self._expires_at = time.monotonic() + self._limits.lifetime_ms / 1000
+        if durable is None:
+            remaining_lifetime = self._limits.lifetime_ms / 1000
+        else:
+            expires_at = _parse_durable_branch_timestamp(
+                durable.record.expires_at,
+                "expires_at",
+            )
+            remaining_lifetime = max(
+                0.0,
+                (expires_at - datetime.now(UTC)).total_seconds(),
+            )
+        self._expires_at = time.monotonic() + remaining_lifetime
         self._timer = threading.Timer(self._limits.lifetime_ms / 1000, self._expire)
         self._timer.daemon = True
-        self._timer.start()
+        if durable is None:
+            self._timer.start()
         self.id = f"{source.id}#branch:{branch_id}"
 
     @property
@@ -1167,6 +4073,9 @@ class LocalWorkspaceBranch(WorkspaceBranch):
 
     @property
     def lifecycle_status(self) -> WorkspaceBranchLifecycleStatus:
+        shared = self._capacity_lease.terminal_lifecycle()
+        if shared is not None:
+            return shared
         with self._state_lock:
             return self._lifecycle
 
@@ -1180,6 +4089,14 @@ class LocalWorkspaceBranch(WorkspaceBranch):
         if max_bytes <= 0:
             raise ValueError("Workspace max_bytes must be greater than zero.")
         return min(max_bytes, self._limits.max_file_bytes)
+
+    def _validate_live_binding(
+        self,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> None:
+        durable = self._durable
+        if durable is not None:
+            binding_claim_lease.validate(durable.record.authority)
 
     async def read_bytes(
         self,
@@ -1250,12 +4167,24 @@ class LocalWorkspaceBranch(WorkspaceBranch):
     async def write_bytes(self, path: str, content: bytes) -> None:
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
+        if self._durable is not None:
+            await self._durable_private_mutation(
+                lambda: self._project_write(path, content),
+                lambda: self._write(path, content, False, None),
+            )
+            return
         await _await_owned_thread(self._write, path, content, False, None)
 
     async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
         if type(content) is not bytes:
             raise TypeError("Workspace create content must be bytes.")
-        result = await _await_owned_thread(self._write, path, content, True, None)
+        if self._durable is None:
+            result = await _await_owned_thread(self._write, path, content, True, None)
+        else:
+            result = await self._durable_private_mutation(
+                lambda: self._project_write(path, content),
+                lambda: self._write(path, content, True, None),
+            )
         if result is None:  # pragma: no cover - create-only invariant
             raise AssertionError("Branch create returned no mutation result.")
         return result
@@ -1271,13 +4200,19 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             raise TypeError("Workspace replace content must be bytes.")
         if type(expected_revision) is not str or not expected_revision.strip():
             raise ValueError("Workspace expected_revision must be a nonblank string.")
-        result = await _await_owned_thread(
-            self._write,
-            path,
-            content,
-            False,
-            expected_revision,
-        )
+        if self._durable is None:
+            result = await _await_owned_thread(
+                self._write,
+                path,
+                content,
+                False,
+                expected_revision,
+            )
+        else:
+            result = await self._durable_private_mutation(
+                lambda: self._project_write(path, content),
+                lambda: self._write(path, content, False, expected_revision),
+            )
         if result is None:  # pragma: no cover - conditional mutation invariant
             raise AssertionError("Branch replace returned no mutation result.")
         return result
@@ -1310,19 +4245,13 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 if before is not None and (create_only or expected_revision is not None)
                 else None
             )
-            proposed_overlay = dict(self._overlay)
-            proposed_tombstones = set(self._tombstones)
-            baseline = self._baseline.get(relative)
-            if (
-                baseline is not None
-                and baseline.sha256 == after.sha256
-                and baseline.bytes == after.bytes
-            ):
-                proposed_overlay.pop(relative, None)
-                proposed_tombstones.discard(relative)
-            else:
-                proposed_overlay[relative] = after
-                proposed_tombstones.discard(relative)
+            proposed_overlay, proposed_tombstones = _project_overlay_write(
+                relative,
+                after,
+                baseline=self._baseline,
+                overlay=self._overlay,
+                tombstones=self._tombstones,
+            )
             self._validate_proposed(relative, proposed_overlay, proposed_tombstones)
             try:
                 if relative in proposed_overlay:
@@ -1354,6 +4283,12 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             )
 
     async def delete(self, path: str) -> None:
+        if self._durable is not None:
+            await self._durable_private_mutation(
+                lambda: self._project_delete(path),
+                lambda: self._delete(path, None),
+            )
+            return
         await _await_owned_thread(self._delete, path, None)
 
     async def delete_if_revision(
@@ -1364,7 +4299,13 @@ class LocalWorkspaceBranch(WorkspaceBranch):
     ) -> WorkspaceMutationResult:
         if type(expected_revision) is not str or not expected_revision.strip():
             raise ValueError("Workspace expected_revision must be a nonblank string.")
-        result = await _await_owned_thread(self._delete, path, expected_revision)
+        if self._durable is None:
+            result = await _await_owned_thread(self._delete, path, expected_revision)
+        else:
+            result = await self._durable_private_mutation(
+                lambda: self._project_delete(path),
+                lambda: self._delete(path, expected_revision),
+            )
         if result is None:  # pragma: no cover - expected revision guarantees a result
             raise AssertionError("Conditional branch delete returned no result.")
         return result
@@ -1392,13 +4333,12 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 if expected_revision is not None
                 else None
             )
-            proposed_overlay = dict(self._overlay)
-            proposed_tombstones = set(self._tombstones)
-            proposed_overlay.pop(relative, None)
-            if relative in self._baseline:
-                proposed_tombstones.add(relative)
-            else:
-                proposed_tombstones.discard(relative)
+            proposed_overlay, proposed_tombstones = _project_overlay_delete(
+                relative,
+                baseline=self._baseline,
+                overlay=self._overlay,
+                tombstones=self._tombstones,
+            )
             self._validate_proposed(relative, proposed_overlay, proposed_tombstones)
             try:
                 delete_regular(self._overlay_root, relative)
@@ -1421,6 +4361,143 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 return None
             return mutation_result("delete", before=before_content, after=None)
 
+    def _project_write(
+        self,
+        path: str,
+        content: bytes,
+    ) -> tuple[dict[str, _FileIdentity], set[str]]:
+        relative = self._validated_path(path)
+        after = _identity_for_bytes(content)
+        return _project_overlay_write(
+            relative,
+            after,
+            baseline=self._baseline,
+            overlay=self._overlay,
+            tombstones=self._tombstones,
+        )
+
+    def _project_delete(
+        self,
+        path: str,
+    ) -> tuple[dict[str, _FileIdentity], set[str]]:
+        relative = self._validated_path(path)
+        return _project_overlay_delete(
+            relative,
+            baseline=self._baseline,
+            overlay=self._overlay,
+            tombstones=self._tombstones,
+        )
+
+    async def _durable_private_mutation(
+        self,
+        projector: Callable[[], tuple[dict[str, _FileIdentity], set[str]]],
+        operation: Callable[[], _ResultT],
+    ) -> _ResultT:
+        durable = self._durable
+        if durable is None:
+            raise AssertionError("Durable private mutation lost its coordinator.")
+        binding_claim_lease = _binding_authority_claim_lease(
+            self._source,
+            durable.record.authority,
+        )
+        try:
+            result = await self._durable_private_mutation_claimed(
+                projector,
+                operation,
+                binding_claim_lease=binding_claim_lease,
+            )
+        except BaseException as primary:
+            _release_binding_authority_claim_lease(binding_claim_lease, primary=primary)
+            raise
+        _release_binding_authority_claim_lease(binding_claim_lease)
+        return result
+
+    async def _durable_private_mutation_claimed(
+        self,
+        projector: Callable[[], tuple[dict[str, _FileIdentity], set[str]]],
+        operation: Callable[[], _ResultT],
+        *,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> _ResultT:
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable private mutation lost its coordinator.")
+        async with durable.lock:
+            self._validate_live_binding(binding_claim_lease)
+            current = await _load_durable_branch_record(
+                durable.store,
+                session_id=durable.record.authority.session_id,
+                storage_key=durable.storage_key,
+            )
+            if current is None:
+                raise WorkspaceBranchFencedError("Durable workspace branch record disappeared.")
+            if current != durable.record:
+                raise WorkspaceBranchOperationConflict(
+                    "Durable workspace branch changed under another owner."
+                )
+            if current.state not in {
+                WorkspaceBranchDurableState.OPEN,
+                WorkspaceBranchDurableState.CONFLICTED,
+            }:
+                raise WorkspaceBranchClosedError(
+                    f"Durable workspace branch is {current.state.value}."
+                )
+            with self._state_lock:
+                self._require_active()
+                proposed_overlay, proposed_tombstones = projector()
+                updated = current.model_copy(
+                    update={
+                        "state": WorkspaceBranchDurableState.OPEN,
+                        "overlay": {
+                            path: _DurableFileIdentity.from_private(identity)
+                            for path, identity in proposed_overlay.items()
+                        },
+                        "tombstones": tuple(sorted(proposed_tombstones)),
+                        "publication": None,
+                        "revision": current.revision + 1,
+                    }
+                )
+                updated = _validated_durable_branch_record(updated)
+            result: list[_ResultT] = []
+
+            def guarded_operation() -> None:
+                self._validate_live_binding(binding_claim_lease)
+                result.append(operation())
+
+            try:
+                await _publish_durable_branch_record(
+                    durable.store,
+                    session_id=current.authority.session_id,
+                    storage_key=durable.storage_key,
+                    expected=current,
+                    updated=updated,
+                    expected_run_epoch=current.authority.expected_run_epoch,
+                    commit_guard=guarded_operation,
+                )
+            except BaseException as signal:
+                try:
+                    loaded = await _load_durable_branch_record(
+                        durable.store,
+                        session_id=current.authority.session_id,
+                        storage_key=durable.storage_key,
+                    )
+                except BaseException as reconciliation_error:
+                    with self._state_lock:
+                        self._set_shared_uncertain_lifecycle_unlocked()
+                    _raise_primary_with_reconciliation_failure(signal, reconciliation_error)
+                if loaded is not None and loaded == updated and result:
+                    durable.record = loaded
+                    if not isinstance(signal, Exception):
+                        raise
+                    return result[0]
+                with self._state_lock:
+                    self._set_shared_uncertain_lifecycle_unlocked()
+                raise
+            durable.record = updated
+            if not result:  # pragma: no cover - guarded store invariant
+                raise AssertionError("Durable private mutation guard did not run.")
+            return result[0]
+
     async def changes(self) -> WorkspaceBranchChangeSet:
         return await _await_owned_thread(self._changes)
 
@@ -1439,8 +4516,574 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             branch_id=request.branch_id,
             baseline_revision=request.baseline_revision,
             change_set_digest=request.change_set_digest,
+            idempotency_key=request.idempotency_key,
+            expected_run_epoch=request.expected_run_epoch,
+            binding_generation=request.binding_generation,
         )
+        if self._durable is not None:
+            return await self._publish_durable(copied)
         return await _await_owned_thread(self._publish, copied)
+
+    async def _publish_durable(
+        self,
+        request: WorkspaceBranchPublicationRequest,
+    ) -> WorkspaceBranchPublicationResult:
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable publication lost its coordinator.")
+        binding_claim_lease = _binding_authority_claim_lease(
+            self._source,
+            durable.record.authority,
+        )
+        try:
+            result = await self._publish_durable_claimed(
+                request,
+                binding_claim_lease=binding_claim_lease,
+            )
+        except BaseException as primary:
+            _release_binding_authority_claim_lease(binding_claim_lease, primary=primary)
+            raise
+        _release_binding_authority_claim_lease(binding_claim_lease)
+        return result
+
+    async def _publish_durable_claimed(
+        self,
+        request: WorkspaceBranchPublicationRequest,
+        *,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> WorkspaceBranchPublicationResult:
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable publication lost its coordinator.")
+        if (
+            request.idempotency_key is None
+            or request.expected_run_epoch is None
+            or request.binding_generation is None
+        ):
+            raise ValueError("Durable publication authority is incomplete.")
+        self._validate_live_binding(binding_claim_lease)
+        attached_record = durable.record
+        current = await _load_durable_branch_record(
+            durable.store,
+            session_id=durable.record.authority.session_id,
+            storage_key=durable.storage_key,
+        )
+        if current is None:
+            raise WorkspaceBranchFencedError("Durable workspace branch record disappeared.")
+        authority = current.authority
+        if request.expected_run_epoch != authority.expected_run_epoch:
+            raise SessionRunFenced(
+                "Workspace branch publication run epoch does not match its creation authority."
+            )
+        if request.binding_generation != authority.binding_generation:
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch publication binding generation is stale."
+            )
+        await self._settle_observed_durable_terminal_handle(
+            current,
+            binding_claim_lease=binding_claim_lease,
+        )
+        if current != attached_record:
+            current = await self._converge_and_settle_observed_durable_operation(
+                current,
+                binding_claim_lease=binding_claim_lease,
+            )
+        previous_attempt = next(
+            (
+                attempt
+                for attempt in current.publication_attempts
+                if attempt.idempotency_key == request.idempotency_key
+            ),
+            None,
+        )
+        if (
+            previous_attempt is not None
+            and previous_attempt.change_set_digest != request.change_set_digest
+        ):
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch publication identity was reused with different material."
+            )
+        if current.publication is not None:
+            persisted = current.publication
+            if persisted.idempotency_key != request.idempotency_key:
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch already has different publication authority."
+                )
+            if (
+                request.branch_id != current.branch_id
+                or request.baseline_revision != current.baseline_revision
+                or request.change_set_digest != persisted.change_set.digest
+            ):
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch publication retry changed its material."
+                )
+            if current.state is WorkspaceBranchDurableState.COMMITTED:
+                return _durable_publication_result(current)
+            if current.state is WorkspaceBranchDurableState.FAILED:
+                return _durable_failed_publication_result(current)
+        elif current != attached_record:
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch changed under this publication owner."
+            )
+        with self._state_lock:
+            self._require_active(allow_publishing=True)
+            if (
+                request.branch_id != self._branch_id
+                or request.baseline_revision != self._baseline_revision
+            ):
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch publication authority does not match the branch."
+                )
+            change_set = self._change_set_unlocked()
+            if request.change_set_digest != change_set.digest:
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch changed after publication authority was issued."
+                )
+        if current.publication is not None and (
+            current.publication.idempotency_key != request.idempotency_key
+            or current.publication.change_set != change_set
+        ):
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch already has different publication authority."
+            )
+        attempts = current.publication_attempts
+        if previous_attempt is None:
+            if len(attempts) >= current.limits.max_publication_attempts:
+                return WorkspaceBranchPublicationResult(
+                    status=WorkspaceBranchOutcomeStatus.RESOURCE_EXHAUSTED,
+                    evidence=self._evidence(
+                        WorkspaceBranchOutcomeStatus.RESOURCE_EXHAUSTED,
+                        change_set,
+                        paths=(),
+                        detail_code="publication_attempt_limit_exceeded",
+                    ),
+                )
+            attempts = (
+                *attempts,
+                _DurablePublicationAttempt(
+                    idempotency_key=request.idempotency_key,
+                    change_set_digest=change_set.digest,
+                ),
+            )
+        if current.state not in {
+            WorkspaceBranchDurableState.OPEN,
+            WorkspaceBranchDurableState.CONFLICTED,
+            WorkspaceBranchDurableState.PUBLICATION_INTENT,
+            WorkspaceBranchDurableState.PUBLICATION_PROGRESS,
+        }:
+            raise WorkspaceBranchClosedError(f"Durable workspace branch is {current.state.value}.")
+        if current.state in {
+            WorkspaceBranchDurableState.OPEN,
+            WorkspaceBranchDurableState.CONFLICTED,
+        }:
+            intended = current.model_copy(
+                update={
+                    "state": WorkspaceBranchDurableState.PUBLICATION_INTENT,
+                    "publication": _DurablePublication(
+                        idempotency_key=request.idempotency_key,
+                        staging_owner=_durable_publication_staging_owner(
+                            private_root_owner=current.private_root_owner,
+                            idempotency_key=request.idempotency_key,
+                            change_set_digest=change_set.digest,
+                        ),
+                        change_set=change_set,
+                    ),
+                    "publication_attempts": attempts,
+                    "revision": current.revision + 1,
+                }
+            )
+            self._validate_live_binding(binding_claim_lease)
+            current = await _publish_or_reconcile_exact_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+                expected=current,
+                updated=intended,
+                expected_run_epoch=authority.expected_run_epoch,
+            )
+            durable.record = current
+        with self._state_lock:
+            self._lifecycle = WorkspaceBranchLifecycleStatus.PUBLISHING
+        try:
+            if current.state in {
+                WorkspaceBranchDurableState.PUBLICATION_INTENT,
+                WorkspaceBranchDurableState.CONFLICTED,
+            }:
+                await _await_owned_thread(
+                    self._preflight_durable_publication,
+                    change_set,
+                )
+                started = current.model_copy(
+                    update={
+                        "state": WorkspaceBranchDurableState.PUBLICATION_PROGRESS,
+                        "revision": current.revision + 1,
+                    }
+                )
+                self._validate_live_binding(binding_claim_lease)
+                current = await _publish_or_reconcile_exact_record(
+                    durable.store,
+                    session_id=authority.session_id,
+                    storage_key=durable.storage_key,
+                    expected=current,
+                    updated=started,
+                    expected_run_epoch=authority.expected_run_epoch,
+                )
+                durable.record = current
+            current = await self._converge_and_record_publication_progress(
+                current,
+                binding_claim_lease=binding_claim_lease,
+            )
+        except WorkspaceBranchOperationConflict:
+            settled = await _load_durable_branch_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+            )
+            if settled is not None:
+                settled = await self._converge_and_settle_observed_durable_operation(
+                    settled,
+                    binding_claim_lease=binding_claim_lease,
+                )
+            if (
+                settled is not None
+                and settled.state is WorkspaceBranchDurableState.COMMITTED
+                and settled.publication is not None
+                and settled.publication.idempotency_key == request.idempotency_key
+                and settled.publication.change_set == change_set
+            ):
+                return _durable_publication_result(settled)
+            if (
+                settled is not None
+                and settled.state is WorkspaceBranchDurableState.FAILED
+                and settled.publication is not None
+                and settled.publication.idempotency_key == request.idempotency_key
+                and settled.publication.change_set == change_set
+            ):
+                return _durable_failed_publication_result(settled)
+            raise
+        except _DurablePublicationConflict as conflict:
+            conflicted = current.model_copy(
+                update={
+                    "state": WorkspaceBranchDurableState.CONFLICTED,
+                    "revision": current.revision + 1,
+                }
+            )
+            self._validate_live_binding(binding_claim_lease)
+            conflicted = await _publish_or_reconcile_exact_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+                expected=current,
+                updated=conflicted,
+                expected_run_epoch=authority.expected_run_epoch,
+            )
+            durable.record = conflicted
+            with self._state_lock:
+                self._lifecycle = WorkspaceBranchLifecycleStatus.ACTIVE
+            evidence = self._evidence(
+                WorkspaceBranchOutcomeStatus.CONFLICTED,
+                change_set,
+                paths=tuple(item.path for item in conflict.conflicts),
+                detail_code="affected_path_conflicted",
+            )
+            return WorkspaceBranchPublicationResult(
+                status=WorkspaceBranchOutcomeStatus.CONFLICTED,
+                evidence=evidence,
+                conflicts=conflict.conflicts,
+            )
+        except _DurablePublicationFailed as publication_failure:
+            failed = current.model_copy(
+                update={
+                    "state": WorkspaceBranchDurableState.FAILED,
+                    "failure": _DurableFailure(
+                        phase="publication",
+                        outcome="failed",
+                        detail_code=publication_failure.detail_code,
+                    ),
+                    "revision": current.revision + 1,
+                }
+            )
+            self._validate_live_binding(binding_claim_lease)
+            failed = await _publish_or_reconcile_exact_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+                expected=current,
+                updated=failed,
+                expected_run_epoch=authority.expected_run_epoch,
+                on_exact_control_signal=lambda record: (
+                    self._settle_observed_durable_terminal_handle(
+                        record,
+                        binding_claim_lease=binding_claim_lease,
+                    )
+                ),
+                retain_uncertain_owner=lambda: self._retain_durable_terminal_settlement(
+                    failed,
+                    publication_expected=current,
+                    binding_claim_lease=binding_claim_lease,
+                ),
+            )
+            await self._settle_observed_durable_terminal_handle(
+                failed,
+                binding_claim_lease=binding_claim_lease,
+                suppress_ordinary_cleanup_failure=True,
+            )
+            return _durable_failed_publication_result(failed)
+        except _DurablePublicationAmbiguous as ambiguous_error:
+            ambiguous = current.model_copy(
+                update={
+                    "state": WorkspaceBranchDurableState.AMBIGUOUS,
+                    "revision": current.revision + 1,
+                }
+            )
+            self._validate_live_binding(binding_claim_lease)
+            ambiguous = await _publish_or_reconcile_exact_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+                expected=current,
+                updated=ambiguous,
+                expected_run_epoch=authority.expected_run_epoch,
+            )
+            durable.record = ambiguous
+            with self._state_lock:
+                self._set_shared_terminal_lifecycle_unlocked(WorkspaceBranchLifecycleStatus.FENCED)
+            return WorkspaceBranchPublicationResult(
+                status=WorkspaceBranchOutcomeStatus.AMBIGUOUS,
+                evidence=self._evidence(
+                    WorkspaceBranchOutcomeStatus.AMBIGUOUS,
+                    change_set,
+                    paths=ambiguous_error.paths,
+                    detail_code="source_publication_ambiguous",
+                ),
+            )
+        committed = current.model_copy(
+            update={
+                "state": WorkspaceBranchDurableState.COMMITTED,
+                "revision": current.revision + 1,
+            }
+        )
+        self._validate_live_binding(binding_claim_lease)
+        committed = await _publish_or_reconcile_exact_record(
+            durable.store,
+            session_id=authority.session_id,
+            storage_key=durable.storage_key,
+            expected=current,
+            updated=committed,
+            expected_run_epoch=authority.expected_run_epoch,
+            on_exact_control_signal=lambda record: self._settle_observed_durable_terminal_handle(
+                record,
+                binding_claim_lease=binding_claim_lease,
+            ),
+            retain_uncertain_owner=lambda: self._retain_durable_terminal_settlement(
+                committed,
+                publication_expected=current,
+                binding_claim_lease=binding_claim_lease,
+            ),
+        )
+        await self._settle_observed_durable_terminal_handle(
+            committed,
+            binding_claim_lease=binding_claim_lease,
+            suppress_ordinary_cleanup_failure=True,
+        )
+        return _durable_publication_result(committed)
+
+    async def _converge_and_record_publication_progress(
+        self,
+        current: _DurableBranchRecord,
+        *,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> _DurableBranchRecord:
+        durable = self._durable
+        publication = current.publication
+        if durable is None or publication is None:
+            raise WorkspaceBranchFencedError("Durable publication intent is incomplete.")
+        if current.state is not WorkspaceBranchDurableState.PUBLICATION_PROGRESS:
+            raise WorkspaceBranchFencedError("Durable publication was not started.")
+        progressed = current.model_copy(
+            update={
+                "revision": current.revision + 1,
+            }
+        )
+
+        def converge_publication() -> None:
+            self._validate_live_binding(binding_claim_lease)
+            self._converge_durable_publication(publication)
+
+        try:
+            progressed = await _publish_durable_branch_record(
+                durable.store,
+                session_id=current.authority.session_id,
+                storage_key=durable.storage_key,
+                expected=current,
+                updated=progressed,
+                expected_run_epoch=current.authority.expected_run_epoch,
+                commit_guard=converge_publication,
+            )
+        except BaseException as signal:
+            staging_error = _publication_staging_cleanup_error(signal)
+            if staging_error is None:
+                raise
+            fence_local_workspace_source(self._source.root)
+            try:
+                _retain_source_staging_cleanup(
+                    staging_error,
+                    source_key=self._source_key,
+                )
+            except BaseException as retention_error:
+                _raise_primary_with_reconciliation_failure(signal, retention_error)
+            raise
+        durable.record = progressed
+        return progressed
+
+    def _preflight_durable_publication(
+        self,
+        change_set: WorkspaceBranchChangeSet,
+    ) -> None:
+        """Prove source inspection before recording the first mutation dispatch."""
+
+        try:
+            with workspace_source_lock(self._source.root, exclusive=True):
+                self._validate_source_root()
+                for change in change_set.changes:
+                    _inspect_source_path(
+                        self._source.root,
+                        change.path,
+                        max_bytes=self._limits.max_file_bytes,
+                    )
+        except OSError:
+            raise _DurablePublicationFailed("source_publication_inspection_failed") from None
+
+    def _converge_durable_publication(
+        self,
+        publication: _DurablePublication,
+    ) -> None:
+        change_set = publication.change_set
+        with workspace_source_lock(self._source.root, exclusive=True):
+            self._validate_source_root()
+            for change in change_set.changes:
+                if change.after is None:
+                    continue
+                try:
+                    settle_regular_staging(
+                        self._source.root,
+                        change.path,
+                        _durable_publication_staging_name(publication, change.path),
+                        expected_sha256=change.after.sha256,
+                        expected_bytes=change.after.bytes,
+                    )
+                except _LocalGuardStagingConflictError:
+                    raise _DurablePublicationAmbiguous((change.path,)) from None
+            positions: dict[str, Literal["before", "after"]] = {}
+            conflicts: list[WorkspaceBranchConflict] = []
+            after_count = 0
+            for change in change_set.changes:
+                try:
+                    actual_path, actual_kind, actual = _inspect_source_path(
+                        self._source.root,
+                        change.path,
+                        max_bytes=self._limits.max_file_bytes,
+                    )
+                except OSError:
+                    raise _DurablePublicationAmbiguous(
+                        tuple(
+                            sorted(
+                                {
+                                    change.path,
+                                    *(
+                                        path
+                                        for path, position in positions.items()
+                                        if position == "after"
+                                    ),
+                                }
+                            )
+                        )
+                    ) from None
+                before_matches = actual_path == change.path and (
+                    (change.before is None and actual_kind == "missing")
+                    or (
+                        change.before is not None
+                        and actual_kind == "file"
+                        and actual is not None
+                        and actual.public() == change.before
+                    )
+                )
+                after_matches = actual_path == change.path and (
+                    (change.after is None and actual_kind == "missing")
+                    or (
+                        change.after is not None
+                        and actual_kind == "file"
+                        and actual is not None
+                        and actual.public() == change.after
+                    )
+                )
+                if after_matches:
+                    positions[change.path] = "after"
+                    after_count += 1
+                elif before_matches:
+                    positions[change.path] = "before"
+                else:
+                    conflicts.append(
+                        WorkspaceBranchConflict(
+                            path=actual_path,
+                            expected=change.before,
+                            actual=None if actual is None else actual.public(),
+                            actual_kind=actual_kind,
+                        )
+                    )
+            if conflicts:
+                paths = tuple(sorted({item.path for item in conflicts}))
+                if after_count:
+                    raise _DurablePublicationAmbiguous(paths)
+                raise _DurablePublicationConflict(tuple(conflicts))
+            for change in change_set.changes:
+                if positions[change.path] == "after":
+                    continue
+                with workspace_path_lock(self._source.root, change.path):
+                    if change.operation == "created":
+                        try:
+                            create_regular(
+                                self._source.root,
+                                change.path,
+                                self._overlay_bytes(change.path),
+                                staging_name=_durable_publication_staging_name(
+                                    publication,
+                                    change.path,
+                                ),
+                            )
+                        except FileExistsError:
+                            raise _DurablePublicationAmbiguous((change.path,)) from None
+                    elif change.operation == "modified":
+                        before = change.before
+                        if before is None:  # pragma: no cover - model invariant
+                            raise AssertionError("Modified change has no before identity.")
+                        try:
+                            replace_regular_if_revision(
+                                self._source.root,
+                                change.path,
+                                self._overlay_bytes(change.path),
+                                f"sha256:{before.sha256}",
+                                staging_name=_durable_publication_staging_name(
+                                    publication,
+                                    change.path,
+                                ),
+                            )
+                        except FileExistsError:
+                            raise _DurablePublicationAmbiguous((change.path,)) from None
+                    else:
+                        before = change.before
+                        if before is None:  # pragma: no cover - model invariant
+                            raise AssertionError("Deleted change has no before identity.")
+                        delete_regular_if_revision(
+                            self._source.root,
+                            change.path,
+                            f"sha256:{before.sha256}",
+                        )
+            verification = self._published_identity_conflicts(change_set)
+            if verification:
+                raise _DurablePublicationAmbiguous(
+                    tuple(sorted(item.path for item in verification))
+                )
 
     def _publish(
         self,
@@ -1630,7 +5273,9 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                     if isinstance(error, _LocalGuardStagingCleanupError)
                 )
                 if rollback_errors or staging_cleanup_errors:
-                    self._lifecycle = WorkspaceBranchLifecycleStatus.FENCED
+                    self._set_shared_terminal_lifecycle_unlocked(
+                        WorkspaceBranchLifecycleStatus.FENCED
+                    )
                     fence_local_workspace_source(self._source.root)
                     retention_errors: list[BaseException] = []
                     for cleanup_error in staging_cleanup_errors:
@@ -1665,7 +5310,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             # teardown. A teardown failure may hide the first acknowledgement,
             # but an exact retry must still recover this committed result.
             self._publication_receipt = committed_receipt
-            self._lifecycle = WorkspaceBranchLifecycleStatus.COMMITTED
+            self._set_shared_terminal_lifecycle_unlocked(WorkspaceBranchLifecycleStatus.COMMITTED)
             self._timer.cancel()
             return committed_result
 
@@ -1926,8 +5571,188 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                     errors.append(error)
         return errors
 
-    async def rollback(self) -> WorkspaceBranchRollbackResult:
+    async def rollback(
+        self,
+        request: WorkspaceBranchRollbackRequest | None = None,
+    ) -> WorkspaceBranchRollbackResult:
+        if self._durable is not None:
+            if request is None:
+                raise ValueError("Durable workspace rollback requires explicit authority.")
+            return await self._rollback_durable(request)
         return await _await_owned_thread(self._rollback, "explicit")
+
+    async def _rollback_durable(
+        self,
+        request: WorkspaceBranchRollbackRequest,
+    ) -> WorkspaceBranchRollbackResult:
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable rollback lost its coordinator.")
+        binding_claim_lease = _binding_authority_claim_lease(
+            self._source,
+            durable.record.authority,
+        )
+        try:
+            result = await self._rollback_durable_claimed(
+                request,
+                binding_claim_lease=binding_claim_lease,
+            )
+        except BaseException as primary:
+            _release_binding_authority_claim_lease(binding_claim_lease, primary=primary)
+            raise
+        _release_binding_authority_claim_lease(binding_claim_lease)
+        return result
+
+    async def _rollback_durable_claimed(
+        self,
+        request: WorkspaceBranchRollbackRequest,
+        *,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> WorkspaceBranchRollbackResult:
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable rollback lost its coordinator.")
+        self._validate_live_binding(binding_claim_lease)
+        attached_record = durable.record
+        current = await _load_durable_branch_record(
+            durable.store,
+            session_id=durable.record.authority.session_id,
+            storage_key=durable.storage_key,
+        )
+        if current is None:
+            raise WorkspaceBranchFencedError("Durable workspace branch record disappeared.")
+        authority = current.authority
+        if request.expected_run_epoch != authority.expected_run_epoch:
+            raise SessionRunFenced(
+                "Workspace branch rollback run epoch does not match creation authority."
+            )
+        if (
+            request.branch_id != current.branch_id
+            or request.binding_generation != authority.binding_generation
+        ):
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch rollback authority does not match the branch."
+            )
+        await self._settle_observed_durable_terminal_handle(
+            current,
+            binding_claim_lease=binding_claim_lease,
+        )
+        if current != attached_record:
+            current = await self._converge_and_settle_observed_durable_operation(
+                current,
+                binding_claim_lease=binding_claim_lease,
+            )
+        if current.rollback is not None:
+            if (
+                current.rollback.idempotency_key != request.idempotency_key
+                or current.rollback.reason != request.reason
+            ):
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch already has different rollback authority."
+                )
+        elif current != attached_record:
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch changed under this rollback owner."
+            )
+        if request.reason == "expired" and not _durable_record_is_expired(current):
+            raise WorkspaceBranchOperationConflict(
+                "Workspace branch cannot expire before its durable lifetime ends."
+            )
+        if current.state in {
+            WorkspaceBranchDurableState.ROLLED_BACK,
+            WorkspaceBranchDurableState.EXPIRED,
+        }:
+            return _durable_rollback_result(current)
+        if current.state not in {
+            WorkspaceBranchDurableState.OPEN,
+            WorkspaceBranchDurableState.CONFLICTED,
+            WorkspaceBranchDurableState.ROLLBACK_INTENT,
+        }:
+            raise WorkspaceBranchClosedError(f"Durable workspace branch is {current.state.value}.")
+        try:
+            if current.state is not WorkspaceBranchDurableState.ROLLBACK_INTENT:
+                paths = tuple(sorted(self._overlay.keys() | self._tombstones))
+                intended = current.model_copy(
+                    update={
+                        "state": WorkspaceBranchDurableState.ROLLBACK_INTENT,
+                        "rollback": _DurableRollback(
+                            idempotency_key=request.idempotency_key,
+                            reason=request.reason,
+                            paths=paths,
+                        ),
+                        "revision": current.revision + 1,
+                    }
+                )
+                self._validate_live_binding(binding_claim_lease)
+                current = await _publish_or_reconcile_exact_record(
+                    durable.store,
+                    session_id=authority.session_id,
+                    storage_key=durable.storage_key,
+                    expected=current,
+                    updated=intended,
+                    expected_run_epoch=authority.expected_run_epoch,
+                )
+            terminal_state = (
+                WorkspaceBranchDurableState.EXPIRED
+                if request.reason == "expired"
+                else WorkspaceBranchDurableState.ROLLED_BACK
+            )
+            terminal = current.model_copy(
+                update={"state": terminal_state, "revision": current.revision + 1}
+            )
+            self._validate_live_binding(binding_claim_lease)
+            terminal = await _publish_or_reconcile_exact_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+                expected=current,
+                updated=terminal,
+                expected_run_epoch=authority.expected_run_epoch,
+                on_exact_control_signal=lambda record: (
+                    self._settle_observed_durable_terminal_handle(
+                        record,
+                        binding_claim_lease=binding_claim_lease,
+                    )
+                ),
+                retain_uncertain_owner=lambda: self._retain_durable_terminal_settlement(
+                    terminal,
+                    publication_expected=current,
+                    binding_claim_lease=binding_claim_lease,
+                ),
+            )
+        except WorkspaceBranchOperationConflict:
+            settled = await _load_durable_branch_record(
+                durable.store,
+                session_id=authority.session_id,
+                storage_key=durable.storage_key,
+            )
+            if settled is not None:
+                settled = await self._converge_and_settle_observed_durable_operation(
+                    settled,
+                    binding_claim_lease=binding_claim_lease,
+                )
+                if (
+                    settled.state
+                    in {
+                        WorkspaceBranchDurableState.ROLLED_BACK,
+                        WorkspaceBranchDurableState.EXPIRED,
+                    }
+                    and settled.rollback is not None
+                    and settled.rollback.idempotency_key == request.idempotency_key
+                    and settled.rollback.reason == request.reason
+                ):
+                    return _durable_rollback_result(settled)
+            raise
+        durable.record = terminal
+        result = _durable_rollback_result(terminal)
+        with self._state_lock:
+            self._validate_live_binding(binding_claim_lease)
+            self._lifecycle = WorkspaceBranchLifecycleStatus.ROLLING_BACK
+        await self._settle_observed_durable_terminal_handle(
+            terminal,
+            binding_claim_lease=binding_claim_lease,
+        )
+        return result
 
     def _rollback(self, reason: str) -> WorkspaceBranchRollbackResult:
         with self._state_lock:
@@ -1959,9 +5784,10 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 _retain_private_tree_cleanup(
                     self._private_root,
                     self._capacity_lease,
+                    private_root_owner=self._private_root_owner,
                 )
                 raise
-            self._lifecycle = WorkspaceBranchLifecycleStatus.ROLLED_BACK
+            self._set_shared_terminal_lifecycle_unlocked(WorkspaceBranchLifecycleStatus.ROLLED_BACK)
             self._rollback_receipt = receipt
             self._timer.cancel()
             return result
@@ -2005,7 +5831,23 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                     "Workspace path conflicts with an existing filesystem-equivalent path."
                 )
 
+    def _set_shared_terminal_lifecycle_unlocked(
+        self,
+        lifecycle: WorkspaceBranchLifecycleStatus,
+    ) -> None:
+        self._capacity_lease.mark_terminal(lifecycle)
+        self._lifecycle = lifecycle
+
+    def _set_shared_uncertain_lifecycle_unlocked(self) -> None:
+        self._capacity_lease.mark_uncertain()
+        self._lifecycle = WorkspaceBranchLifecycleStatus.FENCED
+
     def _require_active(self, *, allow_publishing: bool = False) -> None:
+        shared = self._capacity_lease.terminal_lifecycle()
+        if shared is WorkspaceBranchLifecycleStatus.FENCED:
+            raise WorkspaceBranchFencedError("Workspace branch is fenced.")
+        if shared is not None:
+            raise WorkspaceBranchClosedError(f"Workspace branch is not active: {shared.value}.")
         if self._lifecycle is WorkspaceBranchLifecycleStatus.FENCED:
             raise WorkspaceBranchFencedError("Workspace branch is fenced.")
         if self._lifecycle is WorkspaceBranchLifecycleStatus.PUBLISHING and allow_publishing:
@@ -2015,6 +5857,10 @@ class LocalWorkspaceBranch(WorkspaceBranch):
                 f"Workspace branch is not active: {self._lifecycle.value}."
             )
         if time.monotonic() >= self._expires_at:
+            if self._durable is not None:
+                raise WorkspaceBranchClosedError(
+                    "Durable workspace branch expired; recover it to settle cleanup."
+                )
             self._rollback("expired")
             raise WorkspaceBranchClosedError("Workspace branch expired.")
 
@@ -2090,27 +5936,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
         overlay: dict[str, _FileIdentity],
         tombstones: set[str],
     ) -> tuple[WorkspaceBranchChange, ...]:
-        changes: list[WorkspaceBranchChange] = []
-        for path in sorted(overlay.keys() | tombstones):
-            before = self._baseline.get(path)
-            after = overlay.get(path)
-            if path in tombstones:
-                if before is None:  # pragma: no cover - normalization invariant
-                    continue
-                operation = "deleted"
-            elif before is None:
-                operation = "created"
-            else:
-                operation = "modified"
-            changes.append(
-                WorkspaceBranchChange(
-                    path=path,
-                    operation=operation,
-                    before=None if before is None else before.public(),
-                    after=None if after is None else after.public(),
-                )
-            )
-        return tuple(changes)
+        return _changes_for_retained_branch_state(self._baseline, overlay, tombstones)
 
     def _change_set_unlocked(self) -> WorkspaceBranchChangeSet:
         changes = self._changes_from(self._overlay, self._tombstones)
@@ -2190,6 +6016,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             _retain_private_tree_cleanup(
                 self._private_root,
                 self._capacity_lease,
+                private_root_owner=self._private_root_owner,
             )
             return BaseExceptionGroup(
                 "Private workspace branch fencing and cleanup failures.",
@@ -2286,7 +6113,206 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             raise WorkspaceBranchFencedError("Local workspace source is fenced.")
 
     def _cleanup_and_release(self) -> None:
-        _settle_private_tree_cleanup(self._private_root, self._capacity_lease)
+        _settle_private_tree_cleanup(
+            self._private_root,
+            self._capacity_lease,
+            private_root_owner=self._private_root_owner,
+        )
+
+    async def _converge_and_settle_observed_durable_operation(
+        self,
+        record: _DurableBranchRecord,
+        *,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> _DurableBranchRecord:
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable operation convergence lost its coordinator.")
+        if record.state in {
+            WorkspaceBranchDurableState.PUBLICATION_INTENT,
+            WorkspaceBranchDurableState.PUBLICATION_PROGRESS,
+        }:
+            publication = record.publication
+            if publication is None:  # pragma: no cover - record invariant
+                raise AssertionError("Durable publication lost its intent evidence.")
+            durable.record = record
+            await self._publish_durable_claimed(
+                WorkspaceBranchPublicationRequest(
+                    branch_id=record.branch_id,
+                    baseline_revision=record.baseline_revision,
+                    change_set_digest=publication.change_set.digest,
+                    idempotency_key=publication.idempotency_key,
+                    expected_run_epoch=record.authority.expected_run_epoch,
+                    binding_generation=record.authority.binding_generation,
+                ),
+                binding_claim_lease=binding_claim_lease,
+            )
+        elif record.state is WorkspaceBranchDurableState.ROLLBACK_INTENT:
+            rollback = record.rollback
+            if rollback is None:  # pragma: no cover - record invariant
+                raise AssertionError("Durable rollback lost its intent evidence.")
+            durable.record = record
+            await self._rollback_durable_claimed(
+                WorkspaceBranchRollbackRequest(
+                    branch_id=record.branch_id,
+                    idempotency_key=rollback.idempotency_key,
+                    expected_run_epoch=record.authority.expected_run_epoch,
+                    binding_generation=record.authority.binding_generation,
+                    reason=rollback.reason,
+                ),
+                binding_claim_lease=binding_claim_lease,
+            )
+        else:
+            await self._settle_observed_durable_terminal_handle(
+                record,
+                binding_claim_lease=binding_claim_lease,
+            )
+            return record
+        settled = await _load_durable_branch_record(
+            durable.store,
+            session_id=record.authority.session_id,
+            storage_key=durable.storage_key,
+        )
+        if settled is None:
+            raise WorkspaceBranchFencedError(
+                "Durable workspace branch disappeared during operation convergence."
+            )
+        await self._settle_observed_durable_terminal_handle(
+            settled,
+            binding_claim_lease=binding_claim_lease,
+        )
+        return settled
+
+    async def _settle_observed_durable_terminal_handle(
+        self,
+        record: _DurableBranchRecord,
+        *,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+        suppress_ordinary_cleanup_failure: bool = False,
+    ) -> None:
+        if record.state not in {
+            WorkspaceBranchDurableState.COMMITTED,
+            WorkspaceBranchDurableState.ROLLED_BACK,
+            WorkspaceBranchDurableState.EXPIRED,
+            WorkspaceBranchDurableState.FAILED,
+        }:
+            return
+        self._record_durable_terminal_handle(record)
+        try:
+            await _await_owned_thread(
+                _settle_durable_private_tree_removal,
+                self._source,
+                record,
+                self._capacity_lease,
+                settle_result=lambda _result: self._complete_durable_terminal_settlement(record),
+                pre_dispatch_checkpoint=False,
+            )
+        except BaseException as cleanup_error:
+            if not self._capacity_lease.released():
+                self._retain_durable_terminal_settlement(
+                    record,
+                    publication_expected=None,
+                    binding_claim_lease=binding_claim_lease,
+                )
+                if suppress_ordinary_cleanup_failure and isinstance(cleanup_error, Exception):
+                    self._record_durable_terminal_handle(record)
+                    return
+            raise
+
+    def _retain_durable_terminal_settlement(
+        self,
+        record: _DurableBranchRecord,
+        *,
+        publication_expected: _DurableBranchRecord | None,
+        binding_claim_lease: _BindingAuthorityClaimLease,
+    ) -> None:
+        if record.state not in {
+            WorkspaceBranchDurableState.COMMITTED,
+            WorkspaceBranchDurableState.ROLLED_BACK,
+            WorkspaceBranchDurableState.EXPIRED,
+            WorkspaceBranchDurableState.FAILED,
+        }:
+            raise AssertionError("Retained durable branch settlement is not terminal.")
+        key = _durable_terminal_settlement_key(self)
+        existing = _DURABLE_TERMINAL_SETTLEMENTS.payload(key)
+        if existing is not None:
+            if existing.branch is not self:
+                raise RuntimeError("Retained terminal settlement owner changed.")
+            return
+        self._capacity_lease.retain_for_cleanup()
+        retained = _DURABLE_TERMINAL_SETTLEMENTS.retain(
+            key,
+            source_key=self._source_key,
+            payload=_RetainedDurableTerminalSettlement(
+                branch=self,
+                terminal_record=record,
+                publication_expected=publication_expected,
+                binding_claim_lease=binding_claim_lease,
+            ),
+        )
+        if retained:
+            binding_claim_lease.retain_for_settlement()
+
+    def _complete_durable_terminal_settlement(
+        self,
+        record: _DurableBranchRecord,
+    ) -> None:
+        self._record_durable_terminal_handle(record)
+        self._capacity_lease.release_after_cleanup()
+        _forget_private_tree_cleanup(self._private_root, self._capacity_lease)
+        _release_durable_terminal_settlement(self)
+
+    def _record_durable_terminal_handle(
+        self,
+        record: _DurableBranchRecord,
+    ) -> None:
+        if record.state not in {
+            WorkspaceBranchDurableState.COMMITTED,
+            WorkspaceBranchDurableState.ROLLED_BACK,
+            WorkspaceBranchDurableState.EXPIRED,
+            WorkspaceBranchDurableState.FAILED,
+        }:
+            return
+        durable = self._durable
+        if durable is None:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable terminal settlement lost its coordinator.")
+        durable.record = record
+        with self._state_lock:
+            self._record_durable_terminal_handle_unlocked(record)
+
+    def _record_durable_terminal_handle_unlocked(
+        self,
+        record: _DurableBranchRecord,
+    ) -> None:
+        if record.state is WorkspaceBranchDurableState.COMMITTED:
+            publication = record.publication
+            if publication is None:  # pragma: no cover - record invariant
+                raise AssertionError("Durable publication lost terminal evidence.")
+            self._set_shared_terminal_lifecycle_unlocked(WorkspaceBranchLifecycleStatus.COMMITTED)
+            self._publication_receipt = _PublicationReceipt(
+                change_set_digest=publication.change_set.digest,
+                paths=tuple(change.path for change in publication.change_set.changes),
+            )
+        elif record.state is WorkspaceBranchDurableState.FAILED:
+            self._set_shared_terminal_lifecycle_unlocked(WorkspaceBranchLifecycleStatus.FENCED)
+        elif record.state in {
+            WorkspaceBranchDurableState.ROLLED_BACK,
+            WorkspaceBranchDurableState.EXPIRED,
+        }:
+            rollback = record.rollback
+            if rollback is None:  # pragma: no cover - record invariant
+                raise AssertionError("Durable rollback lost terminal evidence.")
+            self._set_shared_terminal_lifecycle_unlocked(WorkspaceBranchLifecycleStatus.ROLLED_BACK)
+            self._rollback_receipt = _RollbackReceipt(
+                paths=rollback.paths,
+                detail_code=(
+                    "workspace_branch_expired"
+                    if rollback.reason == "expired"
+                    else "workspace_branch_rolled_back"
+                ),
+            )
+        else:  # pragma: no cover - caller invariant
+            raise AssertionError("Durable branch record is not terminal.")
 
     def _finish_terminal_cleanup_unlocked(self) -> None:
         try:
@@ -2295,6 +6321,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             _retain_private_tree_cleanup(
                 self._private_root,
                 self._capacity_lease,
+                private_root_owner=self._private_root_owner,
             )
             if not isinstance(cleanup_error, Exception):
                 raise
@@ -2307,6 +6334,7 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             _retain_private_tree_cleanup(
                 self._private_root,
                 self._capacity_lease,
+                private_root_owner=self._private_root_owner,
             )
             if not isinstance(cleanup_error, Exception):
                 raise
@@ -2626,23 +6654,851 @@ def _missing_ancestor_paths(
     return tuple(sorted(missing, key=lambda value: (value.count("/"), value)))
 
 
-def _remove_private_tree(path: Path) -> None:
-    if path.exists():
+def _remove_private_tree(
+    path: Path,
+    *,
+    private_root_owner: str | None = None,
+) -> None:
+    if private_root_owner is not None:
+        _remove_owned_private_tree(path, private_root_owner)
+        return
+    with suppress(FileNotFoundError):
         shutil.rmtree(path)
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupQuarantineClaim:
+    device: int
+    inode: int
+    file_identity: os.stat_result = field(compare=False)
+
+
+class _CleanupQuarantineReplacement(WorkspaceBranchFencedError):
+    """A raced unowned cleanup pathname was restored to its public location."""
+
+
+class _CleanupQuarantineClaimMissing(WorkspaceBranchFencedError):
+    """The exact cleanup claim disappeared before it could be inspected."""
+
+
+def _cleanup_quarantine_claim_path(quarantine: Path) -> Path:
+    name_digest = hashlib.sha256(os.fsencode(quarantine.name)).hexdigest()
+    return quarantine.with_name(f".cayu-cleanup-{name_digest}.claim")
+
+
+def _cleanup_quarantine_claim_staging_name(quarantine: Path) -> str:
+    return f"{_cleanup_quarantine_claim_path(quarantine).name}.staging"
+
+
+def _cleanup_quarantine_claim_bytes(
+    owner: str,
+    identity: os.stat_result,
+) -> bytes:
+    try:
+        return (
+            f"{_PRIVATE_CLEANUP_CLAIM_PREFIX}\n{owner}\n{identity.st_dev}\n{identity.st_ino}\n"
+        ).encode("ascii")
+    except UnicodeEncodeError as error:  # pragma: no cover - generated owner invariant
+        raise WorkspaceBranchFencedError("Durable private cleanup identity is invalid.") from error
+
+
+def _read_cleanup_quarantine_claim(
+    parent_fd: int,
+    quarantine: Path,
+    owner: str,
+) -> _CleanupQuarantineClaim:
+    claim_path = _cleanup_quarantine_claim_path(quarantine)
+    claim_fd = -1
+    try:
+        claim_fd = os.open(
+            claim_path.name,
+            _PRIVATE_OWNER_OPEN_FLAGS,
+            dir_fd=parent_fd,
+        )
+        claim_identity = os.fstat(claim_fd)
+        if (
+            not stat.S_ISREG(claim_identity.st_mode)
+            or claim_identity.st_size <= 0
+            or claim_identity.st_size > _PRIVATE_CLEANUP_CLAIM_MAX_BYTES
+        ):
+            raise WorkspaceBranchFencedError("Durable private cleanup identity is invalid.")
+        content = bytearray()
+        while len(content) <= _PRIVATE_CLEANUP_CLAIM_MAX_BYTES:
+            chunk = os.read(
+                claim_fd,
+                _PRIVATE_CLEANUP_CLAIM_MAX_BYTES + 1 - len(content),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        current = os.stat(
+            claim_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not os.path.samestat(claim_identity, current):
+            raise WorkspaceBranchFencedError("Durable private cleanup identity changed.")
+        try:
+            lines = bytes(content).decode("ascii").splitlines()
+            if len(lines) != 4 or lines[0] != _PRIVATE_CLEANUP_CLAIM_PREFIX or lines[1] != owner:
+                raise ValueError
+            device = int(lines[2])
+            inode = int(lines[3])
+            if device < 0 or inode <= 0 or lines[2] != str(device) or lines[3] != str(inode):
+                raise ValueError
+            canonical = (f"{_PRIVATE_CLEANUP_CLAIM_PREFIX}\n{owner}\n{device}\n{inode}\n").encode(
+                "ascii"
+            )
+            if bytes(content) != canonical:
+                raise ValueError
+        except (UnicodeDecodeError, ValueError) as error:
+            raise WorkspaceBranchFencedError(
+                "Durable private cleanup identity is invalid."
+            ) from error
+        return _CleanupQuarantineClaim(
+            device=device,
+            inode=inode,
+            file_identity=claim_identity,
+        )
+    except FileNotFoundError as error:
+        raise _CleanupQuarantineClaimMissing(
+            "Durable private cleanup identity is missing."
+        ) from error
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private cleanup identity is unavailable."
+        ) from error
+    finally:
+        if claim_fd >= 0:
+            os.close(claim_fd)
+
+
+def _lock_cleanup_claim_staging(staging_fd: int) -> None:
+    try:
+        lock_module = __import__("fcntl")
+        lock_module.flock(staging_fd, lock_module.LOCK_EX)
+    except (ImportError, OSError) as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private cleanup staging ownership is unavailable."
+        ) from error
+
+
+def _write_cleanup_claim_staging(staging_fd: int, expected: bytes) -> None:
+    os.ftruncate(staging_fd, 0)
+    os.lseek(staging_fd, 0, os.SEEK_SET)
+    remaining = memoryview(expected)
+    while remaining:
+        written = os.write(staging_fd, remaining)
+        if written <= 0:  # pragma: no cover - os.write contract
+            raise OSError(errno.EIO, "cleanup staging write made no progress")
+        remaining = remaining[written:]
+    os.fsync(staging_fd)
+
+
+def _cleanup_claim_staging_is_repairable(
+    parent_fd: int,
+    claim_path: Path,
+    staging_name: str,
+    staging_fd: int,
+    expected: bytes,
+) -> bool:
+    identity = os.fstat(staging_fd)
+    if (
+        not stat.S_ISREG(identity.st_mode)
+        or stat.S_IMODE(identity.st_mode) != _PRIVATE_FILE_MODE
+        or identity.st_uid != os.geteuid()
+        or identity.st_nlink != 1
+        or identity.st_size >= len(expected)
+    ):
+        return False
+    try:
+        current = os.stat(
+            staging_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    if not os.path.samestat(identity, current):
+        return False
+    try:
+        os.stat(
+            claim_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        return False
+    os.lseek(staging_fd, 0, os.SEEK_SET)
+    content = bytearray()
+    while len(content) < len(expected):
+        chunk = os.read(staging_fd, len(expected) - len(content))
+        if not chunk:
+            break
+        content.extend(chunk)
+    return expected.startswith(content)
+
+
+def _validate_exact_cleanup_claim_staging(
+    parent_fd: int,
+    staging_name: str,
+    staging_fd: int,
+    expected: bytes,
+) -> tuple[os.stat_result, bool]:
+    try:
+        staging_identity = os.fstat(staging_fd)
+        if (
+            not stat.S_ISREG(staging_identity.st_mode)
+            or staging_identity.st_size != len(expected)
+            or staging_identity.st_size > _PRIVATE_CLEANUP_CLAIM_MAX_BYTES
+        ):
+            raise WorkspaceBranchFencedError("Durable private cleanup staging identity is invalid.")
+        os.lseek(staging_fd, 0, os.SEEK_SET)
+        content = bytearray()
+        while len(content) <= _PRIVATE_CLEANUP_CLAIM_MAX_BYTES:
+            chunk = os.read(
+                staging_fd,
+                _PRIVATE_CLEANUP_CLAIM_MAX_BYTES + 1 - len(content),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        try:
+            current = os.stat(
+                staging_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            path_present = False
+        else:
+            path_present = True
+            if not os.path.samestat(staging_identity, current):
+                raise WorkspaceBranchFencedError(
+                    "Durable private cleanup staging identity changed."
+                )
+        if bytes(content) != expected:
+            raise WorkspaceBranchFencedError(
+                "Durable private cleanup staging identity conflicts with the owned tree."
+            )
+        return staging_identity, path_present
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private cleanup staging identity is unavailable."
+        ) from error
+
+
+def _remove_exact_cleanup_claim_staging(
+    parent_fd: int,
+    staging_name: str,
+    staging_identity: os.stat_result,
+) -> None:
+    try:
+        current = os.stat(
+            staging_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if not os.path.samestat(staging_identity, current):
+        raise WorkspaceBranchFencedError("Durable private cleanup staging identity changed.")
+    try:
+        os.unlink(staging_name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+
+
+def _read_matching_cleanup_quarantine_claim(
+    parent_fd: int,
+    quarantine: Path,
+    owner: str,
+    owned_identity: os.stat_result,
+) -> _CleanupQuarantineClaim:
+    claim = _read_cleanup_quarantine_claim(parent_fd, quarantine, owner)
+    if claim.device != owned_identity.st_dev or claim.inode != owned_identity.st_ino:
+        raise WorkspaceBranchFencedError(
+            "Durable private cleanup identity conflicts with the owned tree."
+        )
+    return claim
+
+
+def _matching_cleanup_claim_or_settled(
+    parent_fd: int,
+    quarantine: Path,
+    authoritative_path: Path,
+    owner: str,
+    owned_identity: os.stat_result,
+) -> bool:
+    """Return whether another exact cleanup already removed both owned paths."""
+
+    try:
+        _read_matching_cleanup_quarantine_claim(
+            parent_fd,
+            quarantine,
+            owner,
+            owned_identity,
+        )
+    except _CleanupQuarantineClaimMissing as missing_claim:
+        for path in (authoritative_path, quarantine):
+            try:
+                os.stat(
+                    path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise WorkspaceBranchFencedError(
+                    "Durable private cleanup settlement is unavailable."
+                ) from error
+            raise missing_claim
+        return True
+    return False
+
+
+def _write_or_require_cleanup_quarantine_claim(
+    parent_fd: int,
+    quarantine: Path,
+    authoritative_path: Path,
+    owner: str,
+    owned_identity: os.stat_result,
+) -> bool:
+    claim_path = _cleanup_quarantine_claim_path(quarantine)
+    expected = _cleanup_quarantine_claim_bytes(owner, owned_identity)
+    staging_name = _cleanup_quarantine_claim_staging_name(quarantine)
+    staging_fd = -1
+    staging_identity: os.stat_result | None = None
+    created_staging = False
+    staging_path_present = False
+    published = False
+    try:
+        try:
+            staging_fd = os.open(
+                staging_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                _PRIVATE_FILE_MODE,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            try:
+                staging_fd = os.open(
+                    staging_name,
+                    os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                if _matching_cleanup_claim_or_settled(
+                    parent_fd,
+                    quarantine,
+                    authoritative_path,
+                    owner,
+                    owned_identity,
+                ):
+                    return True
+                published = True
+        else:
+            created_staging = True
+        if staging_fd >= 0:
+            _lock_cleanup_claim_staging(staging_fd)
+            if created_staging:
+                _write_cleanup_claim_staging(staging_fd, expected)
+            try:
+                staging_identity, staging_path_present = _validate_exact_cleanup_claim_staging(
+                    parent_fd,
+                    staging_name,
+                    staging_fd,
+                    expected,
+                )
+            except WorkspaceBranchFencedError:
+                if not _cleanup_claim_staging_is_repairable(
+                    parent_fd,
+                    claim_path,
+                    staging_name,
+                    staging_fd,
+                    expected,
+                ):
+                    raise
+                _write_cleanup_claim_staging(staging_fd, expected)
+                staging_identity, staging_path_present = _validate_exact_cleanup_claim_staging(
+                    parent_fd,
+                    staging_name,
+                    staging_fd,
+                    expected,
+                )
+        if not published and not staging_path_present:
+            if _matching_cleanup_claim_or_settled(
+                parent_fd,
+                quarantine,
+                authoritative_path,
+                owner,
+                owned_identity,
+            ):
+                return True
+            published = True
+        elif not published:
+            try:
+                os.link(
+                    staging_name,
+                    claim_path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except (FileExistsError, FileNotFoundError):
+                if _matching_cleanup_claim_or_settled(
+                    parent_fd,
+                    quarantine,
+                    authoritative_path,
+                    owner,
+                    owned_identity,
+                ):
+                    return True
+                published = True
+            else:
+                claim = _read_matching_cleanup_quarantine_claim(
+                    parent_fd,
+                    quarantine,
+                    owner,
+                    owned_identity,
+                )
+                if staging_identity is None or not os.path.samestat(
+                    claim.file_identity, staging_identity
+                ):
+                    raise WorkspaceBranchFencedError(
+                        "Durable private cleanup publication changed its staging identity."
+                    )
+                published = True
+    except WorkspaceBranchFencedError:
+        raise
+    except OSError as error:
+        raise WorkspaceBranchFencedError(
+            "Durable private cleanup staging ownership is unavailable."
+        ) from error
+    finally:
+        primary = sys.exception()
+        cleanup_failures: list[BaseException] = []
+        try:
+            if staging_identity is not None and (created_staging or published):
+                _remove_exact_cleanup_claim_staging(
+                    parent_fd,
+                    staging_name,
+                    staging_identity,
+                )
+        except BaseException as cleanup_error:
+            cleanup_failures.append(cleanup_error)
+        try:
+            if staging_fd >= 0:
+                os.close(staging_fd)
+        except BaseException as cleanup_error:
+            cleanup_failures.append(cleanup_error)
+        try:
+            if published:
+                os.fsync(parent_fd)
+        except BaseException as cleanup_error:
+            cleanup_failures.append(cleanup_error)
+        if cleanup_failures:
+            cleanup_failure: BaseException = (
+                cleanup_failures[0]
+                if len(cleanup_failures) == 1
+                else BaseExceptionGroup(
+                    "Durable private cleanup staging settlement failed.",
+                    cleanup_failures,
+                )
+            )
+            if primary is not None:
+                _raise_primary_with_reconciliation_failure(primary, cleanup_failure)
+            raise cleanup_failure
+    return False
+
+
+def _remove_cleanup_quarantine_claim(
+    parent_fd: int,
+    quarantine: Path,
+    claim: _CleanupQuarantineClaim,
+) -> None:
+    claim_path = _cleanup_quarantine_claim_path(quarantine)
+    try:
+        current = os.stat(
+            claim_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if not os.path.samestat(claim.file_identity, current):
+        raise WorkspaceBranchFencedError("Durable private cleanup identity changed.")
+    try:
+        os.unlink(claim_path.name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+    os.fsync(parent_fd)
+
+
+def _discard_orphaned_cleanup_quarantine_claim(
+    parent_fd: int,
+    quarantine: Path,
+    authoritative_path: Path,
+) -> None:
+    try:
+        os.stat(quarantine.name, dir_fd=parent_fd, follow_symlinks=False)
+        return
+    except FileNotFoundError:
+        pass
+    try:
+        os.stat(authoritative_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        return
+    except FileNotFoundError:
+        pass
+    claim_path = _cleanup_quarantine_claim_path(quarantine)
+    with suppress(FileNotFoundError):
+        os.unlink(claim_path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+
+
+def _remove_owned_private_tree(path: Path, owner: str) -> None:
+    parent_fd = os.open(path.parent, _PRIVATE_DIRECTORY_OPEN_FLAGS)
+    directory_fd = -1
+    try:
+        quarantine = path.with_name(f"{path.name}.cleanup-{owner}")
+        _settle_owned_cleanup_quarantine(
+            parent_fd,
+            quarantine,
+            path,
+            owner,
+        )
+        try:
+            directory_fd = os.open(
+                path.name,
+                _PRIVATE_DIRECTORY_OPEN_FLAGS,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise WorkspaceBranchFencedError(
+                "Durable private branch ownership is unavailable."
+            ) from error
+        owned_identity = os.fstat(directory_fd)
+        _require_private_root_owner(directory_fd, owner)
+        cleanup_already_settled = _write_or_require_cleanup_quarantine_claim(
+            parent_fd,
+            quarantine,
+            path,
+            owner,
+            owned_identity,
+        )
+        if cleanup_already_settled:
+            return
+        try:
+            _rename_private_root_no_replace(path, quarantine, parent_fd=parent_fd)
+        except FileNotFoundError:
+            os.close(directory_fd)
+            directory_fd = -1
+            _settle_owned_cleanup_quarantine(
+                parent_fd,
+                quarantine,
+                path,
+                owner,
+            )
+            return
+        except FileExistsError as error:
+            raise WorkspaceBranchFencedError(
+                "Durable private cleanup quarantine became occupied."
+            ) from error
+        try:
+            current = os.stat(quarantine.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not os.path.samestat(owned_identity, current):
+            claim = _read_cleanup_quarantine_claim(parent_fd, quarantine, owner)
+            _restore_unowned_cleanup_quarantine(
+                parent_fd,
+                quarantine,
+                path,
+                current,
+                claim,
+                _CleanupQuarantineReplacement(
+                    "Durable private branch ownership changed during quarantine."
+                ),
+            )
+        os.close(directory_fd)
+        directory_fd = -1
+        _settle_owned_cleanup_quarantine(
+            parent_fd,
+            quarantine,
+            path,
+            owner,
+        )
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
+def _settle_owned_cleanup_quarantine(
+    parent_fd: int,
+    path: Path,
+    authoritative_path: Path,
+    owner: str,
+) -> None:
+    directory_fd = -1
+    try:
+        try:
+            directory_fd = os.open(
+                path.name,
+                _PRIVATE_DIRECTORY_OPEN_FLAGS,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            _discard_orphaned_cleanup_quarantine_claim(
+                parent_fd,
+                path,
+                authoritative_path,
+            )
+            return
+        except OSError as error:
+            raise WorkspaceBranchFencedError(
+                "Durable private cleanup quarantine is unavailable."
+            ) from error
+        owned_identity = os.fstat(directory_fd)
+        claim = _read_cleanup_quarantine_claim(parent_fd, path, owner)
+        if claim.device != owned_identity.st_dev or claim.inode != owned_identity.st_ino:
+            _restore_unowned_cleanup_quarantine(
+                parent_fd,
+                path,
+                authoritative_path,
+                owned_identity,
+                claim,
+                _CleanupQuarantineReplacement(
+                    "Durable private cleanup quarantine ownership changed."
+                ),
+            )
+        try:
+            _require_private_root_owner(directory_fd, owner)
+        except WorkspaceBranchFencedError as ownership_error:
+            _remove_empty_owned_directory(
+                parent_fd,
+                path,
+                directory_fd,
+                owned_identity,
+                detail="Durable private cleanup quarantine ownership is unavailable.",
+                ownership_error=ownership_error,
+            )
+            _remove_cleanup_quarantine_claim(parent_fd, path, claim)
+            return
+        _remove_private_tree_contents_from_fd(
+            directory_fd,
+            path=path,
+            preserve_owner_marker=True,
+        )
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _remove_cleanup_quarantine_claim(parent_fd, path, claim)
+            return
+        if not os.path.samestat(owned_identity, current):
+            raise WorkspaceBranchFencedError("Durable private cleanup quarantine changed.")
+        try:
+            _require_private_root_owner(directory_fd, owner)
+        except WorkspaceBranchFencedError as ownership_error:
+            _remove_empty_owned_directory(
+                parent_fd,
+                path,
+                directory_fd,
+                owned_identity,
+                detail="Durable private cleanup quarantine changed.",
+                ownership_error=ownership_error,
+            )
+            _remove_cleanup_quarantine_claim(parent_fd, path, claim)
+            return
+        try:
+            os.unlink(_PRIVATE_ROOT_OWNER_FILE, dir_fd=directory_fd)
+        except FileNotFoundError:
+            _remove_empty_owned_directory(
+                parent_fd,
+                path,
+                directory_fd,
+                owned_identity,
+                detail="Durable private cleanup quarantine changed.",
+            )
+            _remove_cleanup_quarantine_claim(parent_fd, path, claim)
+            return
+        try:
+            os.rmdir(path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            _remove_cleanup_quarantine_claim(parent_fd, path, claim)
+            return
+        except BaseException as removal_error:
+            try:
+                _write_private_root_owner_to_fd(directory_fd, owner)
+            except BaseException as restoration_error:
+                raise removal_error from restoration_error
+            raise
+        _remove_cleanup_quarantine_claim(parent_fd, path, claim)
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def _restore_unowned_cleanup_quarantine(
+    parent_fd: int,
+    quarantine: Path,
+    authoritative_path: Path,
+    quarantine_identity: os.stat_result,
+    claim: _CleanupQuarantineClaim,
+    ownership_error: BaseException,
+) -> NoReturn:
+    """Restore a raced unowned pathname instead of deleting or stranding it."""
+
+    try:
+        _rename_private_root_no_replace(
+            quarantine,
+            authoritative_path,
+            parent_fd=parent_fd,
+        )
+    except FileExistsError:
+        raise ownership_error from None
+    except FileNotFoundError:
+        raise ownership_error from None
+    try:
+        restored = os.stat(
+            authoritative_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        raise ownership_error from None
+    if not os.path.samestat(quarantine_identity, restored):
+        raise WorkspaceBranchFencedError(
+            "Durable private cleanup restoration changed ownership."
+        ) from ownership_error
+    try:
+        _remove_cleanup_quarantine_claim(parent_fd, quarantine, claim)
+    except BaseException as cleanup_error:
+        _raise_primary_with_reconciliation_failure(ownership_error, cleanup_error)
+    raise ownership_error
+
+
+def _remove_empty_owned_directory(
+    parent_fd: int,
+    path: Path,
+    directory_fd: int,
+    owned_identity: os.stat_result,
+    *,
+    detail: str,
+    ownership_error: BaseException | None = None,
+) -> None:
+    with os.scandir(directory_fd) as entries:
+        if any(True for _entry in entries):
+            if ownership_error is not None:
+                raise ownership_error
+            raise WorkspaceBranchFencedError(detail)
+    try:
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not os.path.samestat(owned_identity, current):
+        raise WorkspaceBranchFencedError(detail) from ownership_error
+    try:
+        os.rmdir(path.name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+
+
+def _remove_private_tree_contents_from_fd(
+    directory_fd: int,
+    *,
+    path: Path,
+    preserve_owner_marker: bool = False,
+) -> None:
+    with os.scandir(directory_fd) as entries:
+        names = [entry.name for entry in entries]
+    if preserve_owner_marker:
+        names = [name for name in names if name != _PRIVATE_ROOT_OWNER_FILE]
+    for name in names:
+        child_path = path / name
+        try:
+            identity = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(identity.st_mode):
+            try:
+                child_fd = os.open(
+                    name,
+                    _PRIVATE_DIRECTORY_OPEN_FLAGS,
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                continue
+            try:
+                opened_identity = os.fstat(child_fd)
+                if not os.path.samestat(identity, opened_identity):
+                    raise WorkspaceBranchFencedError(
+                        f"Durable private branch path changed during cleanup: {child_path}"
+                    )
+                _remove_private_tree_contents_from_fd(child_fd, path=child_path)
+            finally:
+                os.close(child_fd)
+            try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not os.path.samestat(opened_identity, current):
+                raise WorkspaceBranchFencedError(
+                    f"Durable private branch path changed during cleanup: {child_path}"
+                )
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+            continue
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not os.path.samestat(identity, current):
+            raise WorkspaceBranchFencedError(
+                f"Durable private branch path changed during cleanup: {child_path}"
+            )
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            continue
 
 
 def _discard_captured_baseline(
     captured: _CapturedBaseline,
     capacity_lease: _BranchCapacityLease,
 ) -> None:
-    _discard_private_tree(captured.private_root, capacity_lease)
+    _discard_private_tree(
+        captured.private_root,
+        capacity_lease,
+        private_root_owner=captured.private_root_owner,
+    )
 
 
-def _discard_private_tree(path: Path, capacity_lease: _BranchCapacityLease) -> None:
+def _discard_private_tree(
+    path: Path,
+    capacity_lease: _BranchCapacityLease,
+    *,
+    private_root_owner: str | None = None,
+) -> None:
     try:
-        _settle_private_tree_cleanup(path, capacity_lease)
+        _settle_private_tree_cleanup(
+            path,
+            capacity_lease,
+            private_root_owner=private_root_owner,
+        )
     except BaseException:
-        _retain_private_tree_cleanup(path, capacity_lease)
+        _retain_private_tree_cleanup(
+            path,
+            capacity_lease,
+            private_root_owner=private_root_owner,
+        )
         raise
 
 
@@ -2651,30 +7507,39 @@ def _retain_source_staging_cleanup(
     *,
     source_key: tuple[object, ...],
 ) -> None:
-    _SOURCE_STAGING_CLEANUPS.retain(
-        error,
+    key = (source_key, error.staging_name)
+    inserted, _retained = _SOURCE_STAGING_CLEANUPS.retain_or_existing(
+        key,
         source_key=source_key,
         payload=error,
+        replace_unclaimed=lambda retained: not retained.cleanup_owned and error.cleanup_owned,
     )
-    _schedule_source_staging_cleanup(error)
+    if not inserted:
+        error.release_cleanup_owner()
+    _schedule_source_staging_cleanup(key)
 
 
-def _schedule_source_staging_cleanup(error: _LocalGuardStagingCleanupError) -> None:
+def _schedule_source_staging_cleanup(
+    key: tuple[tuple[object, ...], str],
+) -> None:
     _schedule_retained_cleanup(
         _SOURCE_STAGING_CLEANUPS,
-        error,
+        key,
         _retry_source_staging_cleanup,
         eligible=lambda retained: retained.cleanup_owned,
     )
 
 
-def _retry_source_staging_cleanup(error: _LocalGuardStagingCleanupError) -> None:
+def _retry_source_staging_cleanup(key: tuple[tuple[object, ...], str]) -> None:
+    error = _SOURCE_STAGING_CLEANUPS.payload(key)
+    if error is None:
+        return
     settled = error.retry_cleanup()
     if settled:
-        _SOURCE_STAGING_CLEANUPS.forget(error)
+        _SOURCE_STAGING_CLEANUPS.forget(key)
         return
-    _SOURCE_STAGING_CLEANUPS.release_claim(error)
-    _schedule_source_staging_cleanup(error)
+    _SOURCE_STAGING_CLEANUPS.release_claim(key)
+    _schedule_source_staging_cleanup(key)
 
 
 def _schedule_retained_cleanup(
@@ -2716,9 +7581,13 @@ def _retry_private_tree_cleanup(key: tuple[Path, int]) -> None:
     retained = _PRIVATE_TREE_CLEANUPS.payload(key)
     if retained is None:
         return
-    path, capacity_lease = retained
+    path, capacity_lease, private_root_owner = retained
     try:
-        _settle_private_tree_cleanup(path, capacity_lease)
+        _settle_private_tree_cleanup(
+            path,
+            capacity_lease,
+            private_root_owner=private_root_owner,
+        )
     except BaseException as cleanup_error:
         _PRIVATE_TREE_CLEANUPS.release_claim(key)
         _schedule_private_tree_cleanup(path, capacity_lease)
@@ -2729,11 +7598,16 @@ def _retry_private_tree_cleanup(key: tuple[Path, int]) -> None:
 def _settle_private_tree_cleanup(
     path: Path,
     capacity_lease: _BranchCapacityLease,
+    *,
+    private_root_owner: str | None = None,
 ) -> None:
     """Join the exact lease owner before removing and releasing one private tree."""
 
     with capacity_lease._cleanup_settlement_lock:
-        _remove_private_tree(path)
+        if private_root_owner is None:
+            _remove_private_tree(path)
+        else:
+            _remove_private_tree(path, private_root_owner=private_root_owner)
         capacity_lease.release_after_cleanup()
         _forget_private_tree_cleanup(path, capacity_lease)
 
@@ -2741,13 +7615,15 @@ def _settle_private_tree_cleanup(
 def _retain_private_tree_cleanup(
     path: Path,
     capacity_lease: _BranchCapacityLease,
+    *,
+    private_root_owner: str | None = None,
 ) -> None:
     capacity_lease.retain_for_cleanup()
     key = _private_tree_cleanup_key(path, capacity_lease)
     _PRIVATE_TREE_CLEANUPS.retain(
         key,
         source_key=capacity_lease._source_key,
-        payload=(path, capacity_lease),
+        payload=(path, capacity_lease, private_root_owner),
     )
     _schedule_private_tree_cleanup(path, capacity_lease)
 
@@ -2757,13 +7633,102 @@ def _retry_pending_branch_cleanups(source_key: tuple[object, ...]) -> None:
     _retry_pending_source_staging_cleanups(source_key)
 
 
+async def _retry_pending_durable_terminal_settlements(
+    source_key: tuple[object, ...],
+) -> None:
+    """Assist process-local terminal owners before admitting replacement work."""
+
+    await _retry_pending_durable_recovery_cleanups(source_key)
+    pending_keys = _DURABLE_TERMINAL_SETTLEMENTS.pending_keys(source_key)
+    for key in pending_keys:
+        if not _DURABLE_TERMINAL_SETTLEMENTS.claim(key):
+            continue
+        retained = _DURABLE_TERMINAL_SETTLEMENTS.payload(key)
+        if retained is None:  # pragma: no cover - claim invariant
+            continue
+        try:
+            await _retry_durable_terminal_settlement(retained)
+            _release_durable_terminal_settlement(retained.branch)
+        except BaseException:
+            _DURABLE_TERMINAL_SETTLEMENTS.release_claim(key)
+            raise
+
+
+async def _retry_pending_durable_recovery_cleanups(
+    source_key: tuple[object, ...],
+) -> None:
+    pending_keys = _DURABLE_RECOVERY_CLEANUPS.pending_keys(source_key)
+    for key in pending_keys:
+        if not _DURABLE_RECOVERY_CLEANUPS.claim(key):
+            continue
+        retained = _DURABLE_RECOVERY_CLEANUPS.payload(key)
+        if retained is None:  # pragma: no cover - claim invariant
+            continue
+        try:
+            await _settle_durable_recovery_private_tree(
+                retained.source,
+                retained.record,
+                binding_claim_lease=retained.binding_claim_lease,
+            )
+        except BaseException:
+            _DURABLE_RECOVERY_CLEANUPS.release_claim(key)
+            raise
+
+
+async def _retry_durable_terminal_settlement(
+    retained: _RetainedDurableTerminalSettlement,
+) -> None:
+    branch = retained.branch
+    durable = branch._durable
+    if durable is None:  # pragma: no cover - retained-owner invariant
+        raise AssertionError("Retained durable terminal owner lost its coordinator.")
+    if retained.publication_expected is None:
+        terminal = await _load_durable_branch_record(
+            durable.store,
+            session_id=retained.terminal_record.authority.session_id,
+            storage_key=durable.storage_key,
+        )
+        if terminal is None:
+            raise WorkspaceBranchOperationConflict(
+                "Retained durable terminal evidence changed before cleanup."
+            )
+        if terminal != retained.terminal_record:
+            if terminal.state not in {
+                WorkspaceBranchDurableState.COMMITTED,
+                WorkspaceBranchDurableState.ROLLED_BACK,
+                WorkspaceBranchDurableState.EXPIRED,
+                WorkspaceBranchDurableState.FAILED,
+            }:
+                raise WorkspaceBranchOperationConflict(
+                    "Retained durable terminal evidence changed before cleanup."
+                )
+            await branch._settle_observed_durable_terminal_handle(
+                terminal,
+                binding_claim_lease=retained.binding_claim_lease,
+            )
+            return
+    else:
+        terminal = await _publish_or_reconcile_exact_record(
+            durable.store,
+            session_id=retained.terminal_record.authority.session_id,
+            storage_key=durable.storage_key,
+            expected=retained.publication_expected,
+            updated=retained.terminal_record,
+            expected_run_epoch=retained.terminal_record.authority.expected_run_epoch,
+        )
+    await branch._settle_observed_durable_terminal_handle(
+        terminal,
+        binding_claim_lease=retained.binding_claim_lease,
+    )
+
+
 def _retry_pending_source_staging_cleanups(source_key: tuple[object, ...]) -> None:
     pending = _SOURCE_STAGING_CLEANUPS.claim_pending(
         source_key,
         eligible=lambda retained: retained.cleanup_owned,
     )
-    for error, _payload in pending:
-        _retry_source_staging_cleanup(error)
+    for key, _payload in pending:
+        _retry_source_staging_cleanup(key)
 
 
 def _retry_pending_private_tree_cleanups(source_key: tuple[object, ...]) -> None:
@@ -2796,14 +7761,31 @@ def _private_tree_cleanup_key(
     return path, id(capacity_lease)
 
 
+def _durable_terminal_settlement_key(
+    branch: LocalWorkspaceBranch,
+) -> tuple[Path, int]:
+    return branch._private_root, id(branch._capacity_lease)
+
+
+def _release_durable_terminal_settlement(branch: LocalWorkspaceBranch) -> None:
+    key = _durable_terminal_settlement_key(branch)
+    retained = _DURABLE_TERMINAL_SETTLEMENTS.payload(key)
+    if retained is not None:
+        retained.binding_claim_lease.release_after_settlement()
+        _DURABLE_TERMINAL_SETTLEMENTS.forget(key)
+
+
 async def _await_owned_thread(
     operation: Callable[..., _ResultT],
     *args: object,
     abandon_result: Callable[[_ResultT], None] | None = None,
+    settle_result: Callable[[_ResultT], None] | None = None,
+    pre_dispatch_checkpoint: bool = True,
 ) -> _ResultT:
     """Do not release branch ownership while a cancelled to_thread call still runs."""
 
-    await asyncio.sleep(0)
+    if pre_dispatch_checkpoint:
+        await asyncio.sleep(0)
     worker = asyncio.create_task(asyncio.to_thread(operation, *args))
     caller_signal: BaseException | None = None
     while not worker.done():
@@ -2834,6 +7816,13 @@ async def _await_owned_thread(
         if caller_signal is not None:
             raise caller_signal from worker_error
         raise
+    if settle_result is not None:
+        try:
+            settle_result(result)
+        except BaseException as settlement_error:
+            if caller_signal is not None:
+                raise caller_signal from settlement_error
+            raise
     if caller_signal is not None:
         if abandon_result is not None:
             cleanup_worker = asyncio.create_task(asyncio.to_thread(abandon_result, result))

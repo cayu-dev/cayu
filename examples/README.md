@@ -46,6 +46,8 @@ corresponding credentials or service.
 
 ## Durable orchestration
 
+- [`durable_local_workspace_branch.py`](durable_local_workspace_branch.py) —
+  recover and publish a local copy-on-write branch through SQLite.
 - [`durable_file_workflow/`](durable_file_workflow/) — hermetic task worker with
   per-session files and commands, failure recovery, and app-verified outcomes.
 - [`task_worker_loop.py`](task_worker_loop.py) — durable task claiming and completion.

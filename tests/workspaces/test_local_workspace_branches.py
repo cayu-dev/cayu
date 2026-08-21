@@ -52,23 +52,31 @@ from cayu.workspaces.revisions import (
 
 _BRANCH_PUBLIC_EXPORTS = (
     "WorkspaceBranch",
+    "WorkspaceBranchAuthority",
+    "WorkspaceBranchBindingAuthority",
     "WorkspaceBranchChange",
     "WorkspaceBranchChangeSet",
     "WorkspaceBranchClosedError",
     "WorkspaceBranchConflict",
     "WorkspaceBranchContentIdentity",
     "WorkspaceBranchCreationResult",
+    "WorkspaceBranchDurableState",
     "WorkspaceBranchEvidence",
     "WorkspaceBranchFencedError",
     "WorkspaceBranchLifecycleStatus",
     "WorkspaceBranchLimits",
+    "WorkspaceBranchOperationConflict",
     "WorkspaceBranchOutcomeStatus",
     "WorkspaceBranchPublicationError",
     "WorkspaceBranchPublicationRequest",
     "WorkspaceBranchPublicationResult",
+    "WorkspaceBranchRecoveryRequest",
+    "WorkspaceBranchRecoveryResult",
     "WorkspaceBranchRequest",
     "WorkspaceBranchResourceExhaustedError",
+    "WorkspaceBranchRollbackRequest",
     "WorkspaceBranchRollbackResult",
+    "WorkspaceBranchStore",
 )
 
 
@@ -3004,7 +3012,7 @@ def test_rollback_retry_joins_retained_cleanup_owner(
     import cayu.workspaces._local_branch as branch_module
 
     original_remove = branch_module._remove_private_tree
-    original_release = branch_module._release_branch
+    original_release = branch_module._release_branch_attachment
     background_entered = threading.Event()
     rollback_join_entered = threading.Event()
     release_background = threading.Event()
@@ -3035,13 +3043,13 @@ def test_rollback_retry_joins_retained_cleanup_owner(
             with removal_lock:
                 active_removals -= 1
 
-    def count_release(source_key):
+    def count_release(owner, *, terminal):
         nonlocal release_calls
         release_calls += 1
-        original_release(source_key)
+        original_release(owner, terminal=terminal)
 
     monkeypatch.setattr(branch_module, "_remove_private_tree", controlled_remove)
-    monkeypatch.setattr(branch_module, "_release_branch", count_release)
+    monkeypatch.setattr(branch_module, "_release_branch_attachment", count_release)
     monkeypatch.setattr(branch_module, "_schedule_private_tree_cleanup", lambda *_args: None)
 
     async def scenario() -> None:

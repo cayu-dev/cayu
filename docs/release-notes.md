@@ -508,14 +508,32 @@ request-body change.
 
 ### Local workspaces support bounded speculative branches
 
-An exact `LocalWorkspace` can now create an isolated, process-local branch from
-a complete observed workspace revision. Branches expose the ordinary workspace
-API, deterministic content-free net changes, explicit rollback, and
-conflict-checked all-or-none publication. Source snapshots, overlays, evidence,
-lifetime, and active branch count are bounded; unsafe paths, symlinks, special
-files, stale baselines, and publication conflicts fail closed. Other workspace
-backends remain explicitly unsupported, and durable reconstruction after
-process loss is not part of this first slice.
+An exact `LocalWorkspace` can create an isolated branch from a complete observed
+workspace revision. Branches expose the ordinary workspace API, deterministic
+content-free net changes, explicit rollback, and conflict-checked publication.
+Source snapshots, overlays, evidence, lifetime, and active branch count are
+bounded; unsafe paths, symlinks, special files, stale baselines, and publication
+conflicts fail closed. Other workspace backends remain explicitly unsupported.
+
+Local branches can now opt into durable recovery by supplying a
+`WorkspaceBranchStore`, such as the runtime's `SessionWorkspaceBranchStore`
+adapter for `SessionStore`, together with stable branch, idempotency, run-epoch,
+and binding authority. Custom session stores must explicitly support owned,
+off-thread guarded commits before the adapter accepts them. Creation,
+publication intent/progress, commit, rollback intent, rollback, conflict,
+expiry, failure, and ambiguity survive process replacement across the bundled
+in-memory, SQLite, and PostgreSQL stores. Recovery finishes only source paths
+that still match an exact recorded before state, recognizes already-applied
+paths, and reports durable ambiguity instead of guessing when external content
+appears. Commit and rollback become terminal in the store before cleanup, and
+stale run owners are fenced at the store boundary while a live binding resolver
+holds an exact generation claim through mutation and terminal settlement;
+binding replacement is rejected while that claim remains active. Custom claims
+are transferable to later settlement tasks, and a failed release remains owned
+and retryable instead of silently reopening the binding generation.
+Publication keys remain permanently bound to their first bounded change-set
+attempt, and provably pre-mutation inspection failures settle as replayable
+failed results.
 
 ### Queued dispatch is bound to durable execution profiles
 

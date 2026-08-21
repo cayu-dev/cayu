@@ -42,6 +42,9 @@ from tests.core.tool_result_projection_conformance import (
     assert_tool_result_projection_recovery_conformance,
     assert_tool_result_projection_session_store_conformance,
 )
+from tests.workspaces.test_durable_local_workspace_branches import (
+    assert_durable_workspace_branch_store_conformance,
+)
 
 from cayu import ExecutionProfileComponentClass, LocalArtifactStore
 from cayu.core import Event, EventType, Message
@@ -210,6 +213,16 @@ def test_postgres_session_store_preserves_projected_tool_results(
 
 def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_pending_action_store_conformance)
+
+
+def test_postgres_durable_workspace_branch_conformance(postgres_dsn: str, tmp_path) -> None:
+    async def ops(store):
+        await assert_durable_workspace_branch_store_conformance(
+            store,
+            tmp_path / "postgres-durable-workspace",
+        )
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_offline_provider_operation_recovery(postgres_dsn: str) -> None:

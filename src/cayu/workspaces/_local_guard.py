@@ -97,6 +97,12 @@ class _LocalGuardStagingCleanupError(RuntimeError):
         with self._lock:
             return self._parent_fd is not None
 
+    @property
+    def staging_name(self) -> str:
+        """Return the exact private staging name owned by this cleanup."""
+
+        return self._temp_name
+
     def release_cleanup_owner(self) -> None:
         """Release the descriptor after a wider owner removed the containing tree."""
 
@@ -109,6 +115,10 @@ class _LocalGuardStagingCleanupError(RuntimeError):
 
     def __del__(self) -> None:
         self.release_cleanup_owner()
+
+
+class _LocalGuardStagingConflictError(RuntimeError):
+    """A durable staging name exists without the expected owned content."""
 
 
 def _require_descriptor_guard_support() -> None:
@@ -226,14 +236,25 @@ def _inspect_regular_target_mode(parent_fd: int, name: str) -> int | None:
     return stat.S_IMODE(info.st_mode)
 
 
-def _write_temp(parent_fd: int, name: str, content: bytes, *, mode: int | None) -> str:
+def _write_temp(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    mode: int | None,
+    staging_name: str | None = None,
+) -> str:
     descriptor: int | None = None
     temp_name: str | None = None
-    for _attempt in range(100):
-        candidate = f".{name}.cayu-{secrets.token_hex(12)}"
+    for _attempt in range(1 if staging_name is not None else 100):
+        candidate = (
+            staging_name if staging_name is not None else f".{name}.cayu-{secrets.token_hex(12)}"
+        )
         try:
             descriptor = os.open(candidate, _TEMP_OPEN_FLAGS, 0o666, dir_fd=parent_fd)
         except FileExistsError:
+            if staging_name is not None:
+                raise
             continue
         temp_name = candidate
         break
@@ -324,8 +345,15 @@ def _create_at(
     content: bytes,
     *,
     mode: int | None = None,
+    staging_name: str | None = None,
 ) -> None:
-    temp_name = _write_temp(parent_fd, name, content, mode=mode)
+    temp_name = _write_temp(
+        parent_fd,
+        name,
+        content,
+        mode=mode,
+        staging_name=staging_name,
+    )
     primary: BaseException | None = None
     try:
         os.link(
@@ -358,8 +386,21 @@ def _create_at(
         raise primary
 
 
-def _replace_at(parent_fd: int, name: str, content: bytes, *, mode: int) -> None:
-    temp_name = _write_temp(parent_fd, name, content, mode=mode)
+def _replace_at(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    mode: int,
+    staging_name: str | None = None,
+) -> None:
+    temp_name = _write_temp(
+        parent_fd,
+        name,
+        content,
+        mode=mode,
+        staging_name=staging_name,
+    )
     primary: BaseException | None = None
     try:
         os.rename(
@@ -404,10 +445,16 @@ def open_regular_for_read(root: Path, relative_path: str) -> Iterator[tuple[Bina
         _raise_workspace_path_error(exc, relative_path)
 
 
-def create_regular(root: Path, relative_path: str, content: bytes) -> None:
+def create_regular(
+    root: Path,
+    relative_path: str,
+    content: bytes,
+    *,
+    staging_name: str | None = None,
+) -> None:
     try:
         with _open_parent(root, relative_path, create=True) as (parent_fd, name):
-            _create_at(parent_fd, name, content)
+            _create_at(parent_fd, name, content, staging_name=staging_name)
     except _LocalGuardPathError as exc:
         _raise_workspace_path_error(exc, relative_path)
 
@@ -449,16 +496,76 @@ def replace_regular_if_revision(
     relative_path: str,
     content: bytes,
     expected_revision: str,
+    *,
+    staging_name: str | None = None,
 ) -> tuple[str, str, int]:
     try:
         with _open_parent(root, relative_path) as (parent_fd, name):
             before, mode = _identity_at(parent_fd, name)
             if before[0] != expected_revision:
                 raise WorkspaceRevisionMismatchError(expected_revision, before[0])
-            _replace_at(parent_fd, name, content, mode=mode)
+            _replace_at(
+                parent_fd,
+                name,
+                content,
+                mode=mode,
+                staging_name=staging_name,
+            )
             return before
     except _LocalGuardPathError as exc:
         _raise_workspace_path_error(exc, relative_path)
+
+
+def settle_regular_staging(
+    root: Path,
+    relative_path: str,
+    staging_name: str,
+    *,
+    expected_sha256: str,
+    expected_bytes: int,
+) -> None:
+    """Remove one positively identified durable staging file before replay."""
+
+    if not staging_name or staging_name in {".", ".."} or "/" in staging_name:
+        raise ValueError("Workspace staging identity is invalid.")
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, _name):
+            try:
+                descriptor, info = _open_regular(parent_fd, staging_name)
+            except _LocalGuardPathError as error:
+                if error.status == "missing":
+                    return
+                raise _LocalGuardStagingConflictError(
+                    "Workspace durable staging identity is not a regular file."
+                ) from error
+            if info.st_size != expected_bytes:
+                os.close(descriptor)
+                raise _LocalGuardStagingConflictError(
+                    "Workspace durable staging content does not match its publication."
+                )
+            digest = hashlib.sha256()
+            actual_bytes = 0
+            with os.fdopen(descriptor, "rb") as staging:
+                remaining = expected_bytes + 1
+                while remaining and (chunk := staging.read(min(1 << 16, remaining))):
+                    digest.update(chunk)
+                    actual_bytes += len(chunk)
+                    remaining -= len(chunk)
+            if digest.hexdigest() != expected_sha256 or actual_bytes != expected_bytes:
+                raise _LocalGuardStagingConflictError(
+                    "Workspace durable staging content does not match its publication."
+                )
+            absent, cleanup_failures = _unlink_staging_and_inspect(parent_fd, staging_name)
+            if not absent:
+                _raise_staging_cleanup_error(parent_fd, staging_name, cleanup_failures)
+            if _contains_fatal_cleanup_failure(cleanup_failures):
+                _raise_operation_and_cleanup_failures(None, cleanup_failures)
+    except _LocalGuardPathError as error:
+        if error.status == "missing":
+            return
+        raise _LocalGuardStagingConflictError(
+            "Workspace durable staging parent identity changed."
+        ) from error
 
 
 def delete_regular(root: Path, relative_path: str) -> None:

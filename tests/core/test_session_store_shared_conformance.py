@@ -6,6 +6,7 @@ import contextvars
 import hashlib
 import io
 import json
+import threading
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -26,6 +27,7 @@ import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime.fork_groups as fork_group_module
 import cayu.runtime.sessions as sessions_module
 from cayu import (
+    SessionWorkspaceBranchStore,
     SQLiteSessionStore,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
@@ -14513,6 +14515,59 @@ def test_session_store_conformance_operation_commit_guard_is_atomic(
             assert await store.load_session_operation(created.id, "guarded-request") is None
             assert await store.load_events(created.id) == []
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_workspace_branch_store_guard_does_not_block_event_loop(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        release_guard = threading.Event()
+        guard_started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        publication: asyncio.Task | None = None
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_operation_commit_guard_off_loop",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            branch_store = SessionWorkspaceBranchStore(store)
+
+            def transform(persisted_record):
+                assert persisted_record is None
+                return {"status": "completed"}
+
+            def blocking_guard() -> None:
+                loop.call_soon_threadsafe(guard_started.set)
+                if not release_guard.wait(timeout=5):
+                    raise TimeoutError("test did not release commit guard")
+
+            publication = asyncio.create_task(
+                branch_store.publish_workspace_branch_record(
+                    created.id,
+                    "guarded-request",
+                    record_transform=transform,
+                    commit_guard=blocking_guard,
+                    expected_run_epoch=0,
+                )
+            )
+            await asyncio.wait_for(guard_started.wait(), timeout=5)
+            await asyncio.sleep(0)
+            assert not publication.done()
+            release_guard.set()
+            await publication
+            publication = None
+        finally:
+            release_guard.set()
+            if publication is not None:
+                await asyncio.gather(publication, return_exceptions=True)
             await _close_store(store)
 
     asyncio.run(run())

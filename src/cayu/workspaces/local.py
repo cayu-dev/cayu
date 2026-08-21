@@ -32,13 +32,27 @@ from cayu.workspaces.base import (
     matches_list_pattern,
     validate_list_pattern,
 )
-from cayu.workspaces.branches import WorkspaceBranchCreationResult, WorkspaceBranchRequest
+from cayu.workspaces.branches import (
+    WorkspaceBranchBindingAuthorityProvider,
+    WorkspaceBranchCreationResult,
+    WorkspaceBranchRecoveryRequest,
+    WorkspaceBranchRecoveryResult,
+    WorkspaceBranchRequest,
+    WorkspaceBranchStore,
+)
 
 
 class LocalWorkspace(Workspace):
     """Filesystem workspace rooted at one local directory."""
 
-    def __init__(self, root: str | Path, *, workspace_id: str | None = None) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        workspace_id: str | None = None,
+        branch_store: WorkspaceBranchStore | None = None,
+        branch_authority_resolver: WorkspaceBranchBindingAuthorityProvider | None = None,
+    ) -> None:
         if not isinstance(root, str | PathLike):
             raise TypeError("LocalWorkspace root must be a string or Path.")
         root_path = Path(root).expanduser().resolve()
@@ -52,6 +66,17 @@ class LocalWorkspace(Workspace):
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
         self.root = root_path
+        if branch_store is not None and not isinstance(branch_store, WorkspaceBranchStore):
+            raise TypeError("LocalWorkspace branch_store must implement WorkspaceBranchStore.")
+        self._branch_store = branch_store
+        if branch_authority_resolver is not None and not isinstance(
+            branch_authority_resolver,
+            WorkspaceBranchBindingAuthorityProvider,
+        ):
+            raise TypeError(
+                "LocalWorkspace branch_authority_resolver must own binding-generation claims."
+            )
+        self._branch_authority_resolver = branch_authority_resolver
 
     @property
     def resource_key(self) -> tuple[object, ...]:
@@ -70,6 +95,16 @@ class LocalWorkspace(Workspace):
         from cayu.workspaces._local_branch import create_local_workspace_branch
 
         return await create_local_workspace_branch(self, request)
+
+    async def recover_branch(
+        self,
+        request: WorkspaceBranchRecoveryRequest,
+    ) -> WorkspaceBranchRecoveryResult:
+        """Recover one durable local branch from store and filesystem evidence."""
+
+        from cayu.workspaces._local_branch import recover_local_workspace_branch
+
+        return await recover_local_workspace_branch(self, request)
 
     async def read_bytes(
         self,
