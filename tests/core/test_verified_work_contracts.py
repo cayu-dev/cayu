@@ -2706,17 +2706,22 @@ def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limit
     asyncio.run(scenario())
 
 
-def test_decision_application_prepares_receipt_before_publishing_task_transition() -> None:
+def test_decision_application_prepares_receipt_before_publishing_task_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def scenario() -> None:
         now = datetime(2026, 8, 19, tzinfo=UTC)
-        clock_fails = False
+        lifecycle_clock_fails = [False]
 
-        def clock() -> datetime:
-            if clock_fails:
-                raise RuntimeError("injected application clock failure")
-            return now
+        class ApplicationDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if lifecycle_clock_fails[0]:
+                    raise RuntimeError("injected application lifecycle clock failure")
+                return now if tz is not None else now.replace(tzinfo=None)
 
-        store = InMemoryTaskStore(clock=clock)
+        monkeypatch.setattr(tasks_module, "datetime", ApplicationDatetime)
+        store = InMemoryTaskStore(clock=lambda: now)
         contract = _contract()
         await store.publish_work_contract(contract)
         task = await store.create_running_task(
@@ -2771,8 +2776,8 @@ def test_decision_application_prepares_receipt_before_publishing_task_transition
             result_reference=proposal.result,
         )
 
-        clock_fails = True
-        with pytest.raises(RuntimeError, match="injected application clock failure"):
+        lifecycle_clock_fails[0] = True
+        with pytest.raises(RuntimeError, match="injected application lifecycle clock failure"):
             await store.apply_completion_decision(request)
         unchanged = await store.load_task(task.id)
         assert unchanged is not None
@@ -2786,7 +2791,7 @@ def test_decision_application_prepares_receipt_before_publishing_task_transition
             is None
         )
 
-        clock_fails = False
+        lifecycle_clock_fails[0] = False
         completed = await store.apply_completion_decision(request)
         assert completed.status is TaskStatus.COMPLETED
         assert completed.result == {"accepted": True}

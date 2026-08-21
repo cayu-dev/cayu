@@ -2536,6 +2536,24 @@ atomic creation mutation. The application boundary preflights the authoritative
 snapshot and validates the returned pending task, but post-mutation validation
 does not make a nonconforming extension's private write safe.
 
+`InMemoryTaskStore(clock=...)` uses its injectable clock for availability,
+retry-series timing, and verified-work attempt, proposal, claim, and decision
+evidence. That clock is not authoritative for core `Task` lifecycle fields.
+Decision application uses wall-clock UTC, clamped to the task's existing
+lifecycle timestamps, for the immutable receipt's `applied_at` and any matching
+`Task.updated_at` or `Task.completed_at` transition. Exact application replay
+returns the original receipt snapshot before consulting either clock.
+
+The in-memory store also maintains contracted-session authority in a dedicated
+session index under the same lock as task publication and ordinary-session
+admission. Contracted creation, running creation, start, and attachment update
+the index atomically with the task snapshot. Multiple contracted tasks may bind
+one session; any binding denies ordinary execution. Terminalization does not
+remove a binding, because no verifier-aware release operation exists yet. The
+index is an in-memory implementation detail rather than a new `TaskStore` API;
+other supporting stores must provide an equivalent bounded, atomic authority
+decision.
+
 `terminalize_task(...)` is the claim-fenced, replay-safe completion/failure
 boundary for worker-owned tasks. A request carries the exact task and worker,
 terminal kind, terminal JSON payload, and a caller-stable idempotency key. On its

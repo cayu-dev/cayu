@@ -2215,6 +2215,7 @@ class InMemoryTaskStore(TaskStore):
         ] = {}
         self._decision_application_key_by_decision: dict[str, tuple[str, str]] = {}
         self._ordinary_execution_session_ids: set[str] = set()
+        self._contracted_task_ids_by_session: dict[str, dict[str, None]] = {}
         self._task_keys_by_session: dict[str, list[tuple[datetime, str]]] = {}
         self._task_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
 
@@ -2603,7 +2604,7 @@ class InMemoryTaskStore(TaskStore):
             # independent verifier was running.
             self._ensure_decision_attempt_is_current(task, attempt)
             proposal = self._require_completion_proposal(decision.proposal_id)
-            applied_at = self._clock()
+            applied_at = _task_lifecycle_now(task)
             task_changed = False
             if decision.verdict is CompletionVerdict.ACCEPTED:
                 if request.result is None or request.result_reference is None:
@@ -3496,10 +3497,16 @@ class InMemoryTaskStore(TaskStore):
         self._ensure_attempt_state_is_current(task, attempt)
 
     def _active_work_contract_task_for_session(self, session_id: str) -> Task | None:
-        for task in self._tasks.values():
-            if task.session_id == session_id and task.work_contract is not None:
-                return task
-        return None
+        task_ids = self._contracted_task_ids_by_session.get(session_id)
+        if not task_ids:
+            return None
+        task_id = next(iter(task_ids))
+        task = self._tasks.get(task_id)
+        if task is None or task.session_id != session_id or task.work_contract is None:
+            raise TaskTopologyInconsistent(
+                "The in-memory contracted-session authority index is inconsistent."
+            )
+        return task
 
     def _ensure_contract_session_accepts_attachment(
         self,
@@ -3766,10 +3773,12 @@ class InMemoryTaskStore(TaskStore):
             prior.created_at,
             prior.session_id,
             prior.parent_task_id,
+            prior.work_contract is None,
         ) == (
             task.created_at,
             task.session_id,
             task.parent_task_id,
+            task.work_contract is None,
         ):
             # Lifecycle/status updates are the hot path. They do not change
             # either topology index, so avoid an O(n) list removal/reinsert.
@@ -3778,9 +3787,31 @@ class InMemoryTaskStore(TaskStore):
         if prior is not None:
             self._remove_task_index_entry(self._task_keys_by_session, prior.session_id, prior)
             self._remove_task_index_entry(self._task_keys_by_parent, prior.parent_task_id, prior)
+            self._remove_contracted_session_index_entry(prior)
         self._tasks[task.id] = task
         self._add_task_index_entry(self._task_keys_by_session, task.session_id, task)
         self._add_task_index_entry(self._task_keys_by_parent, task.parent_task_id, task)
+        self._add_contracted_session_index_entry(task)
+
+    def _add_contracted_session_index_entry(self, task: Task) -> None:
+        if task.session_id is None or task.work_contract is None:
+            return
+        self._contracted_task_ids_by_session.setdefault(task.session_id, {}).setdefault(
+            task.id,
+            None,
+        )
+
+    def _remove_contracted_session_index_entry(self, task: Task) -> None:
+        if task.session_id is None or task.work_contract is None:
+            return
+        task_ids = self._contracted_task_ids_by_session.get(task.session_id)
+        if task_ids is None or task.id not in task_ids:
+            raise TaskTopologyInconsistent(
+                "The in-memory contracted-session authority index is incomplete."
+            )
+        del task_ids[task.id]
+        if not task_ids:
+            del self._contracted_task_ids_by_session[task.session_id]
 
     @staticmethod
     def _add_task_index_entry(
@@ -5838,6 +5869,17 @@ def require_contract_bound_task_creation_snapshot(task: Task) -> None:
         max_bytes=WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
         max_items=WORK_CONTRACT_TASK_CREATION_MAX_ITEMS,
     )
+
+
+def _task_lifecycle_now(task: Task) -> datetime:
+    """Return a wall-clock lifecycle time that cannot move ``task`` backward."""
+
+    timestamps = [datetime.now(UTC), task.created_at, task.updated_at]
+    if task.started_at is not None:
+        timestamps.append(task.started_at)
+    if task.completed_at is not None:
+        timestamps.append(task.completed_at)
+    return max(timestamps)
 
 
 def _task_from_create(
