@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import traceback as traceback_module
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
+from cayu._exception_groups import iter_exception_tree, rebuild_exception_group
 from cayu._exception_state import exception_state, set_exception_state
 from cayu._validation import (
     copy_durable_json_object,
@@ -15,8 +19,23 @@ from cayu.vaults import SecretRedactor
 
 MAX_DIAGNOSTIC_UTF8_BYTES = 4 * 1024
 MAX_DIAGNOSTIC_TYPE_UTF8_BYTES = 128
+MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES = 16
 _TRUNCATION_MARKER = "\u2026[truncated]"
 _RUNTIME_EXCEPTION_PAYLOAD_TOKEN = object()
+_RuntimeErrorT = TypeVar("_RuntimeErrorT", bound=BaseException)
+
+
+def _runtime_owned_exception_renderings(error: BaseException) -> tuple[str, ...] | None:
+    """Return bounded-public render surfaces for one runtime-owned exception."""
+
+    try:
+        return (
+            str(error),
+            repr(error),
+            "".join(traceback_module.format_exception_only(type(error), error)),
+        )
+    except BaseException:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +147,155 @@ class ExceptionDiagnostic:
             fields[f"{detail_prefix}durable_value_error_code"] = self.durable_value_error_code
             fields[f"{detail_prefix}durable_value_error_path"] = self.durable_value_error_path
         return fields
+
+
+def credential_safe_runtime_exception(
+    exception_type: type[_RuntimeErrorT],
+    message: str,
+    *,
+    redactor: SecretRedactor,
+    fallback_message: str,
+) -> _RuntimeErrorT:
+    """Construct a runtime-owned exception with credential-safe public renderings.
+
+    Redacting a message before wrapping it is insufficient when a registered
+    secret spans the exception type and its argument or traceback
+    representation. Callers pass only runtime-owned exception classes here, so
+    rendering each fresh candidate cannot dispatch through extension-controlled
+    exception methods.
+    """
+
+    if not isinstance(exception_type, type) or not issubclass(exception_type, BaseException):
+        raise TypeError("exception_type must be a BaseException type.")
+    if type(message) is not str or type(fallback_message) is not str:
+        raise TypeError("Runtime exception diagnostics must be strings.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+
+    candidates = (
+        redactor.redact_text_bounded(message, max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES),
+        redactor.redact_text_bounded(
+            fallback_message,
+            max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+        ),
+        "Runtime diagnostic withheld.",
+        "",
+    )
+    for candidate_message in candidates:
+        candidate = exception_type(candidate_message)
+        rendered = _runtime_owned_exception_renderings(candidate)
+        if rendered is not None and all(
+            len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
+            and redactor.redact_text(value) == value
+            for value in rendered
+        ):
+            return candidate
+    # A secret registry that deliberately contains every fixed runtime
+    # representation makes perfect diagnostic publication impossible.  Keep
+    # the least informative runtime-owned shape and never reintroduce the
+    # caller-derived message.
+    return exception_type()
+
+
+def credential_safe_runtime_exception_group(
+    error: BaseExceptionGroup,
+    *,
+    group_message: str,
+    leaf_mapper: Callable[[BaseException], BaseException],
+    invalid_leaf_factory: Callable[[], BaseException],
+    truncated_leaf_factory: Callable[[], BaseException],
+    fallback_leaf_mapper: Callable[[BaseException], BaseException],
+    redactor: SecretRedactor,
+) -> BaseExceptionGroup:
+    """Detach, bound, and finally redact one runtime-owned exception group.
+
+    Leaf diagnostics are not sufficient proof that the rendered aggregate is
+    safe: group syntax can join individually harmless fragments into a
+    registered secret.  The group is therefore bounded before rendering and
+    the complete public ``str``, ``repr``, and traceback exception rendering are
+    checked after composition. Callers provide mappers that construct only
+    runtime-owned exceptions.
+    """
+
+    if not isinstance(error, BaseExceptionGroup):
+        raise TypeError("error must be a BaseExceptionGroup.")
+    if type(group_message) is not str:
+        raise TypeError("group_message must be a string.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+
+    def invalid_leaf() -> BaseException:
+        try:
+            candidate = invalid_leaf_factory()
+        except BaseException:
+            return RuntimeError("Exception group sanitization failed.")
+        return (
+            candidate
+            if isinstance(candidate, BaseException)
+            else RuntimeError("Exception group sanitization failed.")
+        )
+
+    def rendering_is_safe(candidate: BaseExceptionGroup) -> bool:
+        rendered = _runtime_owned_exception_renderings(candidate)
+        if rendered is None:
+            return False
+        return all(
+            len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
+            and redactor.redact_text(value) == value
+            for value in rendered
+        )
+
+    bounded = rebuild_exception_group(
+        error,
+        group_message=redactor.redact_text_bounded(
+            group_message,
+            max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+        ),
+        leaf_mapper=leaf_mapper,
+        invalid_leaf_factory=invalid_leaf,
+        max_nodes=MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES,
+        truncated_leaf_factory=truncated_leaf_factory,
+    )
+    if rendering_is_safe(bounded):
+        return bounded
+
+    fallback_messages = (
+        "Runtime failure diagnostics were redacted.",
+        "Runtime failure.",
+        "",
+    )
+    for fallback_message in fallback_messages:
+        sanitized = rebuild_exception_group(
+            bounded,
+            group_message=fallback_message,
+            leaf_mapper=fallback_leaf_mapper,
+            invalid_leaf_factory=invalid_leaf,
+            max_nodes=MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES,
+            truncated_leaf_factory=truncated_leaf_factory,
+        )
+        if rendering_is_safe(sanitized):
+            return sanitized
+
+    # A registry containing every fixed runtime representation cannot be
+    # perfectly satisfied. Preserve exact process-control classifications and
+    # leaf cardinality while discarding all text and nesting.
+    minimal_leaves: list[BaseException] = []
+    for leaf in iter_exception_tree(bounded):
+        if isinstance(leaf, BaseExceptionGroup):
+            continue
+        if isinstance(leaf, GeneratorExit):
+            minimal_leaves.append(GeneratorExit())
+        elif isinstance(leaf, KeyboardInterrupt):
+            minimal_leaves.append(KeyboardInterrupt())
+        elif isinstance(leaf, SystemExit):
+            minimal_leaves.append(SystemExit())
+        elif isinstance(leaf, asyncio.CancelledError):
+            minimal_leaves.append(asyncio.CancelledError())
+        elif isinstance(leaf, Exception):
+            minimal_leaves.append(RuntimeError())
+        else:
+            minimal_leaves.append(BaseException())
+    return BaseExceptionGroup("", minimal_leaves or [RuntimeError()])
 
 
 def exception_diagnostic(

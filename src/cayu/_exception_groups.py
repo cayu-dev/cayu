@@ -137,6 +137,8 @@ def rebuild_exception_group(
     group_message: str,
     leaf_mapper: Callable[[BaseException], BaseException],
     invalid_leaf_factory: Callable[[], BaseException],
+    max_nodes: int | None = None,
+    truncated_leaf_factory: Callable[[], BaseException] | None = None,
 ) -> BaseExceptionGroup:
     """Iteratively rebuild a group without retaining extension-owned nodes.
 
@@ -145,9 +147,12 @@ def rebuild_exception_group(
     runtime-owned fallback so sanitization cannot become a new failure path.
     """
 
-    def fresh_invalid_leaf() -> BaseException:
+    if max_nodes is not None and (type(max_nodes) is not int or max_nodes < 1):
+        raise ValueError("max_nodes must be a positive integer or None.")
+
+    def fresh_leaf(factory: Callable[[], BaseException]) -> BaseException:
         try:
-            fallback = invalid_leaf_factory()
+            fallback = factory()
         except BaseException:
             return RuntimeError("Exception group sanitization failed")
         return (
@@ -156,9 +161,16 @@ def rebuild_exception_group(
             else RuntimeError("Exception group sanitization failed")
         )
 
+    def fresh_invalid_leaf() -> BaseException:
+        return fresh_leaf(invalid_leaf_factory)
+
+    def fresh_truncated_leaf() -> BaseException:
+        return fresh_leaf(truncated_leaf_factory or invalid_leaf_factory)
+
     pending: list[tuple[BaseException, bool]] = [(error, False)]
-    children_by_group: dict[int, tuple[BaseException, ...]] = {}
+    children_by_group: dict[int, tuple[tuple[BaseException, ...], bool]] = {}
     rebuilt: dict[int, BaseException] = {}
+    remaining_nodes = None if max_nodes is None else max_nodes - 1
     while pending:
         candidate, expanded = pending.pop()
         candidate_id = id(candidate)
@@ -174,13 +186,15 @@ def rebuild_exception_group(
             )
             continue
         if expanded:
-            children = children_by_group.pop(candidate_id, ())
+            children, truncated = children_by_group.pop(candidate_id, ((), False))
             detached_children: list[BaseException] = []
             for child in children:
                 detached_child = rebuilt.get(id(child))
                 detached_children.append(
                     detached_child if detached_child is not None else fresh_invalid_leaf()
                 )
+            if truncated:
+                detached_children.append(fresh_truncated_leaf())
             if not detached_children:
                 detached_children = [fresh_invalid_leaf()]
             rebuilt[candidate_id] = BaseExceptionGroup(
@@ -201,9 +215,16 @@ def rebuild_exception_group(
                 [fresh_invalid_leaf()],
             )
             continue
-        children_by_group[candidate_id] = children
+        selected_children = children
+        truncated = False
+        if remaining_nodes is not None:
+            selected_count = min(len(children), remaining_nodes)
+            selected_children = children[:selected_count]
+            remaining_nodes -= selected_count
+            truncated = selected_count < len(children)
+        children_by_group[candidate_id] = (selected_children, truncated)
         pending.append((candidate, True))
-        pending.extend((child, False) for child in reversed(children))
+        pending.extend((child, False) for child in reversed(selected_children))
 
     detached = rebuilt.get(id(error))
     if isinstance(detached, BaseExceptionGroup):

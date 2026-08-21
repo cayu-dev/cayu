@@ -10,9 +10,16 @@ from typing import Generic, TypeVar
 
 from cayu._exception_groups import exception_group_children, rebuild_exception_group
 from cayu._task_wait import CapturedAwaitableOutcome, capture_awaitable_outcome
-from cayu.runtime._diagnostics import exception_diagnostic
+from cayu.runtime._diagnostics import (
+    MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES,
+    MAX_DIAGNOSTIC_UTF8_BYTES,
+    credential_safe_runtime_exception,
+    credential_safe_runtime_exception_group,
+    exception_diagnostic,
+)
 from cayu.runtime.tasks import TaskClaimLost, TaskStore
 from cayu.runtime.work_contracts import (
+    CompletionVerificationClaimLost,
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
     WorkContractConflict,
@@ -135,7 +142,12 @@ def _task_store_cancellation(
         nonportable_message=f"{operation_name} cancellation had a non-portable diagnostic.",
         redactor=redactor,
     )
-    return asyncio.CancelledError(diagnostic.message)
+    return credential_safe_runtime_exception(
+        asyncio.CancelledError,
+        diagnostic.message,
+        redactor=redactor,
+        fallback_message=f"{operation_name} cancellation diagnostic was redacted.",
+    )
 
 
 def _detached_task_store_failure(
@@ -153,35 +165,45 @@ def _detached_task_store_failure(
         redactor=redactor,
     )
     message = diagnostic.message
+    safe_type: type[BaseException]
     if isinstance(error, GeneratorExit):
-        return GeneratorExit(message)
-    if isinstance(error, KeyboardInterrupt):
-        return KeyboardInterrupt(message)
-    if isinstance(error, SystemExit):
-        return SystemExit(message)
-    if type(error) is TimeoutError:
-        return TimeoutError(message)
-    if type(error) is ConnectionError:
-        return ConnectionError(message)
-    if type(error) is TaskClaimLost:
-        return TaskClaimLost(message)
-    if type(error) is TaskCompletionDecisionRequired:
-        return TaskCompletionDecisionRequired(message)
-    if type(error) is WorkContractConflict:
-        return WorkContractConflict(message)
-    if type(error) is WorkCompletionConflict:
-        return WorkCompletionConflict(message)
-    if type(error) is ValueError:
-        return ValueError(message)
-    if type(error) is TypeError:
-        return TypeError(message)
-    if type(error) is NotImplementedError:
-        return NotImplementedError(message)
-    if type(error) is RuntimeError:
-        return RuntimeError(message)
-    if isinstance(error, Exception):
-        return RuntimeError(f"{diagnostic.error_type}: {message}")
-    return BaseException(f"{diagnostic.error_type}: {message}")
+        safe_type = GeneratorExit
+    elif isinstance(error, KeyboardInterrupt):
+        safe_type = KeyboardInterrupt
+    elif isinstance(error, SystemExit):
+        safe_type = SystemExit
+    elif type(error) in {
+        TimeoutError,
+        ConnectionError,
+        TaskClaimLost,
+        CompletionVerificationClaimLost,
+        TaskCompletionDecisionRequired,
+        WorkContractConflict,
+        WorkCompletionConflict,
+        ValueError,
+        TypeError,
+        NotImplementedError,
+        RuntimeError,
+    }:
+        safe_type = type(error)
+    elif isinstance(error, Exception):
+        safe_type = RuntimeError
+        message = redactor.redact_text_bounded(
+            f"{diagnostic.error_type}: {message}",
+            max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+        )
+    else:
+        safe_type = BaseException
+        message = redactor.redact_text_bounded(
+            f"{diagnostic.error_type}: {message}",
+            max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+        )
+    return credential_safe_runtime_exception(
+        safe_type,
+        message,
+        redactor=redactor,
+        fallback_message=f"{operation_name} failure diagnostic was redacted.",
+    )
 
 
 def _detached_task_store_group(
@@ -234,6 +256,10 @@ def _detached_task_store_group(
         invalid_leaf_factory=lambda: RuntimeError(
             f"{operation_name} reported an invalid failure group."
         ),
+        max_nodes=MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES,
+        truncated_leaf_factory=lambda: RuntimeError(
+            f"{operation_name} omitted additional failure evidence."
+        ),
     )
     if caller_cancellation is not None and not cancellation_claimed:
         rebuilt = BaseExceptionGroup(
@@ -247,9 +273,85 @@ def _detached_task_store_group(
                 ),
             ],
         )
-    return _deduplicate_detached_task_store_group(
+    deduplicated = _deduplicate_detached_task_store_group(
         rebuilt,
         operation_name=operation_name,
+    )
+    return _credential_safe_task_store_group(
+        deduplicated,
+        operation_name=operation_name,
+        group_message=f"{operation_name} reported multiple failures.",
+        redactor=redactor,
+    )
+
+
+def _credential_safe_task_store_group(
+    error: BaseExceptionGroup,
+    *,
+    operation_name: str,
+    group_message: str,
+    redactor: SecretRedactor,
+) -> BaseExceptionGroup:
+    """Apply the final diagnostic boundary after runtime group composition."""
+
+    return credential_safe_runtime_exception_group(
+        error,
+        group_message=group_message,
+        leaf_mapper=lambda leaf: leaf,
+        invalid_leaf_factory=lambda: RuntimeError(
+            f"{operation_name} reported an invalid failure group."
+        ),
+        truncated_leaf_factory=lambda: RuntimeError(
+            f"{operation_name} omitted additional failure evidence."
+        ),
+        fallback_leaf_mapper=lambda leaf: _generic_task_store_failure(
+            leaf,
+            operation_name=operation_name,
+            redactor=redactor,
+        ),
+        redactor=redactor,
+    )
+
+
+def _generic_task_store_failure(
+    error: BaseException,
+    *,
+    operation_name: str,
+    redactor: SecretRedactor,
+) -> BaseException:
+    """Preserve a detached store failure's public classification without text."""
+
+    if isinstance(error, GeneratorExit):
+        safe_type: type[BaseException] = GeneratorExit
+    elif isinstance(error, KeyboardInterrupt):
+        safe_type = KeyboardInterrupt
+    elif isinstance(error, SystemExit):
+        safe_type = SystemExit
+    elif isinstance(error, asyncio.CancelledError):
+        safe_type = asyncio.CancelledError
+    elif type(error) in {
+        TimeoutError,
+        ConnectionError,
+        TaskClaimLost,
+        CompletionVerificationClaimLost,
+        TaskCompletionDecisionRequired,
+        WorkContractConflict,
+        WorkCompletionConflict,
+        ValueError,
+        TypeError,
+        NotImplementedError,
+        RuntimeError,
+    }:
+        safe_type = type(error)
+    elif isinstance(error, Exception):
+        safe_type = RuntimeError
+    else:
+        safe_type = BaseException
+    return credential_safe_runtime_exception(
+        safe_type,
+        f"{operation_name} failure diagnostic was redacted.",
+        redactor=redactor,
+        fallback_message="Task-store failure diagnostic was withheld.",
     )
 
 
@@ -554,16 +656,22 @@ async def capture_task_store_operation(
             if caller_cancelled:
                 if caller_cancellation is None:  # pragma: no cover - construction invariant
                     raise AssertionError("Caller cancellation was not retained.")
-                failure = BaseExceptionGroup(
-                    f"{operation_name} failed after caller cancellation.",
-                    [
-                        child_cancellation_failure,
-                        _task_store_cancellation(
-                            caller_cancellation,
-                            operation_name=operation_name,
-                            redactor=redactor,
-                        ),
-                    ],
+                group_message = f"{operation_name} failed after caller cancellation."
+                failure = _credential_safe_task_store_group(
+                    BaseExceptionGroup(
+                        group_message,
+                        [
+                            child_cancellation_failure,
+                            _task_store_cancellation(
+                                caller_cancellation,
+                                operation_name=operation_name,
+                                redactor=redactor,
+                            ),
+                        ],
+                    ),
+                    operation_name=operation_name,
+                    group_message=group_message,
+                    redactor=redactor,
                 )
             else:
                 failure = child_cancellation_failure
@@ -589,9 +697,15 @@ async def capture_task_store_operation(
                 operation_name=operation_name,
                 redactor=redactor,
             )
-            failure = BaseExceptionGroup(
-                f"{operation_name} failed after caller cancellation.",
-                [safe_error, safe_cancellation],
+            group_message = f"{operation_name} failed after caller cancellation."
+            failure = _credential_safe_task_store_group(
+                BaseExceptionGroup(
+                    group_message,
+                    [safe_error, safe_cancellation],
+                ),
+                operation_name=operation_name,
+                group_message=group_message,
+                redactor=redactor,
             )
         else:
             failure = safe_error

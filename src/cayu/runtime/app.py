@@ -85,6 +85,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._completion_verifier_coordinator import CompletionVerifierCoordinator
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_subagent_coordinator import (
     DurableSubagentCoordinator,
@@ -188,6 +189,10 @@ from cayu.runtime.budgets import (
     InMemoryBudgetLedger,
     SessionBudgetStore,
     copy_budget_policy,
+)
+from cayu.runtime.completion_verifiers import (
+    CompletionVerifierExecutionRequest,
+    DeterministicCompletionVerifier,
 )
 from cayu.runtime.context import (
     ContextPolicy,
@@ -383,6 +388,8 @@ from cayu.runtime.user_input import (
     copy_user_input_response,
 )
 from cayu.runtime.work_contracts import (
+    CompletionDecision,
+    CompletionVerifierRef,
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
     WorkContract,
@@ -963,6 +970,10 @@ class CayuApp:
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
         self._secret_redactor = resolved_secret_redactor
+        self._completion_verifier_coordinator = CompletionVerifierCoordinator(
+            task_store=self.task_store,
+            secret_redactor=self._secret_redactor,
+        )
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
@@ -1818,6 +1829,21 @@ class CayuApp:
             registration_symbol=registration_symbol,
         )
         return spec
+
+    def register_completion_verifier(
+        self,
+        reference: CompletionVerifierRef,
+        verifier: DeterministicCompletionVerifier,
+    ) -> CompletionVerifierRef:
+        """Register one deterministic verifier under its complete durable identity."""
+
+        try:
+            registered = self._completion_verifier_coordinator.register(reference, verifier)
+        except BaseException:
+            del reference, verifier
+            raise
+        del reference, verifier
+        return registered
 
     def register_fork_group_gate(
         self,
@@ -3584,6 +3610,16 @@ class CayuApp:
             async with _close_delegated_event_stream(forwarded_stream) as owned_forwarded_stream:
                 async for event in owned_forwarded_stream:
                     yield event
+
+    async def verify_completion_proposal(
+        self,
+        request: CompletionVerifierExecutionRequest,
+    ) -> CompletionDecision:
+        """Run the registered deterministic verifier and persist its decision."""
+
+        operation = self._completion_verifier_coordinator.verify(request)
+        del request
+        return await operation
 
     async def create_work_contract(self, request: WorkContractDraft) -> WorkContract:
         if type(request) is not WorkContractDraft:

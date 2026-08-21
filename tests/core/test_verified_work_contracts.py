@@ -1029,6 +1029,8 @@ def test_exact_operation_digests_cover_every_decision_bearing_field() -> None:
     claim_variants = (
         claim.model_copy(update={"proposal_id": "other-proposal"}),
         claim.model_copy(update={"worker_id": "other-verifier-worker"}),
+        claim.model_copy(update={"execution_owner_id": "other-execution-owner"}),
+        claim.model_copy(update={"execution_timeout_seconds": 30.0}),
         claim.model_copy(update={"verifier": other_verifier}),
         claim.model_copy(update={"lease_seconds": 61}),
     )
@@ -1036,6 +1038,18 @@ def test_exact_operation_digests_cover_every_decision_bearing_field() -> None:
         completion_verification_claim_request_sha256(variant)
         != completion_verification_claim_request_sha256(claim)
         for variant in claim_variants
+    )
+    legacy_claim_material = claim.model_dump(mode="json", warnings=False)
+    legacy_claim_material.pop("execution_owner_id")
+    legacy_claim_material.pop("execution_timeout_seconds")
+    assert (
+        completion_verification_claim_request_sha256(claim)
+        == sha256(
+            canonical_durable_json_bytes(
+                legacy_claim_material,
+                "completion_verification_claim",
+            )
+        ).hexdigest()
     )
 
     decision = _rejected_decision(
@@ -1698,6 +1712,17 @@ def test_in_memory_verified_work_lifecycle_rejects_then_accepts_exactly() -> Non
         )
         first_claim = await store.claim_completion_verification(first_claim_request)
         assert await store.claim_completion_verification(first_claim_request) == first_claim
+        renewed_claim = await store.renew_completion_verification_claim(first_claim_request)
+        assert renewed_claim.claimed_at == first_claim.claimed_at
+        assert renewed_claim.attempt_number == first_claim.attempt_number
+        assert renewed_claim.lease_expires_at >= first_claim.lease_expires_at
+
+        with pytest.raises(CompletionVerificationClaimLost, match="exact current live authority"):
+            await store.renew_completion_verification_claim(
+                first_claim_request.model_copy(
+                    update={"execution_owner_id": "another-execution-owner"}
+                )
+            )
 
         with pytest.raises(WorkCompletionConflict, match="another request"):
             await store.claim_completion_verification(
@@ -1711,7 +1736,9 @@ def test_in_memory_verified_work_lifecycle_rejects_then_accepts_exactly() -> Non
         )
         rejected = await store.record_completion_decision(rejected_request)
         assert await store.record_completion_decision(rejected_request) == rejected
-        assert await store.claim_completion_verification(first_claim_request) == first_claim
+        assert await store.claim_completion_verification(first_claim_request) == renewed_claim
+        with pytest.raises(CompletionVerificationClaimLost, match="exact current live authority"):
+            await store.renew_completion_verification_claim(first_claim_request)
 
         with pytest.raises(WorkCompletionConflict, match="another request"):
             await store.record_completion_decision(

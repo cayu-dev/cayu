@@ -497,6 +497,37 @@ can fail only after fusion work. Its weight maps are deeply immutable, and
 `model_copy(update=...)` revalidates updated values before returning a new
 configuration.
 
+### Deterministic completion verifiers publish independently owned decisions
+
+Applications can register a side-effect-free deterministic completion verifier
+under the exact durable verifier identity carried by a work contract, then ask
+`CayuApp.verify_completion_proposal(...)` to evaluate a persisted proposal. The
+runtime resolves and invokes the adapter with bounded immutable context, binds
+its outcome to the live durable claim and frozen contract, and publishes the
+decision without applying it to task or session state. Exact completed retries
+reconcile from the store without requiring the process-local adapter, while
+missing registrations, provider verifier kinds, malformed outcomes, conflicting
+identity, and capacity exhaustion before claim mutation fail closed. A retained
+cancellation-resistant adapter blocks overlap in the same app, while its live
+renewed claim blocks other app instances. Runtime-minted execution-owner
+generations prevent that live claim from dispatching the same verifier
+concurrently elsewhere. A quiescent coordinator inherited through a process
+fork mints a fresh owner generation before use; inherited active execution
+state fails closed and requires rebuilding the app in that worker. The
+execution timeout is bound into the exact claim,
+and the owner renews its lease before dispatch and through execution,
+cancellation-resistant draining, and publication. Process or renewal loss stops
+that protection, so expiry permits at-least-once deterministic evaluation under
+a fresh claim while fencing the stale owner from publication. Completed retries
+continue to reconcile from convergent durable claim and decision indexes,
+including revision-1 claims whose absent execution-owner field retains its
+historical request digest.
+
+This is the deterministic execution-to-decision slice of verified work. It does
+not yet add provider-backed judges, an automatic continuation/application
+worker, or verified-work persistence to built-in SQLite and PostgreSQL task
+stores.
+
 ### Durable tasks retain immutable invocation provenance
 
 Tasks now carry a Cayu-minted invocation identity and their immediate execution

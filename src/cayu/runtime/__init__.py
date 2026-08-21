@@ -108,6 +108,13 @@ from cayu.runtime.checks import (
     ServiceCheckEvidence,
     check_manifest,
 )
+from cayu.runtime.completion_verifiers import (
+    CompletionVerifierExecutionError,
+    CompletionVerifierExecutionRequest,
+    CompletionVerifierRequest,
+    CompletionVerifierUnavailable,
+    DeterministicCompletionVerifier,
+)
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
     CompactionPrompt,
@@ -755,6 +762,7 @@ from cayu.runtime.work_contracts import (
     CompletionVerificationClaim,
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
+    CompletionVerifierDecision,
     CompletionVerifierKind,
     CompletionVerifierRef,
     CriterionOutcomeStatus,
@@ -925,8 +933,13 @@ __all__ = [
     "CompletionVerificationClaim",
     "CompletionVerificationClaimLost",
     "CompletionVerificationClaimRequest",
+    "CompletionVerifierDecision",
+    "CompletionVerifierExecutionError",
+    "CompletionVerifierExecutionRequest",
     "CompletionVerifierKind",
     "CompletionVerifierRef",
+    "CompletionVerifierRequest",
+    "CompletionVerifierUnavailable",
     "ContextCompactor",
     "ContextCountingConfig",
     "ContextCountingMode",
@@ -954,6 +967,7 @@ __all__ = [
     "DefaultContextPolicy",
     "DeferredInteractionInput",
     "DenyPatternRule",
+    "DeterministicCompletionVerifier",
     "DiagnosticSeverity",
     "DispatchHandle",
     "DispatchRequest",

@@ -69,12 +69,10 @@ from cayu.runtime.work_contracts import (
     CompletionProposal,
     CompletionProposalCreate,
     CompletionRejectionAction,
-    CompletionSatisfactionBasis,
     CompletionVerdict,
     CompletionVerificationClaim,
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
-    CriterionOutcomeStatus,
     TaskCompletionDecisionRequired,
     WorkAttempt,
     WorkAttemptCreate,
@@ -96,6 +94,7 @@ from cayu.runtime.work_contracts import (
     copy_work_contract_ref,
     preflight_work_completion_document,
     require_bounded_work_completion_document,
+    validate_completion_decision_contract,
     validate_work_completion_idempotency_key,
     validate_work_completion_linked_id,
     work_attempt_request_sha256,
@@ -1891,6 +1890,13 @@ class TaskStore(ABC):
         """Load the latest verification claim, including an expired claim for recovery."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
 
+    async def renew_completion_verification_claim(
+        self,
+        request: CompletionVerificationClaimRequest,
+    ) -> CompletionVerificationClaim:
+        """Extend one exact live verification claim without changing its owner."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
     async def record_completion_decision(
         self,
         request: CompletionDecisionCreate,
@@ -1900,6 +1906,13 @@ class TaskStore(ABC):
 
     async def load_completion_decision(self, decision_id: str) -> CompletionDecision | None:
         """Load one completion decision by stable identity."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_completion_decision_for_proposal(
+        self,
+        proposal_id: str,
+    ) -> CompletionDecision | None:
+        """Load the one authoritative decision published for a proposal."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
 
     async def apply_completion_decision(
@@ -2469,6 +2482,8 @@ class InMemoryTaskStore(TaskStore):
                 claim_id=request.claim_id,
                 proposal_id=request.proposal_id,
                 worker_id=request.worker_id,
+                execution_owner_id=request.execution_owner_id,
+                execution_timeout_seconds=request.execution_timeout_seconds,
                 verifier=request.verifier,
                 attempt_number=attempt_number,
                 request_sha256=request_sha256,
@@ -2487,6 +2502,51 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             claim = self._completion_verification_claims.get(proposal_id)
             return None if claim is None else claim.model_copy(deep=True)
+
+    async def renew_completion_verification_claim(
+        self,
+        request: CompletionVerificationClaimRequest,
+    ) -> CompletionVerificationClaim:
+        request = copy_completion_verification_claim_request(request)
+        request_sha256 = completion_verification_claim_request_sha256(request)
+        async with self._lock:
+            proposal = self._require_completion_proposal(request.proposal_id)
+            current = self._completion_verification_claims.get(request.proposal_id)
+            now = self._clock()
+            if (
+                current is None
+                or current.claim_id != request.claim_id
+                or current.proposal_id != request.proposal_id
+                or current.worker_id != request.worker_id
+                or current.execution_owner_id != request.execution_owner_id
+                or current.execution_timeout_seconds != request.execution_timeout_seconds
+                or current.verifier != request.verifier
+                or current.request_sha256 != request_sha256
+                or current.lease_expires_at <= now
+                or proposal.proposal_id in self._decision_id_by_proposal
+            ):
+                raise CompletionVerificationClaimLost(
+                    "Verification claim cannot be renewed without exact current live authority."
+                )
+            self._ensure_completion_proposal_is_current(proposal)
+            renewed = CompletionVerificationClaim(
+                claim_id=current.claim_id,
+                proposal_id=current.proposal_id,
+                worker_id=current.worker_id,
+                execution_owner_id=current.execution_owner_id,
+                execution_timeout_seconds=current.execution_timeout_seconds,
+                verifier=current.verifier,
+                attempt_number=current.attempt_number,
+                request_sha256=current.request_sha256,
+                claimed_at=current.claimed_at,
+                lease_expires_at=max(
+                    current.lease_expires_at,
+                    now + timedelta(seconds=request.lease_seconds),
+                ),
+            )
+            self._completion_verification_claims[proposal.proposal_id] = renewed
+            self._verification_claims_by_id[renewed.claim_id] = renewed
+            return renewed.model_copy(deep=True)
 
     async def record_completion_decision(
         self,
@@ -2522,19 +2582,7 @@ class InMemoryTaskStore(TaskStore):
                 )
             self._ensure_completion_proposal_is_current(proposal)
             contract = self._require_work_contract(proposal.contract)
-            expected_criteria = tuple(item.criterion_id for item in contract.criteria)
-            observed_criteria = tuple(item.criterion_id for item in request.criterion_outcomes)
-            if observed_criteria != expected_criteria:
-                raise WorkCompletionConflict(
-                    "Completion decision must cover every contract criterion exactly once in order."
-                )
-            expected_constraints = tuple(item.constraint_id for item in contract.constraints)
-            observed_constraints = tuple(item.constraint_id for item in request.constraint_outcomes)
-            if observed_constraints != expected_constraints:
-                raise WorkCompletionConflict(
-                    "Completion decision must cover every contract constraint exactly once in order."
-                )
-            _validate_completion_decision_contract(contract, request)
+            validate_completion_decision_contract(contract, request)
             decision = CompletionDecision(
                 decision_id=request.decision_id,
                 proposal_id=request.proposal_id,
@@ -2562,6 +2610,16 @@ class InMemoryTaskStore(TaskStore):
         decision_id = require_clean_nonblank(decision_id, "decision_id")
         async with self._lock:
             decision = self._completion_decisions.get(decision_id)
+            return None if decision is None else decision.model_copy(deep=True)
+
+    async def load_completion_decision_for_proposal(
+        self,
+        proposal_id: str,
+    ) -> CompletionDecision | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            decision_id = self._decision_id_by_proposal.get(proposal_id)
+            decision = None if decision_id is None else self._completion_decisions.get(decision_id)
             return None if decision is None else decision.model_copy(deep=True)
 
     async def apply_completion_decision(
@@ -6238,73 +6296,6 @@ def _copy_optional_status_payload(value: dict[str, Any] | None) -> dict[str, Any
     if value is None:
         return None
     return copy_durable_json_object(value, "payload")
-
-
-def _validate_completion_decision_contract(
-    contract: WorkContract,
-    request: CompletionDecisionCreate,
-) -> None:
-    requirements = {item.requirement_id: item for item in contract.evidence_requirements}
-    all_outcomes = (*request.criterion_outcomes, *request.constraint_outcomes)
-    all_references = (
-        *request.evidence_references,
-        *(reference for outcome in all_outcomes for reference in outcome.evidence_references),
-    )
-    for reference in all_references:
-        if reference.requirement_id is None:
-            continue
-        requirement = requirements.get(reference.requirement_id)
-        if requirement is None or requirement.kind != reference.kind:
-            raise WorkCompletionConflict(
-                "Completion decision evidence conflicts with the frozen contract requirements."
-            )
-
-    subject_requirements: dict[tuple[str, str], frozenset[str]] = {
-        ("criterion", item.criterion_id): frozenset(item.evidence_requirement_ids)
-        for item in contract.criteria
-    }
-    subject_requirements.update(
-        {
-            ("constraint", item.constraint_id): frozenset(item.evidence_requirement_ids)
-            for item in contract.constraints
-        }
-    )
-    outcomes_with_subjects = (
-        *((("criterion", item.criterion_id), item) for item in request.criterion_outcomes),
-        *((("constraint", item.constraint_id), item) for item in request.constraint_outcomes),
-    )
-    for subject, outcome in outcomes_with_subjects:
-        required = subject_requirements[subject]
-        bound = {
-            reference.requirement_id
-            for reference in outcome.evidence_references
-            if reference.requirement_id is not None
-        }
-        if not bound.issubset(required):
-            raise WorkCompletionConflict(
-                "Completion outcome cites evidence assigned to another contract outcome."
-            )
-        if outcome.status is not CriterionOutcomeStatus.SATISFIED:
-            continue
-        available = {
-            reference.requirement_id
-            for reference in outcome.evidence_references
-            if reference.available and reference.requirement_id is not None
-        }
-        if required and (
-            outcome.satisfaction_basis is not CompletionSatisfactionBasis.EVIDENCE
-            or not required.issubset(available)
-        ):
-            raise WorkCompletionConflict(
-                "Satisfied completion outcomes must carry every available required evidence item."
-            )
-
-    for gap in request.gaps:
-        required = subject_requirements.get(gap.subject_key())
-        if required is None or not set(gap.evidence_requirement_ids).issubset(required):
-            raise WorkCompletionConflict(
-                "Completion decision contains a gap outside the frozen contract."
-            )
 
 
 _TERMINAL_TASK_STATUSES = {

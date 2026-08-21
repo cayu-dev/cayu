@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
+from itertools import islice
 from typing import Literal, cast
 
 from pydantic import (
@@ -13,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     field_validator,
     model_validator,
@@ -38,6 +40,14 @@ WORK_CONTRACT_MAX_EVIDENCE_REFERENCES = 256
 WORK_CONTRACT_MAX_BYTES = 256 * 1024
 WORK_COMPLETION_PROPOSAL_MAX_BYTES = 256 * 1024
 WORK_COMPLETION_DECISION_MAX_BYTES = 512 * 1024
+# Reserve room for Cayu-owned decision, claim, worker, and verifier authority so
+# every accepted adapter outcome remains publishable as a full decision.  Six
+# request/verifier identities can each consume 256 UTF-8 bytes, while the
+# persisted task identity can consume 2,048 and the attempt/contract identities
+# another 256 each. JSON control escaping can expand one byte to six, for a
+# 24 KiB worst-case expansion; 32 KiB also covers fingerprints, timestamps,
+# field names, versions, and punctuation.
+WORK_COMPLETION_VERIFIER_DECISION_MAX_BYTES = WORK_COMPLETION_DECISION_MAX_BYTES - (32 * 1024)
 WORK_COMPLETION_APPLICATION_MAX_BYTES = 512 * 1024
 WORK_COMPLETION_APPLICATION_MAX_ITEMS = 16_384
 WORK_CONTRACT_TASK_MAX_BYTES = 1024 * 1024
@@ -234,7 +244,7 @@ def preflight_work_completion_document(
 
 def _bounded_identifier(value: str, field_name: str) -> str:
     value = require_durable_clean_nonblank(value, field_name)
-    if len(value.encode("utf-8")) > WORK_CONTRACT_IDENTIFIER_MAX_BYTES:
+    if _utf8_length_exceeds(value, WORK_CONTRACT_IDENTIFIER_MAX_BYTES):
         raise ValueError(
             f"{field_name} must not exceed {WORK_CONTRACT_IDENTIFIER_MAX_BYTES} UTF-8 bytes."
         )
@@ -243,7 +253,7 @@ def _bounded_identifier(value: str, field_name: str) -> str:
 
 def _bounded_reference_id(value: str, field_name: str) -> str:
     value = require_durable_clean_nonblank(value, field_name)
-    if len(value.encode("utf-8")) > WORK_EVIDENCE_REFERENCE_ID_MAX_BYTES:
+    if _utf8_length_exceeds(value, WORK_EVIDENCE_REFERENCE_ID_MAX_BYTES):
         raise ValueError(
             f"{field_name} must not exceed {WORK_EVIDENCE_REFERENCE_ID_MAX_BYTES} UTF-8 bytes."
         )
@@ -252,7 +262,7 @@ def _bounded_reference_id(value: str, field_name: str) -> str:
 
 def validate_work_completion_linked_id(value: str, field_name: str) -> str:
     value = require_durable_clean_nonblank(value, field_name)
-    if len(value.encode("utf-8")) > WORK_COMPLETION_LINKED_ID_MAX_BYTES:
+    if _utf8_length_exceeds(value, WORK_COMPLETION_LINKED_ID_MAX_BYTES):
         raise ValueError(
             f"{field_name} must not exceed {WORK_COMPLETION_LINKED_ID_MAX_BYTES} UTF-8 bytes "
             "when bound to a work contract."
@@ -262,7 +272,7 @@ def validate_work_completion_linked_id(value: str, field_name: str) -> str:
 
 def _bounded_text(value: str, field_name: str) -> str:
     value = require_durable_nonblank(value, field_name)
-    if len(value.encode("utf-8")) > WORK_CONTRACT_TEXT_MAX_BYTES:
+    if _utf8_length_exceeds(value, WORK_CONTRACT_TEXT_MAX_BYTES):
         raise ValueError(
             f"{field_name} must not exceed {WORK_CONTRACT_TEXT_MAX_BYTES} UTF-8 bytes."
         )
@@ -288,12 +298,18 @@ def _sha256_digest(value: str, field_name: str) -> str:
 
 def validate_work_completion_idempotency_key(value: str) -> str:
     value = require_durable_clean_nonblank(value, "idempotency_key")
-    if len(value.encode("utf-8")) > WORK_COMPLETION_IDEMPOTENCY_KEY_MAX_BYTES:
+    if _utf8_length_exceeds(value, WORK_COMPLETION_IDEMPOTENCY_KEY_MAX_BYTES):
         raise ValueError(
             "idempotency_key must not exceed "
             f"{WORK_COMPLETION_IDEMPOTENCY_KEY_MAX_BYTES} UTF-8 bytes."
         )
     return value
+
+
+def _utf8_length_exceeds(value: str, maximum: int) -> bool:
+    """Bound hostile post-construction strings before allocating their full encoding."""
+
+    return len(value) > maximum or len(value.encode("utf-8")) > maximum
 
 
 def _canonical_unique_strings(
@@ -634,13 +650,51 @@ def work_contract_from_draft(draft: WorkContractDraft) -> WorkContract:
 def copy_work_contract_draft(value: WorkContractDraft) -> WorkContractDraft:
     if type(value) is not WorkContractDraft:
         raise TypeError("Work-contract creation requires a WorkContractDraft.")
-    return cast("WorkContractDraft", revalidate_model_input(value, WorkContractDraft))
+    return WorkContractDraft.model_validate(_copy_work_contract_definition(value))
 
 
 def copy_work_contract(value: WorkContract) -> WorkContract:
     if type(value) is not WorkContract:
         raise TypeError("Published work contracts must be WorkContract instances.")
-    return cast("WorkContract", revalidate_model_input(value, WorkContract))
+    return WorkContract.model_validate(
+        {
+            **_copy_work_contract_definition(value),
+            "fingerprint": value.fingerprint,
+        }
+    )
+
+
+def _copy_work_contract_definition(value: WorkContractDraft) -> dict[str, object]:
+    return {
+        "contract_id": value.contract_id,
+        "version": value.version,
+        "supersedes": _copy_bounded_model_input(value.supersedes, WorkContractRef, 3),
+        "objective": value.objective,
+        "criteria": _copy_bounded_items(
+            value.criteria,
+            _copy_work_criterion,
+            maximum=WORK_CONTRACT_MAX_CRITERIA,
+            field_name="criteria",
+        ),
+        "constraints": _copy_bounded_items(
+            value.constraints,
+            _copy_work_constraint,
+            maximum=WORK_CONTRACT_MAX_CONSTRAINTS,
+            field_name="constraints",
+        ),
+        "evidence_requirements": _copy_bounded_items(
+            value.evidence_requirements,
+            _copy_work_evidence_requirement,
+            maximum=WORK_CONTRACT_MAX_EVIDENCE_REQUIREMENTS,
+            field_name="evidence_requirements",
+        ),
+        "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+        "continuation_policy": _copy_bounded_model_input(
+            value.continuation_policy,
+            CompletionContinuationPolicy,
+            3,
+        ),
+    }
 
 
 def copy_work_contract_ref(value: WorkContractRef | None) -> WorkContractRef | None:
@@ -908,24 +962,52 @@ class CompletionVerificationClaimRequest(FrozenWorkContractModel):
     claim_id: str
     proposal_id: str
     worker_id: str
+    execution_owner_id: str | None = None
     verifier: CompletionVerifierRef
     lease_seconds: StrictInt = Field(default=300, ge=1, le=WORK_VERIFICATION_LEASE_MAX_SECONDS)
+    execution_timeout_seconds: StrictFloat | None = Field(
+        default=None,
+        gt=0,
+        le=WORK_VERIFICATION_LEASE_MAX_SECONDS,
+    )
 
     @field_validator("claim_id", "proposal_id", "worker_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_identifier(value, info.field_name)
 
+    @field_validator("execution_owner_id")
+    @classmethod
+    def validate_execution_owner_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_identifier(value, "execution_owner_id")
+
     @field_validator("verifier", mode="before")
     @classmethod
     def copy_verifier(cls, value: object) -> object:
         return revalidate_model_input(value, CompletionVerifierRef)
+
+    @model_validator(mode="after")
+    def validate_execution_timeout_within_lease(self) -> CompletionVerificationClaimRequest:
+        if (
+            self.execution_timeout_seconds is not None
+            and self.execution_timeout_seconds >= self.lease_seconds
+        ):
+            raise ValueError("execution_timeout_seconds must be shorter than lease_seconds.")
+        return self
 
 
 class CompletionVerificationClaim(FrozenWorkContractModel):
     claim_id: str
     proposal_id: str
     worker_id: str
+    execution_owner_id: str | None = None
+    execution_timeout_seconds: StrictFloat | None = Field(
+        default=None,
+        gt=0,
+        le=WORK_VERIFICATION_LEASE_MAX_SECONDS,
+    )
     verifier: CompletionVerifierRef
     attempt_number: StrictInt = Field(ge=1)
     request_sha256: str
@@ -936,6 +1018,13 @@ class CompletionVerificationClaim(FrozenWorkContractModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_identifier(value, info.field_name)
+
+    @field_validator("execution_owner_id")
+    @classmethod
+    def validate_execution_owner_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_identifier(value, "execution_owner_id")
 
     @field_validator("verifier", mode="before")
     @classmethod
@@ -1082,6 +1171,167 @@ class CompletionGap(FrozenWorkContractModel):
         return ("constraint", self.constraint_id)
 
 
+def _validate_completion_decision_outcome(
+    *,
+    verdict: CompletionVerdict,
+    criterion_outcomes: tuple[CompletionCriterionOutcome, ...],
+    constraint_outcomes: tuple[CompletionConstraintOutcome, ...],
+    gaps: tuple[CompletionGap, ...],
+    evidence_references: tuple[WorkEvidenceReference, ...],
+) -> None:
+    """Validate the verifier-owned portion shared by proposed and durable decisions."""
+
+    criterion_ids = tuple(item.criterion_id for item in criterion_outcomes)
+    if len(set(criterion_ids)) != len(criterion_ids):
+        raise ValueError("criterion_outcomes must contain each criterion at most once.")
+    constraint_ids = tuple(item.constraint_id for item in constraint_outcomes)
+    if len(set(constraint_ids)) != len(constraint_ids):
+        raise ValueError("constraint_outcomes must contain each constraint at most once.")
+    gap_keys = tuple(
+        (
+            0 if item.criterion_id is not None else 1,
+            item.criterion_id or item.constraint_id,
+            item.code,
+            item.evidence_requirement_ids,
+        )
+        for item in gaps
+    )
+    if gap_keys != tuple(sorted(set(gap_keys))):
+        raise ValueError("gaps must contain unique values in canonical order.")
+    all_outcomes = (*criterion_outcomes, *constraint_outcomes)
+    evidence_by_identity: dict[tuple[str, str, str], tuple[str, bool, str]] = {}
+    evidence_groups = (
+        evidence_references,
+        *(outcome.evidence_references for outcome in all_outcomes),
+    )
+    for evidence_group in evidence_groups:
+        for reference in evidence_group:
+            identity = _evidence_reference_identity(reference)
+            representation = _evidence_reference_representation(reference)
+            prior_representation = evidence_by_identity.setdefault(identity, representation)
+            if prior_representation != representation:
+                raise ValueError(
+                    "Completion decision contains conflicting representations of the same evidence."
+                )
+    all_satisfied = all(item.status is CriterionOutcomeStatus.SATISFIED for item in all_outcomes)
+    unresolved_subjects = {
+        ("criterion", item.criterion_id)
+        for item in criterion_outcomes
+        if item.status is not CriterionOutcomeStatus.SATISFIED
+    } | {
+        ("constraint", item.constraint_id)
+        for item in constraint_outcomes
+        if item.status is not CriterionOutcomeStatus.SATISFIED
+    }
+    gap_subjects = {item.subject_key() for item in gaps}
+    if verdict is CompletionVerdict.ACCEPTED:
+        if not all_satisfied or gaps:
+            raise ValueError(
+                "Accepted decisions require all criteria and constraints satisfied with no gaps."
+            )
+    else:
+        if all_satisfied or not gaps:
+            raise ValueError("Non-accepted decisions require an unresolved outcome and a gap.")
+        if gap_subjects != unresolved_subjects:
+            raise ValueError(
+                "Non-accepted decisions require gaps for exactly the unresolved outcomes."
+            )
+    evidence_reference_count = len(evidence_references) + sum(
+        len(outcome.evidence_references) for outcome in all_outcomes
+    )
+    if evidence_reference_count > WORK_CONTRACT_MAX_EVIDENCE_REFERENCES:
+        raise ValueError("Completion decision contains too many aggregate evidence references.")
+
+
+class CompletionVerifierDecision(FrozenWorkContractModel):
+    """Verifier-owned outcome before Cayu binds durable decision authority."""
+
+    verdict: CompletionVerdict
+    criterion_outcomes: tuple[CompletionCriterionOutcome, ...] = Field(
+        min_length=1,
+        max_length=WORK_CONTRACT_MAX_CRITERIA,
+    )
+    constraint_outcomes: tuple[CompletionConstraintOutcome, ...] = Field(
+        default=(),
+        max_length=WORK_CONTRACT_MAX_CONSTRAINTS,
+    )
+    gaps: tuple[CompletionGap, ...] = Field(
+        default=(),
+        max_length=WORK_CONTRACT_MAX_CRITERIA + WORK_CONTRACT_MAX_CONSTRAINTS,
+    )
+    evidence_references: tuple[WorkEvidenceReference, ...] = Field(
+        default=(),
+        max_length=WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
+    )
+
+    @field_validator("criterion_outcomes", mode="before")
+    @classmethod
+    def copy_criterion_outcomes(cls, value: object) -> object:
+        return revalidate_model_inputs(
+            value,
+            CompletionCriterionOutcome,
+            maximum=WORK_CONTRACT_MAX_CRITERIA,
+            field_name="criterion_outcomes",
+        )
+
+    @field_validator("constraint_outcomes", mode="before")
+    @classmethod
+    def copy_constraint_outcomes(cls, value: object) -> object:
+        return revalidate_model_inputs(
+            value,
+            CompletionConstraintOutcome,
+            maximum=WORK_CONTRACT_MAX_CONSTRAINTS,
+            field_name="constraint_outcomes",
+        )
+
+    @field_validator("gaps", mode="before")
+    @classmethod
+    def copy_gaps(cls, value: object) -> object:
+        return revalidate_model_inputs(
+            value,
+            CompletionGap,
+            maximum=WORK_CONTRACT_MAX_CRITERIA + WORK_CONTRACT_MAX_CONSTRAINTS,
+            field_name="gaps",
+        )
+
+    @field_validator("evidence_references", mode="before")
+    @classmethod
+    def copy_evidence_references(cls, value: object) -> object:
+        return revalidate_model_inputs(
+            value,
+            WorkEvidenceReference,
+            maximum=WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
+            field_name="evidence_references",
+        )
+
+    @field_validator("evidence_references")
+    @classmethod
+    def validate_evidence_references(
+        cls, value: tuple[WorkEvidenceReference, ...]
+    ) -> tuple[WorkEvidenceReference, ...]:
+        return _validate_evidence_references(value, field_name="evidence_references")
+
+    @model_validator(mode="after")
+    def validate_verdict_shape(self) -> CompletionVerifierDecision:
+        _validate_completion_decision_outcome(
+            verdict=self.verdict,
+            criterion_outcomes=self.criterion_outcomes,
+            constraint_outcomes=self.constraint_outcomes,
+            gaps=self.gaps,
+            evidence_references=self.evidence_references,
+        )
+        encoded = canonical_durable_json_bytes(
+            self.model_dump(mode="json", warnings=False),
+            "completion_verifier_decision",
+        )
+        if len(encoded) > WORK_COMPLETION_VERIFIER_DECISION_MAX_BYTES:
+            raise ValueError(
+                "Completion verifier decision must not exceed "
+                f"{WORK_COMPLETION_VERIFIER_DECISION_MAX_BYTES} bytes."
+            )
+        return self
+
+
 class CompletionDecisionCreate(FrozenWorkContractModel):
     decision_id: str
     proposal_id: str
@@ -1173,69 +1423,13 @@ class CompletionDecisionCreate(FrozenWorkContractModel):
 
     @model_validator(mode="after")
     def validate_verdict_shape(self) -> CompletionDecisionCreate:
-        criterion_ids = tuple(item.criterion_id for item in self.criterion_outcomes)
-        if len(set(criterion_ids)) != len(criterion_ids):
-            raise ValueError("criterion_outcomes must contain each criterion at most once.")
-        constraint_ids = tuple(item.constraint_id for item in self.constraint_outcomes)
-        if len(set(constraint_ids)) != len(constraint_ids):
-            raise ValueError("constraint_outcomes must contain each constraint at most once.")
-        gap_keys = tuple(
-            (
-                0 if item.criterion_id is not None else 1,
-                item.criterion_id or item.constraint_id,
-                item.code,
-                item.evidence_requirement_ids,
-            )
-            for item in self.gaps
+        _validate_completion_decision_outcome(
+            verdict=self.verdict,
+            criterion_outcomes=self.criterion_outcomes,
+            constraint_outcomes=self.constraint_outcomes,
+            gaps=self.gaps,
+            evidence_references=self.evidence_references,
         )
-        if gap_keys != tuple(sorted(set(gap_keys))):
-            raise ValueError("gaps must contain unique values in canonical order.")
-        all_outcomes = (*self.criterion_outcomes, *self.constraint_outcomes)
-        evidence_by_identity: dict[tuple[str, str, str], tuple[str, bool, str]] = {}
-        evidence_groups = (
-            self.evidence_references,
-            *(outcome.evidence_references for outcome in all_outcomes),
-        )
-        for evidence_group in evidence_groups:
-            for reference in evidence_group:
-                identity = _evidence_reference_identity(reference)
-                representation = _evidence_reference_representation(reference)
-                prior_representation = evidence_by_identity.setdefault(identity, representation)
-                if prior_representation != representation:
-                    raise ValueError(
-                        "Completion decision contains conflicting representations of the same "
-                        "evidence."
-                    )
-        all_satisfied = all(
-            item.status is CriterionOutcomeStatus.SATISFIED for item in all_outcomes
-        )
-        unresolved_subjects = {
-            ("criterion", item.criterion_id)
-            for item in self.criterion_outcomes
-            if item.status is not CriterionOutcomeStatus.SATISFIED
-        } | {
-            ("constraint", item.constraint_id)
-            for item in self.constraint_outcomes
-            if item.status is not CriterionOutcomeStatus.SATISFIED
-        }
-        gap_subjects = {item.subject_key() for item in self.gaps}
-        if self.verdict is CompletionVerdict.ACCEPTED:
-            if not all_satisfied or self.gaps:
-                raise ValueError(
-                    "Accepted decisions require all criteria and constraints satisfied with no gaps."
-                )
-        else:
-            if all_satisfied or not self.gaps:
-                raise ValueError("Non-accepted decisions require an unresolved outcome and a gap.")
-            if gap_subjects != unresolved_subjects:
-                raise ValueError(
-                    "Non-accepted decisions require gaps for exactly the unresolved outcomes."
-                )
-        evidence_reference_count = len(self.evidence_references) + sum(
-            len(outcome.evidence_references) for outcome in all_outcomes
-        )
-        if evidence_reference_count > WORK_CONTRACT_MAX_EVIDENCE_REFERENCES:
-            raise ValueError("Completion decision contains too many aggregate evidence references.")
         encoded = canonical_durable_json_bytes(
             self.model_dump(mode="json", warnings=False),
             "completion_decision",
@@ -1245,6 +1439,87 @@ class CompletionDecisionCreate(FrozenWorkContractModel):
                 f"Completion decision must not exceed {WORK_COMPLETION_DECISION_MAX_BYTES} bytes."
             )
         return self
+
+
+def validate_completion_decision_contract(
+    contract: WorkContract,
+    request: CompletionDecisionCreate,
+) -> None:
+    """Require one decision to cover exactly the frozen contract authority."""
+
+    expected_criteria = tuple(item.criterion_id for item in contract.criteria)
+    observed_criteria = tuple(item.criterion_id for item in request.criterion_outcomes)
+    if observed_criteria != expected_criteria:
+        raise WorkCompletionConflict(
+            "Completion decision must cover every contract criterion exactly once in order."
+        )
+    expected_constraints = tuple(item.constraint_id for item in contract.constraints)
+    observed_constraints = tuple(item.constraint_id for item in request.constraint_outcomes)
+    if observed_constraints != expected_constraints:
+        raise WorkCompletionConflict(
+            "Completion decision must cover every contract constraint exactly once in order."
+        )
+
+    requirements = {item.requirement_id: item for item in contract.evidence_requirements}
+    all_outcomes = (*request.criterion_outcomes, *request.constraint_outcomes)
+    all_references = (
+        *request.evidence_references,
+        *(reference for outcome in all_outcomes for reference in outcome.evidence_references),
+    )
+    for reference in all_references:
+        if reference.requirement_id is None:
+            continue
+        requirement = requirements.get(reference.requirement_id)
+        if requirement is None or requirement.kind != reference.kind:
+            raise WorkCompletionConflict(
+                "Completion decision evidence conflicts with the frozen contract requirements."
+            )
+
+    subject_requirements: dict[tuple[str, str], frozenset[str]] = {
+        ("criterion", item.criterion_id): frozenset(item.evidence_requirement_ids)
+        for item in contract.criteria
+    }
+    subject_requirements.update(
+        {
+            ("constraint", item.constraint_id): frozenset(item.evidence_requirement_ids)
+            for item in contract.constraints
+        }
+    )
+    outcomes_with_subjects = tuple(
+        (("criterion", item.criterion_id), item) for item in request.criterion_outcomes
+    ) + tuple((("constraint", item.constraint_id), item) for item in request.constraint_outcomes)
+    for subject, outcome in outcomes_with_subjects:
+        required = subject_requirements[subject]
+        bound = {
+            reference.requirement_id
+            for reference in outcome.evidence_references
+            if reference.requirement_id is not None
+        }
+        if not bound.issubset(required):
+            raise WorkCompletionConflict(
+                "Completion outcome cites evidence assigned to another contract outcome."
+            )
+        if outcome.status is not CriterionOutcomeStatus.SATISFIED:
+            continue
+        available = {
+            reference.requirement_id
+            for reference in outcome.evidence_references
+            if reference.available and reference.requirement_id is not None
+        }
+        if required and (
+            outcome.satisfaction_basis is not CompletionSatisfactionBasis.EVIDENCE
+            or not required.issubset(available)
+        ):
+            raise WorkCompletionConflict(
+                "Satisfied completion outcomes must carry every available required evidence item."
+            )
+
+    for gap in request.gaps:
+        required = subject_requirements.get(gap.subject_key())
+        if required is None or not set(gap.evidence_requirement_ids).issubset(required):
+            raise WorkCompletionConflict(
+                "Completion decision contains a gap outside the frozen contract."
+            )
 
 
 class CompletionDecision(CompletionDecisionCreate):
@@ -1351,45 +1626,363 @@ def _copy_model(value: object, model_type: type[BaseModel], message: str):
 
 
 def copy_work_attempt_create(value: WorkAttemptCreate) -> WorkAttemptCreate:
-    return cast(
-        "WorkAttemptCreate",
-        _copy_model(value, WorkAttemptCreate, "Attempts require a WorkAttemptCreate request."),
+    if type(value) is not WorkAttemptCreate:
+        raise TypeError("Attempts require a WorkAttemptCreate request.")
+    return WorkAttemptCreate.model_validate(_copy_work_attempt_definition(value))
+
+
+def copy_work_attempt(value: WorkAttempt) -> WorkAttempt:
+    if type(value) is not WorkAttempt:
+        raise TypeError("Work-attempt lookups must return a WorkAttempt.")
+    return WorkAttempt.model_validate(
+        {
+            **_copy_work_attempt_definition(value),
+            "ordinal": value.ordinal,
+            "request_sha256": value.request_sha256,
+            "started_at": value.started_at,
+        }
     )
 
 
+def _copy_work_attempt_definition(value: WorkAttemptCreate) -> dict[str, object]:
+    return {
+        "attempt_id": value.attempt_id,
+        "task_id": value.task_id,
+        "session_id": value.session_id,
+        "contract": _copy_bounded_model_input(value.contract, WorkContractRef, 3),
+        "execution_profile_fingerprint": value.execution_profile_fingerprint,
+        "worker_id": value.worker_id,
+    }
+
+
 def copy_completion_proposal_create(value: CompletionProposalCreate) -> CompletionProposalCreate:
-    return cast(
-        "CompletionProposalCreate",
-        _copy_model(
-            value,
-            CompletionProposalCreate,
-            "Completion proposals require a CompletionProposalCreate request.",
-        ),
+    if type(value) is not CompletionProposalCreate:
+        raise TypeError("Completion proposals require a CompletionProposalCreate request.")
+    return CompletionProposalCreate.model_validate(
+        {
+            "proposal_id": value.proposal_id,
+            "attempt_id": value.attempt_id,
+            "result": _copy_bounded_model_input(value.result, CompletionResultReference, 3),
+            "evidence_references": _copy_bounded_items(
+                value.evidence_references,
+                _copy_work_evidence_reference,
+                maximum=WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
+                field_name="evidence_references",
+            ),
+        }
+    )
+
+
+def copy_completion_proposal(value: CompletionProposal) -> CompletionProposal:
+    if type(value) is not CompletionProposal:
+        raise TypeError("Completion proposal lookups must return a CompletionProposal.")
+    return CompletionProposal.model_validate(
+        {
+            "proposal_id": value.proposal_id,
+            "attempt_id": value.attempt_id,
+            "result": _copy_bounded_model_input(value.result, CompletionResultReference, 3),
+            "evidence_references": _copy_bounded_items(
+                value.evidence_references,
+                _copy_work_evidence_reference,
+                maximum=WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
+                field_name="evidence_references",
+            ),
+            "task_id": value.task_id,
+            "contract": _copy_bounded_model_input(value.contract, WorkContractRef, 3),
+            "request_sha256": value.request_sha256,
+            "proposed_at": value.proposed_at,
+        }
     )
 
 
 def copy_completion_verification_claim_request(
     value: CompletionVerificationClaimRequest,
 ) -> CompletionVerificationClaimRequest:
-    return cast(
-        "CompletionVerificationClaimRequest",
-        _copy_model(
-            value,
-            CompletionVerificationClaimRequest,
-            "Verification claims require a CompletionVerificationClaimRequest.",
-        ),
+    if type(value) is not CompletionVerificationClaimRequest:
+        raise TypeError("Verification claims require a CompletionVerificationClaimRequest.")
+    return CompletionVerificationClaimRequest.model_validate(
+        _copy_completion_verification_claim_definition(value)
+    )
+
+
+def copy_completion_verification_claim(
+    value: CompletionVerificationClaim,
+) -> CompletionVerificationClaim:
+    if type(value) is not CompletionVerificationClaim:
+        raise TypeError("Verification-claim lookups must return a CompletionVerificationClaim.")
+    return CompletionVerificationClaim.model_validate(
+        {
+            "claim_id": value.claim_id,
+            "proposal_id": value.proposal_id,
+            "worker_id": value.worker_id,
+            "execution_owner_id": value.execution_owner_id,
+            "execution_timeout_seconds": value.execution_timeout_seconds,
+            "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+            "attempt_number": value.attempt_number,
+            "request_sha256": value.request_sha256,
+            "claimed_at": value.claimed_at,
+            "lease_expires_at": value.lease_expires_at,
+        }
+    )
+
+
+def _copy_completion_verification_claim_definition(
+    value: CompletionVerificationClaimRequest,
+) -> dict[str, object]:
+    return {
+        "claim_id": value.claim_id,
+        "proposal_id": value.proposal_id,
+        "worker_id": value.worker_id,
+        "execution_owner_id": value.execution_owner_id,
+        "execution_timeout_seconds": value.execution_timeout_seconds,
+        "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+        "lease_seconds": value.lease_seconds,
+    }
+
+
+def copy_completion_verifier_decision(
+    value: CompletionVerifierDecision,
+) -> CompletionVerifierDecision:
+    if type(value) is not CompletionVerifierDecision:
+        raise TypeError("Completion verifiers must return a CompletionVerifierDecision.")
+    # Do not feed the model instance to the generic copier: a post-construction
+    # mutation or model_construct() can otherwise make it recursively copy an
+    # arbitrarily large collection before field validators enforce their item
+    # bounds.  Each collection is capped before any nested model is rebuilt.
+    return CompletionVerifierDecision.model_validate(
+        {
+            "verdict": value.verdict,
+            "criterion_outcomes": _copy_bounded_items(
+                value.criterion_outcomes,
+                _copy_completion_criterion_outcome,
+                maximum=WORK_CONTRACT_MAX_CRITERIA,
+                field_name="criterion_outcomes",
+            ),
+            "constraint_outcomes": _copy_bounded_items(
+                value.constraint_outcomes,
+                _copy_completion_constraint_outcome,
+                maximum=WORK_CONTRACT_MAX_CONSTRAINTS,
+                field_name="constraint_outcomes",
+            ),
+            "gaps": _copy_bounded_items(
+                value.gaps,
+                _copy_completion_gap,
+                maximum=WORK_CONTRACT_MAX_CRITERIA + WORK_CONTRACT_MAX_CONSTRAINTS,
+                field_name="gaps",
+            ),
+            "evidence_references": _copy_bounded_items(
+                value.evidence_references,
+                _copy_work_evidence_reference,
+                maximum=WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
+                field_name="evidence_references",
+            ),
+        }
+    )
+
+
+def _copy_bounded_items(
+    value: object,
+    copier: Callable[[object], object],
+    *,
+    maximum: int,
+    field_name: str,
+) -> object:
+    if (
+        value is None
+        or isinstance(value, (str, bytes, bytearray, Mapping, BaseModel))
+        or not isinstance(value, Iterable)
+    ):
+        return value
+    items = tuple(islice(value, maximum + 1))
+    if len(items) > maximum:
+        raise ValueError(f"{field_name} must contain at most {maximum} values.")
+    return tuple(copier(item) for item in items)
+
+
+def _copy_bounded_model_input(
+    value: object,
+    model_type: type[BaseModel],
+    maximum_fields: int,
+) -> object:
+    if isinstance(value, model_type):
+        return revalidate_model_input(value, model_type)
+    if not isinstance(value, Mapping):
+        return value
+    mapping = cast("Mapping[object, object]", value)
+    keys = tuple(islice(mapping, maximum_fields + 1))
+    if len(keys) > maximum_fields:
+        raise ValueError(
+            f"{model_type.__name__} input must contain at most {maximum_fields} fields."
+        )
+    return {key: mapping[key] for key in keys}
+
+
+def _copy_completion_criterion_outcome(value: object) -> object:
+    if not isinstance(value, CompletionCriterionOutcome):
+        return _copy_bounded_model_input(value, CompletionCriterionOutcome, 6)
+    return CompletionCriterionOutcome.model_validate(
+        {
+            "criterion_id": value.criterion_id,
+            "status": value.status,
+            "reason_code": value.reason_code,
+            "satisfaction_basis": value.satisfaction_basis,
+            "evidence_references": _copy_bounded_items(
+                value.evidence_references,
+                _copy_work_evidence_reference,
+                maximum=WORK_COMPLETION_OUTCOME_MAX_EVIDENCE_REFERENCES,
+                field_name="evidence_references",
+            ),
+            "summary": value.summary,
+        }
+    )
+
+
+def _copy_completion_constraint_outcome(value: object) -> object:
+    if not isinstance(value, CompletionConstraintOutcome):
+        return _copy_bounded_model_input(value, CompletionConstraintOutcome, 6)
+    return CompletionConstraintOutcome.model_validate(
+        {
+            "constraint_id": value.constraint_id,
+            "status": value.status,
+            "reason_code": value.reason_code,
+            "satisfaction_basis": value.satisfaction_basis,
+            "evidence_references": _copy_bounded_items(
+                value.evidence_references,
+                _copy_work_evidence_reference,
+                maximum=WORK_COMPLETION_OUTCOME_MAX_EVIDENCE_REFERENCES,
+                field_name="evidence_references",
+            ),
+            "summary": value.summary,
+        }
+    )
+
+
+def _copy_completion_gap(value: object) -> object:
+    if not isinstance(value, CompletionGap):
+        return _copy_bounded_model_input(value, CompletionGap, 5)
+    return CompletionGap.model_validate(
+        {
+            "criterion_id": value.criterion_id,
+            "constraint_id": value.constraint_id,
+            "code": value.code,
+            "evidence_requirement_ids": _copy_bounded_items(
+                value.evidence_requirement_ids,
+                lambda item: item,
+                maximum=WORK_CONTRACT_MAX_EVIDENCE_REQUIREMENTS,
+                field_name="evidence_requirement_ids",
+            ),
+            "summary": value.summary,
+        }
     )
 
 
 def copy_completion_decision_create(value: CompletionDecisionCreate) -> CompletionDecisionCreate:
-    return cast(
-        "CompletionDecisionCreate",
-        _copy_model(
-            value,
-            CompletionDecisionCreate,
-            "Completion decisions require a CompletionDecisionCreate request.",
-        ),
+    if type(value) is not CompletionDecisionCreate:
+        raise TypeError("Completion decisions require a CompletionDecisionCreate request.")
+    return CompletionDecisionCreate.model_validate(_copy_completion_decision_definition(value))
+
+
+def copy_completion_decision(value: CompletionDecision) -> CompletionDecision:
+    if type(value) is not CompletionDecision:
+        raise TypeError("Completion decision lookups must return a CompletionDecision.")
+    return CompletionDecision.model_validate(
+        {
+            **_copy_completion_decision_definition(value),
+            "task_id": value.task_id,
+            "attempt_id": value.attempt_id,
+            "contract": _copy_bounded_model_input(value.contract, WorkContractRef, 3),
+            "request_sha256": value.request_sha256,
+            "gap_fingerprint": value.gap_fingerprint,
+            "decided_at": value.decided_at,
+        }
     )
+
+
+def _copy_completion_decision_definition(
+    value: CompletionDecisionCreate,
+) -> dict[str, object]:
+    return {
+        "decision_id": value.decision_id,
+        "proposal_id": value.proposal_id,
+        "claim_id": value.claim_id,
+        "worker_id": value.worker_id,
+        "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+        "decision_version": value.decision_version,
+        "verdict": value.verdict,
+        "criterion_outcomes": _copy_bounded_items(
+            value.criterion_outcomes,
+            _copy_completion_criterion_outcome,
+            maximum=WORK_CONTRACT_MAX_CRITERIA,
+            field_name="criterion_outcomes",
+        ),
+        "constraint_outcomes": _copy_bounded_items(
+            value.constraint_outcomes,
+            _copy_completion_constraint_outcome,
+            maximum=WORK_CONTRACT_MAX_CONSTRAINTS,
+            field_name="constraint_outcomes",
+        ),
+        "gaps": _copy_bounded_items(
+            value.gaps,
+            _copy_completion_gap,
+            maximum=WORK_CONTRACT_MAX_CRITERIA + WORK_CONTRACT_MAX_CONSTRAINTS,
+            field_name="gaps",
+        ),
+        "evidence_references": _copy_bounded_items(
+            value.evidence_references,
+            _copy_work_evidence_reference,
+            maximum=WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
+            field_name="evidence_references",
+        ),
+    }
+
+
+def _copy_work_criterion(value: object) -> object:
+    if not isinstance(value, WorkCriterion):
+        return _copy_bounded_model_input(value, WorkCriterion, 4)
+    return WorkCriterion.model_validate(
+        {
+            "criterion_id": value.criterion_id,
+            "ordinal": value.ordinal,
+            "description": value.description,
+            "evidence_requirement_ids": _copy_bounded_items(
+                value.evidence_requirement_ids,
+                lambda item: item,
+                maximum=WORK_CONTRACT_MAX_EVIDENCE_REQUIREMENTS,
+                field_name="evidence_requirement_ids",
+            ),
+        }
+    )
+
+
+def _copy_work_constraint(value: object) -> object:
+    if not isinstance(value, WorkConstraint):
+        return _copy_bounded_model_input(value, WorkConstraint, 3)
+    return WorkConstraint.model_validate(
+        {
+            "constraint_id": value.constraint_id,
+            "description": value.description,
+            "evidence_requirement_ids": _copy_bounded_items(
+                value.evidence_requirement_ids,
+                lambda item: item,
+                maximum=WORK_CONTRACT_MAX_EVIDENCE_REQUIREMENTS,
+                field_name="evidence_requirement_ids",
+            ),
+        }
+    )
+
+
+def _copy_work_evidence_requirement(value: object) -> object:
+    if not isinstance(value, WorkEvidenceRequirement):
+        return _copy_bounded_model_input(value, WorkEvidenceRequirement, 3)
+    return WorkEvidenceRequirement(
+        requirement_id=value.requirement_id,
+        kind=value.kind,
+        description=value.description,
+    )
+
+
+def _copy_work_evidence_reference(value: object) -> object:
+    return _copy_bounded_model_input(value, WorkEvidenceReference, 7)
 
 
 def copy_completion_decision_application_request(
@@ -1450,10 +2043,18 @@ def completion_proposal_request_sha256(value: CompletionProposalCreate) -> str:
 def completion_verification_claim_request_sha256(
     value: CompletionVerificationClaimRequest,
 ) -> str:
-    return _request_sha256(
-        copy_completion_verification_claim_request(value),
-        "completion_verification_claim",
-    )
+    copied = copy_completion_verification_claim_request(value)
+    material = copied.model_dump(mode="json", warnings=False)
+    # Earlier claims predate runtime execution-owner generations and bounded
+    # adapter execution. Preserve their exact canonical request material so
+    # durable custom-store claims and completed decisions remain replayable.
+    if copied.execution_owner_id is None:
+        material.pop("execution_owner_id", None)
+    if copied.execution_timeout_seconds is None:
+        material.pop("execution_timeout_seconds", None)
+    return sha256(
+        canonical_durable_json_bytes(material, "completion_verification_claim")
+    ).hexdigest()
 
 
 def completion_decision_request_sha256(value: CompletionDecisionCreate) -> str:
@@ -1521,6 +2122,7 @@ __all__ = [
     "CompletionVerificationClaim",
     "CompletionVerificationClaimLost",
     "CompletionVerificationClaimRequest",
+    "CompletionVerifierDecision",
     "CompletionVerifierKind",
     "CompletionVerifierRef",
     "CriterionOutcomeStatus",
@@ -1542,14 +2144,20 @@ __all__ = [
     "completion_proposal_request_sha256",
     "completion_result_sha256",
     "completion_verification_claim_request_sha256",
+    "copy_completion_decision",
     "copy_completion_decision_application_request",
     "copy_completion_decision_create",
+    "copy_completion_proposal",
     "copy_completion_proposal_create",
+    "copy_completion_verification_claim",
     "copy_completion_verification_claim_request",
+    "copy_completion_verifier_decision",
+    "copy_work_attempt",
     "copy_work_attempt_create",
     "copy_work_contract",
     "copy_work_contract_draft",
     "copy_work_contract_ref",
+    "validate_completion_decision_contract",
     "validate_work_completion_idempotency_key",
     "validate_work_completion_linked_id",
     "work_attempt_request_sha256",

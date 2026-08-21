@@ -2548,6 +2548,91 @@ atomic creation mutation. The application boundary preflights the authoritative
 snapshot and validates the returned pending task, but post-mutation validation
 does not make a nonconforming extension's private write safe.
 
+Applications register deterministic completion-verifier adapters with
+`CayuApp.register_completion_verifier(...)`. Registration is process-local and
+is keyed by the complete immutable `CompletionVerifierRef` tuple: verifier ID,
+version, kind, and configuration fingerprint. An exact duplicate registration
+is rejected rather than replacing live application policy. Publishing a work
+contract does not require its adapter to be present, so queue producers and
+workers may run in separate processes; every worker that may begin unfinished
+verification must reconstruct the exact registration during application
+startup. Provider-backed verifier references remain reserved and fail closed in
+this slice.
+
+`CayuApp.verify_completion_proposal(CompletionVerifierExecutionRequest(...))`
+is the runtime-owned deterministic execution boundary. It loads and validates
+the durable proposal, attempt, and frozen contract chain, then resolves the
+exact registered adapter before claiming verification. The adapter receives an
+immutable `CompletionVerifierRequest` containing detached copies of that
+bounded context and returns only a `CompletionVerifierDecision`. It cannot
+choose proposal, claim, worker, verifier, decision, task, attempt, or contract
+authority. Cayu binds those fields, validates complete criterion, constraint,
+gap, and evidence coverage against the frozen contract before mutation, and
+persists the resulting `CompletionDecision` through the store's live-claim
+fence. A custom supporting store must repeat those checks atomically with its
+decision write.
+
+Adapters must be deterministic and side-effect-free. An external check that
+requires mutation belongs behind Cayu's ordinary effect, idempotency, approval,
+and recovery contracts. Execution has an explicit timeout shorter than the
+verification lease. The app owns at most 64 active or draining adapter tasks;
+capacity exhaustion fails before another claim mutation or adapter dispatch.
+Every coordinator generation contributes a runtime-minted execution-owner ID
+to the durable verification claim. An exact live claim owned by another app or
+reconstructed worker therefore cannot authorize a second adapter dispatch;
+after a process fork, a quiescent inherited coordinator mints a new owner
+generation before use, while inherited active execution state fails closed and
+requires rebuilding the application in that worker;
+the owner renews that exact claim before dispatch and periodically through
+adapter execution, cancellation-resistant draining, and decision publication.
+Supporting stores must implement renewal as an atomic compare-and-extend of the
+complete claim authority tuple, reject expired, replaced, or decided claims,
+and leave `claimed_at` and the attempt number unchanged. After process loss the
+heartbeat stops, unfinished work waits for the last lease to expire, and a
+fresh claim can recover it. A completed exact retry validates the stored owner
+generation and replays the durable decision without acquiring execution again.
+Caller cancellation is delivered through a real task cancellation boundary.
+Cancellation while the adapter owns the outcome publishes no decision. Once
+durable publication has started, the store may commit before observing
+cancellation; cancellation and process-control signals remain authoritative to
+that caller, while a later exact retry reconciles the durable decision. If an
+adapter ignores cancellation after timeout or caller cancellation, Cayu retains
+that child, rejects overlapping execution in the same app, and keeps renewing
+its claim so other app instances reject overlap while durable authority remains
+renewable. If renewal fails or the process is lost, expiry permits a fresh claim
+and therefore at-least-once deterministic evaluation; the stale owner cannot
+publish, and its late result is discarded. Decision publication remains
+claim-fenced and single-authority. Adapter failures cross a bounded
+workload-secret-redacted diagnostic boundary.
+
+Concurrent calls for one proposal are proposal-scoped single-flight, including
+different claim or decision identities and separate app instances sharing one
+supporting store. Supporting stores must preserve the execution-owner ID in the
+claim request hash and returned claim. The bounded adapter execution timeout is
+part of that same claim identity, so an unfinished or completed retry cannot
+reuse stable claim and decision IDs under a different execution policy. For
+compatibility with earlier claims, a missing/`None` execution owner or execution
+timeout retains the historical request hash that omitted that field; any
+non-null value is part of the current exact hash.
+Stores expose the one decision indexed by proposal as well as lookup by
+decision ID; publication and replay require both indexes to exist and converge
+on the same content. A durable decision's complete
+proposal/attempt/contract/claim authority and content-derived integrity evidence
+are checked before process-local adapter resolution, so acknowledgement-loss and
+later app reconstruction replay the decision without invoking or re-registering
+the adapter. If decision publication reports an ambiguous ordinary failure,
+Cayu performs the same read-only exact reconciliation before propagating it.
+Reconciliation never converts cancellation or process control into success, and
+a reconciliation failure is preserved after the original publication failure.
+A different claim tuple or decision publication remains a conflict. This method
+ends at durable decision publication: it deliberately does not call
+`apply_completion_decision(...)`, transition the task or session, create a
+hidden continuation loop, or add provider-verifier usage. Those are separate
+verified-work lifecycle boundaries. At present, only `TaskStore`
+implementations that opt into the verified-work capability can use this API;
+`InMemoryTaskStore` remains the built-in reference implementation for that
+lifecycle.
+
 `InMemoryTaskStore(clock=...)` uses its injectable clock for availability,
 retry-series timing, and verified-work attempt, proposal, claim, and decision
 evidence. That clock is not authoritative for core `Task` lifecycle fields.
