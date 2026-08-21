@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from hashlib import sha256
 from math import fsum
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 from pydantic import (
     BaseModel,
@@ -49,7 +49,12 @@ class RetrievalCandidateIdentity(BaseModel):
 class RankedRetrievalHit(BaseModel):
     """One bounded channel hit; raw scores are diagnostic and never fused."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
 
     identity: RetrievalCandidateIdentity
     rank: int
@@ -57,7 +62,8 @@ class RankedRetrievalHit(BaseModel):
     content_hash: str
     explanations: tuple[str, ...] = ()
     raw_score: float | None = None
-    features: dict[str, float] = Field(default_factory=dict)
+    features: Mapping[str, float] = Field(default_factory=dict)
+    continuation: str | None = None
 
     @field_validator("rank", mode="before")
     @classmethod
@@ -100,21 +106,23 @@ class RankedRetrievalHit(BaseModel):
     @field_validator("features", mode="before")
     @classmethod
     def validate_features(cls, value) -> dict[str, float]:
-        copied = copy_json_value(value, "features")
-        if type(copied) is not dict:
-            raise ValueError("`features` must be an object.")
-        result: dict[str, float] = {}
-        for raw_name, raw_value in copied.items():
-            if type(raw_name) is not str:
-                raise ValueError("Feature names must be strings.")
-            name = require_clean_nonblank(raw_name, "feature name")
-            if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
-                raise ValueError(f"Feature {name!r} must be a number.")
-            feature = require_finite(float(raw_value), f"features[{name!r}]")
-            if feature < 0.0 or feature > 1.0:
-                raise ValueError(f"Feature {name!r} must be between 0.0 and 1.0.")
-            result[name] = feature
-        return result
+        return _copy_feature_map(value)
+
+    @field_validator("features")
+    @classmethod
+    def freeze_features(cls, value: Mapping[str, float]) -> Mapping[str, float]:
+        return FrozenJsonDict(value)
+
+    @field_serializer("features")
+    def serialize_features(self, value: Mapping[str, float]) -> dict[str, float]:
+        return dict(value)
+
+    @field_validator("continuation")
+    @classmethod
+    def validate_continuation(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "continuation")
 
 
 class RankedRetrievalChannel(BaseModel):
@@ -162,6 +170,9 @@ class RankedRetrievalChannel(BaseModel):
         ranks = [hit.rank for hit in self.hits]
         if len(ranks) != len(set(ranks)):
             raise ValueError("Channel hit ranks must be unique.")
+        identities = [hit.identity.sort_key() for hit in self.hits]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Channel candidate identities must be unique.")
         if any(rank > self.candidate_limit for rank in ranks):
             raise ValueError("Channel hit rank exceeds `candidate_limit`.")
         if self.continuation is not None and not self.truncated:
@@ -172,7 +183,12 @@ class RankedRetrievalChannel(BaseModel):
 class WeightedReciprocalRankFusionConfig(BaseModel):
     """Versioned, evaluation-owned WRRF weights and hard work budgets."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
 
     configuration_version: str
     channel_weights: Mapping[str, float]
@@ -186,15 +202,6 @@ class WeightedReciprocalRankFusionConfig(BaseModel):
     @classmethod
     def validate_versions(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("strategy_version")
-    @classmethod
-    def validate_strategy_version(cls, value: str) -> str:
-        if value != WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION:
-            raise ValueError(
-                f"`strategy_version` must be {WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION!r}."
-            )
-        return value
 
     @field_validator("channel_weights", mode="before")
     @classmethod
@@ -287,10 +294,24 @@ class FusedRetrievalCandidate(BaseModel):
     score: float
     reciprocal_rank_score: float
     feature_adjustment: float
-    features: dict[str, float]
+    features: Mapping[str, float]
     best_rank: int
     channel_count: int
     matches: tuple[FusedChannelMatch, ...]
+
+    @field_validator("features", mode="before")
+    @classmethod
+    def validate_features(cls, value) -> dict[str, float]:
+        return _copy_feature_map(value)
+
+    @field_validator("features")
+    @classmethod
+    def freeze_features(cls, value: Mapping[str, float]) -> Mapping[str, float]:
+        return FrozenJsonDict(value)
+
+    @field_serializer("features")
+    def serialize_features(self, value: Mapping[str, float]) -> dict[str, float]:
+        return dict(value)
 
 
 class RetrievalChannelDiagnostics(BaseModel):
@@ -330,6 +351,8 @@ class RetrievalFusionResult(BaseModel):
 class RetrievalFusionStrategy(ABC):
     """Typed replacement seam for bounded, diagnostic-preserving fusion."""
 
+    strategy_version: ClassVar[str]
+
     @abstractmethod
     def fuse(
         self,
@@ -342,12 +365,18 @@ class RetrievalFusionStrategy(ABC):
 class WeightedReciprocalRankFusion(RetrievalFusionStrategy):
     """Deterministic weighted reciprocal-rank fusion reference strategy."""
 
+    strategy_version = WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION
+
     def fuse(
         self,
         channels: tuple[RankedRetrievalChannel, ...],
         config: WeightedReciprocalRankFusionConfig,
     ) -> RetrievalFusionResult:
         config = _copy_fusion_config(config)
+        if config.strategy_version != self.strategy_version:
+            raise ValueError(
+                f"WeightedReciprocalRankFusion requires strategy_version {self.strategy_version!r}."
+            )
         copied_channels = tuple(_copy_ranked_channel(channel) for channel in channels)
         _validate_fusion_channels(copied_channels, config)
 
@@ -355,12 +384,10 @@ class WeightedReciprocalRankFusion(RetrievalFusionStrategy):
         channel_diagnostics: list[RetrievalChannelDiagnostics] = []
         continuation_channels: list[str] = []
         for channel in sorted(copied_channels, key=lambda item: item.channel):
-            unique_in_channel: set[tuple[str, str, str]] = set()
             if channel.continuation is not None:
                 continuation_channels.append(channel.channel)
             for hit in sorted(channel.hits, key=lambda item: item.rank):
                 identity_key = hit.identity.sort_key()
-                unique_in_channel.add(identity_key)
                 accumulator = candidates.get(identity_key)
                 if accumulator is None:
                     accumulator = _CandidateAccumulator(hit)
@@ -374,7 +401,7 @@ class WeightedReciprocalRankFusion(RetrievalFusionStrategy):
                     index_version=channel.index_version,
                     candidate_limit=channel.candidate_limit,
                     hit_count=len(channel.hits),
-                    unique_candidate_count=len(unique_in_channel),
+                    unique_candidate_count=len(channel.hits),
                     truncated=channel.truncated,
                     continuation_available=channel.continuation is not None,
                 )
@@ -503,6 +530,24 @@ def _copy_weight_map(
     return result
 
 
+def _copy_feature_map(value: Any) -> dict[str, float]:
+    copied = copy_json_value(value, "features")
+    if type(copied) is not dict:
+        raise ValueError("`features` must be an object.")
+    result: dict[str, float] = {}
+    for raw_name, raw_value in copied.items():
+        if type(raw_name) is not str:
+            raise ValueError("Feature names must be strings.")
+        name = require_clean_nonblank(raw_name, "feature name")
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+            raise ValueError(f"Feature {name!r} must be a number.")
+        feature = require_finite(float(raw_value), f"features[{name!r}]")
+        if feature < 0.0 or feature > 1.0:
+            raise ValueError(f"Feature {name!r} must be between 0.0 and 1.0.")
+        result[name] = feature
+    return result
+
+
 def _copy_candidate_identity(identity: RetrievalCandidateIdentity) -> RetrievalCandidateIdentity:
     if type(identity) is not RetrievalCandidateIdentity:
         raise TypeError("identity must be a RetrievalCandidateIdentity.")
@@ -524,6 +569,7 @@ def _copy_ranked_hit(hit: RankedRetrievalHit) -> RankedRetrievalHit:
         explanations=tuple(hit.explanations),
         raw_score=hit.raw_score,
         features=dict(hit.features),
+        continuation=hit.continuation,
     )
 
 

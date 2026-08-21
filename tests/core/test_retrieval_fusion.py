@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from cayu.retrieval import (
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     RankedRetrievalChannel,
     RankedRetrievalHit,
     RetrievalCandidateIdentity,
@@ -124,29 +125,35 @@ def test_weighted_rrf_is_independent_of_channel_and_hit_input_order() -> None:
     ]
 
 
-def test_weighted_rrf_collapses_duplicate_channel_hits_to_the_best_rank() -> None:
-    duplicate = RankedRetrievalChannel(
-        channel="lexical",
-        index_version="fts-v4",
-        candidate_limit=3,
-        hits=(
-            _hit("a", 1, representation="title", raw_score=1.0),
-            _hit("a", 2, representation="content", raw_score=100.0),
-        ),
+def test_ranked_channel_rejects_duplicate_candidate_identities() -> None:
+    with pytest.raises(ValidationError, match="candidate identities must be unique"):
+        RankedRetrievalChannel(
+            channel="lexical",
+            index_version="fts-v4",
+            candidate_limit=3,
+            hits=(
+                _hit("a", 1, representation="title", raw_score=1.0),
+                _hit("a", 2, representation="content", raw_score=100.0),
+            ),
+        )
+
+
+def test_retrieval_default_feature_maps_are_immutable() -> None:
+    hit = RankedRetrievalHit(
+        identity=_identity("a"),
+        rank=1,
+        representation="content",
+        content_hash="sha256:content:a",
     )
-    config = _config(
-        channel_weights={"lexical": 2.0},
-        feature_weights={},
-        max_candidates_per_channel=3,
+    config = WeightedReciprocalRankFusionConfig(
+        configuration_version="defaults-v1",
+        channel_weights={"lexical": 1.0},
     )
 
-    result = WeightedReciprocalRankFusion().fuse((duplicate,), config)
-
-    candidate = result.candidates[0]
-    assert candidate.reciprocal_rank_score == 2 / 11
-    assert candidate.channel_count == 1
-    assert [match.rank for match in candidate.matches] == [1, 2]
-    assert result.diagnostics.channels[0].unique_candidate_count == 1
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        hit.features["exact"] = 1.0  # type: ignore[index]
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        config.feature_weights["exact"] = 1.0  # type: ignore[index]
 
 
 def test_weighted_rrf_reports_lane_and_fused_head_truncation() -> None:
@@ -281,12 +288,24 @@ def test_weighted_rrf_configuration_is_defensively_copied_and_versioned() -> Non
 
     assert config.channel_weights == {"lexical": 1.0}
     assert config.fingerprint() == fingerprint
-    with pytest.raises(ValidationError, match="strategy_version"):
-        WeightedReciprocalRankFusionConfig(
-            configuration_version="frozen-v1",
-            channel_weights={"lexical": 1.0},
-            strategy_version="unknown",
+    custom = WeightedReciprocalRankFusionConfig(
+        configuration_version="frozen-v1",
+        channel_weights={"lexical": 1.0},
+        strategy_version="test.custom.v1",
+    )
+    assert custom.strategy_version == "test.custom.v1"
+    with pytest.raises(ValueError, match="requires strategy_version"):
+        WeightedReciprocalRankFusion().fuse(
+            (
+                RankedRetrievalChannel(
+                    channel="lexical",
+                    index_version="fts-v4",
+                    candidate_limit=1,
+                ),
+            ),
+            custom,
         )
+    assert custom.strategy_version != WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION
 
 
 def test_weighted_rrf_configuration_is_deeply_immutable_and_copies_revalidate() -> None:
