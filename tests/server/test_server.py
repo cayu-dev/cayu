@@ -11532,6 +11532,7 @@ def test_secret_bearing_mutation_id_is_rejected_before_execution() -> None:
 
 def test_explicit_compaction_endpoint_uses_replayable_mutation_contract() -> None:
     app = CayuApp(enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         context_policy=CheckpointCompactionContextPolicy(
@@ -11541,14 +11542,19 @@ def test_explicit_compaction_endpoint_uses_replayable_mutation_contract() -> Non
     )
 
     async def prepare() -> tuple[int, int]:
-        session = await app.session_store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="session-explicit-compact-endpoint",
-                messages=[Message.text("user", "create only")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
-        )
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-explicit-compact-endpoint",
+                    messages=[Message.text("user", "create only")],
+                )
+            )
+        ]
+        session = await app.session_store.load("session-explicit-compact-endpoint")
+        assert session is not None
+        assert session.status is SessionStatus.COMPLETED
         transcript = [
             Message.text("user", "old request"),
             Message.text("assistant", "old answer"),
@@ -11556,8 +11562,8 @@ def test_explicit_compaction_endpoint_uses_replayable_mutation_contract() -> Non
             Message.text("assistant", "current answer"),
         ]
         await app.session_store.append_transcript_messages(session.id, transcript)
-        completed = await app.session_store.update_status(session.id, SessionStatus.COMPLETED)
-        return completed.run_epoch, len(transcript)
+        persisted_transcript = await app.session_store.load_transcript(session.id)
+        return session.run_epoch, len(persisted_transcript)
 
     run_epoch, transcript_cursor = asyncio.run(prepare())
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))

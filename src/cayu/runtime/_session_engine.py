@@ -332,7 +332,6 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
     execution_profile_with_component,
-    execution_profile_with_durable_system_projection_digest,
     unavailable_execution_profile_components,
 )
 from cayu.runtime.execution_units import (
@@ -538,7 +537,6 @@ from cayu.runtime.tasks import (
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
     ToolCapabilityCeiling,
-    _resolve_initial_tool_capability_ceiling,
     resolve_tool_capability_ceiling,
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
@@ -2800,6 +2798,7 @@ class _PreparedInitialRun:
     rendered_system_prompt: str | None
     prompt_contributions: tuple[Any, ...]
     execution_profile: ExecutionProfileIdentity
+    tool_capability_ceiling: ToolCapabilityCeiling
     budget_policy: BudgetPolicy | None
     session_identity: SessionIdentity
 
@@ -2828,17 +2827,10 @@ def _runtime_version() -> str | None:
 
 def _session_tool_capability_ceiling(
     session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
 ) -> ToolCapabilityCeiling:
-    """Load durable authority, upgrading a legacy unbounded session in memory."""
+    """Load the required durable application-tool authority."""
 
-    ceiling = tool_capability_ceiling_from_session_metadata(
-        session.metadata,
-        required=False,
-    )
-    if ceiling is not None:
-        return ceiling
-    return resolve_tool_capability_ceiling(None, registered_agent.tool_capabilities)
+    return tool_capability_ceiling_from_session_metadata(session.metadata)
 
 
 def _execution_profile_identity(
@@ -4121,7 +4113,6 @@ class SessionEngine:
             retry_policy=self._effective_retry_policy(request.retry_policy),
             tool_capability_ceiling=_session_tool_capability_ceiling(
                 session,
-                registered_agent,
             ),
         )
         candidate = execution_profile_with_component(
@@ -4252,7 +4243,6 @@ class SessionEngine:
             invocation_semantics_available=invocation_semantics_available,
             tool_capability_ceiling=_session_tool_capability_ceiling(
                 session,
-                registered_agent,
             ).tool_names,
         )
         snapshot = plan.snapshot
@@ -6279,10 +6269,21 @@ class SessionEngine:
         )
         if registered_agent.spec.name != request.agent_name:
             raise ValueError("Initial-run agent override conflicts with the request agent.")
-        effective_tool_capability_ceiling = _resolve_initial_tool_capability_ceiling(
-            request.tool_capability_ceiling,
-            registered_agent.tool_capabilities,
-        )
+        if request.tool_capability_ceiling is None:
+            registered_exposure = registered_agent.all_registered_tool_exposure
+            # Registration reserves ``None`` for a catalog that cannot enter
+            # the bounded exposure contract. Persist a tool-free ceiling so the
+            # existing pre-dispatch MCP manifest boundary can publish its
+            # bounded rejection without creating an authority-incomplete
+            # session. Non-MCP catalogs still fail during model-step setup.
+            effective_tool_capability_ceiling = ToolCapabilityCeiling(
+                tool_names=(() if registered_exposure is None else registered_exposure.tool_names)
+            )
+        else:
+            effective_tool_capability_ceiling = resolve_tool_capability_ceiling(
+                request.tool_capability_ceiling,
+                registered_agent.tool_capabilities,
+            )
         request = request.model_copy(
             update={"tool_capability_ceiling": effective_tool_capability_ceiling}
         )
@@ -6417,6 +6418,7 @@ class SessionEngine:
             rendered_system_prompt=rendered_system_prompt,
             prompt_contributions=tuple(prompt_contributions),
             execution_profile=execution_profile,
+            tool_capability_ceiling=effective_tool_capability_ceiling,
             budget_policy=budget_policy,
             session_identity=session_identity,
         )
@@ -6626,6 +6628,7 @@ class SessionEngine:
         rendered_system_prompt = prepared.rendered_system_prompt
         prompt_contributions = list(prepared.prompt_contributions)
         execution_profile = prepared.execution_profile
+        tool_capability_ceiling = prepared.tool_capability_ceiling
         budget_policy = prepared.budget_policy
         session_identity = prepared.session_identity
         # ``prepared`` also retains the registered provider, whose repr may contain
@@ -6719,6 +6722,7 @@ class SessionEngine:
                     from_statuses=frozenset({SessionStatus.PENDING}),
                     checkpoint_transform=validate_prepared_submission,
                     execution_profile=execution_profile,
+                    tool_capability_ceiling=tool_capability_ceiling,
                     interaction_source_messages=tuple(request.messages),
                     interaction_started_event=interaction_started_event,
                     defer_interaction_source=True,
@@ -7770,11 +7774,7 @@ class SessionEngine:
                 "an unmodified built-in provider compactor so Cayu can admit every "
                 "provider dispatch before execution."
             )
-        expected_profile = (
-            None
-            if EXECUTION_PROFILE_METADATA_KEY not in loaded_session.metadata
-            else execution_profile_from_session_metadata(loaded_session.metadata)
-        )
+        expected_profile = execution_profile_from_session_metadata(loaded_session.metadata)
         try:
             registered_provider = self._get_registered_provider(loaded_session.provider_name)
         except KeyError:
@@ -7810,14 +7810,8 @@ class SessionEngine:
                 },
                 tool_capability_ceiling=_session_tool_capability_ceiling(
                     loaded_session,
-                    registered_agent,
                 ),
             )
-            if expected_profile is None:
-                return execution_profile_with_durable_system_projection_digest(
-                    candidate,
-                    system_prompt_messages_sha256(transcript),
-                )
             return execution_profile_with_component(
                 candidate,
                 expected_profile.component(
@@ -7834,7 +7828,7 @@ class SessionEngine:
         )
         changed_registration_components = (
             ()
-            if expected_profile is None or expected_profile.schema_version < 3
+            if expected_profile.schema_version < 3
             else tuple(
                 component
                 for component in governed_registration_components
@@ -7842,14 +7836,13 @@ class SessionEngine:
             )
         )
         if changed_registration_components:
-            assert expected_profile is not None
             raise ExecutionProfileMismatchError(
                 session_id=loaded_session.id,
                 expected_profile_fingerprint=expected_profile.fingerprint,
                 candidate_profile_fingerprint=profile_candidate.fingerprint,
                 changed_component_classes=changed_registration_components,
             )
-        if expected_profile is None or expected_profile.schema_version < 3:
+        if expected_profile.schema_version < 3:
             compaction_execution_profile = profile_candidate
         else:
             compaction_execution_profile = expected_profile
@@ -11583,10 +11576,10 @@ class SessionEngine:
             )
         loaded_projection_cursor = session_model_projection_cursor(loaded_session)
 
+        stored_execution_profile = execution_profile_from_session_metadata(loaded_session.metadata)
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         stored_tool_capability_ceiling = _session_tool_capability_ceiling(
             loaded_session,
-            registered_agent,
         )
         effective_tool_capability_ceiling = resolve_tool_capability_ceiling(
             request.tool_capability_ceiling,
@@ -11627,13 +11620,8 @@ class SessionEngine:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        if (
-            request.profile_adoption is not None
-            and EXECUTION_PROFILE_METADATA_KEY in loaded_session.metadata
-        ):
-            replay_expected_profile = execution_profile_from_session_metadata(
-                loaded_session.metadata
-            )
+        if request.profile_adoption is not None:
+            replay_expected_profile = stored_execution_profile
             replay_candidate_profile = _execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=registered_provider.name,
@@ -11934,23 +11922,6 @@ class SessionEngine:
             )
         candidate_execution_profile: ExecutionProfileIdentity | None = None
         execution_profile_decision: ExecutionProfileDecision | None = None
-        # #906 owns baseline selection for derived sessions. Until that contract
-        # exists, preserve the pre-profile behavior only for fork records that do
-        # not yet carry profile authority; a malformed or present profile still
-        # enters the normal fail-closed path.
-        legacy_unprofiled_fork = (
-            loaded_session.parent_session_id is not None
-            and EXECUTION_PROFILE_METADATA_KEY not in loaded_session.metadata
-        )
-        if legacy_unprofiled_fork and request.profile_adoption is not None:
-            raise RuntimeError(
-                "A legacy fork without a durable execution profile cannot adopt a new profile."
-            )
-        if legacy_unprofiled_fork and request.tool_capability_ceiling is not None:
-            raise RuntimeError(
-                "A legacy fork without a durable execution profile cannot adopt a tool "
-                "capability ceiling."
-            )
         if not continuing_recovery_boundary:
             candidate_execution_profile = _execution_profile_identity(
                 registered_agent=registered_agent,
@@ -11984,181 +11955,166 @@ class SessionEngine:
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 tool_capability_ceiling=effective_tool_capability_ceiling,
             )
-            if legacy_unprofiled_fork:
-                fork_transcript = await self.session_store.load_transcript(loaded_session.id)
+            expected_execution_profile = stored_execution_profile
+            # A resumed session executes the already-durable system projection.
+            # The current AgentSpec prompt is not re-injected on resume.
+            candidate_execution_profile = execution_profile_with_component(
+                candidate_execution_profile,
+                expected_execution_profile.component(
+                    ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                ),
+            )
+            built_in_model_target_transition = False
+            if target_changed:
                 try:
-                    candidate_execution_profile = (
-                        execution_profile_with_durable_system_projection_digest(
-                            candidate_execution_profile,
-                            system_prompt_messages_sha256(fork_transcript),
-                        )
+                    source_registered_provider = self._get_registered_provider(
+                        loaded_session.provider_name
                     )
-                finally:
-                    fork_transcript.clear()
-            else:
-                expected_execution_profile = execution_profile_from_session_metadata(
-                    loaded_session.metadata
-                )
-                # A resumed session executes the already-durable system projection.
-                # The current AgentSpec prompt is not re-injected on resume.
-                candidate_execution_profile = execution_profile_with_component(
-                    candidate_execution_profile,
-                    expected_execution_profile.component(
-                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
-                    ),
-                )
-                built_in_model_target_transition = False
-                if target_changed:
-                    try:
-                        source_registered_provider = self._get_registered_provider(
-                            loaded_session.provider_name
-                        )
-                    except (KeyError, ValueError):
-                        source_registered_provider = None
-                    if source_registered_provider is not None:
-                        source_registration_profile = _execution_profile_identity(
-                            registered_agent=registered_agent,
-                            provider_name=source_registered_provider.name,
-                            registered_provider=source_registered_provider,
-                            model=loaded_session.model,
-                            durable_system_prompt=None,
-                            redactor=self._secret_redactor,
-                            registered_environment=registered_environment,
-                            process_identity=self._execution_profile_process_identity,
-                            runtime_hooks=self._runtime_hooks,
-                            loop_policies=self._loop_policies,
-                            loop_policy_execution_profile_identities=(
-                                self._loop_policy_execution_profile_identities
-                            ),
-                            request_loop_policies=request.loop_policies,
-                            request_loop_policy_instance_identities=(
-                                self._request_loop_policy_instance_identities(request.loop_policies)
-                            ),
-                            budget_policy=budget_policy,
-                            request_budget_limits=request.budget_limits,
-                            causal_budget_id=loaded_session.causal_budget_id,
-                            structured_output=request.structured_output,
-                            thinking=request.thinking,
-                            max_steps=request.max_steps,
-                            limits=request.limits,
-                            retry_policy=self._effective_retry_policy(request.retry_policy),
-                            tool_capability_ceiling=stored_tool_capability_ceiling,
-                        )
-                        source_registration_profile = execution_profile_with_component(
-                            source_registration_profile,
-                            expected_execution_profile.component(
-                                ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
-                            ),
-                        )
-                        built_in_model_target_transition = (
-                            source_registration_profile == expected_execution_profile
-                        )
-                if required_execution_profile is not None:
-                    assert source_execution_profile is not None
-                    if target_changed and expected_execution_profile != source_execution_profile:
-                        raise ExecutionProfileMismatchError(
-                            session_id=loaded_session.id,
-                            expected_profile_fingerprint=(source_execution_profile.fingerprint),
-                            candidate_profile_fingerprint=(expected_execution_profile.fingerprint),
-                            changed_component_classes=changed_execution_profile_components(
-                                source_execution_profile,
-                                expected_execution_profile,
-                            ),
-                        )
-                    if candidate_execution_profile != required_execution_profile:
-                        raise ExecutionProfileMismatchError(
-                            session_id=loaded_session.id,
-                            expected_profile_fingerprint=(required_execution_profile.fingerprint),
-                            candidate_profile_fingerprint=(candidate_execution_profile.fingerprint),
-                            changed_component_classes=changed_execution_profile_components(
-                                required_execution_profile,
-                                candidate_execution_profile,
-                            ),
-                        )
-            if not legacy_unprofiled_fork:
-                changed_profile_components = changed_execution_profile_components(
-                    expected_execution_profile,
-                    candidate_execution_profile,
-                )
-                fork_relationship = session_fork_profile_relationship(loaded_session)
-                exact_fork_group_initial_invocation = (
-                    loaded_session.run_epoch == 0
-                    and request.profile_adoption is None
-                    and fork_relationship is not None
-                    and fork_relationship.initial_invocation_request_sha256
-                    == _fork_group_initial_invocation_request_sha256(request)
-                    and fork_relationship.initial_invocation_profile == candidate_execution_profile
-                )
-                if exact_fork_group_initial_invocation and changed_profile_components:
-                    execution_profile_decision = _execution_profile_decision_event(
-                        session=loaded_session,
-                        expected_profile=expected_execution_profile,
-                        candidate_profile=candidate_execution_profile,
-                        changed_component_classes=changed_profile_components,
-                        kind=ExecutionProfileDecisionKind.ADOPTED,
-                        policy_identity=_FORK_GROUP_INITIAL_PROFILE_POLICY_ID,
-                        policy_reason=(
-                            "The exact invocation was frozen with the durable fork-group "
-                            "branch before child creation."
+                except (KeyError, ValueError):
+                    source_registered_provider = None
+                if source_registered_provider is not None:
+                    source_registration_profile = _execution_profile_identity(
+                        registered_agent=registered_agent,
+                        provider_name=source_registered_provider.name,
+                        registered_provider=source_registered_provider,
+                        model=loaded_session.model,
+                        durable_system_prompt=None,
+                        redactor=self._secret_redactor,
+                        registered_environment=registered_environment,
+                        process_identity=self._execution_profile_process_identity,
+                        runtime_hooks=self._runtime_hooks,
+                        loop_policies=self._loop_policies,
+                        loop_policy_execution_profile_identities=(
+                            self._loop_policy_execution_profile_identities
                         ),
-                        authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
-                        intent=None,
-                        adoption_request_fingerprint=None,
-                        fallback_actor=_fork_group_initial_profile_actor(),
-                        fallback_reason=(
-                            "Apply the runtime-owned initial fork-group branch invocation."
+                        request_loop_policies=request.loop_policies,
+                        request_loop_policy_instance_identities=(
+                            self._request_loop_policy_instance_identities(request.loop_policies)
                         ),
-                        clock=self._clock,
+                        budget_policy=budget_policy,
+                        request_budget_limits=request.budget_limits,
+                        causal_budget_id=loaded_session.causal_budget_id,
+                        structured_output=request.structured_output,
+                        thinking=request.thinking,
+                        max_steps=request.max_steps,
+                        limits=request.limits,
+                        retry_policy=self._effective_retry_policy(request.retry_policy),
+                        tool_capability_ceiling=stored_tool_capability_ceiling,
                     )
-                else:
-                    execution_profile_decision = await self._classify_execution_profile(
-                        session=loaded_session,
-                        expected_profile=expected_execution_profile,
-                        candidate_profile=candidate_execution_profile,
-                        changed_component_classes=changed_profile_components,
-                        intent=request.profile_adoption,
-                        adoption_request_fingerprint=adoption_request_fingerprint,
-                        target_changed=target_changed,
-                        target_provider_name=registered_provider.name,
-                        target_model=(
-                            requested_target.model
-                            if target_changed and requested_target is not None
-                            else loaded_session.model
+                    source_registration_profile = execution_profile_with_component(
+                        source_registration_profile,
+                        expected_execution_profile.component(
+                            ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
                         ),
-                        built_in_model_target_transition=(built_in_model_target_transition),
-                        tool_capability_ceiling_narrowed=(tool_capability_ceiling_narrowed),
                     )
-                if execution_profile_decision.kind in {
-                    ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
-                    ExecutionProfileDecisionKind.REJECTED,
-                }:
-                    rejection = await self.session_store.reject_execution_profile_resume(
-                        loaded_session.id,
-                        expected_statuses=_RESUMABLE_SESSION_STATUSES,
-                        expected_run_epoch=loaded_session.run_epoch,
-                        expected_profile=expected_execution_profile,
-                        candidate_profile=candidate_execution_profile,
-                        event=execution_profile_decision.event,
-                        decision=execution_profile_decision,
+                    built_in_model_target_transition = (
+                        source_registration_profile == expected_execution_profile
                     )
-                    if not rejection.replayed:
-                        await self._event_writer.fan_out_persisted([rejection.event])
-                    error_type = (
-                        ExecutionProfileMigrationRequired
-                        if execution_profile_decision.kind
-                        is ExecutionProfileDecisionKind.MIGRATION_REQUIRED
-                        else (
-                            ExecutionProfileAdoptionRejected
-                            if request.profile_adoption is not None
-                            else ExecutionProfileMismatchError
-                        )
-                    )
-                    raise error_type(
+            if required_execution_profile is not None:
+                assert source_execution_profile is not None
+                if target_changed and expected_execution_profile != source_execution_profile:
+                    raise ExecutionProfileMismatchError(
                         session_id=loaded_session.id,
-                        expected_profile_fingerprint=expected_execution_profile.fingerprint,
-                        candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
-                        changed_component_classes=changed_profile_components,
+                        expected_profile_fingerprint=(source_execution_profile.fingerprint),
+                        candidate_profile_fingerprint=(expected_execution_profile.fingerprint),
+                        changed_component_classes=changed_execution_profile_components(
+                            source_execution_profile,
+                            expected_execution_profile,
+                        ),
                     )
+                if candidate_execution_profile != required_execution_profile:
+                    raise ExecutionProfileMismatchError(
+                        session_id=loaded_session.id,
+                        expected_profile_fingerprint=(required_execution_profile.fingerprint),
+                        candidate_profile_fingerprint=(candidate_execution_profile.fingerprint),
+                        changed_component_classes=changed_execution_profile_components(
+                            required_execution_profile,
+                            candidate_execution_profile,
+                        ),
+                    )
+            changed_profile_components = changed_execution_profile_components(
+                expected_execution_profile,
+                candidate_execution_profile,
+            )
+            fork_relationship = session_fork_profile_relationship(loaded_session)
+            exact_fork_group_initial_invocation = (
+                loaded_session.run_epoch == 0
+                and request.profile_adoption is None
+                and fork_relationship is not None
+                and fork_relationship.initial_invocation_request_sha256
+                == _fork_group_initial_invocation_request_sha256(request)
+                and fork_relationship.initial_invocation_profile == candidate_execution_profile
+            )
+            if exact_fork_group_initial_invocation and changed_profile_components:
+                execution_profile_decision = _execution_profile_decision_event(
+                    session=loaded_session,
+                    expected_profile=expected_execution_profile,
+                    candidate_profile=candidate_execution_profile,
+                    changed_component_classes=changed_profile_components,
+                    kind=ExecutionProfileDecisionKind.ADOPTED,
+                    policy_identity=_FORK_GROUP_INITIAL_PROFILE_POLICY_ID,
+                    policy_reason=(
+                        "The exact invocation was frozen with the durable fork-group "
+                        "branch before child creation."
+                    ),
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                    intent=None,
+                    adoption_request_fingerprint=None,
+                    fallback_actor=_fork_group_initial_profile_actor(),
+                    fallback_reason=(
+                        "Apply the runtime-owned initial fork-group branch invocation."
+                    ),
+                    clock=self._clock,
+                )
+            else:
+                execution_profile_decision = await self._classify_execution_profile(
+                    session=loaded_session,
+                    expected_profile=expected_execution_profile,
+                    candidate_profile=candidate_execution_profile,
+                    changed_component_classes=changed_profile_components,
+                    intent=request.profile_adoption,
+                    adoption_request_fingerprint=adoption_request_fingerprint,
+                    target_changed=target_changed,
+                    target_provider_name=registered_provider.name,
+                    target_model=(
+                        requested_target.model
+                        if target_changed and requested_target is not None
+                        else loaded_session.model
+                    ),
+                    built_in_model_target_transition=(built_in_model_target_transition),
+                    tool_capability_ceiling_narrowed=(tool_capability_ceiling_narrowed),
+                )
+            if execution_profile_decision.kind in {
+                ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+                ExecutionProfileDecisionKind.REJECTED,
+            }:
+                rejection = await self.session_store.reject_execution_profile_resume(
+                    loaded_session.id,
+                    expected_statuses=_RESUMABLE_SESSION_STATUSES,
+                    expected_run_epoch=loaded_session.run_epoch,
+                    expected_profile=expected_execution_profile,
+                    candidate_profile=candidate_execution_profile,
+                    event=execution_profile_decision.event,
+                    decision=execution_profile_decision,
+                )
+                if not rejection.replayed:
+                    await self._event_writer.fan_out_persisted([rejection.event])
+                error_type = (
+                    ExecutionProfileMigrationRequired
+                    if execution_profile_decision.kind
+                    is ExecutionProfileDecisionKind.MIGRATION_REQUIRED
+                    else (
+                        ExecutionProfileAdoptionRejected
+                        if request.profile_adoption is not None
+                        else ExecutionProfileMismatchError
+                    )
+                )
+                raise error_type(
+                    session_id=loaded_session.id,
+                    expected_profile_fingerprint=expected_execution_profile.fingerprint,
+                    candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
+                    changed_component_classes=changed_profile_components,
+                )
         if continuing_recovery_boundary:
             continuing_execution_profile_snapshot = (
                 await self.validate_execution_profile_continuation(
@@ -12392,9 +12348,7 @@ class SessionEngine:
                     from_statuses=frozenset(_RESUMABLE_SESSION_STATUSES),
                     checkpoint_transform=claim_resumable_checkpoint,
                     execution_profile=invocation_profile,
-                    tool_capability_ceiling=(
-                        None if legacy_unprofiled_fork else effective_tool_capability_ceiling
-                    ),
+                    tool_capability_ceiling=effective_tool_capability_ceiling,
                     interaction_started_event=interaction_started_event,
                     continued_interaction_id=(
                         interaction_id if continuing_recovery_boundary else None
@@ -12404,7 +12358,6 @@ class SessionEngine:
                     model_transition=model_transition,
                     execution_profile_decision=execution_profile_decision,
                     expected_active_invocation_profile=(continuing_execution_profile_snapshot),
-                    allow_unprofiled_derived_session=legacy_unprofiled_fork,
                 ),
             )
         except (SessionStatusConflict, ValueError):
@@ -12935,17 +12888,8 @@ class SessionEngine:
                 "Source agent must be registered to derive inherited taint before forking: "
                 f"{source_session.agent_name}"
             ) from exc
-        durable_source_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
+        source_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
             source_session.metadata,
-            required=False,
-        )
-        source_tool_capability_ceiling = (
-            durable_source_tool_capability_ceiling
-            if durable_source_tool_capability_ceiling is not None
-            else resolve_tool_capability_ceiling(
-                None,
-                source_registered_agent.tool_capabilities,
-            )
         )
         agent_name = request.agent_name or source_session.agent_name
         registered_agent = self._get_registered_agent(agent_name)
@@ -12953,11 +12897,6 @@ class SessionEngine:
             request.tool_capability_ceiling,
             registered_agent.tool_capabilities,
             maximum=source_tool_capability_ceiling,
-        )
-        fork_has_durable_tool_capability_ceiling = (
-            durable_source_tool_capability_ceiling is not None
-            or request.tool_capability_ceiling is not None
-            or effective_tool_capability_ceiling != source_tool_capability_ceiling
         )
         model = request.model or (
             registered_agent.spec.model if request.agent_name is not None else source_session.model
@@ -13134,7 +13073,7 @@ class SessionEngine:
             initial_invocation_profile = (
                 None if initial_invocation is None else candidate_execution_profile
             )
-        elif fork_has_durable_tool_capability_ceiling:
+        else:
             inherited_ceiling_profile = current_child_execution_profile()
             selected_execution_profile = execution_profile_with_component(
                 source_execution_profile,
@@ -13437,11 +13376,10 @@ class SessionEngine:
             ),
             transcript_cursor=fork_projection_cursor,
         )
-        if fork_has_durable_tool_capability_ceiling:
-            fork_metadata = session_metadata_with_tool_capability_ceiling(
-                fork_metadata,
-                effective_tool_capability_ceiling,
-            )
+        fork_metadata = session_metadata_with_tool_capability_ceiling(
+            fork_metadata,
+            effective_tool_capability_ceiling,
+        )
         prompt_workflow.attach_receipt(
             fork_metadata,
             source_session=source_session,
@@ -14967,7 +14905,6 @@ class SessionEngine:
                     retry_policy=retry_policy,
                     tool_capability_ceiling=_session_tool_capability_ceiling(
                         session,
-                        registered_agent,
                     ),
                 )
                 candidate = execution_profile_with_component(

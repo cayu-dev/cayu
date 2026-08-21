@@ -225,21 +225,19 @@ def test_tool_capability_ceiling_resolution_canonicalizes_and_never_widens() -> 
         )
 
 
-def test_initial_ceiling_defers_oversized_catalog_failure_to_the_model_step(
+def test_initial_ceiling_rejects_an_oversized_catalog_before_session_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     capability = _capability("alpha")
     monkeypatch.setattr(exposure_contracts, "TOOL_EXPOSURE_MAX_CATALOG_BYTES", 1)
 
-    assert (
-        exposure_contracts._resolve_initial_tool_capability_ceiling(
+    with pytest.raises(ValueError, match="canonical JSON bytes"):
+        resolve_tool_capability_ceiling(
             None,
             (capability,),
         )
-        is None
-    )
     with pytest.raises(ValueError, match="canonical JSON bytes"):
-        exposure_contracts._resolve_initial_tool_capability_ceiling(
+        resolve_tool_capability_ceiling(
             ToolCapabilityCeiling(tool_names=()),
             (capability,),
         )

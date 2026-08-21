@@ -2605,16 +2605,6 @@ class SQLiteSessionStore(SessionStore):
                     model_transition=prepared_model_transition,
                     decision=prepared_execution_profile_decision,
                 )
-                transformed_checkpoint = checkpoint_transform(
-                    loaded,
-                    self._load_checkpoint_unlocked(session_id),
-                )
-                if transformed_checkpoint is not None:
-                    transformed_checkpoint = copy_durable_json_object(
-                        transformed_checkpoint,
-                        "checkpoint",
-                    )
-
                 transition_metadata = transition_profile_metadata
                 if prepared_model_transition is not None:
                     transcript_rows = self._connection.execute(
@@ -2640,7 +2630,18 @@ class SQLiteSessionStore(SessionStore):
                     loaded,
                     prepared_tool_capability_ceiling,
                     transition_metadata=transition_metadata,
+                    require_existing_ceiling=prepared_execution_profile is not None,
                 )
+
+                transformed_checkpoint = checkpoint_transform(
+                    loaded,
+                    self._load_checkpoint_unlocked(session_id),
+                )
+                if transformed_checkpoint is not None:
+                    transformed_checkpoint = copy_durable_json_object(
+                        transformed_checkpoint,
+                        "checkpoint",
+                    )
 
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 transition_values = (

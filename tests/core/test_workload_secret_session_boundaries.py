@@ -39,6 +39,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionQuery,
     SessionStatus,
+    ToolCapabilityCeiling,
 )
 from cayu.runtime._session_engine import _with_environment_name
 from cayu.runtime._session_request_boundary import (
@@ -420,6 +421,7 @@ def test_public_fork_detaches_resolved_source_from_derived_authority_rejection()
                 agent_name="source-agent",
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -514,6 +516,7 @@ def test_fork_rejects_target_agent_derived_secret_before_any_publication(
                 agent_name="source-agent",
                 session_id="fork-source",
                 messages=[Message.text("user", "source transcript")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -585,6 +588,7 @@ def test_fork_rejects_target_agent_provider_secret_before_mismatch_diagnostic() 
                 agent_name="source-agent",
                 session_id="provider-fork-source",
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -622,6 +626,7 @@ def test_same_agent_fork_ignores_unused_changed_provider_pin() -> None:
                 agent_name="historical-agent",
                 session_id="historical-source",
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",

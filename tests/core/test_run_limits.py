@@ -33,7 +33,7 @@ from cayu.providers import (
     ModelStreamEvent,
     bedrock_billing_identity,
 )
-from cayu.runtime import AlwaysRequireApprovalToolPolicy, CayuApp
+from cayu.runtime import AlwaysRequireApprovalToolPolicy, CayuApp, ToolCapabilityCeiling
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limit_accounting import RunBudgetAccountingAuthority
@@ -560,6 +560,7 @@ def test_session_run_limit_publishes_usage_beyond_int64_without_provider_call() 
                 agent_name="assistant",
                 session_id="sess_aggregate_run_limit",
                 messages=[Message.text("user", "initial")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=_profiled_identity_for_app(
                 app,
@@ -720,6 +721,7 @@ def test_cayu_app_session_elapsed_limit_uses_injected_clock_before_provider_disp
                 agent_name="assistant",
                 session_id="sess_app_elapsed_clock",
                 messages=[Message.text("user", "initial")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=_profiled_identity_for_app(
                 app,

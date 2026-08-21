@@ -29,6 +29,7 @@ from cayu.runtime import (
     Session,
     SessionStatus,
     StructuredOutputSpec,
+    ToolCapabilityCeiling,
 )
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
@@ -205,6 +206,7 @@ async def _publish_structured_model_step(
         AgentSpec(name="assistant", model="fake-model"),
         tools=tools,
     )
+    tool_capability_ceiling = ToolCapabilityCeiling(tool_names=tuple(tool.name for tool in tools))
     execution_profile = session_engine_module._execution_profile_identity(
         registered_agent=profile_app._agents["assistant"],
         provider_name=provider.name,
@@ -214,6 +216,7 @@ async def _publish_structured_model_step(
         redactor=profile_app._secret_redactor,
         process_identity=profile_app._execution_profile_process_identity,
         structured_output=spec,
+        tool_capability_ceiling=tool_capability_ceiling,
     )
     admitted = await create_admitted_session(
         store,
@@ -222,6 +225,7 @@ async def _publish_structured_model_step(
             session_id=session_id,
             messages=[user_message],
             structured_output=spec,
+            tool_capability_ceiling=tool_capability_ceiling,
         ),
         provider_name=provider.name,
         model="fake-model",

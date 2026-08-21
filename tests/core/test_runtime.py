@@ -21,7 +21,11 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import SecretStr, ValidationError
 from tests._session_provenance import fixture_session_invocation
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    profiled_session_identity,
+    run_request_with_registered_tool_ceiling,
+    tool_capability_ceiling_for_app,
+)
 from tests.core._execution_unit_fixtures import model_attempt_identity
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
@@ -11128,7 +11132,8 @@ def test_cayu_app_request_session_budget_uses_rolling_window():
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_rolling_request_budget",
                 messages=[Message.text("user", "old")],
@@ -17072,7 +17077,8 @@ def test_cayu_app_rejects_completed_session_with_pending_tool_round():
 
     async def seed() -> None:
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="completed_pending_round",
                 messages=[Message.text("user", "hello")],
@@ -17597,6 +17603,7 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
                 agent_name="assistant",
                 session_id="sess_prompt_precommit_parent",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -17690,6 +17697,7 @@ def test_prompt_anatomy_fork_requires_exact_intent_inside_atomic_create() -> Non
                 agent_name="assistant",
                 session_id="sess_prompt_intent_parent",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -17738,7 +17746,7 @@ def test_prompt_anatomy_fork_rejects_checkpoint_copy() -> None:
 
     async def scenario() -> None:
         source = await store.create(
-            RunRequest(agent_name="assistant", messages=[]),
+            run_request_with_registered_tool_ceiling(app, agent_name="assistant", messages=[]),
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
@@ -17782,7 +17790,11 @@ def test_prompt_anatomy_fork_requires_concrete_registered_environment(
 
     async def scenario() -> None:
         source = await store.create(
-            RunRequest(agent_name="assistant", messages=[]),
+            run_request_with_registered_tool_ceiling(
+                app,
+                agent_name="assistant",
+                messages=[],
+            ),
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
@@ -17826,7 +17838,11 @@ def test_prompt_anatomy_fork_rejects_live_source_before_effects(
 
     async def scenario() -> None:
         source = await store.create(
-            RunRequest(agent_name="assistant", messages=[]),
+            run_request_with_registered_tool_ceiling(
+                app,
+                agent_name="assistant",
+                messages=[],
+            ),
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
@@ -17873,7 +17889,11 @@ def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
 
     async def scenario() -> None:
         source = await store.create(
-            RunRequest(agent_name="assistant", messages=[]),
+            run_request_with_registered_tool_ceiling(
+                app,
+                agent_name="assistant",
+                messages=[],
+            ),
             identity=profiled_session_identity(
                 provider_name="fake",
                 model="fake-model",
@@ -17990,7 +18010,8 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
 
     async def scenario() -> None:
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_expired_recovery_claim_source",
                 messages=[Message.text("user", "fork me")],
@@ -18123,7 +18144,8 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
         session_id = "sess_ambiguous_expired_recovery_takeover"
         child_id = "sess_ambiguous_expired_recovery_takeover_child"
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "fork me")],
@@ -18250,7 +18272,8 @@ def test_cayu_app_does_not_reconcile_an_ambiguous_takeover_as_a_replacement_owne
         session_id = "sess_ambiguous_takeover_replaced"
         child_id = "sess_ambiguous_takeover_replaced_child"
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "fork me")],
@@ -22078,7 +22101,8 @@ def test_pending_interruption_cascade_blocks_resume_and_fork():
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "sess_pending_cascade_continuation_guard"
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "hello")],
@@ -22900,12 +22924,17 @@ def test_cayu_app_dispatch_rejects_running_session():
 
     async def create_running_session() -> None:
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_dispatch_running",
                 messages=[Message.text("user", "hi")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+                app=app,
+            ),
         )
         await store.update_status("sess_dispatch_running", SessionStatus.RUNNING)
 
@@ -24897,7 +24926,8 @@ def test_cayu_app_resume_releases_run_fence_when_setup_is_cancelled():
         list[Event],
     ]:
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_resume_setup_cancel",
                 messages=[Message.text("user", "hi")],
@@ -24965,7 +24995,8 @@ def test_cayu_app_resume_rejects_active_sessions():
 
     async def setup_running_session() -> None:
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_running",
                 messages=[Message.text("user", "hi")],
@@ -25018,7 +25049,8 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
 
     async def setup_completed_session() -> None:
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_broken_transcript",
                 messages=[Message.text("user", "hi")],
@@ -26791,6 +26823,7 @@ async def _seed_crashed_spawn_parent(
     store,
     *,
     parent_identity: SessionIdentity,
+    parent_tool_capability_ceiling: ToolCapabilityCeiling,
     child_status,
     mode: str = "background",
     linkage: str = "correct",
@@ -26826,6 +26859,7 @@ async def _seed_crashed_spawn_parent(
             agent_name="parent",
             session_id="parent",
             messages=parent_messages,
+            tool_capability_ceiling=parent_tool_capability_ceiling,
         ),
         identity=parent_identity,
         interaction_started_event=_interaction_started_event(
@@ -27019,6 +27053,10 @@ def _recover_parent(
         await _seed_crashed_spawn_parent(
             store,
             parent_identity=parent_identity,
+            parent_tool_capability_ceiling=tool_capability_ceiling_for_app(
+                app,
+                agent_name="parent",
+            ),
             child_status=child_status,
             mode=mode,
             linkage=linkage,
@@ -31410,7 +31448,8 @@ def test_cayu_app_resume_repairs_missing_initial_run_terminal_evidence() -> None
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "sess_resume_missing_initial_terminal"
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
@@ -31856,7 +31895,8 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "sess_resume_failed_before_boundary"
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
@@ -31963,7 +32003,8 @@ def test_cayu_app_resume_reconciles_terminal_event_before_replacing_run_marker()
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "sess_resume_event_before_marker_cleanup"
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
@@ -32156,7 +32197,8 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "sess_terminal_evidence_pending_interrupt"
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
@@ -45554,7 +45596,8 @@ def test_automatic_compaction_lost_checkpoint_ack_reconciles_effective_transform
             ),
         )
         await store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[],
@@ -51448,7 +51491,8 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
 
     session = asyncio.run(
         store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_bad_checkpoint_pair",
                 messages=[],
@@ -51545,7 +51589,8 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
 
     session = asyncio.run(
         store.create(
-            RunRequest(
+            run_request_with_registered_tool_ceiling(
+                app,
                 agent_name="assistant",
                 session_id="sess_bad_checkpoint_cursor",
                 messages=[],

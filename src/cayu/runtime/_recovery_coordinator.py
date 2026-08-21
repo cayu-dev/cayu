@@ -290,7 +290,7 @@ from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     NOT_EXPOSED_IN_REQUEST_REASON,
     ResolvedToolExposureAuthority,
-    resolved_tool_exposure_authority,
+    tool_capability_ceiling_from_session_metadata,
     unexposed_tool_result,
     validate_resolved_tool_exposure_authority,
 )
@@ -991,17 +991,33 @@ def _continued_tool_exposure_profile_id(
 def _retried_model_step_tool_exposure_authority(
     authority: ResolvedToolExposureAuthority | None,
     registered_agent: runtime_records.RegisteredAgentState,
+    session: Session,
 ) -> ResolvedToolExposureAuthority:
     """Return exact exposure authority for a same-model-step retry."""
 
-    if authority is not None:
-        return authority
-    all_registered = registered_agent.all_registered_tool_exposure
-    if all_registered is None:
-        raise RuntimeError(
-            "Legacy provider-operation recovery cannot reconstruct its expose-all snapshot."
+    if authority is None:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation fallback has no durable tool-exposure authority."
         )
-    return resolved_tool_exposure_authority(all_registered)
+    try:
+        validated = validate_resolved_tool_exposure_authority(
+            authority,
+            registered_agent.tool_capabilities,
+        )
+        capability_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
+    except (TypeError, ValueError) as exc:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation fallback has invalid durable tool-exposure authority."
+        ) from exc
+    ceiling_names = frozenset(capability_ceiling.tool_names)
+    if validated.ceiling_count != len(capability_ceiling.tool_names) or any(
+        name not in ceiling_names for name in validated.tool_names
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation fallback tool exposure conflicts with the session capability "
+            "ceiling."
+        )
+    return validated
 
 
 @dataclass(frozen=True)
@@ -3875,9 +3891,23 @@ class RecoveryCoordinator:
             raise ProviderOperationEvidenceError(
                 "Provider-operation disposition lost its source stage."
             )
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        if pending.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            if recovery_context is None:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation fallback requires durable model-completion context."
+                )
+            session = await self._session_store.load(pending.session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {pending.session_id}")
+            registered_agent = self._resolve_registered_agent(session.agent_name)
+            _retried_model_step_tool_exposure_authority(
+                recovery_context.tool_exposure,
+                registered_agent,
+                session,
+            )
         if not stage.reservation_ids:
             return ()
-        recovery_context = model_completion_recovery_context_from_stage(stage)
         if recovery_context is None:
             raise ProviderOperationEvidenceError(
                 "Budgeted provider-operation disposition has no accounting context."
@@ -4170,6 +4200,7 @@ class RecoveryCoordinator:
                     _retried_model_step_tool_exposure_authority(
                         recovery_context.tool_exposure,
                         registered_agent,
+                        session,
                     )
                 ),
                 preserve_failure_until_initial_provider_dispatch=True,

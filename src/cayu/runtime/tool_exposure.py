@@ -326,38 +326,16 @@ def resolve_tool_capability_ceiling(
     return ToolCapabilityCeiling(tool_names=canonical_names)
 
 
-def _resolve_initial_tool_capability_ceiling(
-    requested: ToolCapabilityCeiling | None,
-    registered_tools: tuple[RegisteredToolCapability, ...],
-) -> ToolCapabilityCeiling | None:
-    """Resolve initial authority while preserving bounded oversized-catalog failure."""
-
-    if requested is None:
-        if len(registered_tools) > TOOL_EXPOSURE_MAX_REGISTERED_TOOLS:
-            return None
-        catalog_bytes = 2 + sum(
-            capability._canonical_size_bytes + (1 if index else 0)
-            for index, capability in enumerate(registered_tools)
-        )
-        if catalog_bytes > TOOL_EXPOSURE_MAX_CATALOG_BYTES:
-            return None
-    return resolve_tool_capability_ceiling(requested, registered_tools)
-
-
 def tool_capability_ceiling_from_session_metadata(
     metadata: Mapping[str, Any],
-    *,
-    required: bool = True,
-) -> ToolCapabilityCeiling | None:
+) -> ToolCapabilityCeiling:
     """Load copied durable ceiling authority from runtime-owned session metadata."""
 
     if not isinstance(metadata, Mapping):
         raise TypeError("session metadata must be a mapping.")
     raw = metadata.get(TOOL_CAPABILITY_CEILING_METADATA_KEY)
     if raw is None:
-        if required:
-            raise ValueError("Session metadata has no durable tool capability ceiling.")
-        return None
+        raise ValueError("Session metadata has no durable tool capability ceiling.")
     return ToolCapabilityCeiling.model_validate(raw)
 
 
@@ -381,8 +359,8 @@ def session_metadata_after_tool_capability_ceiling_narrowing(
     """Atomically applicable metadata update that rejects every widening path."""
 
     candidate = copy_tool_capability_ceiling(ceiling)
-    current = tool_capability_ceiling_from_session_metadata(metadata, required=False)
-    if current is not None and not frozenset(candidate.tool_names) <= frozenset(current.tool_names):
+    current = tool_capability_ceiling_from_session_metadata(metadata)
+    if not frozenset(candidate.tool_names) <= frozenset(current.tool_names):
         raise ValueError("A tool capability ceiling may be narrowed but never widened.")
     return session_metadata_with_tool_capability_ceiling(metadata, candidate)
 

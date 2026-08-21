@@ -81,7 +81,8 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.tasks import TaskStatus, TaskStore
 from cayu.runtime.tool_exposure import (
-    _resolve_initial_tool_capability_ceiling,
+    resolve_tool_capability_ceiling,
+    tool_capability_ceiling_from_session_metadata,
 )
 
 
@@ -293,7 +294,7 @@ class DurableSubagentCoordinator:
         registered_child = self._get_registered_agent(request.agent_name)
         request = request.model_copy(
             update={
-                "tool_capability_ceiling": _resolve_initial_tool_capability_ceiling(
+                "tool_capability_ceiling": resolve_tool_capability_ceiling(
                     request.tool_capability_ceiling,
                     registered_child.tool_capabilities,
                 )
@@ -924,8 +925,18 @@ class DurableSubagentCoordinator:
             child_checkpoint,
             idempotency_key=intent.idempotency_key,
         )
+        try:
+            child_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
+                child.metadata
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "Existing durable subagent child has no tool capability ceiling."
+            ) from exc
         if (
             child_intent != intent
+            or intent.request.tool_capability_ceiling is None
+            or child_tool_capability_ceiling != intent.request.tool_capability_ceiling
             or child.parent_session_id != parent.id
             or child.causal_budget_id != intent.causal_budget_id
             or child.agent_name != intent.agent_name
@@ -1158,12 +1169,17 @@ class DurableSubagentCoordinator:
                 checkpoint,
                 idempotency_key=intent.idempotency_key,
             )
+            child_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
+                session.metadata
+            )
         except (TypeError, ValueError) as exc:
             raise _QueuedDispatchAuthorityRejected(
                 "Prepared subagent session authority is malformed."
             ) from exc
         if (
             child_intent != intent
+            or intent.request.tool_capability_ceiling is None
+            or child_tool_capability_ceiling != intent.request.tool_capability_ceiling
             or session.parent_session_id != intent.parent_session_id
             or session.causal_budget_id != intent.causal_budget_id
             or execution_profile_from_session_metadata(session.metadata)

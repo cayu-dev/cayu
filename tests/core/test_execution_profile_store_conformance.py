@@ -21,6 +21,7 @@ from cayu.runtime import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    ToolCapabilityCeiling,
 )
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
@@ -50,7 +51,11 @@ def _profile(*, tool_name: str) -> ExecutionProfileIdentity:
             }
         ],
         tool_implementations=[{"implementation": "test:recording-tool:v1"}],
-        tool_view_grants={"view_kind": "test", "generation": 1},
+        tool_view_grants={
+            "view_kind": "direct",
+            "generation": 1,
+            "grant_baseline": ["original_tool"],
+        },
         effect_authority={"authority": "test-fixture"},
     )
 
@@ -128,7 +133,12 @@ async def _assert_execution_profile_store_conformance(
     expected = _profile(tool_name="original_tool")
     candidate = _profile(tool_name="replacement_tool")
     created = await store.create(
-        RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+        RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
+        ),
         identity=SessionIdentity(
             provider_name="fake",
             model="fake-model",
@@ -201,7 +211,12 @@ async def _assert_execution_profile_store_conformance(
         )
 
     await store.create(
-        RunRequest(agent_name="assistant", session_id=active_session_id, messages=[]),
+        RunRequest(
+            agent_name="assistant",
+            session_id=active_session_id,
+            messages=[],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
+        ),
         identity=SessionIdentity(
             provider_name="fake",
             model="fake-model",
@@ -248,6 +263,7 @@ async def _assert_execution_profile_store_conformance(
             from_statuses=frozenset({SessionStatus.INTERRUPTED}),
             checkpoint_transform=lambda _session, current: current,
             execution_profile=candidate,
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
             continued_interaction_id=active_interaction_id,
             interaction_source_messages=(),
             defer_interaction_source=True,
@@ -298,7 +314,12 @@ async def _assert_execution_profile_store_conformance(
 
     rollback_session_id = f"profile-store-rollback-{suffix}-{uuid4().hex}"
     await store.create(
-        RunRequest(agent_name="assistant", session_id=rollback_session_id, messages=[]),
+        RunRequest(
+            agent_name="assistant",
+            session_id=rollback_session_id,
+            messages=[],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
+        ),
         identity=SessionIdentity(
             provider_name="fake",
             model="fake-model",
@@ -383,7 +404,12 @@ async def _assert_execution_profile_store_conformance(
 
     adoption_session_id = f"profile-store-adoption-{suffix}-{uuid4().hex}"
     await store.create(
-        RunRequest(agent_name="assistant", session_id=adoption_session_id, messages=[]),
+        RunRequest(
+            agent_name="assistant",
+            session_id=adoption_session_id,
+            messages=[],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
+        ),
         identity=SessionIdentity(
             provider_name="fake",
             model="fake-model",
@@ -427,7 +453,12 @@ async def _assert_execution_profile_store_conformance(
 
     concurrent_session_id = f"profile-store-concurrent-{suffix}-{uuid4().hex}"
     await store.create(
-        RunRequest(agent_name="assistant", session_id=concurrent_session_id, messages=[]),
+        RunRequest(
+            agent_name="assistant",
+            session_id=concurrent_session_id,
+            messages=[],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
+        ),
         identity=SessionIdentity(
             provider_name="fake",
             model="fake-model",
@@ -487,6 +518,45 @@ async def _assert_execution_profile_store_conformance(
         == 1
     )
     await store.release_run_fence(concurrent_session_id)
+
+    incomplete_session_id = f"profile-store-incomplete-{suffix}-{uuid4().hex}"
+    await store.create(
+        RunRequest(
+            agent_name="assistant",
+            session_id=incomplete_session_id,
+            messages=[],
+        ),
+        identity=SessionIdentity(
+            provider_name="fake",
+            model="fake-model",
+            execution_profile=expected,
+        ),
+    )
+    await store.update_status(incomplete_session_id, SessionStatus.COMPLETED)
+    incomplete_before = await store.load(incomplete_session_id)
+    assert incomplete_before is not None
+    incomplete_transform_called = False
+
+    def unexpected_incomplete_transform(_session, checkpoint):
+        nonlocal incomplete_transform_called
+        incomplete_transform_called = True
+        return checkpoint
+
+    with pytest.raises(ValueError, match="no durable tool capability ceiling"):
+        await store.admit_execution_profile_resume(
+            incomplete_session_id,
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+            checkpoint_transform=unexpected_incomplete_transform,
+            execution_profile=expected,
+        )
+    incomplete_after = await store.load(incomplete_session_id)
+    assert incomplete_after is not None
+    assert incomplete_transform_called is False
+    assert incomplete_after.status is incomplete_before.status
+    assert incomplete_after.run_epoch == incomplete_before.run_epoch
+    assert incomplete_after.metadata == incomplete_before.metadata
+    assert await store.load_events(incomplete_session_id) == []
 
 
 async def _close_store(store: SessionStore) -> None:
@@ -552,6 +622,7 @@ def test_legacy_custom_store_fails_closed_without_invocation_profile_capability(
                         from_statuses=frozenset({SessionStatus.INTERRUPTED}),
                         checkpoint_transform=lambda _session, checkpoint: checkpoint,
                         execution_profile=profile,
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                         continued_interaction_id=active.interaction_id,
                         interaction_source_messages=(),
                         defer_interaction_source=True,

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core.task_invocation_fixtures import (
     task_backed_session_invocation,
     unattributed_session_invocation_binding,
@@ -96,6 +97,7 @@ from cayu import (
     TaskTerminalKind,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolCapabilityCeiling,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -4684,6 +4686,7 @@ def test_explicit_compaction_obeys_atomic_verified_work_admission() -> None:
             await super().admit_ordinary_session_execution(session_id)
 
     async def seed_compactable_session(
+        app: CayuApp,
         session_store: InMemorySessionStore,
         session_id: str,
     ) -> tuple[Session, int]:
@@ -4692,10 +4695,12 @@ def test_explicit_compaction_obeys_atomic_verified_work_admission() -> None:
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
-            identity=SessionIdentity(
+            identity=profiled_session_identity(
                 provider_name="verified-work-test-provider",
                 model="verified-work-test-model",
+                app=app,
             ),
         )
         transcript = [
@@ -4731,6 +4736,7 @@ def test_explicit_compaction_obeys_atomic_verified_work_admission() -> None:
         await task_store.publish_work_contract(contract)
 
         contracted_session, contracted_cursor = await seed_compactable_session(
+            app,
             session_store,
             "session:contracted-compaction",
         )
@@ -4769,6 +4775,7 @@ def test_explicit_compaction_obeys_atomic_verified_work_admission() -> None:
             ("stale-cursor", 0, 1),
         ):
             invalid_session, invalid_cursor = await seed_compactable_session(
+                app,
                 session_store,
                 f"session:invalid-compaction:{suffix}",
             )
@@ -4806,6 +4813,7 @@ def test_explicit_compaction_obeys_atomic_verified_work_admission() -> None:
             assert attached.work_contract == contract.reference()
 
         racing_session, racing_cursor = await seed_compactable_session(
+            app,
             session_store,
             "session:racing-compaction-admission",
         )
@@ -4852,6 +4860,7 @@ def test_explicit_compaction_obeys_atomic_verified_work_admission() -> None:
         assert await task_store.load_task(racing_task.id) == racing_task
 
         ordinary_session, ordinary_cursor = await seed_compactable_session(
+            app,
             session_store,
             "session:ordinary-compaction",
         )

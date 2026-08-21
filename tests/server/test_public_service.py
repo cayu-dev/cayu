@@ -50,6 +50,7 @@ from cayu import (
     TaskInvocationSnapshot,
     TaskStatus,
     Tool,
+    ToolCapabilityCeiling,
     ToolContext,
     ToolPolicy,
     ToolPolicyDecision,
@@ -1503,6 +1504,7 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
                     messages=[original_message],
                     session_id=reservation.operation.session_id,
                     task_id=reservation.operation.task_id,
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 TaskInvocationSnapshot(
                     id=product_task.id,

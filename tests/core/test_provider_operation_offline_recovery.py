@@ -75,6 +75,7 @@ from cayu.runtime import (
     SessionStore,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolCapabilityCeiling,
     ToolExposureDecision,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
@@ -99,6 +100,8 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
     checkpoint_with_active_invocation_execution_profile,
+    direct_tool_capability_ceiling_component,
+    execution_profile_with_component,
 )
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
@@ -921,6 +924,22 @@ class _RecordingLookupTool(_LookupTool):
         return ToolResult(content="lookup complete")
 
 
+class _ArchiveTool(Tool):
+    spec = ToolSpec(
+        name="archive",
+        effect=ToolEffect.NONE,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:provider-operation-offline-recovery:archive-tool",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        return ToolResult(content="archive complete")
+
+
 class _RecomputedEmptyExposurePolicy(ToolExposurePolicy):
     def __init__(self) -> None:
         self.requests: list[ToolExposurePolicyRequest] = []
@@ -976,11 +995,31 @@ async def _stage_offline_operation(
     tool_policy: ToolPolicy | None = None,
     tool_exposure_policy: ToolExposurePolicy | None = None,
     runtime_hooks: tuple[RuntimeHook, ...] = (),
+    include_tool_exposure: bool = True,
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None,
 ) -> Message:
     user_message = Message.text("user", "finish this while no worker is attached")
     typed_recovery_context = ModelCompletionRecoveryContext.model_validate(
         {} if recovery_context is None else recovery_context
     )
+    authority_app = CayuApp(enable_logging=False)
+    authority_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=list(tools),
+    )
+    registered_agent = authority_app._agents["assistant"]
+    effective_tool_capability_ceiling = (
+        ToolCapabilityCeiling(tool_names=tuple(registered_agent.tools))
+        if tool_capability_ceiling is None
+        else tool_capability_ceiling
+    )
+    if typed_recovery_context.tool_exposure is None and include_tool_exposure:
+        frozen_exposure = registered_agent.all_registered_tool_exposure
+        if frozen_exposure is None:
+            raise AssertionError("Test agent did not freeze its registered tool exposure.")
+        typed_recovery_context = typed_recovery_context.model_copy(
+            update={"tool_exposure": resolved_tool_exposure_authority(frozen_exposure)}
+        )
     interaction_id = f"interaction-{session_id}"
     started_event_id = f"{session_id}:interaction-started"
     started_at = datetime.now(UTC) if started_at is None else started_at
@@ -1015,11 +1054,20 @@ async def _stage_offline_operation(
     )
     execution_profile = session_identity.execution_profile
     assert execution_profile is not None
+    if effective_tool_capability_ceiling.tool_names != tuple(registered_agent.tools):
+        execution_profile = execution_profile_with_component(
+            execution_profile,
+            direct_tool_capability_ceiling_component(effective_tool_capability_ceiling.tool_names),
+        )
+        session_identity = session_identity.model_copy(
+            update={"execution_profile": execution_profile}
+        )
     session = await store.create(
         RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
+            tool_capability_ceiling=effective_tool_capability_ceiling,
         ),
         identity=session_identity,
         interaction_started_event=started_event,
@@ -1126,16 +1174,28 @@ async def _prepare_explicit_fallback_resolution(
     session_id: str,
     provider: _OfflineOperationProvider,
     recovery_context: dict | None = None,
+    tools: tuple[Tool, ...] = (),
+    tool_exposure_policy: ToolExposurePolicy | None = None,
+    include_tool_exposure: bool = True,
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None,
 ) -> tuple[CayuApp, ProviderOperationResolutionRequest]:
     await _stage_offline_operation(
         store,
         session_id=session_id,
         provider=provider,
         recovery_context=recovery_context,
+        tools=tools,
+        tool_exposure_policy=tool_exposure_policy,
+        include_tool_exposure=include_tool_exposure,
+        tool_capability_ceiling=tool_capability_ceiling,
     )
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=list(tools),
+        tool_exposure_policy=tool_exposure_policy,
+    )
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
@@ -3565,6 +3625,133 @@ def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_ne
                     request.model_copy(update={"action": ProviderOperationResolutionAction.FAIL})
                 )
             ]
+
+    asyncio.run(scenario())
+
+
+def test_fallback_retry_without_frozen_exposure_fails_closed_across_recovery() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "offline-fallback-missing-exposure"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        tool = _RecordingLookupTool()
+        exposure_policy = _RecomputedEmptyExposurePolicy()
+        app, request = await _prepare_explicit_fallback_resolution(
+            store,
+            session_id=session_id,
+            provider=provider,
+            recovery_context={"max_steps": 2},
+            tools=(tool,),
+            tool_exposure_policy=exposure_policy,
+            include_tool_exposure=False,
+        )
+        provider.adapter.start_events = (
+            ModelStreamEvent.text_delta("must not be dispatched"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        )
+
+        with pytest.raises(
+            ProviderOperationEvidenceError,
+            match="no durable tool-exposure authority",
+        ):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+
+        assert await load_pending_provider_operation_disposition(store, session_id) is not None
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.start_requests == []
+        assert exposure_policy.requests == []
+        assert tool.calls == []
+
+        with pytest.raises(
+            ProviderOperationEvidenceError,
+            match="no durable tool-exposure authority",
+        ):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+
+        assert await load_pending_provider_operation_disposition(store, session_id) is not None
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.start_requests == []
+        assert exposure_policy.requests == []
+        assert tool.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_fallback_retry_rejects_frozen_exposure_outside_durable_ceiling() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "offline-fallback-exposure-outside-ceiling"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        lookup = _RecordingLookupTool()
+        archive = _ArchiveTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[lookup, archive],
+        )
+        registered_agent = app._agents["assistant"]
+        archive_capability = tuple(
+            capability
+            for capability in registered_agent.tool_capabilities
+            if capability.name == "archive"
+        )
+        frozen_exposure = ResolvedToolExposure(
+            profile_id="frozen-archive",
+            tools=archive_capability,
+            registered_count=2,
+            ceiling_count=1,
+        )
+        await _stage_offline_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+            recovery_context={
+                "max_steps": 2,
+                "tool_exposure": resolved_tool_exposure_authority(frozen_exposure).model_dump(
+                    mode="json"
+                ),
+            },
+            tools=(lookup, archive),
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("lookup",)),
+        )
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active = await store.load_active_model_completion_stage(session_id)
+        assert interrupted is not None
+        assert active is not None
+        request = ProviderOperationResolutionRequest(
+            session_id=session_id,
+            stage_id=active.stage.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FALLBACK_RETRY,
+            reason="reject exposure outside the durable ceiling",
+        )
+        provider.adapter.start_events = (
+            ModelStreamEvent.text_delta("must not be dispatched"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        )
+
+        with pytest.raises(
+            ProviderOperationEvidenceError,
+            match="conflicts with the session capability ceiling",
+        ):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+
+        assert provider.adapter.start_calls == 0
+        assert provider.adapter.start_requests == []
+        assert lookup.calls == []
+        assert await load_pending_provider_operation_disposition(store, session_id) is not None
 
     asyncio.run(scenario())
 
@@ -6854,6 +7041,54 @@ def test_offline_recovery_accepts_hidden_thinking_only_completion() -> None:
         assert await store.load_active_model_completion_stage(session_id) is None
         inspection = await inspect_provider_operation(store, session_id)
         assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
+
+    asyncio.run(scenario())
+
+
+def test_offline_tool_call_recovery_rejects_missing_exposure_authority() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _OfflineOperationProvider(
+            ProviderOperationStatus.COMPLETED,
+            events=(
+                ModelStreamEvent.tool_call(
+                    id="unfrozen-tool-call",
+                    name="lookup",
+                    arguments={"query": "must remain quarantined"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ),
+        )
+        tool = _RecordingLookupTool()
+        session_id = "offline-missing-tool-exposure"
+        user_message = await _stage_offline_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+            tools=(tool,),
+            include_tool_exposure=False,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+        )
+
+        with pytest.raises(
+            ProviderOperationEvidenceError,
+            match="no durable tool-exposure authority",
+        ):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+
+        assert tool.calls == []
+        assert await store.load_transcript(session_id) == [user_message]
+        assert await store.load_active_model_completion_stage(session_id) is not None
 
     asyncio.run(scenario())
 

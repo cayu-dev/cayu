@@ -1354,6 +1354,7 @@ from cayu import (
     TaskExecutionSource,
     TaskInvocationSnapshot,
     TaskStatus,
+    ToolCapabilityCeiling,
     session_invocation_from_task,
 )
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
@@ -2180,6 +2181,11 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
             model="scripted-model",
             invocation_loop_policies=invocation_loop_policies,
         )
+        tool_capability_ceiling = ToolCapabilityCeiling(
+            tool_names=tuple(
+                first_service.cayu_app._agents[first_service.agent_name].tools
+            )
+        )
         await first_service.cayu_app.session_store.create(
             run_request_with_task_invocation(
                 RunRequest(
@@ -2187,6 +2193,7 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                     session_id=reservation.operation.session_id,
                     task_id=reservation.operation.task_id,
                     messages=[original_message],
+                    tool_capability_ceiling=tool_capability_ceiling,
                 ),
                 TaskInvocationSnapshot(
                     id=product_task.id,
@@ -2226,6 +2233,7 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                     else checkpoint
                 ),
                 execution_profile=execution_profile,
+                tool_capability_ceiling=tool_capability_ceiling,
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=(original_message,),
             ),

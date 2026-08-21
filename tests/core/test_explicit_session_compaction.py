@@ -11,7 +11,10 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    profiled_session_identity,
+    versioned_test_provider_identity,
+)
 
 import cayu.runtime._session_engine as session_engine_module
 from cayu import ScriptedModelProvider
@@ -62,6 +65,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionRunFenced,
     SessionStatus,
+    ToolCapabilityCeiling,
 )
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
@@ -137,6 +141,80 @@ class NoFullHistoryReplayStore(InMemorySessionStore):
         raise AssertionError("compaction replay must use indexed event lookup")
 
 
+async def _create_profiled_session(
+    app: CayuApp,
+    store: Any,
+    request: RunRequest,
+    *,
+    identity: SessionIdentity,
+    **kwargs: Any,
+):
+    """Create a low-level compaction fixture with complete runtime authority."""
+
+    registered_agent = app._agents[request.agent_name]
+    ceiling = ToolCapabilityCeiling(tool_names=tuple(registered_agent.tools))
+    prepared_request = request.model_copy(update={"tool_capability_ceiling": ceiling})
+    if identity.execution_profile is None:
+        identity = profiled_session_identity(
+            provider_name=identity.provider_name,
+            model=identity.model,
+            agent_name=request.agent_name,
+            app=app,
+            invocation_loop_policies=request.loop_policies,
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            request_budget_limits=request.budget_limits,
+            causal_budget_id=(request.causal_budget_id or request.task_id or request.session_id),
+            max_steps=request.max_steps,
+            limits=request.limits,
+            retry_policy=app._effective_retry_policy(request.retry_policy),
+        )
+    return await store.create(prepared_request, identity=identity, **kwargs)
+
+
+def test_compact_session_rejects_incomplete_session_authority_before_mutation() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        compactor = RecordingCompactor()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(compactor=compactor),
+        )
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="incomplete-compaction-authority",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_transcript_messages(
+            session.id,
+            [Message.text("user", "must remain untouched")],
+        )
+        session = await store.update_status(session.id, SessionStatus.COMPLETED)
+
+        with pytest.raises(ValueError, match="no durable execution-profile identity"):
+            _ = [
+                event
+                async for event in app.compact_session(
+                    CompactSessionRequest(
+                        session_id=session.id,
+                        idempotency_key="reject-incomplete-authority",
+                        expected_run_epoch=session.run_epoch,
+                        expected_transcript_cursor=1,
+                    )
+                )
+            ]
+
+        assert compactor.requests == []
+        assert await store.load_events(session.id) == []
+        assert await store.load_checkpoint(session.id) is None
+
+    asyncio.run(run())
+
+
 def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
     async def run() -> None:
         store = InMemorySessionStore()
@@ -154,7 +232,9 @@ def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
             AgentSpec(name="assistant", model="summary-model"),
             context_policy=policy,
         )
-        session = await store.create(
+        session = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_coverage_policy",
@@ -310,7 +390,9 @@ def test_compact_session_lost_terminal_ack_keeps_completed_state_unambiguous() -
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_terminal_ack_reconciliation",
@@ -379,7 +461,9 @@ def test_compact_session_cancellation_during_terminal_reconciliation_propagates(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_terminal_reconciliation_cancellation",
@@ -528,7 +612,9 @@ def test_compact_session_cancellation_does_not_wait_forever_for_stalled_publicat
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=f"sess_stalled_{blocked_event_type.value}",
@@ -678,7 +764,9 @@ def test_compact_session_cancellation_does_not_wait_for_stalled_completion_sink(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_stalled_completion_sink",
@@ -865,7 +953,9 @@ def test_compact_session_late_completion_commit_is_not_republished(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_late_completion_commit",
@@ -995,7 +1085,9 @@ def test_compact_session_lost_budget_event_ack_releases_without_duplicate() -> N
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_budget_ack_reconciliation",
@@ -1101,7 +1193,9 @@ def test_compact_session_lost_limit_event_ack_is_not_duplicated(action: str) -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=f"sess_limit_ack_{action}",
@@ -1217,7 +1311,9 @@ def test_compact_session_attempt_ack_expiry_blocks_first_provider_dispatch() -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_attempt_ack_expiry",
@@ -1312,7 +1408,9 @@ def test_compact_session_completion_ack_expiry_blocks_next_hierarchy_dispatch() 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_completion_ack_expiry",
@@ -1398,7 +1496,9 @@ def test_compact_session_invalid_usage_fails_closed_on_next_strict_budget_check(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_invalid_usage_strict_budget",
@@ -1496,7 +1596,9 @@ def test_explicit_compaction_retry_rejects_live_provider_drift_before_dispatch(
             ),
         )
         session_id = "explicit-compaction-live-provider-drift"
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -1563,6 +1665,10 @@ def test_explicit_compaction_lost_completion_ack_is_restart_safe() -> None:
     class RetryableThenSuccessfulProvider(ModelProvider):
         name = "compaction-provider"
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return versioned_test_provider_identity(self)
+
         def __init__(self) -> None:
             self.requests: list[ModelRequest] = []
 
@@ -1628,7 +1734,10 @@ def test_explicit_compaction_lost_completion_ack_is_restart_safe() -> None:
             return app
 
         session_id = "sess_explicit_compaction_lost_ack_restart"
-        created = await store.create(
+        creation_app = new_app()
+        created = await _create_profiled_session(
+            creation_app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -1646,7 +1755,7 @@ def test_explicit_compaction_lost_completion_ack_is_restart_safe() -> None:
 
         first_events: list[Event] = []
         with pytest.raises(ContextBuildError, match="provider overloaded"):
-            async for event in new_app().compact_session(
+            async for event in creation_app.compact_session(
                 CompactSessionRequest(
                     session_id=session_id,
                     idempotency_key="lost-ack-first-process",
@@ -1722,6 +1831,10 @@ def test_unfinished_explicit_compaction_fails_closed_after_restart() -> None:
     class UnfinishedThenSuccessfulProvider(ModelProvider):
         name = "compaction-provider"
 
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return versioned_test_provider_identity(self)
+
         def __init__(self) -> None:
             self.requests: list[ModelRequest] = []
 
@@ -1779,7 +1892,10 @@ def test_unfinished_explicit_compaction_fails_closed_after_restart() -> None:
             )
             return app
 
-        created = await store.create(
+        creation_app = new_app()
+        created = await _create_profiled_session(
+            creation_app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_unfinished_restart",
@@ -1800,7 +1916,7 @@ def test_unfinished_explicit_compaction_fails_closed_after_restart() -> None:
             ContextBuildError,
             match="stream ended without a completed event",
         ):
-            async for event in new_app().compact_session(
+            async for event in creation_app.compact_session(
                 CompactSessionRequest(
                     session_id=created.id,
                     idempotency_key="explicit-unfinished-first-process",
@@ -2306,7 +2422,9 @@ def test_compact_session_preserves_transcript_and_replays_original_outcome() -> 
                 compact_after_messages=100,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_compact",
@@ -2385,7 +2503,9 @@ def test_compact_session_instructions_change_the_governing_profile_without_publi
         )
 
         async def compact(session_id: str, instructions: str) -> list[Event]:
-            created = await store.create(
+            created = await _create_profiled_session(
+                app,
+                store,
                 RunRequest(
                     agent_name="assistant",
                     session_id=session_id,
@@ -2454,7 +2574,9 @@ def test_compact_session_redacts_instructions_before_provider_and_durable_bounda
                 compact_after_messages=100,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compaction_boundary",
@@ -2534,7 +2656,9 @@ def test_compact_session_rejects_secret_policy_checkpoint_before_publication() -
                 compact_after_messages=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_secret_checkpoint",
@@ -2641,7 +2765,9 @@ def test_compact_session_rejects_secret_checkpoint_event_payload_before_publicat
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=policy,
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=f"sess_explicit_secret_event_{secret_location}",
@@ -2736,7 +2862,9 @@ def test_compact_session_discards_secret_checkpoint_event_payload_from_failure(
                 compact_after_messages=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_secret_failure_event_payload",
@@ -2810,7 +2938,9 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
                 compact_after_messages=100,
             ),
         )
-        await store.create(
+        await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -2885,7 +3015,8 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
         after_takeover = await store.load(session_id)
         assert after_takeover is not None
         assert after_takeover.run_epoch > stale_epoch
-        assert after_takeover.metadata == {"stale_owner_write_before_atomic_takeover": True}
+        assert after_takeover.metadata["stale_owner_write_before_atomic_takeover"] is True
+        assert after_takeover.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
         assert "incomplete_session_recovery_claim" not in checkpoint
@@ -2925,7 +3056,9 @@ def test_compact_session_replays_original_outcome_after_session_advances() -> No
                 compact_after_messages=100,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_advanced_replay",
@@ -2993,7 +3126,11 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
 
     async def run() -> None:
         store = InMemorySessionStore()
-        created = await store.create(
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_legacy_replay_pending",
@@ -3059,8 +3196,6 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
             },
         )
         assert await store.load_session_operation(created.id, request.idempotency_key) is None
-        app = CayuApp(session_store=store, enable_logging=False)
-
         replay = [event async for event in app.compact_session(request)]
 
         assert [event.id for event in replay] == await _public_ids_for_private_event_ids(
@@ -3084,7 +3219,9 @@ def test_compact_session_rejects_unobserved_adversarial_completion_telemetry() -
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_private_events",
@@ -3182,7 +3319,9 @@ def test_compact_session_rejects_second_completion_for_one_provider_dispatch() -
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_duplicate_dispatch_completion",
@@ -3256,7 +3395,9 @@ def test_compact_session_generator_exit_preserves_completed_hierarchy_usage() ->
                 max_user_turns=1,
             ),
         )
-        await store.create(
+        await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -3350,7 +3491,9 @@ def test_compact_session_generator_exit_propagates_abandonment_accounting_failur
                 max_user_turns=1,
             ),
         )
-        await store.create(
+        await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -3476,7 +3619,9 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
                 max_user_turns=1,
             ),
         )
-        await store.create(
+        await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -3571,7 +3716,9 @@ def test_compact_session_cancellation_preserves_completed_hierarchy_usage() -> N
                 max_user_turns=1,
             ),
         )
-        await store.create(
+        await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -3647,7 +3794,9 @@ def test_compact_session_claim_blocks_concurrent_resume() -> None:
                 compact_after_messages=100,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_resume_race",
@@ -3724,7 +3873,9 @@ def test_compact_session_rejects_an_equivalent_unexpired_concurrent_claim() -> N
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_same_key_race",
@@ -3811,7 +3962,9 @@ def test_compact_session_expired_initial_claim_never_enters_compactor(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=f"sess_compact_initial_claim_{expiry_boundary}",
@@ -3880,7 +4033,9 @@ def test_compact_session_heartbeats_claim_during_blocked_provider_dispatch(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_provider_claim_heartbeat",
@@ -3986,7 +4141,9 @@ def test_compact_session_claim_heartbeat_loss_cancels_provider_and_fences_public
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_heartbeat_fenced",
@@ -4067,7 +4224,9 @@ def test_compact_session_claim_heartbeat_retries_transient_store_failure(monkeyp
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_heartbeat_retry",
@@ -4162,7 +4321,9 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_heartbeat_lost_ack",
@@ -4261,7 +4422,9 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_delayed_renewal_acknowledgement",
@@ -4690,7 +4853,9 @@ def test_compact_session_caller_cancellation_does_not_wait_for_uncertain_claim_c
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_cancel_uncertain_claim_commit",
@@ -4766,7 +4931,9 @@ def test_compact_session_claim_heartbeat_cannot_revive_an_expired_lease(monkeypa
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_heartbeat_expired",
@@ -4865,7 +5032,9 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_heartbeat_stall",
@@ -4970,7 +5139,9 @@ def test_compact_session_stalled_claim_reconciliation_is_bounded_by_lease_deadli
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_stalled_claim_reconciliation",
@@ -5112,7 +5283,9 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
                     max_user_turns=1,
                 ),
             )
-            created = await store.create(
+            created = await _create_profiled_session(
+                app,
+                store,
                 RunRequest(
                     agent_name="assistant",
                     session_id="sess_sqlite_stalled_renewal",
@@ -5252,7 +5425,9 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
                     max_user_turns=1,
                 ),
             )
-            created = await store.create(
+            created = await _create_profiled_session(
+                app,
+                store,
                 RunRequest(
                     agent_name="assistant",
                     session_id="sess_sqlite_cancel_stalled_claim_write",
@@ -5349,7 +5524,9 @@ def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkey
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_terminal_after_claim_expiry",
@@ -5458,7 +5635,9 @@ def test_compact_session_failure_publication_cannot_terminalize_after_claim_expi
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_failure_publication_after_claim_expiry",
@@ -5536,7 +5715,9 @@ def test_compact_session_terminal_publication_wins_blocked_heartbeat_race(monkey
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_heartbeat_terminal_race",
@@ -5676,7 +5857,9 @@ def test_compact_session_claim_loss_waits_for_completed_dispatch_settlement(monk
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_loss_during_settlement",
@@ -5815,7 +5998,9 @@ def test_compact_session_claim_loss_retains_concurrent_result_telemetry(monkeypa
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_loss_result_telemetry",
@@ -5887,7 +6072,9 @@ def test_compact_session_caller_cancellation_interrupts_blocked_claim_heartbeat(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_heartbeat_cancel",
@@ -5943,7 +6130,9 @@ def test_compact_session_no_context_failure_is_replayable_without_provider_spend
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_no_context",
@@ -5999,7 +6188,9 @@ def test_compact_session_recovers_an_abandoned_accepted_operation() -> None:
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            first_app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_recovery",
@@ -6126,7 +6317,9 @@ def test_compact_session_renews_operation_claim_between_provider_dispatches(monk
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_claim_renewal",
@@ -6273,7 +6466,9 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_concurrent_publication_renewal",
@@ -6354,7 +6549,9 @@ def test_compact_session_recovery_fences_a_late_attempt_and_preserves_its_usage(
 
         first_app = configured_app(now=accepted_at)
         recovered_app = configured_app(now=accepted_at + timedelta(minutes=6))
-        created = await store.create(
+        created = await _create_profiled_session(
+            first_app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_overlap",
@@ -6482,7 +6679,9 @@ def test_compact_session_completion_publication_failure_releases_the_claim() -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_completion_failure",
@@ -6540,7 +6739,9 @@ def test_expired_compaction_claim_does_not_block_resume() -> None:
                 compact_after_messages=100,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            first_app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_expired_compact_resume",
@@ -6664,7 +6865,9 @@ def test_expired_compaction_claim_does_not_block_fork_or_a_new_key() -> None:
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            first_app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_expired_compact_fork",
@@ -6762,7 +6965,9 @@ def test_fork_inherits_compacted_context_without_source_operation_records() -> N
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_fork_source",
@@ -6853,7 +7058,9 @@ def test_compact_session_failure_replays_without_spend_and_new_key_retries() -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_failure",
@@ -6935,7 +7142,9 @@ def test_sqlite_compaction_outcome_reconstructs_after_reopen(tmp_path) -> None:
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_sqlite_reopen",
@@ -6995,7 +7204,9 @@ def test_compact_session_attributes_provider_usage_and_honors_run_limits() -> No
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_usage",
@@ -7166,7 +7377,9 @@ def test_explicit_compaction_persists_undurable_usage_as_unpriced_evidence(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=(
@@ -7239,7 +7452,9 @@ def test_compact_session_deduplicates_persisted_usage_for_session_run_limit() ->
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_session_limit_deduplication",
@@ -7319,7 +7534,9 @@ def test_compact_session_preserves_usage_for_durably_invalid_summary() -> None:
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_invalid_summary",
@@ -7431,7 +7648,9 @@ def test_compact_session_admits_each_static_priced_hierarchy_dispatch() -> None:
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_static_hierarchy_dispatch_budget",
@@ -7493,7 +7712,9 @@ def test_compact_session_admits_each_hierarchy_dispatch_against_run_limits() -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_hierarchy_run_limit",
@@ -7576,7 +7797,9 @@ def test_compact_session_admits_each_hierarchy_dispatch_against_static_budget() 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_hierarchy_static_budget",
@@ -7670,7 +7893,9 @@ def test_compact_session_contextual_budget_counts_prior_hierarchy_dispatches() -
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_contextual_hierarchy_dispatch_budget",
@@ -7763,7 +7988,9 @@ def test_compact_session_cancellation_reconciles_observed_completion_usage() -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_cancel_after_compaction_completion",
@@ -7890,7 +8117,9 @@ def test_compact_session_preserves_observed_usage_when_terminal_signal_replaces_
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id=f"sess_child_failure_{terminal_signal}",
@@ -8014,7 +8243,9 @@ def test_compact_session_cancellation_during_final_renewal_reconciles_actual_usa
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_cancel_during_final_compaction_renewal",
@@ -8117,7 +8348,9 @@ def test_compact_session_failure_after_completion_reconciles_actual_usage() -> N
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compaction_event_after_completion",
@@ -8212,7 +8445,9 @@ def test_compact_session_uses_frozen_canonical_billing_provider_without_identity
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_gateway_compaction_billing",
@@ -8268,7 +8503,9 @@ def test_compact_session_usage_counts_against_supplied_cost_budget() -> None:
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_budget",
@@ -8384,7 +8621,9 @@ def test_compact_session_resolves_bedrock_identity_before_reservation_and_replay
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_contextual_explicit_compaction",
@@ -8462,7 +8701,9 @@ def test_compact_session_preserves_bedrock_identity_without_usage_metrics() -> N
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_contextual_compaction_without_usage",
@@ -8556,7 +8797,9 @@ def test_compact_session_rejects_completion_billing_identity_rewrite() -> None:
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_rewritten_compaction_billing_identity",
@@ -8674,7 +8917,9 @@ def test_compact_session_rejects_unpriced_bedrock_identity_before_dispatch() -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_unpriced_contextual_explicit_compaction",
@@ -8749,7 +8994,9 @@ def test_compact_session_applies_app_policy_and_reserves_before_provider_work() 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_policy_reservation",
@@ -8830,7 +9077,9 @@ def test_compact_session_stops_on_an_exhausted_app_budget_before_provider_work()
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_exhausted_policy",
@@ -8927,7 +9176,9 @@ def test_compact_session_releases_partial_reservations_when_later_acquisition_fa
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_partial_reservation_failure",
@@ -9046,7 +9297,9 @@ def test_compact_session_preserves_partial_cleanup_and_releases_remaining_reserv
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_partial_cleanup_failure",
@@ -9153,7 +9406,9 @@ def test_compact_session_reconciles_reservations_and_replays_budget_events() -> 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_policy_reconcile",
@@ -9259,7 +9514,9 @@ def test_compact_session_settles_usage_overflow_at_reserved_amount_once() -> Non
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_usage_overflow_reconcile",
@@ -9358,7 +9615,9 @@ def test_compact_session_reserves_prompt_cache_compactor_with_session_model() ->
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_prompt_cache_reservation",
@@ -9438,7 +9697,9 @@ def test_compact_session_preserves_usage_when_final_reservation_renewal_fails() 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_final_renewal",
@@ -9523,7 +9784,9 @@ def test_compact_session_releases_reservation_when_initial_renewal_fails() -> No
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_initial_renewal",
@@ -9604,7 +9867,9 @@ def test_compact_session_preserves_usage_returned_while_heartbeat_cancels() -> N
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_heartbeat_cancellation",
@@ -9686,7 +9951,9 @@ def test_compact_session_skips_provider_reservations_for_deterministic_compactio
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_deterministic_compaction_budget",
@@ -9755,7 +10022,9 @@ def test_compact_session_rejects_unknown_compactor_budget_identity_before_work()
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_unknown_compactor_budget_identity",
@@ -9824,7 +10093,9 @@ def test_compact_session_rejects_provider_backed_deterministic_identity_claim() 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_misdeclared_compactor_budget_identity",
@@ -9884,7 +10155,9 @@ def test_compact_session_sanitizes_failure_type_in_event_and_operation_record() 
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_explicit_unsafe_error_type",
@@ -9973,7 +10246,9 @@ def test_compact_session_rejects_unsafe_compactor_budget_identity_before_work(
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_unsafe_compactor_budget_identity",
@@ -10045,7 +10320,9 @@ def test_compact_session_persists_reservation_lifecycle_before_provider_work() -
                 max_user_turns=1,
             ),
         )
-        created = await store.create(
+        created = await _create_profiled_session(
+            app,
+            store,
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_compact_persisted_reservation",

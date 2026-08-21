@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu.artifacts import file_attachment
@@ -35,8 +36,8 @@ from cayu.runtime import (
     InMemorySessionStore,
     ModelCompactor,
     RunRequest,
-    SessionIdentity,
     SessionStatus,
+    ToolCapabilityCeiling,
     TranscriptSnapshot,
 )
 from cayu.runtime.context import ContextBuildResult
@@ -172,14 +173,24 @@ class _BlockingCompactor(ContextCompactor):
 
 
 async def _create_completed_session(
+    app: CayuApp,
     store: InMemorySessionStore,
     *,
     session_id: str,
     transcript: list[Message],
 ):
     session = await store.create(
-        RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
-        identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+        ),
+        identity=profiled_session_identity(
+            provider_name="fake",
+            model="fake-model",
+            app=app,
+        ),
     )
     await store.append_transcript_messages(session.id, transcript)
     return await store.update_status(session.id, SessionStatus.COMPLETED)
@@ -246,6 +257,7 @@ def test_explicit_model_compaction_projects_legacy_summary_before_provider() -> 
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_legacy_summary_provider",
             transcript=transcript,
@@ -300,6 +312,7 @@ def test_explicit_custom_compactor_binds_projected_legacy_summary() -> None:
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_legacy_summary_custom",
             transcript=transcript,
@@ -367,6 +380,7 @@ def test_explicit_compaction_rejects_declared_opaque_provider_before_dispatch() 
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_opaque_compactor_footprint",
             transcript=transcript,
@@ -433,6 +447,7 @@ def test_explicit_compaction_rejects_missing_provider_identity_before_dispatch()
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_undeclared_compactor_footprint",
             transcript=transcript,
@@ -494,6 +509,7 @@ def test_explicit_compaction_failure_does_not_rewrite_legacy_summary() -> None:
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_legacy_summary_failure",
             transcript=transcript,
@@ -554,6 +570,7 @@ def test_explicit_compaction_cancellation_releases_raw_legacy_summary() -> None:
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_legacy_summary_cancellation",
             transcript=transcript,
@@ -609,6 +626,7 @@ def test_explicit_custom_policy_receives_projected_version_one_summary() -> None
             context_policy=policy,
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_version_one_summary",
             transcript=transcript,
@@ -676,6 +694,7 @@ def test_explicit_model_compaction_projects_legacy_transcript_before_provider() 
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_model_secret_projection",
             transcript=transcript,
@@ -740,6 +759,7 @@ def test_explicit_custom_policy_and_compactor_receive_only_projected_messages() 
             context_policy=policy,
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_custom_secret_projection",
             transcript=transcript,
@@ -875,6 +895,7 @@ def test_explicit_compaction_rejects_secret_bearing_legacy_authority_before_clai
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id=f"sess_explicit_{authority_field}_rejection",
             transcript=transcript,
@@ -939,6 +960,7 @@ def test_explicit_compaction_failure_does_not_retain_raw_transcript_secret() -> 
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_failure_projection",
             transcript=transcript,
@@ -1006,6 +1028,7 @@ def test_explicit_compaction_rechecks_cursor_after_projecting_snapshot() -> None
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_snapshot_race",
             transcript=transcript,
@@ -1072,6 +1095,7 @@ def test_explicit_compaction_replay_does_not_repeat_sanitized_work_after_lost_ac
             ),
         )
         completed = await _create_completed_session(
+            app,
             store,
             session_id="sess_explicit_projected_replay",
             transcript=transcript,
@@ -1126,6 +1150,7 @@ def test_explicit_compaction_reprojects_transcript_when_reclaiming_after_restart
             ),
         )
         completed = await _create_completed_session(
+            first_app,
             store,
             session_id="sess_explicit_projected_restart",
             transcript=transcript,

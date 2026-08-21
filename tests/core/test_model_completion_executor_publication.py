@@ -5,6 +5,7 @@ import time
 from collections.abc import AsyncIterator
 
 import pytest
+from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.core import AgentSpec, Event, EventType, Message
@@ -21,8 +22,7 @@ from cayu.runtime import (
     RunLimits,
     RunRequest,
     Session,
-    SessionIdentity,
-    SessionStatus,
+    ToolCapabilityCeiling,
 )
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
@@ -480,20 +480,20 @@ async def _create_model_run(
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     user_message = Message.text("user", "answer durably")
-    session = await store.create(
-        RunRequest(
+    admitted = await create_admitted_session(
+        store,
+        request=RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
         ),
-        identity=SessionIdentity(provider_name=provider.name, model="fake-model"),
+        provider_name=provider.name,
+        model="fake-model",
+        provider=provider,
+        app=app,
     )
-    await store.append_transcript_messages(session.id, [user_message])
-    session = await store.transition_status(
-        session.id,
-        from_statuses={SessionStatus.PENDING},
-        to_status=SessionStatus.RUNNING,
-    )
+    session = admitted.session
     registered_agent = app._agents["assistant"]
     registered_provider = app._providers[provider.name]
     request = await app._model_step_executor.build_request(

@@ -29,6 +29,7 @@ from cayu.runtime import (
     Session,
     SessionIdentity,
     SessionStatus,
+    ToolCapabilityCeiling,
 )
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
@@ -64,6 +65,10 @@ from cayu.runtime.sessions import (
     RuntimePublicationMutation,
     RuntimePublicationRequest,
     runtime_publication_checkpoint_mutation,
+)
+from cayu.runtime.tool_exposure import (
+    ResolvedToolExposureAuthority,
+    resolved_tool_exposure_authority,
 )
 from cayu.runtime.user_input import PendingUserInput
 from cayu.tools import UserInputTool
@@ -170,19 +175,23 @@ class _NeverExecutedTool(Tool):
         return ToolResult(content="must not execute during recovery")
 
 
+def _test_tool(tool_name: str | None) -> Tool | None:
+    if tool_name == _NeverExecutedTool.spec.name:
+        return _NeverExecutedTool()
+    if tool_name == UserInputTool.spec.name:
+        return UserInputTool()
+    if tool_name is not None:
+        raise ValueError(f"Unsupported test tool: {tool_name}")
+    return None
+
+
 def _test_execution_profile(
     *,
     provider_name: str,
     tool_name: str | None = None,
     limits: RunLimits | None = None,
 ) -> ExecutionProfileIdentity:
-    tool: Tool | None = None
-    if tool_name == _NeverExecutedTool.spec.name:
-        tool = _NeverExecutedTool()
-    elif tool_name == UserInputTool.spec.name:
-        tool = UserInputTool()
-    elif tool_name is not None:
-        raise ValueError(f"Unsupported test tool: {tool_name}")
+    tool = _test_tool(tool_name)
     profile_app = CayuApp(enable_logging=False)
     profile_provider = _RecordingProvider()
     if profile_provider.name != provider_name:
@@ -209,6 +218,21 @@ def _test_execution_profile(
             "retry_policy": profile_app._effective_retry_policy(None).model_dump(mode="json"),
         },
     )
+
+
+def _test_tool_exposure_authority(tool_name: str) -> ResolvedToolExposureAuthority:
+    app = CayuApp(enable_logging=False)
+    tool = _test_tool(tool_name)
+    if tool is None:
+        raise AssertionError("Tool-exposure authority requires a test tool.")
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+    exposure = app._agents["assistant"].all_registered_tool_exposure
+    if exposure is None:
+        raise AssertionError("Test agent did not freeze its registered tool exposure.")
+    return resolved_tool_exposure_authority(exposure)
 
 
 class _PromotionAcknowledgementLostStore(InMemorySessionStore):
@@ -420,6 +444,9 @@ async def _stage_completed_model_boundary(
             session_id=session_id,
             messages=[user_message],
             limits=RunLimits() if limits is None else limits,
+            tool_capability_ceiling=ToolCapabilityCeiling(
+                tool_names=((tool_name,) if with_tool_call else ())
+            ),
         ),
         identity=SessionIdentity(
             provider_name=provider_name,
@@ -456,6 +483,7 @@ async def _stage_completed_model_boundary(
         "request_fingerprint": "0" * 64,
         "recovery_context": ModelCompletionRecoveryContext(
             execution_profile_fingerprint=execution_profile.fingerprint,
+            tool_exposure=(_test_tool_exposure_authority(tool_name) if with_tool_call else None),
         ).model_dump(mode="json"),
     }
     await store.prepare_model_completion_stage(
@@ -720,6 +748,7 @@ async def _stage_in_flight_model_boundary(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
         ),
         identity=SessionIdentity(
             provider_name=provider_name,

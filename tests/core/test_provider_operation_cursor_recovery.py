@@ -46,6 +46,7 @@ from cayu.runtime import (
     SessionRunFenced,
     SessionStatus,
     SessionStore,
+    ToolCapabilityCeiling,
     session_usage_summary,
 )
 from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
@@ -66,6 +67,7 @@ from cayu.runtime.sessions import (
     ModelCompletionStageRequest,
     SessionOperationTransform,
 )
+from cayu.runtime.tool_exposure import resolved_tool_exposure_authority
 from cayu.vaults import SecretRedactor
 
 _PROFILE_UNSET = object()
@@ -2002,12 +2004,23 @@ async def _stage_partial_operation(
         raise ValueError("advances must be 1 or 2")
     user_message = Message.text("user", "finish after reconnect")
     interaction_id = f"interaction-{session_id}"
+    authority_app = CayuApp(enable_logging=False)
+    authority_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=list(tools),
+    )
+    registered_agent = authority_app._agents["assistant"]
+    tool_capability_ceiling = ToolCapabilityCeiling(tool_names=tuple(registered_agent.tools))
+    frozen_tool_exposure = registered_agent.all_registered_tool_exposure
+    if frozen_tool_exposure is None:
+        raise AssertionError("Test agent did not freeze its registered tool exposure.")
     admitted = await create_admitted_session(
         store,
         request=RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
+            tool_capability_ceiling=tool_capability_ceiling,
         ),
         provider_name=provider.name,
         model="fake-model",
@@ -2025,6 +2038,7 @@ async def _stage_partial_operation(
     recovery_context = ModelCompletionRecoveryContext(
         execution_profile_fingerprint=execution_profile.fingerprint,
         thinking=thinking,
+        tool_exposure=resolved_tool_exposure_authority(frozen_tool_exposure),
     ).model_dump(mode="json")
     if selected_stage_profile is _PROFILE_MISSING:
         recovery_context.pop("execution_profile_fingerprint")

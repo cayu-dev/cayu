@@ -23,6 +23,7 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SessionStatus,
+    ToolCapabilityCeiling,
 )
 
 
@@ -64,6 +65,7 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
                 agent_name="assistant",
                 session_id="stateful-policy-resume",
                 messages=[initial],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name=provider.name,

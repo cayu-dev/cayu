@@ -799,6 +799,7 @@ def test_sqlite_transcript_retention_cannot_invalidate_admitted_model_switch(
                 agent_name="assistant",
                 session_id="switch-retention",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )
@@ -854,6 +855,7 @@ def test_sqlite_model_switch_uses_absolute_cursor_after_prior_retention(tmp_path
                 agent_name="assistant",
                 session_id="switch-after-retention",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )
@@ -931,6 +933,7 @@ def test_sqlite_approval_continuation_uses_absolute_cursor_after_prior_retention
                 agent_name="assistant",
                 session_id="retained-approval",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(tool=tool, require_approval=True),
         )
@@ -1015,6 +1018,7 @@ def test_sqlite_pending_tool_recovery_uses_absolute_cursor_after_prior_retention
                 agent_name="assistant",
                 session_id="retained-tool-recovery",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(tool=tool),
         )
@@ -1268,6 +1272,7 @@ def test_cross_provider_resume_drops_reasoning_only_assistant_shell() -> None:
                 agent_name="assistant",
                 session_id="switch-reasoning-only-shell",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )
@@ -1344,6 +1349,7 @@ def test_reasoning_only_shell_does_not_break_pending_tool_round_recovery(tmp_pat
                 agent_name="assistant",
                 session_id="switch-reasoning-shell-recovery",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(tool=tool),
         )
@@ -1598,6 +1604,7 @@ def test_model_switch_rejects_unmatched_tool_history_without_mutation() -> None:
                 agent_name="assistant",
                 session_id="switch-unmatched-tool",
                 messages=[Message.text("user", "first")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )
@@ -2198,6 +2205,7 @@ def test_model_switch_preflight_receives_workload_redacted_projection() -> None:
                 agent_name="assistant",
                 session_id="switch-redacted-preflight",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )
@@ -2241,6 +2249,7 @@ def test_model_switch_preflight_failure_does_not_retain_raw_workload_secret() ->
                 agent_name="assistant",
                 session_id="switch-preflight-traceback-redaction",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )
@@ -2572,6 +2581,7 @@ def test_same_provider_model_override_fork_accepts_an_empty_retained_prefix() ->
                 agent_name="assistant",
                 session_id="empty-model-fork-source",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )
@@ -2619,6 +2629,7 @@ def test_sqlite_model_override_partial_fork_translates_absolute_retained_cursor(
                 agent_name="assistant",
                 session_id="model-override-retained-source",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("echo",)),
             ),
             identity=_profiled_source_identity(),
         )

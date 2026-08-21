@@ -2509,13 +2509,10 @@ class Session(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
     @property
-    def tool_capability_ceiling(self) -> ToolCapabilityCeiling | None:
-        """Return copied durable session authority, or ``None`` for a legacy record."""
+    def tool_capability_ceiling(self) -> ToolCapabilityCeiling:
+        """Return the session's required durable application-tool authority."""
 
-        return tool_capability_ceiling_from_session_metadata(
-            self.metadata,
-            required=False,
-        )
+        return tool_capability_ceiling_from_session_metadata(self.metadata)
 
 
 def _queued_dispatch_session_instance_fingerprint(session: Session) -> str:
@@ -2766,14 +2763,13 @@ class SessionInvocationAdmission:
     checkpoint_transform: CheckpointTransform
     execution_profile: ExecutionProfileIdentity
     interaction_source_messages: tuple[Message, ...]
-    tool_capability_ceiling: ToolCapabilityCeiling | None = None
+    tool_capability_ceiling: ToolCapabilityCeiling
     interaction_started_event: Event | None = None
     continued_interaction_id: str | None = None
     defer_interaction_source: bool = False
     model_transition: SessionModelTransition | None = None
     execution_profile_decision: ExecutionProfileDecision | None = None
     expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None
-    allow_unprofiled_derived_session: bool = False
     allow_pending_initial_interaction: bool = False
 
     def __post_init__(self) -> None:
@@ -2793,10 +2789,8 @@ class SessionInvocationAdmission:
         object.__setattr__(
             self,
             "tool_capability_ceiling",
-            _copy_optional_tool_capability_ceiling(self.tool_capability_ceiling),
+            copy_tool_capability_ceiling(self.tool_capability_ceiling),
         )
-        if type(self.allow_unprofiled_derived_session) is not bool:
-            raise TypeError("allow_unprofiled_derived_session must be a boolean.")
         if type(self.allow_pending_initial_interaction) is not bool:
             raise TypeError("allow_pending_initial_interaction must be a boolean.")
         if type(self.interaction_source_messages) is not tuple:
@@ -2857,13 +2851,6 @@ class SessionInvocationAdmission:
                 raise ValueError(
                     "A new interaction cannot reuse active invocation profile authority."
                 )
-            if (
-                self.allow_unprofiled_derived_session
-                and self.execution_profile_decision is not None
-            ):
-                raise ValueError(
-                    "An unprofiled derived session cannot carry an execution-profile decision."
-                )
             if self.defer_interaction_source and not self.allow_pending_initial_interaction:
                 raise ValueError("A new interaction cannot defer its source messages.")
             if self.allow_pending_initial_interaction and (
@@ -2875,10 +2862,6 @@ class SessionInvocationAdmission:
             return
         if self.allow_pending_initial_interaction:
             raise ValueError("Only a new interaction can admit a prepared PENDING session.")
-        if self.allow_unprofiled_derived_session:
-            raise ValueError(
-                "Only a new invocation can establish authority for an unprofiled derived session."
-            )
         if self.expected_active_invocation_profile is None:
             raise ValueError(
                 "A continued interaction requires active invocation profile authority."
@@ -6919,13 +6902,6 @@ class SessionStore(ABC):
             current_session: Session,
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any]:
-            if admission.allow_unprofiled_derived_session and (
-                current_session.parent_session_id is None
-                or EXECUTION_PROFILE_METADATA_KEY in current_session.metadata
-            ):
-                raise RuntimeError(
-                    "Unprofiled derived-session invocation authority changed before admission."
-                )
             current_active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
             if current_active_profile is not None and not (
                 active_invocation_execution_profile_is_released(
@@ -6960,11 +6936,6 @@ class SessionStore(ABC):
             "tool_capability_ceiling": admission.tool_capability_ceiling,
         }
         if active_profile is None:
-            if admission.allow_unprofiled_derived_session:
-                return await self.transition_status_and_checkpoint(
-                    session_id,
-                    **transition_kwargs,
-                )
             return await self.admit_execution_profile_resume(
                 session_id,
                 execution_profile=admission.execution_profile,
@@ -9605,25 +9576,6 @@ class InMemorySessionStore(SessionStore):
                 decision=prepared_execution_profile_decision,
             )
 
-            current_checkpoint = self._checkpoints.get(session_id)
-            transformed_checkpoint = checkpoint_transform(
-                session.model_copy(deep=True),
-                None if current_checkpoint is None else deepcopy(current_checkpoint),
-            )
-            if transformed_checkpoint is not None:
-                transformed_checkpoint = copy_durable_json_object(
-                    transformed_checkpoint,
-                    "checkpoint",
-                )
-
-            if admission is not None:
-                _, interaction_id, _, defer_source = admission
-                existing_deferred = self._deferred_interaction_inputs.get(session_id)
-                if existing_deferred is not None and (
-                    not defer_source or existing_deferred[0] != interaction_id
-                ):
-                    raise RuntimeError("Session already has deferred interaction input.")
-
             if prepared_model_transition is not None:
                 _validate_session_model_transition(
                     session,
@@ -9654,7 +9606,27 @@ class InMemorySessionStore(SessionStore):
                 session,
                 prepared_tool_capability_ceiling,
                 transition_metadata=transition_metadata,
+                require_existing_ceiling=prepared_execution_profile is not None,
             )
+
+            current_checkpoint = self._checkpoints.get(session_id)
+            transformed_checkpoint = checkpoint_transform(
+                session.model_copy(deep=True),
+                None if current_checkpoint is None else deepcopy(current_checkpoint),
+            )
+            if transformed_checkpoint is not None:
+                transformed_checkpoint = copy_durable_json_object(
+                    transformed_checkpoint,
+                    "checkpoint",
+                )
+
+            if admission is not None:
+                _, interaction_id, _, defer_source = admission
+                existing_deferred = self._deferred_interaction_inputs.get(session_id)
+                if existing_deferred is not None and (
+                    not defer_source or existing_deferred[0] != interaction_id
+                ):
+                    raise RuntimeError("Session already has deferred interaction input.")
             if transition_metadata is not None:
                 session_updates["metadata"] = transition_metadata
             updated = session.model_copy(update=session_updates)
@@ -14468,29 +14440,35 @@ def _session_metadata_after_tool_capability_ceiling_admission(
     ceiling: ToolCapabilityCeiling | None,
     *,
     transition_metadata: dict[str, Any] | None,
+    require_existing_ceiling: bool = False,
 ) -> dict[str, Any] | None:
     """Validate a ceiling CAS against the stored session and compose metadata."""
 
-    if ceiling is None:
+    if type(require_existing_ceiling) is not bool:
+        raise TypeError("require_existing_ceiling must be a bool.")
+    if ceiling is None and not require_existing_ceiling:
         return transition_metadata
-    current_ceiling = tool_capability_ceiling_from_session_metadata(
-        session.metadata,
-        required=False,
-    )
-    narrowed = session_metadata_after_tool_capability_ceiling_narrowing(
-        session.metadata,
-        ceiling,
-    )
+    current_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
+    narrowed_metadata: dict[str, Any]
+    if ceiling is None:
+        admitted_ceiling = current_ceiling
+    else:
+        narrowed_metadata = session_metadata_after_tool_capability_ceiling_narrowing(
+            session.metadata,
+            ceiling,
+        )
+        admitted_ceiling = ceiling
     base = session.metadata if transition_metadata is None else transition_metadata
     admitted_profile = execution_profile_from_session_metadata(base)
     if admitted_profile.component(
         ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
-    ) != direct_tool_capability_ceiling_component(ceiling.tool_names):
+    ) != direct_tool_capability_ceiling_component(admitted_ceiling.tool_names):
         raise ValueError("Admitted execution profile conflicts with its tool capability ceiling.")
+    if ceiling is None:
+        return transition_metadata
     if transition_metadata is None and current_ceiling == ceiling:
         return None
-    narrowed_ceiling = tool_capability_ceiling_from_session_metadata(narrowed)
-    assert narrowed_ceiling is not None
+    narrowed_ceiling = tool_capability_ceiling_from_session_metadata(narrowed_metadata)
     return session_metadata_with_tool_capability_ceiling(
         base,
         narrowed_ceiling,
@@ -14791,40 +14769,22 @@ def _validate_profiled_fork_authority(
     system_prompt_replacement: ForkSystemPromptReplacement | None,
     transcript_validator: ForkTranscriptValidator | None,
 ) -> None:
-    source_ceiling = tool_capability_ceiling_from_session_metadata(
-        source_session.metadata,
-        required=False,
-    )
-    fork_ceiling = tool_capability_ceiling_from_session_metadata(
-        fork.metadata,
-        required=False,
-    )
-    if source_ceiling is not None and fork_ceiling is None:
-        raise ValueError("A fork cannot remove durable tool capability ceiling authority.")
-    if (
-        source_ceiling is not None
-        and fork_ceiling is not None
-        and not frozenset(fork_ceiling.tool_names) <= frozenset(source_ceiling.tool_names)
-    ):
+    source_ceiling = tool_capability_ceiling_from_session_metadata(source_session.metadata)
+    fork_ceiling = tool_capability_ceiling_from_session_metadata(fork.metadata)
+    if not frozenset(fork_ceiling.tool_names) <= frozenset(source_ceiling.tool_names):
         raise ValueError("A fork cannot widen its source tool capability ceiling.")
     source_kind, source_profile, active = effective_fork_source_execution_profile(
         source_session,
         source_checkpoint,
     )
-    if source_ceiling is not None and source_profile.component(
+    if source_profile.component(
         ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
     ) != direct_tool_capability_ceiling_component(source_ceiling.tool_names):
         raise ValueError("Fork source profile conflicts with its tool capability ceiling.")
-    if fork_ceiling is not None and relationship.selected_profile.component(
+    if relationship.selected_profile.component(
         ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
     ) != direct_tool_capability_ceiling_component(fork_ceiling.tool_names):
         raise ValueError("Fork child profile conflicts with its tool capability ceiling.")
-    if fork_ceiling is None and relationship.selected_profile.component(
-        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
-    ) != source_profile.component(ExecutionProfileComponentClass.TOOL_VIEW_GRANTS):
-        raise ValueError(
-            "A fork cannot change tool-view authority without a durable capability ceiling."
-        )
     if (
         relationship.source_session_id != source_session.id
         or relationship.child_session_id != fork.id
@@ -14892,6 +14852,11 @@ def validate_profiled_fork_evidence(
         raise TypeError("fork must be a Session.")
     if type(relationship) is not SessionForkProfileRelationship:
         raise TypeError("relationship must be a SessionForkProfileRelationship.")
+    fork_ceiling = tool_capability_ceiling_from_session_metadata(fork.metadata)
+    if relationship.selected_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != direct_tool_capability_ceiling_component(fork_ceiling.tool_names):
+        raise ValueError("Fork child profile conflicts with its tool capability ceiling.")
     stored_relationship = session_fork_profile_relationship(fork)
     if (
         stored_relationship != relationship

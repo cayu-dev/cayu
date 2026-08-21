@@ -46,7 +46,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec
-from cayu.runtime.tool_exposure import ToolExposurePolicy
+from cayu.runtime.tool_exposure import ToolCapabilityCeiling, ToolExposurePolicy
 from cayu.runtime.tool_policy import ToolPolicy
 from cayu.vaults import SecretRedactor
 
@@ -74,6 +74,33 @@ def versioned_test_provider_identity(
         name=f"tests:{provider_type.__module__}.{provider_type.__qualname__}",
         behavior_version=behavior_version,
         implementation_version="1",
+    )
+
+
+def tool_capability_ceiling_for_app(
+    app: CayuApp,
+    *,
+    agent_name: str = "assistant",
+) -> ToolCapabilityCeiling:
+    """Return the complete direct-tool ceiling for a registered test agent."""
+
+    return ToolCapabilityCeiling(tool_names=tuple(app._agents[agent_name].tools))
+
+
+def run_request_with_registered_tool_ceiling(
+    app: CayuApp,
+    **request_fields: Any,
+) -> RunRequest:
+    """Build a request carrying the registered agent's complete tool ceiling."""
+
+    request = RunRequest(**request_fields)
+    return request.model_copy(
+        update={
+            "tool_capability_ceiling": tool_capability_ceiling_for_app(
+                app,
+                agent_name=request.agent_name,
+            )
+        }
     )
 
 

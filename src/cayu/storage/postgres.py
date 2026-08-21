@@ -12586,15 +12586,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         model_transition=prepared_model_transition,
                         decision=prepared_execution_profile_decision,
                     )
-                    transformed_checkpoint = checkpoint_transform(
-                        loaded,
-                        await self._load_checkpoint(cur, session_id),
-                    )
-                    if transformed_checkpoint is not None:
-                        transformed_checkpoint = copy_durable_json_object(
-                            transformed_checkpoint, "checkpoint"
-                        )
-
                     transition_metadata = transition_profile_metadata
                     if prepared_model_transition is not None:
                         await cur.execute(
@@ -12618,7 +12609,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         loaded,
                         prepared_tool_capability_ceiling,
                         transition_metadata=transition_metadata,
+                        require_existing_ceiling=prepared_execution_profile is not None,
                     )
+
+                    transformed_checkpoint = checkpoint_transform(
+                        loaded,
+                        await self._load_checkpoint(cur, session_id),
+                    )
+                    if transformed_checkpoint is not None:
+                        transformed_checkpoint = copy_durable_json_object(
+                            transformed_checkpoint, "checkpoint"
+                        )
 
                     admission_events = []
                     if prepared_execution_profile_decision is not None:

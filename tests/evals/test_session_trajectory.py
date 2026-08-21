@@ -28,6 +28,7 @@ from cayu import (
     SessionTrajectoryErrorCode,
     SQLiteSessionStore,
     TerminalSessionEvidenceErrorCode,
+    ToolCapabilityCeiling,
     ToolsCalledInOrder,
     Trajectory,
     evaluate_assertions,
@@ -93,6 +94,7 @@ async def _create_running_session(
             session_id=session_id,
             parent_session_id=parent_session_id,
             messages=[user_message],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
         ),
         identity=profiled_session_identity(
             provider_name="fake",
@@ -196,8 +198,12 @@ async def _create_zero_transcript_running_session(
             session_id=session_id,
             parent_session_id=parent_session_id,
             messages=[],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
         ),
-        identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        identity=profiled_session_identity(
+            provider_name="fake",
+            model="fake-model",
+        ),
         interaction_started_event=Event(
             id=f"{session_id}-interaction-started",
             type=EventType.INTERACTION_STARTED,

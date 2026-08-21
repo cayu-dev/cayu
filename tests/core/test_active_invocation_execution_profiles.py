@@ -80,6 +80,7 @@ from cayu import (
     ToolApprovalDecision,
     ToolApprovalRequest,
     ToolCallHookContext,
+    ToolCapabilityCeiling,
     ToolContext,
     ToolPolicy,
     ToolPolicyDecision,
@@ -817,6 +818,7 @@ def test_profiled_fork_reconciles_ambiguous_custom_store_results(
                 agent_name="assistant",
                 session_id=f"ambiguous-profiled-fork-source-{store_outcome}",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -882,6 +884,7 @@ def test_profiled_fork_store_rejects_controls_that_conflict_with_relationship(
                 agent_name="assistant",
                 session_id=f"tampered-fork-source-{tampered_control}",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -925,6 +928,7 @@ def test_profiled_fork_store_child_cancellation_is_not_caller_cancellation() -> 
                 agent_name="assistant",
                 session_id="child-cancelled-profiled-fork-source",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -975,6 +979,7 @@ def test_profiled_fork_cancellation_waits_for_dispatched_store_mutation() -> Non
                 agent_name="assistant",
                 session_id="cancelled-profiled-fork-source",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -1048,6 +1053,7 @@ def test_profiled_fork_supervisory_exit_waits_for_store_settlement(
                 agent_name="assistant",
                 session_id="abandoned-profiled-fork-source",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -2045,6 +2051,7 @@ def test_fork_inheritance_preserves_unavailable_parent_profile_identity() -> Non
                 agent_name="assistant",
                 session_id="unavailable-profile-source",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=SessionIdentity(
                 provider_name="fake",
@@ -2085,6 +2092,7 @@ def test_fork_current_child_rejects_unavailable_identity_before_child_creation(
                 agent_name="assistant",
                 session_id="unavailable-current-profile-source",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -2215,6 +2223,8 @@ def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
         baseline_identity = profiled_session_identity(
             provider_name="fake",
             model="fake-model",
+            tools=[tool],
+            max_steps=8,
         )
         active_identity = profiled_session_identity(
             provider_name="fake",
@@ -2231,6 +2241,7 @@ def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
                 agent_name="assistant",
                 session_id=f"active-parent-source-{store_kind}",
                 messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=(tool.spec.name,)),
             ),
             identity=baseline_identity,
         )
@@ -2347,13 +2358,13 @@ def test_profiled_fork_resume_freezes_profile_through_approval_continuation(
     tmp_path,
 ) -> None:
     async def scenario() -> None:
-        source_id = "legacy-unprofiled-fork-source"
-        child_id = "legacy-unprofiled-fork-child"
-        drift_child_id = "legacy-unprofiled-fork-drift-child"
+        source_id = "profiled-fork-source"
+        child_id = "profiled-fork-child"
+        drift_child_id = "profiled-fork-drift-child"
         store: SessionStore = (
             InMemorySessionStore()
             if store_kind == "memory"
-            else SQLiteSessionStore(tmp_path / "unprofiled-fork-profile.sqlite")
+            else SQLiteSessionStore(tmp_path / "profiled-fork-profile.sqlite")
         )
         tool = RecordingExternalTool(description="Original fork tool.")
         provider = ScriptedModelProvider(
@@ -4693,6 +4704,7 @@ async def _assert_snapshot_only_restart_profile_boundary(
                 from_statuses=frozenset({SessionStatus.COMPLETED}),
                 checkpoint_transform=lambda _session, current: current,
                 execution_profile=prior_profile.profile,
+                tool_capability_ceiling=released.tool_capability_ceiling,
                 interaction_started_event=interaction_started,
                 interaction_source_messages=(
                     Message.text("user", "crash before the next durable stage"),
@@ -4859,6 +4871,7 @@ def test_worker_recovery_accepts_never_admitted_profiled_pending_session(
                     agent_name="assistant",
                     session_id=session_id,
                     messages=[Message.text("user", "created but never admitted")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -4917,6 +4930,7 @@ def test_worker_recovery_rejects_malformed_never_admitted_profile_baseline() -> 
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "created but never admitted")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -4981,6 +4995,7 @@ def test_worker_recovery_releases_terminal_invocation_owner(
                     agent_name="assistant",
                     session_id=session_id,
                     messages=[Message.text("user", "create a recovery target")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=SessionIdentity(
                     provider_name="fake",
@@ -5003,6 +5018,7 @@ def test_worker_recovery_releases_terminal_invocation_owner(
                         from_statuses=frozenset({SessionStatus.PENDING}),
                         checkpoint_transform=lambda _session, current: current,
                         execution_profile=prior_profile.profile,
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                         interaction_started_event=interaction_started,
                         interaction_source_messages=(
                             Message.text("user", "finish before worker loss"),

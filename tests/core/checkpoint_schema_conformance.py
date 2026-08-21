@@ -17,6 +17,7 @@ from cayu.runtime import (
     RuntimePublicationRequest,
     SessionIdentity,
     SessionStatus,
+    ToolCapabilityCeiling,
     UserInputResponse,
     runtime_publication_checkpoint_value_digest,
 )
@@ -165,6 +166,7 @@ async def assert_reserved_checkpoint_key_migration_conformance(
             agent_name="checkpoint-agent",
             session_id=session_id,
             messages=[Message.text("user", "preserve safe legacy checkpoint data")],
+            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
         ),
         provider_name="checkpoint-conformance",
         model="checkpoint-model",

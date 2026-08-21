@@ -307,7 +307,6 @@ from cayu.runtime.tool_exposure import (
     ResolvedToolExposureAuthority,
     ToolExposurePolicyRequest,
     copy_resolved_tool_exposure_authority,
-    resolve_tool_capability_ceiling,
     resolve_tool_exposure,
     resolved_tool_exposure_authority,
     tool_capability_ceiling_from_session_metadata,
@@ -3824,6 +3823,15 @@ class ModelStepExecutor:
                     "Provider-operation recovery could not reconstruct its original budget "
                     "reservation and pricing context."
                 ) from accounting_error
+        tool_exposure = None if recovery_context is None else recovery_context.tool_exposure
+        if (
+            durable_step_result is not None
+            and durable_step_result.tool_calls
+            and tool_exposure is None
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation recovery has no durable tool-exposure authority."
+            )
         publication_event = self._event_writer.prepare(publication_event)
         publication = ModelCompletionPublicationRequest(
             dispatch=ModelCompletionDispatch(
@@ -3839,13 +3847,7 @@ class ModelStepExecutor:
                 and post_completion_failure is None
             ),
             structured_output_validation=structured_output_validation,
-            tool_exposure=(
-                _legacy_all_registered_tool_exposure_authority(registered_agent)
-                if durable_step_result is not None
-                and durable_step_result.tool_calls
-                and (recovery_context is None or recovery_context.tool_exposure is None)
-                else (None if recovery_context is None else recovery_context.tool_exposure)
-            ),
+            tool_exposure=tool_exposure,
         )
         await _publish_model_completion(
             model_completion_publisher,
@@ -6224,16 +6226,8 @@ class ModelStepRun:
         self._validate_live_model_semantics = validate_live_model_semantics
         capability_ceiling = tool_capability_ceiling_from_session_metadata(
             self._session.metadata,
-            required=False,
         )
-        self._tool_capability_ceiling = (
-            resolve_tool_capability_ceiling(
-                None,
-                self._registered_agent.tool_capabilities,
-            )
-            if capability_ceiling is None
-            else capability_ceiling
-        )
+        self._tool_capability_ceiling = capability_ceiling
         self._all_tools_within_capability_ceiling = _tool_capability_ceiling_exposure(
             self._registered_agent,
             self._tool_capability_ceiling.tool_names,
@@ -6243,11 +6237,18 @@ class ModelStepRun:
                 "An initial frozen tool exposure and a previous profile cannot be supplied "
                 "together."
             )
-        self._initial_tool_exposure = (
-            None
-            if initial_tool_exposure is None
-            else _require_frozen_tool_exposure(initial_tool_exposure)
-        )
+        if initial_tool_exposure is None:
+            self._initial_tool_exposure = None
+        else:
+            frozen_initial_tool_exposure = _require_frozen_tool_exposure(initial_tool_exposure)
+            ceiling_names = frozenset(self._tool_capability_ceiling.tool_names)
+            if frozen_initial_tool_exposure.ceiling_count != len(
+                self._tool_capability_ceiling.tool_names
+            ) or any(name not in ceiling_names for name in frozen_initial_tool_exposure.tool_names):
+                raise ProviderOperationEvidenceError(
+                    "Initial frozen tool exposure conflicts with the session capability ceiling."
+                )
+            self._initial_tool_exposure = frozen_initial_tool_exposure
         if previous_tool_exposure_profile_id is not None:
             previous_tool_exposure_profile_id = require_durable_clean_nonblank(
                 previous_tool_exposure_profile_id,
@@ -9227,14 +9228,6 @@ def _model_request_tools(
     ):
         tools.append(structured_output_tool_spec(structured_output))
     return tools
-
-
-def _legacy_all_registered_tool_exposure_authority(
-    registered_agent: runtime_records.RegisteredAgentState,
-) -> ResolvedToolExposureAuthority:
-    """Reconstruct the expose-all authority for a pre-exposure recovery stage."""
-
-    return resolved_tool_exposure_authority(_all_registered_tool_exposure(registered_agent))
 
 
 def _require_frozen_tool_exposure(

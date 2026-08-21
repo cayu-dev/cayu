@@ -348,71 +348,7 @@ def test_default_exposure_preserves_all_tools_and_unbounded_run_metadata() -> No
     assert [_tool_names(request) for request in provider.requests] == [["alpha", "beta"]]
 
 
-def test_legacy_session_without_ceiling_uses_catalog_max_and_upgrades_on_resume() -> None:
-    async def exercise() -> None:
-        completed = [
-            ModelStreamEvent.text_delta("done"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-        provider = _ScriptedProvider([completed, completed])
-        store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
-        app.register_provider(provider, default=True)
-        app.register_agent(
-            AgentSpec(name="assistant", model="fake-model"),
-            tools=[_RecordingTool("alpha"), _RecordingTool("beta")],
-        )
-
-        await _collect(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="legacy-ceiling-profile-template",
-                messages=[Message.text("user", "template")],
-            ),
-        )
-        template = await store.load("legacy-ceiling-profile-template")
-        assert template is not None
-        profile = execution_profiles.execution_profile_from_session_metadata(template.metadata)
-        legacy = await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="legacy-ceiling-session",
-                messages=[Message.text("user", "legacy input")],
-            ),
-            identity=SessionIdentity(
-                provider_name=provider.name,
-                model="fake-model",
-                execution_profile=profile,
-            ),
-        )
-        legacy = await store.update_status(legacy.id, SessionStatus.COMPLETED)
-        assert legacy.tool_capability_ceiling is None
-
-        events = [
-            event
-            async for event in app.resume(
-                ResumeRequest(
-                    session_id=legacy.id,
-                    messages=[Message.text("user", "continue")],
-                )
-            )
-        ]
-        assert events[-1].type is EventType.SESSION_COMPLETED
-        assert [_tool_names(request) for request in provider.requests] == [
-            ["alpha", "beta"],
-            ["alpha", "beta"],
-        ]
-        upgraded = await store.load(legacy.id)
-        assert upgraded is not None
-        assert upgraded.tool_capability_ceiling == ToolCapabilityCeiling(
-            tool_names=("alpha", "beta")
-        )
-
-    asyncio.run(exercise())
-
-
-def test_legacy_cross_agent_fork_persists_the_inherited_catalog_intersection() -> None:
+def test_session_without_capability_ceiling_fails_closed_on_resume_and_fork() -> None:
     async def exercise() -> None:
         completed = [
             ModelStreamEvent.text_delta("done"),
@@ -420,35 +356,27 @@ def test_legacy_cross_agent_fork_persists_the_inherited_catalog_intersection() -
         ]
         provider = _ScriptedProvider([completed])
         store = InMemorySessionStore()
-        app = CayuApp(
-            session_store=store,
-            execution_profile_policy=_AllowProfileAdoption(),
-            enable_logging=False,
-        )
+        app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(
-            AgentSpec(name="source", model="fake-model"),
-            tools=[_RecordingTool("alpha"), _RecordingTool("shared")],
-        )
-        app.register_agent(
-            AgentSpec(name="child", model="fake-model"),
-            tools=[_RecordingTool("shared"), _RecordingTool("child_only")],
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha")],
         )
         await _collect(
             app,
             RunRequest(
-                agent_name="source",
-                session_id="legacy-fork-profile-template",
+                agent_name="assistant",
+                session_id="ceiling-profile-template",
                 messages=[Message.text("user", "template")],
             ),
         )
-        template = await store.load("legacy-fork-profile-template")
+        template = await store.load("ceiling-profile-template")
         assert template is not None
-        legacy_source = await store.create(
+        session = await store.create(
             RunRequest(
-                agent_name="source",
-                session_id="legacy-fork-source",
-                messages=[Message.text("user", "legacy input")],
+                agent_name="assistant",
+                session_id="missing-ceiling-session",
+                messages=[Message.text("user", "invalid persisted session")],
             ),
             identity=SessionIdentity(
                 provider_name=provider.name,
@@ -458,92 +386,31 @@ def test_legacy_cross_agent_fork_persists_the_inherited_catalog_intersection() -
                 ),
             ),
         )
-        legacy_source = await store.update_status(
-            legacy_source.id,
-            SessionStatus.COMPLETED,
-        )
-        assert legacy_source.tool_capability_ceiling is None
+        session = await store.update_status(session.id, SessionStatus.COMPLETED)
 
-        events = [
-            event
-            async for event in app.fork_session(
-                ForkSessionRequest(
-                    source_session_id=legacy_source.id,
-                    session_id="legacy-fork-child",
-                    agent_name="child",
-                    execution_profile_selection=(ForkExecutionProfileSelection.CURRENT_CHILD),
-                    profile_adoption=ExecutionProfileAdoptionIntent(
-                        idempotency_key="legacy-fork-intersection-v1",
-                        reason="Install the reviewed child profile.",
-                        requested_by=ResolutionActor(
-                            subject="test-caller",
-                            source=ResolutionActorSource.REQUEST,
-                        ),
-                    ),
+        with pytest.raises(ValueError, match="no durable tool capability ceiling"):
+            _ = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id=session.id,
+                        messages=[Message.text("user", "continue")],
+                    )
                 )
-            )
-        ]
-        assert events[-1].type is EventType.SESSION_FORKED
-        child = await store.load("legacy-fork-child")
-        assert child is not None
-        assert child.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=("shared",))
-
-    asyncio.run(exercise())
-
-
-def test_legacy_unprofiled_fork_keeps_compatibility_without_adopting_a_ceiling() -> None:
-    async def exercise() -> None:
-        completed = [
-            ModelStreamEvent.text_delta("done"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-        provider = _ScriptedProvider([completed])
-        store = InMemorySessionStore()
-        source = await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="legacy-unprofiled-source",
-                messages=[Message.text("user", "source")],
-            ),
-            identity=SessionIdentity(
-                provider_name=provider.name,
-                model="fake-model",
-            ),
-        )
-        child = await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="legacy-unprofiled-child",
-                parent_session_id=source.id,
-                messages=[Message.text("user", "child")],
-            ),
-            identity=SessionIdentity(
-                provider_name=provider.name,
-                model="fake-model",
-            ),
-        )
-        child = await store.update_status(child.id, SessionStatus.COMPLETED)
-        app = CayuApp(session_store=store, enable_logging=False)
-        app.register_provider(provider, default=True)
-        app.register_agent(
-            AgentSpec(name="assistant", model="fake-model"),
-            tools=[_RecordingTool("alpha")],
-        )
-
-        events = [
-            event
-            async for event in app.resume(
-                ResumeRequest(
-                    session_id=child.id,
-                    messages=[Message.text("user", "continue")],
+            ]
+        with pytest.raises(ValueError, match="no durable tool capability ceiling"):
+            _ = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=session.id,
+                        session_id="missing-ceiling-child",
+                    )
                 )
-            )
-        ]
-        assert events[-1].type is EventType.SESSION_COMPLETED
-        resumed = await store.load(child.id)
-        assert resumed is not None
-        assert resumed.tool_capability_ceiling is None
-        assert [_tool_names(request) for request in provider.requests] == [["alpha"]]
+            ]
+
+        assert await store.load("missing-ceiling-child") is None
+        assert len(provider.requests) == 1
 
     asyncio.run(exercise())
 

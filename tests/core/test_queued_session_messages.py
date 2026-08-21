@@ -42,6 +42,7 @@ from cayu.runtime import (
     SessionStatus,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolCapabilityCeiling,
     TranscriptQuery,
     UserInputResponse,
 )
@@ -1112,6 +1113,7 @@ def test_queued_message_survives_interruption_and_is_delivered_on_resume() -> No
                 agent_name="assistant",
                 session_id="sess_queue_resume",
                 messages=[Message.text("user", "original request")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="recording-one-shot",

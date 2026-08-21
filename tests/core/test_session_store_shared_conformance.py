@@ -539,6 +539,14 @@ class _ConformanceCompactor(ContextCompactor):
     def provider_budget_identity(self, _session: Session) -> None:
         return None
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session_store_conformance:compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.calls += 1
         self.requests.append(request.model_copy(deep=True))
@@ -623,6 +631,14 @@ class _ConformancePartialCompactor(ContextCompactor):
     def provider_budget_identity(self, _session: Session) -> None:
         return None
 
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session_store_conformance:partial_compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         return CompactionResult(
             summary=_summary_with_existing(request, "partial coverage"),
@@ -637,6 +653,14 @@ class _ConformancePartialCancellationCompactor(ContextCompactor):
 
     def provider_budget_identity(self, _session: Session) -> None:
         return None
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session_store_conformance:partial_cancellation_compactor",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.started.set()
@@ -2302,6 +2326,7 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                         agent_name="removed_agent",
                         session_id=session_id,
                         messages=[Message.text("user", "finish")],
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                     ),
                     identity=profiled_session_identity(
                         provider_name="fake",
@@ -8327,8 +8352,13 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
                     agent_name="assistant",
                     session_id="sess_compaction_conformance",
                     messages=[Message.text("user", "create only")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=app,
+                ),
             )
             transcript = [
                 Message.text("user", f"old request containing {secret}"),
@@ -8462,8 +8492,17 @@ def test_session_store_conformance_explicit_compaction_projects_legacy_summary(
             )
             session_id = f"sess_compaction_legacy_summary_{session_store_case[0]}"
             created = await store.create(
-                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
-                identity=_identity(),
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                ),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=app,
+                ),
             )
             transcript = [
                 Message.text("user", "old request"),
@@ -8562,8 +8601,13 @@ def test_session_store_conformance_explicit_compaction_rejects_secret_authority(
                     agent_name="assistant",
                     session_id="sess_compaction_authority_conformance",
                     messages=[],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=app,
+                ),
             )
             if authority_kind == "file_attachment":
                 artifact = file_attachment(
@@ -8678,8 +8722,13 @@ def test_session_store_conformance_partial_compaction_cursor_survives_reopen(
                     agent_name="assistant",
                     session_id="sess_partial_coverage_conformance",
                     messages=[],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=app,
+                ),
             )
             transcript = [
                 Message.text("user", "old"),
@@ -8788,8 +8837,13 @@ def test_session_store_conformance_cancelled_partial_compaction_publishes_no_cur
                     agent_name="assistant",
                     session_id="sess_partial_cancel_conformance",
                     messages=[],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=app,
+                ),
             )
             transcript = [
                 Message.text("user", "old"),
@@ -9194,8 +9248,13 @@ def test_session_store_conformance_reclaimed_partial_publication_has_one_prefix(
                     agent_name="assistant",
                     session_id="sess_partial_reclaim_conformance",
                     messages=[],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=first_app,
+                ),
             )
             transcript = [
                 Message.text("user", "old"),
@@ -13865,8 +13924,13 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
                     agent_name="assistant",
                     session_id="sess_compaction_claim_conformance",
                     messages=[Message.text("user", "create only")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=first_app,
+                ),
             )
             transcript = [
                 Message.text("user", "old request"),
@@ -13981,8 +14045,13 @@ def test_session_store_conformance_heartbeats_active_compaction_claim(
                     agent_name="assistant",
                     session_id="sess_compaction_heartbeat_conformance",
                     messages=[],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=app,
+                ),
             )
             transcript = [
                 Message.text("user", "old request"),
@@ -14802,8 +14871,13 @@ def test_session_store_conformance_blocks_delete_during_explicit_compaction(
                     agent_name="assistant",
                     session_id="sess_compaction_delete_conformance",
                     messages=[Message.text("user", "create only")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=_identity(),
+                identity=profiled_session_identity(
+                    provider_name="fake",
+                    model="fake-model",
+                    app=app,
+                ),
             )
             transcript = [
                 Message.text("user", "old request"),
@@ -17824,6 +17898,7 @@ def test_session_store_conformance_rejects_unsafe_derived_fork_before_mutation(
                     agent_name="source-agent",
                     session_id=source_id,
                     messages=[Message.text("user", "fork")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -17903,6 +17978,7 @@ def test_session_store_conformance_same_model_cross_provider_preflight_is_atomic
                     agent_name="source-agent",
                     session_id=source_id,
                     messages=[Message.text("user", "fork source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="source-provider",
@@ -17995,6 +18071,7 @@ def test_session_store_conformance_equal_current_child_authorization_is_replayab
                     agent_name="assistant",
                     session_id=source_id,
                     messages=[Message.text("user", "fork source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -18070,6 +18147,7 @@ def test_session_store_conformance_profiled_fork_is_atomic_and_exactly_replayabl
                     agent_name="assistant",
                     session_id=source_id,
                     messages=[Message.text("user", "fork source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -18165,6 +18243,7 @@ def test_session_store_conformance_generated_profiled_fork_is_idempotent(
                     agent_name="assistant",
                     session_id=source_id,
                     messages=[Message.text("user", "fork source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -18275,6 +18354,7 @@ def test_session_store_conformance_fork_source_provenance_distinguishes_callers(
                     agent_name="assistant",
                     session_id=source_id,
                     messages=[Message.text("user", "source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -18434,6 +18514,7 @@ def test_session_store_conformance_fork_source_deleted_after_initial_load_omits_
                     agent_name="assistant",
                     session_id=source_id,
                     messages=[Message.text("user", "source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -18523,6 +18604,7 @@ def test_session_store_conformance_active_stage_fork_omits_private_source_author
                     agent_name="assistant",
                     session_id=source_id,
                     messages=[Message.text("user", "source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
@@ -18643,6 +18725,7 @@ def test_session_store_conformance_rejects_fork_with_pending_tool_round(
                     agent_name="assistant",
                     session_id=source_id,
                     messages=[Message.text("user", "perform the effect")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",

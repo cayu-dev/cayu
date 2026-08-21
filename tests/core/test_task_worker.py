@@ -42,6 +42,7 @@ from cayu import (
     Tool,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolCapabilityCeiling,
     ToolContext,
     ToolEffect,
     ToolResult,
@@ -1024,6 +1025,7 @@ def test_resume_completes_the_running_task_already_attached_to_the_session(
                     session_id="session-resume",
                     task_id=task.id,
                     messages=[Message.text("user", "original")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 TaskInvocationSnapshot(
                     id=task.id,

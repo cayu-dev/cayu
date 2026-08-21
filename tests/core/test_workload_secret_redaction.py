@@ -74,6 +74,7 @@ from cayu.runtime import (
     StructuredOutputSpec,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolCapabilityCeiling,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -1908,6 +1909,7 @@ def test_resume_rejects_legacy_secret_linkage_before_claiming_session(
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "legacy")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -2005,6 +2007,7 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "legacy")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -3474,6 +3477,7 @@ def test_cayu_app_refuses_to_fork_legacy_secret_bearing_source_state(
                 session_id=source_id,
                 labels=({f"owner-{secret}": "unsafe"} if contaminated_state == "labels" else {}),
                 messages=[Message.text("user", "not copied by create")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -3541,6 +3545,7 @@ def test_cayu_app_can_fork_without_copying_contaminated_legacy_checkpoint() -> N
                 agent_name="assistant",
                 session_id="sess_legacy_checkpoint_not_copied_source",
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -3587,6 +3592,7 @@ def test_fork_profile_resolution_does_not_retain_rejected_checkpoint() -> None:
                 agent_name="assistant",
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -3676,6 +3682,7 @@ def test_atomic_fork_profile_recheck_does_not_retain_changed_checkpoint(
                 agent_name="assistant",
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -3724,6 +3731,7 @@ def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
                 agent_name="assistant",
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -3786,6 +3794,7 @@ def test_fork_failure_does_not_retain_excluded_legacy_checkpoint_secret() -> Non
                 agent_name="assistant",
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="missing-provider",
@@ -3845,6 +3854,7 @@ def test_fork_validates_concurrently_added_transcript_inside_atomic_store_copy()
                 agent_name="assistant",
                 session_id=source_id,
                 messages=[Message.text("user", "source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
             identity=profiled_session_identity(
                 provider_name="fake",
@@ -3900,6 +3910,7 @@ def test_fork_cursor_excluded_secret_is_not_retained_by_later_failure() -> None:
                     session_id=session_id,
                     metadata=({"legacy_private": secret} if session_id == child_id else {}),
                     messages=[Message.text("user", "source")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
                 identity=profiled_session_identity(
                     provider_name="fake",
