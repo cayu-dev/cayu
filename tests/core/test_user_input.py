@@ -45,6 +45,7 @@ from cayu.runtime import (
     StructuredOutputStrategy,
     ToolApprovalRecoveryOutcome,
     ToolCallHookContext,
+    ToolCapabilityCeiling,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -1317,8 +1318,10 @@ def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() 
         ExecutionProfileComponentClass.EFFECT_AUTHORITY,
         ExecutionProfileComponentClass.PROVIDER_ADAPTER,
         ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
-        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
     )
+    session = asyncio.run(store.load("s_registration_drift"))
+    assert session is not None
+    assert session.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=("ask_user",))
     assert echo.metadata_by_text == {}
     assert final_provider.requests == []
 

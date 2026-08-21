@@ -80,6 +80,9 @@ from cayu.runtime.sessions import (
     run_request_with_runtime_invocation,
 )
 from cayu.runtime.tasks import TaskStatus, TaskStore
+from cayu.runtime.tool_exposure import (
+    _resolve_initial_tool_capability_ceiling,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +290,15 @@ class DurableSubagentCoordinator:
         request = copy_run_request(request)
         if request.session_id is None:
             raise ValueError("Durable subagent request requires a deterministic child session.")
+        registered_child = self._get_registered_agent(request.agent_name)
+        request = request.model_copy(
+            update={
+                "tool_capability_ceiling": _resolve_initial_tool_capability_ceiling(
+                    request.tool_capability_ceiling,
+                    registered_child.tool_capabilities,
+                )
+            }
+        )
         dispatch_id = durable_subagent_dispatch_id(
             parent_session_id=parent.id,
             idempotency_key=idempotency_key,

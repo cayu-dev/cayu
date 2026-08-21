@@ -307,8 +307,10 @@ from cayu.runtime.tool_exposure import (
     ResolvedToolExposureAuthority,
     ToolExposurePolicyRequest,
     copy_resolved_tool_exposure_authority,
+    resolve_tool_capability_ceiling,
     resolve_tool_exposure,
     resolved_tool_exposure_authority,
+    tool_capability_ceiling_from_session_metadata,
 )
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
@@ -6220,6 +6222,22 @@ class ModelStepRun:
         self._active_run = active_run
         self._execution_profile = execution_profile
         self._validate_live_model_semantics = validate_live_model_semantics
+        capability_ceiling = tool_capability_ceiling_from_session_metadata(
+            self._session.metadata,
+            required=False,
+        )
+        self._tool_capability_ceiling = (
+            resolve_tool_capability_ceiling(
+                None,
+                self._registered_agent.tool_capabilities,
+            )
+            if capability_ceiling is None
+            else capability_ceiling
+        )
+        self._all_tools_within_capability_ceiling = _tool_capability_ceiling_exposure(
+            self._registered_agent,
+            self._tool_capability_ceiling.tool_names,
+        )
         if initial_tool_exposure is not None and previous_tool_exposure_profile_id is not None:
             raise ValueError(
                 "An initial frozen tool exposure and a previous profile cannot be supplied "
@@ -6283,10 +6301,7 @@ class ModelStepRun:
         if type(policy) is AllRegisteredToolsExposurePolicy:
             # Preserve both the historical metadata bounds and the expose-all
             # hot path: registration already validated this immutable snapshot.
-            return _all_registered_tool_exposure(self._registered_agent)
-        capability_ceiling = tuple(
-            capability.name for capability in self._registered_agent.tool_capabilities
-        )
+            return self._all_tools_within_capability_ceiling
         request = ToolExposurePolicyRequest(
             session_id=self._session.id,
             agent_name=self._registered_agent.spec.name,
@@ -6295,7 +6310,7 @@ class ModelStepRun:
             step=step,
             transcript_cursor=transcript_cursor,
             registered_tools=self._registered_agent.tool_capabilities,
-            capability_ceiling=capability_ceiling,
+            capability_ceiling=self._tool_capability_ceiling.tool_names,
             previous_profile_id=self._previous_tool_exposure_profile_id,
             metadata=self._request_metadata,
         )
@@ -9246,6 +9261,30 @@ def _all_registered_tool_exposure(
         tools=capabilities,
         registered_count=len(capabilities),
         ceiling_count=len(capabilities),
+    )
+
+
+def _tool_capability_ceiling_exposure(
+    registered_agent: runtime_records.RegisteredAgentState,
+    ceiling_names: tuple[str, ...],
+) -> ResolvedToolExposure:
+    """Build the expose-all-policy snapshot inside one canonical ceiling."""
+
+    capabilities = registered_agent.tool_capabilities
+    registered_names = tuple(capability.name for capability in capabilities)
+    if ceiling_names == registered_names:
+        return _all_registered_tool_exposure(registered_agent)
+    ceiling_name_set = frozenset(ceiling_names)
+    selected = tuple(
+        capability for capability in capabilities if capability.name in ceiling_name_set
+    )
+    if tuple(capability.name for capability in selected) != ceiling_names:
+        raise ValueError("The durable tool capability ceiling conflicts with registration.")
+    return ResolvedToolExposure(
+        profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+        tools=selected,
+        registered_count=len(capabilities),
+        ceiling_count=len(selected),
     )
 
 

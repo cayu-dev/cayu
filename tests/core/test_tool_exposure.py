@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator, Mapping
 from typing import Any, cast
 
@@ -18,10 +19,12 @@ from cayu import (
     RegisteredToolCapability,
     SearchTextTool,
     StaticToolExposurePolicy,
+    ToolCapabilityCeiling,
     ToolEffect,
     ToolExposureDecision,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
+    resolve_tool_capability_ceiling,
     resolve_tool_exposure,
 )
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
@@ -140,6 +143,106 @@ def test_policy_request_is_bounded_owned_and_ceiling_ordered() -> None:
         _request(first, ceiling=("missing",))
     with pytest.raises(ValidationError, match="unique tool names"):
         _request(first, first)
+
+
+def test_tool_capability_ceiling_is_versioned_owned_and_fingerprint_bound() -> None:
+    names = ["alpha", "beta"]
+    ceiling = ToolCapabilityCeiling(tool_names=names)
+    names.append("gamma")
+
+    assert ceiling.schema_version == 1
+    assert ceiling.tool_names == ("alpha", "beta")
+    assert len(ceiling.fingerprint) == 64
+    assert cayu.ToolCapabilityCeiling is ToolCapabilityCeiling
+    assert ToolCapabilityCeiling.model_validate(ceiling.model_dump(mode="json")) == ceiling
+
+    dumped = ceiling.model_dump(mode="json")
+    dumped["tool_names"] = ["alpha"]
+    with pytest.raises(ValidationError, match="fingerprint does not match"):
+        ToolCapabilityCeiling.model_validate(dumped)
+    with pytest.raises(ValidationError, match="unique tool names"):
+        ToolCapabilityCeiling(tool_names=("alpha", "alpha"))
+
+
+def test_tool_capability_ceiling_copy_suppresses_hostile_serializer_diagnostics(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "tool-ceiling-hostile-repr-canary"
+
+    class SecretRenderingValue:
+        def __repr__(self) -> str:
+            return secret
+
+    ceiling = ToolCapabilityCeiling(tool_names=("alpha",))
+    object.__setattr__(ceiling, "tool_names", SecretRenderingValue())
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises((TypeError, ValidationError)) as exc_info:
+            exposure_contracts.copy_tool_capability_ceiling(ceiling)
+
+    captured = capsys.readouterr()
+    assert caught == []
+    assert secret not in repr((exc_info.value, captured.out, captured.err))
+
+
+def test_tool_capability_ceiling_resolution_canonicalizes_and_never_widens() -> None:
+    alpha = _capability("alpha")
+    beta = _capability("beta")
+    gamma = _capability("gamma")
+
+    initial = resolve_tool_capability_ceiling(None, (alpha, beta))
+    selected = resolve_tool_capability_ceiling(
+        ToolCapabilityCeiling(tool_names=("beta", "alpha")),
+        (alpha, beta),
+    )
+    reconstructed = resolve_tool_capability_ceiling(
+        None,
+        (alpha, beta, gamma),
+        maximum=initial,
+    )
+    removed = resolve_tool_capability_ceiling(
+        None,
+        (beta, gamma),
+        maximum=initial,
+    )
+
+    assert initial.tool_names == ("alpha", "beta")
+    assert selected.tool_names == ("alpha", "beta")
+    assert reconstructed.tool_names == ("alpha", "beta")
+    assert removed.tool_names == ("beta",)
+
+    with pytest.raises(ValueError, match="never widened"):
+        resolve_tool_capability_ceiling(
+            ToolCapabilityCeiling(tool_names=("alpha", "gamma")),
+            (alpha, beta, gamma),
+            maximum=initial,
+        )
+    with pytest.raises(ValueError, match="unregistered tool"):
+        resolve_tool_capability_ceiling(
+            ToolCapabilityCeiling(tool_names=("missing",)),
+            (alpha, beta),
+        )
+
+
+def test_initial_ceiling_defers_oversized_catalog_failure_to_the_model_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _capability("alpha")
+    monkeypatch.setattr(exposure_contracts, "TOOL_EXPOSURE_MAX_CATALOG_BYTES", 1)
+
+    assert (
+        exposure_contracts._resolve_initial_tool_capability_ceiling(
+            None,
+            (capability,),
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="canonical JSON bytes"):
+        exposure_contracts._resolve_initial_tool_capability_ceiling(
+            ToolCapabilityCeiling(tool_names=()),
+            (capability,),
+        )
 
 
 def test_policy_request_bounds_the_complete_catalog(monkeypatch: pytest.MonkeyPatch) -> None:

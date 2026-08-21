@@ -172,13 +172,13 @@ from cayu.runtime._model_step_executor import (
     ModelStepExecutor,
     ModelStepFlowOutcome,
     ModelStepLimitEvaluationRequest,
-    _all_registered_tool_exposure,
     _detach_model_request,
     _event_with_model_identity_authority,
     _model_request_messages,
     _model_request_tools,
     _require_frozen_tool_exposure,
     _session_agent_spec,
+    _tool_capability_ceiling_exposure,
     is_ambiguous_provider_operation_start_error,
     model_completion_recovery_context_from_stage,
 )
@@ -537,6 +537,11 @@ from cayu.runtime.tasks import (
 )
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
+    ToolCapabilityCeiling,
+    _resolve_initial_tool_capability_ceiling,
+    resolve_tool_capability_ceiling,
+    session_metadata_with_tool_capability_ceiling,
+    tool_capability_ceiling_from_session_metadata,
     validate_resolved_tool_exposure_authority,
 )
 from cayu.runtime.tool_policy import (
@@ -2821,6 +2826,21 @@ def _runtime_version() -> str | None:
         return None
 
 
+def _session_tool_capability_ceiling(
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+) -> ToolCapabilityCeiling:
+    """Load durable authority, upgrading a legacy unbounded session in memory."""
+
+    ceiling = tool_capability_ceiling_from_session_metadata(
+        session.metadata,
+        required=False,
+    )
+    if ceiling is not None:
+        return ceiling
+    return resolve_tool_capability_ceiling(None, registered_agent.tool_capabilities)
+
+
 def _execution_profile_identity(
     *,
     registered_agent: runtime_records.RegisteredAgentState,
@@ -2847,6 +2867,7 @@ def _execution_profile_identity(
     limits: RunLimits | None = None,
     retry_policy: RetryPolicy | None = None,
     finalization_material: dict[str, Any] | None = None,
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None,
 ) -> ExecutionProfileIdentity:
     provider_options, provider_options_process_local = _execution_profile_provider_options(
         registered_agent.spec.provider_options,
@@ -2915,6 +2936,9 @@ def _execution_profile_identity(
             }
             if finalization_material is None
             else copy_json_value(finalization_material, "finalization_material")
+        ),
+        tool_capability_ceiling=(
+            None if tool_capability_ceiling is None else tool_capability_ceiling.tool_names
         ),
     )
 
@@ -3085,6 +3109,10 @@ def _execution_profile_structured_output(
 _EXACT_PROFILE_POLICY_ID = "cayu:execution-profile-exact-reuse:v1"
 _DEFAULT_PROFILE_POLICY_ID = "cayu:execution-profile-default-reject:v1"
 _MODEL_TARGET_PROFILE_POLICY_ID = "cayu:model-target-adoption:v1"
+_TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = "cayu:tool-capability-ceiling-narrowing:v1"
+_MODEL_TARGET_AND_TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = (
+    "cayu:model-target-and-tool-capability-ceiling-adoption:v1"
+)
 _FORK_GROUP_INITIAL_PROFILE_POLICY_ID = "cayu:fork-group-initial-invocation:v1"
 _MODEL_TARGET_BUILT_IN_COMPONENTS = frozenset(
     {
@@ -3097,6 +3125,20 @@ _MODEL_TARGET_BUILT_IN_COMPONENTS = frozenset(
 def _model_target_profile_actor() -> ResolutionActor:
     return ResolutionActor(
         subject="cayu:model-target-adoption",
+        source=ResolutionActorSource.SYSTEM,
+    )
+
+
+def _tool_capability_ceiling_profile_actor() -> ResolutionActor:
+    return ResolutionActor(
+        subject="cayu:tool-capability-ceiling-narrowing",
+        source=ResolutionActorSource.SYSTEM,
+    )
+
+
+def _model_target_and_tool_capability_ceiling_profile_actor() -> ResolutionActor:
+    return ResolutionActor(
+        subject="cayu:model-target-and-tool-capability-ceiling-adoption",
         source=ResolutionActorSource.SYSTEM,
     )
 
@@ -4077,6 +4119,10 @@ class SessionEngine:
             max_steps=request.max_steps,
             limits=request.limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
+            tool_capability_ceiling=_session_tool_capability_ceiling(
+                session,
+                registered_agent,
+            ),
         )
         candidate = execution_profile_with_component(
             candidate,
@@ -4204,6 +4250,10 @@ class SessionEngine:
                 "retry_policy": copy_retry_policy(retry_policy).model_dump(mode="json"),
             },
             invocation_semantics_available=invocation_semantics_available,
+            tool_capability_ceiling=_session_tool_capability_ceiling(
+                session,
+                registered_agent,
+            ).tool_names,
         )
         snapshot = plan.snapshot
         candidate = plan.candidate_profile
@@ -4286,6 +4336,7 @@ class SessionEngine:
         source_provider_name: str | None = None,
         source_model: str | None = None,
         force_authority_review: bool = False,
+        tool_capability_ceiling_narrowed: bool = False,
     ) -> ExecutionProfileDecision:
         event_session = session if decision_session is None else decision_session
         if not changed_component_classes and not force_authority_review:
@@ -4313,26 +4364,58 @@ class SessionEngine:
             and changed_component_set <= _MODEL_TARGET_BUILT_IN_COMPONENTS
         )
         built_in_model_target_adoption = model_target_only and not force_authority_review
-        fallback_actor = _model_target_profile_actor() if built_in_model_target_adoption else None
-        fallback_reason = (
-            "The caller explicitly requested a model-target transition."
-            if built_in_model_target_adoption
-            else "The execution profile changed without authorized adoption."
+        built_in_ceiling_narrowing = (
+            tool_capability_ceiling_narrowed
+            and not force_authority_review
+            and changed_component_set
+            == frozenset({ExecutionProfileComponentClass.TOOL_VIEW_GRANTS})
         )
-        policy_identity = (
-            _MODEL_TARGET_PROFILE_POLICY_ID
-            if built_in_model_target_adoption
-            else _DEFAULT_PROFILE_POLICY_ID
+        built_in_model_target_and_ceiling_adoption = (
+            target_changed
+            and built_in_model_target_transition
+            and tool_capability_ceiling_narrowed
+            and not force_authority_review
+            and {
+                ExecutionProfileComponentClass.PROVIDER_TARGET,
+                ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+            }
+            <= changed_component_set
+            and changed_component_set
+            <= _MODEL_TARGET_BUILT_IN_COMPONENTS | {ExecutionProfileComponentClass.TOOL_VIEW_GRANTS}
         )
+        if built_in_model_target_and_ceiling_adoption:
+            fallback_actor = _model_target_and_tool_capability_ceiling_profile_actor()
+            fallback_reason = (
+                "The caller explicitly requested a model-target transition and narrowed the "
+                "durable tool capability ceiling."
+            )
+            policy_identity = _MODEL_TARGET_AND_TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID
+        elif built_in_model_target_adoption:
+            fallback_actor = _model_target_profile_actor()
+            fallback_reason = "The caller explicitly requested a model-target transition."
+            policy_identity = _MODEL_TARGET_PROFILE_POLICY_ID
+        elif built_in_ceiling_narrowing:
+            fallback_actor = _tool_capability_ceiling_profile_actor()
+            fallback_reason = "The caller explicitly narrowed the durable tool capability ceiling."
+            policy_identity = _TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID
+        else:
+            fallback_actor = None
+            fallback_reason = "The execution profile changed without authorized adoption."
+            policy_identity = _DEFAULT_PROFILE_POLICY_ID
         policy_reason = fallback_reason
+        built_in_profile_adoption = (
+            built_in_model_target_adoption
+            or built_in_ceiling_narrowing
+            or built_in_model_target_and_ceiling_adoption
+        )
         authority_decision = (
             ExecutionProfileAuthorityDecision.AUTHORIZED
-            if built_in_model_target_adoption
+            if built_in_profile_adoption
             else ExecutionProfileAuthorityDecision.NOT_REQUIRED
         )
         action = (
             ExecutionProfilePolicyAction.ADOPT
-            if built_in_model_target_adoption
+            if built_in_profile_adoption
             else ExecutionProfilePolicyAction.REJECT
         )
 
@@ -4432,7 +4515,12 @@ class SessionEngine:
                     "session's persistent execution target."
                 )
         elif action is ExecutionProfilePolicyAction.ADOPT:
-            has_explicit_adoption = intent is not None or model_target_only
+            has_explicit_adoption = (
+                intent is not None
+                or model_target_only
+                or built_in_ceiling_narrowing
+                or built_in_model_target_and_ceiling_adoption
+            )
             authority_is_sufficient = (
                 authority_decision is not ExecutionProfileAuthorityDecision.DENIED
                 and (
@@ -6191,6 +6279,13 @@ class SessionEngine:
         )
         if registered_agent.spec.name != request.agent_name:
             raise ValueError("Initial-run agent override conflicts with the request agent.")
+        effective_tool_capability_ceiling = _resolve_initial_tool_capability_ceiling(
+            request.tool_capability_ceiling,
+            registered_agent.tool_capabilities,
+        )
+        request = request.model_copy(
+            update={"tool_capability_ceiling": effective_tool_capability_ceiling}
+        )
         # An explicit target is exact. Otherwise the agent model and optional
         # provider pin feed the existing routing/default selection.
         if request.target is not None:
@@ -6262,6 +6357,7 @@ class SessionEngine:
             max_steps=request.max_steps,
             limits=request.limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
+            tool_capability_ceiling=effective_tool_capability_ceiling,
         )
         unavailable_profile_components = unavailable_execution_profile_components(execution_profile)
         if unavailable_profile_components:
@@ -7712,6 +7808,10 @@ class SessionEngine:
                     "provider_name": compactor_provider_name,
                     "model": compactor_model,
                 },
+                tool_capability_ceiling=_session_tool_capability_ceiling(
+                    loaded_session,
+                    registered_agent,
+                ),
             )
             if expected_profile is None:
                 return execution_profile_with_durable_system_projection_digest(
@@ -11484,6 +11584,18 @@ class SessionEngine:
         loaded_projection_cursor = session_model_projection_cursor(loaded_session)
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        stored_tool_capability_ceiling = _session_tool_capability_ceiling(
+            loaded_session,
+            registered_agent,
+        )
+        effective_tool_capability_ceiling = resolve_tool_capability_ceiling(
+            request.tool_capability_ceiling,
+            registered_agent.tool_capabilities,
+            maximum=stored_tool_capability_ceiling,
+        )
+        tool_capability_ceiling_narrowed = (
+            effective_tool_capability_ceiling != stored_tool_capability_ceiling
+        )
         requested_target = request.target
         target_changed = requested_target is not None and (
             requested_target.provider_name != loaded_session.provider_name
@@ -11552,6 +11664,7 @@ class SessionEngine:
                 max_steps=request.max_steps,
                 limits=request.limits,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
+                tool_capability_ceiling=effective_tool_capability_ceiling,
             )
             replay_candidate_profile = execution_profile_with_component(
                 replay_candidate_profile,
@@ -11810,6 +11923,11 @@ class SessionEngine:
 
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         continuing_recovery_boundary = pending_round is not None or pending_model_completion
+        if continuing_recovery_boundary and tool_capability_ceiling_narrowed:
+            raise RuntimeError(
+                "A tool capability ceiling cannot be narrowed while model or tool recovery "
+                "is pending."
+            )
         if continuing_recovery_boundary and request.profile_adoption is not None:
             raise RuntimeError(
                 "An execution profile cannot be adopted while model or tool recovery is pending."
@@ -11827,6 +11945,11 @@ class SessionEngine:
         if legacy_unprofiled_fork and request.profile_adoption is not None:
             raise RuntimeError(
                 "A legacy fork without a durable execution profile cannot adopt a new profile."
+            )
+        if legacy_unprofiled_fork and request.tool_capability_ceiling is not None:
+            raise RuntimeError(
+                "A legacy fork without a durable execution profile cannot adopt a tool "
+                "capability ceiling."
             )
         if not continuing_recovery_boundary:
             candidate_execution_profile = _execution_profile_identity(
@@ -11859,6 +11982,7 @@ class SessionEngine:
                 max_steps=request.max_steps,
                 limits=request.limits,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
+                tool_capability_ceiling=effective_tool_capability_ceiling,
             )
             if legacy_unprofiled_fork:
                 fork_transcript = await self.session_store.load_transcript(loaded_session.id)
@@ -11918,6 +12042,7 @@ class SessionEngine:
                             max_steps=request.max_steps,
                             limits=request.limits,
                             retry_policy=self._effective_retry_policy(request.retry_policy),
+                            tool_capability_ceiling=stored_tool_capability_ceiling,
                         )
                         source_registration_profile = execution_profile_with_component(
                             source_registration_profile,
@@ -12001,6 +12126,7 @@ class SessionEngine:
                             else loaded_session.model
                         ),
                         built_in_model_target_transition=(built_in_model_target_transition),
+                        tool_capability_ceiling_narrowed=(tool_capability_ceiling_narrowed),
                     )
                 if execution_profile_decision.kind in {
                     ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
@@ -12143,7 +12269,10 @@ class SessionEngine:
                 portable_messages.clear()
                 try:
                     hook_tools = _model_request_tools(
-                        tool_exposure=_all_registered_tool_exposure(registered_agent),
+                        tool_exposure=_tool_capability_ceiling_exposure(
+                            registered_agent,
+                            effective_tool_capability_ceiling.tool_names,
+                        ),
                         structured_output=request.structured_output,
                     )
                     registered_provider.provider.preflight_portable_messages(
@@ -12263,6 +12392,9 @@ class SessionEngine:
                     from_statuses=frozenset(_RESUMABLE_SESSION_STATUSES),
                     checkpoint_transform=claim_resumable_checkpoint,
                     execution_profile=invocation_profile,
+                    tool_capability_ceiling=(
+                        None if legacy_unprofiled_fork else effective_tool_capability_ceiling
+                    ),
                     interaction_started_event=interaction_started_event,
                     continued_interaction_id=(
                         interaction_id if continuing_recovery_boundary else None
@@ -12803,8 +12935,30 @@ class SessionEngine:
                 "Source agent must be registered to derive inherited taint before forking: "
                 f"{source_session.agent_name}"
             ) from exc
+        durable_source_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
+            source_session.metadata,
+            required=False,
+        )
+        source_tool_capability_ceiling = (
+            durable_source_tool_capability_ceiling
+            if durable_source_tool_capability_ceiling is not None
+            else resolve_tool_capability_ceiling(
+                None,
+                source_registered_agent.tool_capabilities,
+            )
+        )
         agent_name = request.agent_name or source_session.agent_name
         registered_agent = self._get_registered_agent(agent_name)
+        effective_tool_capability_ceiling = resolve_tool_capability_ceiling(
+            request.tool_capability_ceiling,
+            registered_agent.tool_capabilities,
+            maximum=source_tool_capability_ceiling,
+        )
+        fork_has_durable_tool_capability_ceiling = (
+            durable_source_tool_capability_ceiling is not None
+            or request.tool_capability_ceiling is not None
+            or effective_tool_capability_ceiling != source_tool_capability_ceiling
+        )
         model = request.model or (
             registered_agent.spec.model if request.agent_name is not None else source_session.model
         )
@@ -12899,6 +13053,7 @@ class SessionEngine:
                     if initial_invocation is None
                     else self._effective_retry_policy(initial_invocation.request.retry_policy)
                 ),
+                tool_capability_ceiling=effective_tool_capability_ceiling,
             )
             if (
                 prompt_workflow.rendered_child_prompt is None
@@ -12979,7 +13134,18 @@ class SessionEngine:
             initial_invocation_profile = (
                 None if initial_invocation is None else candidate_execution_profile
             )
-        elif initial_invocation is not None:
+        elif fork_has_durable_tool_capability_ceiling:
+            inherited_ceiling_profile = current_child_execution_profile()
+            selected_execution_profile = execution_profile_with_component(
+                source_execution_profile,
+                inherited_ceiling_profile.component(
+                    ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+                ),
+            )
+        if (
+            request.execution_profile_selection is ForkExecutionProfileSelection.INHERIT_PARENT
+            and initial_invocation is not None
+        ):
             candidate_execution_profile = current_child_execution_profile()
             changed_profile_components = changed_execution_profile_components(
                 source_execution_profile,
@@ -12989,6 +13155,7 @@ class SessionEngine:
                 ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
                 ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
                 ExecutionProfileComponentClass.FINALIZATION,
+                ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
             }
             unsupported_changes = tuple(
                 component
@@ -12998,7 +13165,8 @@ class SessionEngine:
             if unsupported_changes:
                 raise RuntimeError(
                     "An inherited fork-group branch changed execution authority outside its "
-                    "declared initial budget, structured-output, or finalization semantics: "
+                    "declared initial budget, structured-output, finalization, or tool-ceiling "
+                    "semantics: "
                     + ", ".join(component.value for component in unsupported_changes)
                     + ". Use an explicitly authorized current-child branch."
                 )
@@ -13112,7 +13280,10 @@ class SessionEngine:
                         hook_tools: list[dict[str, Any]] = []
                         try:
                             hook_tools = _model_request_tools(
-                                tool_exposure=_all_registered_tool_exposure(registered_agent),
+                                tool_exposure=_tool_capability_ceiling_exposure(
+                                    registered_agent,
+                                    effective_tool_capability_ceiling.tool_names,
+                                ),
                                 structured_output=None,
                             )
                             registered_provider.provider.preflight_portable_messages(
@@ -13262,6 +13433,11 @@ class SessionEngine:
             ),
             transcript_cursor=fork_projection_cursor,
         )
+        if fork_has_durable_tool_capability_ceiling:
+            fork_metadata = session_metadata_with_tool_capability_ceiling(
+                fork_metadata,
+                effective_tool_capability_ceiling,
+            )
         prompt_workflow.attach_receipt(
             fork_metadata,
             source_session=source_session,
@@ -14785,6 +14961,10 @@ class SessionEngine:
                     max_steps=max_steps,
                     limits=limits,
                     retry_policy=retry_policy,
+                    tool_capability_ceiling=_session_tool_capability_ceiling(
+                        session,
+                        registered_agent,
+                    ),
                 )
                 candidate = execution_profile_with_component(
                     candidate,

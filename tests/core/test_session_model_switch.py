@@ -57,6 +57,7 @@ from cayu import (
     ToolApprovalDecision,
     ToolApprovalRequest,
     ToolCallPart,
+    ToolCapabilityCeiling,
     ToolContext,
     ToolResult,
     ToolSpec,
@@ -246,6 +247,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
         model_transition=None,
         execution_profile=None,
         execution_profile_decision=None,
+        tool_capability_ceiling=None,
     ):
         if self.inject_pending_round and model_transition is not None:
             self.inject_pending_round = False
@@ -280,6 +282,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
             model_transition=model_transition,
             execution_profile=execution_profile,
             execution_profile_decision=execution_profile_decision,
+            tool_capability_ceiling=tool_capability_ceiling,
         )
 
 
@@ -612,6 +615,53 @@ def test_cross_provider_resume_durably_projects_opaque_state() -> None:
         for message in target.requests[1].messages[2:]
         for part in message.content
     )
+
+
+def test_model_switch_atomically_composes_a_capability_ceiling_narrowing() -> None:
+    source = _NamedProvider(
+        "source",
+        [[ModelStreamEvent.text_delta("first"), ModelStreamEvent.completed()]],
+    )
+    target = _NamedProvider(
+        "target",
+        [[ModelStreamEvent.text_delta("second"), ModelStreamEvent.completed()]],
+    )
+    app, store = _app(source, target)
+    session_id = "switch-with-ceiling-narrowing"
+
+    asyncio.run(
+        _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+    )
+    events = asyncio.run(
+        _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "second")],
+                    target=ModelTarget(provider_name="target", model="target-model"),
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                )
+            )
+        )
+    )
+
+    assert events[0].type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+    assert events[0].payload["decision"] == "adopted"
+    assert events[1].type is EventType.SESSION_MODEL_SWITCHED
+    assert target.preflight_tools == []
+    assert target.requests[0].tools == []
+    session = asyncio.run(store.load(session_id))
+    assert session is not None
+    assert session.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+    assert (session.provider_name, session.model) == ("target", "target-model")
 
 
 def test_model_switch_releases_transcript_snapshots_before_streaming() -> None:

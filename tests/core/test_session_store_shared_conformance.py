@@ -150,6 +150,7 @@ from cayu.runtime import (
     SessionStore,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolCapabilityCeiling,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -197,6 +198,7 @@ from cayu.runtime.checkpoints import (
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
+from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
@@ -1005,6 +1007,24 @@ class _ChangingApprovalPolicy(ToolPolicy):
         )
 
 
+class _CeilingConformanceTool(Tool):
+    def __init__(self, name: str) -> None:
+        self.spec = ToolSpec(
+            name=name,
+            effect=ToolEffect.NONE,
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name=f"tests:session-store-conformance:ceiling-tool:{name}",
+                behavior_version="1",
+                implementation_version="1",
+            ),
+        )
+        super().__init__()
+
+    async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        del ctx, args
+        return ToolResult(content=self.name)
+
+
 def _approval_recovery_environment_spec() -> EnvironmentSpec:
     return EnvironmentSpec(
         name="approval-environment",
@@ -1183,6 +1203,104 @@ def test_session_store_conformance_reconstructs_completed_fork_group(
                 EventType.FORK_GROUP_AWAITING_EVALUATION,
                 EventType.FORK_GROUP_COMPLETED,
             ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_round_trips_and_atomically_narrows_tool_ceiling(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"tool-ceiling-conformance-{session_store_case[0]}"
+        try:
+            initial_provider = FakeProvider(
+                [[ModelStreamEvent.completed({"finish_reason": "stop"})]]
+            )
+            initial_app = CayuApp(session_store=store, enable_logging=False)
+            initial_app.register_provider(initial_provider, default=True)
+            initial_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[
+                    _CeilingConformanceTool("alpha"),
+                    _CeilingConformanceTool("beta"),
+                ],
+            )
+            _ = [
+                event
+                async for event in initial_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "start")],
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("alpha",)),
+                    )
+                )
+            ]
+
+            store = await _reopen_store(session_store_case, store)
+            reconstructed = await store.load(session_id)
+            assert reconstructed is not None
+            assert reconstructed.tool_capability_ceiling == ToolCapabilityCeiling(
+                tool_names=("alpha",)
+            )
+
+            resumed_provider = FakeProvider(
+                [[ModelStreamEvent.completed({"finish_reason": "stop"})]]
+            )
+            resumed_app = CayuApp(session_store=store, enable_logging=False)
+            resumed_app.register_provider(resumed_provider, default=True)
+            resumed_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[
+                    _CeilingConformanceTool("alpha"),
+                    _CeilingConformanceTool("beta"),
+                ],
+            )
+            fork_session_id = f"{session_id}-fork"
+            fork_events = [
+                event
+                async for event in resumed_app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=session_id,
+                        session_id=fork_session_id,
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                    )
+                )
+            ]
+            assert fork_events[-1].type is EventType.SESSION_FORKED
+            _ = [
+                event
+                async for event in resumed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "narrow")],
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                    )
+                )
+            ]
+
+            store = await _reopen_store(session_store_case, store)
+            narrowed = await store.load(session_id)
+            forked = await store.load(fork_session_id)
+            assert narrowed is not None
+            assert forked is not None
+            assert narrowed.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+            assert forked.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+            expected_profile = execution_profile_from_session_metadata(narrowed.metadata)
+            before = narrowed.model_copy(deep=True)
+            with pytest.raises(ValueError, match="never widened"):
+                await store.transition_status_and_checkpoint(
+                    session_id,
+                    from_statuses={SessionStatus.COMPLETED},
+                    to_status=SessionStatus.RUNNING,
+                    checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                    execution_profile=expected_profile,
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("alpha",)),
+                )
+            assert await store.load(session_id) == before
         finally:
             await _close_store(store)
 
@@ -5668,13 +5786,17 @@ def test_session_store_conformance_registration_drift_rejects_paused_call(
                     )
                 ]
 
-            assert raised.value.changed_component_classes == (
-                ExecutionProfileComponentClass.DIRECT_TOOLS,
-                ExecutionProfileComponentClass.EFFECT_AUTHORITY,
-                ExecutionProfileComponentClass.EXECUTION_POLICIES,
-                ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
-                ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
-            )
+                assert raised.value.changed_component_classes == (
+                    ExecutionProfileComponentClass.DIRECT_TOOLS,
+                    ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+                    ExecutionProfileComponentClass.EXECUTION_POLICIES,
+                    ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+                )
+                current = await store.load(session_id)
+                assert current is not None
+                assert current.tool_capability_ceiling == ToolCapabilityCeiling(
+                    tool_names=("stateful_effect",)
+                )
             assert late_calls == []
             assert protected_calls == []
             assert resumed_provider.requests == []

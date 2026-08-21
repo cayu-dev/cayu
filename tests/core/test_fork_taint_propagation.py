@@ -188,6 +188,45 @@ def test_agent_override_explains_that_the_source_agent_must_be_registered() -> N
     asyncio.run(scenario())
 
 
+def test_profiled_fork_replay_does_not_require_source_registration() -> None:
+    async def scenario() -> None:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            ScriptedModelProvider(
+                [
+                    [
+                        ModelStreamEvent.text_delta("Source complete."),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ]
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="source", model="scripted-model"))
+        async for _ in app.run(
+            RunRequest(
+                agent_name="source",
+                session_id="replay-source",
+                messages=[Message.text("user", "Create the source session.")],
+            )
+        ):
+            pass
+
+        request = ForkSessionRequest(
+            source_session_id="replay-source",
+            session_id="replay-child",
+        )
+        first = [event async for event in app.fork_session(request)]
+
+        reconstructed = CayuApp(session_store=app.session_store, enable_logging=False)
+        replay = [event async for event in reconstructed.fork_session(request)]
+
+        assert [event.id for event in replay] == [event.id for event in first]
+        assert [event.type for event in replay] == [EventType.SESSION_FORKED]
+
+    asyncio.run(scenario())
+
+
 def test_store_rejects_fork_when_source_run_epoch_changed_during_preparation() -> None:
     async def scenario() -> None:
         from cayu import InMemorySessionStore

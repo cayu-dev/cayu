@@ -652,6 +652,7 @@ from cayu.runtime.tasks import (
 )
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
+    TOOL_CAPABILITY_CEILING_SCHEMA_VERSION,
     TOOL_EXPOSURE_MAX_CATALOG_BYTES,
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     TOOL_EXPOSURE_METADATA_MAX_BYTES,
@@ -662,10 +663,13 @@ from cayu.runtime.tool_exposure import (
     RegisteredToolCapability,
     ResolvedToolExposure,
     StaticToolExposurePolicy,
+    ToolCapabilityCeiling,
     ToolExposureDecision,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
     copy_resolved_tool_exposure,
+    copy_tool_capability_ceiling,
+    resolve_tool_capability_ceiling,
     resolve_tool_exposure,
 )
 from cayu.runtime.tool_policy import (
@@ -817,6 +821,7 @@ __all__ = [
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES",
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES",
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS",
+    "TOOL_CAPABILITY_CEILING_SCHEMA_VERSION",
     "TOOL_EXPOSURE_MAX_CATALOG_BYTES",
     "TOOL_EXPOSURE_MAX_REGISTERED_TOOLS",
     "TOOL_EXPOSURE_METADATA_MAX_BYTES",
@@ -1320,6 +1325,7 @@ __all__ = [
     "ToolApprovalRecoveryRequest",
     "ToolApprovalRequest",
     "ToolCallHookContext",
+    "ToolCapabilityCeiling",
     "ToolExposureDecision",
     "ToolExposurePolicy",
     "ToolExposurePolicyRequest",
@@ -1410,6 +1416,7 @@ __all__ = [
     "copy_retry_policy",
     "copy_run_limits",
     "copy_session_user_metadata",
+    "copy_tool_capability_ceiling",
     "copy_tool_result_projection_policy",
     "copy_tool_round_identity",
     "default_compaction_prompt",
@@ -1437,6 +1444,7 @@ __all__ = [
     "public_authority_alias_is_reserved",
     "replace_session_user_metadata",
     "resolve_business_approval",
+    "resolve_tool_capability_ceiling",
     "resolve_tool_exposure",
     "retry_decision",
     "run_task_worker",

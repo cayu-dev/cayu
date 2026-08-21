@@ -750,6 +750,25 @@ def _aggregate_identity_strength(
     return ExecutionProfileIdentityStrength.STRUCTURAL
 
 
+def direct_tool_capability_ceiling_component(
+    tool_names: Iterable[str],
+) -> ExecutionProfileComponentIdentity:
+    """Build the canonical profile component for one direct-tool ceiling."""
+
+    names = tuple(require_durable_clean_nonblank(name, "tool_name") for name in tool_names)
+    if len(names) != len(set(names)):
+        raise ValueError("tool_names must contain unique values.")
+    return _available_component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileIdentityStrength.STRUCTURAL,
+        {
+            "view_kind": "direct",
+            "generation": 1,
+            "grant_baseline": list(names),
+        },
+    )
+
+
 def build_execution_profile_identity(
     *,
     runtime_name: str,

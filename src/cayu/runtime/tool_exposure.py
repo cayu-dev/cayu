@@ -34,6 +34,7 @@ from cayu.core.execution_identity import (
 from cayu.core.tools import ToolEffect, ToolResult
 
 TOOL_EXPOSURE_SCHEMA_VERSION = 1
+TOOL_CAPABILITY_CEILING_SCHEMA_VERSION = 1
 TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS = 256
 TOOL_EXPOSURE_MAX_REGISTERED_TOOLS = 10_000
 TOOL_EXPOSURE_MAX_CATALOG_BYTES = 32 * 1024 * 1024
@@ -41,6 +42,7 @@ TOOL_EXPOSURE_METADATA_MAX_ENTRIES = 64
 TOOL_EXPOSURE_METADATA_MAX_BYTES = 4 * 1024
 ALL_REGISTERED_TOOLS_PROFILE_ID = "cayu:all-registered-tools:v1"
 NOT_EXPOSED_IN_REQUEST_REASON = "not_exposed_in_request"
+TOOL_CAPABILITY_CEILING_METADATA_KEY = "cayu:tool_capability_ceiling"
 
 
 def _sha256_durable_json(value: Any, field_name: str) -> str:
@@ -217,6 +219,172 @@ def _revalidate_registered_tool_capability(
         schema_fingerprint=value.schema_fingerprint,
         definition_fingerprint=value.definition_fingerprint,
     )
+
+
+class ToolCapabilityCeiling(BaseModel):
+    """Immutable maximum application-tool set for one durable session.
+
+    Callers name already registered tools. The runtime canonicalizes those names
+    to registration order before the ceiling becomes session authority. Its
+    fingerprint is safe identity evidence; it does not contain schemas, tool
+    implementations, policy bodies, credentials, or arguments.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = TOOL_CAPABILITY_CEILING_SCHEMA_VERSION
+    tool_names: tuple[str, ...] = ()
+    fingerprint: str = ""
+
+    @field_validator("tool_names", mode="before")
+    @classmethod
+    def copy_tool_names(cls, value: object) -> tuple[Any, ...]:
+        return _copy_bounded_sequence(
+            value,
+            field_name="tool_names",
+            max_items=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
+        )
+
+    @field_validator("tool_names")
+    @classmethod
+    def validate_tool_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        names = tuple(
+            _validate_tool_name(name, f"tool_names[{index}]") for index, name in enumerate(value)
+        )
+        if len(names) != len(set(names)):
+            raise ValueError("tool_names must contain unique tool names.")
+        return names
+
+    @model_validator(mode="after")
+    def validate_and_bind_fingerprint(self) -> ToolCapabilityCeiling:
+        fingerprint = _sha256_durable_json(
+            {
+                "record_type": "cayu.tool-capability-ceiling",
+                "schema_version": self.schema_version,
+                "tool_names": list(self.tool_names),
+            },
+            "tool_capability_ceiling",
+        )
+        if self.fingerprint not in {"", fingerprint}:
+            raise ValueError("fingerprint does not match the tool capability ceiling.")
+        object.__setattr__(self, "fingerprint", fingerprint)
+        return self
+
+
+def copy_tool_capability_ceiling(
+    ceiling: ToolCapabilityCeiling,
+) -> ToolCapabilityCeiling:
+    """Return a detached, fully revalidated durable ceiling."""
+
+    if type(ceiling) is not ToolCapabilityCeiling:
+        raise TypeError("ceiling must be a ToolCapabilityCeiling.")
+    return ToolCapabilityCeiling.model_validate(ceiling.model_dump(mode="python", warnings=False))
+
+
+def resolve_tool_capability_ceiling(
+    requested: ToolCapabilityCeiling | None,
+    registered_tools: tuple[RegisteredToolCapability, ...],
+    *,
+    maximum: ToolCapabilityCeiling | None = None,
+) -> ToolCapabilityCeiling:
+    """Canonicalize a new or narrowed ceiling against registered capabilities.
+
+    ``maximum`` is the durable parent/session ceiling. A requested ceiling may
+    only preserve or narrow it. Maximum names absent from a reconstructed
+    catalog are removed; no newly registered or child-only name can enter the
+    result.
+    """
+
+    capabilities = _copy_capability_sequence(registered_tools, "registered_tools")
+    registered_names = tuple(capability.name for capability in capabilities)
+    if len(registered_names) != len(set(registered_names)):
+        raise ValueError("registered_tools must contain unique tool names.")
+    registered_name_set = frozenset(registered_names)
+
+    if requested is not None:
+        requested = copy_tool_capability_ceiling(requested)
+    if maximum is not None:
+        maximum = copy_tool_capability_ceiling(maximum)
+        maximum_name_set = frozenset(maximum.tool_names)
+        maximum_names = tuple(name for name in maximum.tool_names if name in registered_name_set)
+    else:
+        maximum_names = registered_names
+        maximum_name_set = registered_name_set
+
+    selected_names = maximum_names if requested is None else requested.tool_names
+    if any(name not in registered_name_set for name in selected_names):
+        raise ValueError("The requested tool capability ceiling contains an unregistered tool.")
+    if any(name not in maximum_name_set for name in selected_names):
+        raise ValueError("A tool capability ceiling may be narrowed but never widened.")
+    selected_name_set = frozenset(selected_names)
+    canonical_names = tuple(name for name in registered_names if name in selected_name_set)
+    return ToolCapabilityCeiling(tool_names=canonical_names)
+
+
+def _resolve_initial_tool_capability_ceiling(
+    requested: ToolCapabilityCeiling | None,
+    registered_tools: tuple[RegisteredToolCapability, ...],
+) -> ToolCapabilityCeiling | None:
+    """Resolve initial authority while preserving bounded oversized-catalog failure."""
+
+    if requested is None:
+        if len(registered_tools) > TOOL_EXPOSURE_MAX_REGISTERED_TOOLS:
+            return None
+        catalog_bytes = 2 + sum(
+            capability._canonical_size_bytes + (1 if index else 0)
+            for index, capability in enumerate(registered_tools)
+        )
+        if catalog_bytes > TOOL_EXPOSURE_MAX_CATALOG_BYTES:
+            return None
+    return resolve_tool_capability_ceiling(requested, registered_tools)
+
+
+def tool_capability_ceiling_from_session_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    required: bool = True,
+) -> ToolCapabilityCeiling | None:
+    """Load copied durable ceiling authority from runtime-owned session metadata."""
+
+    if not isinstance(metadata, Mapping):
+        raise TypeError("session metadata must be a mapping.")
+    raw = metadata.get(TOOL_CAPABILITY_CEILING_METADATA_KEY)
+    if raw is None:
+        if required:
+            raise ValueError("Session metadata has no durable tool capability ceiling.")
+        return None
+    return ToolCapabilityCeiling.model_validate(raw)
+
+
+def session_metadata_with_tool_capability_ceiling(
+    metadata: Mapping[str, Any],
+    ceiling: ToolCapabilityCeiling,
+) -> dict[str, Any]:
+    """Copy metadata and set exact runtime-owned ceiling authority."""
+
+    copied = copy_durable_json_object(metadata, "session.metadata")
+    copied[TOOL_CAPABILITY_CEILING_METADATA_KEY] = copy_tool_capability_ceiling(ceiling).model_dump(
+        mode="json"
+    )
+    return copy_durable_json_object(copied, "session.metadata")
+
+
+def session_metadata_after_tool_capability_ceiling_narrowing(
+    metadata: Mapping[str, Any],
+    ceiling: ToolCapabilityCeiling,
+) -> dict[str, Any]:
+    """Atomically applicable metadata update that rejects every widening path."""
+
+    candidate = copy_tool_capability_ceiling(ceiling)
+    current = tool_capability_ceiling_from_session_metadata(metadata, required=False)
+    if current is not None and not frozenset(candidate.tool_names) <= frozenset(current.tool_names):
+        raise ValueError("A tool capability ceiling may be narrowed but never widened.")
+    return session_metadata_with_tool_capability_ceiling(metadata, candidate)
 
 
 def _copy_capability_sequence(

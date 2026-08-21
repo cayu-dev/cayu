@@ -4275,7 +4275,11 @@ def session_from_request(
             session_id=session_id,
             parent_session=parent_session,
         ),
-        metadata=session_metadata_for_creation(request.metadata, identity=identity),
+        metadata=session_metadata_for_creation(
+            request.metadata,
+            identity=identity,
+            tool_capability_ceiling=request.tool_capability_ceiling,
+        ),
         labels=copy_label_map(request.labels, "labels"),
     )
 

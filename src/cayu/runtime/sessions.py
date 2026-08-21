@@ -164,6 +164,7 @@ from cayu.runtime.execution_profiles import (
     checkpoint_with_active_invocation_execution_profile,
     copy_execution_profile_adoption_intent,
     copy_execution_profile_decision,
+    direct_tool_capability_ceiling_component,
     execution_profile_baseline_from_session_metadata,
     execution_profile_changes_authority,
     execution_profile_from_session_metadata,
@@ -207,6 +208,14 @@ from cayu.runtime.structured_output import (
     copy_structured_output_spec,
 )
 from cayu.runtime.tasks import TaskInvocationSnapshot
+from cayu.runtime.tool_exposure import (
+    TOOL_CAPABILITY_CEILING_METADATA_KEY,
+    ToolCapabilityCeiling,
+    copy_tool_capability_ceiling,
+    session_metadata_after_tool_capability_ceiling_narrowing,
+    session_metadata_with_tool_capability_ceiling,
+    tool_capability_ceiling_from_session_metadata,
+)
 from cayu.runtime.usage import UsageMetrics
 from cayu.vaults.redaction import SecretRedactor
 
@@ -1025,6 +1034,16 @@ class ModelTarget(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+def _copy_optional_tool_capability_ceiling(
+    value: object,
+) -> ToolCapabilityCeiling | None:
+    if value is None:
+        return None
+    if isinstance(value, ToolCapabilityCeiling):
+        return copy_tool_capability_ceiling(value)
+    return ToolCapabilityCeiling.model_validate(value)
+
+
 class RunRequest(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -1045,6 +1064,8 @@ class RunRequest(BaseModel):
     # Exact per-run execution target. When omitted, the agent model and provider
     # routing/defaults select the initial target.
     target: ModelTarget | None = None
+    # Durable application-tool maximum. None selects the current registered catalog.
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -1084,6 +1105,7 @@ class RunRequest(BaseModel):
                 for key in (
                     MODEL_TARGET_PROJECTION_METADATA_KEY,
                     EXECUTION_PROFILE_METADATA_KEY,
+                    TOOL_CAPABILITY_CEILING_METADATA_KEY,
                     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
                     FORK_EXECUTION_PROFILE_METADATA_KEY,
                 )
@@ -1099,6 +1121,8 @@ class RunRequest(BaseModel):
                 authority_name = "execution-profile authority"
             elif reserved_key == FORK_EXECUTION_PROFILE_METADATA_KEY:
                 authority_name = "fork-profile authority"
+            elif reserved_key == TOOL_CAPABILITY_CEILING_METADATA_KEY:
+                authority_name = "tool-capability-ceiling authority"
             else:
                 authority_name = "prompt-transition authority"
             raise ValueError(f"metadata[{reserved_key!r}] is runtime-owned {authority_name}.")
@@ -1116,6 +1140,14 @@ class RunRequest(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @field_validator("tool_capability_ceiling", mode="before")
+    @classmethod
+    def copy_tool_capability_ceiling(
+        cls,
+        value: object,
+    ) -> ToolCapabilityCeiling | None:
+        return _copy_optional_tool_capability_ceiling(value)
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -1245,6 +1277,8 @@ class ResumeRequest(BaseModel):
     session_id: str
     messages: list[Message]
     target: ModelTarget | None = None
+    # None preserves the durable maximum; an explicit subset narrows it permanently.
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
@@ -1279,6 +1313,14 @@ class ResumeRequest(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @field_validator("tool_capability_ceiling", mode="before")
+    @classmethod
+    def copy_tool_capability_ceiling(
+        cls,
+        value: object,
+    ) -> ToolCapabilityCeiling | None:
+        return _copy_optional_tool_capability_ceiling(value)
 
     @field_validator("profile_adoption", mode="before")
     @classmethod
@@ -1769,6 +1811,8 @@ class ForkSessionRequest(BaseModel):
     agent_name: str | None = None
     model: str | None = None
     environment_name: str | None = None
+    # None inherits the source maximum; an explicit subset narrows it for the child.
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None
     transcript_cursor: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     copy_checkpoint: StrictBool = True
     system_prompt_policy: ForkSystemPromptPolicy = ForkSystemPromptPolicy.INHERIT_SOURCE
@@ -1811,6 +1855,7 @@ class ForkSessionRequest(BaseModel):
         reserved_authority_kinds = {
             MODEL_TARGET_PROJECTION_METADATA_KEY: "model-target authority",
             EXECUTION_PROFILE_METADATA_KEY: "execution-profile authority",
+            TOOL_CAPABILITY_CEILING_METADATA_KEY: "tool-capability-ceiling authority",
             PROMPT_ANATOMY_TRANSITION_METADATA_KEY: "prompt-transition authority",
             FORK_EXECUTION_PROFILE_METADATA_KEY: "fork-profile authority",
             FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY: "fork-group source authority",
@@ -1826,6 +1871,14 @@ class ForkSessionRequest(BaseModel):
                 f"{reserved_authority_kinds[reserved_key]}."
             )
         return copied
+
+    @field_validator("tool_capability_ceiling", mode="before")
+    @classmethod
+    def copy_tool_capability_ceiling(
+        cls,
+        value: object,
+    ) -> ToolCapabilityCeiling | None:
+        return _copy_optional_tool_capability_ceiling(value)
 
     @field_validator("profile_adoption", mode="before")
     @classmethod
@@ -2027,13 +2080,25 @@ class SessionForkProfileRelationship(BaseModel):
         if active != (self.source_active_run_epoch is not None):
             raise ValueError("Active parent profile authority requires a run epoch.")
         if self.selection is ForkExecutionProfileSelection.INHERIT_PARENT:
-            if self.decision is not None or self.selected_profile != self.source_profile:
+            selected_changes = changed_execution_profile_components(
+                self.source_profile,
+                self.selected_profile,
+            )
+            selected_profile_changed_outside_ceiling = (
+                self.selected_profile != self.source_profile
+                and any(
+                    component != ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+                    for component in selected_changes
+                )
+            )
+            if self.decision is not None or selected_profile_changed_outside_ceiling:
                 raise ValueError("Inherited fork profile authority is inconsistent.")
             if self.initial_invocation_profile is not None:
                 allowed_initial_changes = {
                     ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
                     ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
                     ExecutionProfileComponentClass.FINALIZATION,
+                    ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
                 }
                 if any(
                     component not in allowed_initial_changes
@@ -2442,6 +2507,15 @@ class Session(BaseModel):
             return None
         return require_clean_nonblank(value, info.field_name)
 
+    @property
+    def tool_capability_ceiling(self) -> ToolCapabilityCeiling | None:
+        """Return copied durable session authority, or ``None`` for a legacy record."""
+
+        return tool_capability_ceiling_from_session_metadata(
+            self.metadata,
+            required=False,
+        )
+
 
 def _queued_dispatch_session_instance_fingerprint(session: Session) -> str:
     """Identify one durable session creation without exposing invocation origin data."""
@@ -2691,6 +2765,7 @@ class SessionInvocationAdmission:
     checkpoint_transform: CheckpointTransform
     execution_profile: ExecutionProfileIdentity
     interaction_source_messages: tuple[Message, ...]
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None
     interaction_started_event: Event | None = None
     continued_interaction_id: str | None = None
     defer_interaction_source: bool = False
@@ -2713,6 +2788,11 @@ class SessionInvocationAdmission:
             self,
             "execution_profile",
             ExecutionProfileIdentity.model_validate(self.execution_profile.model_dump(mode="json")),
+        )
+        object.__setattr__(
+            self,
+            "tool_capability_ceiling",
+            _copy_optional_tool_capability_ceiling(self.tool_capability_ceiling),
         )
         if type(self.allow_unprofiled_derived_session) is not bool:
             raise TypeError("allow_unprofiled_derived_session must be a boolean.")
@@ -6763,6 +6843,7 @@ class SessionStore(ABC):
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
         """Atomically persist status, checkpoint, interaction, target, and profile admission."""
 
@@ -6774,6 +6855,7 @@ class SessionStore(ABC):
         to_status: SessionStatus,
         checkpoint_transform: CheckpointTransform,
         execution_profile: ExecutionProfileIdentity,
+        tool_capability_ceiling: ToolCapabilityCeiling | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
@@ -6799,6 +6881,7 @@ class SessionStore(ABC):
             model_transition=model_transition,
             execution_profile=execution_profile,
             execution_profile_decision=execution_profile_decision,
+            tool_capability_ceiling=tool_capability_ceiling,
         )
 
     async def admit_session_invocation(
@@ -6873,6 +6956,7 @@ class SessionStore(ABC):
             "defer_interaction_source": admission.defer_interaction_source,
             "model_transition": admission.model_transition,
             "execution_profile_decision": admission.execution_profile_decision,
+            "tool_capability_ceiling": admission.tool_capability_ceiling,
         }
         if active_profile is None:
             if admission.allow_unprofiled_derived_session:
@@ -8753,7 +8837,6 @@ class InMemorySessionStore(SessionStore):
                 if request.parent_session_id is None
                 else self._sessions[request.parent_session_id]
             )
-
             now = datetime.now(UTC)
             session = Session(
                 id=session_id,
@@ -8775,7 +8858,11 @@ class InMemorySessionStore(SessionStore):
                     parent_session=parent_session,
                 ),
                 labels=request.labels,
-                metadata=session_metadata_for_creation(request.metadata, identity=identity),
+                metadata=session_metadata_for_creation(
+                    request.metadata,
+                    identity=identity,
+                    tool_capability_ceiling=request.tool_capability_ceiling,
+                ),
                 run_epoch=1 if admission is not None else 0,
             )
             pending_checkpoint: _PreparedInMemoryCheckpointStore | None = None
@@ -9469,6 +9556,7 @@ class InMemorySessionStore(SessionStore):
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -9492,6 +9580,9 @@ class InMemorySessionStore(SessionStore):
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
             execution_profile_decision
+        )
+        prepared_tool_capability_ceiling = _copy_optional_tool_capability_ceiling(
+            tool_capability_ceiling
         )
         if prepared_execution_profile_decision is not None and admission is None:
             raise ValueError("An execution-profile decision requires atomic interaction admission.")
@@ -9547,18 +9638,24 @@ class InMemorySessionStore(SessionStore):
                 "last_activity_at": now,
                 "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
             }
+            transition_metadata = transition_profile_metadata
             if prepared_model_transition is not None:
+                transition_metadata = _session_metadata_after_model_transition(
+                    session,
+                    prepared_model_transition,
+                    execution_profile_metadata=transition_profile_metadata,
+                )
                 session_updates.update(
                     provider_name=prepared_model_transition.target.provider_name,
                     model=prepared_model_transition.target.model,
-                    metadata=_session_metadata_after_model_transition(
-                        session,
-                        prepared_model_transition,
-                        execution_profile_metadata=transition_profile_metadata,
-                    ),
                 )
-            elif transition_profile_metadata is not None:
-                session_updates["metadata"] = transition_profile_metadata
+            transition_metadata = _session_metadata_after_tool_capability_ceiling_admission(
+                session,
+                prepared_tool_capability_ceiling,
+                transition_metadata=transition_metadata,
+            )
+            if transition_metadata is not None:
+                session_updates["metadata"] = transition_metadata
             updated = session.model_copy(update=session_updates)
             prepared_events: _PreparedInMemoryEventAppend | None = None
             admission_events = []
@@ -13173,6 +13270,9 @@ def copy_run_request(request: RunRequest) -> RunRequest:
                 model=request.target.model,
             )
         ),
+        tool_capability_ceiling=_copy_optional_tool_capability_ceiling(
+            request.tool_capability_ceiling
+        ),
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
@@ -13840,6 +13940,9 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
                 model=request.target.model,
             )
         ),
+        tool_capability_ceiling=_copy_optional_tool_capability_ceiling(
+            request.tool_capability_ceiling
+        ),
         profile_adoption=(
             None
             if request.profile_adoption is None
@@ -14050,6 +14153,9 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
         agent_name=request.agent_name,
         model=request.model,
         environment_name=request.environment_name,
+        tool_capability_ceiling=_copy_optional_tool_capability_ceiling(
+            request.tool_capability_ceiling
+        ),
         transcript_cursor=request.transcript_cursor,
         copy_checkpoint=request.copy_checkpoint,
         system_prompt_policy=request.system_prompt_policy,
@@ -14219,6 +14325,7 @@ def session_metadata_for_creation(
     metadata: dict[str, Any],
     *,
     identity: SessionIdentity,
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None,
 ) -> dict[str, Any]:
     """Combine caller metadata with runtime-owned creation authority."""
 
@@ -14227,9 +14334,26 @@ def session_metadata_for_creation(
         raise ValueError("Session metadata contains runtime-owned execution-profile authority.")
     if FORK_EXECUTION_PROFILE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned fork-profile authority.")
+    if TOOL_CAPABILITY_CEILING_METADATA_KEY in copied:
+        raise ValueError(
+            "Session metadata contains runtime-owned tool-capability-ceiling authority."
+        )
+    if tool_capability_ceiling is not None and identity.execution_profile is None:
+        raise ValueError("A tool capability ceiling requires a durable session execution profile.")
     if identity.execution_profile is not None:
+        if tool_capability_ceiling is not None and identity.execution_profile.component(
+            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+        ) != direct_tool_capability_ceiling_component(tool_capability_ceiling.tool_names):
+            raise ValueError(
+                "Session execution profile conflicts with its tool capability ceiling."
+            )
         copied[EXECUTION_PROFILE_METADATA_KEY] = execution_profile_session_metadata(
             identity.execution_profile
+        )
+    if tool_capability_ceiling is not None:
+        copied = session_metadata_with_tool_capability_ceiling(
+            copied,
+            tool_capability_ceiling,
         )
     return copied
 
@@ -14319,6 +14443,40 @@ def _validate_execution_profile_admission(
     return execution_profile_metadata_after_adoption(
         session.metadata,
         candidate_profile,
+    )
+
+
+def _session_metadata_after_tool_capability_ceiling_admission(
+    session: Session,
+    ceiling: ToolCapabilityCeiling | None,
+    *,
+    transition_metadata: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate a ceiling CAS against the stored session and compose metadata."""
+
+    if ceiling is None:
+        return transition_metadata
+    current_ceiling = tool_capability_ceiling_from_session_metadata(
+        session.metadata,
+        required=False,
+    )
+    narrowed = session_metadata_after_tool_capability_ceiling_narrowing(
+        session.metadata,
+        ceiling,
+    )
+    base = session.metadata if transition_metadata is None else transition_metadata
+    admitted_profile = execution_profile_from_session_metadata(base)
+    if admitted_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != direct_tool_capability_ceiling_component(ceiling.tool_names):
+        raise ValueError("Admitted execution profile conflicts with its tool capability ceiling.")
+    if transition_metadata is None and current_ceiling == ceiling:
+        return None
+    narrowed_ceiling = tool_capability_ceiling_from_session_metadata(narrowed)
+    assert narrowed_ceiling is not None
+    return session_metadata_with_tool_capability_ceiling(
+        base,
+        narrowed_ceiling,
     )
 
 
@@ -14616,10 +14774,40 @@ def _validate_profiled_fork_authority(
     system_prompt_replacement: ForkSystemPromptReplacement | None,
     transcript_validator: ForkTranscriptValidator | None,
 ) -> None:
+    source_ceiling = tool_capability_ceiling_from_session_metadata(
+        source_session.metadata,
+        required=False,
+    )
+    fork_ceiling = tool_capability_ceiling_from_session_metadata(
+        fork.metadata,
+        required=False,
+    )
+    if source_ceiling is not None and fork_ceiling is None:
+        raise ValueError("A fork cannot remove durable tool capability ceiling authority.")
+    if (
+        source_ceiling is not None
+        and fork_ceiling is not None
+        and not frozenset(fork_ceiling.tool_names) <= frozenset(source_ceiling.tool_names)
+    ):
+        raise ValueError("A fork cannot widen its source tool capability ceiling.")
     source_kind, source_profile, active = effective_fork_source_execution_profile(
         source_session,
         source_checkpoint,
     )
+    if source_ceiling is not None and source_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != direct_tool_capability_ceiling_component(source_ceiling.tool_names):
+        raise ValueError("Fork source profile conflicts with its tool capability ceiling.")
+    if fork_ceiling is not None and relationship.selected_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != direct_tool_capability_ceiling_component(fork_ceiling.tool_names):
+        raise ValueError("Fork child profile conflicts with its tool capability ceiling.")
+    if fork_ceiling is None and relationship.selected_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != source_profile.component(ExecutionProfileComponentClass.TOOL_VIEW_GRANTS):
+        raise ValueError(
+            "A fork cannot change tool-view authority without a durable capability ceiling."
+        )
     if (
         relationship.source_session_id != source_session.id
         or relationship.child_session_id != fork.id

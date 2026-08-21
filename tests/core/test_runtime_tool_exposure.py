@@ -26,16 +26,30 @@ from cayu.runtime import (
     ContextCountingConfig,
     ContextCountingMode,
     EventQuery,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RecentTurnsContextPolicy,
+    ResolutionActor,
+    ResolutionActorSource,
+    ResumeRequest,
     RetryPolicy,
     RunRequest,
+    SessionIdentity,
     SessionStatus,
     StaticToolExposurePolicy,
     StructuredOutputSpec,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolCapabilityCeiling,
     ToolExposureDecision,
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
@@ -207,6 +221,26 @@ class _PreviousProfileExposurePolicy(ToolExposurePolicy):
         )
 
 
+class _AllowProfileAdoption(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "tests:tool-ceiling-profile-adoption:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="The test explicitly authorizes the selected child profile.",
+            authority_decision=(
+                ExecutionProfileAuthorityDecision.AUTHORIZED
+                if request.authority_review_required
+                else ExecutionProfileAuthorityDecision.NOT_REQUIRED
+            ),
+        )
+
+
 async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
@@ -314,6 +348,526 @@ def test_default_exposure_preserves_all_tools_and_unbounded_run_metadata() -> No
     assert [_tool_names(request) for request in provider.requests] == [["alpha", "beta"]]
 
 
+def test_legacy_session_without_ceiling_uses_catalog_max_and_upgrades_on_resume() -> None:
+    async def exercise() -> None:
+        completed = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        provider = _ScriptedProvider([completed, completed])
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha"), _RecordingTool("beta")],
+        )
+
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="legacy-ceiling-profile-template",
+                messages=[Message.text("user", "template")],
+            ),
+        )
+        template = await store.load("legacy-ceiling-profile-template")
+        assert template is not None
+        profile = execution_profiles.execution_profile_from_session_metadata(template.metadata)
+        legacy = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="legacy-ceiling-session",
+                messages=[Message.text("user", "legacy input")],
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="fake-model",
+                execution_profile=profile,
+            ),
+        )
+        legacy = await store.update_status(legacy.id, SessionStatus.COMPLETED)
+        assert legacy.tool_capability_ceiling is None
+
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=legacy.id,
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert [_tool_names(request) for request in provider.requests] == [
+            ["alpha", "beta"],
+            ["alpha", "beta"],
+        ]
+        upgraded = await store.load(legacy.id)
+        assert upgraded is not None
+        assert upgraded.tool_capability_ceiling == ToolCapabilityCeiling(
+            tool_names=("alpha", "beta")
+        )
+
+    asyncio.run(exercise())
+
+
+def test_legacy_cross_agent_fork_persists_the_inherited_catalog_intersection() -> None:
+    async def exercise() -> None:
+        completed = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        provider = _ScriptedProvider([completed])
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowProfileAdoption(),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="source", model="fake-model"),
+            tools=[_RecordingTool("alpha"), _RecordingTool("shared")],
+        )
+        app.register_agent(
+            AgentSpec(name="child", model="fake-model"),
+            tools=[_RecordingTool("shared"), _RecordingTool("child_only")],
+        )
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="source",
+                session_id="legacy-fork-profile-template",
+                messages=[Message.text("user", "template")],
+            ),
+        )
+        template = await store.load("legacy-fork-profile-template")
+        assert template is not None
+        legacy_source = await store.create(
+            RunRequest(
+                agent_name="source",
+                session_id="legacy-fork-source",
+                messages=[Message.text("user", "legacy input")],
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="fake-model",
+                execution_profile=(
+                    execution_profiles.execution_profile_from_session_metadata(template.metadata)
+                ),
+            ),
+        )
+        legacy_source = await store.update_status(
+            legacy_source.id,
+            SessionStatus.COMPLETED,
+        )
+        assert legacy_source.tool_capability_ceiling is None
+
+        events = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=legacy_source.id,
+                    session_id="legacy-fork-child",
+                    agent_name="child",
+                    execution_profile_selection=(ForkExecutionProfileSelection.CURRENT_CHILD),
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="legacy-fork-intersection-v1",
+                        reason="Install the reviewed child profile.",
+                        requested_by=ResolutionActor(
+                            subject="test-caller",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_FORKED
+        child = await store.load("legacy-fork-child")
+        assert child is not None
+        assert child.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=("shared",))
+
+    asyncio.run(exercise())
+
+
+def test_legacy_unprofiled_fork_keeps_compatibility_without_adopting_a_ceiling() -> None:
+    async def exercise() -> None:
+        completed = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        provider = _ScriptedProvider([completed])
+        store = InMemorySessionStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="legacy-unprofiled-source",
+                messages=[Message.text("user", "source")],
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="fake-model",
+            ),
+        )
+        child = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="legacy-unprofiled-child",
+                parent_session_id=source.id,
+                messages=[Message.text("user", "child")],
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="fake-model",
+            ),
+        )
+        child = await store.update_status(child.id, SessionStatus.COMPLETED)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha")],
+        )
+
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=child.id,
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        resumed = await store.load(child.id)
+        assert resumed is not None
+        assert resumed.tool_capability_ceiling is None
+        assert [_tool_names(request) for request in provider.requests] == [["alpha"]]
+
+    asyncio.run(exercise())
+
+
+def test_durable_ceiling_can_narrow_on_resume_but_never_widen() -> None:
+    async def exercise() -> None:
+        completed = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        provider = _ScriptedProvider([completed, completed, completed])
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha"), _RecordingTool("beta")],
+        )
+
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="durable-ceiling-resume",
+                messages=[Message.text("user", "start")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("beta",)),
+            ),
+        )
+        created = await store.load("durable-ceiling-resume")
+        assert created is not None
+        assert created.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=("beta",))
+        profile = execution_profiles.execution_profile_from_session_metadata(created.metadata)
+        assert profile.component(
+            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+        ) == execution_profiles.direct_tool_capability_ceiling_component(("beta",))
+
+        narrowed_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=created.id,
+                    messages=[Message.text("user", "narrow")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                )
+            )
+        ]
+        assert narrowed_events[-1].type is EventType.SESSION_COMPLETED
+        narrowed = await store.load(created.id)
+        assert narrowed is not None
+        assert narrowed.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+
+        with pytest.raises(ValueError, match="never widened"):
+            _ = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id=created.id,
+                        messages=[Message.text("user", "widen")],
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("beta",)),
+                    )
+                )
+            ]
+
+        preserved_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=created.id,
+                    messages=[Message.text("user", "preserve")],
+                )
+            )
+        ]
+        assert preserved_events[-1].type is EventType.SESSION_COMPLETED
+        assert [_tool_names(request) for request in provider.requests] == [["beta"], [], []]
+        preserved = await store.load(created.id)
+        assert preserved is not None
+        assert preserved.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+
+    asyncio.run(exercise())
+
+
+def test_forks_inherit_and_may_narrow_the_durable_ceiling() -> None:
+    async def exercise() -> None:
+        provider = _ScriptedProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha"), _RecordingTool("beta")],
+        )
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="ceiling-fork-source",
+                messages=[Message.text("user", "start")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("alpha",)),
+            ),
+        )
+
+        inherited_events = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="ceiling-fork-source",
+                    session_id="ceiling-fork-inherited",
+                )
+            )
+        ]
+        narrowed_events = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="ceiling-fork-source",
+                    session_id="ceiling-fork-narrowed",
+                    transcript_cursor=1,
+                    copy_checkpoint=False,
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                )
+            )
+        ]
+        assert inherited_events[-1].type is EventType.SESSION_FORKED
+        assert narrowed_events[-1].type is EventType.SESSION_FORKED
+        inherited = await store.load("ceiling-fork-inherited")
+        narrowed = await store.load("ceiling-fork-narrowed")
+        assert inherited is not None and narrowed is not None
+        assert inherited.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=("alpha",))
+        assert narrowed.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+
+        with pytest.raises(ValueError, match="never widened"):
+            _ = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id="ceiling-fork-source",
+                        session_id="ceiling-fork-widened",
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("alpha", "beta")),
+                    )
+                )
+            ]
+        assert await store.load("ceiling-fork-widened") is None
+
+    asyncio.run(exercise())
+
+
+def test_different_agent_fork_intersects_ceiling_and_current_child_profile() -> None:
+    async def exercise() -> None:
+        completed = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        provider = _ScriptedProvider([completed, completed])
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowProfileAdoption(),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="source", model="fake-model"),
+            tools=[_RecordingTool("shared"), _RecordingTool("source_only")],
+        )
+        app.register_agent(
+            AgentSpec(name="child", model="fake-model"),
+            tools=[_RecordingTool("shared"), _RecordingTool("child_only")],
+        )
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="source",
+                session_id="different-agent-ceiling-source",
+                messages=[Message.text("user", "start")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("shared", "source_only")),
+            ),
+        )
+
+        fork_events = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="different-agent-ceiling-source",
+                    session_id="different-agent-ceiling-child",
+                    agent_name="child",
+                    execution_profile_selection=(ForkExecutionProfileSelection.CURRENT_CHILD),
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="different-agent-ceiling-v1",
+                        reason="Install the reviewed child profile.",
+                        requested_by=ResolutionActor(
+                            subject="test-caller",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        ]
+        assert fork_events[-1].type is EventType.SESSION_FORKED
+        child = await store.load("different-agent-ceiling-child")
+        assert child is not None
+        assert child.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=("shared",))
+        child_profile = execution_profiles.execution_profile_from_session_metadata(child.metadata)
+        assert child_profile.component(
+            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+        ) == execution_profiles.direct_tool_capability_ceiling_component(("shared",))
+
+        resumed_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=child.id,
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+        assert [_tool_names(request) for request in provider.requests] == [
+            ["shared", "source_only"],
+            ["shared"],
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_changed_registration_cannot_silently_widen_a_reconstructed_session() -> None:
+    async def exercise() -> None:
+        completed = [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        store = InMemorySessionStore()
+
+        original_provider = _ScriptedProvider([completed])
+        original = CayuApp(session_store=store, enable_logging=False)
+        original.register_provider(original_provider, default=True)
+        original.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha"), _RecordingTool("beta")],
+        )
+        await _collect(
+            original,
+            RunRequest(
+                agent_name="assistant",
+                session_id="changed-registration-ceiling",
+                messages=[Message.text("user", "start")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("alpha",)),
+            ),
+        )
+
+        added_provider = _ScriptedProvider([completed])
+        with_addition = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowProfileAdoption(),
+            enable_logging=False,
+        )
+        with_addition.register_provider(added_provider, default=True)
+        with_addition.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("alpha"), _RecordingTool("gamma")],
+        )
+        added_events = [
+            event
+            async for event in with_addition.resume(
+                ResumeRequest(
+                    session_id="changed-registration-ceiling",
+                    messages=[Message.text("user", "after addition")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="changed-registration-addition-v1",
+                        reason="Adopt the reviewed registered catalog.",
+                        requested_by=ResolutionActor(
+                            subject="test-caller",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        ]
+        assert added_events[-1].type is EventType.SESSION_COMPLETED
+        assert [_tool_names(request) for request in added_provider.requests] == [["alpha"]]
+
+        removed_provider = _ScriptedProvider([completed])
+        with_removal = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowProfileAdoption(),
+            enable_logging=False,
+        )
+        with_removal.register_provider(removed_provider, default=True)
+        with_removal.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_RecordingTool("gamma")],
+        )
+        removed_events = [
+            event
+            async for event in with_removal.resume(
+                ResumeRequest(
+                    session_id="changed-registration-ceiling",
+                    messages=[Message.text("user", "after removal")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="changed-registration-removal-v1",
+                        reason="Adopt the reviewed registered catalog.",
+                        requested_by=ResolutionActor(
+                            subject="test-caller",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        ]
+        assert removed_events[-1].type is EventType.SESSION_COMPLETED
+        assert [_tool_names(request) for request in removed_provider.requests] == [[]]
+        reconstructed = await store.load("changed-registration-ceiling")
+        assert reconstructed is not None
+        assert reconstructed.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+
+    asyncio.run(exercise())
+
+
 def test_agent_registration_validates_the_exposure_policy_interface() -> None:
     app = CayuApp(enable_logging=False)
 
@@ -386,6 +940,7 @@ def test_empty_application_exposure_preserves_runtime_structured_output_tool() -
                 "additionalProperties": False,
             },
         ),
+        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
     )
 
     assert events[-1].type is EventType.SESSION_COMPLETED
@@ -528,7 +1083,12 @@ def test_unexposed_sibling_stays_blocked_across_approval_pause() -> None:
         runtime_hooks=[hook],
     )
 
-    pause_events = _run(app, "unexposed-approval-sibling")
+    ceiling = ToolCapabilityCeiling(tool_names=("visible", "hidden"))
+    pause_events = _run(
+        app,
+        "unexposed-approval-sibling",
+        tool_capability_ceiling=ceiling,
+    )
     approval = next(
         event for event in pause_events if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
@@ -562,6 +1122,9 @@ def test_unexposed_sibling_stays_blocked_across_approval_pause() -> None:
     [blocked] = [event for event in resume_events if event.type is EventType.TOOL_CALL_BLOCKED]
     assert blocked.tool_name == "hidden"
     assert blocked.payload["reason"] == "not_exposed_in_request"
+    session = asyncio.run(app.session_store.load("unexposed-approval-sibling"))
+    assert session is not None
+    assert session.tool_capability_ceiling == ceiling
 
 
 async def _collect_approval(
@@ -615,7 +1178,12 @@ def test_unexposed_sibling_stays_blocked_across_user_input_pause() -> None:
         tool_exposure_policy=exposure_policy,
     )
 
-    pause_events = _run(app, "unexposed-input-sibling")
+    ceiling = ToolCapabilityCeiling(tool_names=("ask_user", "hidden"))
+    pause_events = _run(
+        app,
+        "unexposed-input-sibling",
+        tool_capability_ceiling=ceiling,
+    )
     awaiting = next(
         event for event in pause_events if event.type is EventType.SESSION_AWAITING_USER_INPUT
     )
@@ -647,6 +1215,9 @@ def test_unexposed_sibling_stays_blocked_across_user_input_pause() -> None:
     [blocked] = [event for event in resume_events if event.type is EventType.TOOL_CALL_BLOCKED]
     assert blocked.tool_name == "hidden"
     assert blocked.payload["reason"] == "not_exposed_in_request"
+    session = asyncio.run(app.session_store.load("unexposed-input-sibling"))
+    assert session is not None
+    assert session.tool_capability_ceiling == ceiling
 
 
 def test_unexposed_call_stays_blocked_during_ordinary_tool_round_recovery() -> None:
@@ -685,6 +1256,7 @@ def test_unexposed_call_stays_blocked_during_ordinary_tool_round_recovery() -> N
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "go")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
             ),
         )
         assert initial_events[-1].type is EventType.SESSION_FAILED
@@ -694,6 +1266,9 @@ def test_unexposed_call_stays_blocked_during_ordinary_tool_round_recovery() -> N
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
         assert len(provider.requests) == 1
+        recovered = await store.load(session_id)
+        assert recovered is not None
+        assert recovered.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
         return await store.load_events(session_id), hidden, policy
 
     events, hidden, policy = asyncio.run(scenario())
@@ -836,7 +1411,11 @@ def test_one_exposure_snapshot_is_reused_for_retry_and_overflow_recovery(
         ),
     )
 
-    events = _run(app, f"frozen-{failure_kind}")
+    events = _run(
+        app,
+        f"frozen-{failure_kind}",
+        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("alpha",)),
+    )
 
     assert events[-1].type is EventType.SESSION_COMPLETED
     assert len(policy.requests) == 1

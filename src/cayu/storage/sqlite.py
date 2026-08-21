@@ -165,6 +165,7 @@ from cayu.runtime.sessions import (
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
+    _copy_optional_tool_capability_ceiling,
     _copy_profiled_fork_authority,
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
@@ -220,6 +221,7 @@ from cayu.runtime.sessions import (
     _runtime_publication_referenced_event_ids,
     _runtime_publication_storage_key,
     _session_metadata_after_model_transition,
+    _session_metadata_after_tool_capability_ceiling_admission,
     _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline_json,
     _terminal_publication_delete_block_reason,
@@ -351,6 +353,7 @@ from cayu.runtime.tasks import (
     prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
 )
+from cayu.runtime.tool_exposure import ToolCapabilityCeiling
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_support as sqlite_support
@@ -2549,6 +2552,7 @@ class SQLiteSessionStore(SessionStore):
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -2574,6 +2578,9 @@ class SQLiteSessionStore(SessionStore):
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
             execution_profile_decision
+        )
+        prepared_tool_capability_ceiling = _copy_optional_tool_capability_ceiling(
+            tool_capability_ceiling
         )
         if prepared_execution_profile_decision is not None and admission is None:
             raise ValueError("An execution-profile decision requires atomic interaction admission.")
@@ -2629,6 +2636,11 @@ class SQLiteSessionStore(SessionStore):
                         prepared_model_transition,
                         execution_profile_metadata=transition_profile_metadata,
                     )
+                transition_metadata = _session_metadata_after_tool_capability_ceiling_admission(
+                    loaded,
+                    prepared_tool_capability_ceiling,
+                    transition_metadata=transition_metadata,
+                )
 
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 transition_values = (

@@ -223,6 +223,7 @@ from cayu.runtime import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     ToolCallHookContext,
+    ToolCapabilityCeiling,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -17370,13 +17371,8 @@ def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
         "durable parent memory",
         "continue as the child",
     ]
-    assert child_provider.requests[0].tools == [
-        {
-            "name": "echo",
-            "description": "Echo text.",
-            "input_schema": EchoTool.spec.input_schema,
-        }
-    ]
+    assert child.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
+    assert child_provider.requests[0].tools == []
 
 
 def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -> None:
@@ -32978,7 +32974,6 @@ def test_planned_unregistered_call_rejects_registration_drift_before_recovery():
             ExecutionProfileComponentClass.DIRECT_TOOLS,
             ExecutionProfileComponentClass.EFFECT_AUTHORITY,
             ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
-            ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
         )
         assert tool.calls == []
         after = await store.load(session_id)

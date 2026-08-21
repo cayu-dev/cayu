@@ -8,11 +8,15 @@ The source agent reads a hostile prompt-injected ticket. A generic session fork
 inherits the durable taint derived from that tool event. The quarantine policy
 blocks a protected credential rotation, permits a sanitizer, and transfers only
 an inert, provenance-bearing artifact into a new clean session.
-The quarantine agent registers credential rotation only so the example can
-exercise the runtime gate and assert its durable `tool.call.blocked` event. It
-does not register notification or other outbound tools. The application is
-reconstructed after the fork to prove the taint boundary survives `CayuApp`
-reconstruction around the same store.
+The source registration includes credential rotation inside its durable
+capability ceiling, but a static source tool view keeps that operation hidden
+from the model. The quarantine agent can therefore expose the inherited
+capability after the explicitly authorized profile transition without widening
+the fork's ceiling. Its taint policy blocks the attempted rotation and produces
+the durable `tool.call.blocked` event asserted by the example. The quarantine
+agent does not register notification or other outbound tools. The application
+is reconstructed after the fork to prove the taint and capability boundaries
+survive `CayuApp` reconstruction around the same store.
 Its final safety assertions read the inherited taint, blocked policy decision,
 source event identity, recovery summary, and receipt identities from the public
 bounded `runtime_evidence(app, request)` projection. Raw events are retained

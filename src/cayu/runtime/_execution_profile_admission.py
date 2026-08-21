@@ -108,6 +108,7 @@ def resolve_execution_profile_identity(
     request_budget_limit_ids: tuple[str, ...] = (),
     structured_output: Mapping[str, Any] | None = None,
     finalization: Mapping[str, Any] | None = None,
+    tool_capability_ceiling: tuple[str, ...] | None = None,
 ) -> ExecutionProfileIdentity:
     """Resolve one registered runtime body into its durable profile identity."""
 
@@ -125,6 +126,22 @@ def resolve_execution_profile_identity(
         }
         for tool in registered_agent.tool_capabilities
     ]
+    registered_tool_names = tuple(registered_agent.tools)
+    if tool_capability_ceiling is None:
+        effective_tool_capability_ceiling = registered_tool_names
+    else:
+        if type(tool_capability_ceiling) is not tuple:
+            raise TypeError("tool_capability_ceiling must be a tuple or None.")
+        if len(tool_capability_ceiling) != len(set(tool_capability_ceiling)):
+            raise ValueError("tool_capability_ceiling must contain unique tool names.")
+        ceiling_set = frozenset(tool_capability_ceiling)
+        if any(name not in registered_tool_names for name in tool_capability_ceiling):
+            raise ValueError("tool_capability_ceiling contains an unregistered tool.")
+        effective_tool_capability_ceiling = tuple(
+            name for name in registered_tool_names if name in ceiling_set
+        )
+        if effective_tool_capability_ceiling != tool_capability_ceiling:
+            raise ValueError("tool_capability_ceiling must preserve registration order.")
     tool_implementations = []
     tool_implementations_process_local = False
     tool_implementations_application_versioned = False
@@ -390,7 +407,7 @@ def resolve_execution_profile_identity(
         tool_view_grants={
             "view_kind": "direct",
             "generation": 1,
-            "grant_baseline": list(registered_agent.tools),
+            "grant_baseline": list(effective_tool_capability_ceiling),
         },
         execution_policies={
             "tool_policy": tool_policy_entry,
@@ -501,6 +518,7 @@ def prepare_execution_profile_continuation(
     structured_output: Mapping[str, Any] | None = None,
     finalization: Mapping[str, Any] | None = None,
     invocation_semantics_available: bool = False,
+    tool_capability_ceiling: tuple[str, ...] | None = None,
 ) -> ExecutionProfileContinuationPlan:
     """Reconstruct a pending invocation and fail closed on invalid authority."""
 
@@ -579,6 +597,7 @@ def prepare_execution_profile_continuation(
             request_budget_limit_ids=request_budget_limit_ids,
             structured_output=structured_output,
             finalization=finalization,
+            tool_capability_ceiling=tool_capability_ceiling,
         )
     elif type(frozen_candidate_profile) is not ExecutionProfileIdentity:
         raise TypeError("frozen_candidate_profile must be an ExecutionProfileIdentity or None.")
