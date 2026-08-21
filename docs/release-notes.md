@@ -89,6 +89,29 @@ guard.
 
 ## Unreleased
 
+## v0.3.0
+
+`v0.3.0` hardens Cayu's durable runtime contracts while extending the
+reproducible evidence, knowledge, workspace, task, browser, and evaluation
+foundations introduced since `v0.2.1`.
+
+### Upgrade from v0.2.1
+
+Stop all `v0.2.1` and older workers, take application-consistent backups, and
+upgrade independently deployed servers, dashboards, generated clients, and
+workers together. The server contract advances from version 10 to version 16,
+and the public application manifest and generator plan advance from schema 7
+to schema 9.
+
+The storage schema advances from revision 36 to revision 45. Follow the
+revision-specific migration boundaries below: revisions 39 through 45 contain
+breaking durable contracts, and populated legacy knowledge or task stores may
+require the explicitly documented rebuild or drain procedure. Run `cayu storage
+status` followed by `cayu storage migrate` against every configured SQLite or
+PostgreSQL store, and confirm revision 45 with no pending migrations before
+starting `v0.3.0` workers. Mixed-version deployment and application-only
+rollback across these boundaries are unsupported.
+
 ### Project serving assembles the durable Evals foundation
 
 `cayu serve` now derives normalized project identity from `[project].name`,
@@ -525,16 +548,11 @@ retries, restarts, and operator-directed changes.
 
 ### Highlights
 
-- Sessions persist a versioned execution profile covering direct tool schemas,
-  application-declared tool implementations, grant baselines, execution
-  policies, invocation-scoped policies, ordered hooks, environment and runner
-  semantics, and effect authority in addition to the runtime, model target, and
-  durable instruction projection. Missing custom identities are explicitly
-  process-local rather than claimed as reproducible. Tool, approval, runner,
-  hook, environment, workspace, credential-proxy, and virtual-egress evidence
-  references the immutable profile that governed it. Ordinary resume fails
-  closed on drift; applications can explicitly inspect and authorize adoption
-  at a safe boundary, while generic compatible reuse cannot change authority.
+- Sessions persist a versioned execution profile covering their model target,
+  provider configuration, tools, approval policy, environment, context policy,
+  and other execution-critical inputs. Ordinary resume fails closed on drift;
+  applications can explicitly inspect and authorize a compatible profile
+  adoption at a safe boundary.
 - Model targets can change through an atomic durable transition rather than
   mutating live agent configuration. The selected provider and model remain
   attributable through pending work, recovery, forked sessions, and restart.

@@ -550,7 +550,7 @@ def test_bundled_bedrock_price_applies_exact_cache_ttl_and_identity() -> None:
     assert summary.line_items[0].billing_identity == identity
 
 
-def test_bundled_bedrock_price_rejects_unsupported_one_hour_cache_write() -> None:
+def test_bundled_bedrock_price_applies_one_hour_cache_write() -> None:
     identity = bedrock_billing_identity(
         invoked_model="global.anthropic.claude-sonnet-4-6",
         source_region="us-east-1",
@@ -576,10 +576,8 @@ def test_bundled_bedrock_price_rejects_unsupported_one_hour_cache_write() -> Non
         pricing=default_price_book(),
     )
 
-    assert summary.unpriced_model_steps == 1
-    assert summary.line_items[0].missing_pricing_reason == (
-        "pricing does not declare 1-hour cache writes"
-    )
+    assert summary.priced_model_steps == 1
+    assert summary.total_cost == Decimal("18.000006")
 
 
 def test_default_model_catalog_and_price_book_are_independent_offline_resources() -> None:

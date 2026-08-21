@@ -238,7 +238,7 @@ def test_application_anatomy_guide_tracks_shipped_process_roles() -> None:
 
 def test_release_notes_preserve_storage_revision_chronology() -> None:
     release_notes = _REPO_ROOT / "docs" / "release-notes.md"
-    unreleased = _heading_section(release_notes, heading="Unreleased")
+    v0_3_0 = _heading_section(release_notes, heading="v0.3.0")
     v0_2_1 = _heading_section(release_notes, heading="v0.2.1")
     v0_2_0 = _heading_section(release_notes, heading="v0.2.0")
 
@@ -250,14 +250,16 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "confirm revision 36 with no pending migrations" in v0_2_1
     assert "revision 39" not in v0_2_1
 
-    assert "Breaking schema revision 39" in unreleased
-    assert "Breaking schema revision 40" in unreleased
-    assert "confirm revision 40 before starting current workers" in unreleased
-    assert "through revision 40 before deploying them" in unreleased
-    assert "Breaking schema revision 41" in unreleased
-    assert "confirm revision 41 before starting current workers" in unreleased
-    assert "Breaking schema revision 42" in unreleased
-    assert "confirm revision 42 before starting current workers" in unreleased
+    assert "advances from revision 36 to revision 45" in v0_3_0
+    assert "confirm revision 45 with no pending migrations" in v0_3_0
+    assert "Breaking schema revision 39" in v0_3_0
+    assert "Breaking schema revision 40" in v0_3_0
+    assert "confirm revision 40 before starting current workers" in v0_3_0
+    assert "through revision 40 before deploying them" in v0_3_0
+    assert "Breaking schema revision 41" in v0_3_0
+    assert "confirm revision 41 before starting current workers" in v0_3_0
+    assert "Breaking schema revision 42" in v0_3_0
+    assert "confirm revision 42 before starting current workers" in v0_3_0
 
 
 def test_queued_dispatch_revision_40_migration_covers_custom_task_types() -> None:
