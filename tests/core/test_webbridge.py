@@ -602,7 +602,7 @@ def test_sandboxed_interactive_profile_exposes_one_closed_browser_session_tool(
 
     assert [tool.spec.name for tool in bridge.tools] == ["browser_session"]
     assert bridge.browser_protocol == "cayu.browser-session.v1"
-    assert bridge.browser_worker_version == "4"
+    assert bridge.browser_worker_version == "5"
     assert bridge.playwright_version == BROWSER_FETCH_PLAYWRIGHT_VERSION
     tool = bridge.tools[0]
     assert tool.max_dom_nodes == 500

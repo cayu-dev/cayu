@@ -373,6 +373,7 @@ async def _stage_completed_model_boundary(
     tool_call_count: int = 1,
     usage: dict[str, int] | None = None,
     limits: RunLimits | None = None,
+    pending_source_run_epoch: int | None = 1,
 ) -> _StagedCompletion:
     user_message = Message.text("user", "complete this model step once")
     interaction_id = f"interaction-{session_id}"
@@ -517,6 +518,7 @@ async def _stage_completed_model_boundary(
             agent_name="assistant",
             environment_name=None,
             task_id=None,
+            source_run_epoch=pending_source_run_epoch,
             tool_calls=tool_calls,
             policy_outcomes=None,
             structured_output=None,
@@ -600,6 +602,20 @@ async def _stage_completed_model_boundary(
         pointer=pointer,
         publication=publication,
     )
+
+
+def test_model_completion_rejects_pending_round_without_source_run_epoch() -> None:
+    async def run() -> None:
+        with pytest.raises(ValueError, match="conflicting source run epoch"):
+            await _stage_completed_model_boundary(
+                InMemorySessionStore(),
+                session_id="missing-pending-source-run-epoch",
+                provider_name=_RecordingProvider.name,
+                with_tool_call=True,
+                pending_source_run_epoch=None,
+            )
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

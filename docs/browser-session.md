@@ -21,8 +21,8 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:4-playwright-1.62.0` image, the
-`cayu.browser-session.v1` worker protocol, brokered deny-by-default egress,
+`cayu-browser-fetch:5-playwright-1.62.0` image, the
+`cayu.browser-session.v1` protocol and worker version 5, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -40,7 +40,8 @@ and `close`. The first navigation creates Cayu-owned opaque `session_id` and
 - canonical URL, bounded title, load/access state, and truncation reasons; and
 - exact worker, Playwright, Chromium, and protocol identity.
 
-Playwright `aria-ref` values remain private inside the guest worker. Cayu
+Playwright `aria-ref` values remain private inside the guest worker. Every
+operation requires a stable `operation_id`. Cayu
 replaces them with random opaque refs and resolves them only through strict
 Playwright locators. Ref actions require the matching Cayu session, page,
 revision, ref, and a stable `operation_id`. Cayu rejects a stale revision or
@@ -116,9 +117,68 @@ URL/title/snapshot projection is wrapped and escaped as untrusted evidence.
 Page snapshots, titles, URLs, and download names remain untrusted even when
 browser execution itself is admitted.
 
-Worker-loss reconstruction is deliberately unsupported in this slice. After a
-Cayu worker process loses its in-memory allocation authority, callers must not
-guess or replay an action against the still-running browser. Durable
-reconnection and ambiguous-action reconciliation require the durable browser
-operation-receipt extension. Access-block classification and explicit fallback
-routing require the WebBridge access-routing extension.
+## Worker-loss recovery
+
+Durable recovery is available only when the runtime has both an exact execution
+profile and a reconnectable environment-allocation receipt. Before runner
+dispatch, Cayu binds the browser operation to the parent session and run epoch,
+model attempt, tool round and call, idempotency key, execution profile,
+environment name, and opaque allocation fingerprint. It publishes one durable
+intent, advances it to `dispatched`, and permits at most one terminal receipt.
+The guest worker independently binds the same `operation_id` to one exact
+request and returns its retained response for an exact duplicate. A conflicting
+request is `operation_conflict` and is never executed.
+The same fenced parent record carries the bounded normal-operation count,
+cleanup-operation count, and live browser-session identities. Those ceilings
+therefore do not reset when a fresh Cayu process reconnects, while `close`
+retains its separate bounded cleanup allowance.
+
+A fresh Cayu process may reconnect only to the exact still-live allocation
+identified by that durable receipt. It reconstructs the last terminal browser
+session/page revision and opaque refs, then revalidates the materialized runner
+and worker before dispatch. A recovered `observe` uses a new operation identity,
+advances the revision, and publishes fresh refs. Evidence marked uncertain does
+not authorize pre-loss refs; observe again before an action. The durable
+continuity/session records contain only opaque identities, bounded status,
+revisions, and refs—not cookies, local/session storage, profile files,
+credentials, page content, or artifact bytes. A sealed terminal operation
+receipt necessarily retains its bounded `ToolResult`, including bounded URL,
+title, snapshot, and refs needed for exact replay; it never retains raw binary
+artifact bytes or browser-profile contents.
+
+Recovery does not automatically redispatch any browser operation. An intent
+that never reached dispatch becomes `operation_not_dispatched`. A terminal
+receipt is replayed exactly. A dispatched operation without a terminal receipt
+becomes `outcome_ambiguous`, with the known browser session/page identities and
+guidance to avoid replay. The other recovery categories carry bounded guidance
+for explicit restart, matching-profile resume, or outer cleanup. This applies
+to observations too: although a new
+observation is safe under the same admitted live allocation, pending-round
+recovery itself remains read-only and never calls the browser. Effectful clicks,
+fills, submits, key presses, and downloads are never retried after ambiguity.
+
+The failure categories are deliberately distinct:
+
+- `allocation_lost` means the durable session names a different or unavailable
+  live allocation;
+- `incompatible_profile` means the execution profile changed;
+- `authority_expired` means the parent/tool authority or durable record no
+  longer matches;
+- `restoration_required` means no exact live-allocation continuity exists;
+- `outcome_ambiguous` means dispatch may have produced an external effect; and
+- `cleanup_failed` means explicit browser cleanup did not settle.
+
+These terms are not interchangeable. A **live-allocation reconnect** continues
+the same admitted browser process and its surviving page, cookies, storage, and
+navigation state. **Browser-profile restoration** would recreate only a
+separately declared persisted subset; Cayu does not currently offer that mode.
+A **page reload** is a new navigation and may change external state. An
+**operation replay** repeats an old request and is forbidden after ambiguity. A
+**full execution-environment snapshot** would preserve process/VM state; this
+contract makes no such claim. JavaScript heap objects, open sockets, in-flight
+downloads, and arbitrary process state are not reconstructible if the live
+allocation itself is lost.
+
+Access-block classification and explicit fallback routing belong to a separate
+browser-access contract; this recovery boundary does not infer or select a
+fallback.

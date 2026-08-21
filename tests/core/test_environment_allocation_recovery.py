@@ -524,6 +524,8 @@ def test_allocation_recovery_conforms_across_session_stores(
                 operation=EnvironmentFactoryOperation.CREATE,
             )
             assert resolution.error is None
+            assert resolution.registered_environment is not None
+            assert resolution.registered_environment.live_allocation_fingerprint is not None
             assert len(provider.create_calls) == 1
             published = await store.load_checkpoint(session_id)
             assert published is not None
@@ -577,6 +579,8 @@ def test_remote_allocation_recovers_each_prepublication_crash_window(
             operation=EnvironmentFactoryOperation.CREATE,
         )
         assert resolution.error is None
+        assert resolution.registered_environment is not None
+        assert resolution.registered_environment.live_allocation_fingerprint is not None
         assert len(provider.create_calls) == 1
 
         published = await store.load_checkpoint(_SESSION_ID)
@@ -929,6 +933,39 @@ def test_remote_allocation_recovers_after_publication_before_completion_event() 
             operation=EnvironmentFactoryOperation.RECONNECT,
         )
         assert resolution.error is None
+        assert resolution.registered_environment is not None
+        assert resolution.registered_environment.live_allocation_fingerprint is not None
+        assert len(provider.create_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_live_allocation_fingerprint_is_stable_across_exact_reconnect() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await _create_session(store)
+        provider = _FakeRemoteProvider()
+        created = await _resolve(
+            store,
+            session,
+            _FakeRemoteFactory(provider),
+            operation=EnvironmentFactoryOperation.CREATE,
+        )
+        assert created.error is None
+        assert created.registered_environment is not None
+        created_fingerprint = created.registered_environment.live_allocation_fingerprint
+        assert created_fingerprint is not None
+
+        reconnected = await _resolve(
+            store,
+            session,
+            _FakeRemoteFactory(provider),
+            operation=EnvironmentFactoryOperation.RECONNECT,
+        )
+
+        assert reconnected.error is None
+        assert reconnected.registered_environment is not None
+        assert reconnected.registered_environment.live_allocation_fingerprint == created_fingerprint
         assert len(provider.create_calls) == 1
 
     asyncio.run(run())

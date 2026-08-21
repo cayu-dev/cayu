@@ -519,6 +519,7 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "operation": "observe",
                 "session_id": idle_open["session_id"],
                 "page_id": idle_open["page_id"],
+                "operation_id": "interactive-idle-observe-1",
             },
         )
         idle_replacement = await idle_browser_session_tool.run(
@@ -1057,7 +1058,7 @@ def test_interactive_browser_releases_capacity_after_idle_and_initial_failure(
     idle_expired = browser_fetch_results["idle_expired"]
     denied = browser_fetch_results["interactive_denied"]
 
-    assert idle_expired.structured["error"] == "session_closed"
+    assert idle_expired.structured["error"] == "allocation_lost"
     assert browser_fetch_results["idle_replacement"].is_error is False
     assert browser_fetch_results["idle_replacement_close"].structured["closed"] is True
     assert denied.structured["error"] == "destination_denied"

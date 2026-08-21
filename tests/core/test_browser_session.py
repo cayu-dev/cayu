@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
+import os
 import sys
 import types
 from dataclasses import dataclass, field
@@ -14,6 +16,7 @@ import cayu.tools.browser_session as browser_session_module
 from cayu import (
     AgentSpec,
     CayuApp,
+    Event,
     EventType,
     LocalArtifactStore,
     Message,
@@ -23,6 +26,7 @@ from cayu import (
     run_to_completion,
 )
 from cayu.core import ToolContext
+from cayu.core.tools import ToolResult, _bind_runtime_tool_invocation_authority
 from cayu.environments import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
@@ -30,6 +34,9 @@ from cayu.environments import (
 )
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand, ExecResult
 from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError
+from cayu.runtime import SessionIdentity, SessionStatus
+from cayu.runtime.sessions import SessionOperationPublication
+from cayu.storage import SQLiteSessionStore
 from cayu.tools import _browser_guest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools.browser_session import (
@@ -50,17 +57,27 @@ _IDENTITY = BrowserBackendIdentity(
     browser="chromium",
     browser_version="test-chromium",
     worker_protocol="cayu.browser-session.v1",
-    worker_version="4",
+    worker_version="5",
 )
 
 
 @dataclass
 class _FakeBrowserBackend(BrowserSessionBackend):
     calls: list[dict[str, Any]] = field(default_factory=list)
+    preflight_calls: list[dict[str, Any]] = field(default_factory=list)
     failure: BrowserBackendFailure | BaseException | None = None
     failure_disposition: Literal["live", "retired", "uncertain"] = "uncertain"
     revision_number: int = 0
     title: str = "Example form"
+
+    async def preflight(
+        self,
+        ctx: ToolContext,
+        request: dict[str, Any],
+    ) -> BrowserBackendFailure | None:
+        del ctx
+        self.preflight_calls.append(dict(request))
+        return None
 
     async def execute(self, ctx: ToolContext, request: dict[str, Any]) -> BrowserBackendResponse:
         del ctx
@@ -132,6 +149,170 @@ class _CommitThenBlockArtifactStore(LocalArtifactStore):
         return artifact
 
 
+_PROCESS_LOSS_EXIT_CODE = 86
+
+
+@dataclass
+class _ProcessBoundaryBrowserBackend(BrowserSessionBackend):
+    phase: str
+    calls_path: str
+
+    async def execute(self, ctx: ToolContext, request: dict[str, Any]) -> BrowserBackendResponse:
+        del ctx
+        path = Path(self.calls_path)
+        calls = [] if not path.exists() else json.loads(path.read_text(encoding="utf-8"))
+        calls.append(json.loads(json.dumps(request)))
+        path.write_text(json.dumps(calls), encoding="utf-8")
+        if self.phase == "after_dispatch":
+            os._exit(_PROCESS_LOSS_EXIT_CODE)
+        return BrowserBackendResponse(
+            observation=BrowserBackendObservation(
+                session_id=request["session_id"],
+                page_id=request["page_id"],
+                revision="br_process_revision_1",
+                url=request["url"],
+                title="Process recovery fixture",
+                snapshot="- document",
+                refs=(),
+                load_state="loaded",
+                access_state="available",
+                idle_timeout_seconds=900,
+                truncation_reasons=(),
+                backend_identity=_IDENTITY,
+            )
+        )
+
+
+def _run_crashing_cayu_browser_worker(
+    session_path: str,
+    artifact_path: str,
+    phase: str,
+    calls_path: str,
+) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(session_path)
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": f"process-{phase}",
+        }
+        ctx = _context(Path(artifact_path)).model_copy(
+            update={"idempotency_key": "tool-key-tool-call-1"}
+        )
+
+        async def load(storage_key: str) -> dict[str, Any] | None:
+            return await store.load_session_operation("parent-session", storage_key)
+
+        async def compare_and_set(
+            storage_key: str,
+            expected: dict[str, Any] | None,
+            desired: dict[str, Any],
+            secondary: dict[str, dict[str, Any]],
+        ) -> dict[str, Any]:
+            desired_copy = json.loads(json.dumps(desired))
+            secondary_copy = json.loads(json.dumps(secondary))
+            states = {
+                value.get("state")
+                for value in (desired_copy, *secondary_copy.values())
+                if value.get("record_type") == "cayu.browser-operation"
+            }
+            if phase == "before_dispatch" and "dispatched" in states:
+                os._exit(_PROCESS_LOSS_EXIT_CODE)
+            if phase == "after_browser_completion" and "terminal" in states:
+                os._exit(_PROCESS_LOSS_EXIT_CODE)
+
+            def publish(current_session, checkpoint, current):
+                if current_session.run_epoch != 1 or current != expected:
+                    raise RuntimeError("Process recovery fixture lost durable authority.")
+                return SessionOperationPublication(
+                    checkpoint={} if checkpoint is None else checkpoint,
+                    operation_records={storage_key: desired_copy, **secondary_copy},
+                )
+
+            await store.publish_session_operation(
+                "parent-session",
+                idempotency_key=storage_key,
+                operation_transform=publish,
+                events=[],
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=1,
+            )
+            if phase == "before_receipt_publication" and "terminal" in states:
+                os._exit(_PROCESS_LOSS_EXIT_CODE)
+            return desired_copy
+
+        _bind_runtime_tool_invocation_authority(
+            ctx,
+            parent_task_id=None,
+            parent_run_epoch=1,
+            model_step_id="model-step-1",
+            model_attempt_id="model-attempt-1",
+            tool_round_id="tool-round-1",
+            tool_call_id="tool-call-1",
+            tool_name="browser_session",
+            idempotency_key="tool-key-tool-call-1",
+            effective_arguments=args,
+            execution_profile_fingerprint="b" * 64,
+            environment_allocation_fingerprint="a" * 64,
+            load_durable_operation=load,
+            compare_and_set_durable_operation=compare_and_set,
+            seal_durable_output=lambda value: json.loads(json.dumps(value)),
+            secret_publication_sealer=lambda: None,
+        )
+        try:
+            await BrowserSessionTool._from_backend_for_testing(
+                _ProcessBoundaryBrowserBackend(phase=phase, calls_path=calls_path)
+            ).run(ctx, args)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def _run_fresh_cayu_browser_recovery(
+    session_path: str,
+    phase: str,
+    result_path: str,
+) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(session_path)
+
+        async def load(storage_key: str) -> dict[str, Any] | None:
+            return await store.load_session_operation("parent-session", storage_key)
+
+        try:
+            result = await BrowserSessionTool._from_backend_for_testing(
+                _FakeBrowserBackend()
+            ).reconcile_durable_tool_call(
+                parent_session_id="parent-session",
+                parent_run_epoch=1,
+                execution_profile_fingerprint="b" * 64,
+                environment_name="browser",
+                environment_allocation_fingerprint="a" * 64,
+                model_step_id="model-step-1",
+                model_attempt_id="model-attempt-1",
+                tool_round_id="tool-round-1",
+                tool_call_id="tool-call-1",
+                idempotency_key="tool-key-tool-call-1",
+                arguments={
+                    "operation": "navigate",
+                    "url": "https://example.test/form",
+                    "operation_id": f"process-{phase}",
+                },
+                started=True,
+                load_operation=load,
+            )
+            assert result is not None
+            Path(result_path).write_text(
+                json.dumps(result.model_dump(mode="json")),
+                encoding="utf-8",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 class _WireRunner:
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
         return ExecutionAdmissionCandidate(
@@ -180,7 +361,7 @@ class _WireRunner:
             stdout=json.dumps(
                 {
                     "protocol_version": "cayu.browser-session.v1",
-                    "worker_version": "4",
+                    "worker_version": "5",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -202,7 +383,7 @@ class _WireRunner:
                             "browser": "chromium",
                             "browser_version": "test-chromium",
                             "worker_protocol": "cayu.browser-session.v1",
-                            "worker_version": "4",
+                            "worker_version": "5",
                         },
                     },
                     "artifacts": [],
@@ -274,6 +455,96 @@ def _context(
     )
 
 
+def _durable_context(
+    tmp_path: Path,
+    *,
+    args: dict[str, Any],
+    records: dict[str, dict[str, Any]],
+    allocation_fingerprint: str | None = "a" * 64,
+    execution_profile_fingerprint: str = "b" * 64,
+    tool_call_id: str = "tool-call-1",
+    fail_before_state: str | None = None,
+    fail_after_state: str | None = None,
+) -> ToolContext:
+    ctx = _context(tmp_path).model_copy(update={"idempotency_key": f"tool-key-{tool_call_id}"})
+
+    async def load(key: str) -> dict[str, Any] | None:
+        record = records.get(key)
+        return None if record is None else json.loads(json.dumps(record))
+
+    async def compare_and_set(
+        key: str,
+        expected: dict[str, Any] | None,
+        desired: dict[str, Any],
+        secondary: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        assert records.get(key) == expected
+        states = {
+            value.get("state")
+            for value in (desired, *secondary.values())
+            if value.get("record_type") == "cayu.browser-operation"
+        }
+        if fail_before_state in states:
+            raise ConnectionError(f"worker stopped before {fail_before_state} publication")
+        records[key] = json.loads(json.dumps(desired))
+        records.update(json.loads(json.dumps(secondary)))
+        if fail_after_state in states:
+            raise ConnectionError(f"worker stopped after {fail_after_state} publication")
+        return json.loads(json.dumps(desired))
+
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id=None,
+        parent_run_epoch=1,
+        model_step_id="model-step-1",
+        model_attempt_id="model-attempt-1",
+        tool_round_id="tool-round-1",
+        tool_call_id=tool_call_id,
+        tool_name="browser_session",
+        idempotency_key=ctx.idempotency_key or "",
+        effective_arguments=args,
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        environment_allocation_fingerprint=allocation_fingerprint,
+        load_durable_operation=load,
+        compare_and_set_durable_operation=compare_and_set,
+        seal_durable_output=lambda value: json.loads(json.dumps(value)),
+        secret_publication_sealer=lambda: None,
+    )
+    return ctx
+
+
+async def _recover_durable_browser_result(
+    tool: BrowserSessionTool,
+    *,
+    args: dict[str, Any],
+    records: dict[str, dict[str, Any]],
+    tool_call_id: str = "tool-call-1",
+    parent_run_epoch: int = 1,
+    allocation_fingerprint: str | None = "a" * 64,
+) -> ToolResult:
+    async def load(key: str) -> dict[str, Any] | None:
+        record = records.get(key)
+        return None if record is None else json.loads(json.dumps(record))
+
+    result = await tool.reconcile_durable_tool_call(
+        parent_session_id="parent-session",
+        parent_run_epoch=parent_run_epoch,
+        execution_profile_fingerprint="b" * 64,
+        environment_name="browser",
+        environment_allocation_fingerprint=allocation_fingerprint,
+        model_step_id="model-step-1",
+        model_attempt_id="model-attempt-1",
+        tool_round_id="tool-round-1",
+        tool_call_id=tool_call_id,
+        idempotency_key=f"tool-key-{tool_call_id}",
+        arguments=args,
+        started=True,
+        load_operation=load,
+    )
+    assert result is not None
+    return result
+
+
 def _tool(backend: _FakeBrowserBackend) -> BrowserSessionTool:
     return BrowserSessionTool._from_backend_for_testing(backend)
 
@@ -292,6 +563,7 @@ def _interactive_limits(**updates: int) -> _browser_guest._InteractiveLimits:
         "max_redirects": 2,
         "max_requests": 8,
         "max_response_bytes": 4096,
+        "max_operations": 32,
     }
     values.update(updates)
     return _browser_guest._InteractiveLimits(**values)
@@ -375,7 +647,7 @@ def _interactive_request(
 def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
         "protocol_version": "cayu.browser-session.v1",
-        "worker_version": "4",
+        "worker_version": "5",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -392,14 +664,14 @@ def _interactive_raw_request(operation: str) -> dict[str, Any]:
             "max_redirects": 2,
             "max_requests": 8,
             "max_response_bytes": 4096,
+            "max_operations": 32,
         },
     }
-    if operation == "close":
-        raw["operation_id"] = "close-1"
-    else:
+    raw["operation_id"] = f"{operation}-1"
+    if operation != "close":
         raw["page_id"] = "bp_test"
     if operation == "navigate":
-        raw.update(operation_id="navigate-1", url="https://example.test")
+        raw["url"] = "https://example.test"
     return raw
 
 
@@ -429,6 +701,7 @@ async def _browser_session_navigate_observe_and_click_preserve_state(tmp_path: P
             "operation": "observe",
             "session_id": first["session_id"],
             "page_id": first["page_id"],
+            "operation_id": "observe-1",
         },
     )
     second = dict(observed.structured or {})
@@ -682,9 +955,10 @@ def test_browser_session_reclaims_only_authoritatively_closed_parent_state(
                 "operation": "observe",
                 "session_id": first.structured["session_id"],
                 "page_id": first.structured["page_id"],
+                "operation_id": "observe-retired-parent",
             },
         )
-        assert closed.structured["error"] == "session_closed"
+        assert closed.structured["error"] == "allocation_lost"
         backend.failure = None
         backend.failure_disposition = "uncertain"
         admitted = await tool.run(
@@ -841,6 +1115,7 @@ def test_browser_session_positive_retirement_releases_response_limit_capacity(
                 "operation": "observe",
                 "session_id": first.structured["session_id"],
                 "page_id": first.structured["page_id"],
+                "operation_id": "observe-oversized-response",
             },
         )
         assert limited.structured["error"] == "oversized_response"
@@ -1287,6 +1562,7 @@ def test_browser_session_enforces_resource_and_artifact_authority_before_dispatc
                 "operation": "observe",
                 "session_id": "bs_unknown",
                 "page_id": "bp_unknown",
+                "operation_id": "observe-unknown",
             },
         )
         assert unknown_parent.structured["error"] == "unknown_session"
@@ -1381,7 +1657,7 @@ def test_browser_session_refuses_artifacts_when_secret_authority_appears_during_
 def test_interactive_guest_request_parser_rejects_escape_hatches() -> None:
     raw = {
         "protocol_version": "cayu.browser-session.v1",
-        "worker_version": "4",
+        "worker_version": "5",
         "expected_playwright_version": "1.62.0",
         "operation": "navigate",
         "session_id": "bs_test",
@@ -1401,6 +1677,7 @@ def test_interactive_guest_request_parser_rejects_escape_hatches() -> None:
             "max_redirects": 2,
             "max_requests": 8,
             "max_response_bytes": 4096,
+            "max_operations": 32,
         },
     }
     parsed = _browser_guest._interactive_request_from_json(raw)
@@ -1425,6 +1702,7 @@ def test_interactive_guest_snapshot_uses_opaque_refs_and_independent_bounds() ->
         max_redirects=2,
         max_requests=8,
         max_response_bytes=4096,
+        max_operations=32,
     )
 
     snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
@@ -1595,6 +1873,45 @@ def test_interactive_guest_retires_before_materializing_oversized_accessible_tex
         assert page.locator_owner.called is False
         assert cdp.script_execution_transitions == [True, False]
         assert context.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> None:
+    class _LedgerDaemon(_browser_guest._InteractiveDaemon):
+        calls = 0
+
+        async def _execute_locked(self, request):
+            self.calls += 1
+            return {
+                "protocol_version": "cayu.browser-session.v1",
+                "worker_version": "5",
+                "playwright_version": "1.62.0",
+                "kind": "success",
+                "observation": {"call": self.calls, "operation": request.operation},
+                "artifacts": [],
+            }
+
+    async def scenario() -> None:
+        daemon = _LedgerDaemon("bs_test")
+        request = _interactive_request("observe")
+
+        first = await daemon.execute(request)
+        replay = await daemon.execute(request)
+        conflict = await daemon.execute(
+            _browser_guest._InteractiveRequest(
+                **{
+                    **request.__dict__,
+                    "operation": "wait",
+                    "wait_ms": 1,
+                }
+            )
+        )
+
+        assert first == replay
+        assert daemon.calls == 1
+        assert conflict["kind"] == "error"
+        assert conflict["error"] == "operation_conflict"
 
     asyncio.run(scenario())
 
@@ -1789,6 +2106,33 @@ def test_interactive_guest_observation_cleanup_preserves_owner_cancellation() ->
     asyncio.run(scenario())
 
 
+def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
+    class _LedgerDaemon(_browser_guest._InteractiveDaemon):
+        async def _execute_locked(self, request):
+            return {
+                "protocol_version": "cayu.browser-session.v1",
+                "worker_version": "5",
+                "playwright_version": "1.62.0",
+                "kind": "success",
+                "observation": {"operation": request.operation},
+                "artifacts": [],
+            }
+
+    async def scenario() -> None:
+        daemon = _LedgerDaemon("bs_test")
+        limits = _interactive_limits(max_operations=1)
+
+        first = await daemon.execute(_interactive_request("observe", limits=limits))
+        exhausted = await daemon.execute(_interactive_request("wait", limits=limits))
+        cleanup = await daemon.execute(_interactive_request("close", limits=limits))
+
+        assert first["kind"] == "success"
+        assert exhausted["error"] == "resource_exhausted"
+        assert cleanup["kind"] == "success"
+
+    asyncio.run(scenario())
+
+
 def test_interactive_guest_close_reports_cleanup_failure() -> None:
     class _FailedContext:
         async def close(self) -> None:
@@ -1800,7 +2144,7 @@ def test_interactive_guest_close_reports_cleanup_failure() -> None:
         request = _browser_guest._interactive_request_from_json(
             {
                 "protocol_version": "cayu.browser-session.v1",
-                "worker_version": "4",
+                "worker_version": "5",
                 "expected_playwright_version": "1.62.0",
                 "operation": "close",
                 "session_id": "bs_test",
@@ -1818,6 +2162,7 @@ def test_interactive_guest_close_reports_cleanup_failure() -> None:
                     "max_redirects": 2,
                     "max_requests": 8,
                     "max_response_bytes": 4096,
+                    "max_operations": 32,
                 },
             }
         )
@@ -1863,7 +2208,7 @@ def test_interactive_guest_failed_initial_navigation_retires_allocation() -> Non
         request = _browser_guest._interactive_request_from_json(
             {
                 "protocol_version": "cayu.browser-session.v1",
-                "worker_version": "4",
+                "worker_version": "5",
                 "expected_playwright_version": "1.62.0",
                 "operation": "navigate",
                 "session_id": "bs_test",
@@ -1883,11 +2228,13 @@ def test_interactive_guest_failed_initial_navigation_retires_allocation() -> Non
                     "max_redirects": 2,
                     "max_requests": 8,
                     "max_response_bytes": 4096,
+                    "max_operations": 32,
                 },
             }
         )
 
         result = await daemon.execute(request)
+        assert result["kind"] == "error"
 
         assert result["error"] == "destination_denied"
         assert result["allocation_disposition"] == "retired"
@@ -2398,8 +2745,9 @@ def test_interactive_guest_rejects_sticky_denial_before_next_action() -> None:
             full_page=False,
             limits=limits,
         )
-        with pytest.raises(RuntimeError, match="destination_denied"):
-            await daemon.execute(action)
+        result = await daemon.execute(action)
+        assert result["kind"] == "error"
+        assert result["error"] == "destination_denied"
         assert page.locator_called is False
         assert state.revision == "br_revision_1"
 
@@ -2457,6 +2805,19 @@ def test_interactive_transport_envelope_covers_every_supported_maximum() -> None
 
 
 def test_browser_session_wire_requires_positive_allocation_retirement_evidence() -> None:
+    allocation_lost_payload = _browser_guest._interactive_error_payload(
+        _browser_guest._GuestFailure(
+            "allocation_lost",
+            allocation_disposition="retired",
+        )
+    )
+    allocation_lost = browser_session_module._parse_runner_response(
+        json.dumps(allocation_lost_payload),
+        max_artifact_bytes=1024,
+    )
+    assert allocation_lost.failure == BrowserBackendFailure("allocation_lost")
+    assert allocation_lost.allocation_disposition == "retired"
+
     retired_payload = _browser_guest._interactive_error_payload(
         _browser_guest._GuestFailure(
             "oversized_response",
@@ -2708,7 +3069,7 @@ def test_interactive_guest_idle_retirement_marker_releases_parent_capacity(
         _browser_guest._run_interactive_request(_interactive_raw_request("observe"))
     )
 
-    assert retired["error"] == "session_closed"
+    assert retired["error"] == "allocation_lost"
     assert retired["allocation_disposition"] == "retired"
     assert uncertain["error"] == "session_closed"
     assert uncertain["allocation_disposition"] == "uncertain"
@@ -2958,6 +3319,958 @@ def test_browser_session_deduplicates_operation_ids_and_rejects_conflicts(
     tmp_path: Path,
 ) -> None:
     asyncio.run(_browser_session_deduplicates_operation_ids_and_rejects_conflicts(tmp_path))
+
+
+def test_browser_session_reconnects_fresh_tool_to_exact_live_allocation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        navigate_args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "durable-navigate-1",
+        }
+        first = await _tool(backend).run(
+            _durable_context(
+                tmp_path,
+                args=navigate_args,
+                records=records,
+                tool_call_id="navigate-call",
+            ),
+            navigate_args,
+        )
+        assert first.is_error is False
+        browser_session_id = first.structured["session_id"]
+        page_id = first.structured["page_id"]
+
+        observe_args = {
+            "operation": "observe",
+            "session_id": browser_session_id,
+            "page_id": page_id,
+            "operation_id": "durable-observe-1",
+        }
+        recovered = await _tool(backend).run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=records,
+                tool_call_id="observe-call",
+            ),
+            observe_args,
+        )
+
+        assert recovered.is_error is False
+        assert recovered.structured["session_id"] == browser_session_id
+        assert recovered.structured["revision"] == "br_revision_2"
+        assert len(backend.calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_durable_retirement_releases_replacement_capacity(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+
+        def bounded_tool() -> BrowserSessionTool:
+            return BrowserSessionTool(max_sessions=1, _backend=backend)
+
+        navigate_args = {
+            "operation": "navigate",
+            "url": "https://example.test/one",
+            "operation_id": "durable-retirement-navigate",
+        }
+        opened = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=navigate_args,
+                records=records,
+                tool_call_id="durable-retirement-navigate-call",
+            ),
+            navigate_args,
+        )
+        assert opened.is_error is False
+
+        backend.failure = BrowserBackendFailure("session_closed")
+        backend.failure_disposition = "retired"
+        observe_args = {
+            "operation": "observe",
+            "session_id": opened.structured["session_id"],
+            "page_id": opened.structured["page_id"],
+            "operation_id": "durable-retirement-observe",
+        }
+        retired = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=records,
+                tool_call_id="durable-retirement-observe-call",
+            ),
+            observe_args,
+        )
+        assert retired.structured["error"] == "allocation_lost"
+
+        backend.failure = None
+        backend.failure_disposition = "uncertain"
+        replacement_args = {
+            "operation": "navigate",
+            "url": "https://example.test/two",
+            "operation_id": "durable-retirement-replacement",
+        }
+        replacement = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=replacement_args,
+                records=records,
+                tool_call_id="durable-retirement-replacement-call",
+            ),
+            replacement_args,
+        )
+
+        assert replacement.is_error is False
+        assert [call["operation"] for call in backend.calls] == [
+            "navigate",
+            "observe",
+            "navigate",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_durable_limits_survive_fresh_tool_processes(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+
+        def bounded_tool(*, max_operations: int = 4) -> BrowserSessionTool:
+            return BrowserSessionTool(
+                max_sessions=1,
+                max_operations=max_operations,
+                _backend=backend,
+            )
+
+        first_args = {
+            "operation": "navigate",
+            "url": "https://example.test/one",
+            "operation_id": "durable-quota-navigate-one",
+        }
+        first = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=first_args,
+                records=records,
+                tool_call_id="quota-navigate-one",
+            ),
+            first_args,
+        )
+        first_session_id = first.structured["session_id"]
+        call_count = len(backend.calls)
+
+        second_args = {
+            "operation": "navigate",
+            "url": "https://example.test/two",
+            "operation_id": "durable-quota-navigate-two",
+        }
+        session_exhausted = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=second_args,
+                records=records,
+                tool_call_id="quota-navigate-two",
+            ),
+            second_args,
+        )
+        assert session_exhausted.structured["error"] == "resource_exhausted"
+        assert len(backend.calls) == call_count
+
+        close_args = {
+            "operation": "close",
+            "session_id": first_session_id,
+            "operation_id": "durable-quota-close-one",
+        }
+        closed = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=close_args,
+                records=records,
+                tool_call_id="quota-close-one",
+            ),
+            close_args,
+        )
+        assert closed.is_error is False
+
+        third_args = {
+            "operation": "navigate",
+            "url": "https://example.test/three",
+            "operation_id": "durable-quota-navigate-three",
+        }
+        third = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=third_args,
+                records=records,
+                tool_call_id="quota-navigate-three",
+            ),
+            third_args,
+        )
+        assert third.is_error is False
+        third_close_args = {
+            "operation": "close",
+            "session_id": third.structured["session_id"],
+            "operation_id": "durable-quota-close-three",
+        }
+        third_closed = await bounded_tool().run(
+            _durable_context(
+                tmp_path,
+                args=third_close_args,
+                records=records,
+                tool_call_id="quota-close-three",
+            ),
+            third_close_args,
+        )
+        assert third_closed.is_error is False
+
+        operation_records: dict[str, dict[str, Any]] = {}
+        operation_args = {
+            "operation": "navigate",
+            "url": "https://example.test/limited",
+            "operation_id": "durable-operation-one",
+        }
+        operation_first = await bounded_tool(max_operations=1).run(
+            _durable_context(
+                tmp_path,
+                args=operation_args,
+                records=operation_records,
+                tool_call_id="operation-one",
+            ),
+            operation_args,
+        )
+        observe_args = {
+            "operation": "observe",
+            "session_id": operation_first.structured["session_id"],
+            "page_id": operation_first.structured["page_id"],
+            "operation_id": "durable-operation-two",
+        }
+        operation_exhausted = await bounded_tool(max_operations=1).run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=operation_records,
+                tool_call_id="operation-two",
+            ),
+            observe_args,
+        )
+        cleanup_args = {
+            "operation": "close",
+            "session_id": operation_first.structured["session_id"],
+            "operation_id": "durable-operation-cleanup",
+        }
+        cleanup = await bounded_tool(max_operations=1).run(
+            _durable_context(
+                tmp_path,
+                args=cleanup_args,
+                records=operation_records,
+                tool_call_id="operation-cleanup",
+            ),
+            cleanup_args,
+        )
+
+        assert operation_exhausted.structured["error"] == "resource_exhausted"
+        assert cleanup.is_error is False
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_uncertain_reconnect_invalidates_refs_until_observe(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        navigate_args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "durable-navigate-uncertain",
+        }
+        first = await _tool(backend).run(
+            _durable_context(tmp_path, args=navigate_args, records=records),
+            navigate_args,
+        )
+        session_record = next(
+            record
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-session"
+        )
+        session_record["state"] = "uncertain"
+        session_record["refs_valid"] = False
+        fresh_tool = _tool(backend)
+        click_args = {
+            "operation": "click",
+            "session_id": first.structured["session_id"],
+            "page_id": first.structured["page_id"],
+            "expected_revision": first.structured["revision"],
+            "ref": "ref_name",
+            "operation_id": "uncertain-click",
+        }
+
+        refused = await fresh_tool.run(
+            _durable_context(
+                tmp_path,
+                args=click_args,
+                records=records,
+                tool_call_id="uncertain-click-call",
+            ),
+            click_args,
+        )
+        observe_args = {
+            "operation": "observe",
+            "session_id": first.structured["session_id"],
+            "page_id": first.structured["page_id"],
+            "operation_id": "uncertain-observe",
+        }
+        observed = await fresh_tool.run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=records,
+                tool_call_id="uncertain-observe-call",
+            ),
+            observe_args,
+        )
+
+        assert refused.structured["error"] == "stale_observation"
+        assert observed.is_error is False
+        assert observed.structured["revision"] == "br_revision_2"
+        assert len(backend.calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_reconnect_rejects_changed_allocation_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        navigate_args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "durable-navigate-1",
+        }
+        first = await _tool(backend).run(
+            _durable_context(tmp_path, args=navigate_args, records=records),
+            navigate_args,
+        )
+        call_count = len(backend.calls)
+        observe_args = {
+            "operation": "observe",
+            "session_id": first.structured["session_id"],
+            "page_id": first.structured["page_id"],
+            "operation_id": "durable-observe-1",
+        }
+
+        refused = await _tool(backend).run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=records,
+                allocation_fingerprint="c" * 64,
+                tool_call_id="observe-call",
+            ),
+            observe_args,
+        )
+
+        assert refused.structured["error"] == "allocation_lost"
+        assert len(backend.calls) == call_count
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_reconnect_requires_exact_profile_and_live_allocation(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        navigate_args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "durable-navigate-identity",
+        }
+        first = await _tool(backend).run(
+            _durable_context(tmp_path, args=navigate_args, records=records),
+            navigate_args,
+        )
+        observe_args = {
+            "operation": "observe",
+            "session_id": first.structured["session_id"],
+            "page_id": first.structured["page_id"],
+            "operation_id": "durable-observe-identity",
+        }
+        call_count = len(backend.calls)
+
+        wrong_profile = await _tool(backend).run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=records,
+                execution_profile_fingerprint="d" * 64,
+                tool_call_id="observe-profile-call",
+            ),
+            observe_args,
+        )
+        no_live_allocation = await _tool(backend).run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=records,
+                allocation_fingerprint=None,
+                tool_call_id="observe-restoration-call",
+            ),
+            observe_args,
+        )
+        wrong_run_epoch = await _recover_durable_browser_result(
+            _tool(backend),
+            args=navigate_args,
+            records=records,
+            parent_run_epoch=2,
+        )
+
+        assert wrong_profile.structured["error"] == "incompatible_profile"
+        assert "original execution profile" in wrong_profile.structured["guidance"]
+        assert no_live_allocation.structured["error"] == "restoration_required"
+        assert "Start a new browser session" in no_live_allocation.structured["guidance"]
+        assert wrong_run_epoch.structured["error"] == "authority_expired"
+        assert "current runtime authority" in wrong_run_epoch.structured["guidance"]
+        assert len(backend.calls) == call_count
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_worker_loss_before_dispatch_reconciles_intent(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "before-dispatch",
+        }
+        tool = _tool(backend)
+
+        stopped = await tool.run(
+            _durable_context(
+                tmp_path,
+                args=args,
+                records=records,
+                fail_before_state="dispatched",
+            ),
+            args,
+        )
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+
+        assert stopped.structured["error"] == "operation_not_dispatched"
+        assert recovered.structured["error"] == "operation_not_dispatched"
+        assert [
+            record["state"]
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-operation"
+        ] == ["intent"]
+        assert backend.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_worker_loss_after_dispatch_records_terminal_ambiguity(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend(failure=ConnectionError("worker lost after dispatch"))
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "after-dispatch",
+        }
+        tool = _tool(backend)
+
+        stopped = await tool.run(
+            _durable_context(tmp_path, args=args, records=records),
+            args,
+        )
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+
+        assert stopped.structured["error"] == "outcome_ambiguous"
+        assert recovered == stopped
+        assert len(backend.calls) == 1
+        operation_records = [
+            record
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-operation"
+        ]
+        assert len(operation_records) == 1
+        assert operation_records[0]["state"] == "terminal"
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_worker_loss_after_completion_before_receipt_is_not_replayed(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "before-terminal-receipt",
+        }
+        tool = _tool(backend)
+
+        stopped = await tool.run(
+            _durable_context(
+                tmp_path,
+                args=args,
+                records=records,
+                fail_before_state="terminal",
+            ),
+            args,
+        )
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+
+        assert stopped.structured["error"] == "outcome_ambiguous"
+        assert recovered.structured["error"] == "outcome_ambiguous"
+        assert recovered.structured["browser_session_id"] == backend.calls[0]["session_id"]
+        assert len(backend.calls) == 1
+        assert any(record.get("state") == "dispatched" for record in records.values())
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_lost_terminal_acknowledgement_replays_exact_receipt(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "after-terminal-receipt",
+        }
+        tool = _tool(backend)
+
+        acknowledgement_lost = await tool.run(
+            _durable_context(
+                tmp_path,
+                args=args,
+                records=records,
+                fail_after_state="terminal",
+            ),
+            args,
+        )
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+
+        assert acknowledgement_lost.structured["error"] == "outcome_ambiguous"
+        assert recovered.is_error is False
+        assert recovered.structured["session_id"] == backend.calls[0]["session_id"]
+        assert len(backend.calls) == 1
+        assert any(record.get("state") == "terminal" for record in records.values())
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_error", "expected_backend_calls"),
+    [
+        ("before_dispatch", "operation_not_dispatched", 0),
+        ("after_dispatch", "outcome_ambiguous", 1),
+        ("after_browser_completion", "outcome_ambiguous", 1),
+        ("before_receipt_publication", None, 1),
+    ],
+)
+def test_fresh_process_reconciles_each_browser_worker_loss_window(
+    tmp_path: Path,
+    phase: str,
+    expected_error: str | None,
+    expected_backend_calls: int,
+) -> None:
+    session_path = tmp_path / f"browser-process-{phase}.sqlite"
+
+    async def prepare_parent() -> None:
+        store = SQLiteSessionStore(session_path)
+        try:
+            await store.create(
+                RunRequest(
+                    session_id="parent-session",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "open the page")],
+                ),
+                identity=SessionIdentity(
+                    provider_name="process-fixture",
+                    model="process-fixture-model",
+                ),
+                interaction_started_event=Event(
+                    id="process-browser-interaction-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id="parent-session",
+                    interaction_id="process-browser-interaction",
+                    agent_name="assistant",
+                ),
+                interaction_source_messages=[Message.text("user", "open the page")],
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(prepare_parent())
+    spawn = multiprocessing.get_context("spawn")
+    calls_path = tmp_path / f"browser-process-{phase}-calls.json"
+    result_path = tmp_path / f"browser-process-{phase}-result.json"
+    worker = spawn.Process(
+        target=_run_crashing_cayu_browser_worker,
+        args=(str(session_path), str(tmp_path), phase, str(calls_path)),
+    )
+    worker.start()
+    worker.join(timeout=20)
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(timeout=5)
+        raise AssertionError("The crashing Cayu browser worker did not terminate.")
+    assert worker.exitcode == _PROCESS_LOSS_EXIT_CODE
+    calls = [] if not calls_path.exists() else json.loads(calls_path.read_text(encoding="utf-8"))
+    assert len(calls) == expected_backend_calls
+
+    recovery = spawn.Process(
+        target=_run_fresh_cayu_browser_recovery,
+        args=(str(session_path), phase, str(result_path)),
+    )
+    recovery.start()
+    recovery.join(timeout=20)
+    if recovery.is_alive():
+        recovery.terminate()
+        recovery.join(timeout=5)
+        raise AssertionError("The fresh Cayu browser recovery process did not terminate.")
+    assert recovery.exitcode == 0
+    result = ToolResult.model_validate(json.loads(result_path.read_text(encoding="utf-8")))
+
+    if expected_error is None:
+        assert result.is_error is False
+        assert result.structured["revision"] == "br_process_revision_1"
+    else:
+        assert result.is_error is True
+        assert result.structured["error"] == expected_error
+
+
+def test_browser_session_pending_recovery_reads_receipt_without_dispatch(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "DURABLE_OPERATION_SECRET_CANARY",
+        }
+        tool = _tool(backend)
+        result = await tool.run(
+            _durable_context(tmp_path, args=args, records=records),
+            args,
+        )
+        operation_key = next(
+            key
+            for key, record in records.items()
+            if record.get("record_type") == "cayu.browser-operation"
+        )
+
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+        assert recovered == result
+        assert len(backend.calls) == 1
+        assert "DURABLE_OPERATION_SECRET_CANARY" not in json.dumps(records)
+
+        records[operation_key] = {
+            key: value for key, value in records[operation_key].items() if key != "result"
+        }
+        records[operation_key]["state"] = "dispatched"
+        ambiguous = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+        assert ambiguous.structured["error"] == "outcome_ambiguous"
+        assert ambiguous.structured["browser_session_id"] == result.structured["session_id"]
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_terminal_receipt_survives_later_allocation_loss(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "terminal-before-allocation-loss",
+        }
+        tool = _tool(backend)
+        terminal = await tool.run(
+            _durable_context(tmp_path, args=args, records=records),
+            args,
+        )
+
+        without_allocation = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+            allocation_fingerprint=None,
+        )
+        replacement_allocation = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+            allocation_fingerprint="c" * 64,
+        )
+
+        assert without_allocation == terminal
+        assert replacement_allocation == terminal
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("identity_field", ["model_step_id", "model_attempt_id"])
+def test_browser_session_recovery_authenticates_complete_model_attempt_identity(
+    tmp_path: Path,
+    identity_field: str,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": f"tampered-{identity_field}",
+        }
+        tool = _tool(backend)
+        await tool.run(_durable_context(tmp_path, args=args, records=records), args)
+        operation_record = next(
+            record
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-operation"
+            and record.get("state") == "terminal"
+        )
+        operation_record[identity_field] = f"wrong-{identity_field}"
+
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+
+        assert recovered.structured["error"] == "authority_expired"
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_recovery_finds_hook_effective_operation_identity(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        original_args = {
+            "operation": "navigate",
+            "url": "https://example.test/original",
+            "operation_id": "operation-before-hook",
+        }
+        effective_args = {
+            "operation": "navigate",
+            "url": "https://example.test/effective",
+            "operation_id": "operation-after-hook",
+        }
+        tool = _tool(backend)
+        terminal = await tool.run(
+            _durable_context(tmp_path, args=effective_args, records=records),
+            effective_args,
+        )
+
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=original_args,
+            records=records,
+        )
+        locator = next(
+            record
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-operation-locator"
+        )
+
+        assert recovered == terminal
+        assert len(backend.calls) == 1
+        assert "arguments" not in locator
+        assert "operation_id" not in locator
+        assert effective_args["url"] not in json.dumps(locator)
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_operation_conflict_fails_before_runner_preflight(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        original = {
+            "operation": "navigate",
+            "url": "https://example.test/original",
+            "operation_id": "preflight-conflict",
+        }
+        conflicting = {
+            **original,
+            "url": "https://example.test/conflicting",
+        }
+        await _tool(backend).run(
+            _durable_context(tmp_path, args=original, records=records),
+            original,
+        )
+
+        refused = await _tool(backend).run(
+            _durable_context(tmp_path, args=conflicting, records=records),
+            conflicting,
+        )
+
+        assert refused.structured["error"] == "operation_conflict"
+        assert len(backend.preflight_calls) == 1
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_recovery_rejects_oversized_terminal_observation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "bounded-terminal-observation",
+        }
+        tool = BrowserSessionTool(max_snapshot_bytes=128, _backend=backend)
+        await tool.run(_durable_context(tmp_path, args=args, records=records), args)
+        operation_record = next(
+            record
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-operation"
+            and record.get("state") == "terminal"
+        )
+        operation_record["result"]["structured"]["snapshot"] = "x" * 129
+
+        recovered = await _recover_durable_browser_result(
+            tool,
+            args=args,
+            records=records,
+        )
+
+        assert recovered.structured["error"] == "authority_expired"
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_reconnect_rejects_unbounded_session_refs_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        backend = _FakeBrowserBackend()
+        records: dict[str, dict[str, Any]] = {}
+        navigate_args = {
+            "operation": "navigate",
+            "url": "https://example.test/form",
+            "operation_id": "bounded-session-record",
+        }
+        tool = BrowserSessionTool(max_refs=2, _backend=backend)
+        opened = await tool.run(
+            _durable_context(tmp_path, args=navigate_args, records=records),
+            navigate_args,
+        )
+        session_record = next(
+            record
+            for record in records.values()
+            if record.get("record_type") == "cayu.browser-session"
+        )
+        session_record["refs"] = ["ref_one", "ref_two", "ref_three"]
+        observe_args = {
+            "operation": "observe",
+            "session_id": opened.structured["session_id"],
+            "page_id": opened.structured["page_id"],
+            "operation_id": "bounded-session-observe",
+        }
+
+        refused = await BrowserSessionTool(max_refs=2, _backend=backend).run(
+            _durable_context(
+                tmp_path,
+                args=observe_args,
+                records=records,
+                tool_call_id="bounded-session-observe-call",
+            ),
+            observe_args,
+        )
+
+        assert refused.structured["error"] == "restoration_required"
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_pending_recovery_does_not_convert_store_failure_to_receipt() -> None:
+    async def scenario() -> None:
+        tool = _tool(_FakeBrowserBackend())
+
+        async def fail_load(_key: str) -> dict[str, Any] | None:
+            raise ConnectionError("durable operation store unavailable")
+
+        with pytest.raises(ConnectionError, match="store unavailable"):
+            await tool.reconcile_durable_tool_call(
+                parent_session_id="parent-session",
+                parent_run_epoch=1,
+                execution_profile_fingerprint="b" * 64,
+                environment_name="browser",
+                environment_allocation_fingerprint="a" * 64,
+                model_step_id="model-step-1",
+                model_attempt_id="model-attempt-1",
+                tool_round_id="tool-round-1",
+                tool_call_id="tool-call-1",
+                idempotency_key="tool-key-tool-call-1",
+                arguments={
+                    "operation": "navigate",
+                    "url": "https://example.test/form",
+                    "operation_id": "recovery-store-failure",
+                },
+                started=True,
+                load_operation=fail_load,
+            )
+
+    asyncio.run(scenario())
 
 
 def test_browser_session_acknowledgement_loss_is_ambiguous_and_not_replayed(

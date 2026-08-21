@@ -10126,17 +10126,57 @@ class RecoveryCoordinator:
                 idempotency_key=expected_idempotency_key,
                 fallback=tool_call.arguments,
             )
-            reconciled_result = await self._reconcile_subagent_child(
-                subagent_children,
-                idempotency_key=expected_idempotency_key,
-                tool_call_id=pending_tool_call.tool_call_id,
-                tool_name=pending_tool_call.tool_name,
-                tool_round_id=pending_round.tool_round_id,
-                arguments=recovery_arguments,
-                parent_session=session,
-                registered_agent=registered_agent,
-            )
-            result = reconciled_result
+            registered_tool = registered_agent.tools.get(pending_tool_call.tool_name)
+            result: ToolResult | None = None
+            if registered_tool is not None and registered_tool.durable_tool_recovery is not None:
+
+                async def load_durable_tool_operation(
+                    storage_key: str,
+                ) -> dict[str, Any] | None:
+                    return await self._session_store.load_session_operation(
+                        session.id,
+                        storage_key,
+                    )
+
+                result = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(
+                    parent_session_id=session.id,
+                    parent_run_epoch=(pending_round.source_run_epoch or session.run_epoch),
+                    execution_profile_fingerprint=(
+                        None if execution_profile is None else execution_profile.fingerprint
+                    ),
+                    environment_name=environment_name,
+                    environment_allocation_fingerprint=(
+                        None
+                        if registered_environment is None
+                        else registered_environment.live_allocation_fingerprint
+                    ),
+                    model_step_id=pending_round.model_step_id,
+                    model_attempt_id=pending_round.model_attempt_id,
+                    tool_round_id=pending_round.tool_round_id,
+                    tool_call_id=pending_tool_call.tool_call_id,
+                    idempotency_key=expected_idempotency_key,
+                    arguments=copy_json_value(
+                        tool_call.arguments,
+                        "durable_tool_recovery.arguments",
+                    ),
+                    started=pending_tool_call.tool_call_id in started_ids,
+                    load_operation=load_durable_tool_operation,
+                )
+                if result is not None and type(result) is not ToolResult:
+                    raise TypeError("Durable tool recovery must return ToolResult or None.")
+            reconciled_result = None
+            if result is None:
+                reconciled_result = await self._reconcile_subagent_child(
+                    subagent_children,
+                    idempotency_key=expected_idempotency_key,
+                    tool_call_id=pending_tool_call.tool_call_id,
+                    tool_name=pending_tool_call.tool_name,
+                    tool_round_id=pending_round.tool_round_id,
+                    arguments=recovery_arguments,
+                    parent_session=session,
+                    registered_agent=registered_agent,
+                )
+                result = reconciled_result
             if result is None:
                 result = self._reattached_subagent_result(
                     subagent_children,
@@ -10220,6 +10260,12 @@ class RecoveryCoordinator:
             if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES
         }
         pending_calls_by_id = {call.tool_call_id: call for call in pending_round.tool_calls}
+        started_interaction_by_id = {
+            tool_call_id: event.interaction_id
+            for event in lifecycle_events
+            if event.type is EventType.TOOL_CALL_STARTED
+            and type(tool_call_id := event.payload.get("tool_call_id")) is str
+        }
         planned_terminal_events: list[Event] = []
         planned_outcomes: list[runtime_records.ToolCallOutcome] = []
         planned_hook_states: list[
@@ -10262,6 +10308,7 @@ class RecoveryCoordinator:
                 Event(
                     type=event_type,
                     session_id=session.id,
+                    interaction_id=started_interaction_by_id.get(pending_call.tool_call_id),
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     tool_name=outcome.call.name,

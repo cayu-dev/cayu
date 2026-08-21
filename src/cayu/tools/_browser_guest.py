@@ -25,7 +25,7 @@ import sys
 import tempfile
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Never
 from urllib.parse import urljoin, urlsplit
@@ -34,7 +34,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v3"
 WORKER_VERSION = "3"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v1"
-INTERACTIVE_WORKER_VERSION = "4"
+INTERACTIVE_WORKER_VERSION = "5"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -82,6 +82,8 @@ _INTERACTIVE_MAX_IDLE_SECONDS = 60 * 60
 _INTERACTIVE_MAX_REDIRECTS = 10
 _INTERACTIVE_MAX_REQUESTS = 512
 _INTERACTIVE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+_INTERACTIVE_MAX_OPERATIONS = 16_384
+_INTERACTIVE_OPERATION_LEDGER_BYTES = 16 * 1024 * 1024
 _INTERACTIVE_MAX_ELEMENT_TEXT_BYTES = 2 * 1024
 _INTERACTIVE_MAX_TITLE_ENVELOPE_BYTES = 4 * 1024
 _INTERACTIVE_ACCESSIBILITY_SOURCE_MULTIPLIER = 8
@@ -283,6 +285,7 @@ class _InteractiveLimits:
     max_redirects: int
     max_requests: int
     max_response_bytes: int
+    max_operations: int
 
 
 @dataclass(frozen=True)
@@ -303,13 +306,20 @@ class _InteractiveRequest:
     page_id: str | None
     expected_revision: str | None
     ref: str | None
-    operation_id: str | None
+    operation_id: str
     url: str | None
     value: str | None
     key: str | None
     wait_ms: int | None
     full_page: bool
     limits: _InteractiveLimits
+
+
+@dataclass(frozen=True)
+class _InteractiveOperationRecord:
+    fingerprint: str
+    response: dict[str, Any]
+    size_bytes: int
 
 
 @dataclass
@@ -562,8 +572,8 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "session_id",
         "worker_version",
     }
-    page = base | {"page_id"}
-    revision = page | {"expected_revision", "operation_id"}
+    page = base | {"page_id", "operation_id"}
+    revision = page | {"expected_revision"}
     expected: dict[str, set[str]] = {
         "navigate": base | {"page_id", "operation_id", "url"},
         "observe": page,
@@ -591,6 +601,7 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "max_redirects",
         "max_requests",
         "max_response_bytes",
+        "max_operations",
         "max_snapshot_bytes",
         "max_dom_nodes",
         "max_wait_ms",
@@ -658,6 +669,11 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             minimum=1,
             maximum=_INTERACTIVE_MAX_RESPONSE_BYTES,
         ),
+        max_operations=_bounded_int(
+            raw_limits["max_operations"],
+            minimum=1,
+            maximum=_INTERACTIVE_MAX_OPERATIONS,
+        ),
     )
     session_id = _interactive_identifier(raw.get("session_id"))
     page_id = None if "page_id" not in raw else _interactive_identifier(raw["page_id"])
@@ -667,9 +683,7 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         else _interactive_identifier(raw["expected_revision"])
     )
     ref = None if "ref" not in raw else _interactive_identifier(raw["ref"])
-    operation_id = (
-        None if "operation_id" not in raw else _interactive_identifier(raw["operation_id"])
-    )
+    operation_id = _interactive_identifier(raw.get("operation_id"))
     url = None
     if "url" in raw:
         url = raw["url"]
@@ -2686,11 +2700,13 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
             return {**response, "allocation_disposition": "retired"}
         return response
     if request.operation != "navigate":
-        disposition: Literal["retired", "uncertain"] = (
-            "retired" if await _await_interactive_retirement(request.session_id) else "uncertain"
-        )
+        retired = await _await_interactive_retirement(request.session_id)
+        disposition: Literal["retired", "uncertain"] = "retired" if retired else "uncertain"
         return _interactive_error_payload(
-            _GuestFailure("session_closed", allocation_disposition=disposition)
+            _GuestFailure(
+                "allocation_lost" if retired else "session_closed",
+                allocation_disposition=disposition,
+            )
         )
     await _start_interactive_daemon(request.session_id, socket_path)
     # A daemon can fail near the end of its connection window and then spend
@@ -2792,6 +2808,9 @@ class _InteractiveDaemon:
         self.closing = False
         self.close_after_response = False
         self.idle_expired = False
+        self.operations: dict[str, _InteractiveOperationRecord] = {}
+        self.cleanup_operations: dict[str, _InteractiveOperationRecord] = {}
+        self.operation_ledger_bytes = 0
         self.idle_timeout_seconds = _INTERACTIVE_IDLE_SECONDS
         self.last_activity = 0.0
         self.home: Path | None = None
@@ -2852,12 +2871,59 @@ class _InteractiveDaemon:
         if request.session_id != self.session_id:
             raise _GuestFailure("incompatible_browser")
         async with self.lock:
+            fingerprint = _interactive_operation_fingerprint(request)
+            existing = self.operations.get(request.operation_id)
+            if existing is None:
+                existing = self.cleanup_operations.get(request.operation_id)
+            if existing is not None:
+                if existing.fingerprint != fingerprint:
+                    return _interactive_error_payload(_GuestFailure("operation_conflict"))
+                return json.loads(json.dumps(existing.response))
             if self.closing or self.close_requested.is_set():
                 raise _GuestFailure("session_closed")
+            operation_records = (
+                self.cleanup_operations if request.operation == "close" else self.operations
+            )
+            if request.operation == "close":
+                if operation_records:
+                    return _interactive_error_payload(_GuestFailure("resource_exhausted"))
+            elif len(operation_records) >= request.limits.max_operations:
+                return _interactive_error_payload(_GuestFailure("resource_exhausted"))
             try:
-                return await self._execute_locked(request)
+                response = await self._execute_locked(request)
+            except _GuestFailure as exc:
+                response = _interactive_error_payload(exc)
+            except Exception as exc:
+                response = _interactive_error_payload(
+                    _interactive_playwright_error(request.operation, exc)
+                )
             finally:
                 self.last_activity = asyncio.get_running_loop().time()
+            encoded = json.dumps(
+                response,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            retained = response
+            if (
+                len(encoded) > _INTERACTIVE_MAX_SNAPSHOT_BYTES * 2
+                or self.operation_ledger_bytes + len(encoded) > _INTERACTIVE_OPERATION_LEDGER_BYTES
+            ):
+                retained = _interactive_error_payload(_GuestFailure("outcome_ambiguous"))
+                encoded = json.dumps(
+                    retained,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            operation_records[request.operation_id] = _InteractiveOperationRecord(
+                fingerprint=fingerprint,
+                response=json.loads(json.dumps(retained)),
+                size_bytes=len(encoded),
+            )
+            self.operation_ledger_bytes += len(encoded)
+            return response
 
     async def _execute_locked(self, request: _InteractiveRequest) -> dict[str, Any]:
         """Execute while the caller owns the daemon lifecycle lock."""
@@ -3803,6 +3869,7 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
     stable = error.code
     if stable not in {
         "actionability_failed",
+        "allocation_lost",
         "artifact_write_failed",
         "browser_crash",
         "browser_unavailable",
@@ -3813,6 +3880,8 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
         "incompatible_browser",
         "missing_element",
         "navigation_timeout",
+        "operation_conflict",
+        "outcome_ambiguous",
         "oversized_artifact",
         "oversized_response",
         "oversized_snapshot",
@@ -3831,6 +3900,16 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
         "allocation_disposition": error.allocation_disposition,
         "error": stable,
     }
+
+
+def _interactive_operation_fingerprint(request: _InteractiveRequest) -> str:
+    encoded = json.dumps(
+        asdict(request),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return __import__("hashlib").sha256(b"cayu-browser-guest-operation-v1\0" + encoded).hexdigest()
 
 
 def _interactive_playwright_error(operation: str, error: BaseException) -> _GuestFailure:

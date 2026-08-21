@@ -9,7 +9,7 @@ from cayu._validation import require_durable_clean_nonblank
 from cayu._workspace_mutation import WorkspaceMutationProcessFence
 from cayu.core.agents import AgentSpec
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.tools import Tool, ToolEffect, ToolResult
+from cayu.core.tools import DurableToolRecovery, Tool, ToolEffect, ToolResult
 from cayu.environments import (
     BoundWorkspace,
     Environment,
@@ -81,6 +81,7 @@ class RegisteredTool:
     command_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool: Tool
     child_session_recovery: ChildSessionRecoveryMatcher | None = None
+    durable_tool_recovery: DurableToolRecovery | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,10 @@ class RegisteredEnvironment:
     execution_candidate: str | None = None
     unclaimed_factory_result: EnvironmentFactoryResult | None = None
     preserve_factory_allocation: bool = False
+    # Opaque identity for one recoverable process-external allocation. This is
+    # stable across a factory reconnect but absent for process-local/static
+    # environments, which must not claim browser continuity after restart.
+    live_allocation_fingerprint: str | None = None
     registration_source: str | None = None
     registration_symbol: str | None = None
     # Runtime-owned authority for one concrete environment/binding generation.

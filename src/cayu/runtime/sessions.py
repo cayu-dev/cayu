@@ -16361,6 +16361,7 @@ def _validate_assistant_model_completion_publication(
         "agent_name",
         "environment_name",
         "task_id",
+        "source_run_epoch",
         "execution_profile_fingerprint",
         "tool_calls",
         "policy_state",
@@ -16420,6 +16421,12 @@ def _validate_assistant_model_completion_publication(
         raise ValueError("The pending tool round has a conflicting source model-step identity.")
     if marker.get("source_transcript_cursor") != stage.source_transcript_cursor:
         raise ValueError("The pending tool round has a conflicting source transcript cursor.")
+    marker_source_run_epoch = marker.get("source_run_epoch")
+    if (
+        type(marker_source_run_epoch) is not int
+        or marker_source_run_epoch != stage.source_run_epoch
+    ):
+        raise ValueError("The pending tool round has a conflicting source run epoch.")
     try:
         require_clean_nonblank(marker.get("agent_name"), "pending tool-round agent_name")
         for field_name in ("environment_name", "task_id"):

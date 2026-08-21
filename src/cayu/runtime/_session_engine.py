@@ -13917,6 +13917,7 @@ class SessionEngine:
                     agent_name=registered_agent.spec.name,
                     environment_name=_environment_name(registered_environment),
                     task_id=task_id,
+                    source_run_epoch=publication.dispatch.stage.source_run_epoch,
                     tool_calls=tool_calls,
                     policy_outcomes=None,
                     tool_exposure=tool_exposure,

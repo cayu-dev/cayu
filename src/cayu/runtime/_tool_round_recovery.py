@@ -81,6 +81,11 @@ class PendingToolRound(BaseModel):
     agent_name: str
     environment_name: str | None = None
     task_id: str | None = None
+    source_run_epoch: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     execution_profile_fingerprint: str | None = Field(
         default=None,
         min_length=64,
@@ -765,6 +770,7 @@ def checkpoint_with_pending_tool_round(
     agent_name: str,
     environment_name: str | None,
     task_id: str | None,
+    source_run_epoch: int | None = None,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
     tool_exposure: ResolvedToolExposureAuthority | None = None,
@@ -835,6 +841,7 @@ def checkpoint_with_pending_tool_round(
         agent_name=agent_name,
         environment_name=environment_name,
         task_id=task_id,
+        source_run_epoch=source_run_epoch,
         execution_profile_fingerprint=(
             None if active_profile is None else active_profile.profile.fingerprint
         ),

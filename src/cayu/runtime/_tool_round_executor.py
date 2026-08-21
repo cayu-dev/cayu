@@ -157,6 +157,8 @@ from cayu.runtime.sessions import (
     McpManifestHistoryConflict,
     McpManifestPublicationResult,
     Session,
+    SessionOperationPublication,
+    SessionRunFenced,
     SessionStatus,
     SessionStore,
     _mcp_authoritative_manifest_hash,
@@ -1693,6 +1695,7 @@ class ToolRoundExecutor:
             agent_name=registered_agent.spec.name,
             environment_name=_environment_name(registered_environment),
             task_id=task_id,
+            source_run_epoch=session.run_epoch,
             tool_calls=tool_calls,
             policy_outcomes=policy_outcomes,
             structured_output=structured_output,
@@ -2585,6 +2588,114 @@ class ToolRoundExecutor:
             artifact_store=raw_artifact_store,
         )
         if execution_profile is not None:
+
+            async def load_durable_operation(storage_key: str) -> dict[str, Any] | None:
+                return await self._session_store.load_session_operation(
+                    session.id,
+                    storage_key,
+                )
+
+            async def compare_and_set_durable_operation(
+                storage_key: str,
+                expected: dict[str, Any] | None,
+                desired: dict[str, Any],
+                secondary_records: Mapping[str, dict[str, Any]],
+            ) -> dict[str, Any]:
+                expected_copy = (
+                    None
+                    if expected is None
+                    else copy_durable_json_object(expected, "durable_tool_operation.expected")
+                )
+                desired_copy = copy_durable_json_object(
+                    desired,
+                    "durable_tool_operation.desired",
+                )
+                secondary_copy = {
+                    key: copy_durable_json_object(
+                        value,
+                        f"durable_tool_operation.secondary[{key!r}]",
+                    )
+                    for key, value in secondary_records.items()
+                }
+                if storage_key in secondary_copy:
+                    raise ValueError("A durable tool operation cannot duplicate its primary key.")
+
+                def publish(
+                    current_session: Session,
+                    checkpoint: dict[str, Any] | None,
+                    current: dict[str, Any] | None,
+                ) -> SessionOperationPublication:
+                    if (
+                        current_session.id != session.id
+                        or current_session.run_epoch != session.run_epoch
+                    ):
+                        raise SessionRunFenced(
+                            "Durable tool operation lost its parent run authority."
+                        )
+                    if current != expected_copy:
+                        raise RuntimeError("Durable tool operation changed before publication.")
+                    records = {storage_key: desired_copy, **secondary_copy}
+                    return SessionOperationPublication(
+                        checkpoint={} if checkpoint is None else checkpoint,
+                        operation_records=records,
+                    )
+
+                publication = asyncio.create_task(
+                    self._session_store.publish_session_operation(
+                        session.id,
+                        idempotency_key=storage_key,
+                        operation_transform=publish,
+                        events=[],
+                        expected_statuses={SessionStatus.RUNNING},
+                        expected_run_epoch=session.run_epoch,
+                    )
+                )
+                outcome = await await_shielded_task_outcome(publication)
+                publication_error = outcome.error
+                if publication_error is not None:
+                    persisted = await self._session_store.load_session_operation(
+                        session.id,
+                        storage_key,
+                    )
+                    if persisted != desired_copy:
+                        if outcome.cancellation is not None:
+                            outcome.cancellation.add_note(
+                                "Durable tool operation publication also failed: "
+                                f"{type(publication_error).__name__}."
+                            )
+                            raise outcome.cancellation from publication_error
+                        raise publication_error
+                    for key, value in secondary_copy.items():
+                        if (
+                            await self._session_store.load_session_operation(
+                                session.id,
+                                key,
+                            )
+                            != value
+                        ):
+                            raise RuntimeError(
+                                "Durable tool operation acknowledgement is inconsistent."
+                            ) from publication_error
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
+                return copy_durable_json_object(
+                    desired_copy,
+                    "durable_tool_operation.result",
+                )
+
+            def seal_durable_output(record: dict[str, Any]) -> dict[str, Any]:
+                snapshot = invocation_secret_scope.seal_for_publication()
+                if snapshot.unsafe_output or snapshot.secret_scope_incomplete:
+                    raise RuntimeError(
+                        "Durable tool output requires a complete invocation secret scope."
+                    )
+                redacted = snapshot.redactor.redact_json_values(
+                    copy_durable_json_object(record, "durable_tool_output")
+                )
+                if type(redacted) is not dict:
+                    raise TypeError("Durable tool output must remain an object after redaction.")
+                return redacted
+
             _bind_runtime_tool_invocation_authority(
                 tool_context,
                 parent_task_id=task_id,
@@ -2597,6 +2708,14 @@ class ToolRoundExecutor:
                 idempotency_key=idempotency_key,
                 effective_arguments=effective_tool_call.arguments,
                 execution_profile_fingerprint=execution_profile.fingerprint,
+                environment_allocation_fingerprint=(
+                    None
+                    if registered_environment is None
+                    else registered_environment.live_allocation_fingerprint
+                ),
+                load_durable_operation=load_durable_operation,
+                compare_and_set_durable_operation=(compare_and_set_durable_operation),
+                seal_durable_output=seal_durable_output,
                 secret_publication_sealer=invocation_secret_scope.seal_for_publication,
             )
         workspace_window_id: str | None = None

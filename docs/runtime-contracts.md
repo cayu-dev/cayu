@@ -5170,8 +5170,9 @@ failed browser/provider capability never falls back to trusted host HTTP or a
 different provider.
 
 The opt-in interactive sandboxed profile exposes one ordinary
-`browser_session` tool backed by `cayu.browser-session.v1` in the same pinned
-Playwright/Chromium worker image. Cayu owns browser session and page identities.
+`browser_session` tool backed by `cayu.browser-session.v1` worker version 5 in
+the same pinned Playwright/Chromium worker image. Cayu owns browser session and
+page identities.
 Each bounded AI-mode ARIA observation produces a new opaque revision and opaque
 refs; ref actions require that exact revision plus a stable operation id and
 invalidate the old refs before dispatch. Stale revisions, unknown refs, and
@@ -5203,8 +5204,32 @@ lifetime; this initial profile admits one page, restores Chromium popup
 blocking, and installs a pre-document popup guard for explicit and inherited
 targets plus ordinary and prototype popup APIs. Any unexpected second page
 is a fail-safe resource violation that retires the allocation.
-Reconstruction after Cayu worker loss is not supported by this contract. See
-`docs/browser-session.md`.
+
+When an environment factory has published reconnect metadata, the runtime
+derives a content-free allocation fingerprint and binds it with the parent
+session/run epoch, execution profile, model attempt, tool round/call,
+idempotency key, and effective arguments before browser dispatch. Each browser
+operation publishes one durable `intent`, a pre-dispatch `dispatched` marker,
+and at most one terminal result through the session run fence. The guest also
+retains an independently bounded exact-operation ledger. A fenced parent
+record preserves the normal-operation count, cleanup-operation count, and live
+browser-session identities, so worker replacement does not grant fresh
+resource allowance and explicit cleanup remains separately bounded. Fresh Cayu
+processes may reconnect only to the exact same live allocation and restore the
+last terminal revision/ref authority; uncertain evidence invalidates old refs
+and requires a new observation. Pending-round recovery receives only a read-only
+operation-record loader and never dispatches the tool. It returns exact terminal
+evidence, `operation_not_dispatched`, or fail-closed `outcome_ambiguous` rather
+than replaying an action. Lost allocations, profile mismatches, expired
+authority, unsupported restoration, and cleanup failure remain distinct typed
+outcomes with bounded operator guidance. Durable browser continuity/session
+records exclude credentials, browser-profile contents, snapshots, and artifact
+bytes. A sealed terminal operation receipt retains its bounded `ToolResult`,
+including bounded observation content required for exact replay, but excludes
+raw binary artifact bytes and browser-profile contents. Cayu supports no profile
+recreation or full process/VM snapshot when the live allocation is gone. See
+`docs/browser-session.md` for the precise reconnect, restoration, reload, and
+replay terminology.
 
 Tool policy authorizes a model call, and URL validation bounds the requested
 destination, but neither is a process or network-isolation boundary. Only the

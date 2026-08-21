@@ -13,6 +13,7 @@ import inspect
 import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from math import isfinite
 from typing import Any
 
@@ -28,6 +29,7 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_json_value,
     copy_label_map,
@@ -102,6 +104,7 @@ from cayu.runtime._environment_allocation import (
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
     DurableEnvironmentAllocationContext,
     EnvironmentAllocationCoordinator,
+    EnvironmentAllocationReceipt,
 )
 from cayu.runtime._environment_allocation import (
     environment_factory_checkpoint_may_be_committed as _environment_factory_checkpoint_may_be_committed,
@@ -166,6 +169,46 @@ _RunFenceReleaseKey = tuple[str, int]
 logger = logging.getLogger(__name__)
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
+
+
+def _live_allocation_fingerprint(
+    allocation: DurableEnvironmentAllocationContext | None,
+    receipt: EnvironmentAllocationReceipt | None,
+) -> str | None:
+    """Return content-free continuity authority for one acknowledged allocation."""
+
+    if allocation is None and receipt is None:
+        return None
+    reconnect_metadata = (
+        receipt.reconnect_metadata
+        if allocation is None and receipt is not None
+        else allocation.acknowledged_reconnect_metadata
+        if allocation is not None
+        else None
+    )
+    if reconnect_metadata is None:
+        return None
+    if allocation is not None:
+        intent = allocation.intent
+    elif receipt is not None:
+        intent = receipt.intent
+    else:  # pragma: no cover - guarded above
+        return None
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "record_type": "cayu.live-environment-allocation",
+                "schema_version": 1,
+                "allocation_id": intent.allocation_id,
+                "provider": intent.provider,
+                "adapter_generation": intent.adapter_generation,
+                "session_id": intent.session_id,
+                "environment_name": intent.environment_name,
+                "reconnect_metadata": reconnect_metadata,
+            },
+            "live_environment_allocation",
+        )
+    ).hexdigest()
 
 
 class EnvironmentCapacityError(RuntimeError):
@@ -1057,6 +1100,10 @@ class EnvironmentLifecycle:
                     None if admission_candidate is None else admission_candidate.candidate
                 ),
                 unclaimed_factory_result=result,
+                live_allocation_fingerprint=_live_allocation_fingerprint(
+                    allocation_context,
+                    allocation_receipt,
+                ),
                 workspace_mutation_fence=(
                     registered_environment.workspace_mutation_fence.child_fence()
                 ),
@@ -1660,6 +1707,7 @@ class EnvironmentLifecycle:
             preserve_factory_allocation=(
                 registered_environment.unclaimed_factory_result is not None
             ),
+            live_allocation_fingerprint=(registered_environment.live_allocation_fingerprint),
             binding_generation_id=registered_environment.binding_generation_id,
             workspace_mutation_fence=(registered_environment.workspace_mutation_fence),
         )

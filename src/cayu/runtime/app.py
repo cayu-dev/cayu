@@ -59,6 +59,7 @@ from cayu.core.messages import (
 )
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
+    DurableToolRecovery,
     Tool,
     ToolContext,
     ToolResult,
@@ -5534,6 +5535,7 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         ),
         tool=tool.tool,
         child_session_recovery=tool.child_session_recovery,
+        durable_tool_recovery=tool.durable_tool_recovery,
     )
 
 
@@ -5720,6 +5722,7 @@ def _validate_registered_tool(
         child_session_recovery=(
             tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None
         ),
+        durable_tool_recovery=(tool if isinstance(tool, DurableToolRecovery) else None),
     )
 
 

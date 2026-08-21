@@ -302,6 +302,7 @@ async def _publish_structured_model_step(
         agent_name="assistant",
         environment_name=None,
         task_id=None,
+        source_run_epoch=running.run_epoch,
         tool_calls=durable_tool_calls,
         policy_outcomes=None,
         structured_output=spec,

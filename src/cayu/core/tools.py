@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
@@ -507,6 +507,35 @@ class KnowledgeStoreHandle(Protocol):
     async def read_chunks(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
+@runtime_checkable
+class DurableToolRecovery(Protocol):
+    """Narrow read-only recovery seam for one pending durable tool call.
+
+    Recovery receives only opaque runtime identity and an operation-record
+    loader. It cannot dispatch the tool or access the session store directly.
+    """
+
+    async def reconcile_durable_tool_call(
+        self,
+        *,
+        parent_session_id: str,
+        parent_run_epoch: int,
+        execution_profile_fingerprint: str | None,
+        environment_name: str | None,
+        environment_allocation_fingerprint: str | None,
+        model_step_id: str,
+        model_attempt_id: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+        started: bool,
+        load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+    ) -> ToolResult | None:
+        """Return authenticated durable evidence, or ``None`` for generic recovery."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class _RuntimeToolInvocationAuthority:
     parent_task_id: str | None
@@ -519,6 +548,13 @@ class _RuntimeToolInvocationAuthority:
     idempotency_key: str
     effective_arguments_sha256: str
     execution_profile_fingerprint: str
+    environment_allocation_fingerprint: str | None
+    load_durable_operation: Callable[[str], Awaitable[dict[str, Any] | None]]
+    compare_and_set_durable_operation: Callable[
+        [str, dict[str, Any] | None, dict[str, Any], Mapping[str, dict[str, Any]]],
+        Awaitable[dict[str, Any]],
+    ]
+    seal_durable_output: Callable[[dict[str, Any]], dict[str, Any]]
     secret_publication_sealer: Callable[[], Any]
 
 
@@ -541,6 +577,13 @@ def _bind_runtime_tool_invocation_authority(
     idempotency_key: str,
     effective_arguments: dict[str, Any],
     execution_profile_fingerprint: str,
+    environment_allocation_fingerprint: str | None,
+    load_durable_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+    compare_and_set_durable_operation: Callable[
+        [str, dict[str, Any] | None, dict[str, Any], Mapping[str, dict[str, Any]]],
+        Awaitable[dict[str, Any]],
+    ],
+    seal_durable_output: Callable[[dict[str, Any]], dict[str, Any]],
     secret_publication_sealer: Callable[[], Any],
 ) -> None:
     """Bind runtime-only durable tool provenance after hooks finish."""
@@ -549,6 +592,12 @@ def _bind_runtime_tool_invocation_authority(
         raise TypeError("Runtime tool invocation authority requires a ToolContext.")
     if not callable(secret_publication_sealer):
         raise TypeError("Runtime secret publication sealer must be callable.")
+    if not callable(load_durable_operation):
+        raise TypeError("Runtime durable operation loader must be callable.")
+    if not callable(compare_and_set_durable_operation):
+        raise TypeError("Runtime durable operation publisher must be callable.")
+    if not callable(seal_durable_output):
+        raise TypeError("Runtime durable output sealer must be callable.")
     context_id = id(context)
     existing = _RUNTIME_TOOL_INVOCATION_AUTHORITIES.get(context_id)
     if existing is not None and existing[0]() is context:
@@ -567,6 +616,10 @@ def _bind_runtime_tool_invocation_authority(
             canonical_durable_json_bytes(effective_arguments, "effective_arguments")
         ).hexdigest(),
         execution_profile_fingerprint=execution_profile_fingerprint,
+        environment_allocation_fingerprint=environment_allocation_fingerprint,
+        load_durable_operation=load_durable_operation,
+        compare_and_set_durable_operation=compare_and_set_durable_operation,
+        seal_durable_output=seal_durable_output,
         secret_publication_sealer=secret_publication_sealer,
     )
 

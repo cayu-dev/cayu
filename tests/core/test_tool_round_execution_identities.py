@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import cast
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, cast
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 
-from cayu.core import AgentSpec, EventType, Message, ToolCallPart, ToolResultPart
+from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -18,6 +18,7 @@ from cayu.runtime import (
     SessionStore,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.execution_units import ToolRoundIdentity
@@ -56,6 +57,51 @@ class _RecordingTool(Tool):
         value = args["value"]
         self.values.append(value)
         return ToolResult(content=str(value))
+
+
+class _DurableRecoveryRecordingTool(_RecordingTool):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovery_calls: list[dict[str, Any]] = []
+
+    async def reconcile_durable_tool_call(
+        self,
+        *,
+        parent_session_id: str,
+        parent_run_epoch: int,
+        execution_profile_fingerprint: str | None,
+        environment_name: str | None,
+        environment_allocation_fingerprint: str | None,
+        model_step_id: str,
+        model_attempt_id: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+        started: bool,
+        load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+    ) -> ToolResult | None:
+        assert await load_operation("missing-browser-operation") is None
+        self.recovery_calls.append(
+            {
+                "parent_session_id": parent_session_id,
+                "parent_run_epoch": parent_run_epoch,
+                "execution_profile_fingerprint": execution_profile_fingerprint,
+                "environment_name": environment_name,
+                "environment_allocation_fingerprint": environment_allocation_fingerprint,
+                "model_step_id": model_step_id,
+                "model_attempt_id": model_attempt_id,
+                "tool_round_id": tool_round_id,
+                "tool_call_id": tool_call_id,
+                "idempotency_key": idempotency_key,
+                "arguments": arguments,
+                "started": started,
+            }
+        )
+        return ToolResult(
+            content="Recovered from durable evidence.",
+            structured={"recovered": True},
+        )
 
 
 class _TranscriptOnlyStore:
@@ -525,6 +571,7 @@ def test_pending_round_recovery_retains_checkpoint_without_call_boundary() -> No
             agent_name="assistant",
             environment_name=None,
             task_id=None,
+            source_run_epoch=1,
             tool_calls=[tool_call],
             policy_outcomes=None,
             structured_output=None,
@@ -575,6 +622,144 @@ def test_pending_round_recovery_retains_checkpoint_without_call_boundary() -> No
         assert await store.load_transcript(session_id) == transcript
         assert await store.load_events(session_id) == []
         assert tool.values == []
+
+    asyncio.run(scenario())
+
+
+def test_pending_round_recovery_uses_read_only_durable_tool_reconciler() -> None:
+    async def scenario() -> None:
+        session_id = "sess_durable_tool_recovery"
+        identity = _tool_round_identity("d")
+        tool_call = _tool_call(name="record", arguments={"value": 7})
+        checkpoint, _pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
+            None,
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            source_run_epoch=1,
+            tool_calls=[tool_call],
+            policy_outcomes=None,
+            tool_round_identity=identity,
+        )
+        pending = dict(checkpoint["pending_tool_round"])
+        pending["policy_state"] = "planned"
+        pending["policy_context_version"] = 1
+        pending["tool_calls"] = [
+            {
+                **call,
+                "policy_evidence": "authoritative",
+                "policy_decision": "allow",
+                "reason": None,
+                "metadata": {},
+            }
+            for call in pending["tool_calls"]
+        ]
+        checkpoint["pending_tool_round"] = pending
+        assistant_message = transcript_helpers.assistant_message_with_tool_round(
+            Message.tool_call(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+            ),
+            identity,
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        tool = _DurableRecoveryRecordingTool()
+        app.register_provider(_SequencedProvider([]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="sequenced-model"),
+            tools=[tool],
+        )
+        source_messages = [Message.text("user", "record")]
+        await store.create(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                messages=source_messages,
+            ),
+            identity=SessionIdentity(
+                provider_name="sequenced",
+                model="sequenced-model",
+            ),
+            interaction_started_event=Event(
+                id="evt-durable-tool-recovery-started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id="interaction-durable-tool-recovery",
+                agent_name="assistant",
+            ),
+            interaction_source_messages=source_messages,
+        )
+        await store.append_transcript_messages(session_id, [assistant_message])
+        await store.checkpoint(session_id, checkpoint)
+        await store.append_event(
+            session_id,
+            Event(
+                id="evt-durable-tool-recovery-call-started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                interaction_id="interaction-durable-tool-recovery",
+                agent_name="assistant",
+                tool_name=tool_call.name,
+                payload={
+                    **identity.payload(),
+                    "tool_call_id": tool_call.id,
+                    "arguments_state": "quarantined",
+                    "idempotency_key": tool_execution.tool_idempotency_key(
+                        session_id=session_id,
+                        tool_round_id=identity.tool_round_id,
+                        tool_call_id=tool_call.id,
+                    ),
+                },
+            ),
+        )
+        session = await store.load(session_id)
+        assert session is not None
+        messages = await store.load_transcript(session_id)
+        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+            session=session,
+            inactive_before=None,
+        )
+        assert claim is not None
+        assert claim.session_before_fence.run_epoch == 1
+        assert claim.session.run_epoch == 2
+
+        try:
+            recovered_events = [
+                event
+                async for event in app._recovery_coordinator.recover_pending_tool_round(
+                    session=claim.session,
+                    registered_agent=app._get_registered_agent("assistant"),
+                    registered_environment=None,
+                    messages=messages,
+                    incomplete_recovery_claimed=True,
+                )
+            ]
+        finally:
+            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+                session_id=session_id,
+                claim_id=claim.claim_id,
+                authoritative_failure=None,
+            )
+
+        assert tool.values == []
+        assert len(tool.recovery_calls) == 1
+        assert tool.recovery_calls[0]["parent_run_epoch"] == 1
+        assert tool.recovery_calls[0]["model_step_id"] == identity.model_step_id
+        assert tool.recovery_calls[0]["model_attempt_id"] == identity.model_attempt_id
+        assert tool.recovery_calls[0]["arguments"] == {"value": 7}
+        assert tool.recovery_calls[0]["started"] is True
+        transcript = await store.load_transcript(session_id)
+        result_parts = [
+            part
+            for message in transcript
+            for part in message.content
+            if isinstance(part, ToolResultPart)
+        ]
+        assert len(result_parts) == 1
+        assert result_parts[0].structured == {"recovered": True}
+        assert any(event.type is EventType.TOOL_CALL_COMPLETED for event in recovered_events)
 
     asyncio.run(scenario())
 
