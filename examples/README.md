@@ -58,6 +58,8 @@ corresponding credentials or service.
 - [`knowledge_remember_local.py`](knowledge_remember_local.py) — local reviewed knowledge.
 - [`knowledge_recall_live.py`](knowledge_recall_live.py) and
   [`knowledge_embedding_live.py`](knowledge_embedding_live.py) — provider-backed retrieval.
+- [`cross_source_recall.py`](cross_source_recall.py) — credential-free bounded
+  knowledge/transcript recall with exact retrieval evidence.
 - [`postgres_knowledge_embedding.py`](postgres_knowledge_embedding.py) — durable PostgreSQL knowledge.
 
 ## Operations and advanced strategies

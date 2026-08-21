@@ -18,9 +18,11 @@ from cayu._validation import (
     require_execution_unit_id,
 )
 from cayu.core.events import Event
+from cayu.core.messages import Message
 from cayu.runtime.invocation import SessionInvocation, TaskInvocation
 from cayu.runtime.sessions import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
+    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     PendingActionSession,
     RunRequest,
     Session,
@@ -29,6 +31,8 @@ from cayu.runtime.sessions import (
     SessionStatus,
     session_invocation_for_run_request,
     session_metadata_for_creation,
+    transcript_search_document,
+    transcript_search_session_token,
 )
 from cayu.runtime.tasks import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
@@ -101,6 +105,21 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
             return 0
         return 1
 
+    def transcript_text(message_json: object) -> str:
+        if type(message_json) is not str:
+            raise ValueError("Transcript message JSON must be text.")
+        try:
+            payload = json.loads(message_json)
+            message = Message.model_validate(payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Transcript message JSON is invalid.") from exc
+        return transcript_search_document(message)
+
+    def transcript_session_token(session_id: object) -> str:
+        if type(session_id) is not str:
+            raise ValueError("Transcript session id must be text.")
+        return transcript_search_session_token(session_id)
+
     connection.create_function(
         "cayu_pending_action_lookup_key",
         1,
@@ -117,6 +136,24 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
         "cayu_is_execution_unit_id",
         2,
         is_execution_unit_id,
+        deterministic=True,
+    )
+    connection.create_function(
+        "cayu_transcript_search_document",
+        1,
+        transcript_text,
+        deterministic=True,
+    )
+    connection.create_function(
+        "cayu_transcript_session_token",
+        1,
+        transcript_session_token,
+        deterministic=True,
+    )
+    connection.create_function(
+        "cayu_transcript_search_tokenizer_version",
+        0,
+        lambda: TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
         deterministic=True,
     )
     connection.create_aggregate(
@@ -328,7 +365,8 @@ _BASELINE_DDL = """
         role TEXT NOT NULL,
         interaction_id TEXT,
         session_order INTEGER,
-        message_json TEXT NOT NULL
+        message_json TEXT NOT NULL,
+        transcript_search_document TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS cayu_session_message_queue (
@@ -762,6 +800,100 @@ _MIGRATION_STEPS: dict[int, str] = {
             committed_at TEXT NOT NULL,
             PRIMARY KEY (task_id, idempotency_key)
         );
+    """,
+    46: """
+        CREATE TABLE IF NOT EXISTS cayu_transcript_search_configuration (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            tokenizer_version TEXT NOT NULL
+        );
+
+        INSERT OR IGNORE INTO cayu_transcript_search_configuration (
+            singleton, tokenizer_version
+        ) VALUES (1, cayu_transcript_search_tokenizer_version());
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS cayu_transcript_messages_fts
+        USING fts5(session_token, message_text, content='');
+
+        CREATE TRIGGER IF NOT EXISTS cayu_transcript_messages_fts_insert
+        AFTER INSERT ON cayu_transcript_messages
+        WHEN new.role IN ('user', 'assistant')
+        BEGIN
+            INSERT INTO cayu_transcript_messages_fts(
+                rowid, session_token, message_text
+            ) VALUES (
+                new.sequence,
+                cayu_transcript_session_token(new.session_id),
+                new.transcript_search_document
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_transcript_messages_fts_delete
+        AFTER DELETE ON cayu_transcript_messages
+        WHEN old.role IN ('user', 'assistant')
+        BEGIN
+            INSERT INTO cayu_transcript_messages_fts(
+                cayu_transcript_messages_fts,
+                rowid,
+                session_token,
+                message_text
+            ) VALUES (
+                'delete',
+                old.sequence,
+                cayu_transcript_session_token(old.session_id),
+                old.transcript_search_document
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_transcript_messages_fts_update
+        AFTER UPDATE OF session_id, role, message_json
+        ON cayu_transcript_messages
+        BEGIN
+            INSERT INTO cayu_transcript_messages_fts(
+                cayu_transcript_messages_fts,
+                rowid,
+                session_token,
+                message_text
+            )
+            SELECT
+                'delete',
+                old.sequence,
+                cayu_transcript_session_token(old.session_id),
+                old.transcript_search_document
+            WHERE old.role IN ('user', 'assistant');
+
+            UPDATE cayu_transcript_messages
+            SET transcript_search_document =
+                cayu_transcript_search_document(new.message_json)
+            WHERE sequence = new.sequence;
+
+            INSERT INTO cayu_transcript_messages_fts(
+                rowid, session_token, message_text
+            )
+            SELECT
+                new.sequence,
+                cayu_transcript_session_token(new.session_id),
+                cayu_transcript_search_document(new.message_json)
+            WHERE new.role IN ('user', 'assistant');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_transcript_messages_search_document_insert
+        BEFORE INSERT ON cayu_transcript_messages
+        WHEN new.transcript_search_document IS NULL
+             OR new.transcript_search_document
+                <> cayu_transcript_search_document(new.message_json)
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid transcript search document');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_transcript_messages_search_document_update
+        BEFORE UPDATE OF transcript_search_document
+        ON cayu_transcript_messages
+        WHEN new.transcript_search_document IS NULL
+             OR new.transcript_search_document
+                <> cayu_transcript_search_document(new.message_json)
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid transcript search document');
+        END;
     """,
     8: """
         CREATE TABLE IF NOT EXISTS cayu_budget_reservations (
@@ -1949,6 +2081,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ("cayu_tasks", "status_payload_json", "TEXT"),
     ),
     45: (("cayu_tasks", "retry_series_json", "TEXT"),),
+    46: (("cayu_transcript_messages", "transcript_search_document", "TEXT NOT NULL"),),
     14: (
         (
             "cayu_sessions",
@@ -2122,6 +2255,22 @@ def _reject_populated_pre_knowledge_revision_database(
         counts,
         required_tables=inspected,
     )
+
+
+def _reject_populated_pre_transcript_search_database(
+    connection: sqlite3.Connection,
+) -> None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_transcript_messages'"
+    ).fetchone()
+    if table is None:
+        return
+    if connection.execute("SELECT EXISTS(SELECT 1 FROM cayu_transcript_messages)").fetchone()[0]:
+        raise schema.SchemaTooOld(
+            "Storage revision 46 requires the final transcript-search projection "
+            "on every transcript row and deliberately does not backfill earlier "
+            "data. Recreate the Cayu database before starting this build."
+        )
 
 
 def _backfill_session_activity(connection: sqlite3.Connection) -> None:
@@ -2971,6 +3120,14 @@ def reconcile_schema(
         # populated unversioned/partially versioned knowledge schema is not a
         # fresh database and must remain recoverable for an explicit reset.
         _reject_populated_pre_knowledge_revision_database(connection)
+    if (
+        schema_mode is not schema.SchemaMode.VALIDATE
+        and state.revision == schema.UNINITIALIZED
+        and any(revision.revision == 46 for revision in schema.pending(state.revision))
+    ):
+        # Refuse before even creating migration bookkeeping in an unversioned
+        # database. The old transcript remains untouched for an explicit reset.
+        _reject_populated_pre_transcript_search_database(connection)
     if schema_mode is not schema.SchemaMode.VALIDATE:
         connection.execute(_MIGRATIONS_TABLE_DDL)
         connection.commit()
@@ -3027,6 +3184,8 @@ def reconcile_schema(
         _validate_knowledge_publication_access_snapshot_column(connection)
     if app_min_supported >= 45:
         _validate_task_retry_series_schema(connection)
+    if app_min_supported >= 46:
+        _validate_revision_46_transcript_search_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -3896,6 +4055,160 @@ def _validate_task_retry_series_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def _validate_revision_46_transcript_search_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    transcript_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_transcript_messages)")
+    }
+    if transcript_columns.get("transcript_search_document") != ("TEXT", 1):
+        raise RuntimeError(
+            "SQLite transcript search document column is missing or nullable. "
+            "Recreate or restore a known-good revision-46 Cayu database."
+        )
+    configuration_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_transcript_search_configuration)")
+    )
+    if configuration_columns != (
+        ("singleton", "INTEGER", 0, 1),
+        ("tokenizer_version", "TEXT", 1, 0),
+    ):
+        raise RuntimeError(
+            "SQLite transcript search tokenizer configuration is missing or malformed. "
+            "Recreate a revision-46 Cayu database with this runtime."
+        )
+    configuration_table = connection.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'cayu_transcript_search_configuration'"
+    ).fetchone()
+    configuration_sql = (
+        ""
+        if configuration_table is None
+        else "".join(str(configuration_table[0] or "").lower().split())
+    )
+    if "check(singleton=1)" not in configuration_sql:
+        raise RuntimeError(
+            "SQLite transcript search tokenizer configuration lacks its singleton "
+            "constraint. Recreate a revision-46 Cayu database."
+        )
+    configuration = connection.execute(
+        "SELECT singleton, tokenizer_version "
+        "FROM cayu_transcript_search_configuration ORDER BY singleton"
+    ).fetchall()
+    if len(configuration) != 1 or tuple(configuration[0]) != (
+        1,
+        TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
+    ):
+        raise RuntimeError(
+            "SQLite transcript search tokenizer identity conflicts with this runtime. "
+            "Recreate a revision-46 Cayu database with this runtime."
+        )
+    expected = {
+        "cayu_transcript_messages_fts": "table",
+        "cayu_transcript_messages_fts_insert": "trigger",
+        "cayu_transcript_messages_fts_delete": "trigger",
+        "cayu_transcript_messages_fts_update": "trigger",
+        "cayu_transcript_messages_search_document_insert": "trigger",
+        "cayu_transcript_messages_search_document_update": "trigger",
+    }
+    rows = connection.execute(
+        "SELECT name, type, sql FROM sqlite_master WHERE name IN (?, ?, ?, ?, ?, ?)",
+        tuple(expected),
+    ).fetchall()
+    found = {str(row[0]): (str(row[1]), str(row[2] or "")) for row in rows}
+    if set(found) != set(expected) or any(
+        found[name][0] != object_type for name, object_type in expected.items()
+    ):
+        raise RuntimeError(
+            "SQLite transcript search schema is incomplete. Recreate or restore "
+            "a known-good revision-46 Cayu database."
+        )
+    fts_sql = "".join(found["cayu_transcript_messages_fts"][1].lower().split())
+    if "usingfts5(session_token,message_text,content='')" not in fts_sql:
+        raise RuntimeError(
+            "SQLite transcript search index conflicts with Cayu's contentless FTS contract."
+        )
+    insert_sql = "".join(found["cayu_transcript_messages_fts_insert"][1].lower().split())
+    delete_sql = "".join(found["cayu_transcript_messages_fts_delete"][1].lower().split())
+    update_sql = "".join(found["cayu_transcript_messages_fts_update"][1].lower().split())
+    document_insert_sql = "".join(
+        found["cayu_transcript_messages_search_document_insert"][1].lower().split()
+    )
+    document_update_sql = "".join(
+        found["cayu_transcript_messages_search_document_update"][1].lower().split()
+    )
+    if (
+        not all(
+            fragment in insert_sql
+            for fragment in (
+                "afterinsertoncayu_transcript_messages",
+                "whennew.rolein('user','assistant')",
+                "cayu_transcript_session_token(new.session_id)",
+                "new.transcript_search_document",
+            )
+        )
+        or not all(
+            fragment in delete_sql
+            for fragment in (
+                "afterdeleteoncayu_transcript_messages",
+                "whenold.rolein('user','assistant')",
+                "'delete',old.sequence",
+                "cayu_transcript_session_token(old.session_id)",
+                "old.transcript_search_document",
+            )
+        )
+        or not all(
+            fragment in update_sql
+            for fragment in (
+                "afterupdateofsession_id,role,message_json",
+                "'delete',old.sequence",
+                "cayu_transcript_search_document(new.message_json)",
+                "wherenew.rolein('user','assistant')",
+            )
+        )
+        or not all(
+            fragment in document_insert_sql
+            for fragment in (
+                "beforeinsertoncayu_transcript_messages",
+                "new.transcript_search_documentisnullor",
+                "cayu_transcript_search_document(new.message_json)",
+                "raise(abort,'invalidtranscriptsearchdocument')",
+            )
+        )
+        or not all(
+            fragment in document_update_sql
+            for fragment in (
+                "beforeupdateoftranscript_search_document",
+                "new.transcript_search_documentisnullor",
+                "cayu_transcript_search_document(new.message_json)",
+                "raise(abort,'invalidtranscriptsearchdocument')",
+            )
+        )
+    ):
+        raise RuntimeError(
+            "SQLite transcript search maintenance triggers conflict with Cayu's contract."
+        )
+    fixture = json.dumps(
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "visible"},
+                {"type": "thinking", "text": "hidden"},
+            ],
+        }
+    )
+    projected = connection.execute(
+        "SELECT cayu_transcript_search_document(?)",
+        (fixture,),
+    ).fetchone()
+    if projected is None or projected[0] != "x76697369626c65":
+        raise RuntimeError(
+            "SQLite transcript search projection does not preserve the narrative-only boundary."
+        )
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     reconcile_schema(connection, schema.SchemaMode.CREATE)
 
@@ -4090,6 +4403,8 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         _reject_populated_pre_knowledge_access_snapshot_database(connection)
     if current < 42 and any(revision.revision == 42 for revision in schema.pending(current)):
         _reject_populated_pre_knowledge_revision_database(connection)
+    if current < 46 and any(revision.revision == 46 for revision in schema.pending(current)):
+        _reject_populated_pre_transcript_search_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -4144,6 +4459,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _reject_populated_pre_knowledge_revision_database(connection)
         if rev.revision == 43:
             _reject_revision_43_knowledge_identity_overflow(connection)
+        if rev.revision == 46:
+            # BEGIN IMMEDIATE fences transcript writers between the clean-break
+            # check and installation of the final non-null projection.
+            _reject_populated_pre_transcript_search_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -4165,6 +4484,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_44_knowledge_schema(connection)
         if rev.revision == 45:
             _validate_task_retry_series_schema(connection)
+        if rev.revision == 46:
+            _validate_revision_46_transcript_search_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

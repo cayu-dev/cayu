@@ -25,6 +25,7 @@ POSTGRES_CONTENTION_TABLES = (
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
+    "cayu_transcript_search_configuration",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",

@@ -1,9 +1,8 @@
 # Memory foundation contracts
 
-This document records the Phase 0 contracts for Cayu's v5.1 long-term-memory
-work and the immutable knowledge-revision core now built on them. Cross-source
-recall, context composition, curation, and automatic governance remain separate
-layers.
+This document records Cayu's v5.1 long-term-memory foundations, immutable
+knowledge revisions, and the bounded cross-source recall layer built on them.
+Context composition, curation, and automatic governance remain separate layers.
 
 ## Knowledge and memory are different layers
 
@@ -13,9 +12,88 @@ identity, lifecycle, immutable revisions, and revision-bound source evidence.
 knowledge, transcript episodes, artifact-derived documents, and other typed
 sources, fuse them, select a bounded context contribution, and record exposure.
 
-The current `KnowledgeStore` is therefore one memory source. The WRRF
-types in `cayu.retrieval` are source-neutral and do not turn transcripts or
-artifacts into knowledge.
+The current `KnowledgeStore` is therefore one memory source. `SessionStore`
+transcript search is another. The WRRF types in `cayu.retrieval` are
+source-neutral and do not turn transcripts or artifacts into knowledge.
+
+## Bounded cross-source recall
+
+`RecallEngine` runs registered `RecallSource` adapters concurrently under
+per-source and overall deadlines, validates their independently ranked lanes,
+and fuses them with a caller-versioned `RetrievalFusionStrategy`. The built-in
+`KnowledgeRecallSource` contributes separate lexical and semantic lanes;
+`TranscriptRecallSource` contributes a narrative transcript lane. Every source,
+channel, candidate list, record representation, and combined result has an
+explicit count or byte ceiling.
+
+The lexical knowledge lane is authoritative for the built-in knowledge source.
+Its optional semantic lane runs concurrently under its own deadline; an
+unsupported, failed, or timed-out semantic lookup is recorded as partial lane
+coverage without discarding successful lexical evidence. A source-level lexical
+failure still follows the source's required/optional policy.
+
+`RecallEngineConfig.max_result_bytes` bounds the canonical serialized
+`RecallResult`, including diagnostics and continuations rather than only the
+candidate text. If the metadata-only result cannot fit, recall fails closed.
+Sources declare which of their channels accept continuation cursors; supplying
+a cursor for a non-pageable channel is rejected instead of silently ignored.
+Pageable sources provide the exact frontier after every ranked hit. When fusion
+or the result-byte ceiling omits candidates, recall advances a channel only
+through its contiguous ranked prefix whose candidates are actually returned.
+An omitted candidate is therefore eligible on the next page rather than being
+silently skipped.
+
+Callers construct an immutable `RecallSituation` with the current query,
+optional bounded recent conversation or work context, an explicit
+`KnowledgeAccessScope`, a knowledge namespace, and the exact session IDs that
+may be searched. Knowledge filters execute inside `KnowledgeStore`. Transcript
+filters execute inside `SessionStore`; missing and inaccessible-by-omission
+session IDs are indistinguishable to the search result. Recall never discovers
+tenant/session authority or widens the caller's scope.
+
+`RecallResult` contains deterministic fused candidates, exact canonical
+identity and revision, a bounded representation, content hash, source-specific
+locator, fusion diagnostics, and per-source coverage state. Unsupported or
+temporarily omitted optional lanes are not described as complete. A required
+source failure fails the recall request; an optional source can be represented
+as unavailable without inventing empty complete coverage.
+
+Every fusion implementation has an immutable strategy identity which must match
+the caller's versioned fusion configuration and the returned diagnostics. A
+custom strategy may rank differently, but cannot claim the built-in WRRF
+identity or alter source evidence, channel coverage, or provenance.
+
+Transcript search indexes only `TextPart` content from user and assistant
+messages. Thinking, tool calls/results, provider state, and system messages are
+not searchable or returned. A canonical case-folded document uses collision-free
+hex identities for ordinary terms and fixed-size SHA-256 identities for long
+terms to preserve Python word boundaries across the in-memory, SQLite FTS5, and
+PostgreSQL GIN-backed implementations. Phrase adjacency and distinct-term
+coverage outrank bounded term frequency. SQLite and PostgreSQL intersect opaque
+session terms inside their full-text indexes, while memory addresses only the
+selected session posting lists. All three use the same explicit scope,
+relevance order, pagination, byte, and scan contract. Exceeding the scan
+ceiling yields no fabricated partial ranking or continuation; coverage is
+reported incomplete so a caller can deliberately raise the bound and retry.
+The index version includes the runtime Unicode database used by Python's word
+matching and case folding. Durable SQLite and PostgreSQL stores persist that
+tokenizer identity and fail startup on a mismatch; operators must use a clean
+revision-46 database rather than mixing index writers with different Unicode
+semantics. Cayu does not rewrite existing transcript rows or repair this
+mismatch.
+
+SQLite session-store reads return caller cancellation and recall deadlines
+promptly. Because Python cannot stop an already-running SQLite worker thread
+safely, the physical read remains fenced behind its connection lock until it
+settles; later reads and shutdown cannot reuse that connection in the meantime.
+
+Recall is retrieval only. It does not decide that a candidate should enter a
+model request, does not inspect the model's existing context, and does not
+position material around lost-in-the-middle regions. Those are future/context
+composition decisions owned by a `ContextPolicy` (and eventually exposure
+evidence), after authorization-safe recall has produced candidates. The
+credential-free [cross-source example](../examples/cross_source_recall.py)
+shows the boundary explicitly.
 
 ## Storage-enforced access
 
@@ -312,14 +390,15 @@ bounded, canonical revision identity is retained, output is deterministic for
 recorded inputs/configuration, diagnostics reproduce the decision, and raw
 payload text from rejected candidates is not required in model-facing output.
 
-## Reproducible baseline
+## Reproducible baselines
 
-[`benchmarks/memory`](../benchmarks/memory/README.md) contains the public
-hermetic corpus, checked in-memory/SQLite keyword results, and the command that
-reproduces them without model or network calls. It measures retrieval quality,
-false injection, stale results, authorization leaks (including ID/chunk reads),
-source/citation correctness, candidate/truncation counts, byte/token overhead,
-latency, and English/Spanish/French slices.
+[`benchmarks/memory`](../benchmarks/memory/README.md) contains public hermetic
+corpora and checked in-memory/SQLite results for both knowledge-only retrieval
+and cross-source recall. The runners require no model or network calls. They
+measure retrieval quality, false injection/results, stale results,
+authorization leaks, source/locator correctness, honest partial coverage,
+candidate/truncation counts, byte/token overhead, latency, multilingual
+queries, duplicate provenance, and short follow-ups.
 
 The same bounded corpus schema accepts `origin="external_private"`, trajectory
 identity, and turn index. Production-shaped long trajectories stay outside the

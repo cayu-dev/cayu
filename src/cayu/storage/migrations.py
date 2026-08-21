@@ -263,6 +263,12 @@ REVISIONS: tuple[Revision, ...] = (
     # atomically create delayed successors with an immutable settlement receipt.
     # Older task workers would ignore that authority and could renew the series.
     Revision(revision=45, kind=RevisionKind.BREAKING, compatible_from=45),
+    # Session stores now promise indexed, narrative-only transcript search.
+    # Revision 46 installs the SQLite triggers/FTS table and PostgreSQL
+    # application-computed projection/GIN index required to uphold that public
+    # capability. Populated transcript tables must be recreated: the transition
+    # deliberately has no historical projection backfill or compatibility path.
+    Revision(revision=46, kind=RevisionKind.BREAKING, compatible_from=46),
 )
 
 #: The revision an empty database is initialized to.

@@ -7,6 +7,7 @@ from typing import Any
 from cayu._validation import copy_label_map
 from cayu.runtime.invocation import SessionInvocation, TaskInvocation
 from cayu.runtime.sessions import (
+    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     PendingActionSession,
     Session,
     SessionOrder,
@@ -187,8 +188,20 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         interaction_id TEXT,
         session_order BIGINT,
-        message JSONB NOT NULL
+        message JSONB NOT NULL,
+        transcript_search_document TEXT NOT NULL
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_transcript_search_configuration (
+        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+        tokenizer_version TEXT NOT NULL
+    )
+    """,
+    f"""
+    INSERT INTO cayu_transcript_search_configuration (singleton, tokenizer_version)
+    VALUES (TRUE, '{TRANSCRIPT_SEARCH_TOKENIZER_VERSION}')
+    ON CONFLICT (singleton) DO NOTHING
     """,
     """
     CREATE TABLE IF NOT EXISTS cayu_mcp_manifest_baselines (

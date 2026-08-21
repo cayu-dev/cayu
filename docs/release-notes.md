@@ -106,6 +106,56 @@ retention, ZDR, latency, account, model, region, and project-policy tradeoffs ar
 documented in `cayu guide providers` and must be accepted explicitly by enabling
 the provider option.
 
+### Bounded cross-source recall preserves exact evidence and authority
+
+`RecallEngine` now coordinates independently bounded knowledge and transcript
+sources, validates exact canonical records, and applies deterministic,
+caller-versioned weighted reciprocal-rank fusion. `RecallSituation` requires an
+explicit knowledge access scope and explicit transcript session IDs;
+`RecallResult` reports exact revision/locator evidence, source coverage,
+truncation, and fusion diagnostics. Recall is intentionally retrieval-only and
+does not automatically expose candidates to a model context.
+
+Session stores add bounded narrative transcript search with identical
+in-memory, SQLite, and PostgreSQL behavior. Only user/assistant `TextPart`
+content is indexed; thinking, tools, provider state, system messages, and
+non-text parts are excluded. A portable case-folded document uses collision-free
+hex identities for ordinary terms and fixed-size SHA-256 identities for long
+terms, giving Python, SQLite FTS5, and PostgreSQL GIN identical long-token,
+Unicode, and token-boundary semantics. Phrase and distinct-term coverage
+outrank bounded repetition. Results are relevance-ranked
+before page truncation, and an exceeded scan ceiling fails closed without
+exposing an arbitrary partial ranking. Opaque session terms constrain candidate
+work inside each backend index.
+Explicit session scoping, score-bound keyset cursors, scan ceilings, and byte
+ceilings prevent global or unbounded transcript search.
+
+Recall continuations now advance only through the contiguous per-channel prefix
+present in the returned fused result, so fusion-head and result-byte clipping do
+not skip omitted transcript hits. Optional semantic knowledge lookup has its own
+deadline and no longer discards successful lexical evidence when it fails.
+Custom fusion implementations must publish their own configuration-matched
+strategy identity instead of claiming WRRF provenance.
+
+Storage revision 46 is a deliberate breaking boundary because session-store
+binaries now promise the indexed search capability. It does not backfill or
+reinterpret any pre-revision-46 transcript row. Migration fails before changing
+the schema when the transcript table is populated; recreate that Cayu database
+before starting this build. Empty stores may advance to revision 46 and fresh
+stores are created directly with the final projection and indexes. Cayu carries
+no transcript compatibility or projection-repair path.
+
+The transcript index version records Python's Unicode tokenizer database, and
+durable stores persist the same identity. A mismatch fails startup and requires
+a clean database; it is never repaired or migrated in place. Cancelled SQLite
+transcript reads return to the caller promptly while the physical worker
+remains connection-fenced until it settles.
+
+The public hermetic cross-source corpus freezes backend-parity identities and
+measures recall, false results, stale revisions, authorization leaks, locator
+correctness, honest partial coverage, candidate/byte overhead, multilingual
+queries, duplicate provenance, and short follow-ups without provider calls.
+
 ## v0.3.0
 
 `v0.3.0` hardens Cayu's durable runtime contracts while extending the

@@ -42,6 +42,7 @@ from cayu.runtime import (
 from cayu.runtime.aggregates import AggregateUsageMetrics
 from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
 from cayu.runtime.sessions import (
+    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     BudgetReservationIdentityConflict,
     ModelCompletionStageRequest,
     PendingActionQuery,
@@ -2054,7 +2055,7 @@ def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 45"):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
@@ -2087,7 +2088,7 @@ def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2133,7 +2134,7 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2209,7 +2210,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 40"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2559,6 +2560,212 @@ def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
     assert version == schema_migrations.LATEST_REVISION
 
 
+def test_sqlite_transcript_search_trigger_shape_fails_closed_in_migrate_mode(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "transcript-search-invalid.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(
+            """
+            DROP TRIGGER cayu_transcript_messages_fts_insert;
+            CREATE TRIGGER cayu_transcript_messages_fts_insert
+            AFTER INSERT ON cayu_transcript_messages
+            BEGIN
+                SELECT 1;
+            END;
+            """
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="maintenance triggers conflict"):
+        SQLiteSessionStore(db_path)
+
+    with pytest.raises(RuntimeError, match="maintenance triggers conflict"):
+        SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        )
+
+    connection = sqlite3.connect(db_path)
+    try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'cayu_transcript_messages_fts_insert'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert "SELECT 1" in trigger_sql
+
+
+def test_sqlite_revision_forty_six_rejects_populated_transcript_database_without_mutation(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "pre-transcript-search.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def create_old_transcript() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="recall",
+                session_id="pre-transcript-search",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await store.append_transcript_messages(
+            session.id,
+            [Message.text("user", "visible")],
+            interaction_id="old-interaction",
+        )
+        await _close(store)
+
+    asyncio.run(create_old_transcript())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(
+            """
+            DROP TRIGGER cayu_transcript_messages_fts_insert;
+            DROP TRIGGER cayu_transcript_messages_fts_delete;
+            DROP TRIGGER cayu_transcript_messages_fts_update;
+            DROP TRIGGER cayu_transcript_messages_search_document_insert;
+            DROP TRIGGER cayu_transcript_messages_search_document_update;
+            DROP TABLE cayu_transcript_messages_fts;
+            DROP TABLE cayu_transcript_search_configuration;
+            ALTER TABLE cayu_transcript_messages
+                DROP COLUMN transcript_search_document;
+            DELETE FROM cayu_schema_migrations WHERE revision = 46;
+            PRAGMA user_version = 45;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="does not backfill"):
+        SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        )
+
+    connection = sqlite3.connect(db_path)
+    try:
+        revision = connection.execute("SELECT MAX(revision) FROM cayu_schema_migrations").fetchone()
+        version = connection.execute("PRAGMA user_version").fetchone()
+        transcript_count = connection.execute(
+            "SELECT COUNT(*) FROM cayu_transcript_messages "
+            "WHERE session_id = 'pre-transcript-search'"
+        ).fetchone()
+        transcript_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_transcript_messages)")
+        }
+        fts = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_transcript_messages_fts'"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert revision == (45,)
+    assert version == (45,)
+    assert transcript_count == (1,)
+    assert "transcript_search_document" not in transcript_columns
+    assert fts is None
+
+
+def test_sqlite_revision_forty_six_migrates_empty_transcript_database(tmp_path) -> None:
+    db_path = tmp_path / "empty-pre-transcript-search.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(
+            """
+            DROP TRIGGER cayu_transcript_messages_fts_insert;
+            DROP TRIGGER cayu_transcript_messages_fts_delete;
+            DROP TRIGGER cayu_transcript_messages_fts_update;
+            DROP TRIGGER cayu_transcript_messages_search_document_insert;
+            DROP TRIGGER cayu_transcript_messages_search_document_update;
+            DROP TABLE cayu_transcript_messages_fts;
+            DROP TABLE cayu_transcript_search_configuration;
+            ALTER TABLE cayu_transcript_messages
+                DROP COLUMN transcript_search_document;
+            DELETE FROM cayu_schema_migrations WHERE revision = 46;
+            PRAGMA user_version = 45;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(migrated))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        revision = connection.execute("SELECT MAX(revision) FROM cayu_schema_migrations").fetchone()
+        version = connection.execute("PRAGMA user_version").fetchone()
+        transcript_column = {
+            row[1]: (row[2], row[3])
+            for row in connection.execute("PRAGMA table_info(cayu_transcript_messages)")
+        }["transcript_search_document"]
+        fts = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_transcript_messages_fts'"
+        ).fetchone()
+        tokenizer_configuration = connection.execute(
+            "SELECT singleton, tokenizer_version FROM cayu_transcript_search_configuration"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert revision == (46,)
+    assert version == (46,)
+    assert transcript_column == ("TEXT", 1)
+    assert fts is not None
+    assert tokenizer_configuration == (1, TRANSCRIPT_SEARCH_TOKENIZER_VERSION)
+
+
+def test_sqlite_transcript_tokenizer_identity_mismatch_fails_closed(tmp_path) -> None:
+    db_path = tmp_path / "transcript-tokenizer-mismatch.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE cayu_transcript_search_configuration "
+            "SET tokenizer_version = 'incompatible-tokenizer'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="tokenizer identity conflicts"):
+        SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        )
+
+    connection = sqlite3.connect(db_path)
+    try:
+        marker = connection.execute(
+            "SELECT tokenizer_version FROM cayu_transcript_search_configuration"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert marker == ("incompatible-tokenizer",)
+
+
 def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     connection = sqlite3.connect(db_path)
@@ -2612,6 +2819,10 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'cayu_knowledge_chunks_fts'"
         ).fetchone()
+        transcript_fts = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_transcript_messages_fts'"
+        ).fetchone()
         revisions = connection.execute(
             "SELECT revision, compatible_from FROM cayu_schema_migrations ORDER BY revision"
         ).fetchall()
@@ -2626,6 +2837,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
     assert watcher_table is not None
     assert knowledge_table is not None
     assert knowledge_fts is not None
+    assert transcript_fts is not None
     assert {
         "worker_id",
         "lease_expires_at",
@@ -2683,13 +2895,18 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (43, 43),
         (44, 44),
         (45, 45),
+        (46, 46),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
 
 def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(
     tmp_path,
+    monkeypatch,
 ) -> None:
+    # This test intentionally boots historical revision-40/41 binaries. The
+    # current SessionStore requires revision 46 for its transcript-search index.
+    monkeypatch.setattr(sqlite_storage, "_SQLITE_SESSION_MIN_REQUIRED_REVISION", 40)
     db_path = tmp_path / "pre-knowledge-access-snapshot.sqlite"
     revisions = schema_migrations.REVISIONS
     schema_migrations.REVISIONS = tuple(
@@ -3354,14 +3571,14 @@ def test_sqlite_off_thread_reader_retains_connection_ownership_during_cancellati
         await asyncio.sleep(0)
 
         assert store._read_lock.locked()
-        assert not owner.done()
+        assert owner.done()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
         assert not follower_started.is_set()
         assert not follower.done()
         assert not close_task.done()
 
         release_worker.set()
-        with pytest.raises(asyncio.CancelledError):
-            await owner
         assert await follower == 2
         await close_task
 
@@ -3451,12 +3668,13 @@ def test_sqlite_in_memory_read_cancellation_serializes_shared_writer_connection(
         await asyncio.sleep(0)
 
         assert store._read_lock is store._lock
+        assert owner.done()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
         assert not writer_started.is_set()
         assert not writer.done()
 
         release_worker.set()
-        with pytest.raises(asyncio.CancelledError):
-            await owner
         await writer
         await store.close()
 

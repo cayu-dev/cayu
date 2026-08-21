@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import hmac
 import json
 import logging
@@ -136,6 +137,7 @@ from cayu.runtime.sessions import (
     SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
     SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
     CheckpointTransform,
@@ -217,6 +219,9 @@ from cayu.runtime.sessions import (
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    TranscriptSearchHit,
+    TranscriptSearchQuery,
+    TranscriptSearchResult,
     TranscriptSnapshot,
     UsageRollupQuery,
     _activate_session_run_fence,
@@ -340,12 +345,15 @@ from cayu.runtime.sessions import (
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
+    copy_transcript_search_query,
     copy_usage_rollup_query,
     decode_session_cursor,
     decode_session_lineage_cursor,
     decode_session_topology_cursor,
+    decode_transcript_search_cursor,
     encode_session_cursor,
     encode_session_lineage_cursor,
+    encode_transcript_search_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
     fork_transcript_is_accepted,
@@ -357,6 +365,12 @@ from cayu.runtime.sessions import (
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
+    transcript_search_document,
+    transcript_search_document_score,
+    transcript_search_hit_from_message,
+    transcript_search_position_after_cursor,
+    transcript_search_query_document,
+    transcript_search_session_token,
     transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
@@ -554,7 +568,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 40
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 46
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 45
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
@@ -575,6 +589,22 @@ _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     contains_style="postgres_ilike",
     datetime_param=pg_support.to_utc,
 )
+
+
+def _postgres_transcript_search_expression(query: TranscriptSearchQuery) -> str:
+    session_terms = " | ".join(
+        transcript_search_session_token(session_id) for session_id in query.session_ids
+    )
+    text_terms = " | ".join(transcript_search_query_document(query.text).split())
+    return f"({session_terms}) & ({text_terms})"
+
+
+def _postgres_transcript_index_document(session_id: str, message: Message) -> str:
+    narrative_document = transcript_search_document(message)
+    session_term = transcript_search_session_token(session_id)
+    return session_term if not narrative_document else f"{session_term} {narrative_document}"
+
+
 _KNOWLEDGE_SEARCH_PAGE_SIZE = 500
 _KNOWLEDGE_SEARCH_TOKEN_RE = re.compile(r"\w+")
 _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS = 2000
@@ -1823,6 +1853,21 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    46: (
+        "ALTER TABLE cayu_transcript_messages ADD COLUMN IF NOT EXISTS "
+        "transcript_search_document TEXT NOT NULL",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_transcript_search_configuration (
+            singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            tokenizer_version TEXT NOT NULL
+        )
+        """,
+        f"""
+        INSERT INTO cayu_transcript_search_configuration (singleton, tokenizer_version)
+        VALUES (TRUE, '{TRANSCRIPT_SEARCH_TOKENIZER_VERSION}')
+        ON CONFLICT (singleton) DO NOTHING
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -2235,6 +2280,7 @@ class _ConcurrentIndexMigration:
     predicate_definition: str | None
     create_statement: str
     drop_statement: str
+    access_method: str = "btree"
     required_key_collations: tuple[str | None, ...] = ()
     unique: bool = False
     replace_existing: bool = False
@@ -2710,6 +2756,29 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             required_key_collations=("C",),
         ),
     ),
+    46: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_transcript_messages_narrative_fts",
+            table_name="cayu_transcript_messages",
+            key_definitions=("to_tsvector('simple'::regconfig, transcript_search_document)",),
+            predicate_definition="message ->> 'role' = ANY (ARRAY['user', 'assistant'])",
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_transcript_messages_narrative_fts
+                ON cayu_transcript_messages USING GIN (
+                    to_tsvector(
+                        'simple'::regconfig,
+                        transcript_search_document
+                    )
+                )
+                WHERE message ->> 'role' IN ('user', 'assistant')
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_transcript_messages_narrative_fts"
+            ),
+            access_method="gin",
+        ),
+    ),
 }
 
 
@@ -2820,6 +2889,24 @@ async def _reject_populated_pre_knowledge_revision_database(cur: Any) -> None:
         counts,
         required_tables=counts,
     )
+
+
+async def _reject_populated_pre_transcript_search_database(cur: Any) -> None:
+    await cur.execute("SELECT to_regclass('cayu_transcript_messages')")
+    registered = await cur.fetchone()
+    if registered is None or registered[0] is None:
+        return
+    # Fence transcript writers through the revision transaction so a clean
+    # preflight cannot race an old writer before the non-null column is added.
+    await cur.execute("LOCK TABLE cayu_transcript_messages IN SHARE ROW EXCLUSIVE MODE")
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_transcript_messages)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 46 requires the final transcript-search projection "
+            "on every transcript row and deliberately does not backfill earlier "
+            "data. Recreate the Cayu database before starting this build."
+        )
 
 
 async def _reject_revision_43_knowledge_identity_overflow(cur: Any) -> None:
@@ -3075,6 +3162,10 @@ class _PostgresStoreBase:
                         revision.revision == 42 for revision in schema.pending(current)
                     ):
                         await _reject_populated_pre_knowledge_revision_database(cur)
+                    if current < 46 and any(
+                        revision.revision == 46 for revision in schema.pending(current)
+                    ):
+                        await _reject_populated_pre_transcript_search_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -3105,6 +3196,8 @@ class _PostgresStoreBase:
                             await self._validate_knowledge_index_readiness_schema(cur)
                         if self._min_required_revision >= 45:
                             await self._validate_task_retry_series_schema(cur)
+                        if self._min_required_revision >= 46:
+                            await self._validate_transcript_search_document_column(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3159,6 +3252,7 @@ class _PostgresStoreBase:
                 await _acquire_schema_transaction_lock(conn, cur)
                 state = await self._read_schema_state(cur)
                 if state.revision < concurrent_revision.revision:
+                    await self._validate_revision_schema_objects(cur, concurrent_revision)
                     if concurrent_revision.revision == 23:
                         await self._validate_budget_reservation_identity_registry(
                             cur,
@@ -3264,6 +3358,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_index_readiness_schema(cur)
         if self._min_required_revision >= 45:
             await self._validate_task_retry_series_schema(cur)
+        if self._min_required_revision >= 46:
+            await self._validate_transcript_search_document_column(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3342,6 +3438,93 @@ class _PostgresStoreBase:
             await self._validate_knowledge_index_readiness_schema(cur)
         if revision.revision == 45:
             await self._validate_task_retry_series_schema(cur)
+        if revision.revision == 46:
+            await self._validate_transcript_search_document_column(cur)
+
+    async def _validate_transcript_search_document_column(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, is_generated
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_transcript_messages'
+              AND column_name = 'transcript_search_document'
+            """
+        )
+        if await cur.fetchone() != ("text", "NO", "NEVER"):
+            raise RuntimeError(
+                "Postgres transcript search document column is missing or nullable. "
+                "Recreate or restore a known-good revision-46 Cayu database."
+            )
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_transcript_search_configuration'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("singleton", "boolean", "NO"),
+            ("tokenizer_version", "text", "NO"),
+        ):
+            raise RuntimeError(
+                "Postgres transcript search tokenizer configuration is missing or "
+                "malformed. Recreate a revision-46 Cayu database with this runtime."
+            )
+        await cur.execute(
+            """
+            SELECT array_agg(attribute.attname ORDER BY key.ordinality)
+            FROM pg_constraint AS constraint_definition
+            JOIN pg_class AS relation
+              ON relation.oid = constraint_definition.conrelid
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            CROSS JOIN LATERAL unnest(constraint_definition.conkey)
+                WITH ORDINALITY AS key(attribute_number, ordinality)
+            JOIN pg_attribute AS attribute
+              ON attribute.attrelid = relation.oid
+             AND attribute.attnum = key.attribute_number
+            WHERE namespace.nspname = current_schema()
+              AND relation.relname = 'cayu_transcript_search_configuration'
+              AND constraint_definition.contype = 'p'
+            """
+        )
+        if await cur.fetchone() != (["singleton"],):
+            raise RuntimeError(
+                "Postgres transcript search tokenizer configuration lacks its "
+                "singleton primary key. Recreate a revision-46 Cayu database."
+            )
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_definition.oid, TRUE)
+            FROM pg_constraint AS constraint_definition
+            JOIN pg_class AS relation
+              ON relation.oid = constraint_definition.conrelid
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND relation.relname = 'cayu_transcript_search_configuration'
+              AND constraint_definition.contype = 'c'
+            ORDER BY constraint_definition.conname
+            """
+        )
+        check_definitions = {"".join(str(row[0]).lower().split()) for row in await cur.fetchall()}
+        if "check(singleton)" not in check_definitions:
+            raise RuntimeError(
+                "Postgres transcript search tokenizer configuration lacks its "
+                "singleton constraint. Recreate a revision-46 Cayu database."
+            )
+        await cur.execute(
+            "SELECT singleton, tokenizer_version "
+            "FROM cayu_transcript_search_configuration ORDER BY singleton"
+        )
+        if tuple(await cur.fetchall()) != ((True, TRANSCRIPT_SEARCH_TOKENIZER_VERSION),):
+            raise RuntimeError(
+                "Postgres transcript search tokenizer identity conflicts with this runtime. "
+                "Recreate a revision-46 Cayu database with this runtime."
+            )
 
     async def _validate_knowledge_publication_access_snapshot_column(
         self,
@@ -4602,6 +4785,8 @@ class _PostgresStoreBase:
             await _reject_populated_pre_knowledge_access_snapshot_database(cur)
         if current < 42 and any(revision.revision == 42 for revision in schema.pending(current)):
             await _reject_populated_pre_knowledge_revision_database(cur)
+        if current < 46 and any(revision.revision == 46 for revision in schema.pending(current)):
+            await _reject_populated_pre_transcript_search_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -4703,7 +4888,7 @@ class _PostgresStoreBase:
                     AND table_class.relname = %s,
                     FALSE
                 ),
-                COALESCE(access_method.amname = 'btree', FALSE),
+                COALESCE(access_method.amname = %s, FALSE),
                 ARRAY(
                     SELECT pg_get_indexdef(
                         index_definition.indexrelid,
@@ -4752,7 +4937,7 @@ class _PostgresStoreBase:
             WHERE namespace.nspname = current_schema()
               AND index_class.relname = %s
             """,
-            (index.table_name, index.index_name),
+            (index.table_name, index.access_method, index.index_name),
         )
         row = await cur.fetchone()
         if row is None:
@@ -11097,6 +11282,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    supports_transcript_search: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -12049,14 +12235,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await cur.executemany(
                             """
                             INSERT INTO cayu_transcript_messages
-                                (session_id, interaction_id, message)
-                            VALUES (%s, %s, %s)
+                                (session_id, interaction_id, message,
+                                 transcript_search_document)
+                            VALUES (%s, %s, %s, %s)
                             """,
                             [
                                 (
                                     fork.id,
                                     copied_interaction_ids[index],
                                     _dumps(message.model_dump(mode="json")),
+                                    _postgres_transcript_index_document(fork.id, message),
                                 )
                                 for index, message in enumerate(copied_messages)
                             ],
@@ -12764,13 +12952,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         else:
                             await cur.executemany(
                                 "INSERT INTO cayu_transcript_messages "
-                                "(session_id, interaction_id, message) "
-                                "VALUES (%s, %s, %s)",
+                                "(session_id, interaction_id, message, "
+                                "transcript_search_document) VALUES (%s, %s, %s, %s)",
                                 [
                                     (
                                         session_id,
                                         interaction_id,
                                         _dumps(message.model_dump(mode="json")),
+                                        _postgres_transcript_index_document(session_id, message),
                                     )
                                     for message in source_messages
                                 ],
@@ -14663,12 +14852,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     await cur.executemany(
                         "INSERT INTO cayu_transcript_messages "
-                        "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
+                        "(session_id, interaction_id, message, "
+                        "transcript_search_document) VALUES (%s, %s, %s, %s)",
                         [
                             (
                                 session_id,
                                 interaction_id,
                                 _dumps(message.model_dump(mode="json")),
+                                _postgres_transcript_index_document(session_id, message),
                             )
                             for message in transcript_messages
                         ],
@@ -15895,8 +16086,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         stored_target_checkpoint = checkpoint_codec.encode(loaded, checkpoint)
 
                     transcript_rows = [
-                        (session_id, request.interaction_id, _dumps(message_payload))
-                        for message_payload in prepared.transcript_payloads
+                        (
+                            session_id,
+                            request.interaction_id,
+                            _dumps(message_payload),
+                            _postgres_transcript_index_document(session_id, message),
+                        )
+                        for message, message_payload in zip(
+                            request.transcript_messages,
+                            prepared.transcript_payloads,
+                            strict=True,
+                        )
                     ]
                     prepared_event_rows = []
                     for event, event_payload in zip(
@@ -15976,9 +16176,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await cur.executemany(
                             """
                             INSERT INTO cayu_transcript_messages (
-                                session_id, interaction_id, message
+                                session_id, interaction_id, message,
+                                transcript_search_document
                             )
-                            VALUES (%s, %s, %s)
+                            VALUES (%s, %s, %s, %s)
                             """,
                             transcript_rows,
                         )
@@ -18700,14 +18901,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.executemany(
                         """
                         INSERT INTO cayu_transcript_messages
-                            (session_id, interaction_id, message)
-                        VALUES (%s, %s, %s)
+                            (session_id, interaction_id, message,
+                             transcript_search_document)
+                        VALUES (%s, %s, %s, %s)
                         """,
                         [
                             (
                                 session_id,
                                 interaction_id,
                                 _dumps(message.model_dump(mode="json")),
+                                _postgres_transcript_index_document(session_id, message),
                             )
                             for message in copied_messages
                         ],
@@ -18789,12 +18992,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     await cur.executemany(
                         "INSERT INTO cayu_transcript_messages "
-                        "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
+                        "(session_id, interaction_id, message, "
+                        "transcript_search_document) VALUES (%s, %s, %s, %s)",
                         [
                             (
                                 session_id,
                                 None if index < prefix_count else interaction_id,
                                 _dumps(message.model_dump(mode="json")),
+                                _postgres_transcript_index_document(session_id, message),
                             )
                             for index, message in enumerate(replacement)
                         ],
@@ -18855,12 +19060,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     await cur.executemany(
                         "INSERT INTO cayu_transcript_messages "
-                        "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
+                        "(session_id, interaction_id, message, "
+                        "transcript_search_document) VALUES (%s, %s, %s, %s)",
                         [
                             (
                                 session_id,
                                 interaction_id,
                                 _dumps(message.model_dump(mode="json")),
+                                _postgres_transcript_index_document(session_id, message),
                             )
                             for message in messages
                         ],
@@ -18937,14 +19144,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await cur.executemany(
                             """
                             INSERT INTO cayu_transcript_messages
-                                (session_id, interaction_id, message)
-                            VALUES (%s, %s, %s)
+                                (session_id, interaction_id, message,
+                                 transcript_search_document)
+                            VALUES (%s, %s, %s, %s)
                             """,
                             [
                                 (
                                     session_id,
                                     interaction_id,
                                     _dumps(message.model_dump(mode="json")),
+                                    _postgres_transcript_index_document(session_id, message),
                                 )
                                 for message in copied_messages
                             ],
@@ -19126,6 +19335,138 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 records=filter_transcript_records(records, include_thinking=query.include_thinking),
                 total_records=total_records,
             )
+
+    async def search_transcript(
+        self,
+        query: TranscriptSearchQuery,
+    ) -> TranscriptSearchResult:
+        query = copy_transcript_search_query(query)
+        cursor = decode_transcript_search_cursor(query)
+        query_document = transcript_search_query_document(query.text)
+        fetch_limit = query.max_records_scanned + 1
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                WITH search_query AS (
+                    SELECT to_tsquery('simple'::regconfig, %s) AS value
+                )
+                SELECT
+                    transcript.session_id,
+                    transcript.session_order - 1 AS transcript_index,
+                    transcript.interaction_id,
+                    transcript.message,
+                    transcript.transcript_search_document
+                FROM cayu_transcript_messages AS transcript
+                CROSS JOIN search_query
+                WHERE transcript.session_id = ANY(%s)
+                  AND transcript.message ->> 'role' IN ('user', 'assistant')
+                  AND transcript.message ->> 'role' = ANY(%s)
+                  AND to_tsvector(
+                        'simple'::regconfig,
+                        transcript.transcript_search_document
+                      ) @@ search_query.value
+                LIMIT %s
+                """,
+                [
+                    _postgres_transcript_search_expression(query),
+                    list(query.session_ids),
+                    [str(role) for role in query.roles],
+                    fetch_limit,
+                ],
+            )
+            rows = await cur.fetchall()
+
+        if len(rows) > query.max_records_scanned:
+            return TranscriptSearchResult(
+                query=query,
+                matched_records_examined=query.max_records_scanned,
+                truncated=True,
+                coverage_complete=False,
+            )
+
+        candidate_heap: list[tuple[int, str, int, Any, Message]] = []
+        for row_number, row in enumerate(rows, start=1):
+            message = Message(**_json_obj(row[3]))
+            document = transcript_search_document(message)
+            if row[4] != _postgres_transcript_index_document(str(row[0]), message):
+                raise RuntimeError("Postgres transcript search document is inconsistent.")
+            score = transcript_search_document_score(document, query_document)
+            if score <= 0:
+                raise RuntimeError("Postgres transcript search index is inconsistent.")
+            heapq.heappush(
+                candidate_heap,
+                (-score, str(row[0]), -int(row[1]), row, message),
+            )
+            if row_number % 256 == 0:
+                await asyncio.sleep(0)
+
+        hits: list[TranscriptSearchHit] = []
+        remaining_bytes = query.max_bytes
+        truncated = False
+        continuation_available = False
+        ranked_examined = 0
+        while candidate_heap:
+            negative_score, session_id, negative_transcript_index, row, message = heapq.heappop(
+                candidate_heap
+            )
+            score = -negative_score
+            transcript_index = -negative_transcript_index
+            ranked_examined += 1
+            if ranked_examined % 256 == 0:
+                await asyncio.sleep(0)
+            if cursor is not None and not transcript_search_position_after_cursor(
+                raw_score=score,
+                session_id=session_id,
+                transcript_index=transcript_index,
+                cursor=cursor,
+            ):
+                continue
+            if len(hits) >= query.limit:
+                truncated = True
+                continuation_available = True
+                break
+            hit = transcript_search_hit_from_message(
+                session_id=session_id,
+                transcript_index=transcript_index,
+                interaction_id=row[2],
+                message=message,
+                max_text_bytes=remaining_bytes,
+                raw_score=float(score),
+            )
+            if hit is None:
+                truncated = True
+                continuation_available = bool(hits)
+                break
+            hits.append(hit)
+            remaining_bytes -= len(hit.text.encode("utf-8"))
+            if not hit.text_complete:
+                truncated = True
+                continuation_available = bool(candidate_heap)
+                break
+            if remaining_bytes == 0:
+                truncated = bool(candidate_heap)
+                continuation_available = truncated
+                break
+        next_cursor = (
+            encode_transcript_search_cursor(
+                query,
+                raw_score=int(hits[-1].raw_score or 0),
+                session_id=hits[-1].session_id,
+                transcript_index=hits[-1].transcript_index,
+            )
+            if continuation_available and hits
+            else None
+        )
+        return TranscriptSearchResult(
+            query=query,
+            hits=tuple(hits),
+            matched_records_examined=len(rows),
+            truncated=truncated,
+            coverage_complete=True,
+            next_cursor=next_cursor,
+        )
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")

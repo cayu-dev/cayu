@@ -295,6 +295,75 @@ manifest. The application fingerprint therefore changes when prompt presence
 changes, but not when one non-empty prompt is edited into another; runtime tests
 and evals are the behavioral proof for prompt content.
 
+## Transcript search and recall
+
+`SessionStore.search_transcript(TranscriptSearchQuery)` is an indexed,
+narrative-only retrieval capability. A query must name 1-100 session IDs and
+cannot search the global session corpus. It may select user and/or assistant
+roles, and it carries independent hit-count, returned-text-byte, matched-record
+scan, and cursor bounds. Each explicit session ID also retains the normal
+session-identity byte bound. Results use stable
+`(raw_score DESC, session_id, transcript_index DESC)` relevance order and report
+whether coverage is complete. Cursors preserve that exact ranked frontier and
+are bound to the query text, selected roles, and explicit session scope;
+changing any of those invalidates the cursor. Page count, byte, and scan
+ceilings may be adjusted without changing the frontier. If the indexed match
+set exceeds the scan ceiling, the store returns no partial ranking or cursor,
+reports incomplete coverage, and lets the caller retry with a larger explicit
+ceiling.
+
+Only `TextPart` content enters transcript search. Thinking, tool calls, tool
+results, provider state, system messages, and non-text parts are excluded from
+both the index and returned representation. Cayu case-folds each Python lexical
+term into a tokenizer-safe ASCII identity: ordinary terms use collision-free
+hex, while long terms use a separately prefixed fixed-size SHA-256 identity.
+Long terms, underscores, Unicode folds, and term boundaries therefore have
+identical meaning in every backend using the same recorded tokenizer identity.
+The public index version includes Python's Unicode database version. SQLite and
+PostgreSQL persist that identity in a singleton revision-46 configuration row
+and fail startup if it differs from the running process. This is a clean-break
+contract: Cayu does not rewrite transcript rows, rebuild the index, or provide a
+compatibility mode for an identity mismatch. Ranking gives phrase adjacency
+priority, then distinct query coverage, then bounded occurrence frequency, so
+repeated-term spam cannot outrank a complete exact phrase. SQLite maintains a
+contentless FTS5 projection with transactional validation and update triggers.
+PostgreSQL stores the application-computed document plus one opaque session
+term in a non-null column behind a partial GIN index, so the index intersects
+lexical and explicit-session scope before loading candidates. The in-memory
+implementation maintains a role-aware inverted index and shares the same
+behavioral conformance contract.
+
+`RecallEngine` is a source-neutral, bounded retrieval coordinator over
+application-registered `RecallSource` adapters. A `RecallSituation` carries an
+explicit knowledge scope and explicit transcript session IDs. Built-in
+knowledge and transcript adapters apply those constraints before candidates
+reach deterministic weighted reciprocal-rank fusion. `RecallResult` records
+exact candidate identity/revision/locator, source and channel coverage,
+truncation, continuation, and fusion diagnostics. Its configured result-byte
+ceiling applies to the complete canonical serialized result, including metadata;
+an envelope that cannot fit fails closed. Continuations are accepted only for
+channels that explicitly declare paging support. Each hit in a pageable channel
+must carry its exact post-hit frontier. Fusion-head and serialized-byte clipping
+advance only through the contiguous channel prefix represented in the returned
+candidates, so a continuation never skips an omitted hit. Optional semantic
+knowledge lookup has a separate deadline and degrades that lane to honest
+partial coverage while preserving a successful lexical lane.
+
+A custom `RetrievalFusionStrategy` declares an immutable strategy version which
+must match its configuration and diagnostics. It may choose a different ranking
+but cannot identify itself as WRRF or change validated source evidence and
+coverage facts.
+
+Caller cancellation and recall timeouts stop waiting for SQLite session-store
+reads promptly. An already-dispatched worker retains ownership of its physical
+connection and lock in an observed background task until it settles, preventing
+later queries or shutdown from reusing the connection concurrently.
+
+Recall does not mutate the transcript, inject messages, or authorize context
+exposure. A `ContextPolicy` remains the separate application boundary that
+chooses the actual provider-visible message list, including whether and where
+any recalled representation is admitted.
+
 ## ContextPolicy
 
 Builds the model-facing message list immediately before each provider request.

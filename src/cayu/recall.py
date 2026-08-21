@@ -45,7 +45,16 @@ from cayu.retrieval import (
     WeightedReciprocalRankFusion,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.runtime.sessions import MAX_SESSION_ID_BYTES
+from cayu.runtime.sessions import (
+    MAX_SESSION_ID_BYTES,
+    TRANSCRIPT_SEARCH_INDEX_VERSION,
+    TRANSCRIPT_SEARCH_MAX_BYTES,
+    TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,
+    TRANSCRIPT_SEARCH_MIN_MAX_BYTES,
+    SessionStore,
+    TranscriptSearchQuery,
+    encode_transcript_search_cursor,
+)
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeAccessScope,
@@ -61,6 +70,7 @@ from cayu.storage.memory import (
 RECALL_ENGINE_VERSION = "cayu.recall.v1"
 KNOWLEDGE_LEXICAL_CHANNEL = "knowledge.lexical"
 KNOWLEDGE_SEMANTIC_CHANNEL = "knowledge.semantic"
+TRANSCRIPT_LEXICAL_CHANNEL = "transcript.lexical"
 RECALL_MAX_RECENT_CONVERSATION_ITEMS = 20
 RECALL_MAX_RECENT_CONVERSATION_BYTES = 32_000
 RECALL_MAX_WORK_CONTEXT_BYTES = 32_000
@@ -1431,6 +1441,126 @@ class KnowledgeRecallSource(RecallSource):
         )
 
 
+class TranscriptRecallSource(RecallSource):
+    """Authoritative transcript narrative lane over explicit session scope."""
+
+    name = "transcript"
+    channel_names = (TRANSCRIPT_LEXICAL_CHANNEL,)
+    continuation_channels = (TRANSCRIPT_LEXICAL_CHANNEL,)
+
+    def __init__(
+        self,
+        store: SessionStore,
+        *,
+        required: bool = False,
+        candidate_limit: int = 20,
+        max_bytes: int = 64_000,
+        max_records_scanned: int = 10_000,
+    ) -> None:
+        if not isinstance(store, SessionStore):
+            raise TypeError("store must be a SessionStore.")
+        super().__init__(required=required, candidate_limit=candidate_limit)
+        if not store.supports_transcript_search:
+            raise ValueError("SessionStore does not advertise transcript search support.")
+        if (
+            type(max_bytes) is not int
+            or not TRANSCRIPT_SEARCH_MIN_MAX_BYTES <= max_bytes <= TRANSCRIPT_SEARCH_MAX_BYTES
+        ):
+            raise ValueError(
+                "max_bytes must be between "
+                f"{TRANSCRIPT_SEARCH_MIN_MAX_BYTES} and {TRANSCRIPT_SEARCH_MAX_BYTES}."
+            )
+        if (
+            type(max_records_scanned) is not int
+            or not 1 <= max_records_scanned <= TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT
+        ):
+            raise ValueError(
+                f"max_records_scanned must be between 1 and {TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT}."
+            )
+        self._store = store
+        self._max_bytes = max_bytes
+        self._max_records_scanned = max_records_scanned
+
+    async def retrieve(self, situation: RecallSituation) -> RecallSourceResult:
+        if not situation.transcript_session_ids:
+            return RecallSourceResult(
+                source=self.name,
+                channels=(
+                    RankedRetrievalChannel(
+                        channel=TRANSCRIPT_LEXICAL_CHANNEL,
+                        index_version=TRANSCRIPT_SEARCH_INDEX_VERSION,
+                        candidate_limit=self.candidate_limit,
+                    ),
+                ),
+                records=(),
+                coverage_complete=True,
+            )
+        result = await self._store.search_transcript(
+            TranscriptSearchQuery(
+                text=situation.retrieval_text(),
+                session_ids=situation.transcript_session_ids,
+                limit=self.candidate_limit,
+                max_bytes=self._max_bytes,
+                max_records_scanned=self._max_records_scanned,
+                cursor=situation.continuations.get(TRANSCRIPT_LEXICAL_CHANNEL),
+            )
+        )
+        records: list[RecallRecord] = []
+        ranked: list[RankedRetrievalHit] = []
+        for rank, hit in enumerate(result.hits, start=1):
+            identity = RetrievalCandidateIdentity(
+                record_type="transcript_message",
+                record_id=f"{hit.session_id}:{hit.transcript_index}",
+                revision=hit.content_hash,
+            )
+            record = RecallRecord(
+                identity=identity,
+                representation="transcript_text",
+                text=hit.text,
+                text_complete=hit.text_complete,
+                content_hash=hit.content_hash,
+                locator={
+                    "session_id": hit.session_id,
+                    "interaction_id": hit.interaction_id,
+                    "transcript_index": hit.transcript_index,
+                    "text_part_indexes": list(hit.text_part_indexes),
+                },
+            )
+            records.append(record)
+            ranked.append(
+                RankedRetrievalHit(
+                    identity=identity,
+                    rank=rank,
+                    representation=record.representation,
+                    content_hash=record.content_hash,
+                    explanations=("authoritative transcript text match",),
+                    raw_score=hit.raw_score,
+                    features={"authoritative_evidence": 1.0},
+                    continuation=encode_transcript_search_cursor(
+                        result.query,
+                        raw_score=int(hit.raw_score or 0),
+                        session_id=hit.session_id,
+                        transcript_index=hit.transcript_index,
+                    ),
+                )
+            )
+        channel = RankedRetrievalChannel(
+            channel=TRANSCRIPT_LEXICAL_CHANNEL,
+            index_version=result.index_version,
+            candidate_limit=self.candidate_limit,
+            hits=tuple(ranked),
+            truncated=result.truncated,
+            continuation=result.next_cursor,
+        )
+        return RecallSourceResult(
+            source=self.name,
+            channels=(channel,),
+            records=tuple(records),
+            coverage_complete=result.coverage_complete,
+            partial_reason=(None if result.coverage_complete else "scan_limit"),
+        )
+
+
 def _knowledge_recall_record(
     hit: KnowledgeHit,
     *,
@@ -1571,6 +1701,7 @@ __all__ = [
     "KNOWLEDGE_LEXICAL_CHANNEL",
     "KNOWLEDGE_SEMANTIC_CHANNEL",
     "RECALL_ENGINE_VERSION",
+    "TRANSCRIPT_LEXICAL_CHANNEL",
     "KnowledgeRecallSource",
     "RecallCandidate",
     "RecallEngine",
@@ -1583,4 +1714,5 @@ __all__ = [
     "RecallSourceResult",
     "RecallSourceStatus",
     "RecallSourceUnavailable",
+    "TranscriptRecallSource",
 ]

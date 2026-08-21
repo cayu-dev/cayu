@@ -90,7 +90,7 @@ def test_task_retry_policy_round_trips_as_normalized_public_json() -> None:
 def test_task_retry_migration_documentation_matches_schema_revision() -> None:
     contract = Path("docs/runtime-contracts.md").read_text(encoding="utf-8")
 
-    assert schema_migrations.LATEST_REVISION == 45
+    assert schema_migrations.LATEST_REVISION >= 45
     assert "Breaking schema revision\n45 adds the retry-series" in contract
     assert "Pre-45 task workers" in contract
 

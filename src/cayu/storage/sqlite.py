@@ -147,6 +147,9 @@ from cayu.runtime.sessions import (
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    TranscriptSearchHit,
+    TranscriptSearchQuery,
+    TranscriptSearchResult,
     TranscriptSnapshot,
     UsageRollupQuery,
     _activate_session_run_fence,
@@ -270,12 +273,15 @@ from cayu.runtime.sessions import (
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
+    copy_transcript_search_query,
     copy_usage_rollup_query,
     decode_session_cursor,
     decode_session_lineage_cursor,
     decode_session_topology_cursor,
+    decode_transcript_search_cursor,
     encode_session_cursor,
     encode_session_lineage_cursor,
+    encode_transcript_search_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
     fork_transcript_is_accepted,
@@ -285,6 +291,12 @@ from cayu.runtime.sessions import (
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
+    transcript_search_document,
+    transcript_search_document_score,
+    transcript_search_hit_from_message,
+    transcript_search_position_after_cursor,
+    transcript_search_query_document,
+    transcript_search_session_token,
     transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
@@ -361,7 +373,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 40
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 46
 _SQLITE_TASK_MIN_REQUIRED_REVISION = 45
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -369,6 +381,16 @@ _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     datetime_param=sqlite_support.format_datetime,
 )
 _T = TypeVar("_T")
+
+
+def _sqlite_transcript_search_expression(query: TranscriptSearchQuery) -> str:
+    session_terms = " OR ".join(
+        f'"{transcript_search_session_token(session_id)}"' for session_id in query.session_ids
+    )
+    text_terms = " OR ".join(
+        f'"{token}"' for token in transcript_search_query_document(query.text).split()
+    )
+    return f"session_token:({session_terms}) AND message_text:({text_terms})"
 
 
 def _alias_key_fingerprint_matches(value: object, expected: str) -> bool:
@@ -387,6 +409,7 @@ async def _run_off_thread_with_connection_ownership(
     operation: Callable[[sqlite3.Connection], _T],
     *,
     executor: Executor | None = None,
+    worker_started: asyncio.Event | None = None,
 ) -> _T:
     """Keep a SQLite connection owned until its off-thread operation terminates.
 
@@ -411,6 +434,8 @@ async def _run_off_thread_with_connection_ownership(
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         worker = loop.run_in_executor(executor, context.run, capture_outcome)
+        if worker_started is not None:
+            worker_started.set()
         cancellation: asyncio.CancelledError | None = None
 
         while not worker.done():
@@ -1060,6 +1085,7 @@ class SQLiteSessionStore(SessionStore):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    supports_transcript_search: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1101,6 +1127,7 @@ class SQLiteSessionStore(SessionStore):
         self._read_only = read_only
         self._public_authority_alias_codec = public_authority_alias_codec
         self._lock = asyncio.Lock()
+        self._detached_read_tasks: set[asyncio.Task[object]] = set()
         self._connection = self._connect_read_only(db_path) if read_only else self._connect(db_path)
         try:
             self._register_public_authority_alias_sql_function(self._connection)
@@ -1412,17 +1439,51 @@ class SQLiteSessionStore(SessionStore):
         )
 
     async def _run_read(self, query: Callable[[sqlite3.Connection], _T]) -> _T:
-        """Run a read-only query off the event loop on the read connection."""
+        """Run a cancellable read while retaining physical connection ownership."""
 
         def guarded(connection: sqlite3.Connection) -> _T:
             self._require_current_public_authority_configuration(connection)
             return query(connection)
 
-        return await _run_off_thread_with_connection_ownership(
-            self._read_lock,
-            self._read_connection,
-            guarded,
+        worker_started = asyncio.Event()
+        owner = asyncio.create_task(
+            _run_off_thread_with_connection_ownership(
+                self._read_lock,
+                self._read_connection,
+                guarded,
+                worker_started=worker_started,
+            ),
+            name="cayu-sqlite-read-owner",
         )
+        try:
+            return await asyncio.shield(owner)
+        except asyncio.CancelledError:
+            if not worker_started.is_set():
+                owner.cancel()
+            self._retain_detached_read_task(owner)
+            raise
+
+    def _retain_detached_read_task(self, task: asyncio.Task[object]) -> None:
+        """Observe a cancelled caller's physical read until the worker settles."""
+
+        self._detached_read_tasks.add(task)
+
+        def settled(completed: asyncio.Task[object]) -> None:
+            self._detached_read_tasks.discard(completed)
+            try:
+                failure = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if failure is not None:
+                completed.get_loop().call_exception_handler(
+                    {
+                        "message": "Detached SQLite read failed after caller cancellation",
+                        "exception": failure,
+                        "task": completed,
+                    }
+                )
+
+        task.add_done_callback(settled)
 
     async def _run_write(self, statement: Callable[[sqlite3.Connection], _T]) -> _T:
         """Run a write statement off the event loop on the writer connection."""
@@ -2070,9 +2131,10 @@ class SQLiteSessionStore(SessionStore):
                             session_id,
                             role,
                             interaction_id,
-                            message_json
+                            message_json,
+                            transcript_search_document
                         )
-                        VALUES (?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
                         [
                             (
@@ -2080,6 +2142,7 @@ class SQLiteSessionStore(SessionStore):
                                 str(message.role),
                                 copied_interaction_ids[index],
                                 sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                transcript_search_document(message),
                             )
                             for index, message in enumerate(copied_messages)
                         ],
@@ -2798,14 +2861,15 @@ class SQLiteSessionStore(SessionStore):
                     else:
                         self._connection.executemany(
                             "INSERT INTO cayu_transcript_messages "
-                            "(session_id, role, interaction_id, message_json) "
-                            "VALUES (?, ?, ?, ?)",
+                            "(session_id, role, interaction_id, message_json, "
+                            "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
                             [
                                 (
                                     session_id,
                                     str(message.role),
                                     interaction_id,
                                     sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                    transcript_search_document(message),
                                 )
                                 for message in source_messages
                             ],
@@ -4398,14 +4462,15 @@ class SQLiteSessionStore(SessionStore):
                     )
                 connection.executemany(
                     "INSERT INTO cayu_transcript_messages "
-                    "(session_id, role, interaction_id, message_json) "
-                    "VALUES (?, ?, ?, ?)",
+                    "(session_id, role, interaction_id, message_json, "
+                    "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
                     [
                         (
                             session_id,
                             str(message.role),
                             interaction_id,
                             sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            transcript_search_document(message),
                         )
                         for message in transcript_messages
                     ],
@@ -5604,6 +5669,7 @@ class SQLiteSessionStore(SessionStore):
                         str(message.role),
                         request.interaction_id,
                         sqlite_support.json_dumps(message_payload),
+                        transcript_search_document(message),
                     )
                     for message, message_payload in zip(
                         request.transcript_messages,
@@ -5664,9 +5730,10 @@ class SQLiteSessionStore(SessionStore):
                     connection.executemany(
                         """
                         INSERT INTO cayu_transcript_messages (
-                            session_id, role, interaction_id, message_json
+                            session_id, role, interaction_id, message_json,
+                            transcript_search_document
                         )
-                        VALUES (?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
                         transcript_rows,
                     )
@@ -8725,9 +8792,10 @@ class SQLiteSessionStore(SessionStore):
                         session_id,
                         role,
                         interaction_id,
-                        message_json
+                        message_json,
+                        transcript_search_document
                     )
-                    VALUES (?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -8735,6 +8803,7 @@ class SQLiteSessionStore(SessionStore):
                             str(message.role),
                             interaction_id,
                             sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            transcript_search_document(message),
                         )
                         for message in copied_messages
                     ],
@@ -8806,13 +8875,15 @@ class SQLiteSessionStore(SessionStore):
                 )
                 connection.executemany(
                     "INSERT INTO cayu_transcript_messages "
-                    "(session_id, role, interaction_id, message_json) VALUES (?, ?, ?, ?)",
+                    "(session_id, role, interaction_id, message_json, "
+                    "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
                     [
                         (
                             session_id,
                             str(message.role),
                             None if index < prefix_count else interaction_id,
                             sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            transcript_search_document(message),
                         )
                         for index, message in enumerate(replacement)
                     ],
@@ -8890,13 +8961,15 @@ class SQLiteSessionStore(SessionStore):
                 messages = [Message(**item) for item in json.loads(row["source_messages_json"])]
                 connection.executemany(
                     "INSERT INTO cayu_transcript_messages "
-                    "(session_id, role, interaction_id, message_json) VALUES (?, ?, ?, ?)",
+                    "(session_id, role, interaction_id, message_json, "
+                    "transcript_search_document) VALUES (?, ?, ?, ?, ?)",
                     [
                         (
                             session_id,
                             str(message.role),
                             interaction_id,
                             sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            transcript_search_document(message),
                         )
                         for message in messages
                     ],
@@ -8982,9 +9055,10 @@ class SQLiteSessionStore(SessionStore):
                             session_id,
                             role,
                             interaction_id,
-                            message_json
+                            message_json,
+                            transcript_search_document
                         )
-                        VALUES (?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
                         [
                             (
@@ -8992,6 +9066,7 @@ class SQLiteSessionStore(SessionStore):
                                 str(message.role),
                                 interaction_id,
                                 sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                transcript_search_document(message),
                             )
                             for message in copied_messages
                         ],
@@ -9196,6 +9271,132 @@ class SQLiteSessionStore(SessionStore):
             )
 
         return await self._run_read(run_query)
+
+    async def search_transcript(
+        self,
+        query: TranscriptSearchQuery,
+    ) -> TranscriptSearchResult:
+        query = copy_transcript_search_query(query)
+        cursor = decode_transcript_search_cursor(query)
+        roles = tuple(str(role) for role in query.roles)
+        role_placeholders = ", ".join("?" for _ in roles)
+        session_placeholders = ", ".join("?" for _ in query.session_ids)
+        query_document = transcript_search_query_document(query.text)
+        fetch_limit = query.max_records_scanned + 1
+
+        def run_search(connection: sqlite3.Connection) -> TranscriptSearchResult:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    transcript.session_id,
+                    transcript.session_order - 1 AS transcript_index,
+                    transcript.interaction_id,
+                    transcript.message_json,
+                    transcript.transcript_search_document
+                FROM cayu_transcript_messages_fts
+                JOIN cayu_transcript_messages AS transcript
+                  ON transcript.sequence = cayu_transcript_messages_fts.rowid
+                WHERE cayu_transcript_messages_fts MATCH ?
+                  AND transcript.session_id IN ({session_placeholders})
+                  AND transcript.role IN ({role_placeholders})
+                LIMIT ?
+                """,
+                [
+                    _sqlite_transcript_search_expression(query),
+                    *query.session_ids,
+                    *roles,
+                    fetch_limit,
+                ],
+            ).fetchall()
+            if len(rows) > query.max_records_scanned:
+                return TranscriptSearchResult(
+                    query=query,
+                    matched_records_examined=query.max_records_scanned,
+                    truncated=True,
+                    coverage_complete=False,
+                )
+
+            candidates: list[tuple[int, sqlite3.Row, Message]] = []
+            for row in rows:
+                message = Message.model_validate(json.loads(row["message_json"]))
+                document = transcript_search_document(message)
+                if row["transcript_search_document"] != document:
+                    raise RuntimeError("SQLite transcript search document is inconsistent.")
+                score = transcript_search_document_score(document, query_document)
+                if score <= 0:
+                    raise RuntimeError("SQLite transcript search index is inconsistent.")
+                candidates.append((score, row, message))
+            candidates.sort(
+                key=lambda item: (
+                    -item[0],
+                    item[1]["session_id"],
+                    -item[1]["transcript_index"],
+                )
+            )
+            if cursor is not None:
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if transcript_search_position_after_cursor(
+                        raw_score=candidate[0],
+                        session_id=candidate[1]["session_id"],
+                        transcript_index=candidate[1]["transcript_index"],
+                        cursor=cursor,
+                    )
+                ]
+
+            hits: list[TranscriptSearchHit] = []
+            remaining_bytes = query.max_bytes
+            truncated = False
+            continuation_available = False
+            for candidate_index, (score, row, message) in enumerate(candidates):
+                if len(hits) >= query.limit:
+                    truncated = True
+                    continuation_available = True
+                    break
+                hit = transcript_search_hit_from_message(
+                    session_id=row["session_id"],
+                    transcript_index=row["transcript_index"],
+                    interaction_id=row["interaction_id"],
+                    message=message,
+                    max_text_bytes=remaining_bytes,
+                    raw_score=float(score),
+                )
+                if hit is None:
+                    truncated = True
+                    continuation_available = bool(hits)
+                    break
+                hits.append(hit)
+                remaining_bytes -= len(hit.text.encode("utf-8"))
+                has_remaining_candidate = candidate_index + 1 < len(candidates)
+                if not hit.text_complete:
+                    truncated = True
+                    continuation_available = has_remaining_candidate
+                    break
+                if remaining_bytes == 0:
+                    truncated = has_remaining_candidate
+                    continuation_available = truncated
+                    break
+            next_cursor = (
+                encode_transcript_search_cursor(
+                    query,
+                    raw_score=int(hits[-1].raw_score or 0),
+                    session_id=hits[-1].session_id,
+                    transcript_index=hits[-1].transcript_index,
+                )
+                if continuation_available and hits
+                else None
+            )
+            return TranscriptSearchResult(
+                query=query,
+                hits=tuple(hits),
+                matched_records_examined=len(rows),
+                truncated=truncated,
+                coverage_complete=True,
+                next_cursor=next_cursor,
+            )
+
+        return await self._run_read(run_search)
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")

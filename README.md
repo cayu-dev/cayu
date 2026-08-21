@@ -66,6 +66,7 @@ deployments.
 | Cost control | Usage events, run limits, budgets, pricing, causal-budget summaries |
 | Execution boundaries | Environments, workspaces, runners, artifacts, vaults, egress |
 | Reviewed knowledge | Durable entries, approval state, keyword/vector retrieval, recall tools |
+| Long-term recall | Bounded knowledge/transcript sources, deterministic fusion, exact locators and coverage |
 | Provider flexibility | OpenAI API, experimental OpenAI subscription login, Anthropic, Bedrock, Vertex, OpenAI-compatible APIs |
 | Agent operations | Tasks, dispatchers, event watchers, subagents, runtime hooks |
 | Behavioral proof | Runtime tests, production-session promotion, durable evals, comparison, and CI reports |

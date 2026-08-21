@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+import threading
+import time
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from itertools import repeat
 
 import pytest
 
 from cayu._validation import canonical_durable_json_bytes
+from cayu.core.messages import Message
 from cayu.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
+    TRANSCRIPT_LEXICAL_CHANNEL,
     KnowledgeRecallSource,
     RecallEngine,
     RecallEngineConfig,
@@ -21,6 +25,7 @@ from cayu.recall import (
     RecallSourceResult,
     RecallSourceStatus,
     RecallSourceUnavailable,
+    TranscriptRecallSource,
 )
 from cayu.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
@@ -32,12 +37,20 @@ from cayu.retrieval import (
     WeightedReciprocalRankFusion,
     WeightedReciprocalRankFusionConfig,
 )
+from cayu.runtime.sessions import (
+    MAX_SESSION_ID_BYTES,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+    TranscriptSearchQuery,
+)
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeSearchMode,
 )
+from cayu.storage.sqlite import SQLiteSessionStore
 
 _NOW = datetime(2026, 8, 21, 7, 0, tzinfo=UTC)
 
@@ -161,9 +174,59 @@ def test_recall_situation_is_bounded_defensive_and_resolves_short_followups() ->
         RecallSituation(query="bounded", recent_conversation=repeat("message"))
     with pytest.raises(ValueError, match="more than 100 ids"):
         RecallSituation(query="bounded", transcript_session_ids=repeat("session"))
+    with pytest.raises(ValueError, match="more than 100"):
+        TranscriptSearchQuery(text="bounded", session_ids=repeat("session"))
+    with pytest.raises(ValueError, match="at most .* UTF-8 bytes"):
+        TranscriptSearchQuery(
+            text="bounded",
+            session_ids=("s" * (MAX_SESSION_ID_BYTES + 1),),
+        )
     default_situation = RecallSituation(query="bounded")
     with pytest.raises(TypeError, match="cannot be mutated"):
         default_situation.continuations["new"] = "cursor"  # type: ignore[index]
+
+
+def test_in_memory_transcript_search_is_cooperatively_cancellable() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        await store.create(
+            RunRequest(agent_name="agent", session_id="bounded-search", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_transcript_messages(
+            "bounded-search",
+            [Message.text("assistant", f"cancellation marker {index}") for index in range(600)],
+            interaction_id="bulk-interaction",
+        )
+        search = asyncio.create_task(
+            store.search_transcript(
+                TranscriptSearchQuery(
+                    text="cancellation marker",
+                    session_ids=("bounded-search",),
+                    max_records_scanned=1_000,
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not search.done()
+        search.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await search
+
+        await store.append_transcript_messages(
+            "bounded-search",
+            [Message.text("assistant", "postcancellationevidence")],
+            interaction_id="post-cancellation-interaction",
+        )
+        recovered = await store.search_transcript(
+            TranscriptSearchQuery(
+                text="postcancellationevidence",
+                session_ids=("bounded-search",),
+            )
+        )
+        assert [hit.transcript_index for hit in recovered.hits] == [600]
+
+    asyncio.run(run())
 
 
 def test_recall_engine_is_completion_order_independent_and_byte_stable() -> None:
@@ -395,6 +458,239 @@ def test_recall_engine_cancels_outstanding_source_work_at_global_timeout() -> No
     asyncio.run(run())
 
 
+def test_recall_timeout_returns_promptly_while_sqlite_read_remains_fenced(tmp_path) -> None:
+    store = SQLiteSessionStore(tmp_path / "recall-timeout.sqlite")
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    class BlockingSQLiteSource(RecallSource):
+        name = "sqlite"
+        channel_names = ("sqlite.lexical",)
+
+        def __init__(self) -> None:
+            super().__init__(required=False, candidate_limit=1)
+
+        async def retrieve(self, situation: RecallSituation) -> RecallSourceResult:
+            del situation
+
+            def blocked_read(_connection) -> None:
+                worker_started.set()
+                if not release_worker.wait(timeout=5):
+                    raise TimeoutError("test did not release the SQLite reader")
+
+            await store._run_read(blocked_read)
+            raise AssertionError("cancelled read unexpectedly returned")
+
+    async def run() -> tuple[RecallResult, float]:
+        engine = RecallEngine(
+            (BlockingSQLiteSource(),),
+            fusion_config=_fusion_config("sqlite.lexical"),
+            config=RecallEngineConfig(
+                source_timeout_seconds=0.02,
+                overall_timeout_seconds=0.1,
+            ),
+        )
+        started = time.monotonic()
+        result = await engine.recall(_situation())
+        elapsed = time.monotonic() - started
+        assert worker_started.is_set()
+        assert store._read_lock.locked()
+        release_worker.set()
+        await store.close()
+        return result, elapsed
+
+    result, elapsed = asyncio.run(run())
+
+    assert elapsed < 0.08
+    assert result.sources[0].status is RecallSourceStatus.UNAVAILABLE
+    assert result.sources[0].failure_code == "timeout"
+
+
+def test_recall_engine_bounds_the_complete_serialized_result_and_keeps_a_fused_prefix() -> None:
+    sources = (
+        _StaticRecallSource(name="alpha", channel="alpha.lexical", record_id="a"),
+        _StaticRecallSource(name="beta", channel="beta.lexical", record_id="b"),
+    )
+
+    async def run() -> tuple[RecallResult, int]:
+        complete = await RecallEngine(
+            sources,
+            fusion_config=_fusion_config("alpha.lexical", "beta.lexical"),
+        ).recall(_situation())
+        one_candidate = RecallResult(
+            engine_version=complete.engine_version,
+            situation_sha256=complete.situation_sha256,
+            candidates=complete.candidates[:1],
+            fusion=complete.fusion,
+            sources=complete.sources,
+            continuations=complete.continuations,
+            truncated=True,
+            omitted_by_result_bytes=1,
+        )
+        exact_limit = len(
+            canonical_durable_json_bytes(
+                one_candidate.model_dump(mode="json"),
+                "recall result",
+            )
+        )
+        bounded = await RecallEngine(
+            sources,
+            fusion_config=_fusion_config("alpha.lexical", "beta.lexical"),
+            config=RecallEngineConfig(max_result_bytes=exact_limit),
+        ).recall(_situation())
+        with pytest.raises(ValueError, match="metadata exceeded"):
+            await RecallEngine(
+                sources,
+                fusion_config=_fusion_config("alpha.lexical", "beta.lexical"),
+                config=RecallEngineConfig(max_result_bytes=1),
+            ).recall(_situation())
+        return bounded, exact_limit
+
+    result, exact_limit = asyncio.run(run())
+    assert len(result.candidates) == 1
+    assert result.omitted_by_result_bytes == 1
+    assert result.truncated is True
+    assert (
+        len(canonical_durable_json_bytes(result.model_dump(mode="json"), "recall result"))
+        == exact_limit
+    )
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        result.candidates[0].fused.features["mutated"] = 1.0
+    default_payload = result.model_dump(mode="python")
+    default_payload.pop("continuations")
+    default_result = RecallResult.model_validate(default_payload)
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        default_result.continuations["new"] = "cursor"  # type: ignore[index]
+
+
+def test_recall_result_returns_exact_channel_continuations() -> None:
+    async def run():
+        sessions = InMemorySessionStore()
+        await sessions.create(
+            RunRequest(agent_name="agent", session_id="atlas-session", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await sessions.append_transcript_messages(
+            "atlas-session",
+            [
+                Message.text("assistant", "Older Atlas evidence"),
+                Message.text("assistant", "Newer Atlas evidence"),
+            ],
+            interaction_id="atlas-interaction",
+        )
+        engine = RecallEngine(
+            (TranscriptRecallSource(sessions, required=True, candidate_limit=1),),
+            fusion_config=_fusion_config(TRANSCRIPT_LEXICAL_CHANNEL),
+        )
+        first = await engine.recall(_situation(transcript_session_ids=("atlas-session",)))
+        second = await engine.recall(
+            _situation(
+                transcript_session_ids=("atlas-session",),
+                continuations=first.continuations,
+            )
+        )
+        with pytest.raises(ValueError, match="unknown channel"):
+            await engine.recall(_situation(continuations={"unknown": "cursor"}))
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert set(first.continuations) == {TRANSCRIPT_LEXICAL_CHANNEL}
+    assert first.fusion.continuation_channels == (TRANSCRIPT_LEXICAL_CHANNEL,)
+    assert first.candidates[0].record.locator["transcript_index"] == 1
+    assert second.continuations == {}
+    assert second.candidates[0].record.locator["transcript_index"] == 0
+    with pytest.raises(TypeError):
+        first.continuations["other"] = "cursor"  # type: ignore[index]
+
+
+def test_recall_continuation_advances_only_past_the_visible_fused_prefix() -> None:
+    async def run() -> list[int]:
+        sessions = InMemorySessionStore()
+        await sessions.create(
+            RunRequest(agent_name="agent", session_id="atlas-session", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await sessions.append_transcript_messages(
+            "atlas-session",
+            [Message.text("assistant", f"Atlas evidence {index}") for index in range(5)],
+            interaction_id="atlas-interaction",
+        )
+        source = TranscriptRecallSource(sessions, required=True, candidate_limit=4)
+        config = _fusion_config(TRANSCRIPT_LEXICAL_CHANNEL).model_copy(
+            update={"fused_head_limit": 2}
+        )
+        engine = RecallEngine((source,), fusion_config=config)
+        continuations: dict[str, str] = {}
+        observed: list[int] = []
+        while True:
+            page = await engine.recall(
+                _situation(
+                    transcript_session_ids=("atlas-session",),
+                    continuations=continuations,
+                )
+            )
+            observed.extend(
+                int(candidate.record.locator["transcript_index"]) for candidate in page.candidates
+            )
+            continuations = dict(page.continuations)
+            if not continuations:
+                break
+        return observed
+
+    assert asyncio.run(run()) == [4, 3, 2, 1, 0]
+
+
+def test_recall_byte_clipping_does_not_advance_past_omitted_transcript_hits() -> None:
+    async def run() -> tuple[list[int], list[int]]:
+        sessions = InMemorySessionStore()
+        await sessions.create(
+            RunRequest(agent_name="agent", session_id="atlas-session", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await sessions.append_transcript_messages(
+            "atlas-session",
+            [
+                Message.text("assistant", f"Atlas evidence {index} " + "x" * 1_000)
+                for index in range(6)
+            ],
+            interaction_id="atlas-interaction",
+        )
+        source = TranscriptRecallSource(sessions, required=True, candidate_limit=5)
+        fusion_config = _fusion_config(TRANSCRIPT_LEXICAL_CHANNEL)
+        complete = await RecallEngine((source,), fusion_config=fusion_config).recall(
+            _situation(transcript_session_ids=("atlas-session",))
+        )
+        complete_bytes = len(
+            canonical_durable_json_bytes(
+                complete.model_dump(mode="json"),
+                "complete recall result",
+            )
+        )
+        clipped = await RecallEngine(
+            (source,),
+            fusion_config=fusion_config,
+            config=RecallEngineConfig(max_result_bytes=complete_bytes - 1),
+        ).recall(_situation(transcript_session_ids=("atlas-session",)))
+        remainder = await RecallEngine((source,), fusion_config=fusion_config).recall(
+            _situation(
+                transcript_session_ids=("atlas-session",),
+                continuations=clipped.continuations,
+            )
+        )
+        return (
+            [int(candidate.record.locator["transcript_index"]) for candidate in clipped.candidates],
+            [
+                int(candidate.record.locator["transcript_index"])
+                for candidate in remainder.candidates
+            ],
+        )
+
+    clipped, remainder = asyncio.run(run())
+    assert 0 < len(clipped) < 5
+    assert clipped + remainder == [5, 4, 3, 2, 1, 0]
+
+
 def test_recall_byte_selection_handles_continuation_metadata_that_shrinks() -> None:
     class ShrinkingContinuationSource(RecallSource):
         name = "shrinking"
@@ -511,6 +807,94 @@ def test_recall_engine_rejects_cursor_advancement_without_a_returned_hit() -> No
 
     with pytest.raises(ValueError, match="cannot advance its cursor without a hit"):
         asyncio.run(engine.recall(_situation()))
+
+
+def test_built_in_sources_fuse_exact_current_knowledge_and_transcript_evidence() -> None:
+    async def run():
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = InMemoryKnowledgeStore(access_scope=scope)
+        revision_one = await knowledge.create_entry(
+            KnowledgeEntry(
+                id="release-date",
+                text="Obsolete release date was Thursday",
+                namespace="project:cayu",
+            )
+        )
+        await knowledge.append_entry_revision(
+            revision_one.model_copy(
+                update={
+                    "revision": 2,
+                    "text": "Atlas canonical release date is Friday",
+                    "updated_at": revision_one.updated_at + timedelta(microseconds=1),
+                }
+            ),
+            expected_revision=1,
+        )
+
+        sessions = InMemorySessionStore()
+        await sessions.create(
+            RunRequest(agent_name="agent", session_id="atlas-session", messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await sessions.append_transcript_messages(
+            "atlas-session",
+            [Message.text("assistant", "Atlas planning discussion preferred Monday")],
+            interaction_id="atlas-interaction",
+        )
+
+        engine = RecallEngine(
+            (
+                KnowledgeRecallSource(knowledge),
+                TranscriptRecallSource(sessions),
+            ),
+            fusion_config=_fusion_config(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+        )
+        return await engine.recall(
+            _situation(
+                knowledge_access_scope=scope,
+                knowledge_namespace="project:cayu",
+                transcript_session_ids=("atlas-session",),
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert {candidate.record.identity.record_type for candidate in result.candidates} == {
+        "knowledge_entry",
+        "transcript_message",
+    }
+    knowledge_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if candidate.record.identity.record_type == "knowledge_entry"
+    )
+    transcript_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if candidate.record.identity.record_type == "transcript_message"
+    )
+    assert knowledge_candidate.record.identity.revision == "2"
+    assert knowledge_candidate.record.locator == {
+        "entry_id": "release-date",
+        "entry_revision": 2,
+    }
+    assert "Obsolete" not in knowledge_candidate.record.text
+    assert transcript_candidate.record.locator == {
+        "session_id": "atlas-session",
+        "interaction_id": "atlas-interaction",
+        "transcript_index": 0,
+        "text_part_indexes": [0],
+    }
+    assert [source.status for source in result.sources] == [
+        RecallSourceStatus.PARTIAL,
+        RecallSourceStatus.COMPLETE,
+    ]
+    assert result.sources[0].failure_code == "semantic_unsupported"
+    assert result.truncated is True
 
 
 @pytest.mark.parametrize(

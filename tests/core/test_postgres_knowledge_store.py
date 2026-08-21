@@ -93,6 +93,7 @@ _TABLES = (
     "cayu_session_labels",
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
+    "cayu_transcript_search_configuration",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",
@@ -108,6 +109,35 @@ _TABLES = (
     "cayu_eval_corpora",
     "cayu_schema_migrations",
 )
+
+
+async def _initialize_historical_schema(
+    postgres_dsn: str,
+    *,
+    through_revision: int,
+) -> None:
+    """Create an intentionally old schema without relaxing current store startup."""
+    from cayu import PostgresSessionStore
+
+    revisions = schema_migrations.REVISIONS
+    schema_migrations.REVISIONS = tuple(
+        revision for revision in revisions if revision.revision <= through_revision
+    )
+    historical_store = PostgresSessionStore(
+        postgres_dsn,
+        min_size=1,
+        max_size=2,
+        schema_mode=SchemaMode.MIGRATE,
+    )
+    # These migration tests emulate an older binary. The current session store
+    # correctly requires revision 46 because it advertises indexed transcript
+    # search; only this throwaway historical instance may accept the old target.
+    historical_store._min_required_revision = through_revision
+    try:
+        await historical_store.ensure_schema()
+    finally:
+        await historical_store.close()
+        schema_migrations.REVISIONS = revisions
 
 
 def test_postgres_knowledge_write_locks_are_batched_in_global_order(
@@ -3715,25 +3745,11 @@ def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu import PostgresKnowledgeStore
         from cayu.storage import postgres as postgres_storage
 
         await _drop_all(postgres_dsn)
-        revisions = schema_migrations.REVISIONS
-        schema_migrations.REVISIONS = tuple(
-            revision for revision in revisions if revision.revision <= 42
-        )
-        revision_42_schema = PostgresSessionStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.MIGRATE,
-        )
-        try:
-            await revision_42_schema.ensure_schema()
-        finally:
-            await revision_42_schema.close()
-            schema_migrations.REVISIONS = revisions
+        await _initialize_historical_schema(postgres_dsn, through_revision=42)
 
         timestamp = datetime(2026, 8, 18, 9, 0, tzinfo=UTC)
         entry = KnowledgeEntry(
@@ -3858,25 +3874,11 @@ def test_postgres_revision_43_preserves_migrated_expiration_cleanup_audiences(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu import PostgresKnowledgeStore
         from cayu.storage import postgres as postgres_storage
 
         await _drop_all(postgres_dsn)
-        revisions = schema_migrations.REVISIONS
-        schema_migrations.REVISIONS = tuple(
-            revision for revision in revisions if revision.revision <= 42
-        )
-        revision_42_schema = PostgresSessionStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.MIGRATE,
-        )
-        try:
-            await revision_42_schema.ensure_schema()
-        finally:
-            await revision_42_schema.close()
-            schema_migrations.REVISIONS = revisions
+        await _initialize_historical_schema(postgres_dsn, through_revision=42)
 
         baseline = datetime.now(UTC)
         future_expiry = baseline + timedelta(hours=1)
@@ -3994,25 +3996,11 @@ def test_postgres_revision_43_rejects_out_of_contract_revision_42_identities(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu import PostgresKnowledgeStore
         from cayu.storage import postgres as postgres_storage
 
         await _drop_all(postgres_dsn)
-        revisions = schema_migrations.REVISIONS
-        schema_migrations.REVISIONS = tuple(
-            revision for revision in revisions if revision.revision <= 42
-        )
-        revision_42_schema = PostgresSessionStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.MIGRATE,
-        )
-        try:
-            await revision_42_schema.ensure_schema()
-        finally:
-            await revision_42_schema.close()
-            schema_migrations.REVISIONS = revisions
+        await _initialize_historical_schema(postgres_dsn, through_revision=42)
 
         entry = KnowledgeEntry(id="bounded-entry", text="Valid revision-42 entry.")
         oversized_chunk_id = "c" * (MAX_KNOWLEDGE_CHUNK_ID_BYTES + 1)
@@ -4095,24 +4083,10 @@ def test_postgres_revision_migration_refuses_populated_legacy_knowledge_unchange
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
-        revisions = schema_migrations.REVISIONS
-        schema_migrations.REVISIONS = tuple(
-            revision for revision in revisions if revision.revision <= 41
-        )
-        legacy_schema = PostgresSessionStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.MIGRATE,
-        )
-        try:
-            await legacy_schema.ensure_schema()
-        finally:
-            await legacy_schema.close()
-            schema_migrations.REVISIONS = revisions
+        await _initialize_historical_schema(postgres_dsn, through_revision=41)
 
         async with (
             await psycopg.AsyncConnection.connect(postgres_dsn) as connection,

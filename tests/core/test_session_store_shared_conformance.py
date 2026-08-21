@@ -17,6 +17,9 @@ import pytest
 from pydantic import SecretStr, ValidationError
 from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._workload_secret_support import FakeProvider
+from tests.core.transcript_search_conformance import (
+    assert_transcript_search_conformance,
+)
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_engine as session_engine_module
@@ -289,6 +292,7 @@ _POSTGRES_TABLES = (
     "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
+    "cayu_transcript_search_configuration",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_checkpoints",
@@ -307,7 +311,12 @@ _POSTGRES_DATA_TABLES = (
     *(
         table
         for table in _POSTGRES_TABLES
-        if table not in {"cayu_public_authority_alias_config", "cayu_schema_migrations"}
+        if table
+        not in {
+            "cayu_public_authority_alias_config",
+            "cayu_schema_migrations",
+            "cayu_transcript_search_configuration",
+        }
     ),
 )
 
@@ -1325,6 +1334,17 @@ def test_session_store_conformance_round_trips_and_atomically_narrows_tool_ceili
                     tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("alpha",)),
                 )
             assert await store.load(session_id) == before
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_transcript_search_conformance(session_store_case) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            await assert_transcript_search_conformance(store)
         finally:
             await _close_store(store)
 

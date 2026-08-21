@@ -17,6 +17,7 @@ import pytest
 from cayu import PostgresSessionStore, PostgresTaskStore, TaskCreate
 from cayu.core import Event, EventType, Message
 from cayu.runtime import EventOrder, EventQuery, RunRequest, SessionIdentity
+from cayu.runtime.sessions import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
@@ -119,6 +120,182 @@ def test_revision_thirty_four_builds_task_availability_index_concurrently() -> N
     assert index.predicate_definition == "status = 'pending' AND session_id IS NULL"
     assert "CREATE INDEX CONCURRENTLY" in index.create_statement
     assert postgres_storage._required_concurrent_indexes(34)[-1] == index
+
+
+def test_revision_forty_six_builds_transcript_search_index_concurrently() -> None:
+    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[46]
+
+    assert len(indexes) == 1
+    index = indexes[0]
+    assert index.index_name == "idx_cayu_transcript_messages_narrative_fts"
+    assert index.table_name == "cayu_transcript_messages"
+    assert index.access_method == "gin"
+    assert index.key_definitions == (
+        "to_tsvector('simple'::regconfig, transcript_search_document)",
+    )
+    assert "message ->> 'role'" in (index.predicate_definition or "")
+    assert "CREATE INDEX CONCURRENTLY" in index.create_statement
+    assert "USING GIN" in index.create_statement
+    assert postgres_storage._required_concurrent_indexes(46)[-1] == index
+
+
+def test_revision_forty_six_rejects_populated_transcript_database_without_mutation(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+            await creator.create(
+                RunRequest(
+                    agent_name="recall",
+                    session_id="pre-transcript-search",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await creator.append_transcript_messages(
+                "pre-transcript-search",
+                [Message.text("assistant", "visible")],
+                interaction_id="old-interaction",
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_transcript_messages_narrative_fts")
+                await cur.execute("DROP TABLE cayu_transcript_search_configuration")
+                await cur.execute(
+                    "ALTER TABLE cayu_transcript_messages DROP COLUMN transcript_search_document"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 46")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="does not backfill"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (45,)
+            await cur.execute(
+                "SELECT COUNT(*) "
+                "FROM cayu_transcript_messages "
+                "WHERE session_id = 'pre-transcript-search'"
+            )
+            assert await cur.fetchone() == (1,)
+            await cur.execute("SELECT to_regclass('idx_cayu_transcript_messages_narrative_fts')")
+            assert await cur.fetchone() == (None,)
+            await cur.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_transcript_messages' "
+                "AND column_name = 'transcript_search_document'"
+            )
+            assert await cur.fetchone() == (0,)
+
+    asyncio.run(runner())
+
+
+def test_revision_forty_six_migrates_empty_transcript_database(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_transcript_messages_narrative_fts")
+                await cur.execute("DROP TABLE cayu_transcript_search_configuration")
+                await cur.execute(
+                    "ALTER TABLE cayu_transcript_messages DROP COLUMN transcript_search_document"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 46")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT data_type, is_nullable, is_generated "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_transcript_messages' "
+                "AND column_name = 'transcript_search_document'"
+            )
+            assert await cur.fetchone() == ("text", "NO", "NEVER")
+            await cur.execute("SELECT to_regclass('idx_cayu_transcript_messages_narrative_fts')")
+            assert await cur.fetchone() == ("idx_cayu_transcript_messages_narrative_fts",)
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (46,)
+            await cur.execute(
+                "SELECT singleton, tokenizer_version FROM cayu_transcript_search_configuration"
+            )
+            assert await cur.fetchone() == (True, TRANSCRIPT_SEARCH_TOKENIZER_VERSION)
+
+    asyncio.run(runner())
+
+
+def test_postgres_transcript_tokenizer_identity_mismatch_fails_closed(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_transcript_search_configuration "
+                    "SET tokenizer_version = 'incompatible-tokenizer'"
+                )
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="tokenizer identity conflicts"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT tokenizer_version FROM cayu_transcript_search_configuration")
+            assert await cur.fetchone() == ("incompatible-tokenizer",)
+
+    asyncio.run(runner())
 
 
 def test_postgres_workflow_replay_is_fenced_atomic_and_indexed(postgres_dsn: str) -> None:
@@ -322,6 +499,7 @@ _TABLES = (
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
+    "cayu_transcript_search_configuration",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",
@@ -1052,6 +1230,20 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 45"
             )
             assert await cur.fetchone() == ("breaking", 45)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 46"
+            )
+            assert await cur.fetchone() == ("breaking", 46)
+            await cur.execute(
+                "SELECT data_type, is_nullable, is_generated "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_transcript_messages' "
+                "AND column_name = 'transcript_search_document'"
+            )
+            assert await cur.fetchone() == ("text", "NO", "NEVER")
+            await cur.execute("SELECT to_regclass('idx_cayu_transcript_messages_narrative_fts')")
+            assert (await cur.fetchone())[0] == "idx_cayu_transcript_messages_narrative_fts"
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

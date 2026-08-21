@@ -1,0 +1,572 @@
+{
+  "schema_version": "cayu.recall_baseline_corpus.v1",
+  "corpus_revision": "public-cross-source-v1",
+  "origin": "hermetic_public",
+  "knowledge": [
+    {
+      "id": "deployment-port",
+      "revisions": ["Deployment gateway uses orionport8443."],
+      "namespace": "org-a",
+      "labels": {"project": "alpha"}
+    },
+    {
+      "id": "refund-owner",
+      "revisions": ["Refund owner marker is refundownerhelena."],
+      "namespace": "org-a",
+      "labels": {"project": "alpha"}
+    },
+    {
+      "id": "release-date",
+      "revisions": [
+        "Atlasrelease date used to be Thursday.",
+        "Current atlasrelease date is Friday."
+      ],
+      "namespace": "org-a",
+      "labels": {"project": "alpha"}
+    },
+    {
+      "id": "authorized-boundary",
+      "revisions": ["Authorized marker is cobaltboundary."],
+      "namespace": "org-a",
+      "labels": {"project": "alpha"}
+    },
+    {
+      "id": "foreign-boundary",
+      "revisions": ["Foreign marker is cobaltboundary."],
+      "namespace": "org-b",
+      "labels": {"project": "alpha"}
+    },
+    {
+      "id": "spanish-deployment",
+      "revisions": ["El marcador de despliegue es despliegueazul."],
+      "namespace": "org-a",
+      "labels": {"project": "alpha"}
+    },
+    {
+      "id": "scan-fallback",
+      "revisions": ["The bounded recall marker is scanlimitfallback."],
+      "namespace": "org-a",
+      "labels": {"project": "alpha"}
+    }
+  ],
+  "transcripts": [
+    {
+      "session_id": "ops-session",
+      "messages": [
+        {
+          "interaction_id": "ops-interaction",
+          "role": "assistant",
+          "text": "The launch discussion selected ceruleancodeword."
+        }
+      ]
+    },
+    {
+      "session_id": "support-session",
+      "messages": [
+        {
+          "interaction_id": "support-interaction",
+          "role": "user",
+          "text": "We agreed that refundownerhelena owns refunds."
+        }
+      ]
+    },
+    {
+      "session_id": "release-history",
+      "messages": [
+        {
+          "interaction_id": "release-interaction",
+          "role": "assistant",
+          "text": "At that time the atlasrelease date was Thursday."
+        }
+      ]
+    },
+    {
+      "session_id": "authorized-session",
+      "messages": [
+        {
+          "interaction_id": "authorized-interaction",
+          "role": "assistant",
+          "text": "The authorized discussion marker is cobaltboundary."
+        }
+      ]
+    },
+    {
+      "session_id": "foreign-session",
+      "messages": [
+        {
+          "interaction_id": "foreign-interaction",
+          "role": "assistant",
+          "text": "The foreign discussion marker is cobaltboundary."
+        }
+      ]
+    },
+    {
+      "session_id": "russian-session",
+      "messages": [
+        {
+          "interaction_id": "russian-interaction",
+          "role": "user",
+          "text": "Кодовое слово обсуждения — северноесияние."
+        }
+      ]
+    },
+    {
+      "session_id": "token-boundary-session",
+      "messages": [
+        {
+          "interaction_id": "token-boundary-decoy",
+          "role": "assistant",
+          "text": "foo bar boundary decoy"
+        },
+        {
+          "interaction_id": "token-boundary-exact",
+          "role": "assistant",
+          "text": "foo_bar exact boundary"
+        }
+      ]
+    },
+    {
+      "session_id": "unicode-fold-session",
+      "messages": [
+        {
+          "interaction_id": "unicode-fold-interaction",
+          "role": "user",
+          "text": "Straße rollout marker"
+        }
+      ]
+    },
+    {
+      "session_id": "a-ranking-session",
+      "messages": [
+        {
+          "interaction_id": "ranking-weak",
+          "role": "assistant",
+          "text": "Nebula details with orbit notes and a later window"
+        }
+      ]
+    },
+    {
+      "session_id": "z-ranking-session",
+      "messages": [
+        {
+          "interaction_id": "ranking-exact",
+          "role": "assistant",
+          "text": "Nebula orbit window"
+        }
+      ]
+    },
+    {
+      "session_id": "scan-bound-session",
+      "messages": [
+        {
+          "interaction_id": "scan-bound-one",
+          "role": "assistant",
+          "text": "First scanlimitfallback transcript decoy"
+        },
+        {
+          "interaction_id": "scan-bound-two",
+          "role": "assistant",
+          "text": "Second scanlimitfallback transcript decoy"
+        }
+      ]
+    },
+    {
+      "session_id": "byte-bound-session",
+      "messages": [
+        {
+          "interaction_id": "byte-bound-interaction",
+          "role": "assistant",
+          "text": "🚀 byteboundmarker evidence"
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "knowledge-only",
+      "language": "en",
+      "query": "orionport8443",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "relevant": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "deployment-port:r1:0",
+          "revision": "1",
+          "locator": {
+            "entry_id": "deployment-port",
+            "entry_revision": 1,
+            "chunk_id": "deployment-port:r1:0",
+            "chunk_index": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "transcript-only",
+      "language": "en",
+      "query": "ceruleancodeword",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["ops-session"],
+      "relevant": [
+        {
+          "record_type": "transcript_message",
+          "record_id": "ops-session:0",
+          "locator": {
+            "session_id": "ops-session",
+            "interaction_id": "ops-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "duplicate-provenance",
+      "language": "en",
+      "query": "refundownerhelena",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["support-session"],
+      "relevant": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "refund-owner:r1:0",
+          "revision": "1",
+          "locator": {
+            "entry_id": "refund-owner",
+            "entry_revision": 1,
+            "chunk_id": "refund-owner:r1:0",
+            "chunk_index": 0
+          }
+        },
+        {
+          "record_type": "transcript_message",
+          "record_id": "support-session:0",
+          "locator": {
+            "session_id": "support-session",
+            "interaction_id": "support-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "current-knowledge-and-historical-transcript",
+      "language": "en",
+      "query": "atlasrelease",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["release-history"],
+      "relevant": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "release-date:r2:0",
+          "revision": "2",
+          "locator": {
+            "entry_id": "release-date",
+            "entry_revision": 2,
+            "chunk_id": "release-date:r2:0",
+            "chunk_index": 0
+          }
+        },
+        {
+          "record_type": "transcript_message",
+          "record_id": "release-history:0",
+          "locator": {
+            "session_id": "release-history",
+            "interaction_id": "release-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "authorization-isolation",
+      "language": "en",
+      "query": "cobaltboundary",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["authorized-session"],
+      "relevant": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "authorized-boundary:r1:0",
+          "revision": "1",
+          "locator": {
+            "entry_id": "authorized-boundary",
+            "entry_revision": 1,
+            "chunk_id": "authorized-boundary:r1:0",
+            "chunk_index": 0
+          }
+        },
+        {
+          "record_type": "transcript_message",
+          "record_id": "authorized-session:0",
+          "locator": {
+            "session_id": "authorized-session",
+            "interaction_id": "authorized-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ],
+      "forbidden": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "foreign-boundary:r1:0",
+          "revision": "1",
+          "locator": {
+            "entry_id": "foreign-boundary",
+            "entry_revision": 1,
+            "chunk_id": "foreign-boundary:r1:0",
+            "chunk_index": 0
+          }
+        },
+        {
+          "record_type": "transcript_message",
+          "record_id": "foreign-session:0",
+          "locator": {
+            "session_id": "foreign-session",
+            "interaction_id": "foreign-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "spanish-knowledge",
+      "language": "es",
+      "query": "despliegueazul",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "relevant": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "spanish-deployment:r1:0",
+          "revision": "1",
+          "locator": {
+            "entry_id": "spanish-deployment",
+            "entry_revision": 1,
+            "chunk_id": "spanish-deployment:r1:0",
+            "chunk_index": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "russian-transcript",
+      "language": "ru",
+      "query": "северноесияние",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["russian-session"],
+      "relevant": [
+        {
+          "record_type": "transcript_message",
+          "record_id": "russian-session:0",
+          "locator": {
+            "session_id": "russian-session",
+            "interaction_id": "russian-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "short-followup-why",
+      "language": "en",
+      "query": "Why?",
+      "recent_conversation": ["We need orionport8443."],
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "relevant": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "deployment-port:r1:0",
+          "revision": "1",
+          "locator": {
+            "entry_id": "deployment-port",
+            "entry_revision": 1,
+            "chunk_id": "deployment-port:r1:0",
+            "chunk_index": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "short-followup-action",
+      "language": "en",
+      "query": "Let's do that.",
+      "recent_conversation": ["ceruleancodeword"],
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["ops-session"],
+      "relevant": [
+        {
+          "record_type": "transcript_message",
+          "record_id": "ops-session:0",
+          "locator": {
+            "session_id": "ops-session",
+            "interaction_id": "ops-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "token-boundary-normalization",
+      "language": "en",
+      "query": "foo_bar",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["token-boundary-session"],
+      "cutoff": 2,
+      "relevant": [
+        {
+          "record_type": "transcript_message",
+          "record_id": "token-boundary-session:1",
+          "locator": {
+            "session_id": "token-boundary-session",
+            "interaction_id": "token-boundary-exact",
+            "transcript_index": 1,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "unicode-casefold-parity",
+      "language": "de",
+      "query": "STRASSE",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["unicode-fold-session"],
+      "relevant": [
+        {
+          "record_type": "transcript_message",
+          "record_id": "unicode-fold-session:0",
+          "locator": {
+            "session_id": "unicode-fold-session",
+            "interaction_id": "unicode-fold-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "relevance-before-identity",
+      "language": "en",
+      "query": "Nebula orbit window",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["a-ranking-session", "z-ranking-session"],
+      "cutoff": 1,
+      "relevant": [
+        {
+          "record_type": "transcript_message",
+          "record_id": "z-ranking-session:0",
+          "locator": {
+            "session_id": "z-ranking-session",
+            "interaction_id": "ranking-exact",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    },
+    {
+      "id": "scan-overflow-fails-closed",
+      "language": "en",
+      "query": "scanlimitfallback",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["scan-bound-session"],
+      "transcript_max_records_scanned": 1,
+      "relevant": [
+        {
+          "record_type": "knowledge_chunk",
+          "record_id": "scan-fallback:r1:0",
+          "revision": "1",
+          "locator": {
+            "entry_id": "scan-fallback",
+            "entry_revision": 1,
+            "chunk_id": "scan-fallback:r1:0",
+            "chunk_index": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "byte-truncation-without-false-continuation",
+      "language": "en",
+      "query": "byteboundmarker",
+      "namespace": "org-a",
+      "access": {
+        "allowed_namespaces": ["org-a"],
+        "required_labels": {"project": "alpha"}
+      },
+      "transcript_session_ids": ["byte-bound-session"],
+      "transcript_max_bytes": 4,
+      "cutoff": 1,
+      "relevant": [
+        {
+          "record_type": "transcript_message",
+          "record_id": "byte-bound-session:0",
+          "locator": {
+            "session_id": "byte-bound-session",
+            "interaction_id": "byte-bound-interaction",
+            "transcript_index": 0,
+            "text_part_indexes": [0]
+          }
+        }
+      ]
+    }
+  ]
+}

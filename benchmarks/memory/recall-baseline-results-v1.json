@@ -1,0 +1,1168 @@
+{
+  "corpus_revision": "public-cross-source-v1",
+  "results": [
+    {
+      "backend": "memory",
+      "cases": [
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "knowledge-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 9.313125,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2370,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "transcript-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 6.730791,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2593,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "duplicate-provenance",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 9.049208,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3524,
+          "selected_identities": [
+            "knowledge_chunk:refund-owner:r1:0:1",
+            "transcript_message:support-session:0:741e9cf4ac7b66a2d54116934778c3154b2f1025e072a6e8f176d8fbd3219335"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "current-knowledge-and-historical-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 13.905917,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3521,
+          "selected_identities": [
+            "knowledge_chunk:release-date:r2:0:2",
+            "transcript_message:release-history:0:215d99ad812a8c47b51092442230a707bd330e282040e5c40bcd607678c9268e"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "authorization-isolation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 12.711709,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3564,
+          "selected_identities": [
+            "knowledge_chunk:authorized-boundary:r1:0:1",
+            "transcript_message:authorized-session:0:5dbe513381cee6dad9456b34dca87a6d262cbc76f2ea4e54f3eeff1d3de6794e"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "spanish-knowledge",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "es",
+          "latency_ms": 11.117209,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2388,
+          "selected_identities": [
+            "knowledge_chunk:spanish-deployment:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "russian-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "ru",
+          "latency_ms": 9.36475,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2641,
+          "selected_identities": [
+            "transcript_message:russian-session:0:921a11e70570119976f3fcf4de67c97517bbd9773d927b8ec111daa5bb8c37ef"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-why",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 8.30075,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2370,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-action",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 6.186625,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2589,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "token-boundary-normalization",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 6.126875,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2605,
+          "selected_identities": [
+            "transcript_message:token-boundary-session:1:c0d3140619aeb566ba5c6cadd9501cf39e6cf7036ed85d1979e6dcf1fe3039db"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "unicode-casefold-parity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "de",
+          "latency_ms": 5.70525,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2603,
+          "selected_identities": [
+            "transcript_message:unicode-fold-session:0:99c0e33b267103c30a0436810fe4d31f458de985ead9ebd9589de8ff05254ac9"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "relevance-before-identity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [
+            "transcript.lexical"
+          ],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 5.884125,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2894,
+          "selected_identities": [
+            "transcript_message:z-ranking-session:0:cbd7eb8b118e4b9fef59275ea993248d754ec16c5b6a35cde16699c5995400cb"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "scan-overflow-fails-closed",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 7.894834,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 2,
+          "recall_at_k": 1.0,
+          "result_bytes": 2406,
+          "selected_identities": [
+            "knowledge_chunk:scan-fallback:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": "scan_limit"
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "partial"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "byte-truncation-without-false-continuation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 6.422042,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2606,
+          "selected_identities": [
+            "transcript_message:byte-bound-session:0:bd5ec4358313ea077dcc799f008356e59bdb19b382f588db3c8bed3747dbd271"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        }
+      ],
+      "configuration": {
+        "channel_weights": {
+          "knowledge.lexical": 1,
+          "knowledge.semantic": 1,
+          "transcript.lexical": 1
+        },
+        "cutoffs_by_case": {
+          "authorization-isolation": 5,
+          "byte-truncation-without-false-continuation": 1,
+          "current-knowledge-and-historical-transcript": 5,
+          "duplicate-provenance": 5,
+          "knowledge-only": 5,
+          "relevance-before-identity": 1,
+          "russian-transcript": 5,
+          "scan-overflow-fails-closed": 5,
+          "short-followup-action": 5,
+          "short-followup-why": 5,
+          "spanish-knowledge": 5,
+          "token-boundary-normalization": 2,
+          "transcript-only": 5,
+          "unicode-casefold-parity": 5
+        },
+        "engine_version": "cayu.recall.v1",
+        "fusion_configuration_version": "public-recall-baseline-v1",
+        "fusion_strategy_version": "cayu.wrrf.v1",
+        "source_set": [
+          "knowledge",
+          "transcript"
+        ],
+        "token_estimator": "ceil(utf8_json_bytes/4)",
+        "transcript_budgets_by_case": {
+          "authorization-isolation": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "byte-truncation-without-false-continuation": {
+            "max_bytes": 4,
+            "max_records_scanned": 10000
+          },
+          "current-knowledge-and-historical-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "duplicate-provenance": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "knowledge-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "relevance-before-identity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "russian-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "scan-overflow-fails-closed": {
+            "max_bytes": 64000,
+            "max_records_scanned": 1
+          },
+          "short-followup-action": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "short-followup-why": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "spanish-knowledge": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "token-boundary-normalization": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "transcript-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "unicode-casefold-parity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          }
+        }
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "public-cross-source-v1",
+      "metrics": {
+        "authorization_leak_rate": 0.0,
+        "case_count": 14,
+        "estimated_result_tokens": 9669,
+        "false_complete_rate": 0.0,
+        "false_result_rate": 0.0,
+        "latency_p50_ms": 7.894834,
+        "latency_p95_ms": 13.905917,
+        "locator_correctness": 1.0,
+        "mean_candidate_count": 1.2142857142857142,
+        "partial_source_count": 15,
+        "recall_at_k": 1.0,
+        "result_bytes": 38674,
+        "stale_knowledge_rate": 0.0,
+        "total_candidate_count": 17,
+        "truncated_case_count": 14
+      },
+      "schema_version": "cayu.recall_baseline_result.v1"
+    },
+    {
+      "backend": "sqlite",
+      "cases": [
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "knowledge-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 8.070792,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2390,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "transcript-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 7.176417,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2593,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "duplicate-provenance",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 11.470916,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3544,
+          "selected_identities": [
+            "knowledge_chunk:refund-owner:r1:0:1",
+            "transcript_message:support-session:0:741e9cf4ac7b66a2d54116934778c3154b2f1025e072a6e8f176d8fbd3219335"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "current-knowledge-and-historical-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 9.916166,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3540,
+          "selected_identities": [
+            "knowledge_chunk:release-date:r2:0:2",
+            "transcript_message:release-history:0:215d99ad812a8c47b51092442230a707bd330e282040e5c40bcd607678c9268e"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "authorization-isolation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 9.875208,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3582,
+          "selected_identities": [
+            "knowledge_chunk:authorized-boundary:r1:0:1",
+            "transcript_message:authorized-session:0:5dbe513381cee6dad9456b34dca87a6d262cbc76f2ea4e54f3eeff1d3de6794e"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "spanish-knowledge",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "es",
+          "latency_ms": 5.92775,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2408,
+          "selected_identities": [
+            "knowledge_chunk:spanish-deployment:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "russian-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "ru",
+          "latency_ms": 6.908084,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2641,
+          "selected_identities": [
+            "transcript_message:russian-session:0:921a11e70570119976f3fcf4de67c97517bbd9773d927b8ec111daa5bb8c37ef"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-why",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 6.759083,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2390,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-action",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 8.758917,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2589,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "token-boundary-normalization",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 6.683083,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2605,
+          "selected_identities": [
+            "transcript_message:token-boundary-session:1:c0d3140619aeb566ba5c6cadd9501cf39e6cf7036ed85d1979e6dcf1fe3039db"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "unicode-casefold-parity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "de",
+          "latency_ms": 6.369583,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2603,
+          "selected_identities": [
+            "transcript_message:unicode-fold-session:0:99c0e33b267103c30a0436810fe4d31f458de985ead9ebd9589de8ff05254ac9"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "relevance-before-identity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [
+            "transcript.lexical"
+          ],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 7.072042,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2894,
+          "selected_identities": [
+            "transcript_message:z-ranking-session:0:cbd7eb8b118e4b9fef59275ea993248d754ec16c5b6a35cde16699c5995400cb"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "scan-overflow-fails-closed",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 7.544667,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 2,
+          "recall_at_k": 1.0,
+          "result_bytes": 2426,
+          "selected_identities": [
+            "knowledge_chunk:scan-fallback:r1:0:1"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": "scan_limit"
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "partial"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        },
+        {
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "byte-truncation-without-false-continuation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-16.0.0"
+          },
+          "continuation_channels": [],
+          "false_complete": false,
+          "false_result_count": 0,
+          "language": "en",
+          "latency_ms": 6.162042,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2606,
+          "selected_identities": [
+            "transcript_message:byte-bound-session:0:bd5ec4358313ea077dcc799f008356e59bdb19b382f588db3c8bed3747dbd271"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_knowledge_count": 0,
+          "truncated": true
+        }
+      ],
+      "configuration": {
+        "channel_weights": {
+          "knowledge.lexical": 1,
+          "knowledge.semantic": 1,
+          "transcript.lexical": 1
+        },
+        "cutoffs_by_case": {
+          "authorization-isolation": 5,
+          "byte-truncation-without-false-continuation": 1,
+          "current-knowledge-and-historical-transcript": 5,
+          "duplicate-provenance": 5,
+          "knowledge-only": 5,
+          "relevance-before-identity": 1,
+          "russian-transcript": 5,
+          "scan-overflow-fails-closed": 5,
+          "short-followup-action": 5,
+          "short-followup-why": 5,
+          "spanish-knowledge": 5,
+          "token-boundary-normalization": 2,
+          "transcript-only": 5,
+          "unicode-casefold-parity": 5
+        },
+        "engine_version": "cayu.recall.v1",
+        "fusion_configuration_version": "public-recall-baseline-v1",
+        "fusion_strategy_version": "cayu.wrrf.v1",
+        "source_set": [
+          "knowledge",
+          "transcript"
+        ],
+        "token_estimator": "ceil(utf8_json_bytes/4)",
+        "transcript_budgets_by_case": {
+          "authorization-isolation": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "byte-truncation-without-false-continuation": {
+            "max_bytes": 4,
+            "max_records_scanned": 10000
+          },
+          "current-knowledge-and-historical-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "duplicate-provenance": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "knowledge-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "relevance-before-identity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "russian-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "scan-overflow-fails-closed": {
+            "max_bytes": 64000,
+            "max_records_scanned": 1
+          },
+          "short-followup-action": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "short-followup-why": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "spanish-knowledge": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "token-boundary-normalization": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "transcript-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "unicode-casefold-parity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          }
+        }
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "public-cross-source-v1",
+      "metrics": {
+        "authorization_leak_rate": 0.0,
+        "case_count": 14,
+        "estimated_result_tokens": 9703,
+        "false_complete_rate": 0.0,
+        "false_result_rate": 0.0,
+        "latency_p50_ms": 7.072042,
+        "latency_p95_ms": 11.470916,
+        "locator_correctness": 1.0,
+        "mean_candidate_count": 1.2142857142857142,
+        "partial_source_count": 15,
+        "recall_at_k": 1.0,
+        "result_bytes": 38811,
+        "stale_knowledge_rate": 0.0,
+        "total_candidate_count": 17,
+        "truncated_case_count": 14
+      },
+      "schema_version": "cayu.recall_baseline_result.v1"
+    }
+  ],
+  "schema_version": "cayu.recall_baseline_matrix.v1"
+}

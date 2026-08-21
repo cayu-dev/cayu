@@ -7,9 +7,11 @@ import hashlib
 import heapq
 import json
 import math
+import re
 import secrets
 import time
 import traceback as traceback_module
+import unicodedata
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
@@ -71,6 +73,7 @@ from cayu.core.messages import (
     Message,
     MessageRole,
     ProviderStatePart,
+    TextPart,
     ThinkingPart,
     ToolCallPart,
     ToolResultPart,
@@ -5948,6 +5951,30 @@ class TranscriptPage(BaseModel):
     total_records: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
+TRANSCRIPT_SEARCH_TOKENIZER_VERSION = (
+    f"cayu.transcript.tokenizer.v1+unicode-{unicodedata.unidata_version}"
+)
+TRANSCRIPT_SEARCH_INDEX_VERSION = f"cayu.transcript.text.v1+{TRANSCRIPT_SEARCH_TOKENIZER_VERSION}"
+TRANSCRIPT_SEARCH_DEFAULT_LIMIT = 20
+TRANSCRIPT_SEARCH_MAX_LIMIT = 100
+TRANSCRIPT_SEARCH_DEFAULT_MAX_BYTES = 32_000
+TRANSCRIPT_SEARCH_MAX_BYTES = 1_000_000
+TRANSCRIPT_SEARCH_DEFAULT_SCAN_LIMIT = 10_000
+TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT = 100_000
+TRANSCRIPT_SEARCH_MAX_SESSION_IDS = 100
+TRANSCRIPT_SEARCH_MAX_QUERY_BYTES = 8_192
+TRANSCRIPT_SEARCH_MAX_CURSOR_BYTES = 4_096
+TRANSCRIPT_SEARCH_MIN_MAX_BYTES = 4
+_TRANSCRIPT_SEARCH_CURSOR_VERSION = 1
+_TRANSCRIPT_SEARCH_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_TRANSCRIPT_SEARCH_OCCURRENCE_CAP = SESSION_MESSAGE_CONTENT_MAX_BYTES
+_TRANSCRIPT_SEARCH_COVERAGE_SCALE = _TRANSCRIPT_SEARCH_OCCURRENCE_CAP + 1
+_TRANSCRIPT_SEARCH_PHRASE_SCALE = (
+    TRANSCRIPT_SEARCH_MAX_QUERY_BYTES + 1
+) * _TRANSCRIPT_SEARCH_COVERAGE_SCALE
+_TRANSCRIPT_SEARCH_MAX_INLINE_TOKEN_BYTES = 512
+
+
 class TranscriptSnapshot(BaseModel):
     """Retained transcript records plus the permanent append cursor."""
 
@@ -6524,6 +6551,283 @@ class TranscriptQuery(BaseModel):
         return MessageRole(value)
 
 
+class TranscriptSearchQuery(BaseModel):
+    """Bounded lexical search over explicitly selected authoritative transcripts."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
+
+    text: str
+    session_ids: tuple[str, ...]
+    roles: tuple[MessageRole, ...] = (
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+    )
+    limit: int = TRANSCRIPT_SEARCH_DEFAULT_LIMIT
+    max_bytes: int = TRANSCRIPT_SEARCH_DEFAULT_MAX_BYTES
+    max_records_scanned: int = TRANSCRIPT_SEARCH_DEFAULT_SCAN_LIMIT
+    cursor: str | None = None
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        value = require_nonblank(value, "text")
+        if len(value.encode("utf-8")) > TRANSCRIPT_SEARCH_MAX_QUERY_BYTES:
+            raise ValueError(
+                f"`text` must be at most {TRANSCRIPT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes."
+            )
+        if not transcript_search_query_tokens(value):
+            raise ValueError("`text` must contain at least one searchable word.")
+        return value
+
+    @field_validator("session_ids", mode="before")
+    @classmethod
+    def validate_session_ids(cls, value) -> tuple[str, ...]:
+        if isinstance(value, str | bytes):
+            raise ValueError("`session_ids` must be a sequence of session identifiers.")
+        try:
+            values = list(islice(value, TRANSCRIPT_SEARCH_MAX_SESSION_IDS + 1))
+        except TypeError as exc:
+            raise ValueError("`session_ids` must be a sequence of session identifiers.") from exc
+        if not values:
+            raise ValueError("Transcript search requires at least one explicit session id.")
+        if len(values) > TRANSCRIPT_SEARCH_MAX_SESSION_IDS:
+            raise ValueError(
+                f"`session_ids` cannot contain more than {TRANSCRIPT_SEARCH_MAX_SESSION_IDS} ids."
+            )
+        cleaned = [require_clean_nonblank(item, "session_ids") for item in values]
+        if any(len(session_id.encode("utf-8")) > MAX_SESSION_ID_BYTES for session_id in cleaned):
+            raise ValueError(
+                f"`session_ids` values must be at most {MAX_SESSION_ID_BYTES} UTF-8 bytes."
+            )
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("`session_ids` cannot contain duplicates.")
+        return tuple(sorted(cleaned))
+
+    @field_validator("roles", mode="before")
+    @classmethod
+    def validate_roles(cls, value) -> tuple[MessageRole, ...]:
+        if isinstance(value, str | bytes):
+            raise ValueError("`roles` must be a sequence of message roles.")
+        try:
+            roles = tuple(MessageRole(item) for item in islice(value, 3))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("`roles` contains an invalid message role.") from exc
+        if not roles:
+            raise ValueError("`roles` cannot be empty.")
+        if len(roles) > 2:
+            raise ValueError("`roles` cannot contain more than two narrative roles.")
+        if len(roles) != len(set(roles)):
+            raise ValueError("`roles` cannot contain duplicates.")
+        if MessageRole.SYSTEM in roles or MessageRole.TOOL in roles:
+            raise ValueError("Transcript recall indexes only user and assistant narrative text.")
+        return tuple(sorted(roles, key=str))
+
+    @field_validator("limit", "max_bytes", "max_records_scanned", mode="before")
+    @classmethod
+    def validate_bounds(cls, value, info) -> int:
+        if type(value) is not int:
+            raise ValueError(f"`{info.field_name}` must be an integer.")
+        maximum = {
+            "limit": TRANSCRIPT_SEARCH_MAX_LIMIT,
+            "max_bytes": TRANSCRIPT_SEARCH_MAX_BYTES,
+            "max_records_scanned": TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,
+        }[info.field_name]
+        minimum = TRANSCRIPT_SEARCH_MIN_MAX_BYTES if info.field_name == "max_bytes" else 1
+        if not minimum <= value <= maximum:
+            raise ValueError(f"`{info.field_name}` must be between {minimum} and {maximum}.")
+        return value
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, "cursor")
+        if len(value.encode("ascii", errors="ignore")) != len(value):
+            raise ValueError("`cursor` must contain ASCII characters only.")
+        if len(value) > TRANSCRIPT_SEARCH_MAX_CURSOR_BYTES:
+            raise ValueError(
+                f"`cursor` must be at most {TRANSCRIPT_SEARCH_MAX_CURSOR_BYTES} bytes."
+            )
+        return value
+
+
+class TranscriptSearchHit(BaseModel):
+    """One exact transcript record matched through its non-thinking text parts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: str
+    transcript_index: int
+    interaction_id: str | None = None
+    role: MessageRole
+    text: str
+    text_complete: bool
+    content_hash: str
+    text_part_indexes: tuple[int, ...]
+    raw_score: float | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "session_id")
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_interaction_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "interaction_id")
+
+    @field_validator("transcript_index", mode="before")
+    @classmethod
+    def validate_transcript_index(cls, value) -> int:
+        if type(value) is not int or not 0 <= value <= MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("`transcript_index` must be a non-negative durable integer.")
+        return value
+
+    @field_validator("text")
+    @classmethod
+    def validate_hit_text(cls, value: str) -> str:
+        return require_nonblank(value, "text")
+
+    @field_validator("text_complete", mode="before")
+    @classmethod
+    def validate_text_complete(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`text_complete` must be a boolean.")
+        return value
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: str) -> str:
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("`content_hash` must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("text_part_indexes", mode="before")
+    @classmethod
+    def validate_text_part_indexes(cls, value) -> tuple[int, ...]:
+        if isinstance(value, int | str | bytes):
+            raise ValueError("`text_part_indexes` must be a sequence of indexes.")
+        try:
+            indexes = tuple(value)
+        except TypeError as exc:
+            raise ValueError("`text_part_indexes` must be a sequence of indexes.") from exc
+        if not indexes or any(type(index) is not int or index < 0 for index in indexes):
+            raise ValueError("`text_part_indexes` must contain non-negative integers.")
+        if indexes != tuple(sorted(set(indexes))):
+            raise ValueError("`text_part_indexes` must be unique and ascending.")
+        return indexes
+
+    @field_validator("raw_score", mode="before")
+    @classmethod
+    def validate_raw_score(cls, value) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("`raw_score` must be a number.")
+        score = float(value)
+        if not math.isfinite(score):
+            raise ValueError("`raw_score` must be finite.")
+        return score
+
+
+class TranscriptSearchResult(BaseModel):
+    """One bounded transcript-search page and its exact continuation frontier."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    query: TranscriptSearchQuery
+    hits: tuple[TranscriptSearchHit, ...] = ()
+    index_version: str = TRANSCRIPT_SEARCH_INDEX_VERSION
+    matched_records_examined: int = 0
+    truncated: bool = False
+    coverage_complete: bool = True
+    next_cursor: str | None = None
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def copy_query(cls, value) -> TranscriptSearchQuery:
+        if type(value) is not TranscriptSearchQuery:
+            raise TypeError("`query` must be a TranscriptSearchQuery.")
+        return copy_transcript_search_query(value)
+
+    @field_validator("hits", mode="before")
+    @classmethod
+    def copy_hits(cls, value) -> tuple[TranscriptSearchHit, ...]:
+        return tuple(copy_transcript_search_hit(item) for item in value)
+
+    @field_validator("index_version")
+    @classmethod
+    def validate_index_version(cls, value: str) -> str:
+        return require_clean_nonblank(value, "index_version")
+
+    @field_validator("matched_records_examined", mode="before")
+    @classmethod
+    def validate_records_examined(cls, value) -> int:
+        if type(value) is not int or value < 0:
+            raise ValueError("`matched_records_examined` must be a non-negative integer.")
+        return value
+
+    @field_validator("truncated", "coverage_complete", mode="before")
+    @classmethod
+    def validate_boolean(cls, value, info) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"`{info.field_name}` must be a boolean.")
+        return value
+
+    @field_validator("next_cursor")
+    @classmethod
+    def validate_next_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return TranscriptSearchQuery.validate_cursor(value)
+
+    @model_validator(mode="after")
+    def validate_page(self) -> TranscriptSearchResult:
+        if len(self.hits) > self.query.limit:
+            raise ValueError("Transcript search hits exceed the query limit.")
+        identities = [(hit.session_id, hit.transcript_index) for hit in self.hits]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Transcript search hits cannot repeat a transcript record.")
+        if self.next_cursor is not None and not self.truncated:
+            raise ValueError("A transcript continuation requires `truncated=True`.")
+        if not self.coverage_complete and not self.truncated:
+            raise ValueError("Incomplete transcript coverage must be reported as truncated.")
+        if not self.coverage_complete and (self.hits or self.next_cursor is not None):
+            raise ValueError(
+                "Incomplete transcript coverage cannot expose a partial ranking or cursor."
+            )
+        if self.matched_records_examined > self.query.max_records_scanned:
+            raise ValueError("Transcript search exceeded `max_records_scanned`.")
+        if len(self.hits) > self.matched_records_examined:
+            raise ValueError("Transcript search cannot return more hits than it examined.")
+        if any(hit.session_id not in self.query.session_ids for hit in self.hits):
+            raise ValueError("Transcript search returned a session outside the explicit scope.")
+        if any(hit.role not in self.query.roles for hit in self.hits):
+            raise ValueError("Transcript search returned a role outside the explicit scope.")
+        if tuple(self.hits) != tuple(
+            sorted(
+                self.hits,
+                key=lambda hit: (
+                    -(hit.raw_score if hit.raw_score is not None else float("-inf")),
+                    hit.session_id,
+                    -hit.transcript_index,
+                ),
+            )
+        ):
+            raise ValueError("Transcript search hits must use deterministic relevance order.")
+        if sum(len(hit.text.encode("utf-8")) for hit in self.hits) > self.query.max_bytes:
+            raise ValueError("Transcript search hits exceeded `max_bytes`.")
+        return self
+
+
 def _without_thinking_parts(message: Message) -> Message | None:
     kept = [part for part in message.content if type(part) is not ThinkingPart]
     if not kept:
@@ -6633,6 +6937,7 @@ class SessionStore(ABC):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_model_completion_stage_release: ClassVar[bool] = False
+    supports_transcript_search: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @property
@@ -8202,6 +8507,19 @@ class SessionStore(ABC):
         Same isolation contract as `load_transcript`.
         """
 
+    async def search_transcript(
+        self,
+        query: TranscriptSearchQuery,
+    ) -> TranscriptSearchResult:
+        """Search explicitly selected transcript narratives within hard bounds.
+
+        This optional capability fails closed for custom stores until they opt in.
+        Implementations must enforce the supplied session set inside the query and
+        must never interpret an empty or omitted set as global access.
+        """
+
+        raise NotImplementedError("This SessionStore does not support transcript search.")
+
     @abstractmethod
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         """Persist a checkpoint for resume/replay."""
@@ -8290,6 +8608,7 @@ class InMemorySessionStore(SessionStore):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    supports_transcript_search: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
@@ -8386,6 +8705,8 @@ class InMemorySessionStore(SessionStore):
         self._transcripts: dict[str, list[Message]] = {}
         self._transcript_interaction_ids: dict[str, list[str | None]] = {}
         self._transcript_indices_by_interaction: dict[str, dict[str | None, list[int]]] = {}
+        self._transcript_search_documents: dict[str, list[tuple[MessageRole, str]]] = {}
+        self._transcript_search_postings: dict[tuple[str, MessageRole], dict[str, list[int]]] = {}
         self._deferred_interaction_inputs: dict[str, tuple[str, list[Message]]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
         # Live queued-dispatch handoffs are indexed incrementally so restart
@@ -8667,6 +8988,48 @@ class InMemorySessionStore(SessionStore):
         self._transcript_indices_by_interaction[session_id] = projection
         return projection
 
+    def _remove_transcript_search_session_unlocked(self, session_id: str) -> None:
+        documents = self._transcript_search_documents.pop(session_id, ())
+        posting_keys = {(token, role) for role, document in documents for token in document.split()}
+        for posting_key in posting_keys:
+            sessions = self._transcript_search_postings.get(posting_key)
+            if sessions is None:
+                raise RuntimeError("In-memory transcript search index is inconsistent.")
+            sessions.pop(session_id, None)
+            if not sessions:
+                del self._transcript_search_postings[posting_key]
+
+    def _extend_transcript_search_unlocked(
+        self,
+        session_id: str,
+        messages: Sequence[Message],
+    ) -> None:
+        documents = self._transcript_search_documents.setdefault(session_id, [])
+        expected_start = len(self._transcripts.get(session_id, ())) - len(messages)
+        if len(documents) != expected_start:
+            raise RuntimeError("In-memory transcript search index is inconsistent.")
+        for offset, message in enumerate(messages):
+            document = (
+                transcript_search_document(message)
+                if message.role in {MessageRole.USER, MessageRole.ASSISTANT}
+                else ""
+            )
+            transcript_index = expected_start + offset
+            documents.append((message.role, document))
+            for token in set(document.split()):
+                self._transcript_search_postings.setdefault((token, message.role), {}).setdefault(
+                    session_id, []
+                ).append(transcript_index)
+
+    def _replace_transcript_search_session_unlocked(
+        self,
+        session_id: str,
+        messages: Sequence[Message],
+    ) -> None:
+        self._remove_transcript_search_session_unlocked(session_id)
+        self._transcript_search_documents[session_id] = []
+        self._extend_transcript_search_unlocked(session_id, messages)
+
     async def register_public_authority_alias(
         self,
         public_alias: str,
@@ -8865,6 +9228,7 @@ class InMemorySessionStore(SessionStore):
             self._session_operation_records[session.id] = {}
             self._transcripts[session.id] = []
             self._transcript_interaction_ids[session.id] = []
+            self._transcript_search_documents[session.id] = []
             if admission is not None:
                 started_event, source_messages = admission
                 interaction_id = started_event.interaction_id
@@ -9112,6 +9476,7 @@ class InMemorySessionStore(SessionStore):
             self._pending_action_event_records[fork.id] = {}
             self._session_operation_records[fork.id] = {}
             self._transcripts[fork.id] = copied_transcript
+            self._replace_transcript_search_session_unlocked(fork.id, copied_transcript)
             # Historical attribution remains tied to the source session's
             # interactions; new child work receives new child interaction IDs.
             self._transcript_interaction_ids[fork.id] = copied_interaction_ids
@@ -9331,6 +9696,7 @@ class InMemorySessionStore(SessionStore):
             self._pending_action_event_records.pop(session_id, None)
             self._pending_action_index_scopes.pop(session_id, None)
             self._pending_action_latest_barrier_records.pop(session_id, None)
+            self._remove_transcript_search_session_unlocked(session_id)
             self._transcripts.pop(session_id, None)
             self._transcript_interaction_ids.pop(session_id, None)
             self._transcript_indices_by_interaction.pop(session_id, None)
@@ -9674,6 +10040,7 @@ class InMemorySessionStore(SessionStore):
                     )
                 else:
                     self._transcripts[session_id].extend(source_messages)
+                    self._extend_transcript_search_unlocked(session_id, source_messages)
                     self._extend_transcript_attribution_unlocked(
                         session_id, [interaction_id] * len(source_messages)
                     )
@@ -10834,6 +11201,7 @@ class InMemorySessionStore(SessionStore):
             ]
             updated_session = self._append_events_unlocked(session, persisted_events)
             self._transcripts.setdefault(session_id, []).extend(transcript_messages)
+            self._extend_transcript_search_unlocked(session_id, transcript_messages)
             self._transcript_interaction_ids.setdefault(session_id, [])
             self._extend_transcript_attribution_unlocked(
                 session_id, [interaction_id] * len(transcript_messages)
@@ -11710,6 +12078,7 @@ class InMemorySessionStore(SessionStore):
             }
         )
         self._transcripts[session_id].extend(request.transcript_messages)
+        self._extend_transcript_search_unlocked(session_id, request.transcript_messages)
         self._extend_transcript_attribution_unlocked(
             session_id, [request.interaction_id] * len(request.transcript_messages)
         )
@@ -12697,6 +13066,7 @@ class InMemorySessionStore(SessionStore):
                     scope_session_id=session_id,
                 )
             self._transcripts[session_id].extend(copied_messages)
+            self._extend_transcript_search_unlocked(session_id, copied_messages)
             self._extend_transcript_attribution_unlocked(
                 session_id, [interaction_id] * len(copied_messages)
             )
@@ -12755,6 +13125,7 @@ class InMemorySessionStore(SessionStore):
                 interaction_id=interaction_id,
             )
             self._transcripts[session_id] = replacement
+            self._replace_transcript_search_session_unlocked(session_id, replacement)
             self._transcript_interaction_ids[session_id] = [None] * prefix_count + [
                 interaction_id
             ] * len(expected)
@@ -12789,6 +13160,7 @@ class InMemorySessionStore(SessionStore):
             if deferred_interaction_id != interaction_id:
                 raise RuntimeError("Deferred interaction input belongs to another interaction.")
             self._transcripts[session_id].extend(messages)
+            self._extend_transcript_search_unlocked(session_id, messages)
             self._extend_transcript_attribution_unlocked(
                 session_id,
                 [interaction_id] * len(messages),
@@ -12850,6 +13222,7 @@ class InMemorySessionStore(SessionStore):
                         scope_session_id=session_id,
                     )
                 self._transcripts[session_id].extend(copied_messages)
+                self._extend_transcript_search_unlocked(session_id, copied_messages)
                 self._extend_transcript_attribution_unlocked(
                     session_id, [interaction_id] * len(copied_messages)
                 )
@@ -12929,6 +13302,178 @@ class InMemorySessionStore(SessionStore):
                 records=filter_transcript_records(records, include_thinking=query.include_thinking),
                 total_records=total_records,
             )
+
+    async def search_transcript(
+        self,
+        query: TranscriptSearchQuery,
+    ) -> TranscriptSearchResult:
+        query = copy_transcript_search_query(query)
+        cursor = decode_transcript_search_cursor(query)
+        query_document = transcript_search_query_document(query.text)
+        query_tokens = tuple(query_document.split())
+        role_set = set(query.roles)
+        candidate_heap: list[tuple[int, str, int, Message, str | None]] = []
+        overflow = False
+
+        async with self._lock:
+            selected = frozenset(
+                session_id for session_id in query.session_ids if session_id in self._sessions
+            )
+            posting_sources: list[tuple[str, list[int]]] = []
+            posting_heap: list[tuple[str, int, int, int]] = []
+            for token in query_tokens:
+                for role in query.roles:
+                    posting_sessions = self._transcript_search_postings.get((token, role), {})
+                    for session_id in sorted(selected):
+                        indexes = posting_sessions.get(session_id)
+                        if not indexes:
+                            continue
+                        source_index = len(posting_sources)
+                        posting_sources.append((session_id, indexes))
+                        position = len(indexes) - 1
+                        heapq.heappush(
+                            posting_heap,
+                            (session_id, -indexes[position], source_index, position),
+                        )
+
+            popped = 0
+            next_yield = 256
+            while posting_heap:
+                session_id, negative_index, source_index, position = heapq.heappop(posting_heap)
+                candidate_key = (session_id, negative_index)
+                same_candidate = [(source_index, position)]
+                while posting_heap and posting_heap[0][:2] == candidate_key:
+                    _, _, duplicate_source, duplicate_position = heapq.heappop(posting_heap)
+                    same_candidate.append((duplicate_source, duplicate_position))
+                for matched_source, matched_position in same_candidate:
+                    source_session_id, indexes = posting_sources[matched_source]
+                    next_position = matched_position - 1
+                    if next_position >= 0:
+                        heapq.heappush(
+                            posting_heap,
+                            (
+                                source_session_id,
+                                -indexes[next_position],
+                                matched_source,
+                                next_position,
+                            ),
+                        )
+                popped += len(same_candidate)
+                if popped >= next_yield:
+                    next_yield = popped + 256
+                    await asyncio.sleep(0)
+
+                transcript_index = -negative_index
+                messages = self._transcripts.get(session_id, ())
+                interaction_ids = self._transcript_interaction_ids.get(session_id, ())
+                documents = self._transcript_search_documents.get(session_id, ())
+                if not (
+                    transcript_index < len(messages)
+                    and len(messages) == len(interaction_ids) == len(documents)
+                ):
+                    raise RuntimeError("In-memory transcript search index is inconsistent.")
+                message = messages[transcript_index]
+                if message.role not in role_set:
+                    continue
+                indexed_role, document = documents[transcript_index]
+                if indexed_role != message.role:
+                    raise RuntimeError("In-memory transcript search index is inconsistent.")
+                score = transcript_search_document_score(document, query_document)
+                if score <= 0:  # pragma: no cover - postings establish a token match
+                    raise RuntimeError("In-memory transcript search posting is inconsistent.")
+                if len(candidate_heap) >= query.max_records_scanned:
+                    overflow = True
+                    break
+                heapq.heappush(
+                    candidate_heap,
+                    (
+                        -score,
+                        session_id,
+                        -transcript_index,
+                        message,
+                        interaction_ids[transcript_index],
+                    ),
+                )
+
+            if overflow:
+                return TranscriptSearchResult(
+                    query=query,
+                    matched_records_examined=query.max_records_scanned,
+                    truncated=True,
+                    coverage_complete=False,
+                )
+
+            matched_records_examined = len(candidate_heap)
+            hits: list[TranscriptSearchHit] = []
+            remaining_bytes = query.max_bytes
+            truncated = False
+            continuation_available = False
+            ranked_examined = 0
+            while candidate_heap:
+                (
+                    negative_score,
+                    session_id,
+                    negative_transcript_index,
+                    message,
+                    interaction_id,
+                ) = heapq.heappop(candidate_heap)
+                score = -negative_score
+                transcript_index = -negative_transcript_index
+                ranked_examined += 1
+                if ranked_examined % 256 == 0:
+                    await asyncio.sleep(0)
+                if cursor is not None and not transcript_search_position_after_cursor(
+                    raw_score=score,
+                    session_id=session_id,
+                    transcript_index=transcript_index,
+                    cursor=cursor,
+                ):
+                    continue
+                if len(hits) >= query.limit:
+                    truncated = True
+                    continuation_available = True
+                    break
+                hit = transcript_search_hit_from_message(
+                    session_id=session_id,
+                    transcript_index=transcript_index,
+                    interaction_id=interaction_id,
+                    message=message,
+                    max_text_bytes=remaining_bytes,
+                    raw_score=float(score),
+                )
+                if hit is None:
+                    truncated = True
+                    continuation_available = bool(hits)
+                    break
+                hits.append(hit)
+                remaining_bytes -= len(hit.text.encode("utf-8"))
+                if not hit.text_complete:
+                    truncated = True
+                    continuation_available = bool(candidate_heap)
+                    break
+                if remaining_bytes == 0:
+                    truncated = bool(candidate_heap)
+                    continuation_available = truncated
+                    break
+
+        next_cursor = (
+            encode_transcript_search_cursor(
+                query,
+                raw_score=int(hits[-1].raw_score or 0),
+                session_id=hits[-1].session_id,
+                transcript_index=hits[-1].transcript_index,
+            )
+            if continuation_available and hits
+            else None
+        )
+        return TranscriptSearchResult(
+            query=query,
+            hits=tuple(hits),
+            matched_records_examined=matched_records_examined,
+            truncated=truncated,
+            coverage_complete=True,
+            next_cursor=next_cursor,
+        )
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -19379,6 +19924,304 @@ def copy_transcript_query(query: TranscriptQuery) -> TranscriptQuery:
         limit=query.limit,
         include_thinking=query.include_thinking,
     )
+
+
+def transcript_search_query_tokens(text: str) -> tuple[str, ...]:
+    """Return stable case-folded lexical terms shared by every backend."""
+
+    if type(text) is not str:
+        raise TypeError("Transcript search text must be a string.")
+    return tuple(
+        dict.fromkeys(token.casefold() for token in _TRANSCRIPT_SEARCH_TOKEN_RE.findall(text))
+    )
+
+
+def transcript_search_document_from_text(text: str) -> str:
+    """Encode narrative terms as tokenizer-safe portable ASCII lexemes.
+
+    Database tokenizers must never reinterpret the lexical boundary selected by
+    Cayu. Ordinary case-folded UTF-8 terms use a collision-free hexadecimal
+    identity; long terms use a separately prefixed SHA-256 identity so they
+    cannot exceed database lexeme limits. Repeated terms are retained for
+    deterministic scoring.
+    """
+
+    if type(text) is not str:
+        raise TypeError("Transcript search document text must be a string.")
+    return " ".join(
+        _transcript_search_token_identity(token.casefold())
+        for token in _TRANSCRIPT_SEARCH_TOKEN_RE.findall(text)
+    )
+
+
+def transcript_search_query_document(text: str) -> str:
+    """Return the deduplicated portable document used for one query."""
+
+    return " ".join(
+        _transcript_search_token_identity(token) for token in transcript_search_query_tokens(text)
+    )
+
+
+def _transcript_search_token_identity(token: str) -> str:
+    encoded = token.encode("utf-8")
+    if len(encoded) <= _TRANSCRIPT_SEARCH_MAX_INLINE_TOKEN_BYTES:
+        return "x" + encoded.hex()
+    return "h" + sha256(encoded).hexdigest()
+
+
+def transcript_search_text(message: Message) -> tuple[str, tuple[int, ...]]:
+    """Project only provider-neutral narrative text; reasoning and tool payloads stay out."""
+
+    if type(message) is not Message:
+        raise TypeError("Transcript search requires a Message.")
+    parts = [
+        (index, part.text) for index, part in enumerate(message.content) if type(part) is TextPart
+    ]
+    return "\n".join(text for _, text in parts), tuple(index for index, _ in parts)
+
+
+def transcript_search_document(message: Message) -> str:
+    """Return the canonical indexed lexical document for one transcript message."""
+
+    return transcript_search_document_from_text(transcript_search_text(message)[0])
+
+
+def transcript_search_session_token(session_id: str) -> str:
+    """Return the FTS-safe opaque term used to constrain SQLite candidate lookup."""
+
+    session_id = require_clean_nonblank(session_id, "session_id")
+    return "s" + sha256(session_id.encode("utf-8")).hexdigest()
+
+
+def transcript_search_query_fingerprint(query: TranscriptSearchQuery) -> str:
+    if type(query) is not TranscriptSearchQuery:
+        raise TypeError("query must be a TranscriptSearchQuery.")
+    material = {
+        "text": query.text,
+        "session_ids": list(query.session_ids),
+        "roles": [str(role) for role in query.roles],
+    }
+    return sha256(canonical_durable_json_bytes(material, "transcript search query")).hexdigest()
+
+
+def encode_transcript_search_cursor(
+    query: TranscriptSearchQuery,
+    *,
+    raw_score: int,
+    session_id: str,
+    transcript_index: int,
+) -> str:
+    query = copy_transcript_search_query(query, cursor=None)
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if session_id not in query.session_ids:
+        raise ValueError("Transcript search cursor session is outside the query scope.")
+    if type(raw_score) is not int or not 0 <= raw_score <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Transcript search cursor score is invalid.")
+    if type(transcript_index) is not int or not 0 <= transcript_index <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Transcript search cursor index is invalid.")
+    material = {
+        "version": _TRANSCRIPT_SEARCH_CURSOR_VERSION,
+        "query_sha256": transcript_search_query_fingerprint(query),
+        "raw_score": raw_score,
+        "session_id_b64": base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii"),
+        "transcript_index": transcript_index,
+    }
+    encoded = base64.urlsafe_b64encode(
+        canonical_durable_json_bytes(material, "transcript search cursor")
+    ).decode("ascii")
+    if len(encoded) > TRANSCRIPT_SEARCH_MAX_CURSOR_BYTES:
+        raise ValueError("Transcript search cursor exceeds its byte limit.")
+    return encoded
+
+
+def decode_transcript_search_cursor(
+    query: TranscriptSearchQuery,
+) -> tuple[int, str, int] | None:
+    query = copy_transcript_search_query(query)
+    if query.cursor is None:
+        return None
+    try:
+        encoded = query.cursor.encode("ascii")
+        raw = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw) != encoded:
+            raise ValueError("Non-canonical transcript search cursor.")
+        decoded = json.loads(raw.decode("utf-8"))
+        if (
+            type(decoded) is not dict
+            or set(decoded)
+            != {
+                "version",
+                "query_sha256",
+                "raw_score",
+                "session_id_b64",
+                "transcript_index",
+            }
+            or decoded["version"] != _TRANSCRIPT_SEARCH_CURSOR_VERSION
+            or type(decoded["query_sha256"]) is not str
+            or type(decoded["raw_score"]) is not int
+            or type(decoded["session_id_b64"]) is not str
+            or type(decoded["transcript_index"]) is not int
+        ):
+            raise ValueError("Invalid transcript search cursor material.")
+        encoded_session = decoded["session_id_b64"].encode("ascii")
+        session_bytes = base64.b64decode(encoded_session, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(session_bytes) != encoded_session:
+            raise ValueError("Non-canonical transcript search cursor session.")
+        session_id = session_bytes.decode("utf-8")
+        expected = transcript_search_query_fingerprint(
+            copy_transcript_search_query(query, cursor=None)
+        )
+        if not secrets.compare_digest(decoded["query_sha256"], expected):
+            raise ValueError("Transcript search cursor belongs to another query.")
+        if session_id not in query.session_ids:
+            raise ValueError("Transcript search cursor session is outside the query scope.")
+        transcript_index = decoded["transcript_index"]
+        if not 0 <= transcript_index <= MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("Transcript search cursor index is invalid.")
+        raw_score = decoded["raw_score"]
+        if not 0 <= raw_score <= MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("Transcript search cursor score is invalid.")
+        return raw_score, session_id, transcript_index
+    except (
+        binascii.Error,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ValueError("Invalid transcript search cursor.") from exc
+
+
+def transcript_search_position_after_cursor(
+    *,
+    raw_score: int,
+    session_id: str,
+    transcript_index: int,
+    cursor: tuple[int, str, int],
+) -> bool:
+    """Return whether a ranked identity follows an exact keyset frontier."""
+
+    cursor_score, cursor_session_id, cursor_transcript_index = cursor
+    return raw_score < cursor_score or (
+        raw_score == cursor_score
+        and (
+            session_id > cursor_session_id
+            or (session_id == cursor_session_id and transcript_index < cursor_transcript_index)
+        )
+    )
+
+
+def copy_transcript_search_query(
+    query: TranscriptSearchQuery,
+    *,
+    cursor: str | None | object = ...,
+) -> TranscriptSearchQuery:
+    if type(query) is not TranscriptSearchQuery:
+        raise TypeError("Transcript search queries must be TranscriptSearchQuery instances.")
+    resolved_cursor = query.cursor if cursor is ... else cursor
+    if resolved_cursor is not None and type(resolved_cursor) is not str:
+        raise TypeError("Transcript search cursor must be a string or None.")
+    return TranscriptSearchQuery(
+        text=query.text,
+        session_ids=tuple(query.session_ids),
+        roles=tuple(query.roles),
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+        max_records_scanned=query.max_records_scanned,
+        cursor=resolved_cursor,
+    )
+
+
+def copy_transcript_search_hit(hit: TranscriptSearchHit) -> TranscriptSearchHit:
+    if type(hit) is not TranscriptSearchHit:
+        raise TypeError("Transcript search hits must be TranscriptSearchHit instances.")
+    return TranscriptSearchHit.model_validate(hit.model_dump(mode="python"))
+
+
+def transcript_search_hit_from_message(
+    *,
+    session_id: str,
+    transcript_index: int,
+    interaction_id: str | None,
+    message: Message,
+    max_text_bytes: int,
+    raw_score: float | None = None,
+) -> TranscriptSearchHit | None:
+    if type(max_text_bytes) is not int or max_text_bytes < 1:
+        return None
+    text, part_indexes = transcript_search_text(message)
+    if not text or not part_indexes:
+        return None
+    encoded = text.encode("utf-8")
+    preview = encoded[:max_text_bytes].decode("utf-8", errors="ignore")
+    if not preview:
+        return None
+    return TranscriptSearchHit(
+        session_id=session_id,
+        transcript_index=transcript_index,
+        interaction_id=interaction_id,
+        role=message.role,
+        text=preview,
+        text_complete=len(preview.encode("utf-8")) == len(encoded),
+        content_hash=sha256(encoded).hexdigest(),
+        text_part_indexes=part_indexes,
+        raw_score=raw_score,
+    )
+
+
+def transcript_search_score(text: str, query: TranscriptSearchQuery) -> float:
+    """Return a deterministic diagnostic score; fusion consumes only the rank."""
+
+    document = transcript_search_document_from_text(text)
+    query_document = transcript_search_query_document(query.text)
+    return float(transcript_search_document_score(document, query_document))
+
+
+def transcript_search_document_score(document: str, query_document: str) -> int:
+    """Score canonical documents identically after indexed candidate lookup."""
+
+    if type(document) is not str or type(query_document) is not str:
+        raise TypeError("Transcript search documents must be strings.")
+    document_tokens = tuple(document.split())
+    query_tokens = tuple(query_document.split())
+    query_set = set(query_tokens)
+    document_set = set(document_tokens)
+    coverage = sum(token in document_set for token in query_tokens)
+    occurrences = min(
+        sum(token in query_set for token in document_tokens),
+        _TRANSCRIPT_SEARCH_OCCURRENCE_CAP,
+    )
+    phrase = int(_contains_token_sequence(document_tokens, query_tokens))
+    score = (
+        phrase * _TRANSCRIPT_SEARCH_PHRASE_SCALE
+        + coverage * _TRANSCRIPT_SEARCH_COVERAGE_SCALE
+        + occurrences
+    )
+    if score > MAX_DURABLE_JSON_INTEGER:  # pragma: no cover - durable input bounds are tighter
+        raise ValueError("Transcript search score exceeds the durable integer limit.")
+    return score
+
+
+def _contains_token_sequence(haystack: tuple[str, ...], needle: tuple[str, ...]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    prefix_lengths = [0] * len(needle)
+    matched = 0
+    for index in range(1, len(needle)):
+        while matched and needle[index] != needle[matched]:
+            matched = prefix_lengths[matched - 1]
+        if needle[index] == needle[matched]:
+            matched += 1
+            prefix_lengths[index] = matched
+    matched = 0
+    for token in haystack:
+        while matched and token != needle[matched]:
+            matched = prefix_lengths[matched - 1]
+        if token == needle[matched]:
+            matched += 1
+            if matched == len(needle):
+                return True
+    return False
 
 
 def _session_matches(session: Session, query: SessionQuery) -> bool:
